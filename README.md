@@ -18,6 +18,12 @@ cargo test --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
+## Benchmarks
+
+Serc has both focused Criterion/CodSpeed benchmarks and an
+[end-to-end Hyperfine harness](scripts/benchmarks/README.md) that compares CPython `compileall`
+with `serc compile` on a pinned NumPy source tree.
+
 ## CPython compatibility
 
 Clone the repository with submodules, then provide an exact CPython 3.14.5 executable:
