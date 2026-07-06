@@ -410,21 +410,23 @@ impl Assembler {
     }
 
     pub(in crate::assembler) fn remove_redundant_forward_jumps(&mut self) {
+        let graph = self
+            .graph
+            .as_mut()
+            .expect("assembler pass requires the block graph");
+        let mut items = graph
+            .iter()
+            .flat_map(|(block, contents)| {
+                contents
+                    .items()
+                    .iter()
+                    .copied()
+                    .map(move |item| (block, item))
+            })
+            .collect::<Vec<_>>();
         let mut index = 0;
-        loop {
-            let graph = self
-                .graph
-                .as_ref()
-                .expect("assembler pass requires the block graph");
-            let positions = graph.item_positions();
-            if index >= positions.len() {
-                break;
-            }
-            let items = positions
-                .iter()
-                .map(|position| *graph.item(*position))
-                .collect::<Vec<_>>();
-            let Item::Instruction(instruction) = items[index] else {
+        while index < items.len() {
+            let Item::Instruction(instruction) = items[index].1 else {
                 index += 1;
                 continue;
             };
@@ -437,12 +439,7 @@ impl Assembler {
                 continue;
             }
             if instruction.has_flag(InstructionFlags::DEFER_REDUNDANT_JUMP_REMOVAL) {
-                let Item::Instruction(instruction) = self
-                    .graph
-                    .as_mut()
-                    .expect("assembler pass requires the block graph")
-                    .item_mut(positions[index])
-                else {
+                let Item::Instruction(instruction) = &mut items[index].1 else {
                     unreachable!();
                 };
                 instruction.remove_flag(InstructionFlags::DEFER_REDUNDANT_JUMP_REMOVAL);
@@ -455,79 +452,49 @@ impl Assembler {
             }
             let target_is_next = items[index + 1..]
                 .iter()
+                .map(|(_, item)| item)
                 .take_while(|item| matches!(item, Item::Label(_)))
                 .any(|item| matches!(item, Item::Label(label) if *label == target));
             if !target_is_next {
                 index += 1;
                 continue;
             }
-            let previous_line = items[..index].iter().rev().find_map(|item| {
-                if let Item::Instruction(instruction) = item {
-                    Some(instruction.location.line)
-                } else {
-                    None
-                }
+            let previous = items[..index]
+                .iter()
+                .rposition(|(_, item)| matches!(item, Item::Instruction(_)));
+            let previous_line = previous.map(|previous| {
+                let Item::Instruction(instruction) = items[previous].1 else {
+                    unreachable!();
+                };
+                instruction.location.line
             });
-            let next_line = items[index + 1..].iter().find_map(|item| {
-                if let Item::Instruction(instruction) = item {
-                    Some(instruction.location.line)
-                } else {
-                    None
-                }
+            let next = items[index + 1..]
+                .iter()
+                .position(|(_, item)| matches!(item, Item::Instruction(_)))
+                .map(|next| index + 1 + next);
+            let next_line = next.map(|next| {
+                let Item::Instruction(instruction) = items[next].1 else {
+                    unreachable!();
+                };
+                instruction.location.line
             });
             if !instruction.has_flag(InstructionFlags::PRESERVE_INLINED_JUMP_NOP)
                 && (instruction.location.line < 0
                     || previous_line == Some(instruction.location.line)
                     || next_line == Some(instruction.location.line))
             {
-                self.graph
-                    .as_mut()
-                    .expect("assembler pass requires the block graph")
-                    .remove_item(positions[index]);
+                items.remove(index);
                 if instruction.has_flag(InstructionFlags::EXCLUDE_EXCEPTION_IF_EXTENDED)
-                    && let Some(previous) =
-                        positions[..index].iter().rev().copied().find(|position| {
-                            matches!(
-                                self.graph
-                                    .as_ref()
-                                    .expect("assembler pass requires the block graph")
-                                    .item(*position),
-                                Item::Instruction(_)
-                            )
-                        })
+                    && let Some(previous) = previous
                 {
-                    let Item::Instruction(previous) = self
-                        .graph
-                        .as_mut()
-                        .expect("assembler pass requires the block graph")
-                        .item_mut(previous)
-                    else {
+                    let Item::Instruction(previous) = &mut items[previous].1 else {
                         unreachable!();
                     };
                     previous.insert_flag(InstructionFlags::EXCLUDE_EXCEPTION_IF_EXTENDED);
                 }
                 if instruction.location.line >= 0
-                    && let Some(next) = self
-                        .graph
-                        .as_ref()
-                        .expect("assembler pass requires the block graph")
-                        .item_positions()
-                        .into_iter()
-                        .skip(index)
-                        .find(|position| {
-                            matches!(
-                                self.graph
-                                    .as_ref()
-                                    .expect("assembler pass requires the block graph")
-                                    .item(*position),
-                                Item::Instruction(_)
-                            )
-                        })
-                    && let Item::Instruction(next) = self
-                        .graph
-                        .as_mut()
-                        .expect("assembler pass requires the block graph")
-                        .item_mut(next)
+                    && let Some(next) = next.map(|next| next - 1)
+                    && let Item::Instruction(next) = &mut items[next].1
                     && next.location.line < 0
                     && !next.has_flag(InstructionFlags::PRESERVE_NO_LOCATION)
                     && !next.has_flag(InstructionFlags::ALLOW_NO_LOCATION_BLOCK_INLINING)
@@ -535,18 +502,21 @@ impl Assembler {
                     next.location = instruction.location;
                 }
             } else {
-                let Item::Instruction(instruction) = self
-                    .graph
-                    .as_mut()
-                    .expect("assembler pass requires the block graph")
-                    .item_mut(positions[index])
-                else {
+                let Item::Instruction(instruction) = &mut items[index].1 else {
                     unreachable!();
                 };
                 instruction.opcode = NOP;
                 instruction.operand = Operand::Value(0);
                 index += 1;
             }
+        }
+
+        let order = graph.order().to_vec();
+        for block in order {
+            graph[block].items_mut().clear();
+        }
+        for (block, item) in items {
+            graph[block].items_mut().push(item);
         }
     }
 
