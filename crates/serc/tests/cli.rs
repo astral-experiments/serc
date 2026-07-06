@@ -125,6 +125,58 @@ fn compile_matches_cpython_pyc() {
     assert_eq!(fs_err::read(pyc_path).unwrap(), expected);
 }
 
+#[test]
+fn compile_matches_cpython_for_latin1_encoding_cookies() {
+    let Some(python) = common::python_3145() else {
+        return;
+    };
+    let directory = tempfile::tempdir().unwrap();
+
+    for (name, source) in [
+        (
+            "latin1_bytes",
+            b"# coding: latin-1\nvalue = '\xe9'\n".as_slice(),
+        ),
+        (
+            "utf8_bytes",
+            b"# coding: latin-1\nvalue = '\xc3\xa9'\n".as_slice(),
+        ),
+    ] {
+        let source_path = directory.path().join(format!("{name}.py"));
+        let pyc_path = directory
+            .path()
+            .join(format!("__pycache__/{name}.cpython-314.pyc"));
+        fs_err::write(&source_path, source).unwrap();
+
+        let cpython = Command::new(&python)
+            .args([
+                "-I",
+                "-m",
+                "compileall",
+                "-q",
+                "-f",
+                "-o",
+                "0",
+                "--invalidation-mode",
+                "timestamp",
+            ])
+            .arg(&source_path)
+            .output()
+            .unwrap();
+        assert!(cpython.status.success(), "{cpython:?}");
+        let expected = fs_err::read(&pyc_path).unwrap();
+
+        let output = serc()
+            .args(["compile", "--quiet"])
+            .arg(&source_path)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+
+        assert_eq!(fs_err::read(pyc_path).unwrap(), expected);
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn compile_honors_umask_for_cache_permissions() {
