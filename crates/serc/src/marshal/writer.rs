@@ -1,12 +1,7 @@
-use rustc_hash::FxHashMap;
-
 use crate::compiler::{CodeObject, Constant};
 
-use super::graph::ObjectGraph;
-use super::key::{
-    ObjectKey, code_bytes_key, code_key, constant_key, constant_sort_key, constants_tuple_key,
-    local_kinds_key, locals_tuple_key, slice_member_uses_identity, strings_tuple_key,
-};
+use super::graph::{ObjectGraph, ObjectId};
+use super::key::{constant_sort_key, slice_member_uses_identity};
 use super::v5::{
     FLAG_REF, TYPE_ASCII, TYPE_ASCII_INTERNED, TYPE_BINARY_COMPLEX, TYPE_BINARY_FLOAT, TYPE_CODE,
     TYPE_ELLIPSIS, TYPE_FALSE, TYPE_FROZENSET, TYPE_INT, TYPE_INTERNED, TYPE_LONG, TYPE_NONE,
@@ -19,7 +14,8 @@ pub(crate) fn encode_code(code: &CodeObject) -> Vec<u8> {
     let mut writer = Writer {
         graph: &graph,
         output: Vec::new(),
-        references: FxHashMap::default(),
+        references: vec![None; graph.object_count()],
+        reference_count: 0,
     };
     writer.write_code(code, true);
     writer.output
@@ -29,7 +25,8 @@ pub(crate) fn encode_code(code: &CodeObject) -> Vec<u8> {
 struct Writer<'a> {
     graph: &'a ObjectGraph,
     output: Vec<u8>,
-    references: FxHashMap<ObjectKey, u32>,
+    references: Vec<Option<u32>>,
+    reference_count: usize,
 }
 
 impl Writer<'_> {
@@ -41,26 +38,28 @@ impl Writer<'_> {
         self.output.extend_from_slice(&value.to_le_bytes());
     }
 
-    fn begin_object(&mut self, key: ObjectKey, force_reference: bool) -> Option<u8> {
-        if !self.graph.is_shared(&key, force_reference) {
+    fn begin_object(&mut self, object: ObjectId, force_reference: bool) -> Option<u8> {
+        if !self.graph.is_shared_object(object, force_reference) {
             return Some(0);
         }
-        if let Some(index) = self.references.get(&key).copied() {
+        if let Some(index) = self.references[object.0] {
             self.byte(TYPE_REF);
             self.long(index);
             return None;
         }
-        let index = u32::try_from(self.references.len()).expect("marshal reference limit exceeded");
-        self.references.insert(key, index);
+        let index = u32::try_from(self.reference_count).expect("marshal reference limit exceeded");
+        self.reference_count += 1;
+        self.references[object.0] = Some(index);
         Some(FLAG_REF)
     }
 
     fn bytes(&mut self, value: &[u8], force_reference: bool) {
-        self.bytes_with_key(ObjectKey::Bytes(value.to_vec()), value, force_reference);
+        let object = self.graph.bytes(value);
+        self.bytes_with_object(object, value, force_reference);
     }
 
-    fn bytes_with_key(&mut self, key: ObjectKey, value: &[u8], force_reference: bool) {
-        let Some(flag) = self.begin_object(key, force_reference) else {
+    fn bytes_with_object(&mut self, object: ObjectId, value: &[u8], force_reference: bool) {
+        let Some(flag) = self.begin_object(object, force_reference) else {
             return;
         };
         self.byte(TYPE_STRING | flag);
@@ -69,15 +68,15 @@ impl Writer<'_> {
     }
 
     fn string(&mut self, value: &str) {
-        self.string_with_force(value, false);
+        let object = self.graph.metadata_string(value);
+        self.string_with_object(object, value, false);
     }
 
-    fn string_with_force(&mut self, value: &str, force_reference: bool) {
-        let key = ObjectKey::String(value.to_string());
-        let Some(flag) = self.begin_object(key, force_reference) else {
+    fn string_with_object(&mut self, object: ObjectId, value: &str, force_reference: bool) {
+        let interned = self.graph.is_interned(value);
+        let Some(flag) = self.begin_object(object, force_reference || interned) else {
             return;
         };
-        let interned = self.graph.is_interned(value);
         let bytes = value.as_bytes();
         if value.is_ascii() && bytes.len() < 256 {
             self.byte(
@@ -112,10 +111,13 @@ impl Writer<'_> {
         self.output.extend_from_slice(bytes);
     }
 
-    fn surrogate_string_with_force(&mut self, value: &[u8], force_reference: bool) {
-        let Some(flag) =
-            self.begin_object(ObjectKey::SurrogateString(value.to_vec()), force_reference)
-        else {
+    fn surrogate_string_with_object(
+        &mut self,
+        object: ObjectId,
+        value: &[u8],
+        force_reference: bool,
+    ) {
+        let Some(flag) = self.begin_object(object, force_reference) else {
             return;
         };
         self.byte(TYPE_UNICODE | flag);
@@ -128,8 +130,8 @@ impl Writer<'_> {
         self.output.extend_from_slice(value);
     }
 
-    fn tuple_header(&mut self, key: ObjectKey, length: usize, force_reference: bool) -> bool {
-        let Some(flag) = self.begin_object(key, force_reference) else {
+    fn tuple_header(&mut self, object: ObjectId, length: usize, force_reference: bool) -> bool {
+        let Some(flag) = self.begin_object(object, force_reference) else {
             return false;
         };
         if let Ok(length) = u8::try_from(length) {
@@ -143,8 +145,8 @@ impl Writer<'_> {
     }
 
     fn strings(&mut self, values: &[String], force_reference: bool) {
-        let key = strings_tuple_key(values);
-        if self.tuple_header(key, values.len(), force_reference) {
+        let object = self.graph.strings_tuple(values);
+        if self.tuple_header(object, values.len(), force_reference) {
             for value in values {
                 self.string(value);
             }
@@ -152,8 +154,8 @@ impl Writer<'_> {
     }
 
     fn locals(&mut self, code: &CodeObject) {
-        let key = locals_tuple_key(code);
-        if self.tuple_header(key, code.locals.len(), false) {
+        let object = self.graph.locals_tuple(code);
+        if self.tuple_header(object, code.locals.len(), false) {
             for value in &code.locals {
                 self.string(value);
             }
@@ -161,8 +163,8 @@ impl Writer<'_> {
     }
 
     fn constants(&mut self, values: &[Constant], force_reference: bool) {
-        let key = constants_tuple_key(values);
-        if self.tuple_header(key, values.len(), force_reference) {
+        let object = self.graph.constants_tuple(values);
+        if self.tuple_header(object, values.len(), force_reference) {
             for value in values {
                 self.constant(value);
             }
@@ -179,39 +181,51 @@ impl Writer<'_> {
             Constant::Bool(false) => self.byte(TYPE_FALSE),
             Constant::Bool(true) => self.byte(TYPE_TRUE),
             Constant::Ellipsis => self.byte(TYPE_ELLIPSIS),
-            Constant::Int(value) => self.integer(*value, force_reference),
-            Constant::SignedInt(value) => self.signed_integer(*value, force_reference),
-            Constant::BigInt { negative, digits } => {
-                self.big_integer(digits, *negative, force_reference);
+            Constant::Int(integer) => {
+                let object = self.graph.constant(value);
+                self.integer(object, *integer, force_reference);
             }
-            Constant::Float(value) => {
-                let Some(flag) =
-                    self.begin_object(ObjectKey::Float(value.to_bits()), force_reference)
-                else {
+            Constant::SignedInt(integer) => {
+                let object = self.graph.constant(value);
+                self.signed_integer(object, *integer, force_reference);
+            }
+            Constant::BigInt { negative, digits } => {
+                let object = self.graph.constant(value);
+                self.big_integer(object, digits, *negative, force_reference);
+            }
+            Constant::Float(float) => {
+                let object = self.graph.constant(value);
+                let Some(flag) = self.begin_object(object, force_reference) else {
                     return;
                 };
                 self.byte(TYPE_BINARY_FLOAT | flag);
-                self.output.extend_from_slice(&value.to_le_bytes());
+                self.output.extend_from_slice(&float.to_le_bytes());
             }
             Constant::Complex { real, imag } => {
-                let Some(flag) = self.begin_object(
-                    ObjectKey::Complex(real.to_bits(), imag.to_bits()),
-                    force_reference,
-                ) else {
+                let object = self.graph.constant(value);
+                let Some(flag) = self.begin_object(object, force_reference) else {
                     return;
                 };
                 self.byte(TYPE_BINARY_COMPLEX | flag);
                 self.output.extend_from_slice(&real.to_le_bytes());
                 self.output.extend_from_slice(&imag.to_le_bytes());
             }
-            Constant::String(value) => self.string_with_force(value, force_reference),
-            Constant::SurrogateString(value) => {
-                self.surrogate_string_with_force(value, force_reference);
+            Constant::String(string) => {
+                let object = self.graph.constant(value);
+                self.string_with_object(object, string, force_reference);
             }
-            Constant::Bytes(value) => self.bytes(value, force_reference),
+            Constant::SurrogateString(string) => {
+                let object = self.graph.constant(value);
+                self.surrogate_string_with_object(object, string, force_reference);
+            }
+            Constant::Bytes(bytes) => {
+                let object = self.graph.constant(value);
+                self.bytes_with_object(object, bytes, force_reference);
+            }
             Constant::Tuple(values) => self.constants(values, force_reference),
             Constant::FrozenSet(values) => {
-                let Some(flag) = self.begin_object(constant_key(value), force_reference) else {
+                let object = self.graph.constant(value);
+                let Some(flag) = self.begin_object(object, force_reference) else {
                     return;
                 };
                 self.byte(TYPE_FROZENSET | flag);
@@ -228,7 +242,8 @@ impl Writer<'_> {
                 }
             }
             Constant::Slice { lower, upper, step } => {
-                let Some(flag) = self.begin_object(constant_key(value), force_reference) else {
+                let object = self.graph.constant(value);
+                let Some(flag) = self.begin_object(object, force_reference) else {
                     return;
                 };
                 self.byte(TYPE_SLICE | flag);
@@ -245,8 +260,8 @@ impl Writer<'_> {
             self.constant(value);
             return;
         }
-        let key = ObjectKey::SliceMember(std::ptr::from_ref(value).addr());
-        let Some(flag) = self.begin_object(key, false) else {
+        let object = self.graph.slice_member(value);
+        let Some(flag) = self.begin_object(object, false) else {
             return;
         };
         match value {
@@ -346,8 +361,8 @@ impl Writer<'_> {
         }
     }
 
-    fn integer(&mut self, value: u64, force_reference: bool) {
-        let Some(flag) = self.begin_object(ObjectKey::Int(value), force_reference) else {
+    fn integer(&mut self, object: ObjectId, value: u64, force_reference: bool) {
+        let Some(flag) = self.begin_object(object, force_reference) else {
             return;
         };
         if let Ok(value) = i32::try_from(value) {
@@ -367,8 +382,8 @@ impl Writer<'_> {
         }
     }
 
-    fn signed_integer(&mut self, value: i64, force_reference: bool) {
-        let Some(flag) = self.begin_object(ObjectKey::SignedInt(value), force_reference) else {
+    fn signed_integer(&mut self, object: ObjectId, value: i64, force_reference: bool) {
+        let Some(flag) = self.begin_object(object, force_reference) else {
             return;
         };
         if let Ok(value) = i32::try_from(value) {
@@ -389,10 +404,14 @@ impl Writer<'_> {
         }
     }
 
-    fn big_integer(&mut self, value: &[u16], negative: bool, force_reference: bool) {
-        let Some(flag) =
-            self.begin_object(ObjectKey::BigInt(negative, value.to_vec()), force_reference)
-        else {
+    fn big_integer(
+        &mut self,
+        object: ObjectId,
+        value: &[u16],
+        negative: bool,
+        force_reference: bool,
+    ) {
+        let Some(flag) = self.begin_object(object, force_reference) else {
             return;
         };
         self.byte(TYPE_LONG | flag);
@@ -408,7 +427,8 @@ impl Writer<'_> {
     }
 
     fn write_code(&mut self, code: &CodeObject, force_reference: bool) {
-        let Some(flag) = self.begin_object(code_key(code), force_reference) else {
+        let object = self.graph.code(code);
+        let Some(flag) = self.begin_object(object, force_reference) else {
             return;
         };
         self.byte(TYPE_CODE | flag);
@@ -417,11 +437,13 @@ impl Writer<'_> {
         self.long(code.keyword_only_arg_count);
         self.long(code.stack_size);
         self.long(code.flags);
-        self.bytes_with_key(code_bytes_key(code), &code.bytecode, true);
+        let bytecode = self.graph.code_bytes(code);
+        self.bytes_with_object(bytecode, &code.bytecode, true);
         self.constants(&code.constants, false);
         self.strings(&code.names, false);
         self.locals(code);
-        self.bytes_with_key(local_kinds_key(code), &code.local_kinds, false);
+        let local_kinds = self.graph.local_kinds(code);
+        self.bytes_with_object(local_kinds, &code.local_kinds, false);
         self.string(&code.filename);
         self.string(&code.name);
         self.string(&code.qualified_name);
