@@ -49,8 +49,8 @@ fn uses_cpython_reference_cache_boundaries() {
     for key in [
         ObjectKey::Int(256),
         ObjectKey::SignedInt(-5),
-        ObjectKey::Bytes(Vec::new()),
-        ObjectKey::Bytes(vec![0]),
+        ObjectKey::Bytes(&[]),
+        ObjectKey::Bytes(&[0]),
         ObjectKey::EmptyTuple,
     ] {
         assert!(graph.is_shared(&key, false), "expected cached key {key:?}");
@@ -58,7 +58,7 @@ fn uses_cpython_reference_cache_boundaries() {
     for key in [
         ObjectKey::Int(257),
         ObjectKey::SignedInt(-6),
-        ObjectKey::Bytes(vec![0, 1]),
+        ObjectKey::Bytes(&[0, 1]),
         ObjectKey::Float(1.0_f64.to_bits()),
     ] {
         assert!(
@@ -73,12 +73,15 @@ fn uses_cpython_reference_cache_boundaries() {
 fn tracks_interned_strings_from_constants_and_metadata() {
     let mut code = code_object(vec![
         Constant::String("identifier".to_string()),
+        Constant::String("méthode".to_string()),
         Constant::String("not interned".to_string()),
     ]);
+    code.interned_constant_strings.insert("méthode".to_string());
     code.names.push("metadata name with spaces".to_string());
     let graph = ObjectGraph::for_code(&code);
 
     assert!(graph.is_interned("identifier"));
+    assert!(graph.is_interned("méthode"));
     assert!(graph.is_interned("metadata name with spaces"));
     assert!(graph.is_interned("module.py"));
     assert!(!graph.is_interned("not interned"));
@@ -135,8 +138,10 @@ fn frozen_set_keys_and_reference_order_ignore_input_order() {
     let mut reversed = values.clone();
     reversed.reverse();
 
-    let first_key = constant_key(&Constant::FrozenSet(values.clone()));
-    let second_key = constant_key(&Constant::FrozenSet(reversed.clone()));
+    let first = Constant::FrozenSet(values.clone());
+    let second = Constant::FrozenSet(reversed.clone());
+    let first_key = constant_key(&first);
+    let second_key = constant_key(&second);
     assert_eq!(first_key, second_key);
 
     let first = code_object(vec![Constant::FrozenSet(values)]);
