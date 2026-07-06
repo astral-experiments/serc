@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use crate::compiler::{CodeObject, Constant};
 
@@ -19,7 +19,7 @@ pub(crate) fn encode_code(code: &CodeObject) -> Vec<u8> {
     let mut writer = Writer {
         graph: &graph,
         output: Vec::new(),
-        references: HashMap::default(),
+        references: FxHashMap::default(),
     };
     writer.write_code(code, true);
     writer.output
@@ -29,7 +29,7 @@ pub(crate) fn encode_code(code: &CodeObject) -> Vec<u8> {
 struct Writer<'a> {
     graph: &'a ObjectGraph,
     output: Vec<u8>,
-    references: HashMap<ObjectKey, u32>,
+    references: FxHashMap<ObjectKey, u32>,
 }
 
 impl Writer<'_> {
