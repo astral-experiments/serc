@@ -1,13 +1,13 @@
 use std::io::Write as _;
 use std::process::{Command, Stdio};
 
+use serc::{CPYTHON_TARGET, compile, compile_to_pyc};
 use tempfile::tempdir;
-use uv_python_bytecode::{CPYTHON_TARGET, compile, compile_to_pyc};
 
 const CPYTHON_MARSHAL: &str = "import marshal, sys; code = compile(sys.stdin.read(), sys.argv[1], 'exec', dont_inherit=True, optimize=0); sys.stdout.buffer.write(marshal.dumps(code))";
 
 fn python_3145() -> Option<String> {
-    let configured = std::env::var("UV_PYTHON_BYTECODE_TEST_PYTHON").ok();
+    let configured = std::env::var("SERC_TEST_PYTHON").ok();
     let executable = configured.as_deref().unwrap_or("python3.14");
     let version = CPYTHON_TARGET.version_string();
     let magic = CPYTHON_TARGET.magic_hex();
@@ -26,7 +26,7 @@ fn python_3145() -> Option<String> {
     }
     assert!(
         configured.is_none(),
-        "UV_PYTHON_BYTECODE_TEST_PYTHON must name CPython {} with magic {}: {}",
+        "SERC_TEST_PYTHON must name CPython {} with magic {}: {}",
         version,
         magic,
         String::from_utf8_lossy(&output.stderr).trim()

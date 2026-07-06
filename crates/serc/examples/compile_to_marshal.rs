@@ -5,7 +5,7 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use uv_python_bytecode::compile;
+use serc::compile;
 
 fn main() -> ExitCode {
     let Some(path) = env::args_os().nth(1).map(PathBuf::from) else {

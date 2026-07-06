@@ -11,7 +11,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use cpu_time::ProcessTime;
-use uv_python_bytecode::{CPYTHON_TARGET, CompiledModule, compile};
+use serc::{CPYTHON_TARGET, CompiledModule, compile};
 use walkdir::WalkDir;
 
 const BOOTSTRAP_SAMPLES: usize = 10_000;

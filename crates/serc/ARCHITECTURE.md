@@ -1,6 +1,6 @@
-# uv-python-bytecode architecture
+# Serc architecture
 
-`uv-python-bytecode` compiles Python source to CPython code objects without embedding or starting a
+Serc compiles Python source to CPython code objects without embedding or starting a
 Python runtime. Ruff supplies the parser and AST; the rest of the compiler, assembler, marshal
 writer, and `.pyc` wrapper are implemented in Rust.
 
@@ -234,9 +234,9 @@ The generator reads these CPython files:
 Run it from the repository root:
 
 ```console
-python3 crates/uv-python-bytecode/scripts/generate_cpython_target.py \
+python3 crates/serc/scripts/generate_cpython_target.py \
   --cpython /path/to/cpython
-python3 crates/uv-python-bytecode/scripts/generate_cpython_target.py \
+python3 crates/serc/scripts/generate_cpython_target.py \
   --cpython /path/to/cpython \
   --check
 ```
@@ -254,14 +254,14 @@ opcode.
 ## Correctness gate
 
 Focused tests can use a CPython 3.14.5 executable through
-`UV_PYTHON_BYTECODE_TEST_PYTHON`. The full gate compares the Ruff and ty corpora to CPython's
+`SERC_TEST_PYTHON`. The full gate compares the Ruff and ty corpora to CPython's
 marshal output. From the repository root, with `RUFF` pointing to a Ruff checkout:
 
 ```console
-UV_PYTHON_BYTECODE_TEST_PYTHON=/path/to/python3.14 \
-  cargo test --locked -p uv-python-bytecode --all-targets
+SERC_TEST_PYTHON=/path/to/python3.14 \
+  cargo test --locked -p serc --all-targets
 
-cargo run --locked -p uv-python-bytecode --example compare_cpython_corpus -- \
+cargo run --locked -p serc --example compare_cpython_corpus -- \
   --python /path/to/python3.14 \
   --expected-files 2451 \
   --require-all \

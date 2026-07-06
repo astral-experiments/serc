@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::Instant;
 
+use serc::{CPYTHON_TARGET, CompileError, compile};
 use rayon::prelude::*;
-use uv_python_bytecode::{CPYTHON_TARGET, CompileError, compile};
 use walkdir::WalkDir;
 
 const ORACLE: &str = r#"

@@ -5,7 +5,7 @@ mod tests {
     use std::fmt::Write as _;
 
     use super::common::{assert_executes, assert_matches_cpython_marshal};
-    use uv_python_bytecode::{CPYTHON_TARGET, compile, compile_to_pyc};
+    use serc::{CPYTHON_TARGET, compile, compile_to_pyc};
 
     #[test]
     fn exposes_the_pinned_cpython_source_identity() {

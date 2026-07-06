@@ -1,0 +1,13 @@
+/target/
+*.pending-snap
+*.rs.bk
+*.pdb
+**/.DS_Store
+.idea/
+.vscode/
+__pycache__/
+flamegraph.svg
+perf.data
+perf.data.old
+profile.json
+profile.json.gz
