@@ -33,6 +33,12 @@ jobs:
     permissions:
       contents: read
 
+  benchmark:
+    uses: ./.github/workflows/benchmark.yml
+    permissions:
+      contents: read
+      id-token: write
+
   check-zizmor:
     uses: ./.github/workflows/check-zizmor.yml
     permissions:
