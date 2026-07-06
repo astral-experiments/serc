@@ -2163,7 +2163,7 @@ impl Compiler {
                 }
             }
         }
-        let mut seen_temporaries = HashSet::new();
+        let mut seen_temporaries = HashSet::default();
         temporary_names.retain(|name| seen_temporaries.insert(name.clone()));
         let mut temporary_indices = Vec::with_capacity(temporary_names.len());
         for name in &temporary_names {
@@ -2352,7 +2352,7 @@ impl Compiler {
         for comprehension in &generator.generators {
             collect_target_names(&comprehension.target, &mut locals);
         }
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         locals.retain(|name| seen.insert(name.clone()));
         let required_names = generator_required_names(generator);
         let generator_cellvars = generator_cellvars(generator);

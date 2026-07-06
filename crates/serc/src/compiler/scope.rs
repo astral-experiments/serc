@@ -2102,7 +2102,7 @@ pub(super) fn generator_named_targets(
 pub(super) fn generator_required_names(
     generator: &ruff_python_ast::ExprGenerator,
 ) -> BTreeSet<String> {
-    let mut local_names = HashSet::new();
+    let mut local_names = HashSet::default();
     for comprehension in &generator.generators {
         let mut names = Vec::new();
         collect_target_names(&comprehension.target, &mut names);
@@ -2132,7 +2132,7 @@ pub(super) fn generator_required_names(
 }
 
 pub(super) fn generator_cellvars(generator: &ruff_python_ast::ExprGenerator) -> HashSet<String> {
-    let mut local_names = HashSet::new();
+    let mut local_names = HashSet::default();
     for comprehension in &generator.generators {
         let mut names = Vec::new();
         collect_target_names(&comprehension.target, &mut names);
