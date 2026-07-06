@@ -34,10 +34,42 @@ jobs:
       contents: read
 
   benchmark:
-    uses: ./.github/workflows/benchmark.yml
+    name: "CodSpeed benchmarks"
+    # Fork pull requests are intentionally skipped so untrusted code cannot request an OIDC token.
+    if: >-
+      github.repository == 'astral-sh/serc' &&
+      (
+        github.event_name != 'pull_request' ||
+        github.event.pull_request.head.repo.full_name == github.repository
+      )
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     permissions:
       contents: read
       id-token: write
+    env:
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          shared-key: benchmark-${{ runner.os }}-${{ runner.arch }}-profiling-codspeed-simulation
+      - name: "Install Rust toolchain"
+        run: rustup show
+      - name: "Install cargo-codspeed"
+        uses: taiki-e/install-action@15449e3094499af05d8d964a1c884208e4b8b595 # v2.81.11
+        with:
+          tool: cargo-codspeed@4.4.1
+      - name: "Build benchmarks"
+        run: cargo codspeed build --locked -m simulation --profile profiling -p serc_benchmark --bench compiler --no-default-features --features "benchmarks,codspeed"
+      - name: "Run benchmarks"
+        uses: CodSpeedHQ/action@c145068895e045cc725ee76fcd2307624b65c3af # v4.17.5
+        with:
+          mode: simulation
+          run: cargo codspeed run -m simulation -p serc_benchmark --bench compiler
 
   check-zizmor:
     uses: ./.github/workflows/check-zizmor.yml
