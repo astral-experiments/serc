@@ -3,7 +3,7 @@ use std::hint::black_box;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::UNIX_EPOCH;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::builder::Styles;
 use clap::builder::styling::{AnsiColor, Effects};
@@ -160,14 +160,7 @@ fn compile_path(path: &Path, check: bool) -> Result<(), String> {
     let modified = metadata
         .modified()
         .map_err(|error| format!("failed to read the mtime for {}: {error}", path.display()))?;
-    let seconds = modified.duration_since(UNIX_EPOCH).map_err(|error| {
-        format!(
-            "{} has a modification time before the Unix epoch: {error}",
-            path.display()
-        )
-    })?;
-    let source_mtime = u32::try_from(seconds.as_secs())
-        .map_err(|error| format!("failed to encode the mtime for {}: {error}", path.display()))?;
+    let source_mtime = encode_mtime(modified);
     let pyc = compile_to_pyc(&source, filename, source_mtime)
         .map_err(|error| format!("failed to compile {}: {error}", path.display()))?;
     let output = cache_path(path)?;
@@ -189,6 +182,18 @@ fn compile_path(path: &Path, check: bool) -> Result<(), String> {
         .persist(&output)
         .map(|_| ())
         .map_err(|error| format!("failed to replace {}: {error}", output.display()))
+}
+
+fn encode_mtime(modified: SystemTime) -> u32 {
+    match modified.duration_since(UNIX_EPOCH) {
+        Ok(duration) => low_u32(duration.as_secs()),
+        Err(error) => 0_u32.wrapping_sub(low_u32(error.duration().as_secs())),
+    }
+}
+
+fn low_u32(value: u64) -> u32 {
+    let [first, second, third, fourth, _, _, _, _] = value.to_le_bytes();
+    u32::from_le_bytes([first, second, third, fourth])
 }
 
 #[cfg(unix)]
@@ -236,8 +241,9 @@ fn write_error(message: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{cache_path, cache_tag, discover};
+    use super::{cache_path, cache_tag, discover, encode_mtime};
     use std::path::{Path, PathBuf};
+    use std::time::{Duration, UNIX_EPOCH};
 
     #[test]
     fn target_cache_tag() {
@@ -249,6 +255,19 @@ mod tests {
         assert_eq!(
             cache_path(Path::new("package/module.py")).unwrap(),
             PathBuf::from("package/__pycache__/module.cpython-314.pyc")
+        );
+    }
+
+    #[test]
+    fn wraps_mtime_to_cpython_uint32() {
+        assert_eq!(
+            encode_mtime(UNIX_EPOCH - Duration::from_millis(1500)),
+            u32::MAX
+        );
+        assert_eq!(encode_mtime(UNIX_EPOCH - Duration::from_millis(500)), 0);
+        assert_eq!(
+            encode_mtime(UNIX_EPOCH + Duration::from_secs(u64::from(u32::MAX) + 1)),
+            0
         );
     }
 
