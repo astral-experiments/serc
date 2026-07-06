@@ -28,7 +28,6 @@ corpus="${1:-$default_corpus}"
 results_json="${2:-$repo_root/target/benchmarks/results/numpy.json}"
 warmup="${HYPERFINE_WARMUP:-3}"
 min_runs="${HYPERFINE_MIN_RUNS:-10}"
-serc="$repo_root/target/release/serc"
 
 if ! command -v "$python" >/dev/null 2>&1; then
     echo "error: CPython executable not found: $python" >&2
@@ -93,12 +92,38 @@ if actual != expected:
 '
 
 echo "Building Serc in release mode"
-CARGO_INCREMENTAL=0 cargo build \
-    --manifest-path "$repo_root/Cargo.toml" \
-    --release \
-    --locked \
-    --package serc \
-    --bin serc
+serc="$(
+    CARGO_INCREMENTAL=0 cargo build \
+        --manifest-path "$repo_root/Cargo.toml" \
+        --release \
+        --locked \
+        --package serc \
+        --bin serc \
+        --message-format json-render-diagnostics \
+        | "$python" -c '
+import json
+import sys
+
+executable = None
+for line in sys.stdin:
+    message = json.loads(line)
+    if message["reason"] == "compiler-message":
+        rendered = message["message"].get("rendered")
+        if rendered:
+            print(rendered, file=sys.stderr, end="")
+    elif (
+        message["reason"] == "compiler-artifact"
+        and message["target"]["name"] == "serc"
+        and "bin" in message["target"]["kind"]
+        and message["executable"] is not None
+    ):
+        executable = message["executable"]
+
+if executable is None:
+    raise SystemExit("cargo did not report the Serc executable")
+print(executable)
+'
+)"
 
 clean_caches() {
     find "$corpus" -type d -name __pycache__ -prune -exec rm -rf {} +
