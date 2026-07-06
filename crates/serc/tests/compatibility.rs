@@ -1,10 +1,16 @@
 mod common;
 
+#[allow(dead_code, unreachable_pub)]
+mod benchmark_workloads {
+    include!("../../serc_benchmark/src/workloads.rs");
+}
+
 #[cfg(test)]
 mod tests {
     use std::fmt::Write as _;
 
     use super::common::{assert_executes, assert_matches_cpython_marshal};
+    use crate::benchmark_workloads;
     use serc::{CPYTHON_TARGET, compile, compile_to_pyc};
 
     #[test]
@@ -44,27 +50,13 @@ mod tests {
 
     #[test]
     fn benchmark_workloads_match_cpython_marshal() {
-        let workloads = [
-            (
-                include_str!("fixtures/execution/context_managers.py"),
-                "benchmark/context_managers.py",
-            ),
-            (
-                include_str!("fixtures/benchmark/annotation_scopes.py"),
-                "annotation_scopes.py",
-            ),
-            (
-                include_str!("fixtures/benchmark/match_control_flow.py"),
-                "match.py",
-            ),
-            (
-                include_str!("fixtures/benchmark/loop_async_edges.py"),
-                "loop_tail.py",
-            ),
-        ];
-
-        for (source, filename) in workloads {
-            assert_matches_cpython_marshal(source, filename);
+        for workload in benchmark_workloads::COMPILE_MICRO_WORKLOADS
+            .iter()
+            .chain(benchmark_workloads::COMPOSITE_WORKLOADS)
+            .chain(benchmark_workloads::LARGE_WORKLOADS)
+            .chain(benchmark_workloads::MARSHAL_MICRO_WORKLOADS)
+        {
+            assert_matches_cpython_marshal(workload.source, workload.filename);
         }
     }
 

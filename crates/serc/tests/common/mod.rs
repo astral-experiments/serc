@@ -51,7 +51,8 @@ pub(crate) fn assert_matches_cpython_marshal(source: &str, filename: &str) {
     assert!(expected.status.success());
     assert_eq!(
         compile(source, filename).unwrap().marshal(),
-        expected.stdout
+        expected.stdout,
+        "marshal mismatch for {filename}",
     );
 }
 
