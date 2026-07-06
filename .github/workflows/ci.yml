@@ -14,24 +14,88 @@ concurrency:
 
 jobs:
   check-fmt:
-    uses: astral-sh/serc/.github/workflows/check-fmt.yml@main
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
     permissions:
       contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: "Install Rustfmt"
+        run: rustup component add rustfmt
+      - run: cargo fmt --all --check
 
   check-lint:
-    uses: astral-sh/serc/.github/workflows/check-lint.yml@main
+    name: "clippy on linux"
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
     permissions:
       contents: read
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_NET_RETRY: 10
+      CARGO_TERM_COLOR: always
+      RUSTUP_MAX_RETRIES: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: "Install Rust toolchain"
+        run: rustup component add clippy
+      - name: "Clippy"
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   test:
-    uses: astral-sh/serc/.github/workflows/test.yml@main
+    name: "cargo test on linux"
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
     permissions:
       contents: read
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_NET_RETRY: 10
+      CARGO_TERM_COLOR: always
+      SERC_TEST_PYTHON: python
+      RUSTUP_MAX_RETRIES: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.14.5"
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: "Install Rust toolchain"
+        run: rustup show
+      - name: "Cargo test"
+        run: cargo test --workspace --all-targets --locked
 
   compatibility:
-    uses: astral-sh/serc/.github/workflows/compatibility.yml@main
+    name: "CPython compatibility"
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
     permissions:
       contents: read
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_NET_RETRY: 10
+      CARGO_TERM_COLOR: always
+      RUSTUP_MAX_RETRIES: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          submodules: true
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.14.5"
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: "Install Rust toolchain"
+        run: rustup show
+      - name: "Compare with CPython"
+        run: ./scripts/check-cpython-compatibility python
 
   benchmark:
     name: "CodSpeed benchmarks"
@@ -72,6 +136,14 @@ jobs:
           run: cargo codspeed run -m simulation -p serc_benchmark --bench compiler
 
   check-zizmor:
-    uses: astral-sh/serc/.github/workflows/check-zizmor.yml@main
+    runs-on: ubuntu-latest
     permissions:
       contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: zizmorcore/zizmor-action@b1d7e1fb5de872772f31590499237e7cce841e8e # v0.5.3
+        with:
+          advanced-security: false
+          annotations: true
