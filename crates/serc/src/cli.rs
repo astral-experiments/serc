@@ -180,12 +180,11 @@ fn compile_path(path: &Path, check: bool) -> Result<(), String> {
     })?;
     fs_err::create_dir_all(parent)
         .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+    let mut temporary = temporary_cache_file(parent, &metadata)
         .map_err(|error| format!("failed to create a temporary cache file: {error}"))?;
     temporary
         .write_all(&pyc)
         .map_err(|error| format!("failed to write a temporary cache file: {error}"))?;
-    set_cache_permissions(temporary.as_file(), &metadata, &output)?;
     temporary
         .persist(&output)
         .map(|_| ())
@@ -193,26 +192,24 @@ fn compile_path(path: &Path, check: bool) -> Result<(), String> {
 }
 
 #[cfg(unix)]
-fn set_cache_permissions(
-    cache: &std::fs::File,
+fn temporary_cache_file(
+    parent: &Path,
     source: &std::fs::Metadata,
-    path: &Path,
-) -> Result<(), String> {
+) -> io::Result<tempfile::NamedTempFile> {
     use std::os::unix::fs::PermissionsExt;
 
     let mode = (source.permissions().mode() & 0o666) | 0o200;
-    cache
-        .set_permissions(std::fs::Permissions::from_mode(mode))
-        .map_err(|error| format!("failed to set permissions for {}: {error}", path.display()))
+    tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(mode))
+        .tempfile_in(parent)
 }
 
 #[cfg(not(unix))]
-fn set_cache_permissions(
-    _cache: &std::fs::File,
+fn temporary_cache_file(
+    parent: &Path,
     _source: &std::fs::Metadata,
-    _path: &Path,
-) -> Result<(), String> {
-    Ok(())
+) -> io::Result<tempfile::NamedTempFile> {
+    tempfile::NamedTempFile::new_in(parent)
 }
 
 fn cache_path(path: &Path) -> Result<PathBuf, String> {

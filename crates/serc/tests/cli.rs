@@ -127,6 +127,33 @@ fn compile_matches_cpython_pyc() {
 
 #[cfg(unix)]
 #[test]
+fn compile_honors_umask_for_cache_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempfile::tempdir().unwrap();
+    let source_path = directory.path().join("module.py");
+    let pyc_path = directory.path().join("__pycache__/module.cpython-314.pyc");
+    fs_err::write(&source_path, "answer = 42\n").unwrap();
+    fs_err::set_permissions(&source_path, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+    let output = Command::new("sh")
+        .args([
+            "-c",
+            "umask 077; exec \"$1\" compile --quiet \"$2\"",
+            "sh",
+            env!("CARGO_BIN_EXE_serc"),
+        ])
+        .arg(&source_path)
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    let mode = fs_err::metadata(pyc_path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+}
+
+#[cfg(unix)]
+#[test]
 fn compile_replaces_a_cache_symlink_without_following_it() {
     use std::os::unix::fs::symlink;
 
