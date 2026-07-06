@@ -1,3 +1,5 @@
+use compact_str::CompactString;
+
 use crate::compiler::{CodeObject, Constant};
 
 use super::v5::{
@@ -18,12 +20,12 @@ pub(super) enum ObjectKey<'a> {
     BigInt(bool, &'a [u16]),
     Float(u64),
     Complex(u64, u64),
-    String(&'a str),
+    String(CompactString),
     SurrogateString(&'a [u8]),
     Bytes(&'a [u8]),
     ConstantTuple(Vec<Self>),
     FrozenSet(Vec<Self>),
-    StringTuple(Vec<&'a str>),
+    StringTuple(Vec<CompactString>),
     // Annotation-scope locals retain identity even when their contents compare equal.
     AnnotationLocals(usize),
     // CPython reuses one canonical empty tuple.
@@ -83,7 +85,7 @@ pub(super) fn constant_key(value: &Constant) -> ObjectKey<'_> {
         Constant::BigInt { negative, digits } => ObjectKey::BigInt(*negative, digits),
         Constant::Float(value) => ObjectKey::Float(value.to_bits()),
         Constant::Complex { real, imag } => ObjectKey::Complex(real.to_bits(), imag.to_bits()),
-        Constant::String(value) => ObjectKey::String(value),
+        Constant::String(value) => ObjectKey::String(value.as_str().into()),
         Constant::SurrogateString(value) => ObjectKey::SurrogateString(value),
         Constant::Bytes(value) => ObjectKey::Bytes(value),
         Constant::Tuple(values) => constants_tuple_key(values),
@@ -271,7 +273,7 @@ pub(super) fn constants_tuple_key(values: &[Constant]) -> ObjectKey<'_> {
     } else if let Some(values) = values
         .iter()
         .map(|value| match value {
-            Constant::String(value) => Some(value.as_str()),
+            Constant::String(value) => Some(CompactString::from(value.as_str())),
             _ => None,
         })
         .collect::<Option<Vec<_>>>()
@@ -286,7 +288,12 @@ pub(super) fn strings_tuple_key(values: &[String]) -> ObjectKey<'_> {
     if values.is_empty() {
         ObjectKey::EmptyTuple
     } else {
-        ObjectKey::StringTuple(values.iter().map(String::as_str).collect())
+        ObjectKey::StringTuple(
+            values
+                .iter()
+                .map(|value| CompactString::from(value.as_str()))
+                .collect(),
+        )
     }
 }
 

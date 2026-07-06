@@ -173,7 +173,7 @@ impl<'a> ObjectGraph<'a> {
     fn visit_metadata_string(&mut self, value: &'a str) {
         self.record_at(
             ObjectLocation::MetadataString(value.as_ptr().addr()),
-            ObjectKey::String(value),
+            ObjectKey::String(value.into()),
             true,
         );
     }
@@ -204,7 +204,7 @@ impl<'a> ObjectGraph<'a> {
             Constant::String(value) => {
                 self.record_at(
                     location,
-                    ObjectKey::String(value),
+                    ObjectKey::String(value.as_str().into()),
                     explicitly_interned.contains(value.as_str()) || should_intern(value),
                 );
             }
@@ -341,7 +341,7 @@ impl<'a> ObjectGraph<'a> {
         self.objects
             .iter()
             .find_map(|(key, id)| match key {
-                ObjectKey::String(string) if *string == value => Some(*id),
+                ObjectKey::String(string) if string.as_str() == value => Some(*id),
                 _ => None,
             })
             .is_some_and(|id| self.objects_by_id[id.0].interned)

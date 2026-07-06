@@ -770,6 +770,7 @@ dependencies = [
 name = "serc"
 version = "0.1.0"
 dependencies = [
+ "compact_str",
  "cpu-time",
  "fs-err",
  "rayon",

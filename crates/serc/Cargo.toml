@@ -17,6 +17,7 @@ doctest = false
 workspace = true
 
 [dependencies]
+compact_str = "0.9.1"
 ruff_python_ast = { workspace = true }
 ruff_python_codegen = { workspace = true }
 ruff_python_parser = { workspace = true }
