@@ -84,3 +84,9 @@ published independently.
 
 From the workspace root, `./scripts/check-cpython-compatibility /path/to/python3.14` initializes
 the matching Ruff corpus and runs the complete frozen gate.
+
+## Benchmarks
+
+The [Serc benchmark suite](../serc_benchmark/README.md) measures the public compile and
+marshal boundaries over fixed, CPython-validated workloads. Its documentation records the stable
+benchmark identities and the canonical local Criterion and CodSpeed simulation commands.

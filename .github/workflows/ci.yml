@@ -14,26 +14,136 @@ concurrency:
 
 jobs:
   check-fmt:
-    uses: ./.github/workflows/check-fmt.yml
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
     permissions:
       contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: "Install Rustfmt"
+        run: rustup component add rustfmt
+      - run: cargo fmt --all --check
 
   check-lint:
-    uses: ./.github/workflows/check-lint.yml
+    name: "clippy on linux"
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
     permissions:
       contents: read
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_NET_RETRY: 10
+      CARGO_TERM_COLOR: always
+      RUSTUP_MAX_RETRIES: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: "Install Rust toolchain"
+        run: rustup component add clippy
+      - name: "Clippy"
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   test:
-    uses: ./.github/workflows/test.yml
+    name: "cargo test on linux"
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
     permissions:
       contents: read
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_NET_RETRY: 10
+      CARGO_TERM_COLOR: always
+      SERC_TEST_PYTHON: python
+      RUSTUP_MAX_RETRIES: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.14.5"
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: "Install Rust toolchain"
+        run: rustup show
+      - name: "Cargo test"
+        run: cargo test --workspace --all-targets --locked
 
   compatibility:
-    uses: ./.github/workflows/compatibility.yml
+    name: "CPython compatibility"
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
     permissions:
       contents: read
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_NET_RETRY: 10
+      CARGO_TERM_COLOR: always
+      RUSTUP_MAX_RETRIES: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          submodules: true
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.14.5"
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: "Install Rust toolchain"
+        run: rustup show
+      - name: "Compare with CPython"
+        run: ./scripts/check-cpython-compatibility python
+
+  benchmark:
+    name: "CodSpeed benchmarks"
+    # Fork pull requests are intentionally skipped so untrusted code cannot request an OIDC token.
+    if: >-
+      github.repository == 'astral-sh/serc' &&
+      (
+        github.event_name != 'pull_request' ||
+        github.event.pull_request.head.repo.full_name == github.repository
+      )
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          shared-key: benchmark-${{ runner.os }}-${{ runner.arch }}-profiling-codspeed-simulation
+      - name: "Install Rust toolchain"
+        run: rustup show
+      - name: "Install cargo-codspeed"
+        uses: taiki-e/install-action@15449e3094499af05d8d964a1c884208e4b8b595 # v2.81.11
+        with:
+          tool: cargo-codspeed@4.4.1
+      - name: "Build benchmarks"
+        run: cargo codspeed build --locked -m simulation --profile profiling -p serc_benchmark --bench compiler --no-default-features --features "benchmarks,codspeed"
+      - name: "Run benchmarks"
+        uses: CodSpeedHQ/action@c145068895e045cc725ee76fcd2307624b65c3af # v4.17.5
+        with:
+          mode: simulation
+          run: cargo codspeed run -m simulation -p serc_benchmark --bench compiler
 
   check-zizmor:
-    uses: ./.github/workflows/check-zizmor.yml
+    runs-on: ubuntu-latest
     permissions:
       contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: zizmorcore/zizmor-action@b1d7e1fb5de872772f31590499237e7cce841e8e # v0.5.3
+        with:
+          advanced-security: false
+          annotations: true

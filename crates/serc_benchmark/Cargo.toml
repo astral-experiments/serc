@@ -1,0 +1,34 @@
+[package]
+name = "serc_benchmark"
+version = "0.0.0"
+publish = false
+edition = { workspace = true }
+rust-version = { workspace = true }
+homepage = { workspace = true }
+repository = { workspace = true }
+authors = { workspace = true }
+license = { workspace = true }
+readme = "README.md"
+
+[lib]
+bench = false
+test = false
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+codspeed-criterion-compat = { workspace = true, optional = true }
+criterion = { workspace = true, optional = true }
+serc = { path = "../serc" }
+
+[features]
+default = []
+benchmarks = ["dep:criterion"]
+codspeed = ["dep:codspeed-criterion-compat"]
+
+[[bench]]
+name = "compiler"
+harness = false
+required-features = ["benchmarks"]

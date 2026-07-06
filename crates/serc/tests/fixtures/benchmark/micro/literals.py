@@ -1,0 +1,10 @@
+none_value = None
+boolean_values = (True, False)
+integer_values = (0, 1, -1, 255, 256, 65_536, 36_893_488_147_419_103_232)
+float_values = (0.0, -0.0, 1.5, 1e100)
+complex_values = (1j, 2 + 3j)
+string_values = ("", "short", "shared", "shared", "snowman: ☃")
+byte_values = (b"", b"bytes", rb"raw\x00bytes")
+collection_values = ([1, 2, 3], {"a": 1, "b": 2}, {1, 2, 3}, (1, 2, 3))
+formatted = f"{integer_values[1]}:{string_values[2]!r}"
+template = t"{integer_values[2]}:{string_values[4]}"

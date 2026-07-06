@@ -1,10 +1,16 @@
 mod common;
 
+#[allow(dead_code, unreachable_pub)]
+mod benchmark_workloads {
+    include!("../../serc_benchmark/src/workloads.rs");
+}
+
 #[cfg(test)]
 mod tests {
     use std::fmt::Write as _;
 
     use super::common::{assert_executes, assert_matches_cpython_marshal};
+    use crate::benchmark_workloads;
     use serc::{CPYTHON_TARGET, compile, compile_to_pyc};
 
     #[test]
@@ -43,6 +49,18 @@ mod tests {
     }
 
     #[test]
+    fn benchmark_workloads_match_cpython_marshal() {
+        for workload in benchmark_workloads::COMPILE_MICRO_WORKLOADS
+            .iter()
+            .chain(benchmark_workloads::COMPOSITE_WORKLOADS)
+            .chain(benchmark_workloads::LARGE_WORKLOADS)
+            .chain(benchmark_workloads::MARSHAL_MICRO_WORKLOADS)
+        {
+            assert_matches_cpython_marshal(workload.source, workload.filename);
+        }
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_a_module_containing_only_global_statements() {
         let source = "global x\nglobal x, y, z\n";
         assert_matches_cpython_marshal(source, "global.py");
@@ -50,7 +68,7 @@ mod tests {
 
     #[test]
     fn matches_cpython_marshal_when_a_match_case_ends_in_a_constant_expression() {
-        let source = "match foo:\n    case foo_bar: ...\nmatch foo:\n    case _: ...\nmatch 1:\n    case _ if (True): ...\nmatch (1, 2):\n    case _: ...\nmatch subject:\n    case [a, b]: ...\n    case (a, b): ...\nmatch value:\n    case 1:\n        h(x)\n    case _:\n        ...\ndef terminal_try_star():\n    try:\n        assigned = 1\n    except* ValueError:\n        assigned = 2\ntry: ...\nexcept* ValueError: ...\nraise terminal\nmatch subject:\n    case unreachable_capture:\n        pass\n[temporary for temporary in values]\n\ndef match_assignment(value):\n    match value:\n        case True:\n            assigned = 1\n        case False:\n            assigned = 2\n    return assigned\n\ndef subject_before_capture(value):\n    match match:\n        case case:\n            pass\n    match = value\n    return match, case\n\ndef terminal_default_if(value):\n    match value:\n        case 1:\n            pass\n        case _:\n            if value != 2:\n                pass\n            elif value == 2:\n                pass\n\ndef terminal_nondefault_if(value):\n    match value:\n        case 1:\n            if value != 2:\n                pass\n            elif value == 2:\n                pass\n        case _:\n            pass\n";
+        let source = include_str!("fixtures/benchmark/match_control_flow.py");
         assert_matches_cpython_marshal(source, "match.py");
     }
 
@@ -117,31 +135,7 @@ class Generic[T]:
 
     #[test]
     fn matches_cpython_marshal_for_annotation_scope_closures() {
-        let source = r"from __future__ import annotations
-
-def outer():
-    from . import dependency
-
-    class Generic[T: dependency.Type](dependency.Base):
-        pass
-
-    def function[T = dependency.Type](value: T):
-        pass
-
-    type Alias[T: dependency.Type] = tuple[dependency.Type, T]
-    type Plain = dependency.Type
-
-
-class Container:
-    Local = object
-
-    class Nested[T: Local](Local):
-        pass
-
-
-class CapturesBase[T](factory(lambda: T), metaclass=factory(lambda: T)):
-    pass
-";
+        let source = include_str!("fixtures/benchmark/annotation_scopes.py");
         assert_matches_cpython_marshal(source, "annotation_scopes.py");
     }
 
@@ -331,7 +325,7 @@ except Error:
 
     #[test]
     fn matches_cpython_marshal_for_loop_and_async_iteration_edges() {
-        let source = "def f():\n    for value in range(10):\n        if 2 <= value <= 8:\n            print(value)\n\ndef constant_false_loop(value):\n    while False:\n        unreachable()\n    return value\n\ndef constant_true_break(manager):\n    while True:\n        try:\n            break\n        except Exception:\n            pass\n    manager.value = manager.other\n\ndef nested_break_finally():\n    while condition:\n        try:\n            while ():\n                if 3:\n                    break\n        finally:\n            return\n\nasync def async_tail(items, result):\n    async for value in items:\n        if value:\n            result.append(value)\n\nasync def protected_async_for(manager, items):\n    with manager:\n        async for item in items:\n            ...\n\nasync def protected_async_comprehension(manager, items):\n    async with manager:\n        consume({item async for item in items})\n\nasync def nested_async_cleanup(items):\n    async for item in items:\n        await sleep(item)\n        async with manager(item):\n            consume(item)\n\ndef protected_boolean_tail(manager, items):\n    with manager:\n        for item in items:\n            if first(item) and second(item):\n                action(item)\n\ndef nested_boolean_tail(manager, items):\n    with manager:\n        for item in items:\n            if (first(item) and second(item)) or (third(item) and fourth(item)):\n                action(item)\n\ndef protected_with_loop(manager, items):\n    with manager:\n        for item in items:\n            while condition:\n                if first:\n                    action(item)\n                elif second:\n                    other(item)\n\ndef protected_generator_loop(items):\n    for item in items:\n        while condition:\n            if first:\n                yield item\n            elif second:\n                yield item + 1\n\ntry:\n    for item in items:\n        while condition:\n            if first:\n                action()\n            elif second:\n                other()\nexcept ValueError:\n    handle()\nfinally:\n    cleanup()\n";
+        let source = include_str!("fixtures/benchmark/loop_async_edges.py");
         assert_matches_cpython_marshal(source, "loop_tail.py");
     }
 
