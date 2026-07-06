@@ -122,7 +122,8 @@ fn discover(roots: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
         for entry in WalkDir::new(root).follow_links(false) {
             let entry =
                 entry.map_err(|error| format!("failed to walk {}: {error}", root.display()))?;
-            if entry.file_type().is_file()
+            if (entry.file_type().is_file()
+                || (entry.file_type().is_symlink() && entry.path().is_file()))
                 && entry
                     .path()
                     .extension()
@@ -285,6 +286,23 @@ mod tests {
         assert_eq!(
             paths,
             vec![directory.path().join("b.py"), nested.join("a.py")]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovers_symlinked_python_files() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target");
+        let source = directory.path().join("module.py");
+        fs_err::write(&target, "pass\n").unwrap();
+        symlink(&target, &source).unwrap();
+
+        assert_eq!(
+            discover(&[directory.path().to_path_buf()]).unwrap(),
+            [source]
         );
     }
 }

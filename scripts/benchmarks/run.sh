@@ -129,7 +129,13 @@ clean_caches() {
     find "$corpus" -type d -name __pycache__ -prune -exec rm -rf {} +
 }
 
-source_count="$(find "$corpus" -type f -name '*.py' | wc -l | tr -d ' ')"
+source_count="$("$python" -I -c '
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+print(sum(1 for path in root.rglob("*.py") if path.is_file()))
+' "$corpus")"
 if [[ "$using_pinned_numpy" == true && "$source_count" != 505 ]]; then
     echo "error: expected 505 NumPy Python files, found $source_count" >&2
     exit 1
