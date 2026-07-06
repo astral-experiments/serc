@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::compiler::{CodeObject, Constant};
 
@@ -10,8 +10,8 @@ use super::key::{
 
 #[derive(Debug, Default)]
 pub(super) struct ObjectGraph {
-    objects: HashMap<ObjectKey, usize>,
-    interned_strings: HashSet<String>,
+    objects: FxHashMap<ObjectKey, usize>,
+    interned_strings: FxHashSet<String>,
 }
 
 impl ObjectGraph {
