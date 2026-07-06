@@ -14,22 +14,22 @@ concurrency:
 
 jobs:
   check-fmt:
-    uses: ./.github/workflows/check-fmt.yml
+    uses: astral-sh/serc/.github/workflows/check-fmt.yml@main
     permissions:
       contents: read
 
   check-lint:
-    uses: ./.github/workflows/check-lint.yml
+    uses: astral-sh/serc/.github/workflows/check-lint.yml@main
     permissions:
       contents: read
 
   test:
-    uses: ./.github/workflows/test.yml
+    uses: astral-sh/serc/.github/workflows/test.yml@main
     permissions:
       contents: read
 
   compatibility:
-    uses: ./.github/workflows/compatibility.yml
+    uses: astral-sh/serc/.github/workflows/compatibility.yml@main
     permissions:
       contents: read
 
@@ -72,6 +72,6 @@ jobs:
           run: cargo codspeed run -m simulation -p serc_benchmark --bench compiler
 
   check-zizmor:
-    uses: ./.github/workflows/check-zizmor.yml
+    uses: astral-sh/serc/.github/workflows/check-zizmor.yml@main
     permissions:
       contents: read
