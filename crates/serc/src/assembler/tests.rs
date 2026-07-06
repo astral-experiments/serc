@@ -282,6 +282,31 @@ fn graph_opcodes(assembler: &Assembler) -> Vec<crate::target::Opcode> {
 }
 
 #[test]
+fn uninitialized_load_analysis_follows_single_block_backedges() {
+    let mut assembler = Assembler::default();
+    let label = assembler.label();
+    assembler.graph = assembler_with_graph(vec![
+        Item::Label(label),
+        pass_instruction(LOAD_FAST, 0, 1),
+        pass_instruction(DELETE_FAST, 0, 1),
+        Item::Instruction(Instruction::new(
+            JUMP_BACKWARD,
+            Operand::Backward(label),
+            SourceLocation::new(1, 1, 0, 0),
+            None,
+        )),
+    ])
+    .graph;
+
+    assembler.add_checks_for_uninitialized_loads(1, 1);
+
+    assert_eq!(
+        graph_opcodes(&assembler),
+        [LOAD_FAST_CHECK, DELETE_FAST, JUMP_BACKWARD]
+    );
+}
+
+#[test]
 fn redundant_swap_removal_preserves_forward_scan_semantics() {
     let mut assembler = assembler_with_graph(vec![
         pass_instruction(SWAP, 2, 1),

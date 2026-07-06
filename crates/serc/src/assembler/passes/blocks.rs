@@ -11,6 +11,9 @@ use crate::target::opcodes::{
 
 impl Assembler {
     pub(in crate::assembler) fn push_cold_blocks_to_end(&mut self) {
+        if self.exception_regions.is_empty() {
+            return;
+        }
         let graph = self
             .graph
             .as_mut()
