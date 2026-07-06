@@ -124,10 +124,7 @@ fn discover(roots: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
                 entry.map_err(|error| format!("failed to walk {}: {error}", root.display()))?;
             if (entry.file_type().is_file()
                 || (entry.file_type().is_symlink() && entry.path().is_file()))
-                && entry
-                    .path()
-                    .extension()
-                    .is_some_and(|extension| extension == "py")
+                && has_python_suffix(entry.path())
             {
                 paths.push(entry.into_path());
             }
@@ -140,6 +137,11 @@ fn discover(roots: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
         return Err("no Python files found".to_string());
     }
     Ok(paths)
+}
+
+fn has_python_suffix(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|name| name.as_encoded_bytes().ends_with(b".py"))
 }
 
 fn compile_path(path: &Path, check: bool) -> Result<(), String> {
@@ -341,9 +343,15 @@ fn temporary_cache_file(
 }
 
 fn cache_path(path: &Path) -> Result<PathBuf, String> {
-    let stem = path
-        .file_stem()
+    let filename = path
+        .file_name()
         .ok_or_else(|| format!("{} has no file name", path.display()))?;
+    let stem = if filename == ".py" {
+        std::ffi::OsStr::new("py")
+    } else {
+        path.file_stem()
+            .ok_or_else(|| format!("{} has no file stem", path.display()))?
+    };
     let mut filename = OsString::from(stem);
     filename.push(format!(".{}.pyc", cache_tag()));
     let parent = path
@@ -364,7 +372,7 @@ fn write_error(message: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{cache_path, cache_tag, decode_source, discover, encode_mtime};
+    use super::{cache_path, cache_tag, decode_source, discover, encode_mtime, has_python_suffix};
     use std::path::{Path, PathBuf};
     use std::time::{Duration, UNIX_EPOCH};
 
@@ -379,6 +387,11 @@ mod tests {
             cache_path(Path::new("package/module.py")).unwrap(),
             PathBuf::from("package/__pycache__/module.cpython-314.pyc")
         );
+        assert_eq!(
+            cache_path(Path::new("package/.py")).unwrap(),
+            PathBuf::from("package/__pycache__/py.cpython-314.pyc")
+        );
+        assert!(has_python_suffix(Path::new("package/.py")));
     }
 
     #[test]

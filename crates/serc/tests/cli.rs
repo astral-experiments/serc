@@ -70,6 +70,26 @@ fn check_compiles_a_directory_without_writing() {
 }
 
 #[test]
+fn compile_discovers_dot_py_basename() {
+    let directory = tempfile::tempdir().unwrap();
+    fs_err::write(directory.path().join(".py"), "answer = 42\n").unwrap();
+
+    let output = serc()
+        .args(["compile", "--quiet"])
+        .arg(directory.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        directory
+            .path()
+            .join("__pycache__/py.cpython-314.pyc")
+            .is_file()
+    );
+}
+
+#[test]
 fn compile_failure_has_a_nonzero_status() {
     let directory = tempfile::tempdir().unwrap();
     let source_path = directory.path().join("invalid.py");
