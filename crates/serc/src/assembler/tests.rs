@@ -246,3 +246,76 @@ fn removes_an_overwritten_local_store() {
         [POP_TOP.code(), 0, STORE_FAST.code(), 1]
     );
 }
+
+fn pass_instruction(opcode: crate::target::Opcode, argument: u32, line: i32) -> Item {
+    Item::Instruction(Instruction::new(
+        opcode,
+        Operand::Value(argument),
+        SourceLocation::new(line, line, 0, 0),
+        None,
+    ))
+}
+
+fn assembler_with_graph(items: Vec<Item>) -> Assembler {
+    Assembler {
+        graph: Some(super::block_graph::BlockGraph::from_items(
+            items,
+            &rustc_hash::FxHashSet::default(),
+        )),
+        ..Assembler::default()
+    }
+}
+
+fn graph_opcodes(assembler: &Assembler) -> Vec<crate::target::Opcode> {
+    assembler
+        .graph
+        .as_ref()
+        .unwrap()
+        .iter_items()
+        .filter_map(|item| {
+            let Item::Instruction(instruction) = item else {
+                return None;
+            };
+            Some(instruction.opcode)
+        })
+        .collect()
+}
+
+#[test]
+fn redundant_swap_removal_preserves_forward_scan_semantics() {
+    let mut assembler = assembler_with_graph(vec![
+        pass_instruction(SWAP, 2, 1),
+        Item::Label(super::Label(0)),
+        pass_instruction(SWAP, 2, 1),
+        pass_instruction(SWAP, 2, 1),
+        pass_instruction(POP_TOP, 0, 1),
+        Item::Label(super::Label(1)),
+        pass_instruction(POP_TOP, 0, 1),
+    ]);
+
+    assembler.remove_redundant_swaps_before_pops();
+
+    assert_eq!(graph_opcodes(&assembler), [SWAP, SWAP, POP_TOP, POP_TOP]);
+}
+
+#[test]
+fn redundant_nop_removal_preserves_forward_scan_semantics() {
+    let mut converted = match pass_instruction(NOP, 0, 1) {
+        Item::Instruction(instruction) => instruction,
+        Item::Label(_) => unreachable!(),
+    };
+    converted.insert_flag(InstructionFlags::CONVERTED_POP_BLOCK);
+    let mut assembler = assembler_with_graph(vec![
+        pass_instruction(NOP, 0, 1),
+        Item::Label(super::Label(0)),
+        pass_instruction(NOP, 0, -1),
+        pass_instruction(LOAD_CONST, 0, 1),
+        pass_instruction(NOP, 0, -1),
+        Item::Instruction(converted),
+        pass_instruction(RETURN_VALUE, 0, 2),
+    ]);
+
+    assembler.remove_redundant_nops();
+
+    assert_eq!(graph_opcodes(&assembler), [NOP, LOAD_CONST, RETURN_VALUE]);
+}

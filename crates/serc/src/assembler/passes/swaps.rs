@@ -6,62 +6,51 @@ use crate::assembler::block_graph::{BlockGraph, ItemPosition};
 
 impl Assembler {
     pub(in crate::assembler) fn remove_redundant_swaps_before_pops(&mut self) {
-        let mut index = 0;
-        loop {
-            let graph = self
-                .graph
-                .as_ref()
-                .expect("assembler pass requires the block graph");
-            let positions = graph.item_positions();
-            if index >= positions.len() {
-                break;
-            }
-            let items = positions
-                .iter()
-                .map(|position| *graph.item(*position))
-                .collect::<Vec<_>>();
-            let Item::Instruction(instruction) = items[index] else {
-                index += 1;
-                continue;
-            };
-            if instruction.opcode != SWAP {
-                index += 1;
-                continue;
-            }
-            let Operand::Value(depth) = instruction.operand else {
-                index += 1;
-                continue;
-            };
-            let pop_count = usize::try_from(depth).unwrap_or(usize::MAX);
-            let preceded_by_swap = items[..index].iter().rev().find_map(|item| {
-                if let Item::Instruction(instruction) = item {
-                    Some(instruction.opcode == SWAP)
-                } else {
-                    None
-                }
-            }) == Some(true);
-            let following = items[index + 1..]
-                .iter()
-                .filter_map(|item| {
-                    if let Item::Instruction(instruction) = item {
-                        Some(instruction.opcode)
-                    } else {
-                        None
-                    }
-                })
-                .take(pop_count)
-                .collect::<Vec<_>>();
-            if preceded_by_swap
-                && following.len() == pop_count
-                && following.iter().all(|opcode| *opcode == POP_TOP)
+        let graph = self
+            .graph
+            .as_ref()
+            .expect("assembler pass requires the block graph");
+        let instructions = graph
+            .item_positions()
+            .into_iter()
+            .filter_map(|position| {
+                let Item::Instruction(instruction) = *graph.item(position) else {
+                    return None;
+                };
+                Some((position, instruction))
+            })
+            .collect::<Vec<_>>();
+        let mut previous = None;
+        let mut redundant = Vec::new();
+        for (index, (position, instruction)) in instructions.iter().copied().enumerate() {
+            let remove = if instruction.opcode == SWAP
+                && let Operand::Value(depth) = instruction.operand
             {
-                self.graph
-                    .as_mut()
-                    .expect("assembler pass requires the block graph")
-                    .remove_item(positions[index]);
+                let pop_count = usize::try_from(depth).unwrap_or(usize::MAX);
+                previous.is_some_and(|previous: Instruction| previous.opcode == SWAP)
+                    && instructions[index + 1..]
+                        .get(..pop_count)
+                        .is_some_and(|following| {
+                            following
+                                .iter()
+                                .all(|(_, instruction)| instruction.opcode == POP_TOP)
+                        })
             } else {
-                index += 1;
+                false
+            };
+            if remove {
+                redundant.push(position);
+            } else {
+                previous = Some(instruction);
             }
+        }
+
+        let graph = self
+            .graph
+            .as_mut()
+            .expect("assembler pass requires the block graph");
+        for position in redundant.into_iter().rev() {
+            graph.remove_item(position);
         }
     }
 

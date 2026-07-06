@@ -1,7 +1,7 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::super::{
-    COMPARE_OP, CONTAINS_OP, COPY, IS_OP, InstructionFlags, Item, JUMP_BACKWARD,
+    COMPARE_OP, CONTAINS_OP, COPY, IS_OP, Instruction, InstructionFlags, Item, JUMP_BACKWARD,
     JUMP_BACKWARD_NO_INTERRUPT, JUMP_FORWARD, NOP, NOT_TAKEN, Operand, POP_JUMP_IF_FALSE,
     POP_JUMP_IF_TRUE, POP_TOP, STORE_FAST, TO_BOOL, UNARY_NOT, ends_scope, is_unconditional_jump,
 };
@@ -560,67 +560,47 @@ impl Assembler {
     }
 
     pub(in crate::assembler) fn remove_redundant_nops(&mut self) {
-        let mut index = 0;
-        loop {
-            let graph = self
-                .graph
-                .as_ref()
-                .expect("assembler pass requires the block graph");
-            let positions = graph.item_positions();
-            if index >= positions.len() {
-                break;
-            }
-            let items = positions
-                .iter()
-                .map(|position| *graph.item(*position))
-                .collect::<Vec<_>>();
-            let Item::Instruction(instruction) = items[index] else {
-                index += 1;
-                continue;
-            };
-            if instruction.opcode != NOP {
-                index += 1;
-                continue;
-            }
-            if instruction.location.line < 0 {
-                self.graph
-                    .as_mut()
-                    .expect("assembler pass requires the block graph")
-                    .remove_item(positions[index]);
-                continue;
-            }
-            if instruction.has_flag(InstructionFlags::CONVERTED_POP_BLOCK)
-                && let Some(previous) = items[..index].iter().rev().find_map(|item| {
-                    if let Item::Instruction(instruction) = item {
-                        Some(instruction)
-                    } else {
-                        None
-                    }
-                })
-                && previous.location.line == instruction.location.line
-                && !(ends_scope(previous.opcode) || is_unconditional_jump(previous.opcode))
-            {
-                self.graph
-                    .as_mut()
-                    .expect("assembler pass requires the block graph")
-                    .remove_item(positions[index]);
-                continue;
-            }
-            let next_location = items[index + 1..].iter().find_map(|item| {
-                if let Item::Instruction(instruction) = item {
-                    Some(instruction.location)
-                } else {
-                    None
-                }
-            });
-            if next_location.is_some_and(|location| location.line == instruction.location.line) {
-                self.graph
-                    .as_mut()
-                    .expect("assembler pass requires the block graph")
-                    .remove_item(positions[index]);
+        let graph = self
+            .graph
+            .as_ref()
+            .expect("assembler pass requires the block graph");
+        let instructions = graph
+            .item_positions()
+            .into_iter()
+            .filter_map(|position| {
+                let Item::Instruction(instruction) = *graph.item(position) else {
+                    return None;
+                };
+                Some((position, instruction))
+            })
+            .collect::<Vec<_>>();
+        let mut previous = None;
+        let mut redundant = Vec::new();
+        for (index, (position, instruction)) in instructions.iter().copied().enumerate() {
+            let remove = instruction.opcode == NOP
+                && (instruction.location.line < 0
+                    || (instruction.has_flag(InstructionFlags::CONVERTED_POP_BLOCK)
+                        && previous.is_some_and(|previous: Instruction| {
+                            previous.location.line == instruction.location.line
+                                && !(ends_scope(previous.opcode)
+                                    || is_unconditional_jump(previous.opcode))
+                        }))
+                    || instructions
+                        .get(index + 1)
+                        .is_some_and(|(_, next)| next.location.line == instruction.location.line));
+            if remove {
+                redundant.push(position);
             } else {
-                index += 1;
+                previous = Some(instruction);
             }
+        }
+
+        let graph = self
+            .graph
+            .as_mut()
+            .expect("assembler pass requires the block graph");
+        for position in redundant.into_iter().rev() {
+            graph.remove_item(position);
         }
     }
 }
