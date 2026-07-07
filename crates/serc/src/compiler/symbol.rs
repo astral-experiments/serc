@@ -760,12 +760,11 @@ impl Compiler {
     pub(super) fn emit_comparison(
         &mut self,
         operation: ComparisonOperation,
-        force_boolean: bool,
+        mode: ComparisonMode,
     ) -> Result<(), CompileError> {
-        let argument = if force_boolean {
-            operation.boolean_argument()
-        } else {
-            operation.argument()
+        let argument = match mode {
+            ComparisonMode::Value => operation.argument(),
+            ComparisonMode::Boolean => operation.boolean_argument(),
         };
         self.emit(COMPARE_OP, argument, -1)
     }

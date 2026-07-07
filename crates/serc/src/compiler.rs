@@ -190,6 +190,86 @@ enum DefinitionDecorators {
     AlreadyCompiled,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct CompiledFunctionDefaults {
+    positional: bool,
+    keyword: bool,
+}
+
+impl CompiledFunctionDefaults {
+    fn count(self) -> usize {
+        usize::from(self.positional) + usize::from(self.keyword)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SpecializedLowering {
+    Applied,
+    NotApplicable,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SuperAttributeKind {
+    Attribute,
+    Method,
+}
+
+impl SuperAttributeKind {
+    const fn method_flag(self) -> u32 {
+        match self {
+            Self::Attribute => 0,
+            Self::Method => 1,
+        }
+    }
+
+    const fn stack_effect(self) -> i32 {
+        match self {
+            Self::Attribute => -2,
+            Self::Method => -1,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ComparisonMode {
+    Value,
+    Boolean,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LoopBackedge {
+    Emitted,
+    Required,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TryCompileOptions {
+    terminal: bool,
+    emit_statement_nop: bool,
+    exclude_terminal_body_not_taken: bool,
+}
+
+impl TryCompileOptions {
+    const STANDARD: Self = Self {
+        terminal: false,
+        emit_statement_nop: true,
+        exclude_terminal_body_not_taken: false,
+    };
+    const TERMINAL: Self = Self {
+        terminal: true,
+        ..Self::STANDARD
+    };
+    const LOOP_TAIL: Self = Self {
+        exclude_terminal_body_not_taken: true,
+        ..Self::STANDARD
+    };
+    const NESTED_HANDLER: Self = Self {
+        terminal: false,
+        emit_statement_nop: false,
+        exclude_terminal_body_not_taken: false,
+    };
+}
+
 #[derive(Debug)]
 struct CompilationContext {
     filename: String,

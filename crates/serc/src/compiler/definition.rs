@@ -164,7 +164,7 @@ impl Compiler {
             definition.is_async,
         );
         let defaults = self.compile_function_defaults(definition, definition_location)?;
-        let default_argument_count = usize::from(defaults.0) + usize::from(defaults.1);
+        let default_argument_count = defaults.count();
         if default_argument_count == 2 {
             self.assembler.set_location(definition_location);
             self.emit(SWAP, 2, 0)?;
@@ -190,7 +190,7 @@ impl Compiler {
         let child_plan = child_plan.materialize(&arena.names);
 
         let mut locals = vec![".defaults".to_string()];
-        if defaults.1 {
+        if defaults.keyword {
             locals.push(".kwdefaults".to_string());
         }
         locals.extend(
@@ -348,7 +348,7 @@ impl Compiler {
     fn compile_plain_function_definition(
         &mut self,
         definition: &StmtFunctionDef,
-        preloaded_defaults: Option<(bool, bool)>,
+        preloaded_defaults: Option<CompiledFunctionDefaults>,
         decorators: DefinitionDecorators,
     ) -> Result<(), CompileError> {
         let parameters = &definition.parameters;
@@ -364,12 +364,11 @@ impl Compiler {
             definition.is_async,
         );
 
-        let (has_positional_defaults, has_keyword_defaults) =
-            if let Some(defaults) = preloaded_defaults {
-                defaults
-            } else {
-                self.compile_function_defaults(definition, definition_location)?
-            };
+        let defaults = if let Some(defaults) = preloaded_defaults {
+            defaults
+        } else {
+            self.compile_function_defaults(definition, definition_location)?
+        };
 
         let (scope_id, plan) = self.resolved_function_plan(definition)?;
         let closure_names: Vec<_> = plan.freevars.iter().cloned().collect();
@@ -478,10 +477,10 @@ impl Compiler {
         if function_has_annotations(definition) {
             self.emit_function_attribute(FunctionAttribute::ANNOTATE)?;
         }
-        if has_keyword_defaults {
+        if defaults.keyword {
             self.emit_function_attribute(FunctionAttribute::KWDEFAULTS)?;
         }
-        if has_positional_defaults {
+        if defaults.positional {
             self.emit_function_attribute(FunctionAttribute::DEFAULTS)?;
         }
         if decorators == DefinitionDecorators::Compile {
@@ -503,7 +502,7 @@ impl Compiler {
         &mut self,
         definition: &StmtFunctionDef,
         definition_location: SourceLocation,
-    ) -> Result<(bool, bool), CompileError> {
+    ) -> Result<CompiledFunctionDefaults, CompileError> {
         let parameters = &definition.parameters;
         let positional_defaults: Vec<_> = parameters
             .posonlyargs
@@ -553,10 +552,10 @@ impl Compiler {
             self.emit(BUILD_MAP, count, 1 - i32::try_from(count).unwrap() * 2)?;
         }
 
-        Ok((
-            !positional_defaults.is_empty(),
-            !keyword_defaults.is_empty(),
-        ))
+        Ok(CompiledFunctionDefaults {
+            positional: !positional_defaults.is_empty(),
+            keyword: !keyword_defaults.is_empty(),
+        })
     }
 
     pub(super) fn compile_class_definition(
@@ -1148,7 +1147,7 @@ impl Compiler {
         self.load_name(&parameter)?;
         self.add_constant(Constant::Int(2))?;
         self.emit(LOAD_SMALL_INT, 2, 1)?;
-        self.emit_comparison(ComparisonOperation::GT, false)?;
+        self.emit_comparison(ComparisonOperation::GT, ComparisonMode::Value)?;
         let supported = self.assembler.label();
         self.emit_jump_forward(POP_JUMP_IF_FALSE, supported, -1)?;
         self.emit(NOT_TAKEN, 0, 0)?;
@@ -1420,7 +1419,7 @@ impl Compiler {
         child.load_name("format")?;
         child.add_constant(Constant::Int(2))?;
         child.emit(LOAD_SMALL_INT, 2, 1)?;
-        child.emit_comparison(ComparisonOperation::GT, false)?;
+        child.emit_comparison(ComparisonOperation::GT, ComparisonMode::Value)?;
         let supported = child.assembler.label();
         child.emit_jump_forward(POP_JUMP_IF_FALSE, supported, -1)?;
         child.emit(NOT_TAKEN, 0, 0)?;

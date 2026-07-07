@@ -311,7 +311,7 @@ impl Compiler {
                 }
                 self.assembler
                     .set_location(self.source_location(pattern.range));
-                self.emit_comparison(ComparisonOperation::EQ, true)?;
+                self.emit_comparison(ComparisonOperation::EQ, ComparisonMode::Boolean)?;
                 self.jump_to_match_fail(context, POP_JUMP_IF_FALSE, -1)
             }
             Pattern::MatchSingleton(pattern) => {
@@ -497,7 +497,7 @@ impl Compiler {
                 } else {
                     ComparisonOperation::EQ
                 },
-                false,
+                ComparisonMode::Value,
             )?;
             self.jump_to_match_fail(context, POP_JUMP_IF_FALSE, -1)?;
         }
@@ -586,7 +586,7 @@ impl Compiler {
                 to_u32(pattern.keys.len(), "mapping pattern key count")?,
                 1,
             )?;
-            self.emit_comparison(ComparisonOperation::GE, false)?;
+            self.emit_comparison(ComparisonOperation::GE, ComparisonMode::Value)?;
             self.jump_to_match_fail(context, POP_JUMP_IF_FALSE, -1)?;
         }
         if let Some(keys) = pattern
@@ -783,7 +783,9 @@ impl Compiler {
                 self.emit(LOAD_CONST, index, 1)?;
             }
             Expr::BinOp(binary) => {
-                if !self.compile_optimized_percent_format(binary)? {
+                if self.compile_optimized_percent_format(binary)?
+                    == SpecializedLowering::NotApplicable
+                {
                     self.compile_expression(&binary.left)?;
                     self.compile_expression(&binary.right)?;
                     self.emit_binary_operation(binary_operator(binary.op, false))?;
@@ -806,7 +808,9 @@ impl Compiler {
                 self.compile_call(call)?;
             }
             Expr::Attribute(attribute) if attribute.ctx == ExprContext::Load => {
-                if !self.compile_super_attribute(attribute, false)? {
+                if self.compile_super_attribute(attribute, SuperAttributeKind::Attribute)?
+                    == SpecializedLowering::NotApplicable
+                {
                     self.compile_expression(&attribute.value)?;
                     let index = self.name_index(attribute.attr.as_str())?;
                     self.assembler
@@ -1358,9 +1362,9 @@ impl Compiler {
     fn compile_optimized_percent_format(
         &mut self,
         expression: &ExprBinOp,
-    ) -> Result<bool, CompileError> {
+    ) -> Result<SpecializedLowering, CompileError> {
         let Some(parts) = optimized_percent_format(expression) else {
-            return Ok(false);
+            return Ok(SpecializedLowering::NotApplicable);
         };
 
         let expression_location = self.source_location(expression.range);
@@ -1404,7 +1408,7 @@ impl Compiler {
                 1 - i32::try_from(count).unwrap(),
             )?,
         }
-        Ok(true)
+        Ok(SpecializedLowering::Applied)
     }
 
     pub(super) fn load_string_constant(&mut self, value: &str) -> Result<(), CompileError> {
@@ -1497,7 +1501,9 @@ impl Compiler {
             .iter()
             .any(|keyword| keyword.arg.is_none());
         let direct_method = if let Some(attribute) = self.direct_method_attribute(call) {
-            if !self.compile_super_attribute(attribute, true)? {
+            if self.compile_super_attribute(attribute, SuperAttributeKind::Method)?
+                == SpecializedLowering::NotApplicable
+            {
                 self.compile_expression(&attribute.value)?;
                 let index = self.name_index(attribute.attr.as_str())?;
                 self.assembler
@@ -1508,7 +1514,10 @@ impl Compiler {
         } else {
             false
         };
-        if !direct_method && !self.compile_direct_global_callable(&call.func)? {
+        if !direct_method
+            && self.compile_direct_global_callable(&call.func)?
+                == SpecializedLowering::NotApplicable
+        {
             let newly_owned_callable = if call
                 .arguments
                 .args
@@ -1795,13 +1804,13 @@ impl Compiler {
     fn compile_super_attribute(
         &mut self,
         attribute: &ruff_python_ast::ExprAttribute,
-        method: bool,
-    ) -> Result<bool, CompileError> {
+        kind: SuperAttributeKind,
+    ) -> Result<SpecializedLowering, CompileError> {
         let Expr::Call(call) = attribute.value.as_ref() else {
-            return Ok(false);
+            return Ok(SpecializedLowering::NotApplicable);
         };
         let Expr::Name(super_name) = call.func.as_ref() else {
-            return Ok(false);
+            return Ok(SpecializedLowering::NotApplicable);
         };
         if super_name.id.as_str() != "super"
             || attribute.attr.as_str() == "__class__"
@@ -1809,7 +1818,7 @@ impl Compiler {
             || self.is_imported("super")
             || self.is_imported(SHADOWED_SUPER_SENTINEL)
         {
-            return Ok(false);
+            return Ok(SpecializedLowering::NotApplicable);
         }
         let explicit = match call.arguments.args.as_ref() {
             [] => false,
@@ -1818,7 +1827,7 @@ impl Compiler {
             {
                 true
             }
-            _ => return Ok(false),
+            _ => return Ok(SpecializedLowering::NotApplicable),
         };
         let globally_resolved = match &self.unit.scope {
             Scope::Module => true,
@@ -1835,7 +1844,7 @@ impl Compiler {
             Scope::Class { bound_names, .. } => !self.contains_name(bound_names, "super"),
         };
         if !globally_resolved {
-            return Ok(false);
+            return Ok(SpecializedLowering::NotApplicable);
         }
 
         if explicit {
@@ -1849,17 +1858,17 @@ impl Compiler {
             let attribute_index = self.name_index(attribute.attr.as_str())?;
             self.emit(
                 LOAD_SUPER_ATTR,
-                (attribute_index << 2) | 2 | u32::from(method),
-                if method { -1 } else { -2 },
+                (attribute_index << 2) | 2 | kind.method_flag(),
+                kind.stack_effect(),
             )?;
             self.assembler
                 .set_location(self.source_location(self.attribute_opcode_range(attribute)));
             self.emit(NOP, 0, 0)?;
-            return Ok(true);
+            return Ok(SpecializedLowering::Applied);
         }
 
         if self.unit.arg_count == 0 {
-            return Ok(false);
+            return Ok(SpecializedLowering::NotApplicable);
         }
         let (class_index, first_parameter) = match &self.unit.scope {
             Scope::Function {
@@ -1871,17 +1880,17 @@ impl Compiler {
                 && self.scope_index(indices, "super").is_none() =>
             {
                 let Some(class_index) = self.scope_index(free_indices, "__class__") else {
-                    return Ok(false);
+                    return Ok(SpecializedLowering::NotApplicable);
                 };
                 let Some(first_parameter) = self.symbols.locals.first() else {
-                    return Ok(false);
+                    return Ok(SpecializedLowering::NotApplicable);
                 };
                 let Some(first_parameter) = self.scope_index(indices, first_parameter) else {
-                    return Ok(false);
+                    return Ok(SpecializedLowering::NotApplicable);
                 };
                 (class_index, first_parameter)
             }
-            _ => return Ok(false),
+            _ => return Ok(SpecializedLowering::NotApplicable),
         };
 
         self.assembler
@@ -1897,21 +1906,24 @@ impl Compiler {
         let attribute_index = self.name_index(attribute.attr.as_str())?;
         self.emit(
             LOAD_SUPER_ATTR,
-            (attribute_index << 2) | u32::from(method),
-            if method { -1 } else { -2 },
+            (attribute_index << 2) | kind.method_flag(),
+            kind.stack_effect(),
         )?;
         self.assembler
             .set_location(self.source_location(self.attribute_opcode_range(attribute)));
         self.emit(NOP, 0, 0)?;
-        Ok(true)
+        Ok(SpecializedLowering::Applied)
     }
 
-    fn compile_direct_global_callable(&mut self, expression: &Expr) -> Result<bool, CompileError> {
+    fn compile_direct_global_callable(
+        &mut self,
+        expression: &Expr,
+    ) -> Result<SpecializedLowering, CompileError> {
         if self.unit.annotation_classdict_index.is_some() {
-            return Ok(false);
+            return Ok(SpecializedLowering::NotApplicable);
         }
         let Expr::Name(name) = expression else {
-            return Ok(false);
+            return Ok(SpecializedLowering::NotApplicable);
         };
         let is_global = match &self.unit.scope {
             Scope::Function {
@@ -1927,13 +1939,13 @@ impl Compiler {
             Scope::Module | Scope::Class { .. } => false,
         };
         if !is_global {
-            return Ok(false);
+            return Ok(SpecializedLowering::NotApplicable);
         }
         self.assembler
             .set_location(self.source_location(expression.range()));
         let index = self.name_index(name.id.as_str())?;
         self.emit(LOAD_GLOBAL, (index << 1) | 1, 2)?;
-        Ok(true)
+        Ok(SpecializedLowering::Applied)
     }
 
     fn compile_lambda(&mut self, lambda: &ruff_python_ast::ExprLambda) -> Result<(), CompileError> {
