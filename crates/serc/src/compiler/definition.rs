@@ -1,7 +1,35 @@
-// Compiler submodules intentionally share the parent-owned state and lowering vocabulary.
-#![allow(clippy::wildcard_imports)]
+use std::sync::Arc;
 
-use super::*;
+use ruff_python_ast::visitor::Visitor;
+use ruff_python_ast::{Expr, Keyword, Stmt, StmtClassDef, StmtFunctionDef, TypeParam};
+use ruff_text_size::Ranged;
+use rustc_hash::FxHashSet;
+
+use super::{
+    BUILD_LIST, BUILD_MAP, BUILD_TUPLE, CALL, CALL_FUNCTION_EX, CALL_KW, CONTAINS_OP, COPY,
+    DICT_MERGE, LIST_APPEND, LIST_EXTEND, LOAD_BUILD_CLASS, LOAD_CONST, LOAD_FAST, LOAD_SMALL_INT,
+    MAKE_FUNCTION, NOT_TAKEN, POP_JUMP_IF_FALSE, PUSH_NULL, RAISE_VARARGS, RETURN_VALUE,
+    STORE_SUBSCR, SWAP, UNPACK_SEQUENCE,
+};
+use crate::CompileError;
+use crate::assembler::SourceLocation;
+use crate::target::code_flags::{
+    CO_ASYNC_GENERATOR, CO_COROUTINE, CO_FUTURE_ANNOTATIONS, CO_GENERATOR, CO_METHOD, CO_NESTED,
+    CO_VARARGS, CO_VARKEYWORDS,
+};
+use crate::target::operands::{
+    BinaryIntrinsic, CommonConstant, ComparisonOperation, FunctionAttribute, UnaryIntrinsic,
+};
+
+use super::constant::fold_constant;
+use super::scope::{
+    LoweringFunctionPlan, NameId, ReferenceCollector, collect_simple_annotations,
+    expression_required_names, nested_expression_required_names, type_parameter_required_names,
+};
+use super::source::unparse_annotation;
+use super::statement::suite_contains_yield;
+use super::symbol::{to_u32, unsupported};
+use super::{CodeObject, Compiler, Constant, SUPPORTED_FUTURE_FLAGS, Scope};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DefinitionDecorators {

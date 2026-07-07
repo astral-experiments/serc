@@ -1,7 +1,53 @@
-// Compiler submodules intentionally share the parent-owned state and lowering vocabulary.
-#![allow(clippy::wildcard_imports)]
+use std::collections::BTreeSet;
+use std::sync::Arc;
 
-use super::*;
+use ruff_python_ast::visitor::{Visitor, walk_expr};
+use ruff_python_ast::{
+    BoolOp, CmpOp, ConversionFlag, Expr, ExprBinOp, ExprContext, FStringPart, Identifier,
+    InterpolatedStringElement, Keyword, Number, Operator, Pattern, Singleton, Stmt, UnaryOp,
+};
+use ruff_text_size::Ranged;
+
+use super::{
+    BINARY_SLICE, BUILD_INTERPOLATION, BUILD_LIST, BUILD_MAP, BUILD_SET, BUILD_SLICE, BUILD_STRING,
+    BUILD_TEMPLATE, BUILD_TUPLE, CALL, CALL_FUNCTION_EX, CALL_KW, CLEANUP_THROW, COMPARE_OP,
+    CONTAINS_OP, COPY, DELETE_ATTR, DELETE_SUBSCR, DICT_MERGE, DICT_UPDATE, END_ASYNC_FOR, END_FOR,
+    END_SEND, FOR_ITER, FORMAT_SIMPLE, FORMAT_WITH_SPEC, GET_AITER, GET_ANEXT, GET_AWAITABLE,
+    GET_ITER, GET_LEN, GET_YIELD_FROM_ITER, IS_OP, JUMP_BACKWARD, JUMP_BACKWARD_NO_INTERRUPT,
+    JUMP_FORWARD, LIST_APPEND, LIST_EXTEND, LOAD_ATTR, LOAD_CONST, LOAD_DEREF, LOAD_FAST,
+    LOAD_FAST_AND_CLEAR, LOAD_GLOBAL, LOAD_SMALL_INT, LOAD_SUPER_ATTR, MAKE_CELL, MAKE_FUNCTION,
+    MAP_ADD, MATCH_CLASS, MATCH_KEYS, MATCH_MAPPING, MATCH_SEQUENCE, NOP, NOT_TAKEN, POP_ITER,
+    POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE, POP_JUMP_IF_TRUE, POP_TOP,
+    PUSH_NULL, RERAISE, RETURN_VALUE, SEND, SET_ADD, SET_UPDATE, STORE_ATTR, STORE_FAST,
+    STORE_SLICE, STORE_SUBSCR, SWAP, TO_BOOL, UNARY_INVERT, UNARY_NEGATIVE, UNARY_NOT, UNPACK_EX,
+    UNPACK_SEQUENCE, YIELD_VALUE,
+};
+use crate::CompileError;
+use crate::assembler::{Label, SourceLocation};
+use crate::target::Opcode;
+use crate::target::code_flags::{
+    CO_ASYNC_GENERATOR, CO_COROUTINE, CO_GENERATOR, CO_METHOD, CO_NESTED, CO_VARARGS,
+    CO_VARKEYWORDS,
+};
+use crate::target::operands::{
+    BinaryOperation, CommonConstant, ComparisonOperation, Conversion, FunctionAttribute,
+    ResumeLocation, UnaryIntrinsic,
+};
+
+use super::constant::{
+    PercentFormatPart, big_integer_digits, constant_slice, first_literal_constant, fold_constant,
+    folded_bool_operand, optimized_percent_format, python_constants_equal,
+    two_element_slice_optimization,
+};
+use super::scope::{
+    LoweringFunctionPlan, NameId, analyze_lambda_scope, collect_named_expression_target_names,
+    collect_nested_comprehension_target_names, collect_target_names, comprehension_cell_names,
+    generator_cellvars, generator_required_names,
+};
+use super::source::{debug_text_range, statement_execution_range, strip_expression_comments};
+use super::statement::{is_wildcard_pattern, suite_terminates};
+use super::symbol::{expression_name, to_u32, unsupported};
+use super::{Compiler, Constant, HashSet, SHADOWED_SUPER_SENTINEL, SUPPORTED_FUTURE_FLAGS, Scope};
 
 #[derive(Debug)]
 struct MatchContext {

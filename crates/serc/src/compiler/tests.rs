@@ -1,7 +1,9 @@
 use ruff_python_ast::Stmt;
 use ruff_python_parser::parse_module;
 
-use super::{Compiler, Constant, FunctionPlan, NameId, NameInterner, ScopeBodyFacts, clean_doc};
+use super::definition::clean_doc;
+use super::scope::{FunctionPlan, NameId, NameInterner, ScopeBodyFacts};
+use super::{Compiler, Constant};
 
 #[test]
 fn interns_adversarial_identifier_families_densely() {

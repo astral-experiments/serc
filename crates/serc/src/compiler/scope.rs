@@ -1,7 +1,15 @@
-// Compiler submodules intentionally share the parent-owned state and lowering vocabulary.
-#![allow(clippy::wildcard_imports)]
+use std::borrow::Cow;
+use std::collections::BTreeSet;
 
-use super::*;
+use ruff_python_ast::visitor::{Visitor, walk_expr, walk_pattern, walk_stmt};
+use ruff_python_ast::{Expr, ExprContext, Pattern, Stmt, StmtClassDef, StmtFunctionDef, TypeParam};
+use rustc_hash::{FxHashMap, FxHashSet};
+
+use crate::CompileError;
+use crate::target::code_flags::{CO_FUTURE_ANNOTATIONS, CO_FUTURE_BARRY_AS_BDFL};
+
+use super::symbol::mangle_name;
+use super::{Compiler, HashMap, HashSet, SHADOWED_SUPER_SENTINEL, Scope};
 
 impl Compiler {
     pub(super) fn scope_arena(&self) -> Result<&ScopeArena, CompileError> {

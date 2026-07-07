@@ -1,9 +1,22 @@
-// Compiler submodules intentionally share the parent-owned state and lowering vocabulary.
-#![allow(clippy::wildcard_imports)]
+use std::borrow::Cow;
 
+use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
+use ruff_python_ast::{
+    BoolOp, Expr, ExprBinOp, ExprContext, FStringPart, InterpolatedStringElement, Number, Operator,
+    Stmt, UnaryOp,
+};
+use ruff_text_size::Ranged;
+use rustc_hash::FxHashMap;
+
+use super::{LOAD_CONST, LOAD_SMALL_INT, NOP, STORE_NAME};
+use crate::CompileError;
 use crate::assembler::InstructionId;
+use crate::target::operands::Conversion;
 
-use super::*;
+use super::expression::literal_truthiness;
+use super::scope::NameId;
+use super::symbol::{mangle_name, to_u32};
+use super::{CodeObject, Compiler, Constant, HashSet};
 
 #[derive(Debug, Default)]
 pub(super) struct OutputState {

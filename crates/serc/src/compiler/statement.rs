@@ -1,7 +1,36 @@
-// Compiler submodules intentionally share the parent-owned state and lowering vocabulary.
-#![allow(clippy::wildcard_imports)]
+use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
+use ruff_python_ast::{BoolOp, Expr, Pattern, Stmt, UnaryOp};
+use ruff_text_size::Ranged;
 
-use super::*;
+use super::{
+    BINARY_SLICE, BUILD_LIST, BUILD_MAP, BUILD_SET, BUILD_TUPLE, CALL, CHECK_EG_MATCH,
+    CHECK_EXC_MATCH, CLEANUP_THROW, COPY, END_ASYNC_FOR, END_FOR, END_SEND, FOR_ITER, GET_AITER,
+    GET_ANEXT, GET_ITER, IMPORT_FROM, IMPORT_NAME, JUMP_BACKWARD, JUMP_BACKWARD_NO_INTERRUPT,
+    JUMP_FORWARD, LIST_APPEND, LOAD_ATTR, LOAD_CONST, LOAD_SMALL_INT, MAP_ADD, NOP, NOT_TAKEN,
+    POP_EXCEPT, POP_ITER, POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE,
+    POP_JUMP_IF_TRUE, POP_TOP, PUSH_EXC_INFO, RAISE_VARARGS, RERAISE, RETURN_VALUE, SEND, SET_ADD,
+    STORE_ATTR, STORE_SLICE, STORE_SUBSCR, SWAP, TO_BOOL, WITH_EXCEPT_START, YIELD_VALUE,
+};
+use crate::CompileError;
+use crate::assembler::{Label, SourceLocation};
+use crate::target::code_flags::{CO_ASYNC_GENERATOR, CO_COROUTINE, CO_FUTURE_ANNOTATIONS};
+use crate::target::operands::{
+    BinaryIntrinsic, BinaryOperation, CommonConstant, ResumeLocation, SpecialMethod, UnaryIntrinsic,
+};
+
+use super::constant::{
+    first_literal_constant, first_suite_literal_constant, fold_constant, is_literal_constant,
+    literal_constant, optimized_percent_format, two_element_slice_optimization,
+};
+use super::expression::{
+    binary_operator, comparison_operator, comparison_operator_boolean, early_condition_truthiness,
+    expression_defers_async_comprehension_restore, jump_constant_truthiness,
+    optimized_generator_callable,
+};
+use super::scope::{NameId, ReferenceCollector, collect_target_names};
+use super::source::{implicit_return_range, unparse_annotation};
+use super::symbol::{statement_name, to_u32, unsupported};
+use super::{Compiler, Constant, Scope};
 
 #[derive(Clone, Copy, Debug)]
 struct LoopContext {
