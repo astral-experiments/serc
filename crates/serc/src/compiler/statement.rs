@@ -2699,7 +2699,7 @@ impl Compiler {
         }
         self.set_depth(base_depth + 2);
         self.assembler.set_location(iterator_location);
-        self.apply_stack_effect(-2)?;
+        self.apply_compiler_stack_effect(END_ASYNC_FOR, 0, -2)?;
         self.assembler.emit_backward(END_ASYNC_FOR, send_end);
         self.assembler.add_exception_region(
             protected_start,

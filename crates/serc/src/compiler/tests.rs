@@ -1,7 +1,46 @@
 use ruff_python_ast::Stmt;
 use ruff_python_parser::parse_module;
 
-use super::{Compiler, Constant, FunctionPlan, NameId, NameInterner, ScopeBodyFacts, clean_doc};
+use crate::target::opcodes::{BUILD_TUPLE, LOAD_CONST, RAISE_VARARGS, RERAISE, RETURN_VALUE};
+
+use super::{
+    Compiler, CompilerStackEffect, Constant, FunctionPlan, NameId, NameInterner, ScopeBodyFacts,
+    clean_doc, compiler_stack_effect, validate_compiler_stack_effect,
+};
+
+#[test]
+fn compiler_stack_effects_distinguish_values_from_scope_exit_bookkeeping() {
+    assert_eq!(
+        compiler_stack_effect(LOAD_CONST, 0),
+        CompilerStackEffect::Fixed(1)
+    );
+    assert_eq!(
+        compiler_stack_effect(BUILD_TUPLE, 3),
+        CompilerStackEffect::Fixed(-2)
+    );
+    assert_eq!(
+        compiler_stack_effect(RETURN_VALUE, 0),
+        CompilerStackEffect::Fixed(-1)
+    );
+    assert_eq!(
+        compiler_stack_effect(RAISE_VARARGS, 1),
+        CompilerStackEffect::Fixed(-1)
+    );
+    assert_eq!(
+        compiler_stack_effect(RERAISE, 1),
+        CompilerStackEffect::ContextDependent
+    );
+    assert_eq!(validate_compiler_stack_effect(RERAISE, 1, -3), Ok(-3));
+    assert!(validate_compiler_stack_effect(RERAISE, 1, 0).is_err());
+}
+
+#[test]
+fn compiler_stack_effect_validation_rejects_stale_lowering_metadata() {
+    let error = validate_compiler_stack_effect(LOAD_CONST, 0, 0).unwrap_err();
+    assert!(
+        matches!(error, crate::CompileError::Internal(message) if message.contains("declared stack effect 0") && message.contains("expected 1"))
+    );
+}
 
 #[test]
 fn interns_adversarial_identifier_families_densely() {

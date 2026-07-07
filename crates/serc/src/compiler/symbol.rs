@@ -718,7 +718,7 @@ impl Compiler {
         effect: i32,
         exception_policy: ExceptionPolicy,
     ) -> Result<(), CompileError> {
-        self.apply_stack_effect(effect)?;
+        self.apply_compiler_stack_effect(opcode, argument, effect)?;
         self.assembler.emit_with_depth(
             opcode,
             argument,
@@ -800,7 +800,7 @@ impl Compiler {
         argument: u32,
         effect: i32,
     ) -> Result<(), CompileError> {
-        self.apply_stack_effect(effect)?;
+        self.apply_compiler_stack_effect(LOAD_FAST, argument, effect)?;
         self.assembler
             .emit_owned_fast_with_depth(argument, self.control.depth.cast_unsigned());
         Ok(())
@@ -832,7 +832,7 @@ impl Compiler {
         {
             self.assembler.set_location(location);
         }
-        self.apply_stack_effect(effect)?;
+        self.apply_compiler_stack_effect(opcode, 0, effect)?;
         self.assembler.emit_forward_with_depth(
             opcode,
             label,
@@ -853,7 +853,7 @@ impl Compiler {
         {
             self.assembler.set_location(location);
         }
-        self.apply_stack_effect(effect)?;
+        self.apply_compiler_stack_effect(opcode, 0, effect)?;
         self.assembler
             .emit_backward_with_depth(opcode, label, self.control.depth.cast_unsigned());
         Ok(())
@@ -878,7 +878,17 @@ impl Compiler {
         Some(location)
     }
 
-    pub(super) fn apply_stack_effect(&mut self, effect: i32) -> Result<(), CompileError> {
+    pub(super) fn apply_compiler_stack_effect(
+        &mut self,
+        opcode: Opcode,
+        argument: u32,
+        declared: i32,
+    ) -> Result<(), CompileError> {
+        let effect = validate_compiler_stack_effect(opcode, argument, declared)?;
+        self.apply_stack_effect(effect)
+    }
+
+    fn apply_stack_effect(&mut self, effect: i32) -> Result<(), CompileError> {
         self.control.depth += effect;
         if self.control.depth < 0 {
             return Err(CompileError::Internal(
@@ -896,6 +906,51 @@ impl Compiler {
         debug_assert!(depth >= 0);
         self.control.depth = depth;
         self.control.max_depth = self.control.max_depth.max(depth.cast_unsigned());
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum CompilerStackEffect {
+    Fixed(i32),
+    ContextDependent,
+}
+
+/// Returns the effect on the compiler's logical value stack when it is fixed.
+pub(super) fn compiler_stack_effect(opcode: Opcode, argument: u32) -> CompilerStackEffect {
+    match opcode {
+        // CPython's physical interpreter stack retains the return value for frame teardown, but
+        // the compiler has finished consuming its logical value stack.
+        RETURN_VALUE => CompilerStackEffect::Fixed(-1),
+        // RERAISE can discard additional logical exception-state values introduced by the
+        // surrounding lowering path. Its effect is supplied by that path explicitly.
+        RERAISE => CompilerStackEffect::ContextDependent,
+        _ => CompilerStackEffect::Fixed(
+            i32::try_from(opcode_num_pushed(opcode, argument))
+                .expect("opcode push count fits in i32")
+                - i32::try_from(opcode_num_popped(opcode, argument))
+                    .expect("opcode pop count fits in i32"),
+        ),
+    }
+}
+
+pub(super) fn validate_compiler_stack_effect(
+    opcode: Opcode,
+    argument: u32,
+    declared: i32,
+) -> Result<i32, CompileError> {
+    match compiler_stack_effect(opcode, argument) {
+        CompilerStackEffect::Fixed(expected) if declared != expected => {
+            Err(CompileError::Internal(format!(
+                "compiler declared stack effect {declared} for opcode {} with argument {argument}, expected {expected}",
+                opcode.code()
+            )))
+        }
+        CompilerStackEffect::Fixed(expected) => Ok(expected),
+        CompilerStackEffect::ContextDependent if declared < 0 => Ok(declared),
+        CompilerStackEffect::ContextDependent => Err(CompileError::Internal(format!(
+            "compiler declared non-consuming stack effect {declared} for context-dependent opcode {}",
+            opcode.code()
+        ))),
     }
 }
 
