@@ -591,7 +591,7 @@ impl Compiler {
         let required_names = &class_plan.required;
         let type_parameter_requirements = type_parameter_required_names(type_params);
         let mut type_parameter_cell_requirements = type_parameter_requirements.clone();
-        let mut wrapper_requirements = type_parameter_requirements.clone();
+        let mut wrapper_requirements = type_parameter_requirements;
         if let Some(arguments) = definition.arguments.as_deref() {
             for argument in &arguments.args {
                 wrapper_requirements.extend(expression_required_names(argument));

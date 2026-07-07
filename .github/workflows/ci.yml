@@ -45,7 +45,44 @@ jobs:
       - name: "Install Rust toolchain"
         run: rustup component add clippy
       - name: "Clippy"
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+  msrv:
+    name: "cargo check (MSRV 1.94.0)"
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_NET_RETRY: 10
+      CARGO_TERM_COLOR: always
+      RUSTUP_MAX_RETRIES: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: "Install MSRV toolchain"
+        run: rustup toolchain install 1.94.0 --profile minimal
+      - name: "Check with MSRV"
+        run: cargo +1.94.0 check --workspace --all-targets --all-features --locked
+
+  shear:
+    name: "cargo shear"
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: "Install cargo-shear"
+        uses: taiki-e/install-action@15449e3094499af05d8d964a1c884208e4b8b595 # v2.81.11
+        with:
+          tool: cargo-shear@1.12.4
+      - run: cargo shear --deny-warnings
 
   test:
     name: "cargo test on linux"
@@ -70,7 +107,41 @@ jobs:
       - name: "Install Rust toolchain"
         run: rustup show
       - name: "Cargo test"
-        run: cargo test --workspace --all-targets --locked
+        run: cargo test --workspace --all-targets --all-features --locked
+
+  test-other:
+    name: "cargo test (${{ matrix.os }})"
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_NET_RETRY: 10
+      CARGO_TERM_COLOR: always
+      SERC_TEST_PYTHON: python
+      RUSTUP_MAX_RETRIES: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.14.5"
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          cache-bin: false
+      - name: "Install Rust toolchain"
+        run: rustup show
+      - name: "Test core library and binary"
+        run: cargo test --workspace --lib --bins --all-features --locked
+      # The benchmark-script integration tests require Bash and are covered by Linux.
+      - name: "Test CLI"
+        run: cargo test -p serc --test cli --all-features --locked
 
   compatibility:
     name: "CPython compatibility"
