@@ -45,6 +45,26 @@ the frozen split of 2,230 exact matches and 221 CPython-rejected inputs, with no
 other outcomes. CI runs this gate against the exact supported CPython release
 on every pull request and every push to `main`.
 
+For broader diagnostics, Serc also has a separately pinned corpus derived
+from [`mypy_primer`](https://github.com/hauntsaninja/mypy_primer). The frozen
+snapshot contains 73,537 tracked `.py` and `.pyi` files from 162 logical catalog
+entries across 160 repositories. It is intentionally opt-in because
+materializing and checking its 691,638,412 source bytes requires substantial
+network, storage, and CPU resources:
+
+```console
+./scripts/setup-mypy-primer-corpus
+./scripts/check-mypy-primer-compatibility /path/to/python3.14.5
+```
+
+The second command freezes an initial outcome baseline of 52,080 byte-identical
+files, 21,298 failures, and 159 files rejected by CPython. It exits unsuccessfully
+when the outcome counts change so compatibility improvements advance the baseline
+explicitly. CI validates the pinned catalog and the
+corpus-management scripts, but the full comparison does not replace or weaken
+the Ruff compatibility gate above. See [`corpora/README.md`](corpora/README.md)
+for the exact snapshot boundary and reproducibility details.
+
 See [`crates/serc/ARCHITECTURE.md`](crates/serc/ARCHITECTURE.md) for
 compiler internals and target-generation details.
 

@@ -49,10 +49,22 @@ jobs:
             Python/flowgraph.c
             Python/marshal.c
           sparse-checkout-cone-mode: false
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: hauntsaninja/mypy_primer
+          ref: ff3d9531335dad605d43fcc208c9c159bb09fa81
+          path: target/mypy_primer
+          persist-credentials: false
+          sparse-checkout: mypy_primer/projects.py
+          sparse-checkout-cone-mode: false
       - name: "Install Rustfmt"
         run: rustup component add rustfmt
       - name: "Check Ruff revision"
         run: ./scripts/check-ruff-pin
+      - name: "Test mypy_primer corpus manager"
+        run: python -m unittest discover -s scripts -p 'test_*.py'
+      - name: "Check mypy_primer catalog"
+        run: python scripts/mypy_primer_corpus.py check-catalog --primer-checkout target/mypy_primer
       - name: "Test target generator"
         run: python -m unittest discover -s crates/serc/scripts -p 'test_*.py'
       - name: "Check generated target"
