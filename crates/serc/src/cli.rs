@@ -211,7 +211,10 @@ enum SourceEncoding {
     Ascii,
     Iso8859_9,
     Cp437,
-    Standard(&'static encoding_rs::Encoding),
+    Cp850,
+    Windows1252,
+    ShiftJis,
+    Cp932,
 }
 
 fn decode_source(bytes: &[u8]) -> Result<String, String> {
@@ -261,21 +264,11 @@ fn decode_source(bytes: &[u8]) -> Result<String, String> {
                 _ => char::from(byte),
             })
             .collect()),
-        SourceEncoding::Cp437 => Ok(bytes
-            .iter()
-            .copied()
-            .map(|byte| {
-                if byte.is_ascii() {
-                    char::from(byte)
-                } else {
-                    CP437_HIGH[usize::from(byte - 0x80)]
-                }
-            })
-            .collect()),
-        SourceEncoding::Standard(encoding) => encoding
-            .decode_without_bom_handling_and_without_replacement(bytes)
-            .map(std::borrow::Cow::into_owned)
-            .ok_or_else(|| format!("source is not valid {}", encoding.name())),
+        SourceEncoding::Cp437 => Ok(decode_high_table(bytes, &CP437_HIGH)),
+        SourceEncoding::Cp850 => Ok(decode_high_table(bytes, &CP850_HIGH)),
+        SourceEncoding::Windows1252 => decode_windows_1252(bytes),
+        SourceEncoding::ShiftJis => decode_shift_jis(bytes, true),
+        SourceEncoding::Cp932 => decode_shift_jis(bytes, false),
     }
 }
 
@@ -371,13 +364,13 @@ fn classify_encoding(name: &str) -> Option<(SourceEncoding, bool)> {
         "iso8859_9" | "iso_8859_9" | "iso_8859_9_1989" | "iso_ir_148" | "latin5" | "l5"
         | "csisolatin5" => SourceEncoding::Iso8859_9,
         "cp437" | "437" | "ibm437" | "cspc8codepage437" => SourceEncoding::Cp437,
-        "cp1252" | "1252" | "windows_1252" => SourceEncoding::Standard(encoding_rs::WINDOWS_1252),
-        _ => {
-            let label = codec_name.replace('_', "-");
-            SourceEncoding::Standard(encoding_rs::Encoding::for_label_no_replacement(
-                label.as_bytes(),
-            )?)
+        "cp850" | "850" | "ibm850" | "cspc850multilingual" => SourceEncoding::Cp850,
+        "cp1252" | "1252" | "windows_1252" => SourceEncoding::Windows1252,
+        "shift_jis" | "shiftjis" | "sjis" | "s_jis" | "csshiftjis" | "x_mac_japanese" => {
+            SourceEncoding::ShiftJis
         }
+        "cp932" | "932" | "ms932" | "ms_kanji" | "mskanji" | "windows_31j" => SourceEncoding::Cp932,
+        _ => return None,
     };
     Some((encoding, false))
 }
@@ -399,6 +392,90 @@ fn normalize_codec_name(name: &str) -> String {
     normalized
 }
 
+fn decode_high_table(bytes: &[u8], high: &[char; 128]) -> String {
+    bytes
+        .iter()
+        .copied()
+        .map(|byte| {
+            if byte.is_ascii() {
+                char::from(byte)
+            } else {
+                high[usize::from(byte - 0x80)]
+            }
+        })
+        .collect()
+}
+
+fn decode_windows_1252(bytes: &[u8]) -> Result<String, String> {
+    bytes
+        .iter()
+        .copied()
+        .map(|byte| {
+            if !(0x80..0xa0).contains(&byte) {
+                return Ok(char::from(byte));
+            }
+            let character = WINDOWS_1252_C1[usize::from(byte - 0x80)];
+            if character == '\u{fffe}' {
+                Err(format!("source is not valid CP1252 at byte 0x{byte:02x}"))
+            } else {
+                Ok(character)
+            }
+        })
+        .collect()
+}
+
+fn decode_shift_jis(bytes: &[u8], strict_jis: bool) -> Result<String, String> {
+    if strict_jis {
+        validate_shift_jis(bytes)?;
+    }
+    let decoded = encoding_rs::SHIFT_JIS
+        .decode_without_bom_handling_and_without_replacement(bytes)
+        .ok_or_else(|| "source is not valid Shift_JIS".to_string())?;
+    if !strict_jis {
+        return Ok(decoded.into_owned());
+    }
+    Ok(decoded
+        .chars()
+        .map(|character| match character {
+            '\u{ff5e}' => '\u{301c}',
+            '\u{2225}' => '\u{2016}',
+            '\u{ff0d}' => '\u{2212}',
+            '\u{ffe0}' => '\u{00a2}',
+            '\u{ffe1}' => '\u{00a3}',
+            '\u{ffe2}' => '\u{00ac}',
+            _ => character,
+        })
+        .collect())
+}
+
+fn validate_shift_jis(bytes: &[u8]) -> Result<(), String> {
+    let mut index = 0;
+    while let Some(&byte) = bytes.get(index) {
+        match byte {
+            0x00..=0x7f | 0xa1..=0xdf => index += 1,
+            0x81..=0x9f | 0xe0..=0xea if byte != 0x87 => {
+                if bytes.get(index + 1).is_none() {
+                    return Err("source ends with an incomplete Shift_JIS sequence".to_string());
+                }
+                index += 2;
+            }
+            _ => {
+                return Err(format!(
+                    "source is not valid Shift_JIS at byte 0x{byte:02x}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+const WINDOWS_1252_C1: [char; 32] = [
+    '\u{20ac}', '\u{fffe}', '\u{201a}', '\u{0192}', '\u{201e}', '\u{2026}', '\u{2020}', '\u{2021}',
+    '\u{02c6}', '\u{2030}', '\u{0160}', '\u{2039}', '\u{0152}', '\u{fffe}', '\u{017d}', '\u{fffe}',
+    '\u{fffe}', '\u{2018}', '\u{2019}', '\u{201c}', '\u{201d}', '\u{2022}', '\u{2013}', '\u{2014}',
+    '\u{02dc}', '\u{2122}', '\u{0161}', '\u{203a}', '\u{0153}', '\u{fffe}', '\u{017e}', '\u{0178}',
+];
+
 const CP437_HIGH: [char; 128] = [
     '\u{00c7}', '\u{00fc}', '\u{00e9}', '\u{00e2}', '\u{00e4}', '\u{00e0}', '\u{00e5}', '\u{00e7}',
     '\u{00ea}', '\u{00eb}', '\u{00e8}', '\u{00ef}', '\u{00ee}', '\u{00ec}', '\u{00c4}', '\u{00c5}',
@@ -416,6 +493,25 @@ const CP437_HIGH: [char; 128] = [
     '\u{03a6}', '\u{0398}', '\u{03a9}', '\u{03b4}', '\u{221e}', '\u{03c6}', '\u{03b5}', '\u{2229}',
     '\u{2261}', '\u{00b1}', '\u{2265}', '\u{2264}', '\u{2320}', '\u{2321}', '\u{00f7}', '\u{2248}',
     '\u{00b0}', '\u{2219}', '\u{00b7}', '\u{221a}', '\u{207f}', '\u{00b2}', '\u{25a0}', '\u{00a0}',
+];
+
+const CP850_HIGH: [char; 128] = [
+    '\u{00c7}', '\u{00fc}', '\u{00e9}', '\u{00e2}', '\u{00e4}', '\u{00e0}', '\u{00e5}', '\u{00e7}',
+    '\u{00ea}', '\u{00eb}', '\u{00e8}', '\u{00ef}', '\u{00ee}', '\u{00ec}', '\u{00c4}', '\u{00c5}',
+    '\u{00c9}', '\u{00e6}', '\u{00c6}', '\u{00f4}', '\u{00f6}', '\u{00f2}', '\u{00fb}', '\u{00f9}',
+    '\u{00ff}', '\u{00d6}', '\u{00dc}', '\u{00f8}', '\u{00a3}', '\u{00d8}', '\u{00d7}', '\u{0192}',
+    '\u{00e1}', '\u{00ed}', '\u{00f3}', '\u{00fa}', '\u{00f1}', '\u{00d1}', '\u{00aa}', '\u{00ba}',
+    '\u{00bf}', '\u{00ae}', '\u{00ac}', '\u{00bd}', '\u{00bc}', '\u{00a1}', '\u{00ab}', '\u{00bb}',
+    '\u{2591}', '\u{2592}', '\u{2593}', '\u{2502}', '\u{2524}', '\u{00c1}', '\u{00c2}', '\u{00c0}',
+    '\u{00a9}', '\u{2563}', '\u{2551}', '\u{2557}', '\u{255d}', '\u{00a2}', '\u{00a5}', '\u{2510}',
+    '\u{2514}', '\u{2534}', '\u{252c}', '\u{251c}', '\u{2500}', '\u{253c}', '\u{00e3}', '\u{00c3}',
+    '\u{255a}', '\u{2554}', '\u{2569}', '\u{2566}', '\u{2560}', '\u{2550}', '\u{256c}', '\u{00a4}',
+    '\u{00f0}', '\u{00d0}', '\u{00ca}', '\u{00cb}', '\u{00c8}', '\u{0131}', '\u{00cd}', '\u{00ce}',
+    '\u{00cf}', '\u{2518}', '\u{250c}', '\u{2588}', '\u{2584}', '\u{00a6}', '\u{00cc}', '\u{2580}',
+    '\u{00d3}', '\u{00df}', '\u{00d4}', '\u{00d2}', '\u{00f5}', '\u{00d5}', '\u{00b5}', '\u{00fe}',
+    '\u{00de}', '\u{00da}', '\u{00db}', '\u{00d9}', '\u{00fd}', '\u{00dd}', '\u{00af}', '\u{00b4}',
+    '\u{00ad}', '\u{00b1}', '\u{2017}', '\u{00be}', '\u{00b6}', '\u{00a7}', '\u{00f7}', '\u{00b8}',
+    '\u{00b0}', '\u{00a8}', '\u{00b7}', '\u{00b9}', '\u{00b3}', '\u{00b2}', '\u{25a0}', '\u{00a0}',
 ];
 
 fn encode_mtime(modified: SystemTime) -> u32 {

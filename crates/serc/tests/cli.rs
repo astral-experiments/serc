@@ -174,6 +174,11 @@ fn compile_matches_cpython_for_encoding_cookies() {
             b"# coding: iso-8859-9\nvalue = '\x80'\n".as_slice(),
         ),
         ("cp437", b"# coding: cp437\nvalue = '\x80'\n".as_slice()),
+        ("cp850", b"# coding: cp850\nvalue = '\x9b'\n".as_slice()),
+        (
+            "shift_jis",
+            b"# coding: shift_jis\nvalue = '\x81\x60'\n".as_slice(),
+        ),
         ("ascii", b"# coding: ascii\nvalue = 'ascii'\n".as_slice()),
     ] {
         let source_path = directory.path().join(format!("{name}.py"));
