@@ -164,40 +164,22 @@ fn compile_matches_cpython_pyc() {
 }
 
 #[test]
-fn compile_matches_cpython_for_encoding_cookies() {
+fn compile_matches_cpython_for_utf8_encoding_cookies() {
     let Some(python) = common::python_3145() else {
         return;
     };
     let directory = tempfile::tempdir().unwrap();
 
     for (name, source) in [
+        ("utf8", b"# coding: utf-8\nvalue = '\xc3\xa9'\n".as_slice()),
         (
-            "latin1_bytes",
-            b"# coding: latin-1\nvalue = '\xe9'\n".as_slice(),
+            "utf8_alias",
+            b"# coding: utf8\nvalue = '\xc3\xa9'\n".as_slice(),
         ),
         (
-            "utf8_bytes",
-            b"# coding: latin-1\nvalue = '\xc3\xa9'\n".as_slice(),
+            "utf8_bom",
+            b"\xef\xbb\xbf# coding: utf-8\nvalue = '\xc3\xa9'\n".as_slice(),
         ),
-        (
-            "windows_1252",
-            b"# coding: cp1252\nvalue = '\x80'\n".as_slice(),
-        ),
-        (
-            "windows_1252_alias",
-            b"# coding: windows_1252\nvalue = '\x80'\n".as_slice(),
-        ),
-        (
-            "iso_8859_9",
-            b"# coding: iso-8859-9\nvalue = '\x80'\n".as_slice(),
-        ),
-        ("cp437", b"# coding: cp437\nvalue = '\x80'\n".as_slice()),
-        ("cp850", b"# coding: cp850\nvalue = '\x9b'\n".as_slice()),
-        (
-            "shift_jis",
-            b"# coding: shift_jis\nvalue = '\x81\x60'\n".as_slice(),
-        ),
-        ("ascii", b"# coding: ascii\nvalue = 'ascii'\n".as_slice()),
     ] {
         let source_path = directory.path().join(format!("{name}.py"));
         let pyc_path = directory
@@ -232,6 +214,34 @@ fn compile_matches_cpython_for_encoding_cookies() {
 
         assert_eq!(fs_err::read(pyc_path).unwrap(), expected);
     }
+}
+
+#[test]
+fn compile_rejects_non_utf8_encoding_cookies() {
+    let directory = tempfile::tempdir().unwrap();
+
+    for encoding in ["ascii", "latin-1", "cp932", "koi8-r", "gbk", "big5"] {
+        let source_path = directory.path().join(format!("{encoding}.py"));
+        fs_err::write(
+            &source_path,
+            format!("# coding: {encoding}\nvalue = 'ascii'\n"),
+        )
+        .unwrap();
+
+        let output = serc()
+            .args(["compile", "--quiet"])
+            .arg(&source_path)
+            .output()
+            .unwrap();
+
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(&format!("unsupported source encoding `{encoding}`")),
+            "{output:?}"
+        );
+    }
+    assert!(!directory.path().join("__pycache__").exists());
 }
 
 #[cfg(unix)]

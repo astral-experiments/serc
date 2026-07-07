@@ -205,27 +205,14 @@ fn compile_path_with_metadata(
         .map_err(|error| format!("failed to replace {}: {error}", output.display()))
 }
 
-enum SourceEncoding {
-    Utf8,
-    Latin1,
-    Ascii,
-    Iso8859_9,
-    Cp437,
-    Cp850,
-    Windows1252,
-    ShiftJis,
-    Cp932,
-}
-
 fn decode_source(bytes: &[u8]) -> Result<String, String> {
     const UTF8_BOM: &[u8] = b"\xef\xbb\xbf";
 
     let (bytes, has_bom) = bytes
         .strip_prefix(UTF8_BOM)
         .map_or((bytes, false), |bytes| (bytes, true));
-    let cookie = declared_encoding(bytes);
-    let encoding = if let Some(cookie) = cookie {
-        let Some((encoding, bom_compatible)) = classify_encoding(cookie) else {
+    if let Some(cookie) = declared_encoding(bytes) {
+        let Some(bom_compatible) = classify_utf8_encoding(cookie) else {
             return Err(format!("unsupported source encoding `{cookie}`"));
         };
         if has_bom && !bom_compatible {
@@ -233,43 +220,11 @@ fn decode_source(bytes: &[u8]) -> Result<String, String> {
                 "encoding problem: UTF-8 BOM conflicts with `{cookie}`"
             ));
         }
-        encoding
-    } else {
-        SourceEncoding::Utf8
-    };
+    }
 
-    let source = match encoding {
-        SourceEncoding::Utf8 => std::str::from_utf8(bytes)
-            .map(str::to_owned)
-            .map_err(|error| format!("source is not valid UTF-8: {error}")),
-        SourceEncoding::Latin1 => Ok(bytes.iter().copied().map(char::from).collect()),
-        SourceEncoding::Ascii => {
-            if !bytes.is_ascii() {
-                return Err("source is not valid ASCII".to_string());
-            }
-            std::str::from_utf8(bytes)
-                .map(str::to_owned)
-                .map_err(|error| format!("source is not valid ASCII: {error}"))
-        }
-        SourceEncoding::Iso8859_9 => Ok(bytes
-            .iter()
-            .copied()
-            .map(|byte| match byte {
-                0xd0 => '\u{011e}',
-                0xdd => '\u{0130}',
-                0xde => '\u{015e}',
-                0xf0 => '\u{011f}',
-                0xfd => '\u{0131}',
-                0xfe => '\u{015f}',
-                _ => char::from(byte),
-            })
-            .collect()),
-        SourceEncoding::Cp437 => Ok(decode_high_table(bytes, &CP437_HIGH)),
-        SourceEncoding::Cp850 => Ok(decode_high_table(bytes, &CP850_HIGH)),
-        SourceEncoding::Windows1252 => decode_windows_1252(bytes),
-        SourceEncoding::ShiftJis => decode_shift_jis(bytes, true),
-        SourceEncoding::Cp932 => decode_shift_jis(bytes, false),
-    }?;
+    let source = std::str::from_utf8(bytes)
+        .map(str::to_owned)
+        .map_err(|error| format!("source is not valid UTF-8: {error}"))?;
     if source.contains('\0') {
         return Err("source code string cannot contain null bytes".to_string());
     }
@@ -340,7 +295,7 @@ fn is_blank_or_comment(line: &[u8]) -> bool {
         .is_none_or(|byte| matches!(byte, b'#' | b'\r' | b'\n'))
 }
 
-fn classify_encoding(name: &str) -> Option<(SourceEncoding, bool)> {
+fn classify_utf8_encoding(name: &str) -> Option<bool> {
     let normalized_prefix: String = name
         .bytes()
         .take(12)
@@ -351,38 +306,14 @@ fn classify_encoding(name: &str) -> Option<(SourceEncoding, bool)> {
         })
         .collect();
     if normalized_prefix == "utf-8" || normalized_prefix.starts_with("utf-8-") {
-        return Some((SourceEncoding::Utf8, true));
-    }
-    if matches!(
-        normalized_prefix.as_str(),
-        "latin-1" | "iso-8859-1" | "iso-latin-1"
-    ) || normalized_prefix.starts_with("latin-1-")
-        || normalized_prefix.starts_with("iso-8859-1-")
-        || normalized_prefix.starts_with("iso-latin-1-")
-    {
-        return Some((SourceEncoding::Latin1, false));
+        return Some(true);
     }
 
-    let codec_name = normalize_codec_name(name);
-    let encoding = match codec_name.as_str() {
-        "utf" | "u8" | "utf8" | "utf8_ucs2" | "utf8_ucs4" | "cp65001" => SourceEncoding::Utf8,
-        "latin" | "latin1" | "l1" | "8859" | "cp819" | "ibm819" | "csisolatin1" | "iso8859"
-        | "iso8859_1" | "iso_8859_1_1987" | "iso_ir_100" => SourceEncoding::Latin1,
-        "ascii" | "646" | "cp367" | "ibm367" | "csascii" | "us" | "us_ascii" | "iso646_us"
-        | "iso_646.irv_1991" | "iso_ir_6" | "ansi_x3.4_1968" | "ansi_x3_4_1968"
-        | "ansi_x3.4_1986" => SourceEncoding::Ascii,
-        "iso8859_9" | "iso_8859_9" | "iso_8859_9_1989" | "iso_ir_148" | "latin5" | "l5"
-        | "csisolatin5" => SourceEncoding::Iso8859_9,
-        "cp437" | "437" | "ibm437" | "cspc8codepage437" => SourceEncoding::Cp437,
-        "cp850" | "850" | "ibm850" | "cspc850multilingual" => SourceEncoding::Cp850,
-        "cp1252" | "1252" | "windows_1252" => SourceEncoding::Windows1252,
-        "shift_jis" | "shiftjis" | "sjis" | "s_jis" | "csshiftjis" | "x_mac_japanese" => {
-            SourceEncoding::ShiftJis
-        }
-        "cp932" | "932" | "ms932" | "ms_kanji" | "mskanji" | "windows_31j" => SourceEncoding::Cp932,
-        _ => return None,
-    };
-    Some((encoding, false))
+    matches!(
+        normalize_codec_name(name).as_str(),
+        "utf" | "u8" | "utf8" | "utf8_ucs2" | "utf8_ucs4" | "cp65001"
+    )
+    .then_some(false)
 }
 
 fn normalize_codec_name(name: &str) -> String {
@@ -401,128 +332,6 @@ fn normalize_codec_name(name: &str) -> String {
     }
     normalized
 }
-
-fn decode_high_table(bytes: &[u8], high: &[char; 128]) -> String {
-    bytes
-        .iter()
-        .copied()
-        .map(|byte| {
-            if byte.is_ascii() {
-                char::from(byte)
-            } else {
-                high[usize::from(byte - 0x80)]
-            }
-        })
-        .collect()
-}
-
-fn decode_windows_1252(bytes: &[u8]) -> Result<String, String> {
-    bytes
-        .iter()
-        .copied()
-        .map(|byte| {
-            if !(0x80..0xa0).contains(&byte) {
-                return Ok(char::from(byte));
-            }
-            let character = WINDOWS_1252_C1[usize::from(byte - 0x80)];
-            if character == '\u{fffe}' {
-                Err(format!("source is not valid CP1252 at byte 0x{byte:02x}"))
-            } else {
-                Ok(character)
-            }
-        })
-        .collect()
-}
-
-fn decode_shift_jis(bytes: &[u8], strict_jis: bool) -> Result<String, String> {
-    if strict_jis {
-        validate_shift_jis(bytes)?;
-    }
-    let decoded = encoding_rs::SHIFT_JIS
-        .decode_without_bom_handling_and_without_replacement(bytes)
-        .ok_or_else(|| "source is not valid Shift_JIS".to_string())?;
-    if !strict_jis {
-        return Ok(decoded.into_owned());
-    }
-    Ok(decoded
-        .chars()
-        .map(|character| match character {
-            '\u{ff5e}' => '\u{301c}',
-            '\u{2225}' => '\u{2016}',
-            '\u{ff0d}' => '\u{2212}',
-            '\u{ffe0}' => '\u{00a2}',
-            '\u{ffe1}' => '\u{00a3}',
-            '\u{ffe2}' => '\u{00ac}',
-            _ => character,
-        })
-        .collect())
-}
-
-fn validate_shift_jis(bytes: &[u8]) -> Result<(), String> {
-    let mut index = 0;
-    while let Some(&byte) = bytes.get(index) {
-        match byte {
-            0x00..=0x7f | 0xa1..=0xdf => index += 1,
-            0x81..=0x9f | 0xe0..=0xea if byte != 0x87 => {
-                if bytes.get(index + 1).is_none() {
-                    return Err("source ends with an incomplete Shift_JIS sequence".to_string());
-                }
-                index += 2;
-            }
-            _ => {
-                return Err(format!(
-                    "source is not valid Shift_JIS at byte 0x{byte:02x}"
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-const WINDOWS_1252_C1: [char; 32] = [
-    '\u{20ac}', '\u{fffe}', '\u{201a}', '\u{0192}', '\u{201e}', '\u{2026}', '\u{2020}', '\u{2021}',
-    '\u{02c6}', '\u{2030}', '\u{0160}', '\u{2039}', '\u{0152}', '\u{fffe}', '\u{017d}', '\u{fffe}',
-    '\u{fffe}', '\u{2018}', '\u{2019}', '\u{201c}', '\u{201d}', '\u{2022}', '\u{2013}', '\u{2014}',
-    '\u{02dc}', '\u{2122}', '\u{0161}', '\u{203a}', '\u{0153}', '\u{fffe}', '\u{017e}', '\u{0178}',
-];
-
-const CP437_HIGH: [char; 128] = [
-    '\u{00c7}', '\u{00fc}', '\u{00e9}', '\u{00e2}', '\u{00e4}', '\u{00e0}', '\u{00e5}', '\u{00e7}',
-    '\u{00ea}', '\u{00eb}', '\u{00e8}', '\u{00ef}', '\u{00ee}', '\u{00ec}', '\u{00c4}', '\u{00c5}',
-    '\u{00c9}', '\u{00e6}', '\u{00c6}', '\u{00f4}', '\u{00f6}', '\u{00f2}', '\u{00fb}', '\u{00f9}',
-    '\u{00ff}', '\u{00d6}', '\u{00dc}', '\u{00a2}', '\u{00a3}', '\u{00a5}', '\u{20a7}', '\u{0192}',
-    '\u{00e1}', '\u{00ed}', '\u{00f3}', '\u{00fa}', '\u{00f1}', '\u{00d1}', '\u{00aa}', '\u{00ba}',
-    '\u{00bf}', '\u{2310}', '\u{00ac}', '\u{00bd}', '\u{00bc}', '\u{00a1}', '\u{00ab}', '\u{00bb}',
-    '\u{2591}', '\u{2592}', '\u{2593}', '\u{2502}', '\u{2524}', '\u{2561}', '\u{2562}', '\u{2556}',
-    '\u{2555}', '\u{2563}', '\u{2551}', '\u{2557}', '\u{255d}', '\u{255c}', '\u{255b}', '\u{2510}',
-    '\u{2514}', '\u{2534}', '\u{252c}', '\u{251c}', '\u{2500}', '\u{253c}', '\u{255e}', '\u{255f}',
-    '\u{255a}', '\u{2554}', '\u{2569}', '\u{2566}', '\u{2560}', '\u{2550}', '\u{256c}', '\u{2567}',
-    '\u{2568}', '\u{2564}', '\u{2565}', '\u{2559}', '\u{2558}', '\u{2552}', '\u{2553}', '\u{256b}',
-    '\u{256a}', '\u{2518}', '\u{250c}', '\u{2588}', '\u{2584}', '\u{258c}', '\u{2590}', '\u{2580}',
-    '\u{03b1}', '\u{00df}', '\u{0393}', '\u{03c0}', '\u{03a3}', '\u{03c3}', '\u{00b5}', '\u{03c4}',
-    '\u{03a6}', '\u{0398}', '\u{03a9}', '\u{03b4}', '\u{221e}', '\u{03c6}', '\u{03b5}', '\u{2229}',
-    '\u{2261}', '\u{00b1}', '\u{2265}', '\u{2264}', '\u{2320}', '\u{2321}', '\u{00f7}', '\u{2248}',
-    '\u{00b0}', '\u{2219}', '\u{00b7}', '\u{221a}', '\u{207f}', '\u{00b2}', '\u{25a0}', '\u{00a0}',
-];
-
-const CP850_HIGH: [char; 128] = [
-    '\u{00c7}', '\u{00fc}', '\u{00e9}', '\u{00e2}', '\u{00e4}', '\u{00e0}', '\u{00e5}', '\u{00e7}',
-    '\u{00ea}', '\u{00eb}', '\u{00e8}', '\u{00ef}', '\u{00ee}', '\u{00ec}', '\u{00c4}', '\u{00c5}',
-    '\u{00c9}', '\u{00e6}', '\u{00c6}', '\u{00f4}', '\u{00f6}', '\u{00f2}', '\u{00fb}', '\u{00f9}',
-    '\u{00ff}', '\u{00d6}', '\u{00dc}', '\u{00f8}', '\u{00a3}', '\u{00d8}', '\u{00d7}', '\u{0192}',
-    '\u{00e1}', '\u{00ed}', '\u{00f3}', '\u{00fa}', '\u{00f1}', '\u{00d1}', '\u{00aa}', '\u{00ba}',
-    '\u{00bf}', '\u{00ae}', '\u{00ac}', '\u{00bd}', '\u{00bc}', '\u{00a1}', '\u{00ab}', '\u{00bb}',
-    '\u{2591}', '\u{2592}', '\u{2593}', '\u{2502}', '\u{2524}', '\u{00c1}', '\u{00c2}', '\u{00c0}',
-    '\u{00a9}', '\u{2563}', '\u{2551}', '\u{2557}', '\u{255d}', '\u{00a2}', '\u{00a5}', '\u{2510}',
-    '\u{2514}', '\u{2534}', '\u{252c}', '\u{251c}', '\u{2500}', '\u{253c}', '\u{00e3}', '\u{00c3}',
-    '\u{255a}', '\u{2554}', '\u{2569}', '\u{2566}', '\u{2560}', '\u{2550}', '\u{256c}', '\u{00a4}',
-    '\u{00f0}', '\u{00d0}', '\u{00ca}', '\u{00cb}', '\u{00c8}', '\u{0131}', '\u{00cd}', '\u{00ce}',
-    '\u{00cf}', '\u{2518}', '\u{250c}', '\u{2588}', '\u{2584}', '\u{00a6}', '\u{00cc}', '\u{2580}',
-    '\u{00d3}', '\u{00df}', '\u{00d4}', '\u{00d2}', '\u{00f5}', '\u{00d5}', '\u{00b5}', '\u{00fe}',
-    '\u{00de}', '\u{00da}', '\u{00db}', '\u{00d9}', '\u{00fd}', '\u{00dd}', '\u{00af}', '\u{00b4}',
-    '\u{00ad}', '\u{00b1}', '\u{2017}', '\u{00be}', '\u{00b6}', '\u{00a7}', '\u{00f7}', '\u{00b8}',
-    '\u{00b0}', '\u{00a8}', '\u{00b7}', '\u{00b9}', '\u{00b3}', '\u{00b2}', '\u{25a0}', '\u{00a0}',
-];
 
 fn encode_mtime(modified: SystemTime) -> u32 {
     match modified.duration_since(UNIX_EPOCH) {
@@ -626,19 +435,15 @@ mod tests {
     }
 
     #[test]
-    fn decodes_pep_263_encoding_cookies() {
+    fn accepts_only_utf8_source_encodings() {
         assert_eq!(
-            decode_source(b"# comment\n# coding: latin-1\nvalue = '\xe9'\n").unwrap(),
-            "# comment\n# coding: latin-1\nvalue = '\u{e9}'\n"
+            decode_source(b"# coding: utf-8\nvalue = '\xc3\xa9'\n").unwrap(),
+            "# coding: utf-8\nvalue = '\u{e9}'\n"
         );
+        assert!(decode_source(b"# coding: utf8\nvalue = 1\n").is_ok());
         assert_eq!(
-            decode_source(b"# coding: cp1252\nvalue = '\x80'\n").unwrap(),
-            "# coding: cp1252\nvalue = '\u{20ac}'\n"
-        );
-        assert!(decode_source(b"# coding: ascii\nvalue = 1\n").is_ok());
-        assert_eq!(
-            decode_source(b"# coding: ascii\nvalue = '\x80'\n").unwrap_err(),
-            "source is not valid ASCII"
+            decode_source(b"# coding: latin-1\nvalue = 'ascii'\n").unwrap_err(),
+            "unsupported source encoding `latin-1`"
         );
     }
 
