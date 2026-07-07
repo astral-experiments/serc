@@ -368,6 +368,133 @@ except Exception:
     }
 
     #[test]
+    fn matches_cpython_marshal_for_trailing_finally_exits_in_synchronous_with_bodies() {
+        let source = r"def direct(manager):
+    with manager:
+        try:
+            body()
+        finally:
+            cleanup()
+
+def followed(manager):
+    with manager:
+        try:
+            body()
+        finally:
+            cleanup()
+    after()
+
+def leading_statement(manager):
+    with manager:
+        before()
+        try:
+            body()
+        finally:
+            cleanup()
+    after()
+
+def multiple_items(outer, inner):
+    with outer, inner:
+        try:
+            body()
+        finally:
+            cleanup()
+    after()
+
+def enclosing_try(manager):
+    try:
+        with manager:
+            try:
+                body()
+            finally:
+                cleanup()
+        after()
+    except Exception:
+        recover()
+
+def multiple_finalbody_statements(manager):
+    with manager:
+        try:
+            body()
+        finally:
+            cleanup_one()
+            cleanup_two()
+    after()
+
+def nested_managers(outer, inner):
+    with outer:
+        with inner:
+            try:
+                body()
+            finally:
+                cleanup()
+    after()
+
+async def synchronous_inside_async(async_manager, sync_manager):
+    async with async_manager:
+        with sync_manager:
+            try:
+                await body()
+            finally:
+                await cleanup()
+    await after()
+
+def nontrailing():
+    with manager:
+        try:
+            body()
+        finally:
+            cleanup()
+        inside_after()
+    outside_after()
+
+def nested_if(manager, flag):
+    with manager:
+        if flag:
+            try:
+                body()
+            finally:
+                cleanup()
+    after()
+
+def nested_loop(manager, items):
+    with manager:
+        for item in items:
+            try:
+                body(item)
+            finally:
+                cleanup(item)
+    after()
+
+def unreachable_trailing_try(manager):
+    with manager:
+        return value()
+        try:
+            body()
+        finally:
+            cleanup()
+
+async def asynchronous_manager(manager):
+    async with manager:
+        try:
+            await body()
+        finally:
+            await cleanup()
+    await after()
+
+async def synchronous_outside_async(sync_manager, async_manager):
+    with sync_manager:
+        async with async_manager:
+            try:
+                await body()
+            finally:
+                await cleanup()
+    await after()
+";
+        assert_matches_cpython_marshal(source, "with_finally_exit.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_terminal_assertions_in_with_bodies() {
         let source = "def simple(manager, condition):\n    with manager:\n        assert condition\n\ndef message(manager, condition):\n    with manager:\n        use()\n        assert condition, make_message()\n\ndef boolean(manager, first, second):\n    with manager:\n        assert first or second\n\ndef conjunction(manager, first, second):\n    with manager:\n        assert first and second\n\ndef conditional(manager, first, second, condition):\n    with manager:\n        assert first if condition else second\n\ndef constant_true():\n    with manager:\n        assert True\n\ndef constant_false():\n    with manager:\n        assert False\n\ndef followed(manager, condition):\n    with manager:\n        assert condition\n    use()\n\ndef same_line(manager, condition):\n    with manager: assert condition\n\ndef nested(outer, inner, condition):\n    try:\n        with outer:\n            with inner:\n                assert condition\n    finally:\n        cleanup()\n\nasync def asynchronous(manager, condition):\n    async with manager:\n        assert condition\n";
         assert_matches_cpython_marshal(source, "with_assert.py");

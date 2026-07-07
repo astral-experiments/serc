@@ -153,6 +153,9 @@ pub(super) struct ControlFlowState {
     active_terminal_withs: usize,
     // CPython retains the empty end block when an async for ends a protected suite.
     emit_protected_async_for_end_nop: bool,
+    // CPython retains the normal finally exit when it directly ends a synchronous with body.
+    // This is consumed by the selected outer try before compiling any nested try statements.
+    preserve_next_finally_exit_nop: bool,
     pub(super) active_exception_region_exclusions: Vec<Vec<(Label, Label)>>,
     active_exception_handlers: Vec<ExceptionHandlerContext>,
     active_return_finally_contexts: Vec<ReturnFinallyContext>,
@@ -4327,6 +4330,8 @@ impl Compiler {
         statement: &ruff_python_ast::StmtTry,
         terminal: bool,
     ) -> Result<(), CompileError> {
+        let preserve_exit_nop = std::mem::take(&mut self.control.preserve_next_finally_exit_nop);
+
         if statement.handlers.is_empty()
             && statement.orelse.is_empty()
             && matches!(statement.body.as_slice(), [Stmt::Continue(_)])
@@ -4555,7 +4560,31 @@ impl Compiler {
             } else {
                 ExceptionPolicy::default()
             };
+            let exit_exclusion_start = preserve_exit_nop.then(|| {
+                let start = self.assembler.label();
+                self.assembler.mark(start);
+                start
+            });
             self.emit_jump_forward_with_exception_policy(JUMP_FORWARD, end, 0, exception_policy)?;
+            if preserve_exit_nop {
+                self.assembler
+                    .preserve_last_redundant_jump_nop_after_threading();
+            }
+            if let Some(exit_exclusion_start) = exit_exclusion_start {
+                let exit_exclusion_end = self.assembler.label();
+                self.assembler.mark(exit_exclusion_end);
+                for exclusions in &mut self.control.active_with_region_exclusions {
+                    exclusions.push((exit_exclusion_start, exit_exclusion_end));
+                }
+                for exclusions in &mut self.control.active_exception_region_exclusions {
+                    exclusions.push((exit_exclusion_start, exit_exclusion_end));
+                }
+                if self.control.generator_region_start.is_some() {
+                    self.control
+                        .generator_region_exclusions
+                        .push((exit_exclusion_start, exit_exclusion_end));
+                }
+            }
         }
         if protected_has_instructions {
             self.add_exception_regions_with_exclusions(
@@ -4847,6 +4876,26 @@ impl Compiler {
                 self.compile_suite(leading)?;
                 self.with_control_override(
                     |control| &mut control.exclude_terminal_if_not_taken,
+                    true,
+                    |compiler| compiler.compile_statement(last),
+                )?;
+            } else if let Some((last @ Stmt::Try(statement), leading)) = body.split_last()
+                && statement.handlers.is_empty()
+                && statement.orelse.is_empty()
+                && !suite_terminates(&statement.body)
+                && !suite_terminates(&statement.finalbody)
+                && !suite_terminates(leading)
+                && statement.finalbody.iter().any(|statement| {
+                    !matches!(statement, Stmt::Pass(_))
+                        && !matches!(
+                            statement,
+                            Stmt::Expr(expression) if fold_constant(&expression.value).is_some()
+                        )
+                })
+            {
+                self.compile_suite(leading)?;
+                self.with_control_override(
+                    |control| &mut control.preserve_next_finally_exit_nop,
                     true,
                     |compiler| compiler.compile_statement(last),
                 )?;
