@@ -470,14 +470,15 @@ impl OptimizationPipeline {
         let order = graph.order().to_vec();
         let mut items = items.into_iter().peekable();
         for block in order {
-            let mut replacement = Vec::with_capacity(graph[block].items().len());
-            while items
-                .peek()
-                .is_some_and(|(item_block, _)| *item_block == block)
-            {
-                replacement.push(items.next().unwrap().1);
-            }
-            graph.replace_items(block, replacement);
+            graph.mutate_items_preserving_labels(block, |block_items| {
+                block_items.clear();
+                while items
+                    .peek()
+                    .is_some_and(|(item_block, _)| *item_block == block)
+                {
+                    block_items.push(items.next().unwrap().1);
+                }
+            });
         }
         let remaining = items.next();
         debug_assert!(remaining.is_none());
@@ -487,34 +488,37 @@ impl OptimizationPipeline {
         let graph = &mut self.graph;
         let order = graph.order().to_vec();
         for block in order {
-            let mut previous = None;
-            let mut block_has_instruction = false;
-            for position in graph.block_item_positions(block) {
-                if matches!(graph.item(position), Item::Label(_)) {
-                    if block_has_instruction {
-                        previous = None;
-                        block_has_instruction = false;
+            graph.mutate_items_preserving_labels(block, |items| {
+                let mut previous = None;
+                let mut block_has_instruction = false;
+                for item in items {
+                    match item {
+                        Item::Label(_) if block_has_instruction => {
+                            previous = None;
+                            block_has_instruction = false;
+                        }
+                        Item::Label(_) => {}
+                        Item::Instruction(instruction) => {
+                            block_has_instruction = true;
+                            if instruction.location.line < 0
+                                && !instruction.no_location_policy.preserve
+                            {
+                                if let Some(location) = previous {
+                                    instruction.location = location;
+                                }
+                            } else {
+                                previous = Some(instruction.location);
+                            }
+                            if !matches!(instruction.operand, Operand::Value(_))
+                                || ends_scope(instruction.opcode)
+                            {
+                                previous = None;
+                                block_has_instruction = false;
+                            }
+                        }
                     }
-                    continue;
                 }
-                let instruction = graph
-                    .instruction_mut(position)
-                    .expect("non-label item is an instruction");
-                block_has_instruction = true;
-                if instruction.location.line < 0 && !instruction.no_location_policy.preserve {
-                    if let Some(location) = previous {
-                        instruction.location = location;
-                    }
-                } else {
-                    previous = Some(instruction.location);
-                }
-                if !matches!(instruction.operand, Operand::Value(_))
-                    || ends_scope(instruction.opcode)
-                {
-                    previous = None;
-                    block_has_instruction = false;
-                }
-            }
+            });
         }
     }
 

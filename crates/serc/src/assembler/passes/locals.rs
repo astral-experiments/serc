@@ -721,22 +721,24 @@ impl OptimizationPipeline {
         let graph = &mut self.graph;
         let order = graph.order().to_vec();
         for block in order {
-            let items = graph[block].items();
-            let original_len = items.len();
-            let mut fused_items = Vec::with_capacity(original_len);
-            let mut read = 0;
-            while read < original_len {
-                if let Some(second) = read.checked_add(1).filter(|index| *index < original_len)
-                    && let Some(fused) = fuse_pair(items[read], items[second])
-                {
-                    fused_items.push(fused);
-                    read += 2;
-                } else {
-                    fused_items.push(items[read]);
-                    read += 1;
+            graph.mutate_items_preserving_labels(block, |items| {
+                let original_len = items.len();
+                let mut read = 0;
+                let mut write = 0;
+                while read < original_len {
+                    if let Some(second) = read.checked_add(1).filter(|index| *index < original_len)
+                        && let Some(fused) = fuse_pair(items[read], items[second])
+                    {
+                        items[write] = fused;
+                        read += 2;
+                    } else {
+                        items[write] = items[read];
+                        read += 1;
+                    }
+                    write += 1;
                 }
-            }
-            graph.replace_items(block, fused_items);
+                items.truncate(write);
+            });
         }
     }
 }
