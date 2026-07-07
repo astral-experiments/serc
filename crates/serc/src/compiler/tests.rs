@@ -1,5 +1,9 @@
 use ruff_python_ast::Stmt;
+use ruff_python_ast::token::TokenKind;
 use ruff_python_parser::parse_module;
+use ruff_text_size::Ranged;
+
+use crate::assembler::SourceLocation;
 
 use super::{Compiler, Constant, FunctionPlan, NameId, NameInterner, ScopeBodyFacts, clean_doc};
 
@@ -210,6 +214,64 @@ fn retains_parser_tokens_in_the_shared_compilation_context() {
     let compiler = Compiler::module("example.py", source, parsed.tokens().clone());
 
     assert_eq!(compiler.context.tokens, expected);
+}
+
+#[test]
+fn definition_locations_start_at_keyword_tokens() {
+    let source = r#"@decorate("class def async")
+async \
+    def function():
+    pass
+@decorate("def class")
+class Container:
+    pass
+"#;
+    let parsed = parse_module(source).unwrap();
+    let compiler = Compiler::module("example.py", source, parsed.tokens().clone());
+    let [Stmt::FunctionDef(function), Stmt::ClassDef(class)] = parsed.suite().as_slice() else {
+        panic!("expected a function and a class");
+    };
+
+    assert_eq!(
+        compiler.definition_location(
+            function.range,
+            function.name.range(),
+            TokenKind::Def,
+            function.is_async,
+        ),
+        SourceLocation::new(2, 4, 0, 8),
+    );
+    assert_eq!(
+        compiler.definition_location(class.range, class.name.range(), TokenKind::Class, false),
+        SourceLocation::new(6, 7, 0, 8),
+    );
+}
+
+#[test]
+fn trailing_semicolon_locations_follow_token_boundaries() {
+    let source = r#"first = "not; boundary"; second = 2
+continued = 1 \
+    ; third = 3
+commented = 4  # ; not a boundary
+"#;
+    let parsed = parse_module(source).unwrap();
+    let compiler = Compiler::module("example.py", source, parsed.tokens().clone());
+    let locations = parsed
+        .suite()
+        .iter()
+        .map(|statement| compiler.source_location_including_trailing_semicolon(statement.range()))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        locations,
+        [
+            SourceLocation::new(1, 1, 0, 24),
+            SourceLocation::new(1, 1, 25, 35),
+            SourceLocation::new(2, 3, 0, 5),
+            SourceLocation::new(3, 3, 6, 15),
+            SourceLocation::new(4, 4, 0, 13),
+        ],
+    );
 }
 
 #[test]

@@ -27,61 +27,41 @@ impl Compiler {
         &self,
         range: ruff_text_size::TextRange,
         name_range: ruff_text_size::TextRange,
-        keyword: &[u8],
+        keyword: TokenKind,
         is_async: bool,
     ) -> SourceLocation {
-        fn find_keyword(bytes: &[u8], start: usize, end: usize, keyword: &[u8]) -> Option<usize> {
-            let last_start = end.checked_sub(keyword.len())?;
-            (start..=last_start).rev().find(|&offset| {
-                bytes.get(offset..offset + keyword.len()) == Some(keyword)
-                    && bytes
-                        .get(offset.wrapping_sub(1))
-                        .is_none_or(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_')
-                    && bytes
-                        .get(offset + keyword.len())
-                        .is_none_or(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_')
-            })
-        }
-
-        let bytes = self.context.source.as_bytes();
-        let range_start = usize::from(range.start());
-        let name_start = usize::from(name_range.start());
-        let keyword_start = find_keyword(bytes, range_start, name_start, keyword)
-            .unwrap_or_else(|| name_start.saturating_sub(keyword.len() + 1));
-        let start = if is_async {
-            find_keyword(bytes, range_start, keyword_start, b"async").unwrap_or(keyword_start)
-        } else {
-            keyword_start
-        };
-        let (line, column) = self.source_position(u32::try_from(start).unwrap_or(u32::MAX));
+        let tokens = self.context.tokens.in_range(ruff_text_size::TextRange::new(
+            range.start(),
+            name_range.start(),
+        ));
+        let start = tokens
+            .iter()
+            .enumerate()
+            .rfind(|(_, token)| token.kind() == keyword)
+            .map_or(range.start(), |(keyword_index, keyword)| {
+                if is_async {
+                    tokens[..keyword_index]
+                        .iter()
+                        .rfind(|token| token.kind() == TokenKind::Async)
+                        .map_or(keyword.start(), ruff_text_size::Ranged::start)
+                } else {
+                    keyword.start()
+                }
+            });
+        let (line, column) = self.source_position(u32::from(start));
         let (end_line, end_column) = self.definition_end_position(range);
         SourceLocation::new(line, end_line, column, end_column)
     }
 
     fn definition_end_position(&self, range: ruff_text_size::TextRange) -> (i32, i32) {
-        let bytes = self.context.source.as_bytes();
-        let original_end = usize::from(range.end());
-        let mut end = original_end;
-        loop {
-            while matches!(bytes.get(end), Some(b' ' | b'\t' | b'\x0c')) {
-                end += 1;
-            }
-            if bytes.get(end) == Some(&b';') {
-                return self.source_position(u32::try_from(end + 1).unwrap_or(u32::MAX));
-            }
-            if bytes.get(end) != Some(&b'\\') {
-                break;
-            }
-            end += 1;
-            if bytes.get(end) == Some(&b'\r') {
-                end += 1;
-            }
-            if bytes.get(end) != Some(&b'\n') {
-                break;
-            }
-            end += 1;
-        }
-        self.source_position(u32::try_from(original_end).unwrap_or(u32::MAX))
+        let end = self
+            .context
+            .tokens
+            .after(range.end())
+            .first()
+            .filter(|token| token.kind() == TokenKind::Semi)
+            .map_or(range.end(), ruff_text_size::Ranged::end);
+        self.source_position(u32::from(end))
     }
 
     pub(super) fn source_position(&self, offset: u32) -> (i32, i32) {
