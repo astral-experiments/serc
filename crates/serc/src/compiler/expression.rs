@@ -3776,7 +3776,7 @@ impl Compiler {
         } else {
             self.compile_expression(last)?;
         }
-        self.assembler.preserve_block_boundary(end);
+        self.assembler.preserve_block_boundary_if_new(end);
         self.assembler.mark(end);
         self.set_depth(base_depth + 1);
         Ok(())
