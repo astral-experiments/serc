@@ -35,6 +35,7 @@ use super::{Compiler, Scope};
 
 #[derive(Clone, Copy, Debug)]
 struct LoopContext {
+    body_start: usize,
     continue_label: Label,
     break_label: Label,
     iterator_cleanup: IteratorCleanup,
@@ -179,6 +180,7 @@ impl Compiler {
         break_policy: LoopBreakPolicy,
     ) -> LoopContext {
         LoopContext {
+            body_start: self.assembler.instruction_count(),
             continue_label,
             break_label,
             iterator_cleanup,
@@ -1451,7 +1453,10 @@ impl Compiler {
                     .last()
                     .copied()
                     .ok_or_else(|| CompileError::Internal("break outside loop".to_string()))?;
+                let is_first_emitted_body_instruction =
+                    self.assembler.instruction_count() == context.body_start;
                 self.emit(NOP, 0, 0)?;
+                let marker_end = self.assembler.instruction_count();
                 let finally_end_unwind_start =
                     self.emit_finally_end_unwind(context.finally_end_depth, false)?;
                 let exclusion_start = if self.control.active_exception_region_exclusions.len()
@@ -1486,6 +1491,7 @@ impl Compiler {
                             self.assembler.mark(start);
                             start
                         });
+                    let has_no_emitted_cleanup = self.assembler.instruction_count() == marker_end;
                     self.emit_jump_forward(JUMP_FORWARD, context.break_label, 0)?;
                     if context.break_policy.preserves_jump_exit() {
                         // CPython inlines small exit blocks before removing a jump to the next
@@ -1493,6 +1499,16 @@ impl Compiler {
                         // the following finally return is copied onto the edge.
                         self.assembler.defer_last_jump_removal();
                         self.assembler.preserve_last_inlined_jump_nop();
+                    } else if has_no_emitted_cleanup {
+                        // CPython keeps the break marker when it replaces a jump with a small
+                        // inlined exit block. A break that is the first emitted body instruction
+                        // also owns the line event after early direct-jump removal; later
+                        // same-line body instructions do not. Cleanup edges retain neither NOP.
+                        if is_first_emitted_body_instruction {
+                            self.assembler.preserve_last_inlined_jump_nop();
+                        } else {
+                            self.assembler.preserve_last_direct_inlined_jump_nop();
+                        }
                     }
                     if let Some(jump_exclusion_start) = jump_exclusion_start {
                         let jump_exclusion_end = self.assembler.label();
