@@ -3,6 +3,40 @@
 
 use super::*;
 
+#[derive(Debug)]
+pub(super) struct CodeUnit {
+    pub(super) scope: Scope,
+    pub(super) scope_id: ScopeId,
+    pub(super) generic_target_qualified_name: Option<String>,
+    pub(super) child_qualified_name_parent: Option<String>,
+    pub(super) class_scope_is_nested: bool,
+    pub(super) module_annotation_index: u32,
+    pub(super) annotation_classdict_index: Option<u32>,
+    pub(super) name: String,
+    pub(super) qualified_name: String,
+    pub(super) private_name: Option<String>,
+    pub(super) arg_count: u32,
+    pub(super) positional_only_arg_count: u32,
+    pub(super) keyword_only_arg_count: u32,
+    pub(super) flags: u32,
+    pub(super) first_line_number: u32,
+    pub(super) annotation_thunk: bool,
+}
+
+#[derive(Debug)]
+pub(super) struct CodeUnitSpec {
+    pub(super) scope: Scope,
+    pub(super) scope_id: ScopeId,
+    pub(super) name: String,
+    pub(super) qualified_name: String,
+    pub(super) private_name: Option<String>,
+    pub(super) arg_count: u32,
+    pub(super) positional_only_arg_count: u32,
+    pub(super) keyword_only_arg_count: u32,
+    pub(super) flags: u32,
+    pub(super) first_line_number: u32,
+}
+
 impl Compiler {
     fn new(context: Arc<CompilationContext>, unit: CodeUnit, symbols: SymbolState) -> Self {
         Self {
@@ -17,12 +51,7 @@ impl Compiler {
     }
 
     pub(crate) fn module(filename: &str, source: &str) -> Self {
-        let context = Arc::new(CompilationContext {
-            filename: filename.to_string(),
-            source: Arc::from(source),
-            line_index: LineIndex::from_source_text(source),
-            scopes: OnceLock::new(),
-        });
+        let context = Arc::new(CompilationContext::new(filename, source));
         let unit = CodeUnit::from_spec(CodeUnitSpec {
             scope: Scope::Module,
             scope_id: ScopeId::MODULE,

@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::BTreeSet;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use ruff_python_ast::visitor::{Visitor, walk_expr, walk_pattern, walk_stmt};
 use ruff_python_ast::{
@@ -10,7 +10,6 @@ use ruff_python_ast::{
     StmtFunctionDef, Suite, TypeParam, UnaryOp,
 };
 use ruff_python_codegen::{Generator, Indentation, Mode as CodegenMode};
-use ruff_source_file::{LineEnding, LineIndex};
 use ruff_text_size::{Ranged, TextSize};
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -18,7 +17,7 @@ type HashMap<K, V> = FxHashMap<K, V>;
 type HashSet<T> = FxHashSet<T>;
 
 use crate::CompileError;
-use crate::assembler::{AssembledCode, Assembler, InstructionId, Label, SourceLocation};
+use crate::assembler::{AssembledCode, Assembler, Label, SourceLocation};
 use crate::target::code_flags::{
     CO_ASYNC_GENERATOR, CO_COROUTINE, CO_FUTURE_ANNOTATIONS, CO_FUTURE_BARRY_AS_BDFL, CO_GENERATOR,
     CO_HAS_DOCSTRING, CO_METHOD, CO_NESTED, CO_NEWLOCALS, CO_OPTIMIZED, CO_VARARGS, CO_VARKEYWORDS,
@@ -51,7 +50,8 @@ mod tests;
 // Compiler submodules intentionally share the parent-owned state and lowering vocabulary.
 #[allow(clippy::wildcard_imports)]
 use self::{
-    constant::*, definition::*, expression::*, scope::*, source::*, statement::*, symbol::*,
+    constant::*, definition::*, expression::*, orchestration::CodeUnit, scope::*, source::*,
+    statement::*, symbol::*,
 };
 
 // CPython initially emits owned local loads, then strength-reduces safe loads
@@ -268,112 +268,6 @@ impl TryCompileOptions {
         emit_statement_nop: false,
         exclude_terminal_body_not_taken: false,
     };
-}
-
-#[derive(Debug)]
-struct CompilationContext {
-    filename: String,
-    source: Arc<str>,
-    line_index: LineIndex,
-    scopes: OnceLock<ScopeArena>,
-}
-
-#[derive(Debug)]
-struct CodeUnit {
-    scope: Scope,
-    scope_id: ScopeId,
-    generic_target_qualified_name: Option<String>,
-    child_qualified_name_parent: Option<String>,
-    class_scope_is_nested: bool,
-    module_annotation_index: u32,
-    annotation_classdict_index: Option<u32>,
-    name: String,
-    qualified_name: String,
-    private_name: Option<String>,
-    arg_count: u32,
-    positional_only_arg_count: u32,
-    keyword_only_arg_count: u32,
-    flags: u32,
-    first_line_number: u32,
-    annotation_thunk: bool,
-}
-
-#[derive(Debug)]
-struct CodeUnitSpec {
-    scope: Scope,
-    scope_id: ScopeId,
-    name: String,
-    qualified_name: String,
-    private_name: Option<String>,
-    arg_count: u32,
-    positional_only_arg_count: u32,
-    keyword_only_arg_count: u32,
-    flags: u32,
-    first_line_number: u32,
-}
-
-#[derive(Debug, Default)]
-struct OutputState {
-    constants: Vec<Constant>,
-    deferred_constants_before_return: Vec<(InstructionId, Constant)>,
-    deferred_constants: Vec<(Option<InstructionId>, Constant)>,
-    deferred_names: Vec<(InstructionId, String)>,
-    names: Vec<String>,
-    name_indices: FxHashMap<NameId, u32>,
-    interned_constant_strings: HashSet<String>,
-}
-
-#[derive(Debug, Default)]
-struct SymbolState {
-    locals: Vec<String>,
-    fast_local_count: usize,
-    cell_names: NameSet,
-    free_names: Vec<String>,
-    temporary_indices: FxHashMap<NameId, u32>,
-    hidden_names: NameSet,
-    active_temporaries: NameSet,
-    initialized_locals: NameSet,
-    owned_load_locals: NameSet,
-    imported_scope_names: NameSet,
-    type_parameter_names: NameSet,
-    module_globals: NameSet,
-}
-
-#[derive(Debug, Default)]
-struct ControlFlowState {
-    defer_async_comprehension_restore: bool,
-    reorder_async_comprehension_cleanup_throw: bool,
-    pending_comprehension_restores: Vec<(Vec<u32>, SourceLocation)>,
-    active_comprehension_cleanups: Vec<(Label, u32)>,
-    active_comprehension_region_exclusions: Vec<Vec<(Label, Label)>>,
-    active_with_exits: Vec<WithExitContext>,
-    active_with_region_exclusions: Vec<Vec<(Label, Label)>>,
-    active_terminal_withs: usize,
-    // CPython retains the empty end block when an async for ends a protected suite.
-    emit_protected_async_for_end_nop: bool,
-    active_exception_region_exclusions: Vec<Vec<(Label, Label)>>,
-    active_exception_handlers: Vec<ExceptionHandlerContext>,
-    active_return_finally_contexts: Vec<ReturnFinallyContext>,
-    // CPython's normalized `NOT_TAKEN` can reuse a normal-finally CFG slot that still owns the
-    // coroutine stop-iteration handler.
-    active_normal_finally_bodies: usize,
-    active_finally_end_blocks: usize,
-    active_finally_try_bodies: usize,
-    active_pass_finally_locations: Vec<SourceLocation>,
-    active_overriding_finally_returns: usize,
-    preserve_finally_break_exit_loop_range: Option<ruff_text_size::TextRange>,
-    exclude_terminal_if_not_taken: bool,
-    exclude_condition_not_taken_from_exception: bool,
-    exclude_condition_not_taken_from_all_exception_regions: bool,
-    exclude_loop_tail_not_taken_from_control_flow_regions: bool,
-    unwind_exception_handlers_for_implicit_return: bool,
-    prevent_try_exit_inlining: bool,
-    generator_region_start: Option<Label>,
-    generator_region_exclusions: Vec<(Label, Label)>,
-    emitted_fallthrough_return: bool,
-    loops: Vec<LoopContext>,
-    depth: i32,
-    max_depth: u32,
 }
 
 #[derive(Debug)]

@@ -1,7 +1,20 @@
 // Compiler submodules intentionally share the parent-owned state and lowering vocabulary.
 #![allow(clippy::wildcard_imports)]
 
+use crate::assembler::InstructionId;
+
 use super::*;
+
+#[derive(Debug, Default)]
+pub(super) struct OutputState {
+    pub(super) constants: Vec<Constant>,
+    pub(super) deferred_constants_before_return: Vec<(InstructionId, Constant)>,
+    pub(super) deferred_constants: Vec<(Option<InstructionId>, Constant)>,
+    pub(super) deferred_names: Vec<(InstructionId, String)>,
+    pub(super) names: Vec<String>,
+    pub(super) name_indices: FxHashMap<NameId, u32>,
+    pub(super) interned_constant_strings: HashSet<String>,
+}
 
 impl Compiler {
     pub(super) fn emit_folded_constant(
