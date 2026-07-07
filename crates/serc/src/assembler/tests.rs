@@ -659,6 +659,41 @@ fn graph_opcodes(assembler: &super::OptimizationPipeline) -> Vec<crate::target::
 }
 
 #[test]
+fn threads_unconditional_forward_jumps_without_conditional_jumps() {
+    let first_target = super::Label(0);
+    let final_target = super::Label(1);
+    let mut assembler = optimization_pipeline(vec![
+        Item::Instruction(Instruction::new(
+            JUMP_FORWARD,
+            Operand::Forward(first_target),
+            SourceLocation::NONE,
+            None,
+        )),
+        Item::Label(first_target),
+        Item::Instruction(Instruction::new(
+            JUMP_FORWARD,
+            Operand::Forward(final_target),
+            SourceLocation::NONE,
+            None,
+        )),
+        Item::Label(final_target),
+        pass_instruction(RETURN_VALUE, 0, 1),
+    ]);
+
+    assembler.thread_forward_jumps();
+
+    let graph = &assembler.graph;
+    let first = graph
+        .iter_items()
+        .find_map(|item| match item {
+            Item::Instruction(instruction) => Some(instruction),
+            Item::Label(_) => None,
+        })
+        .unwrap();
+    assert!(matches!(first.operand, Operand::Forward(label) if label == final_target));
+}
+
+#[test]
 fn uninitialized_load_analysis_follows_single_block_backedges() {
     let label = super::Label(0);
     let mut assembler = optimization_pipeline(vec![
