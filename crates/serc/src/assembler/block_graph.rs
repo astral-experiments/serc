@@ -285,7 +285,7 @@ impl BlockGraph {
         block
     }
 
-    pub(super) fn allocate_block(&mut self, items: Vec<Item>) -> BasicBlockId {
+    fn allocate_block(&mut self, items: Vec<Item>) -> BasicBlockId {
         let block = BasicBlockId(self.blocks.len());
         self.blocks.push(BasicBlock::new(items));
         let labels = self[block]
