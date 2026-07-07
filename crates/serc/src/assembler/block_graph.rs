@@ -1,6 +1,6 @@
 use std::ops::{Index, IndexMut};
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashSet;
 
 use super::{
     ExceptionRegion, Instruction, Item, Label, Operand, block_has_fallthrough, block_jump_target,
@@ -13,6 +13,8 @@ use super::{
 /// emitted order therefore never changes the identity of any other block.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(super) struct BasicBlockId(usize);
+
+const UNBOUND_BLOCK: BasicBlockId = BasicBlockId(usize::MAX);
 
 impl BasicBlockId {
     pub(super) const fn index(self) -> usize {
@@ -74,7 +76,7 @@ impl BasicBlock {
 pub(super) struct BlockGraph {
     blocks: Vec<BasicBlock>,
     order: Vec<BasicBlockId>,
-    label_blocks: FxHashMap<Label, BasicBlockId>,
+    label_blocks: Vec<BasicBlockId>,
 }
 
 fn normalized_segment_lengths<'a>(
@@ -156,7 +158,7 @@ impl BlockGraph {
         let mut graph = Self {
             blocks,
             order,
-            label_blocks: FxHashMap::default(),
+            label_blocks: Vec::new(),
         };
         graph.rebuild_label_index();
         graph
@@ -215,7 +217,30 @@ impl BlockGraph {
     }
 
     pub(super) fn label_block(&self, label: Label) -> Option<BasicBlockId> {
-        self.label_blocks.get(&label).copied()
+        self.label_blocks
+            .get(usize::try_from(label.0).unwrap())
+            .copied()
+            .filter(|block| *block != UNBOUND_BLOCK)
+    }
+
+    fn clear_label_index(&mut self) {
+        self.label_blocks.fill(UNBOUND_BLOCK);
+    }
+
+    fn bind_label(&mut self, label: Label, block: BasicBlockId) {
+        let index = usize::try_from(label.0).unwrap();
+        if index >= self.label_blocks.len() {
+            self.label_blocks.resize(index + 1, UNBOUND_BLOCK);
+        }
+        let previous = std::mem::replace(&mut self.label_blocks[index], block);
+        debug_assert_eq!(previous, UNBOUND_BLOCK, "label is bound more than once");
+    }
+
+    fn unbind_label(&mut self, label: Label) {
+        let index = usize::try_from(label.0).unwrap();
+        if let Some(block) = self.label_blocks.get_mut(index) {
+            *block = UNBOUND_BLOCK;
+        }
     }
 
     pub(super) fn push_block(&mut self, items: Vec<Item>) -> BasicBlockId {
@@ -240,8 +265,7 @@ impl BlockGraph {
             })
             .collect::<Vec<_>>();
         for label in labels {
-            let previous = self.label_blocks.insert(label, block);
-            debug_assert!(previous.is_none(), "label is bound more than once");
+            self.bind_label(label, block);
         }
         block
     }
@@ -263,7 +287,7 @@ impl BlockGraph {
         // Labels may move from an existing block into a newly allocated suffix.
         // Rebuild the index after repartitioning instead of treating that move
         // as a duplicate binding.
-        self.label_blocks.clear();
+        self.clear_label_index();
         let item_count = self
             .order
             .iter()
@@ -313,7 +337,6 @@ impl BlockGraph {
         starts_block: impl Fn(&Instruction) -> bool,
         ends_block: impl Fn(&Instruction) -> bool,
     ) {
-        self.label_blocks.clear();
         let item_count = self
             .order
             .iter()
@@ -350,6 +373,17 @@ impl BlockGraph {
             segment_lengths.push(segment_length);
         }
 
+        if segment_lengths.len() == self.order.len()
+            && self
+                .order
+                .iter()
+                .zip(&segment_lengths)
+                .all(|(block, length)| self[*block].items.len() == *length)
+        {
+            return;
+        }
+
+        self.clear_label_index();
         let original_order = std::mem::take(&mut self.order);
         let items = original_order
             .iter()
@@ -386,24 +420,27 @@ impl BlockGraph {
             })
             .collect::<Vec<_>>();
         for label in labels {
-            let previous = self.label_blocks.insert(label, block);
-            debug_assert!(previous.is_none(), "label is bound more than once");
+            self.bind_label(label, block);
         }
     }
 
     pub(super) fn insert_label(&mut self, block: BasicBlockId, position: usize, label: Label) {
         self[block].items.insert(position, Item::Label(label));
-        let previous = self.label_blocks.insert(label, block);
-        debug_assert!(previous.is_none(), "label is bound more than once");
+        self.bind_label(label, block);
     }
 
     pub(super) fn rebuild_label_index(&mut self) {
-        let mut label_blocks = FxHashMap::default();
+        let mut label_blocks = std::mem::take(&mut self.label_blocks);
+        label_blocks.fill(UNBOUND_BLOCK);
         for block in self.order.iter().copied() {
             for item in self[block].items() {
                 if let Item::Label(label) = item {
-                    let previous = label_blocks.insert(*label, block);
-                    debug_assert!(previous.is_none(), "label is bound more than once");
+                    let index = usize::try_from(label.0).unwrap();
+                    if index >= label_blocks.len() {
+                        label_blocks.resize(index + 1, UNBOUND_BLOCK);
+                    }
+                    let previous = std::mem::replace(&mut label_blocks[index], block);
+                    debug_assert_eq!(previous, UNBOUND_BLOCK, "label is bound more than once");
                 }
             }
         }
@@ -523,8 +560,7 @@ impl BlockGraph {
 
     pub(super) fn insert_item(&mut self, position: ItemPosition, item: Item) {
         if let Item::Label(label) = item {
-            let previous = self.label_blocks.insert(label, position.block);
-            debug_assert!(previous.is_none(), "label is bound more than once");
+            self.bind_label(label, position.block);
         }
         self[position.block].items.insert(position.offset, item);
     }
@@ -532,25 +568,20 @@ impl BlockGraph {
     pub(super) fn remove_item(&mut self, position: ItemPosition) -> Item {
         let item = self[position.block].items.remove(position.offset);
         if let Item::Label(label) = item {
-            self.label_blocks.remove(&label);
+            self.unbind_label(label);
         }
         item
     }
 
-    pub(super) fn reachable_blocks(
-        &self,
-        exception_regions: &[ExceptionRegion],
-    ) -> FxHashSet<BasicBlockId> {
+    pub(super) fn reachable_blocks(&self, exception_regions: &[ExceptionRegion]) -> Vec<bool> {
+        let mut reachable = vec![false; self.blocks.len()];
         let Some(entry) = self.order.first().copied() else {
-            return FxHashSet::default();
+            return reachable;
         };
-        let order_positions = self
-            .order
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(position, block)| (block, position))
-            .collect::<FxHashMap<_, _>>();
+        let mut order_positions = vec![usize::MAX; self.blocks.len()];
+        for (position, block) in self.order.iter().copied().enumerate() {
+            order_positions[block.index()] = position;
+        }
         let region_blocks = exception_regions
             .iter()
             .filter_map(|region| {
@@ -561,7 +592,6 @@ impl BlockGraph {
                 ))
             })
             .collect::<Vec<_>>();
-        let mut reachable = FxHashSet::default();
         let mut pending = vec![entry];
         pending.extend(
             region_blocks
@@ -569,10 +599,10 @@ impl BlockGraph {
                 .filter_map(|(start, end, handler)| (start == end).then_some(*handler)),
         );
         while let Some(block) = pending.pop() {
-            if !reachable.insert(block) {
+            if std::mem::replace(&mut reachable[block.index()], true) {
                 continue;
             }
-            let position = order_positions[&block];
+            let position = order_positions[block.index()];
             if block_has_fallthrough(self[block].items())
                 && let Some(next) = self.order.get(position + 1)
             {
@@ -584,7 +614,9 @@ impl BlockGraph {
                 pending.push(target);
             }
             for (start, end, handler) in &region_blocks {
-                if order_positions[start] <= position && position < order_positions[end] {
+                if order_positions[start.index()] <= position
+                    && position < order_positions[end.index()]
+                {
                     pending.push(*handler);
                 }
             }
@@ -596,7 +628,7 @@ impl BlockGraph {
         let reachable = self.reachable_blocks(exception_regions);
         self.iter()
             .flat_map(|(block, contents)| {
-                let reachable = reachable.contains(&block);
+                let reachable = reachable[block.index()];
                 contents
                     .items()
                     .iter()
@@ -633,7 +665,7 @@ impl BlockGraph {
     #[cfg(any(test, debug_assertions))]
     pub(super) fn validate(&self) -> Result<(), String> {
         let mut seen_blocks = FxHashSet::default();
-        let mut labels = FxHashMap::default();
+        let mut labels = Vec::new();
         for block in self.order.iter().copied() {
             if !seen_blocks.insert(block) {
                 return Err(format!("block {} appears more than once", block.index()));
@@ -645,14 +677,25 @@ impl BlockGraph {
                 return Err(format!("block {} is empty", block.index()));
             }
             for item in contents.items() {
-                if let Item::Label(label) = item
-                    && labels.insert(*label, block).is_some()
-                {
-                    return Err(format!("label {} is bound more than once", label.0));
+                if let Item::Label(label) = item {
+                    let index = usize::try_from(label.0).unwrap();
+                    if index >= labels.len() {
+                        labels.resize(index + 1, UNBOUND_BLOCK);
+                    }
+                    if std::mem::replace(&mut labels[index], block) != UNBOUND_BLOCK {
+                        return Err(format!("label {} is bound more than once", label.0));
+                    }
                 }
             }
         }
-        if labels != self.label_blocks {
+        while labels.last() == Some(&UNBOUND_BLOCK) {
+            labels.pop();
+        }
+        let mut indexed = self.label_blocks.as_slice();
+        while indexed.last() == Some(&UNBOUND_BLOCK) {
+            indexed = &indexed[..indexed.len() - 1];
+        }
+        if labels != indexed {
             return Err("label-to-block index is stale".to_string());
         }
         Ok(())
@@ -771,7 +814,7 @@ mod tests {
         let mut graph = BlockGraph {
             blocks: Vec::new(),
             order: Vec::new(),
-            label_blocks: FxHashMap::default(),
+            label_blocks: Vec::new(),
         };
         let first = graph.push_block(vec![
             Item::Label(first_label),
