@@ -120,14 +120,7 @@ impl Compiler {
         wrapper.emit_unary_intrinsic(UnaryIntrinsic::TYPEALIAS)?;
         wrapper.emit(RETURN_VALUE, 0, -1)?;
         let wrapper = wrapper.finish_inner(false)?;
-
-        let wrapper_closure_names: Vec<_> = wrapper
-            .locals
-            .iter()
-            .zip(&wrapper.local_kinds)
-            .filter(|(_, kind)| **kind & CO_FAST_FREE != 0)
-            .map(|(name, _)| name.clone())
-            .collect();
+        let wrapper_closure_names = plan.freevars;
         if !wrapper_closure_names.is_empty() {
             self.emit_closure_tuple(&wrapper_closure_names)?;
         }
@@ -297,14 +290,7 @@ impl Compiler {
         wrapper.emit_binary_intrinsic(BinaryIntrinsic::SET_FUNCTION_TYPE_PARAMS)?;
         wrapper.emit(RETURN_VALUE, 0, -1)?;
         let wrapper = wrapper.finish_inner(false)?;
-
-        let wrapper_closure_names: Vec<_> = wrapper
-            .locals
-            .iter()
-            .zip(&wrapper.local_kinds)
-            .filter(|(_, kind)| **kind & CO_FAST_FREE != 0)
-            .map(|(name, _)| name.clone())
-            .collect();
+        let wrapper_closure_names = wrapper_plan.freevars;
         if !wrapper_closure_names.is_empty() {
             self.emit_closure_tuple(&wrapper_closure_names)?;
         }
@@ -372,7 +358,7 @@ impl Compiler {
             };
 
         let (scope_id, plan) = self.resolved_function_plan(definition)?;
-        let closure_names = self.name_strings(plan.freevars.iter().copied());
+        let closure_names = plan.freevars.clone();
         let annotation_child = self.compile_function_annotations(definition, &plan)?;
 
         let arg_count = to_u32(
@@ -448,14 +434,7 @@ impl Compiler {
         let child = child.compile_function_body(&definition.body)?;
 
         self.assembler.set_location(definition_location);
-        if let Some(annotation_child) = annotation_child {
-            let annotation_closure_names: Vec<_> = annotation_child
-                .locals
-                .iter()
-                .zip(&annotation_child.local_kinds)
-                .filter(|(_, kind)| **kind & CO_FAST_FREE != 0)
-                .map(|(name, _)| name.clone())
-                .collect();
+        if let Some((annotation_child, annotation_closure_names)) = annotation_child {
             if !annotation_closure_names.is_empty() {
                 self.emit_closure_tuple(&annotation_closure_names)?;
             }
@@ -692,13 +671,7 @@ impl Compiler {
             .compile_plain_class_definition(definition, DefinitionDecorators::AlreadyCompiled)?;
         wrapper.emit(RETURN_VALUE, 0, -1)?;
         let wrapper = wrapper.finish_inner(false)?;
-        let wrapper_closure_names: Vec<_> = wrapper
-            .locals
-            .iter()
-            .zip(&wrapper.local_kinds)
-            .filter(|(_, kind)| **kind & CO_FAST_FREE != 0)
-            .map(|(name, _)| name.clone())
-            .collect();
+        let wrapper_closure_names = plan.freevars;
 
         let definition_location =
             self.definition_location(definition.range, definition.name.range(), b"class", false);
@@ -763,7 +736,7 @@ impl Compiler {
             let type_params = self.required_name_id(".type_params");
             self.insert_lexical_name(&mut freevars, type_params);
         }
-        let closure_names = self.name_strings(freevars.iter().copied());
+        let closure_names = freevars.clone();
         let qualified_name = self
             .unit
             .generic_target_qualified_name
@@ -1057,8 +1030,7 @@ impl Compiler {
             || self
                 .symbols
                 .free_names
-                .iter()
-                .any(|name| name == "__classdict__");
+                .contains(&self.required_name_id("__classdict__"));
         if can_see_class_scope {
             let classdict = self.required_name_id("__classdict__");
             self.insert_lexical_name(&mut freevars, classdict);
@@ -1070,13 +1042,13 @@ impl Compiler {
             .map(|name| self.required_name_id(name))
             .filter(|name| !freevar_set.contains(name))
             .collect();
-        let closure_names = self.name_strings(freevars.iter().copied());
         let plan = LoweringFunctionPlan {
             locals: vec![self.required_name_id(".format")],
             globals,
             freevars,
             ..LoweringFunctionPlan::default()
         };
+        let closure_names = plan.freevars.clone();
         // Definitions inside an annotation scope are qualified against that
         // scope's parent. Generic-parameter wrappers are themselves annotation
         // scopes even though this compiler represents them as functions.
@@ -1125,7 +1097,7 @@ impl Compiler {
         child
             .assembler
             .set_location(child.source_location(setup_range));
-        child.emit_annotation_format_guard()?;
+        child.emit_annotation_format_guard(".format")?;
         child.compile_expression(expression)?;
         child
             .assembler
@@ -1149,13 +1121,8 @@ impl Compiler {
         self.emit_function_attribute(FunctionAttribute::DEFAULTS)
     }
 
-    fn emit_annotation_format_guard(&mut self) -> Result<(), CompileError> {
-        let parameter = self
-            .symbols
-            .locals
-            .first()
-            .map_or_else(|| "format".to_string(), Clone::clone);
-        self.load_name(&parameter)?;
+    fn emit_annotation_format_guard(&mut self, parameter: &str) -> Result<(), CompileError> {
+        self.load_name(parameter)?;
         self.add_constant(Constant::Int(2))?;
         self.emit(LOAD_SMALL_INT, 2, 1)?;
         self.emit_comparison(ComparisonOperation::GT, false)?;
@@ -1173,7 +1140,7 @@ impl Compiler {
         &self,
         definition: &StmtFunctionDef,
         function_plan: &LoweringFunctionPlan,
-    ) -> Result<Option<CodeObject>, CompileError> {
+    ) -> Result<Option<(CodeObject, Vec<NameId>)>, CompileError> {
         let parameters = &definition.parameters;
         let mut annotations = Vec::<(String, &Expr)>::new();
         for parameter in parameters.args.iter().chain(&parameters.posonlyargs) {
@@ -1219,8 +1186,7 @@ impl Compiler {
                 || self
                     .symbols
                     .free_names
-                    .iter()
-                    .any(|name| name == "__classdict__"));
+                    .contains(&self.required_name_id("__classdict__")));
         if can_see_class_scope {
             let classdict = self.required_name_id("__classdict__");
             self.insert_lexical_name(&mut freevars, classdict);
@@ -1276,7 +1242,7 @@ impl Compiler {
         );
         child.assembler.set_location(location);
 
-        child.emit_annotation_format_guard()?;
+        child.emit_annotation_format_guard("format")?;
 
         let future_annotations = self.unit.flags & CO_FUTURE_ANNOTATIONS != 0;
         for (name, annotation) in &annotations {
@@ -1300,13 +1266,14 @@ impl Compiler {
         let count = to_u32(annotations.len(), "annotation count")?;
         child.emit(BUILD_MAP, count, 1 - i32::try_from(count).unwrap() * 2)?;
         child.emit(RETURN_VALUE, 0, -1)?;
-        child.finish_inner(false).map(Some)
+        let child = child.finish_inner(false)?;
+        Ok(Some((child, plan.freevars)))
     }
 
     pub(super) fn compile_class_annotations(
         &self,
         body: &[Stmt],
-    ) -> Result<Option<(CodeObject, Vec<String>)>, CompileError> {
+    ) -> Result<Option<(CodeObject, Vec<NameId>)>, CompileError> {
         let mut annotations = Vec::new();
         collect_simple_annotations(body, &mut annotations);
         if annotations.is_empty() {
@@ -1317,7 +1284,7 @@ impl Compiler {
         for annotation in &annotations {
             references.visit_expr(&annotation.annotation);
         }
-        let available_freevars = self.name_id_set(&self.symbols.free_names);
+        let available_freevars: FxHashSet<_> = self.symbols.free_names.iter().copied().collect();
         let reference_ids = self.name_id_set(&references.references);
         let mut freevars = Vec::new();
         for name in reference_ids
@@ -1334,7 +1301,7 @@ impl Compiler {
             .into_iter()
             .filter(|name| !freevar_set.contains(name))
             .collect();
-        let closure_names = self.name_strings(freevars.iter().copied());
+        let closure_names = freevars.clone();
         let plan = LoweringFunctionPlan {
             locals: vec![self.required_name_id("format")],
             globals,
@@ -1370,7 +1337,7 @@ impl Compiler {
         let line = i32::try_from(self.unit.first_line_number).unwrap_or(i32::MAX);
         let setup_location = SourceLocation::new(line, line, 0, 0);
         child.assembler.set_location(setup_location);
-        child.emit_annotation_format_guard()?;
+        child.emit_annotation_format_guard("format")?;
         child.emit(BUILD_MAP, 0, 1)?;
 
         for annotation in annotations {

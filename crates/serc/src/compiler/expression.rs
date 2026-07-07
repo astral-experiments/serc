@@ -1873,10 +1873,10 @@ impl Compiler {
                 let Some(class_index) = self.scope_index(free_indices, "__class__") else {
                     return Ok(false);
                 };
-                let Some(first_parameter) = self.symbols.locals.first() else {
+                let Some(first_parameter) = self.symbols.locals.first().copied() else {
                     return Ok(false);
                 };
-                let Some(first_parameter) = self.scope_index(indices, first_parameter) else {
+                let Some(first_parameter) = indices.get(&first_parameter).copied() else {
                     return Ok(false);
                 };
                 (class_index, first_parameter)
@@ -2000,7 +2000,7 @@ impl Compiler {
             .collect::<BTreeSet<_>>();
         let globals = self.name_id_set(analysis.required.difference(&freevar_names));
         let freevars = self.name_ids(&freevar_names);
-        let closure_names = self.name_strings(freevars.iter().copied());
+        let closure_names = freevars.clone();
         let plan = LoweringFunctionPlan {
             locals: self.name_ids(analysis.locals),
             globals,
@@ -2367,11 +2367,11 @@ impl Compiler {
                 globals.insert(name);
             }
         }
-        let closure_names: Vec<_> = freevars.iter().cloned().collect();
         let locals = self.name_ids(locals);
         let globals = self.name_id_set(globals);
         let generator_cellvars = self.name_id_set(generator_cellvars);
         let freevars = self.name_ids(freevars);
+        let closure_names = freevars.clone();
         let generator_range = self.generator_expression_range(generator.range);
         let plan = LoweringFunctionPlan {
             locals,
@@ -3233,7 +3233,7 @@ impl Compiler {
             index
         } else {
             let index = to_u32(self.symbols.locals.len(), "comprehension local count")?;
-            self.symbols.locals.push(name.to_string());
+            self.symbols.locals.push(name_id);
             if !matches!(self.unit.scope, Scope::Function { .. }) {
                 self.symbols.hidden_names.insert(name_id);
             }
