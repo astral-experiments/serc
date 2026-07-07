@@ -1,5 +1,5 @@
-use ruff_python_ast::Stmt;
 use ruff_python_ast::token::TokenKind;
+use ruff_python_ast::{Expr, Stmt};
 use ruff_python_parser::parse_module;
 use ruff_text_size::Ranged;
 
@@ -272,6 +272,54 @@ commented = 4  # ; not a boundary
             SourceLocation::new(4, 4, 0, 13),
         ],
     );
+}
+
+#[test]
+fn generator_expression_ranges_follow_parser_tokens() {
+    for (source, expected) in [
+        (
+            "result = consume(\n    # before\n    value for value in values\n    # after\n)\n",
+            "(\n    # before\n    value for value in values\n    # after\n)",
+        ),
+        (
+            "result = consume(\\\n    value for value in values\\\n)\n",
+            "(\\\n    value for value in values\\\n)",
+        ),
+        (
+            r#"result = consume((value, nested[")"], {"(": value}) for value in values if predicate(")#"))
+"#,
+            r#"((value, nested[")"], {"(": value}) for value in values if predicate(")#"))"#,
+        ),
+        (
+            r#"result = (((")", {"(": value}) for value in values))
+"#,
+            r#"((")", {"(": value}) for value in values)"#,
+        ),
+    ] {
+        let parsed = parse_module(source).unwrap();
+        let Stmt::Assign(assignment) = &parsed.suite()[0] else {
+            panic!("expected an assignment");
+        };
+        let generator = match assignment.value.as_ref() {
+            Expr::Generator(generator) => generator,
+            Expr::Call(call) => {
+                let [Expr::Generator(generator)] = call.arguments.args.as_ref() else {
+                    panic!("expected a generator call argument");
+                };
+                generator
+            }
+            expression => panic!("expected a generator or call, got {expression:?}"),
+        };
+        let compiler = Compiler::module("example.py", source, parsed.tokens().clone());
+        let range = compiler.generator_expression_range(generator);
+        let expected_start = source.find(expected).unwrap();
+        let actual_start = usize::from(range.start());
+        let actual_end = usize::from(range.end());
+
+        assert_eq!(actual_start, expected_start);
+        assert_eq!(actual_end, expected_start + expected.len());
+        assert_eq!(&source[actual_start..actual_end], expected);
+    }
 }
 
 #[test]
