@@ -19,6 +19,11 @@ pub(super) enum Scalar<'a> {
     Bytes(&'a [u8]),
 }
 
+#[expect(
+    clippy::inline_always,
+    reason = "specializes known scalar variants in the hot marshal path"
+)]
+#[inline(always)]
 pub(super) fn write_scalar(output: &mut Vec<u8>, value: Scalar<'_>, flag: u8) {
     match value {
         Scalar::None => output.push(TYPE_NONE),
