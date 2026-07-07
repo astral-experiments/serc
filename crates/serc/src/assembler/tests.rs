@@ -1,5 +1,7 @@
+use super::ir::{BorrowFallthrough, ExceptionPolicy};
 use super::{
-    Assembler, AssemblerStage, Instruction, InstructionFlags, Item, Operand, SourceLocation,
+    Assembler, AssemblerStage, ExceptionExclusion, Instruction, InstructionFlags, Item,
+    NormalizedExceptionOwner, Operand, SourceLocation,
 };
 use crate::target::opcodes::*;
 
@@ -17,7 +19,99 @@ fn instruction_constructors_set_audited_defaults() {
         synthetic.preserve_direct_inlined_jump_nop, None,
         "synthetic instructions do not inherit jump provenance"
     );
-    assert_eq!(synthetic.normalized_exception_owner, None);
+    assert_eq!(synthetic.exception_policy, ExceptionPolicy::default());
+    assert_eq!(regular.borrow_fallthrough, BorrowFallthrough::Reachable);
+    assert_eq!(synthetic.borrow_fallthrough, BorrowFallthrough::Reachable);
+}
+
+#[test]
+fn borrow_fallthrough_barrier_stays_on_predecessor_across_labels_and_emission() {
+    let mut assembler = Assembler::default();
+    assembler.emit(LOAD_CONST, 0);
+    let boundary = assembler.label();
+    assembler.mark(boundary);
+    assembler.mark_last_borrow_fallthrough_barrier();
+    assembler.emit(LOAD_CONST, 1);
+
+    let [
+        Item::Instruction(predecessor),
+        Item::Label(actual_boundary),
+        Item::Instruction(next),
+    ] = assembler.items.as_slice()
+    else {
+        panic!("unexpected instruction stream: {:?}", assembler.items);
+    };
+    assert_eq!(*actual_boundary, boundary);
+    assert_eq!(predecessor.borrow_fallthrough, BorrowFallthrough::Barrier);
+    assert_eq!(next.borrow_fallthrough, BorrowFallthrough::Reachable);
+}
+
+#[test]
+#[should_panic(expected = "borrow fallthrough barrier requires a preceding instruction")]
+fn borrow_fallthrough_barrier_requires_a_predecessor() {
+    let mut assembler = Assembler::default();
+    let boundary = assembler.label();
+    assembler.mark(boundary);
+    assembler.mark_last_borrow_fallthrough_barrier();
+}
+
+#[test]
+fn value_emission_attaches_exception_policy_across_intervening_labels() {
+    let mut assembler = Assembler::default();
+    let normalized_owner = ExceptionPolicy::normalized_owner(false);
+    assembler.emit_with_depth(NOT_TAKEN, 0, 0, normalized_owner);
+    let first_boundary = assembler.label();
+    assembler.mark(first_boundary);
+    assembler.emit_with_depth(NOP, 0, 0, ExceptionPolicy::EXCLUDE_ALWAYS);
+    let second_boundary = assembler.label();
+    assembler.mark(second_boundary);
+    assembler.emit_with_depth(NOP, 0, 0, ExceptionPolicy::default());
+
+    let [
+        Item::Instruction(normalized),
+        Item::Label(actual_first_boundary),
+        Item::Instruction(excluded),
+        Item::Label(actual_second_boundary),
+        Item::Instruction(default),
+    ] = assembler.items.as_slice()
+    else {
+        panic!("expected three instructions separated by labels");
+    };
+    assert_eq!(*actual_first_boundary, first_boundary);
+    assert_eq!(*actual_second_boundary, second_boundary);
+    assert_eq!(normalized.exception_policy, normalized_owner);
+    assert_eq!(excluded.exception_policy, ExceptionPolicy::EXCLUDE_ALWAYS);
+    assert_eq!(default.exception_policy, ExceptionPolicy::default());
+}
+
+#[test]
+fn jump_emission_attaches_exception_policy_after_an_intervening_label() {
+    let mut assembler = Assembler::default();
+    assembler.emit_with_depth(NOP, 0, 0, ExceptionPolicy::default());
+    let boundary = assembler.label();
+    assembler.mark(boundary);
+    let target = assembler.label();
+    assembler.emit_forward_with_depth(
+        JUMP_FORWARD,
+        target,
+        0,
+        ExceptionPolicy::EXCLUDE_IF_EXTENDED,
+    );
+
+    let [
+        Item::Instruction(default),
+        Item::Label(actual_boundary),
+        Item::Instruction(excluded),
+    ] = assembler.items.as_slice()
+    else {
+        panic!("expected two instructions separated by one label");
+    };
+    assert_eq!(*actual_boundary, boundary);
+    assert_eq!(default.exception_policy, ExceptionPolicy::default());
+    assert_eq!(
+        excluded.exception_policy,
+        ExceptionPolicy::EXCLUDE_IF_EXTENDED
+    );
 }
 
 #[test]
@@ -40,6 +134,14 @@ fn fusion_classifies_every_instruction_flag() {
 }
 
 #[test]
+fn exception_exclusion_names_layout_policy() {
+    assert!(!ExceptionExclusion::None.applies(1));
+    assert!(!ExceptionExclusion::IfExtended.applies(0));
+    assert!(ExceptionExclusion::IfExtended.applies(1));
+    assert!(ExceptionExclusion::Always.applies(0));
+}
+
+#[test]
 fn fusion_uses_each_flags_propagation_policy() {
     let mut first = Instruction::new(
         LOAD_FAST,
@@ -52,7 +154,6 @@ fn fusion_uses_each_flags_propagation_policy() {
         InstructionFlags::ALLOW_NO_LOCATION_BLOCK_INLINING,
         InstructionFlags::DEFER_REDUNDANT_JUMP_REMOVAL,
         InstructionFlags::CONVERTED_POP_BLOCK,
-        InstructionFlags::EXCLUDE_EXCEPTION_IF_EXTENDED,
         InstructionFlags::PREVENT_FUSION_WITH_NEXT,
         InstructionFlags::PRESERVE_INLINED_JUMP_NOP,
     ] {
@@ -60,7 +161,10 @@ fn fusion_uses_each_flags_propagation_policy() {
     }
     first.remove_flag(InstructionFlags::ALLOW_JUMP_THREADING_TARGET);
     first.preserve_direct_inlined_jump_nop = Some(super::Label(1));
-    first.normalized_exception_owner = Some(false);
+    first
+        .exception_policy
+        .exclude(ExceptionExclusion::IfExtended);
+    first.exception_policy.normalized_owner = NormalizedExceptionOwner::Absent;
 
     let mut second = Instruction::new(
         LOAD_FAST,
@@ -72,16 +176,16 @@ fn fusion_uses_each_flags_propagation_policy() {
         InstructionFlags::STRICT_OWNED_LOAD,
         InstructionFlags::PRESERVE_NO_LOCATION,
         InstructionFlags::PRESERVE_NOP_AFTER_JUMP_THREADING,
-        InstructionFlags::EXCLUDE_EXCEPTION,
         InstructionFlags::PREVENT_FUSION_WITH_PREVIOUS,
-        InstructionFlags::BORROW_UNREACHABLE_ENTRY,
         InstructionFlags::PRESERVE_INLINED_JUMP_NOP,
     ] {
         second.insert_flag(flag);
     }
     second.remove_flag(InstructionFlags::INLINE_SMALL_EXIT);
     second.preserve_direct_inlined_jump_nop = Some(super::Label(2));
-    second.normalized_exception_owner = Some(true);
+    second.exception_policy.exclude(ExceptionExclusion::Always);
+    second.exception_policy.normalized_owner = NormalizedExceptionOwner::Present;
+    second.borrow_fallthrough = BorrowFallthrough::Barrier;
 
     let fused = Instruction::fused(LOAD_FAST_LOAD_FAST, Operand::Value(0x12), first, second);
 
@@ -93,8 +197,6 @@ fn fusion_uses_each_flags_propagation_policy() {
         InstructionFlags::DEFER_REDUNDANT_JUMP_REMOVAL,
         InstructionFlags::PRESERVE_NOP_AFTER_JUMP_THREADING,
         InstructionFlags::CONVERTED_POP_BLOCK,
-        InstructionFlags::EXCLUDE_EXCEPTION,
-        InstructionFlags::EXCLUDE_EXCEPTION_IF_EXTENDED,
     ] {
         assert!(fused.has_flag(flag), "missing merged flag {flag:?}");
     }
@@ -104,18 +206,24 @@ fn fusion_uses_each_flags_propagation_policy() {
         InstructionFlags::ALLOW_JUMP_THREADING_TARGET,
         InstructionFlags::PREVENT_FUSION_WITH_NEXT,
         InstructionFlags::PREVENT_FUSION_WITH_PREVIOUS,
-        InstructionFlags::BORROW_UNREACHABLE_ENTRY,
     ] {
         assert!(!fused.has_flag(flag), "unexpected merged flag {flag:?}");
     }
     assert_eq!(fused.location, first.location);
     assert_eq!(fused.depth_after, second.depth_after);
     assert_eq!(fused.preserve_direct_inlined_jump_nop, None);
-    assert_eq!(fused.normalized_exception_owner, Some(false));
+    assert_eq!(fused.borrow_fallthrough, BorrowFallthrough::Barrier);
+    assert_eq!(
+        fused.exception_policy,
+        ExceptionPolicy {
+            exclusion: ExceptionExclusion::Always,
+            normalized_owner: NormalizedExceptionOwner::Absent,
+        }
+    );
 
     let mut first_edge = Instruction::new(LOAD_FAST, Operand::Value(1), SourceLocation::NONE, None);
     first_edge.insert_flag(InstructionFlags::PREVENT_FUSION_WITH_PREVIOUS);
-    first_edge.insert_flag(InstructionFlags::BORROW_UNREACHABLE_ENTRY);
+    first_edge.borrow_fallthrough = BorrowFallthrough::Barrier;
     let mut second_edge =
         Instruction::new(LOAD_FAST, Operand::Value(2), SourceLocation::NONE, None);
     second_edge.insert_flag(InstructionFlags::PREVENT_FUSION_WITH_NEXT);
@@ -130,13 +238,13 @@ fn fusion_uses_each_flags_propagation_policy() {
         InstructionFlags::ALLOW_JUMP_THREADING_TARGET,
         InstructionFlags::PREVENT_FUSION_WITH_NEXT,
         InstructionFlags::PREVENT_FUSION_WITH_PREVIOUS,
-        InstructionFlags::BORROW_UNREACHABLE_ENTRY,
     ] {
         assert!(
             fused_edges.has_flag(flag),
             "missing edge-selected flag {flag:?}"
         );
     }
+    assert_eq!(fused_edges.borrow_fallthrough, BorrowFallthrough::Reachable);
 }
 
 #[test]

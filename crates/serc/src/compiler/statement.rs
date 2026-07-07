@@ -2699,7 +2699,7 @@ impl Compiler {
         }
         self.set_depth(base_depth + 2);
         self.assembler.set_location(iterator_location);
-        self.apply_stack_effect(-2)?;
+        self.apply_compiler_stack_effect(END_ASYNC_FOR, 0, -2)?;
         self.assembler.emit_backward(END_ASYNC_FOR, send_end);
         self.assembler.add_exception_region(
             protected_start,
@@ -3119,13 +3119,15 @@ impl Compiler {
                     .filter(|previous| previous.line == location.line)
                     .unwrap_or(location);
                 self.assembler.set_location(location);
-                self.emit(NOP, 0, 0)?;
                 // The no-op body does not inherit an enclosing finally's exception owner.
-                if self.control.prevent_try_exit_inlining
+                let exception_policy = if self.control.prevent_try_exit_inlining
                     && self.control.active_exception_region_exclusions.len() > 1
                 {
-                    self.assembler.exclude_last_instruction_from_exception();
-                }
+                    ExceptionPolicy::EXCLUDE_ALWAYS
+                } else {
+                    ExceptionPolicy::default()
+                };
+                self.emit_with_exception_policy(NOP, 0, 0, exception_policy)?;
             }
             location
         };
@@ -3196,16 +3198,18 @@ impl Compiler {
                 } else {
                     None
                 };
-            self.emit_jump_forward(JUMP_FORWARD, end, 0)?;
             // A pass-only nested try leaves an ownerless exit NOP unless the enclosing region
             // is the synthetic protected body of try/finally.
-            if body_noop_location.is_some()
+            let exception_policy = if body_noop_location.is_some()
                 && statement.orelse.is_empty()
                 && !self.control.active_exception_region_exclusions.is_empty()
                 && self.control.active_finally_try_bodies == 0
             {
-                self.assembler.exclude_last_instruction_from_exception();
-            }
+                ExceptionPolicy::EXCLUDE_ALWAYS
+            } else {
+                ExceptionPolicy::default()
+            };
+            self.emit_jump_forward_with_exception_policy(JUMP_FORWARD, end, 0, exception_policy)?;
             if body_ends_with_break_loop {
                 // CPython's `POP_BLOCK` initially prevents the loop break from threading
                 // through this normal try exit. Once `POP_BLOCK` disappears, the exit jump
@@ -3342,7 +3346,7 @@ impl Compiler {
                     self.emit(LOAD_CONST, none, 1)?;
                     self.store_name(name.as_str())?;
                     self.delete_name(name.as_str())?;
-                    self.emit(RERAISE, 1, -3)?;
+                    self.emit_reraise(ReraiseStackState::HandlerCleanup)?;
                 }
                 self.assembler.mark(next_handler);
                 dispatch_start = if handler.name.is_some() {
@@ -3564,20 +3568,26 @@ impl Compiler {
                 if terminal {
                     self.emit_deferred_implicit_return()?;
                 } else {
-                    self.emit_jump_forward(JUMP_FORWARD, end, 0)?;
+                    // A pass-only finally keeps these extended handler exits in its protected
+                    // region; executable finally bodies use CPython's stale-owner exclusion.
+                    let exception_policy = if !handler_body_has_instructions
+                        && !self.control.active_exception_region_exclusions.is_empty()
+                        && self.control.active_pass_finally_locations.is_empty()
+                    {
+                        ExceptionPolicy::EXCLUDE_IF_EXTENDED
+                    } else {
+                        ExceptionPolicy::default()
+                    };
+                    self.emit_jump_forward_with_exception_policy(
+                        JUMP_FORWARD,
+                        end,
+                        0,
+                        exception_policy,
+                    )?;
                     if handler.name.is_some() && matches!(handler.body.last(), Some(Stmt::Try(_))) {
                         // The cleanup is larger than a small exit, but is still eligible because
                         // it has no line number and cannot fall through.
                         self.assembler.prepare_last_no_location_block_for_inlining();
-                    }
-                    // A pass-only finally keeps these extended handler exits in its protected
-                    // region; executable finally bodies use CPython's stale-owner exclusion.
-                    if !handler_body_has_instructions
-                        && !self.control.active_exception_region_exclusions.is_empty()
-                        && self.control.active_pass_finally_locations.is_empty()
-                    {
-                        self.assembler
-                            .exclude_last_instruction_from_exception_if_extended();
                     }
                     let return_is_overridden = self.control.active_overriding_finally_returns > 0
                         && matches!(handler.body.last(), Some(Stmt::Return(_)));
@@ -3595,7 +3605,7 @@ impl Compiler {
                 self.emit(LOAD_CONST, none, 1)?;
                 self.store_name(name.as_str())?;
                 self.delete_name(name.as_str())?;
-                self.emit(RERAISE, 1, -3)?;
+                self.emit_reraise(ReraiseStackState::HandlerCleanup)?;
             }
 
             self.assembler.mark(next_handler);
@@ -3613,7 +3623,7 @@ impl Compiler {
         }) {
             self.set_depth(base_depth + 2);
             self.assembler.set_location(final_handler_location);
-            self.emit(RERAISE, 0, -2)?;
+            self.emit_reraise(ReraiseStackState::ActiveExceptionHandler)?;
             let dispatch_end = self.assembler.label();
             self.assembler.mark(dispatch_end);
             self.assembler.add_exception_region(
@@ -3630,7 +3640,7 @@ impl Compiler {
         self.assembler.set_location(SourceLocation::NONE);
         self.emit(COPY, 3, 1)?;
         self.emit(POP_EXCEPT, 0, -1)?;
-        self.emit(RERAISE, 1, -3)?;
+        self.emit_reraise(ReraiseStackState::HandlerCleanup)?;
 
         if statement.handlers.iter().all(|handler| {
             handler.as_except_handler().is_some_and(|handler| {
@@ -3905,7 +3915,7 @@ impl Compiler {
         self.set_depth(base_depth + 2);
         self.emit(SWAP, 2, 0)?;
         self.emit(POP_EXCEPT, 0, -1)?;
-        self.emit(RERAISE, 0, -1)?;
+        self.emit_reraise(ReraiseStackState::ExceptionOnly)?;
         self.add_exception_regions_with_exclusions(
             handler_region_start,
             handler_region_end,
@@ -3920,7 +3930,7 @@ impl Compiler {
         self.assembler.set_location(SourceLocation::NONE);
         self.emit(COPY, 3, 1)?;
         self.emit(POP_EXCEPT, 0, -1)?;
-        self.emit(RERAISE, 1, -3)?;
+        self.emit_reraise(ReraiseStackState::HandlerCleanup)?;
 
         self.assembler.mark(orelse);
         self.set_depth(base_depth);
@@ -4177,11 +4187,14 @@ impl Compiler {
                                     .assembler
                                     .set_location(compiler.source_location(last.range()));
                             }
-                            compiler.emit(NOP, 0, 0)?;
                             // A no-op protected body does not acquire an enclosing try's handler.
-                            if compiler.control.active_exception_region_exclusions.len() > 1 {
-                                compiler.assembler.exclude_last_instruction_from_exception();
-                            }
+                            let exception_policy =
+                                if compiler.control.active_exception_region_exclusions.len() > 1 {
+                                    ExceptionPolicy::EXCLUDE_ALWAYS
+                                } else {
+                                    ExceptionPolicy::default()
+                                };
+                            compiler.emit_with_exception_policy(NOP, 0, 0, exception_policy)?;
                         }
                         Ok(has_instructions)
                     } else {
@@ -4253,8 +4266,12 @@ impl Compiler {
                     // Mark both the pass and its exit because CFG optimization can keep either NOP.
                     let pass_start = compiler.assembler.label();
                     compiler.assembler.mark(pass_start);
-                    compiler.emit(NOP, 0, 0)?;
-                    compiler.assembler.exclude_last_instruction_from_exception();
+                    compiler.emit_with_exception_policy(
+                        NOP,
+                        0,
+                        0,
+                        ExceptionPolicy::EXCLUDE_ALWAYS,
+                    )?;
                     let pass_end = compiler.assembler.label();
                     compiler.assembler.mark(pass_end);
                     for exclusions in &mut compiler.control.active_exception_region_exclusions {
@@ -4285,12 +4302,14 @@ impl Compiler {
             if let Some(location) = self.assembler.last_instruction_location() {
                 self.assembler.set_location(location);
             }
-            self.emit_jump_forward(JUMP_FORWARD, end, 0)?;
-            if pass_finally_location.is_some()
+            let exception_policy = if pass_finally_location.is_some()
                 && !self.control.active_exception_region_exclusions.is_empty()
             {
-                self.assembler.exclude_last_instruction_from_exception();
-            }
+                ExceptionPolicy::EXCLUDE_ALWAYS
+            } else {
+                ExceptionPolicy::default()
+            };
+            self.emit_jump_forward_with_exception_policy(JUMP_FORWARD, end, 0, exception_policy)?;
         }
         if protected_has_instructions {
             self.add_exception_regions_with_exclusions(
@@ -4337,13 +4356,13 @@ impl Compiler {
                 if let Some(location) = self.assembler.last_instruction_location() {
                     self.assembler.set_location(location);
                 }
-                self.emit(RERAISE, 0, -2)?;
+                self.emit_reraise(ReraiseStackState::ActiveExceptionHandler)?;
             }
             self.assembler.mark(condition_false);
             self.set_depth(base_depth + 2);
             self.assembler
                 .set_location(self.source_location(final_if.test.range()));
-            self.emit(RERAISE, 0, -2)?;
+            self.emit_reraise(ReraiseStackState::ActiveExceptionHandler)?;
         } else {
             if let Some(location) = pass_finally_location {
                 self.assembler.set_location(location);
@@ -4365,7 +4384,7 @@ impl Compiler {
                 } else if let Some(location) = self.assembler.last_instruction_location() {
                     self.assembler.set_location(location);
                 }
-                self.emit(RERAISE, 0, -2)?;
+                self.emit_reraise(ReraiseStackState::ActiveExceptionHandler)?;
             }
         }
         let handler_end = if let Some(handler_end) = explicit_handler_end {
@@ -4394,7 +4413,7 @@ impl Compiler {
         self.assembler.set_location(SourceLocation::NONE);
         self.emit(COPY, 3, 1)?;
         self.emit(POP_EXCEPT, 0, -1)?;
-        self.emit(RERAISE, 1, -3)?;
+        self.emit_reraise(ReraiseStackState::HandlerCleanup)?;
         self.assembler.mark(end);
         self.set_depth(base_depth);
         Ok(())
@@ -4475,7 +4494,7 @@ impl Compiler {
         self.assembler.set_location(SourceLocation::NONE);
         self.emit(COPY, 3, 1)?;
         self.emit(POP_EXCEPT, 0, -1)?;
-        self.emit(RERAISE, 1, -3)?;
+        self.emit_reraise(ReraiseStackState::HandlerCleanup)?;
         self.set_depth(base_depth);
         Ok(())
     }
@@ -4743,7 +4762,7 @@ impl Compiler {
         self.emit(TO_BOOL, 0, 0)?;
         self.emit_jump_forward(POP_JUMP_IF_TRUE, suppress, -1)?;
         self.emit(NOT_TAKEN, 0, 0)?;
-        self.emit(RERAISE, 2, -5)?;
+        self.emit_reraise(ReraiseStackState::WithHandler)?;
         self.assembler.mark(suppress);
         self.set_depth(base_depth + 5);
         self.emit(POP_TOP, 0, -1)?;
@@ -4773,7 +4792,7 @@ impl Compiler {
         self.assembler.set_location(SourceLocation::NONE);
         self.emit(COPY, 3, 1)?;
         self.emit(POP_EXCEPT, 0, -1)?;
-        self.emit(RERAISE, 1, -3)?;
+        self.emit_reraise(ReraiseStackState::HandlerCleanup)?;
         self.assembler.mark(end);
         self.set_depth(base_depth);
         for name in newly_initialized_targets {
@@ -4925,7 +4944,7 @@ impl Compiler {
         for exclusions in &mut self.control.active_with_region_exclusions {
             exclusions.push((not_taken_start, not_taken_end));
         }
-        self.emit(RERAISE, 2, -5)?;
+        self.emit_reraise(ReraiseStackState::WithHandler)?;
         self.assembler.mark(suppress);
         self.set_depth(base_depth + 5);
         self.emit(POP_TOP, 0, -1)?;
@@ -4959,7 +4978,7 @@ impl Compiler {
         self.assembler.set_location(SourceLocation::NONE);
         self.emit(COPY, 3, 1)?;
         self.emit(POP_EXCEPT, 0, -1)?;
-        self.emit(RERAISE, 1, -3)?;
+        self.emit_reraise(ReraiseStackState::HandlerCleanup)?;
         self.assembler.mark(end);
         self.set_depth(base_depth);
         for name in newly_initialized_targets {

@@ -18,7 +18,9 @@ type HashMap<K, V> = FxHashMap<K, V>;
 type HashSet<T> = FxHashSet<T>;
 
 use crate::CompileError;
-use crate::assembler::{AssembledCode, Assembler, InstructionId, Label, SourceLocation};
+use crate::assembler::{
+    AssembledCode, Assembler, ExceptionPolicy, InstructionId, Label, SourceLocation,
+};
 use crate::target::code_flags::{
     CO_ASYNC_GENERATOR, CO_COROUTINE, CO_FUTURE_ANNOTATIONS, CO_FUTURE_BARRY_AS_BDFL, CO_GENERATOR,
     CO_HAS_DOCSTRING, CO_METHOD, CO_NESTED, CO_NEWLOCALS, CO_OPTIMIZED, CO_VARARGS, CO_VARKEYWORDS,
@@ -35,7 +37,9 @@ use crate::target::operands::{
     BinaryIntrinsic, BinaryOperation, CommonConstant, ComparisonOperation, Conversion,
     FunctionAttribute, ResumeLocation, SpecialMethod, UnaryIntrinsic,
 };
-use crate::target::{Opcode, is_unconditional_jump};
+use crate::target::{
+    Opcode, is_unconditional_jump, num_popped as opcode_num_popped, num_pushed as opcode_num_pushed,
+};
 
 mod constant;
 mod definition;
