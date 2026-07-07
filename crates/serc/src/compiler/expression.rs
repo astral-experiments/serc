@@ -54,10 +54,10 @@ impl Compiler {
                 on_top: 0,
             };
             self.compile_stack_pattern(&case.pattern, &mut context)?;
-            for name in &context.stores {
+            for &name in &context.stores {
                 self.assembler
                     .set_location(self.source_location(case.pattern.range()));
-                self.store_name(name)?;
+                self.store_name_id(name)?;
             }
             let mut guard_always_false = false;
             let mut irrefutable_true_guard = false;
@@ -362,7 +362,7 @@ impl Compiler {
             self.emit(SWAP, to_u32(rotations, "pattern capture rotation")?, 0)?;
             rotations -= 1;
         }
-        context.stores.push(name.to_string());
+        context.stores.push(self.required_name_id(name));
         Ok(())
     }
 
@@ -381,7 +381,7 @@ impl Compiler {
     ) -> Result<(), CompileError> {
         let entry_depth = self.control.depth;
         let end = self.assembler.label();
-        let mut control: Option<Vec<String>> = None;
+        let mut control: Option<Vec<NameId>> = None;
         for (index, alternative) in pattern.patterns.iter().enumerate() {
             self.assembler
                 .set_location(self.source_location(alternative.range()));
@@ -458,7 +458,10 @@ impl Compiler {
             self.rotate_match_stack(rotations)?;
             if context.stores.contains(&name) {
                 return Err(CompileError::InvalidPattern {
-                    message: format!("multiple assignments to name '{name}' in pattern"),
+                    message: format!(
+                        "multiple assignments to name '{}' in pattern",
+                        self.resolve_name(name)
+                    ),
                     range: pattern.range,
                 });
             }

@@ -490,12 +490,12 @@ impl Compiler {
         });
         if self.control.unwind_exception_handlers_for_implicit_return {
             for index in (0..self.control.active_exception_handlers.len()).rev() {
-                let name = self.control.active_exception_handlers[index].name.clone();
+                let name = self.control.active_exception_handlers[index].name;
                 self.emit(POP_EXCEPT, 0, -1)?;
-                if let Some(name) = &name {
+                if let Some(name) = name {
                     self.emit_deferred_constant_before_return(Constant::None)?;
-                    self.store_name(name)?;
-                    self.delete_name(name)?;
+                    self.store_name_id(name)?;
+                    self.delete_name_id(name)?;
                 }
             }
         }
@@ -1499,7 +1499,7 @@ impl Compiler {
                 for handler_index in (0..handler_count).rev() {
                     let (loop_depth, name) = {
                         let handler = &self.control.active_exception_handlers[handler_index];
-                        (handler.loop_depth, handler.name.clone())
+                        (handler.loop_depth, handler.name)
                     };
                     self.emit_loop_iterator_cleanup(loop_depth, next_loop, preserve_tos)?;
                     if preserve_tos {
@@ -1531,11 +1531,11 @@ impl Compiler {
                             );
                         }
                     }
-                    if let Some(name) = &name {
+                    if let Some(name) = name {
                         let none = self.add_constant(Constant::None)?;
                         self.emit(LOAD_CONST, none, 1)?;
-                        self.store_name(name)?;
-                        self.delete_name(name)?;
+                        self.store_name_id(name)?;
+                        self.delete_name_id(name)?;
                     }
                     next_loop = loop_depth;
                 }
@@ -2015,17 +2015,17 @@ impl Compiler {
         for index in (0..self.control.active_exception_handlers.len()).rev() {
             let (handler_loop_depth, name) = {
                 let handler = &self.control.active_exception_handlers[index];
-                (handler.loop_depth, handler.name.clone())
+                (handler.loop_depth, handler.name)
             };
             if handler_loop_depth < loop_depth {
                 break;
             }
             self.emit(POP_EXCEPT, 0, -1)?;
-            if let Some(name) = &name {
+            if let Some(name) = name {
                 let none = self.add_constant(Constant::None)?;
                 self.emit(LOAD_CONST, none, 1)?;
-                self.store_name(name)?;
-                self.delete_name(name)?;
+                self.store_name_id(name)?;
+                self.delete_name_id(name)?;
             }
         }
         Ok(())
@@ -3509,7 +3509,7 @@ impl Compiler {
                         Some(Stmt::Break(_) | Stmt::Continue(_))
                     );
                     let context = ExceptionHandlerContext {
-                        name: handler.name.as_ref().map(ToString::to_string),
+                        name: handler_name,
                         loop_depth: self.control.loops.len(),
                     };
                     let ((), exclusions) = self.with_exception_handler(context, |compiler| {

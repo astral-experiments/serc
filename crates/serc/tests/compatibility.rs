@@ -179,6 +179,23 @@ mod tests {
     }
 
     #[test]
+    fn reports_the_original_duplicate_pattern_binding_name() {
+        let source = "class Container:\n    match value:\n        case [__captured, [__captured] | [__captured]]:\n            pass\n";
+        let error = compile(source, "duplicate_pattern.py").unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "failed to parse Python source: multiple assignments to name '__captured' in pattern"
+        );
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_private_pattern_capture_names() {
+        let source = "class Container:\n    def capture(self, value):\n        match value:\n            case [__captured]:\n                return __captured\n        return None\n";
+        assert_matches_cpython_marshal(source, "private_pattern.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_an_unreachable_generic_type_alias() {
         let source = "raise Exception\nassert False\ntype X[T] = T\n";
         assert_matches_cpython_marshal(source, "type_alias.py");
@@ -370,6 +387,21 @@ except Error:
     fn matches_cpython_marshal_for_a_return_from_an_exception_handler() {
         let source = "def f():\n    value = source()\n    try:\n        raise ValueError\n    except ValueError:\n        return value\n\ndef nested():\n    try:\n        body()\n    except ValueError as error:\n        try:\n            pass\n        except TypeError:\n            raise error\n\ndef nested_message():\n    try:\n        body()\n    except ValueError as error:\n        try:\n            finish()\n        except TypeError:\n            log(f\"error: {error}\")\n";
         assert_matches_cpython_marshal(source, "handler_return.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_named_exception_cleanup() {
+        let source = r"class Container:
+    def nested_handler(self):
+        try:
+            body()
+        except ValueError as __error:
+            try:
+                pass
+            except TypeError:
+                raise __error
+";
+        assert_matches_cpython_marshal(source, "named_exception_cleanup.py");
     }
 
     #[test]
