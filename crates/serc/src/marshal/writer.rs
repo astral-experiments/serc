@@ -1,6 +1,6 @@
 use crate::compiler::{CodeObject, Constant};
 
-use super::graph::{ObjectGraph, ObjectId};
+use super::graph::{ObjectGraph, ObjectId, ObjectLocation};
 use super::key::{constant_sort_key, slice_member_uses_identity};
 use super::v5::{
     FLAG_REF, TYPE_ASCII, TYPE_ASCII_INTERNED, TYPE_BINARY_COMPLEX, TYPE_BINARY_FLOAT, TYPE_CODE,
@@ -16,8 +16,10 @@ pub(crate) fn encode_code(code: &CodeObject) -> Vec<u8> {
         output: Vec::new(),
         references: vec![None; graph.object_count()],
         reference_count: 0,
+        next_occurrence: 0,
     };
     writer.write_code(code, true);
+    debug_assert_eq!(writer.next_occurrence, graph.occurrence_count());
     writer.output
 }
 
@@ -27,9 +29,20 @@ struct Writer<'graph, 'code> {
     output: Vec<u8>,
     references: Vec<Option<u32>>,
     reference_count: usize,
+    next_occurrence: usize,
 }
 
 impl Writer<'_, '_> {
+    fn next_object(&mut self, location: ObjectLocation) -> ObjectId {
+        let object = self.graph.occurrence(self.next_occurrence, location);
+        self.next_occurrence += 1;
+        object
+    }
+
+    fn constant_object(&mut self, value: &Constant) -> ObjectId {
+        self.next_object(ObjectLocation::Constant(std::ptr::from_ref(value).addr()))
+    }
+
     fn byte(&mut self, value: u8) {
         self.output.push(value);
     }
@@ -54,7 +67,7 @@ impl Writer<'_, '_> {
     }
 
     fn bytes(&mut self, value: &[u8], force_reference: bool) {
-        let object = self.graph.bytes(value);
+        let object = self.next_object(ObjectLocation::Bytes(value.as_ptr().addr()));
         self.bytes_with_object(object, value, force_reference);
     }
 
@@ -68,7 +81,7 @@ impl Writer<'_, '_> {
     }
 
     fn string(&mut self, value: &str) {
-        let object = self.graph.metadata_string(value);
+        let object = self.next_object(ObjectLocation::MetadataString(value.as_ptr().addr()));
         self.string_with_object(object, value, false);
     }
 
@@ -145,7 +158,7 @@ impl Writer<'_, '_> {
     }
 
     fn strings(&mut self, values: &[String], force_reference: bool) {
-        let object = self.graph.strings_tuple(values);
+        let object = self.next_object(ObjectLocation::StringsTuple(values.as_ptr().addr()));
         if self.tuple_header(object, values.len(), force_reference) {
             for value in values {
                 self.string(value);
@@ -154,7 +167,7 @@ impl Writer<'_, '_> {
     }
 
     fn locals(&mut self, code: &CodeObject) {
-        let object = self.graph.locals_tuple(code);
+        let object = self.next_object(ObjectLocation::LocalsTuple(std::ptr::from_ref(code).addr()));
         if self.tuple_header(object, code.locals.len(), false) {
             for value in &code.locals {
                 self.string(value);
@@ -163,7 +176,7 @@ impl Writer<'_, '_> {
     }
 
     fn constants(&mut self, values: &[Constant], force_reference: bool) {
-        let object = self.graph.constants_tuple(values);
+        let object = self.next_object(ObjectLocation::ConstantsTuple(values.as_ptr().addr()));
         if self.tuple_header(object, values.len(), force_reference) {
             for value in values {
                 self.constant(value);
@@ -182,19 +195,19 @@ impl Writer<'_, '_> {
             Constant::Bool(true) => self.byte(TYPE_TRUE),
             Constant::Ellipsis => self.byte(TYPE_ELLIPSIS),
             Constant::Int(integer) => {
-                let object = self.graph.constant(value);
+                let object = self.constant_object(value);
                 self.integer(object, *integer, force_reference);
             }
             Constant::SignedInt(integer) => {
-                let object = self.graph.constant(value);
+                let object = self.constant_object(value);
                 self.signed_integer(object, *integer, force_reference);
             }
             Constant::BigInt { negative, digits } => {
-                let object = self.graph.constant(value);
+                let object = self.constant_object(value);
                 self.big_integer(object, digits, *negative, force_reference);
             }
             Constant::Float(float) => {
-                let object = self.graph.constant(value);
+                let object = self.constant_object(value);
                 let Some(flag) = self.begin_object(object, force_reference) else {
                     return;
                 };
@@ -202,7 +215,7 @@ impl Writer<'_, '_> {
                 self.output.extend_from_slice(&float.to_le_bytes());
             }
             Constant::Complex { real, imag } => {
-                let object = self.graph.constant(value);
+                let object = self.constant_object(value);
                 let Some(flag) = self.begin_object(object, force_reference) else {
                     return;
                 };
@@ -211,20 +224,20 @@ impl Writer<'_, '_> {
                 self.output.extend_from_slice(&imag.to_le_bytes());
             }
             Constant::String(string) => {
-                let object = self.graph.constant(value);
+                let object = self.constant_object(value);
                 self.string_with_object(object, string, force_reference);
             }
             Constant::SurrogateString(string) => {
-                let object = self.graph.constant(value);
+                let object = self.constant_object(value);
                 self.surrogate_string_with_object(object, string, force_reference);
             }
             Constant::Bytes(bytes) => {
-                let object = self.graph.constant(value);
+                let object = self.constant_object(value);
                 self.bytes_with_object(object, bytes, force_reference);
             }
             Constant::Tuple(values) => self.constants(values, force_reference),
             Constant::FrozenSet(values) => {
-                let object = self.graph.constant(value);
+                let object = self.constant_object(value);
                 let Some(flag) = self.begin_object(object, force_reference) else {
                     return;
                 };
@@ -242,7 +255,7 @@ impl Writer<'_, '_> {
                 }
             }
             Constant::Slice { lower, upper, step } => {
-                let object = self.graph.constant(value);
+                let object = self.constant_object(value);
                 let Some(flag) = self.begin_object(object, force_reference) else {
                     return;
                 };
@@ -260,7 +273,9 @@ impl Writer<'_, '_> {
             self.constant(value);
             return;
         }
-        let object = self.graph.slice_member(value);
+        let object = self.next_object(ObjectLocation::SliceMember(
+            std::ptr::from_ref(value).addr(),
+        ));
         let Some(flag) = self.begin_object(object, false) else {
             return;
         };
@@ -427,7 +442,7 @@ impl Writer<'_, '_> {
     }
 
     fn write_code(&mut self, code: &CodeObject, force_reference: bool) {
-        let object = self.graph.code(code);
+        let object = self.next_object(ObjectLocation::Code(std::ptr::from_ref(code).addr()));
         let Some(flag) = self.begin_object(object, force_reference) else {
             return;
         };
@@ -437,12 +452,13 @@ impl Writer<'_, '_> {
         self.long(code.keyword_only_arg_count);
         self.long(code.stack_size);
         self.long(code.flags);
-        let bytecode = self.graph.code_bytes(code);
+        let bytecode = self.next_object(ObjectLocation::CodeBytes(std::ptr::from_ref(code).addr()));
         self.bytes_with_object(bytecode, &code.bytecode, true);
         self.constants(&code.constants, false);
         self.strings(&code.names, false);
         self.locals(code);
-        let local_kinds = self.graph.local_kinds(code);
+        let local_kinds =
+            self.next_object(ObjectLocation::LocalKinds(std::ptr::from_ref(code).addr()));
         self.bytes_with_object(local_kinds, &code.local_kinds, false);
         self.string(&code.filename);
         self.string(&code.name);

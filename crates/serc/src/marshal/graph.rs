@@ -1,6 +1,6 @@
 use std::collections::hash_map::Entry;
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
 use crate::compiler::{CodeObject, Constant};
 
@@ -13,7 +13,7 @@ use super::key::{
 // Source addresses are graph-local lookup keys only. They remain valid while `encode_code` holds
 // the immutable `CodeObject`, and are never written to the marshal stream.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-enum ObjectLocation {
+pub(super) enum ObjectLocation {
     Bytes(usize),
     Code(usize),
     CodeBytes(usize),
@@ -41,16 +41,29 @@ struct Object {
 pub(super) struct ObjectGraph<'a> {
     objects: FxHashMap<ObjectKey<'a>, ObjectId>,
     objects_by_id: Vec<Object>,
-    locations: FxHashMap<ObjectLocation, ObjectId>,
+    occurrences: Vec<ObjectId>,
+    #[cfg(debug_assertions)]
+    occurrence_locations: Vec<ObjectLocation>,
+    explicitly_interned: Vec<&'a str>,
 }
 
 impl<'a> ObjectGraph<'a> {
     pub(super) fn for_code(code: &'a CodeObject) -> Self {
-        let mut explicitly_interned = FxHashSet::default();
-        collect_explicitly_interned(code, &mut explicitly_interned);
         let mut graph = Self::default();
-        graph.visit_code(code, &explicitly_interned);
+        graph.visit_code(code);
+        graph.mark_explicitly_interned();
         graph
+    }
+
+    fn mark_explicitly_interned(&mut self) {
+        for value in std::mem::take(&mut self.explicitly_interned) {
+            let Some(id) = self.objects.get(&ObjectKey::String(value)).copied() else {
+                continue;
+            };
+            let object = &mut self.objects_by_id[id.0];
+            object.cached = true;
+            object.interned = true;
+        }
     }
 
     #[cfg(test)]
@@ -58,11 +71,11 @@ impl<'a> ObjectGraph<'a> {
         self.record_object(key, false).1
     }
 
-    fn record_at(&mut self, location: ObjectLocation, key: ObjectKey<'a>, interned: bool) -> bool {
+    fn record_at(&mut self, _location: ObjectLocation, key: ObjectKey<'a>, interned: bool) -> bool {
         let (id, first) = self.record_object(key, interned);
-        if let Some(previous) = self.locations.insert(location, id) {
-            debug_assert_eq!(previous, id, "object location changed identity");
-        }
+        self.occurrences.push(id);
+        #[cfg(debug_assertions)]
+        self.occurrence_locations.push(_location);
         first
     }
 
@@ -91,17 +104,19 @@ impl<'a> ObjectGraph<'a> {
         }
     }
 
-    fn visit_code(&mut self, code: &'a CodeObject, explicitly_interned: &FxHashSet<&'a str>) {
+    fn visit_code(&mut self, code: &'a CodeObject) {
         let address = std::ptr::from_ref(code).addr();
         if !self.record_at(ObjectLocation::Code(address), code_key(code), false) {
             return;
         }
+        self.explicitly_interned
+            .extend(code.interned_constant_strings.iter().map(String::as_str));
         self.record_at(
             ObjectLocation::CodeBytes(address),
             code_bytes_key(code),
             false,
         );
-        self.visit_constants_tuple(&code.constants, explicitly_interned);
+        self.visit_constants_tuple(&code.constants);
         self.visit_strings_tuple(&code.names);
         self.visit_locals_tuple(code);
         self.record_at(
@@ -124,11 +139,7 @@ impl<'a> ObjectGraph<'a> {
         );
     }
 
-    fn visit_constants_tuple(
-        &mut self,
-        values: &'a [Constant],
-        explicitly_interned: &FxHashSet<&'a str>,
-    ) {
+    fn visit_constants_tuple(&mut self, values: &'a [Constant]) {
         let key = constants_tuple_key(values);
         if !self.record_at(
             ObjectLocation::ConstantsTuple(values.as_ptr().addr()),
@@ -138,7 +149,7 @@ impl<'a> ObjectGraph<'a> {
             return;
         }
         for value in values {
-            self.visit_constant(value, explicitly_interned);
+            self.visit_constant(value);
         }
     }
 
@@ -178,7 +189,7 @@ impl<'a> ObjectGraph<'a> {
         );
     }
 
-    fn visit_constant(&mut self, value: &'a Constant, explicitly_interned: &FxHashSet<&'a str>) {
+    fn visit_constant(&mut self, value: &'a Constant) {
         let location = ObjectLocation::Constant(std::ptr::from_ref(value).addr());
         match value {
             Constant::None | Constant::Bool(_) | Constant::Ellipsis => {}
@@ -202,11 +213,7 @@ impl<'a> ObjectGraph<'a> {
                 );
             }
             Constant::String(value) => {
-                self.record_at(
-                    location,
-                    ObjectKey::String(value),
-                    explicitly_interned.contains(value.as_str()) || should_intern(value),
-                );
+                self.record_at(location, ObjectKey::String(value), should_intern(value));
             }
             Constant::SurrogateString(value) => {
                 self.record_at(location, ObjectKey::SurrogateString(value), false);
@@ -214,34 +221,30 @@ impl<'a> ObjectGraph<'a> {
             Constant::Bytes(value) => {
                 self.record_at(location, ObjectKey::Bytes(value), false);
             }
-            Constant::Tuple(values) => self.visit_constants_tuple(values, explicitly_interned),
+            Constant::Tuple(values) => self.visit_constants_tuple(values),
             Constant::FrozenSet(values) => {
                 let key = constant_key(value);
                 if self.record_at(location, key, false) {
                     let mut values: Vec<_> = values.iter().collect();
                     values.sort_by_key(|value| constant_sort_key(value));
                     for value in values {
-                        self.visit_constant(value, explicitly_interned);
+                        self.visit_constant(value);
                     }
                 }
             }
             Constant::Slice { lower, upper, step } => {
                 let key = constant_key(value);
                 if self.record_at(location, key, false) {
-                    self.visit_slice_member(lower, explicitly_interned);
-                    self.visit_slice_member(upper, explicitly_interned);
-                    self.visit_slice_member(step, explicitly_interned);
+                    self.visit_slice_member(lower);
+                    self.visit_slice_member(upper);
+                    self.visit_slice_member(step);
                 }
             }
-            Constant::Code(code) => self.visit_code(code, explicitly_interned),
+            Constant::Code(code) => self.visit_code(code),
         }
     }
 
-    fn visit_slice_member(
-        &mut self,
-        value: &'a Constant,
-        explicitly_interned: &FxHashSet<&'a str>,
-    ) {
+    fn visit_slice_member(&mut self, value: &'a Constant) {
         if slice_member_uses_identity(value) {
             let address = std::ptr::from_ref(value).addr();
             self.record_at(
@@ -250,7 +253,7 @@ impl<'a> ObjectGraph<'a> {
                 false,
             );
         } else {
-            self.visit_constant(value, explicitly_interned);
+            self.visit_constant(value);
         }
     }
 
@@ -286,50 +289,14 @@ impl<'a> ObjectGraph<'a> {
         self.objects_by_id.len()
     }
 
-    fn object_at(&self, location: ObjectLocation) -> ObjectId {
-        self.locations[&location]
+    pub(super) fn occurrence_count(&self) -> usize {
+        self.occurrences.len()
     }
 
-    pub(super) fn bytes(&self, value: &[u8]) -> ObjectId {
-        self.object_at(ObjectLocation::Bytes(value.as_ptr().addr()))
-    }
-
-    pub(super) fn code(&self, code: &CodeObject) -> ObjectId {
-        self.object_at(ObjectLocation::Code(std::ptr::from_ref(code).addr()))
-    }
-
-    pub(super) fn code_bytes(&self, code: &CodeObject) -> ObjectId {
-        self.object_at(ObjectLocation::CodeBytes(std::ptr::from_ref(code).addr()))
-    }
-
-    pub(super) fn constant(&self, value: &Constant) -> ObjectId {
-        self.object_at(ObjectLocation::Constant(std::ptr::from_ref(value).addr()))
-    }
-
-    pub(super) fn constants_tuple(&self, values: &[Constant]) -> ObjectId {
-        self.object_at(ObjectLocation::ConstantsTuple(values.as_ptr().addr()))
-    }
-
-    pub(super) fn local_kinds(&self, code: &CodeObject) -> ObjectId {
-        self.object_at(ObjectLocation::LocalKinds(std::ptr::from_ref(code).addr()))
-    }
-
-    pub(super) fn locals_tuple(&self, code: &CodeObject) -> ObjectId {
-        self.object_at(ObjectLocation::LocalsTuple(std::ptr::from_ref(code).addr()))
-    }
-
-    pub(super) fn metadata_string(&self, value: &str) -> ObjectId {
-        self.object_at(ObjectLocation::MetadataString(value.as_ptr().addr()))
-    }
-
-    pub(super) fn slice_member(&self, value: &Constant) -> ObjectId {
-        self.object_at(ObjectLocation::SliceMember(
-            std::ptr::from_ref(value).addr(),
-        ))
-    }
-
-    pub(super) fn strings_tuple(&self, values: &[String]) -> ObjectId {
-        self.object_at(ObjectLocation::StringsTuple(values.as_ptr().addr()))
+    pub(super) fn occurrence(&self, index: usize, _expected: ObjectLocation) -> ObjectId {
+        #[cfg(debug_assertions)]
+        debug_assert_eq!(self.occurrence_locations[index], _expected);
+        self.occurrences[index]
     }
 
     pub(super) fn is_interned_object(&self, id: ObjectId) -> bool {
@@ -345,32 +312,5 @@ impl<'a> ObjectGraph<'a> {
                 _ => None,
             })
             .is_some_and(|id| self.objects_by_id[id.0].interned)
-    }
-}
-
-fn collect_explicitly_interned<'a>(code: &'a CodeObject, strings: &mut FxHashSet<&'a str>) {
-    strings.extend(code.interned_constant_strings.iter().map(String::as_str));
-    for constant in &code.constants {
-        collect_nested_explicitly_interned(constant, strings);
-    }
-}
-
-fn collect_nested_explicitly_interned<'a>(
-    constant: &'a Constant,
-    strings: &mut FxHashSet<&'a str>,
-) {
-    match constant {
-        Constant::Tuple(values) | Constant::FrozenSet(values) => {
-            for value in values {
-                collect_nested_explicitly_interned(value, strings);
-            }
-        }
-        Constant::Slice { lower, upper, step } => {
-            collect_nested_explicitly_interned(lower, strings);
-            collect_nested_explicitly_interned(upper, strings);
-            collect_nested_explicitly_interned(step, strings);
-        }
-        Constant::Code(code) => collect_explicitly_interned(code, strings),
-        _ => {}
     }
 }
