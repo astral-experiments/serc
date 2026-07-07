@@ -850,9 +850,16 @@ pub(super) fn fold_constant(expression: &Expr) -> Option<Constant> {
             UnaryOp::Not => literal_truthiness(&unary.operand).map(|value| Constant::Bool(!value)),
             UnaryOp::USub => match fold_constant(&unary.operand)? {
                 Constant::Int(0) => Some(Constant::Int(0)),
-                Constant::Int(value) => i64::try_from(value)
-                    .ok()
-                    .map(|value| Constant::SignedInt(-value)),
+                Constant::Int(value) => match value.cmp(&i64::MIN.unsigned_abs()) {
+                    std::cmp::Ordering::Less => Some(Constant::SignedInt(
+                        -i64::try_from(value).expect("magnitude below 2^63 fits in i64"),
+                    )),
+                    std::cmp::Ordering::Equal => Some(Constant::SignedInt(i64::MIN)),
+                    std::cmp::Ordering::Greater => Some(Constant::BigInt {
+                        negative: true,
+                        digits: big_integer_digits(&value.to_string()),
+                    }),
+                },
                 Constant::BigInt { negative, digits } => Some(Constant::BigInt {
                     negative: !negative,
                     digits,

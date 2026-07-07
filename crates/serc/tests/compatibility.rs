@@ -456,6 +456,12 @@ except Error:
     }
 
     #[test]
+    fn matches_cpython_marshal_for_negative_large_integer_literals() {
+        let source = "minimum_i64 = -9223372036854775808\nbelow_minimum_i64 = -9223372036854775809\nnegative_u64_max = -18446744073709551615\nnegative_u64_overflow = -18446744073709551616\n";
+        assert_matches_cpython_marshal(source, "negative_large_integers.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_folded_branches_in_a_with_statement() {
         let source = "from contextlib import suppress\n\ndef f():\n    with suppress(Exception):\n        if 1:\n            pass\n        elif 1:\n            pass\n        elif 1:\n            pass\n        try:\n            pass\n        except Exception:\n            pass\n        finally:\n            pass\n        if 2:\n            pass\n        while True:\n            pass\n";
         assert_matches_cpython_marshal(source, "protected_branches.py");
