@@ -2,6 +2,7 @@
 use rustc_hash::FxHashMap;
 
 use super::block_graph::BlockGraph;
+use super::layout::label_position;
 use super::{
     AssembledCode, Assembler, Item, Label, LayoutAssembler, Operand, OptimizationPipeline,
     UnoptimizedCode, extended_arg_count,
@@ -273,6 +274,7 @@ impl OptimizationPipeline {
             exception_regions: self.exception_regions,
             preserved_block_boundaries: self.preserved_block_boundaries,
             removed_max_depth,
+            next_label: self.next_label,
         })
     }
 }
@@ -286,19 +288,21 @@ impl LayoutAssembler {
             .count();
         let mut extended_args = vec![0_u8; instruction_count];
         let mut resolved_arguments = vec![0_u32; instruction_count];
+        let mut labels = vec![None; usize::try_from(self.next_label).unwrap()];
 
         for _ in 0..8 {
-            let (positions, labels) = self.positions(&extended_args);
+            let code_units = self.label_positions(&extended_args, &mut labels);
             let mut changed = false;
+            let mut position = 0;
             let mut instruction_index = 0;
 
             for item in &self.items {
                 let Item::Instruction(instruction) = item else {
                     continue;
                 };
-                let position = positions[instruction_index];
                 let opcode_position = position + u32::from(extended_args[instruction_index]);
                 let jump_base = opcode_position + 1 + u32::from(instruction.opcode.caches());
+                position = jump_base;
                 let argument = match instruction.operand {
                     Operand::Value(argument) => argument,
                     Operand::Deferred(id) => {
@@ -308,7 +312,7 @@ impl LayoutAssembler {
                         )));
                     }
                     Operand::Forward(label) => {
-                        let target = *labels.get(&label).ok_or_else(|| {
+                        let target = label_position(&labels, label).ok_or_else(|| {
                             CompileError::Internal("unbound forward jump label".to_string())
                         })?;
                         target.checked_sub(jump_base).ok_or_else(|| {
@@ -316,7 +320,7 @@ impl LayoutAssembler {
                         })?
                     }
                     Operand::Backward(label) => {
-                        let target = *labels.get(&label).ok_or_else(|| {
+                        let target = label_position(&labels, label).ok_or_else(|| {
                             CompileError::Internal("unbound backward jump label".to_string())
                         })?;
                         jump_base.checked_sub(target).ok_or_else(|| {
@@ -338,7 +342,7 @@ impl LayoutAssembler {
                 #[cfg(any(test, debug_assertions))]
                 self.validate_structure(AssemblerStage::FinalLayout)?;
                 let line_table = self.line_table(&extended_args, first_line_number);
-                let exception_table = self.exception_table(&extended_args)?;
+                let exception_table = self.exception_table(&extended_args, &labels)?;
                 let max_depth = self
                     .items
                     .iter()
@@ -349,7 +353,7 @@ impl LayoutAssembler {
                     .max()
                     .unwrap_or(0);
                 return Ok(AssembledCode {
-                    bytecode: self.encode(&extended_args, &resolved_arguments),
+                    bytecode: self.encode(&extended_args, &resolved_arguments, code_units),
                     line_table,
                     exception_table,
                     max_depth,
