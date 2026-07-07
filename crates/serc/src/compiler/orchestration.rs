@@ -50,8 +50,8 @@ impl Compiler {
         }
     }
 
-    pub(crate) fn module(filename: &str, source: &str) -> Self {
-        let context = Arc::new(CompilationContext::new(filename, source));
+    pub(crate) fn module(filename: &str, source: &str, tokens: Tokens) -> Self {
+        let context = Arc::new(CompilationContext::new(filename, source, tokens));
         let unit = CodeUnit::from_spec(CodeUnitSpec {
             scope: Scope::Module,
             scope_id: ScopeId::MODULE,

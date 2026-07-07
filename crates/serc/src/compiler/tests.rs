@@ -1,5 +1,9 @@
-use ruff_python_ast::Stmt;
+use ruff_python_ast::token::TokenKind;
+use ruff_python_ast::{Expr, Stmt};
 use ruff_python_parser::parse_module;
+use ruff_text_size::Ranged;
+
+use crate::assembler::SourceLocation;
 
 use super::{Compiler, Constant, FunctionPlan, NameId, NameInterner, ScopeBodyFacts, clean_doc};
 
@@ -63,7 +67,7 @@ fn name_ids_deduplicate_private_name_mangling_collisions() {
         return self.__value
 ";
     let parsed = parse_module(source).unwrap();
-    let module = Compiler::module("example.py", source)
+    let module = Compiler::module("example.py", source, parsed.tokens().clone())
         .compile_module(parsed.suite())
         .unwrap();
     let class = module
@@ -96,7 +100,7 @@ fn single_pass_local_collection_preserves_source_order() {
     annotation_only: int
 ";
     let parsed = parse_module(source).unwrap();
-    let module = Compiler::module("example.py", source)
+    let module = Compiler::module("example.py", source, parsed.tokens().clone())
         .compile_module(parsed.suite())
         .unwrap();
     let function = module
@@ -183,8 +187,9 @@ fn scope_body_facts_preserve_named_scope_and_annotation_boundaries() {
 
 #[test]
 fn compiles_a_simple_module() {
-    let parsed = parse_module("answer = 6 * 7\nprint(answer)\n").unwrap();
-    let code = Compiler::module("example.py", "answer = 6 * 7\nprint(answer)\n")
+    let source = "answer = 6 * 7\nprint(answer)\n";
+    let parsed = parse_module(source).unwrap();
+    let code = Compiler::module("example.py", source, parsed.tokens().clone())
         .compile_module(parsed.suite())
         .unwrap();
     assert_eq!(code.name, "<module>");
@@ -196,14 +201,132 @@ fn compiles_a_simple_module() {
 fn compiles_type_alias() {
     let source = "type Alias = int\n";
     let parsed = parse_module(source).unwrap();
-    Compiler::module("example.py", source)
+    Compiler::module("example.py", source, parsed.tokens().clone())
         .compile_module(parsed.suite())
         .unwrap();
 }
 
 #[test]
+fn retains_parser_tokens_in_the_shared_compilation_context() {
+    let source = "value = (\n    1  # comment\n)\n";
+    let parsed = parse_module(source).unwrap();
+    let expected = parsed.tokens().clone();
+    let compiler = Compiler::module("example.py", source, parsed.tokens().clone());
+
+    assert_eq!(compiler.context.tokens, expected);
+}
+
+#[test]
+fn definition_locations_start_at_keyword_tokens() {
+    let source = r#"@decorate("class def async")
+async \
+    def function():
+    pass
+@decorate("def class")
+class Container:
+    pass
+"#;
+    let parsed = parse_module(source).unwrap();
+    let compiler = Compiler::module("example.py", source, parsed.tokens().clone());
+    let [Stmt::FunctionDef(function), Stmt::ClassDef(class)] = parsed.suite().as_slice() else {
+        panic!("expected a function and a class");
+    };
+
+    assert_eq!(
+        compiler.definition_location(
+            function.range,
+            function.name.range(),
+            TokenKind::Def,
+            function.is_async,
+        ),
+        SourceLocation::new(2, 4, 0, 8),
+    );
+    assert_eq!(
+        compiler.definition_location(class.range, class.name.range(), TokenKind::Class, false),
+        SourceLocation::new(6, 7, 0, 8),
+    );
+}
+
+#[test]
+fn trailing_semicolon_locations_follow_token_boundaries() {
+    let source = r#"first = "not; boundary"; second = 2
+continued = 1 \
+    ; third = 3
+commented = 4  # ; not a boundary
+"#;
+    let parsed = parse_module(source).unwrap();
+    let compiler = Compiler::module("example.py", source, parsed.tokens().clone());
+    let locations = parsed
+        .suite()
+        .iter()
+        .map(|statement| compiler.source_location_including_trailing_semicolon(statement.range()))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        locations,
+        [
+            SourceLocation::new(1, 1, 0, 24),
+            SourceLocation::new(1, 1, 25, 35),
+            SourceLocation::new(2, 3, 0, 5),
+            SourceLocation::new(3, 3, 6, 15),
+            SourceLocation::new(4, 4, 0, 13),
+        ],
+    );
+}
+
+#[test]
+fn generator_expression_ranges_follow_parser_tokens() {
+    for (source, expected) in [
+        (
+            "result = consume(\n    # before\n    value for value in values\n    # after\n)\n",
+            "(\n    # before\n    value for value in values\n    # after\n)",
+        ),
+        (
+            "result = consume(\\\n    value for value in values\\\n)\n",
+            "(\\\n    value for value in values\\\n)",
+        ),
+        (
+            r#"result = consume((value, nested[")"], {"(": value}) for value in values if predicate(")#"))
+"#,
+            r#"((value, nested[")"], {"(": value}) for value in values if predicate(")#"))"#,
+        ),
+        (
+            r#"result = (((")", {"(": value}) for value in values))
+"#,
+            r#"((")", {"(": value}) for value in values)"#,
+        ),
+    ] {
+        let parsed = parse_module(source).unwrap();
+        let Stmt::Assign(assignment) = &parsed.suite()[0] else {
+            panic!("expected an assignment");
+        };
+        let generator = match assignment.value.as_ref() {
+            Expr::Generator(generator) => generator,
+            Expr::Call(call) => {
+                let [Expr::Generator(generator)] = call.arguments.args.as_ref() else {
+                    panic!("expected a generator call argument");
+                };
+                generator
+            }
+            expression => panic!("expected a generator or call, got {expression:?}"),
+        };
+        let compiler = Compiler::module("example.py", source, parsed.tokens().clone());
+        let range = compiler.generator_expression_range(generator);
+        let expected_start = source.find(expected).unwrap();
+        let actual_start = usize::from(range.start());
+        let actual_end = usize::from(range.end());
+
+        assert_eq!(actual_start, expected_start);
+        assert_eq!(actual_end, expected_start + expected.len());
+        assert_eq!(&source[actual_start..actual_end], expected);
+    }
+}
+
+#[test]
 fn source_positions_use_utf8_byte_columns() {
-    let compiler = Compiler::module("example.py", "α = 1\nβγ = 2\n");
+    let source = "α = 1\nβγ = 2\n";
+    let parsed = parse_module(source).unwrap();
+    let compiler = Compiler::module("example.py", source, parsed.tokens().clone());
 
     assert_eq!(compiler.source_position(0), (1, 0));
     assert_eq!(compiler.source_position(2), (1, 2));
@@ -216,7 +339,8 @@ fn source_positions_use_utf8_byte_columns() {
 #[test]
 fn source_positions_clamp_to_eof() {
     let source = "first\né\n";
-    let compiler = Compiler::module("example.py", source);
+    let parsed = parse_module(source).unwrap();
+    let compiler = Compiler::module("example.py", source, parsed.tokens().clone());
     let eof = u32::try_from(source.len()).unwrap();
 
     assert_eq!(compiler.source_position(eof), (3, 0));
@@ -227,7 +351,8 @@ fn source_positions_clamp_to_eof() {
 #[test]
 fn source_positions_preserve_crlf_boundaries_and_eof() {
     let source = "one\r\ntwo";
-    let compiler = Compiler::module("example.py", source);
+    let parsed = parse_module(source).unwrap();
+    let compiler = Compiler::module("example.py", source, parsed.tokens().clone());
 
     assert_eq!(compiler.source_position(2), (1, 2));
     assert_eq!(compiler.source_position(5), (2, 0));
@@ -236,7 +361,8 @@ fn source_positions_preserve_crlf_boundaries_and_eof() {
     assert_eq!(compiler.source_position(u32::MAX), (2, 3));
 
     let source = "one\r\ntwo\r\n";
-    let compiler = Compiler::module("example.py", source);
+    let parsed = parse_module(source).unwrap();
+    let compiler = Compiler::module("example.py", source, parsed.tokens().clone());
 
     assert_eq!(compiler.source_position(8), (2, 3));
     assert_eq!(compiler.source_position(9), (2, 4));

@@ -11,15 +11,17 @@ use super::*;
 pub(super) struct CompilationContext {
     pub(super) filename: String,
     pub(super) source: Arc<str>,
+    pub(super) tokens: Tokens,
     pub(super) line_index: LineIndex,
     pub(super) scopes: OnceLock<ScopeArena>,
 }
 
 impl CompilationContext {
-    pub(super) fn new(filename: &str, source: &str) -> Self {
+    pub(super) fn new(filename: &str, source: &str, tokens: Tokens) -> Self {
         Self {
             filename: filename.to_string(),
             source: Arc::from(source),
+            tokens,
             line_index: LineIndex::from_source_text(source),
             scopes: OnceLock::new(),
         }
@@ -50,61 +52,41 @@ impl Compiler {
         &self,
         range: ruff_text_size::TextRange,
         name_range: ruff_text_size::TextRange,
-        keyword: &[u8],
+        keyword: TokenKind,
         is_async: bool,
     ) -> SourceLocation {
-        fn find_keyword(bytes: &[u8], start: usize, end: usize, keyword: &[u8]) -> Option<usize> {
-            let last_start = end.checked_sub(keyword.len())?;
-            (start..=last_start).rev().find(|&offset| {
-                bytes.get(offset..offset + keyword.len()) == Some(keyword)
-                    && bytes
-                        .get(offset.wrapping_sub(1))
-                        .is_none_or(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_')
-                    && bytes
-                        .get(offset + keyword.len())
-                        .is_none_or(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_')
-            })
-        }
-
-        let bytes = self.context.source.as_bytes();
-        let range_start = usize::from(range.start());
-        let name_start = usize::from(name_range.start());
-        let keyword_start = find_keyword(bytes, range_start, name_start, keyword)
-            .unwrap_or_else(|| name_start.saturating_sub(keyword.len() + 1));
-        let start = if is_async {
-            find_keyword(bytes, range_start, keyword_start, b"async").unwrap_or(keyword_start)
-        } else {
-            keyword_start
-        };
-        let (line, column) = self.source_position(u32::try_from(start).unwrap_or(u32::MAX));
+        let tokens = self.context.tokens.in_range(ruff_text_size::TextRange::new(
+            range.start(),
+            name_range.start(),
+        ));
+        let start = tokens
+            .iter()
+            .enumerate()
+            .rfind(|(_, token)| token.kind() == keyword)
+            .map_or(range.start(), |(keyword_index, keyword)| {
+                if is_async {
+                    tokens[..keyword_index]
+                        .iter()
+                        .rfind(|token| token.kind() == TokenKind::Async)
+                        .map_or(keyword.start(), ruff_text_size::Ranged::start)
+                } else {
+                    keyword.start()
+                }
+            });
+        let (line, column) = self.source_position(u32::from(start));
         let (end_line, end_column) = self.definition_end_position(range);
         SourceLocation::new(line, end_line, column, end_column)
     }
 
     fn definition_end_position(&self, range: ruff_text_size::TextRange) -> (i32, i32) {
-        let bytes = self.context.source.as_bytes();
-        let original_end = usize::from(range.end());
-        let mut end = original_end;
-        loop {
-            while matches!(bytes.get(end), Some(b' ' | b'\t' | b'\x0c')) {
-                end += 1;
-            }
-            if bytes.get(end) == Some(&b';') {
-                return self.source_position(u32::try_from(end + 1).unwrap_or(u32::MAX));
-            }
-            if bytes.get(end) != Some(&b'\\') {
-                break;
-            }
-            end += 1;
-            if bytes.get(end) == Some(&b'\r') {
-                end += 1;
-            }
-            if bytes.get(end) != Some(&b'\n') {
-                break;
-            }
-            end += 1;
-        }
-        self.source_position(u32::try_from(original_end).unwrap_or(u32::MAX))
+        let end = self
+            .context
+            .tokens
+            .after(range.end())
+            .first()
+            .filter(|token| token.kind() == TokenKind::Semi)
+            .map_or(range.end(), ruff_text_size::Ranged::end);
+        self.source_position(u32::from(end))
     }
 
     pub(super) fn source_position(&self, offset: u32) -> (i32, i32) {
@@ -176,60 +158,15 @@ impl Compiler {
 
     pub(super) fn generator_expression_range(
         &self,
-        range: ruff_text_size::TextRange,
+        generator: &ruff_python_ast::ExprGenerator,
     ) -> ruff_text_size::TextRange {
-        let bytes = self.context.source.as_bytes();
-        let original_start = usize::from(range.start());
-        let original_end = usize::from(range.end());
-        if range_is_wrapped_in_parentheses(&self.context.source, original_start, original_end) {
-            return range;
-        }
-        let mut start = usize::from(range.start());
-        loop {
-            while start > 0 && bytes[start - 1].is_ascii_whitespace() {
-                start -= 1;
-            }
-            let line_start = bytes[..start]
-                .iter()
-                .rposition(|byte| *byte == b'\n')
-                .map_or(0, |position| position + 1);
-            let comment_line = bytes[line_start..start]
-                .iter()
-                .find(|byte| !byte.is_ascii_whitespace())
-                == Some(&b'#');
-            if !comment_line {
-                break;
-            }
-            start = line_start;
-        }
-        if start > 0 && bytes[start - 1] == b'(' {
-            start -= 1;
-        } else {
-            start = usize::from(range.start());
+        if generator.parenthesized {
+            return generator.range;
         }
 
-        let mut end = usize::from(range.end());
-        loop {
-            while end < bytes.len() && bytes[end].is_ascii_whitespace() {
-                end += 1;
-            }
-            if bytes.get(end) != Some(&b'#') {
-                break;
-            }
-            while end < bytes.len() && !matches!(bytes[end], b'\n' | b'\r') {
-                end += 1;
-            }
-        }
-        if end < bytes.len() && bytes[end] == b')' {
-            end += 1;
-        } else {
-            end = usize::from(range.end());
-        }
-
-        ruff_text_size::TextRange::new(
-            ruff_text_size::TextSize::new(u32::try_from(start).unwrap_or(u32::MAX)),
-            ruff_text_size::TextSize::new(u32::try_from(end).unwrap_or(u32::MAX)),
-        )
+        ruff_python_ast::token::parentheses_iterator(generator.into(), None, &self.context.tokens)
+            .next()
+            .unwrap_or(generator.range)
     }
 
     fn interpolated_string_content_range(
@@ -400,76 +337,6 @@ fn fstring_literal_span(
         }
     }
     Some(ruff_text_size::TextRange::new(first?, last?))
-}
-
-fn range_is_wrapped_in_parentheses(source: &str, start: usize, end: usize) -> bool {
-    let bytes = source.as_bytes();
-    if end <= start || bytes.get(start) != Some(&b'(') || bytes.get(end - 1) != Some(&b')') {
-        return false;
-    }
-
-    let mut stack = Vec::new();
-    let mut index = start;
-    let mut quote = None;
-    let mut triple_quoted = false;
-    while index < end {
-        if let Some(delimiter) = quote {
-            if bytes[index] == b'\\' {
-                index = (index + 2).min(end);
-                continue;
-            }
-            if bytes[index] == delimiter {
-                if triple_quoted {
-                    if bytes.get(index..index + 3) == Some(&[delimiter; 3]) {
-                        index += 3;
-                        quote = None;
-                        triple_quoted = false;
-                        continue;
-                    }
-                } else {
-                    index += 1;
-                    quote = None;
-                    continue;
-                }
-            }
-            index += 1;
-            continue;
-        }
-
-        match bytes[index] {
-            b'#' => {
-                while index < end && !matches!(bytes[index], b'\n' | b'\r') {
-                    index += 1;
-                }
-            }
-            delimiter @ (b'\'' | b'"') => {
-                triple_quoted = bytes.get(index..index + 3) == Some(&[delimiter; 3]);
-                index += if triple_quoted { 3 } else { 1 };
-                quote = Some(delimiter);
-            }
-            opening @ (b'(' | b'[' | b'{') => {
-                stack.push(opening);
-                index += 1;
-            }
-            closing @ (b')' | b']' | b'}') => {
-                let Some(opening) = stack.pop() else {
-                    return false;
-                };
-                if !matches!(
-                    (opening, closing),
-                    (b'(', b')') | (b'[', b']') | (b'{', b'}')
-                ) {
-                    return false;
-                }
-                index += 1;
-                if stack.is_empty() {
-                    return index == end;
-                }
-            }
-            _ => index += 1,
-        }
-    }
-    false
 }
 
 /// Removes Python comments while preserving the whitespace and newlines around
