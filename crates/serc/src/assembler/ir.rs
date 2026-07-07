@@ -78,14 +78,21 @@ impl AssemblerStage {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct Label(pub(super) u32);
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct InstructionId(pub(super) usize);
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct OperandPatchId(pub(super) u32);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Operand {
     Value(u32),
+    Deferred(OperandPatchId),
     Forward(Label),
     Backward(Label),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct OperandPatch {
+    pub(super) item_index: u32,
+    pub(super) argument: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -475,6 +482,7 @@ pub(super) enum UnoptimizedCode {
 #[derive(Debug)]
 pub(crate) struct Assembler {
     pub(super) code: UnoptimizedCode,
+    pub(super) operand_patches: Vec<OperandPatch>,
     pub(super) next_label: u32,
     pub(super) location: SourceLocation,
     pub(super) exception_regions: Vec<ExceptionRegion>,
@@ -545,6 +553,7 @@ impl Default for Assembler {
     fn default() -> Self {
         Self {
             code: UnoptimizedCode::Linear(Vec::new()),
+            operand_patches: Vec::new(),
             next_label: 0,
             location: SourceLocation::NONE,
             exception_regions: Vec::new(),

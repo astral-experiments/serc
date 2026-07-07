@@ -356,7 +356,7 @@ impl OptimizationPipeline {
                     };
                     let next = match next_operand {
                         Operand::Forward(next) | Operand::Backward(next) => next,
-                        Operand::Value(_) => unreachable!(),
+                        Operand::Value(_) | Operand::Deferred(_) => unreachable!(),
                     };
                     if next == target {
                         break;

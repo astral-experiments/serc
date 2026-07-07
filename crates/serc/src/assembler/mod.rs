@@ -8,6 +8,7 @@ mod tests;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use crate::CompileError;
 use crate::target::opcodes::{
     CHECK_EXC_MATCH, COMPARE_OP, CONTAINS_OP, COPY, DELETE_DEREF, DELETE_FAST, DICT_MERGE,
     DICT_UPDATE, END_SEND, EXTENDED_ARG, FOR_ITER, FORMAT_SIMPLE, GET_ANEXT, GET_LEN,
@@ -28,11 +29,12 @@ use crate::target::{
 #[cfg(any(test, debug_assertions))]
 use ir::AssemblerStage;
 pub(crate) use ir::{
-    AssembledCode, Assembler, ExceptionPolicy, InstructionId, Label, SourceLocation,
+    AssembledCode, Assembler, ExceptionPolicy, Label, OperandPatchId, SourceLocation,
 };
 use ir::{
     BorrowFallthrough, ExceptionExclusion, ExceptionRegion, Instruction, Item, LayoutAssembler,
-    LoadPolicy, NormalizedExceptionOwner, Operand, OptimizationPipeline, UnoptimizedCode,
+    LoadPolicy, NormalizedExceptionOwner, Operand, OperandPatch, OptimizationPipeline,
+    UnoptimizedCode,
 };
 
 fn reachable_constant_indices(
@@ -170,7 +172,7 @@ impl Assembler {
     }
 
     pub(crate) fn mark_before_trailing_instructions(&mut self, label: Label, count: usize) {
-        let items = self.linear_items_mut();
+        let items = self.linear_items();
         let index = items
             .iter()
             .enumerate()
@@ -178,11 +180,11 @@ impl Assembler {
             .filter(|(_, item)| matches!(item, Item::Instruction(_)))
             .nth(count.saturating_sub(1))
             .map_or(items.len(), |(index, _)| index);
-        items.insert(index, Item::Label(label));
+        self.insert_label(index, label);
     }
 
     pub(crate) fn mark_before_trailing_converted_pop_block(&mut self, label: Label) -> bool {
-        let items = self.linear_items_mut();
+        let items = self.linear_items();
         let mut instructions = items.iter().enumerate().rev().filter_map(|(index, item)| {
             let Item::Instruction(instruction) = item else {
                 return None;
@@ -203,8 +205,21 @@ impl Assembler {
         {
             index = previous_index;
         }
-        items.insert(index, Item::Label(label));
+        self.insert_label(index, label);
         true
+    }
+
+    fn insert_label(&mut self, index: usize, label: Label) {
+        let patch_index = u32::try_from(index).expect("assembler item index should fit in u32");
+        for patch in &mut self.operand_patches {
+            if patch.item_index >= patch_index {
+                patch.item_index = patch
+                    .item_index
+                    .checked_add(1)
+                    .expect("too many assembler items");
+            }
+        }
+        self.linear_items_mut().insert(index, Item::Label(label));
     }
 
     pub(crate) fn fusion_barrier(&mut self) {
@@ -369,17 +384,103 @@ impl Assembler {
         &mut self,
         opcode: Opcode,
         depth_after: u32,
-    ) -> InstructionId {
-        let id = InstructionId(self.linear_items().len());
-        self.emit_operand_with_depth(opcode, Operand::Value(0), Some(depth_after));
+    ) -> OperandPatchId {
+        let id = OperandPatchId(
+            u32::try_from(self.operand_patches.len()).expect("too many operand patches"),
+        );
+        self.operand_patches.push(OperandPatch {
+            item_index: u32::try_from(self.linear_items().len())
+                .expect("assembler item index should fit in u32"),
+            argument: None,
+        });
+        self.emit_operand_with_depth(opcode, Operand::Deferred(id), Some(depth_after));
         id
     }
 
-    pub(crate) fn patch_argument(&mut self, id: InstructionId, argument: u32) {
-        let Item::Instruction(instruction) = &mut self.linear_items_mut()[id.0] else {
-            unreachable!("instruction handle points to a label");
+    pub(crate) fn patch_argument(
+        &mut self,
+        id: OperandPatchId,
+        argument: u32,
+    ) -> Result<(), CompileError> {
+        let index = usize::try_from(id.0).expect("operand patch ID should fit in usize");
+        let patch = self
+            .operand_patches
+            .get_mut(index)
+            .ok_or_else(|| CompileError::Internal(format!("unknown operand patch {}", id.0)))?;
+        if patch.argument.is_some() {
+            return Err(CompileError::Internal(format!(
+                "operand patch {} was resolved more than once",
+                id.0
+            )));
+        }
+        patch.argument = Some(argument);
+        Ok(())
+    }
+
+    pub(crate) fn resolve_operand_patches(&mut self) -> Result<(), CompileError> {
+        if self.operand_patches.is_empty() {
+            return Ok(());
+        }
+        let UnoptimizedCode::Linear(items) = &mut self.code else {
+            return Err(CompileError::Internal(
+                "operand patches reached the prepared assembler graph".to_string(),
+            ));
         };
-        instruction.operand = Operand::Value(argument);
+
+        for (id, patch) in self.operand_patches.iter().enumerate() {
+            let state = if patch.argument.is_some() {
+                "resolved"
+            } else {
+                "unresolved"
+            };
+            let expected = OperandPatchId(u32::try_from(id).expect("too many operand patches"));
+            let item_index = usize::try_from(patch.item_index)
+                .expect("assembler item index should fit in usize");
+            let Some(Item::Instruction(instruction)) = items.get(item_index) else {
+                return Err(CompileError::Internal(format!(
+                    "{state} operand patch {id} has no instruction"
+                )));
+            };
+            if !matches!(instruction.operand, Operand::Deferred(id) if id == expected) {
+                return Err(CompileError::Internal(format!(
+                    "{state} operand patch {id} has no instruction"
+                )));
+            }
+        }
+
+        for (item_index, item) in items.iter_mut().enumerate() {
+            let Item::Instruction(instruction) = item else {
+                continue;
+            };
+            let Operand::Deferred(id) = instruction.operand else {
+                continue;
+            };
+            let index = usize::try_from(id.0).expect("operand patch ID should fit in usize");
+            let Some(patch) = self.operand_patches.get(index) else {
+                return Err(CompileError::Internal(format!(
+                    "instruction references unknown operand patch {}",
+                    id.0
+                )));
+            };
+            if usize::try_from(patch.item_index).expect("assembler item index should fit in usize")
+                != item_index
+            {
+                return Err(CompileError::Internal(format!(
+                    "operand patch {} belongs to more than one instruction",
+                    id.0
+                )));
+            }
+            let Some(argument) = patch.argument else {
+                return Err(CompileError::Internal(format!(
+                    "operand patch {} was never resolved",
+                    id.0
+                )));
+            };
+            instruction.operand = Operand::Value(argument);
+        }
+
+        self.operand_patches.clear();
+        Ok(())
     }
 
     pub(crate) fn used_constant_indices(&mut self, load_const: Opcode) -> FxHashSet<u32> {
@@ -641,7 +742,7 @@ fn block_jump_target(block: &[Item]) -> Option<Label> {
     })?;
     match instruction.operand {
         Operand::Forward(target) | Operand::Backward(target) => Some(target),
-        Operand::Value(_) => None,
+        Operand::Value(_) | Operand::Deferred(_) => None,
     }
 }
 

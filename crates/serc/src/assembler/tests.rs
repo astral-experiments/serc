@@ -4,7 +4,7 @@ use super::ir::{
 };
 use super::{
     Assembler, AssemblerStage, ExceptionExclusion, Instruction, Item, NormalizedExceptionOwner,
-    Operand, SourceLocation,
+    Operand, OperandPatchId, SourceLocation,
 };
 use crate::target::opcodes::*;
 
@@ -381,6 +381,80 @@ fn owned_fast_loads_use_real_opcodes_with_provenance() {
     assert_eq!(instruction.opcode, LOAD_FAST);
     assert!(instruction.load_policy.force_owned);
     assert!(!instruction.load_policy.strict_owned);
+}
+
+#[test]
+fn operand_patches_survive_item_insertion() {
+    let mut assembler = Assembler::default();
+    let patch = assembler.emit_placeholder_with_depth(LOAD_CONST, 1);
+    let preceding = assembler.label();
+    assembler.mark_before_trailing_instructions(preceding, 1);
+
+    assembler.patch_argument(patch, 37).unwrap();
+    assembler.resolve_operand_patches().unwrap();
+
+    assert!(matches!(assembler.linear_items()[0], Item::Label(label) if label == preceding));
+    assert!(matches!(
+        assembler.linear_items()[1],
+        Item::Instruction(Instruction {
+            operand: Operand::Value(37),
+            ..
+        })
+    ));
+}
+
+#[test]
+fn operand_patches_reject_duplicate_resolution() {
+    let mut assembler = Assembler::default();
+    let patch = assembler.emit_placeholder_with_depth(LOAD_CONST, 1);
+
+    assembler.patch_argument(patch, 1).unwrap();
+    let error = assembler.patch_argument(patch, 2).unwrap_err();
+
+    assert!(error.to_string().contains("resolved more than once"));
+}
+
+#[test]
+fn operand_patches_must_be_resolved_and_attached() {
+    let mut unresolved = Assembler::default();
+    unresolved.emit_placeholder_with_depth(LOAD_CONST, 1);
+    let error = unresolved.resolve_operand_patches().unwrap_err();
+    assert!(error.to_string().contains("was never resolved"));
+
+    let mut detached = Assembler::default();
+    let patch = detached.emit_placeholder_with_depth(LOAD_CONST, 1);
+    detached.patch_argument(patch, 1).unwrap();
+    detached.linear_items_mut().clear();
+    let error = detached.resolve_operand_patches().unwrap_err();
+    assert!(error.to_string().contains("has no instruction"));
+}
+
+#[test]
+fn operand_patches_reject_duplicate_and_unknown_attachments() {
+    let mut duplicate = Assembler::default();
+    let patch = duplicate.emit_placeholder_with_depth(LOAD_CONST, 1);
+    duplicate.patch_argument(patch, 1).unwrap();
+    let item = duplicate.linear_items()[0];
+    duplicate.linear_items_mut().push(item);
+    let error = duplicate.resolve_operand_patches().unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("belongs to more than one instruction")
+    );
+
+    let mut unknown = Assembler::default();
+    let patch = unknown.emit_placeholder_with_depth(LOAD_CONST, 1);
+    unknown.patch_argument(patch, 1).unwrap();
+    let Item::Instruction(mut instruction) = unknown.linear_items()[0] else {
+        unreachable!();
+    };
+    instruction.operand = Operand::Deferred(OperandPatchId(1));
+    unknown
+        .linear_items_mut()
+        .push(Item::Instruction(instruction));
+    let error = unknown.resolve_operand_patches().unwrap_err();
+    assert!(error.to_string().contains("unknown operand patch"));
 }
 
 #[test]

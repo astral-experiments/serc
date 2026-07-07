@@ -195,7 +195,9 @@ impl OptimizationPipeline {
         fn stored_local(instruction: &Instruction) -> Option<u32> {
             (instruction.opcode == STORE_FAST).then(|| match instruction.operand {
                 Operand::Value(argument) => argument,
-                Operand::Forward(_) | Operand::Backward(_) => unreachable!(),
+                Operand::Deferred(_) | Operand::Forward(_) | Operand::Backward(_) => {
+                    unreachable!()
+                }
             })
         }
 

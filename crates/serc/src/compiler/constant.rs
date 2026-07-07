@@ -10,7 +10,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{LOAD_CONST, LOAD_SMALL_INT, NOP, STORE_NAME};
 use crate::CompileError;
-use crate::assembler::InstructionId;
+use crate::assembler::OperandPatchId;
 use crate::target::operands::Conversion;
 
 use super::Compiler;
@@ -68,9 +68,9 @@ impl ConstantPool {
 #[derive(Debug, Default)]
 pub(super) struct OutputState {
     pub(super) constants: ConstantPool,
-    pub(super) deferred_constants_before_return: Vec<(InstructionId, Constant)>,
-    pub(super) deferred_constants: Vec<(Option<InstructionId>, Constant)>,
-    pub(super) deferred_names: Vec<(InstructionId, String)>,
+    pub(super) deferred_constants_before_return: Vec<(OperandPatchId, Constant)>,
+    pub(super) deferred_constants: Vec<(Option<OperandPatchId>, Constant)>,
+    pub(super) deferred_names: Vec<(OperandPatchId, String)>,
     pub(super) names: Vec<String>,
     name_indices: FxHashMap<NameId, u32>,
     pub(super) interned_constant_strings: FxHashSet<String>,
