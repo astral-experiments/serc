@@ -52,6 +52,7 @@ Each stage has one primary owner:
 | Public library API, input normalization, parser setup, `.pyc` header         | `src/lib.rs`       |
 | Filesystem CLI, source discovery, and timestamp-cache writes                 | `../serc_cli/`  |
 | Scope analysis, AST lowering, constants/names/locals, stack-depth accounting | `src/compiler.rs`, `src/compiler/` |
+| Finished constant and code-object model                                      | `src/code_object.rs` |
 | Labels, control-flow rewrites, instruction layout, line and exception tables | `src/assembler/`   |
 | CPython IDs, widths, flags, stack metadata, version and provenance           | `src/target/`      |
 | Marshal equality/identity keys, reference graph, binary encoding             | `src/marshal/`     |
@@ -68,8 +69,8 @@ provide CPython's symbol table, compiler, runtime, or marshal implementation.
 
 ### Scope planning and lowering
 
-`src/compiler.rs` owns the shared compiler state and code-object data model. The behavioral
-implementation is split into real Rust submodules under `src/compiler/`:
+`src/compiler.rs` owns the shared lowering state. The behavioral implementation is split into real
+Rust submodules under `src/compiler/`:
 
 - `scope.rs` owns scope plans, name interning, and the binding/reference collectors.
 - `orchestration.rs` owns compiler construction, nested compilation, and code-object finishing.
@@ -104,8 +105,10 @@ Before assembly, `Compiler::finish_inner`:
 1. computes CPython local-kind bytes; and
 1. passes the symbolic stream to `Assembler::finish_code`.
 
-The resulting `CodeObject` is the complete handwritten representation consumed by the marshal
-layer.
+`src/code_object.rs` owns the finished `Constant` and `CodeObject` model. It is a neutral leaf
+shared by the compiler and marshal layers, so binary encoding does not depend on compiler
+implementation details. The resulting `CodeObject` is the complete handwritten representation
+consumed by the marshal layer.
 
 ### Assembler
 

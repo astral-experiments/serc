@@ -5,6 +5,7 @@
 //! Python releases, so future targets should be implemented as separate backends.
 
 mod assembler;
+mod code_object;
 mod compiler;
 mod marshal;
 mod source;
@@ -13,7 +14,8 @@ mod target;
 use std::error::Error;
 use std::fmt;
 
-use compiler::{CodeObject, Compiler};
+use code_object::{CodeObject, CodeObjectValidationError};
+use compiler::Compiler;
 use ruff_text_size::TextRange;
 pub use source::{SourceDecodeError, decode_source};
 
@@ -147,6 +149,12 @@ impl Error for CompileError {
             Self::Parse(error) => Some(error),
             Self::InvalidPattern { .. } | Self::Unsupported(_) | Self::Internal(_) => None,
         }
+    }
+}
+
+impl From<CodeObjectValidationError> for CompileError {
+    fn from(error: CodeObjectValidationError) -> Self {
+        Self::Internal(error.to_string())
     }
 }
 

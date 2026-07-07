@@ -2,7 +2,7 @@ use std::collections::hash_map::Entry;
 
 use rustc_hash::FxHashMap;
 
-use crate::compiler::{CodeObject, Constant};
+use crate::code_object::{CodeObject, Constant};
 
 use super::key::{
     ObjectKey, code_bytes_key, code_key, constant_key, constants_tuple_key,
@@ -109,8 +109,12 @@ impl<'a> ObjectGraph<'a> {
         if !self.record_at(ObjectLocation::Code(address), code_key(code), false) {
             return;
         }
-        self.explicitly_interned
-            .extend(code.interned_constant_strings.iter().map(String::as_str));
+        self.explicitly_interned.extend(
+            code.marshal_hints
+                .explicitly_interned_strings
+                .iter()
+                .map(String::as_str),
+        );
         self.record_at(
             ObjectLocation::CodeBytes(address),
             code_bytes_key(code),
