@@ -82,6 +82,7 @@ struct ReturnFinallyContext {
 struct WithExitContext {
     location: SourceLocation,
     is_async: bool,
+    exception_region_depth: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -587,8 +588,20 @@ impl Compiler {
                     }
                 }
             } else {
+                // CPython drops this end NOP when async-with is the innermost protected owner;
+                // an intervening exception region still retains it.
+                let innermost_async_with =
+                    self.control
+                        .active_with_exits
+                        .last()
+                        .is_some_and(|context| {
+                            context.is_async
+                                && self.control.active_exception_region_exclusions.len()
+                                    == context.exception_region_depth
+                        });
                 let emit_protected_async_for_end_nop = is_final
                     && matches!(statement, Stmt::For(statement) if statement.is_async)
+                    && !innermost_async_with
                     && (!self.control.active_with_region_exclusions.is_empty()
                         || !self.control.active_exception_region_exclusions.is_empty());
                 self.with_control_override(
@@ -4920,6 +4933,7 @@ impl Compiler {
         let context = WithExitContext {
             location: self.source_location(item.context_expr.range()),
             is_async: false,
+            exception_region_depth: self.control.active_exception_region_exclusions.len(),
         };
         let (body_noop, region_exclusions) = self.with_region_exclusion_collector(
             |control| &mut control.active_with_region_exclusions,
@@ -5099,7 +5113,20 @@ impl Compiler {
         let context = WithExitContext {
             location: self.source_location(item.context_expr.range()),
             is_async: true,
+            exception_region_depth: self.control.active_exception_region_exclusions.len(),
         };
+        let outer_exception_owns_exit = context.exception_region_depth > 0
+        // Without the converted end NOP, CPython gives the async-with exit back to the
+        // surrounding exception region instead of the coroutine stop handler.
+            && remaining.is_empty()
+            && matches!(
+                body.last(),
+                Some(Stmt::For(statement))
+                    if statement.is_async
+                        && statement.orelse.is_empty()
+                        && !suite_contains_loop_break(&statement.body)
+            );
+
         let ((), mut region_exclusions) = self.with_region_exclusion_collector(
             |control| &mut control.active_with_region_exclusions,
             |compiler| {
@@ -5136,6 +5163,11 @@ impl Compiler {
             region_exclusions.clear();
         }
         self.assembler.mark(protected_end);
+        if outer_exception_owns_exit {
+            self.control
+                .generator_region_exclusions
+                .push((protected_end, end));
+        }
 
         self.assembler
             .set_location(self.source_location(item.context_expr.range()));
@@ -5184,11 +5216,18 @@ impl Compiler {
         self.emit(NOT_TAKEN, 0, 0)?;
         let not_taken_end = self.assembler.label();
         self.assembler.mark(not_taken_end);
-        self.control
-            .generator_region_exclusions
-            .push((not_taken_start, not_taken_end));
+        if !outer_exception_owns_exit {
+            self.control
+                .generator_region_exclusions
+                .push((not_taken_start, not_taken_end));
+        }
         for exclusions in &mut self.control.active_with_region_exclusions {
             exclusions.push((not_taken_start, not_taken_end));
+        }
+        if outer_exception_owns_exit {
+            for exclusions in &mut self.control.active_exception_region_exclusions {
+                exclusions.push((not_taken_start, not_taken_end));
+            }
         }
         self.emit_reraise(ReraiseStackState::WithHandler)?;
         self.assembler.mark(suppress);

@@ -615,6 +615,21 @@ except Error:
     }
 
     #[test]
+    fn matches_cpython_marshal_for_terminal_async_for_in_with_bodies() {
+        let source = "async def sync_with_direct(manager, items):\n    with manager:\n        async for item in items:\n            consume(item)\n\nasync def async_with_direct(manager, items):\n    async with manager:\n        async for item in items:\n            consume(item)\n\nasync def sync_then_async_with(sync_manager, async_manager, items):\n    with sync_manager:\n        async with async_manager:\n            async for item in items:\n                consume(item)\n\nasync def async_then_sync_with(async_manager, sync_manager, items):\n    async with async_manager:\n        with sync_manager:\n            async for item in items:\n                consume(item)\n\nasync def async_with_two_items(first, second, items):\n    async with first, second:\n        async for item in items:\n            consume(item)\n\nasync def async_with_inner_finally(manager, items):\n    async with manager:\n        try:\n            async for item in items:\n                consume(item)\n        finally:\n            cleanup()\n\nasync def async_with_nonfinal(manager, items):\n    async with manager:\n        async for item in items:\n            consume(item)\n        after()\n";
+        assert_matches_cpython_marshal(source, "async_with_terminal_async_for.py");
+
+        let source = "async def try_around_async_with(manager, items):\n    try:\n        async with manager:\n            async for item in items:\n                consume(item)\n    finally:\n        cleanup()\n";
+        assert_matches_cpython_marshal(source, "try_finally_async_with.py");
+    }
+
+    #[test]
+    fn matches_cpython_terminal_async_for_nop_ownership() {
+        let source = "import dis\n\nasync def sync_with_direct(manager, items):\n    with manager:\n        async for item in items:\n            consume(item)\n\nasync def async_then_sync_with(async_manager, sync_manager, items):\n    async with async_manager:\n        with sync_manager:\n            async for item in items:\n                consume(item)\n\nasync def try_around_async_with(manager, items):\n    try:\n        async with manager:\n            async for item in items:\n                consume(item)\n    finally:\n        cleanup()\n\nasync def async_with_around_try(manager, items):\n    async with manager:\n        try:\n            async for item in items:\n                consume(item)\n        finally:\n            cleanup()\n\ndef has_end_nop(function):\n    instructions = list(dis.get_instructions(function))\n    return any(\n        left.opname == 'END_ASYNC_FOR' and right.opname == 'NOP'\n        for left, right in zip(instructions, instructions[1:])\n    )\n\nfor function in (sync_with_direct, async_then_sync_with, try_around_async_with, async_with_around_try):\n    print(has_end_nop(function))\n";
+        assert_executes(source, "True\nTrue\nFalse\nTrue\n");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_terminal_boolean_comprehension() {
         let source = "foo or {x: None for x in bar}\n";
         assert_matches_cpython_marshal(source, "boolean_comprehension.py");
