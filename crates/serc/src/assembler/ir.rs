@@ -7,8 +7,7 @@ pub(crate) struct AssembledCode {
     pub(crate) bytecode: Vec<u8>,
     pub(crate) line_table: Vec<u8>,
     pub(crate) exception_table: Vec<u8>,
-    pub(crate) max_depth: u32,
-    pub(crate) removed_max_depth: Option<u32>,
+    pub(crate) stack_size: u32,
 }
 
 #[cfg(any(test, debug_assertions))]
@@ -478,6 +477,7 @@ pub(crate) struct Assembler {
     pub(super) next_label: u32,
     pub(super) location: SourceLocation,
     pub(super) exception_regions: Vec<ExceptionRegion>,
+    pub(super) exception_handler_entries: Vec<ExceptionHandlerEntry>,
     pub(super) preserved_block_boundaries: FxHashSet<Label>,
     pub(super) borrow_unreachable_blocks: FxHashSet<Label>,
     pub(super) load_fast_borrowing_enabled: bool,
@@ -493,6 +493,7 @@ pub(super) struct OptimizationPipeline {
     pub(super) graph: BlockGraph,
     pub(super) next_label: u32,
     pub(super) exception_regions: Vec<ExceptionRegion>,
+    pub(super) exception_handler_entries: Vec<ExceptionHandlerEntry>,
     pub(super) preserved_block_boundaries: FxHashSet<Label>,
     pub(super) borrow_unreachable_blocks: FxHashSet<Label>,
 }
@@ -503,7 +504,7 @@ pub(super) struct LayoutAssembler {
     pub(super) items: Vec<Item>,
     pub(super) exception_regions: Vec<ExceptionRegion>,
     pub(super) preserved_block_boundaries: FxHashSet<Label>,
-    pub(super) removed_max_depth: Option<u32>,
+    pub(super) stack_size: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -513,6 +514,19 @@ pub(super) struct ExceptionRegion {
     pub(super) target: Label,
     pub(super) depth: u32,
     pub(super) preserve_lasti: bool,
+}
+
+/// The CFG edge originally represented by a CPython `SETUP_*` pseudo-instruction.
+///
+/// Optimizations can shrink an exception region to nothing while its handler remains in the
+/// optimized CFG. Retaining the setup edge separately keeps stack-depth reachability equivalent
+/// to CPython even when the final exception table no longer contains that region.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ExceptionHandlerEntry {
+    pub(super) source: Label,
+    pub(super) target: Label,
+    pub(super) source_depth: u32,
+    pub(super) target_depth: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -548,6 +562,7 @@ impl Default for Assembler {
             next_label: 0,
             location: SourceLocation::NONE,
             exception_regions: Vec::new(),
+            exception_handler_entries: Vec::new(),
             preserved_block_boundaries: FxHashSet::default(),
             borrow_unreachable_blocks: FxHashSet::default(),
             load_fast_borrowing_enabled: true,

@@ -13,6 +13,7 @@ use crate::CompileError;
 mod blocks;
 mod control_flow;
 mod locals;
+mod stack_depth;
 mod swaps;
 
 #[cfg(any(test, debug_assertions))]
@@ -187,6 +188,7 @@ impl Assembler {
             graph,
             next_label: self.next_label,
             exception_regions: self.exception_regions,
+            exception_handler_entries: self.exception_handler_entries,
             preserved_block_boundaries: self.preserved_block_boundaries,
             borrow_unreachable_blocks: self.borrow_unreachable_blocks,
         }
@@ -205,7 +207,7 @@ impl OptimizationPipeline {
         local_count: usize,
         parameter_count: usize,
     ) -> Result<LayoutAssembler, CompileError> {
-        let mut removed_max_depth = self.remove_unreachable_instructions();
+        self.remove_unreachable_instructions();
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::RemoveUnreachableInitial)?;
         self.optimize_boolean_conversions();
@@ -214,9 +216,7 @@ impl OptimizationPipeline {
         self.thread_forward_jumps();
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::ThreadForwardJumps)?;
-        if let Some(depth) = self.remove_unreachable_instructions() {
-            removed_max_depth = Some(removed_max_depth.map_or(depth, |current| current.max(depth)));
-        }
+        self.remove_unreachable_instructions();
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::RemoveUnreachableAfterThreading)?;
         self.remove_redundant_forward_jumps();
@@ -261,11 +261,12 @@ impl OptimizationPipeline {
         self.optimize_load_fast();
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::OptimizeLoadFast)?;
+        let stack_size = self.calculate_stack_size()?;
         Ok(LayoutAssembler {
             items: self.graph.into_items(),
             exception_regions: self.exception_regions,
             preserved_block_boundaries: self.preserved_block_boundaries,
-            removed_max_depth,
+            stack_size,
         })
     }
 }
@@ -326,21 +327,11 @@ impl LayoutAssembler {
                 self.validate_structure(AssemblerStage::FinalLayout)?;
                 let line_table = self.line_table(&extended_args, first_line_number);
                 let exception_table = self.exception_table(&extended_args)?;
-                let max_depth = self
-                    .items
-                    .iter()
-                    .filter_map(|item| match item {
-                        Item::Instruction(instruction) => instruction.depth_after,
-                        Item::Label(_) => None,
-                    })
-                    .max()
-                    .unwrap_or(0);
                 return Ok(AssembledCode {
                     bytecode: self.encode(&extended_args, &resolved_arguments),
                     line_table,
                     exception_table,
-                    max_depth,
-                    removed_max_depth: self.removed_max_depth,
+                    stack_size: self.stack_size,
                 });
             }
         }

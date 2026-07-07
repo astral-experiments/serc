@@ -706,28 +706,12 @@ impl Compiler {
             bytecode,
             line_table,
             exception_table,
-            max_depth: assembled_max_depth,
-            removed_max_depth,
+            stack_size,
         } = self.assembler.finish_code(
             self.unit.first_line_number,
             self.symbols.fast_local_count,
             parameter_count,
         )?;
-        let max_depth = if removed_max_depth == Some(self.control.max_depth)
-            && assembled_max_depth < self.control.max_depth
-        {
-            assembled_max_depth
-        } else {
-            self.control.max_depth
-        };
-        let stack_size = if self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
-            != 0
-            && self.control.generator_region_start.is_some()
-        {
-            max_depth.max(2)
-        } else {
-            max_depth.max(1)
-        };
         let code = CodeObject {
             arg_count: self.unit.arg_count,
             positional_only_arg_count: self.unit.positional_only_arg_count,

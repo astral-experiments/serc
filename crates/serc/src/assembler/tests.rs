@@ -490,11 +490,22 @@ fn emits_extended_arguments() {
 #[test]
 fn removes_an_overwritten_local_store() {
     let mut assembler = Assembler::default();
+    assembler.emit(LOAD_CONST, 0);
+    assembler.emit(LOAD_CONST, 1);
     assembler.emit(STORE_FAST, 1);
     assembler.emit(STORE_FAST, 1);
     assert_eq!(
         assembler.finish().unwrap(),
-        [POP_TOP.code(), 0, STORE_FAST.code(), 1]
+        [
+            LOAD_CONST.code(),
+            0,
+            LOAD_CONST.code(),
+            1,
+            POP_TOP.code(),
+            0,
+            STORE_FAST.code(),
+            1,
+        ]
     );
 }
 

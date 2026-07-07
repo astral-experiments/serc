@@ -40,10 +40,9 @@ impl OptimizationPipeline {
         }
     }
 
-    pub(in crate::assembler) fn remove_unreachable_instructions(&mut self) -> Option<u32> {
+    pub(in crate::assembler) fn remove_unreachable_instructions(&mut self) {
         let graph = &mut self.graph;
         let reachable = graph.reachable_blocks(&self.exception_regions);
-        let mut removed_max_depth = None;
         let order = graph.order().to_vec();
         let mut empty = FxHashSet::default();
         for block in order {
@@ -52,13 +51,7 @@ impl OptimizationPipeline {
             }
             graph[block].items_mut().retain(|item| match item {
                 Item::Label(_) => true,
-                Item::Instruction(instruction) => {
-                    if let Some(depth) = instruction.depth_after {
-                        removed_max_depth =
-                            Some(removed_max_depth.map_or(depth, |max: u32| max.max(depth)));
-                    }
-                    false
-                }
+                Item::Instruction(_) => false,
             });
             if graph[block].items().is_empty() {
                 empty.insert(block);
@@ -67,7 +60,6 @@ impl OptimizationPipeline {
         if !empty.is_empty() {
             graph.retain_order(|block| !empty.contains(&block));
         }
-        removed_max_depth
     }
 
     #[cfg(any(test, debug_assertions))]

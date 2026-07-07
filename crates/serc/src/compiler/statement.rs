@@ -25,8 +25,7 @@ use super::constant::{
 };
 use super::expression::{
     binary_operator, comparison_operator, comparison_operator_boolean, early_condition_truthiness,
-    expression_defers_async_comprehension_restore, jump_constant_truthiness,
-    optimized_generator_callable,
+    expression_defers_async_comprehension_restore, optimized_generator_callable,
 };
 use super::scope::{NameId, ReferenceCollector, collect_target_names};
 use super::source::{implicit_return_range, unparse_annotation};
@@ -161,7 +160,6 @@ pub(super) struct ControlFlowState {
     pub(super) emitted_fallthrough_return: bool,
     loops: Vec<LoopContext>,
     pub(super) depth: i32,
-    pub(super) max_depth: u32,
 }
 
 impl Compiler {
@@ -1920,10 +1918,6 @@ impl Compiler {
         let has_terminating_else = branches
             .last()
             .is_some_and(|(test, body)| test.is_none() && suite_terminates(body));
-        // The remaining branches still compile for symbol and constant-table side effects, but
-        // their exception handlers do not contribute to CPython's stack size.
-        let first_branch_is_always_true = jump_constant_truthiness(&statement.test) == Some(true);
-        let mut first_branch_max_depth = None;
         for (branch_index, (test, body)) in branches.into_iter().enumerate() {
             if let Some(test) = test {
                 let next = self.assembler.label();
@@ -1966,9 +1960,6 @@ impl Compiler {
                     self.assembler
                         .set_location(self.source_location(statement.range()));
                     self.emit(NOP, 0, 0)?;
-                }
-                if branch_index == 0 && first_branch_is_always_true {
-                    first_branch_max_depth = Some(self.control.max_depth);
                 }
                 if !suite_terminates(body) && branch_index + 1 < branch_count {
                     let nested_if_body_falls_through = matches!(
@@ -2025,9 +2016,6 @@ impl Compiler {
 
         self.assembler.mark(end);
         self.set_depth(base_depth);
-        if let Some(max_depth) = first_branch_max_depth {
-            self.control.max_depth = max_depth;
-        }
         Ok(())
     }
 
@@ -4856,7 +4844,6 @@ impl Compiler {
         let handler_end = self.assembler.label();
         let cleanup = self.assembler.label();
         let end = self.assembler.label();
-        self.control.max_depth = self.control.max_depth.max((base_depth + 7).cast_unsigned());
         let newly_initialized_targets =
             item.optional_vars
                 .as_deref()

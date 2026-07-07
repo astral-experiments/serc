@@ -1073,17 +1073,12 @@ impl Compiler {
                 "compiler produced a negative stack depth".to_string(),
             ));
         }
-        self.control.max_depth = self
-            .control
-            .max_depth
-            .max(self.control.depth.cast_unsigned());
         Ok(())
     }
 
     pub(super) fn set_depth(&mut self, depth: i32) {
         debug_assert!(depth >= 0);
         self.control.depth = depth;
-        self.control.max_depth = self.control.max_depth.max(depth.cast_unsigned());
     }
 }
 

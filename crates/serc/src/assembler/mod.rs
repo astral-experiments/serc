@@ -31,8 +31,9 @@ pub(crate) use ir::{
     AssembledCode, Assembler, ExceptionPolicy, InstructionId, Label, SourceLocation,
 };
 use ir::{
-    BorrowFallthrough, ExceptionExclusion, ExceptionRegion, Instruction, Item, LayoutAssembler,
-    LoadPolicy, NormalizedExceptionOwner, Operand, OptimizationPipeline, UnoptimizedCode,
+    BorrowFallthrough, ExceptionExclusion, ExceptionHandlerEntry, ExceptionRegion, Instruction,
+    Item, LayoutAssembler, LoadPolicy, NormalizedExceptionOwner, Operand, OptimizationPipeline,
+    UnoptimizedCode,
 };
 
 fn reachable_constant_indices(
@@ -327,6 +328,16 @@ impl Assembler {
         depth: u32,
         preserve_lasti: bool,
     ) {
+        let source_depth = self.emitted_region_start_depth(start, end).unwrap_or(depth);
+        let target_depth = depth
+            .checked_add(1 + u32::from(preserve_lasti))
+            .expect("exception handler depth fits in u32");
+        self.exception_handler_entries.push(ExceptionHandlerEntry {
+            source: start,
+            target,
+            source_depth,
+            target_depth,
+        });
         self.exception_regions.push(ExceptionRegion {
             start,
             end,
@@ -334,6 +345,38 @@ impl Assembler {
             depth,
             preserve_lasti,
         });
+    }
+
+    /// Recovers the physical stack depth at an exception region's emitted start label.
+    ///
+    /// The exception table stores the depth to restore, which differs from the depth at the
+    /// corresponding `SETUP_*` pseudo-instruction for constructs such as `with`. The compiler's
+    /// first depth annotation inside the region, adjusted by the generated opcode effects, gives
+    /// us the pseudo-instruction's original entry depth before CFG optimization removes it.
+    fn emitted_region_start_depth(&self, start: Label, end: Label) -> Option<u32> {
+        if start == end {
+            return None;
+        }
+        let mut in_region = false;
+        let mut cumulative_effect = 0_i64;
+        for item in self.linear_items() {
+            match item {
+                Item::Label(label) if *label == start => in_region = true,
+                Item::Label(label) if in_region && *label == end => break,
+                Item::Instruction(instruction) if in_region => {
+                    let argument = match instruction.operand {
+                        Operand::Value(argument) => argument,
+                        Operand::Forward(_) | Operand::Backward(_) => 0,
+                    };
+                    cumulative_effect += opcode_stack_effect(instruction.opcode, argument);
+                    if let Some(depth_after) = instruction.depth_after {
+                        return u32::try_from(i64::from(depth_after) - cumulative_effect).ok();
+                    }
+                }
+                Item::Instruction(_) | Item::Label(_) => {}
+            }
+        }
+        None
     }
 
     pub(crate) fn emit(&mut self, opcode: Opcode, argument: u32) {
