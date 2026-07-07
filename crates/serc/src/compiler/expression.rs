@@ -3,6 +3,12 @@
 
 use super::*;
 
+#[derive(Clone, Copy, Debug)]
+struct ConditionMarkerPolicy {
+    excluded: ExceptionPolicy,
+    ordinary: ExceptionPolicy,
+}
+
 impl Compiler {
     pub(super) fn compile_match(
         &mut self,
@@ -3729,6 +3735,54 @@ impl Compiler {
         }
     }
 
+    fn emit_condition_not_taken(
+        &mut self,
+        policy: ConditionMarkerPolicy,
+    ) -> Result<(), CompileError> {
+        if !self.control.exclude_terminal_if_not_taken
+            && !self.control.exclude_condition_not_taken_from_exception
+        {
+            return self.emit_with_exception_policy(NOT_TAKEN, 0, 0, policy.ordinary);
+        }
+
+        let exclude_from_generator = self.control.exclude_condition_not_taken_from_exception
+            && self.control.generator_region_start.is_some();
+        let exclude_from_exception = self.control.exclude_condition_not_taken_from_exception
+            || (self.control.exclude_terminal_if_not_taken
+                && !self.control.active_with_region_exclusions.is_empty());
+        self.control.exclude_terminal_if_not_taken = false;
+
+        let exclusion_start = self.assembler.label();
+        self.assembler.mark(exclusion_start);
+        self.emit_with_exception_policy(NOT_TAKEN, 0, 0, policy.excluded)?;
+        let exclusion_end = self.assembler.label();
+        self.assembler.mark(exclusion_end);
+
+        if exclude_from_generator {
+            self.control
+                .generator_region_exclusions
+                .push((exclusion_start, exclusion_end));
+        }
+        for exclusions in &mut self.control.active_with_region_exclusions {
+            exclusions.push((exclusion_start, exclusion_end));
+        }
+        if exclude_from_exception {
+            if self
+                .control
+                .exclude_condition_not_taken_from_all_exception_regions
+            {
+                for exclusions in &mut self.control.active_exception_region_exclusions {
+                    exclusions.push((exclusion_start, exclusion_end));
+                }
+            } else if let Some(exclusions) =
+                self.control.active_exception_region_exclusions.last_mut()
+            {
+                exclusions.push((exclusion_start, exclusion_end));
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn compile_jump_if(
         &mut self,
         expression: &Expr,
@@ -3903,53 +3957,12 @@ impl Compiler {
                 label,
                 -1,
             )?;
-            if self.control.exclude_terminal_if_not_taken
-                || self.control.exclude_condition_not_taken_from_exception
-            {
-                let exclude_from_generator =
-                    self.control.exclude_condition_not_taken_from_exception
-                        && self.control.generator_region_start.is_some();
-                let exclude_from_exception =
-                    self.control.exclude_condition_not_taken_from_exception
-                        || (self.control.exclude_terminal_if_not_taken
-                            && !self.control.active_with_region_exclusions.is_empty());
-                self.control.exclude_terminal_if_not_taken = false;
-                let exclusion_start = self.assembler.label();
-                self.assembler.mark(exclusion_start);
-                self.emit(NOT_TAKEN, 0, 0)?;
-                let exclusion_end = self.assembler.label();
-                self.assembler.mark(exclusion_end);
-                if exclude_from_generator {
-                    self.control
-                        .generator_region_exclusions
-                        .push((exclusion_start, exclusion_end));
-                }
-                for exclusions in &mut self.control.active_with_region_exclusions {
-                    exclusions.push((exclusion_start, exclusion_end));
-                }
-                if exclude_from_exception {
-                    if self
-                        .control
-                        .exclude_condition_not_taken_from_all_exception_regions
-                    {
-                        for exclusions in &mut self.control.active_exception_region_exclusions {
-                            exclusions.push((exclusion_start, exclusion_end));
-                        }
-                    } else if let Some(exclusions) =
-                        self.control.active_exception_region_exclusions.last_mut()
-                    {
-                        exclusions.push((exclusion_start, exclusion_end));
-                    }
-                }
-                return Ok(());
-            }
-            self.emit_with_exception_policy(
-                NOT_TAKEN,
-                0,
-                0,
-                ExceptionPolicy::normalized_owner(self.control.active_normal_finally_bodies > 0),
-            )?;
-            return Ok(());
+            return self.emit_condition_not_taken(ConditionMarkerPolicy {
+                excluded: ExceptionPolicy::default(),
+                ordinary: ExceptionPolicy::normalized_owner(
+                    self.control.active_normal_finally_bodies > 0,
+                ),
+            });
         }
         let comparison_is_boolean = if let Expr::Compare(comparison) = expression
             && comparison.ops.len() == 1
@@ -3979,59 +3992,12 @@ impl Compiler {
             label,
             -1,
         )?;
-        if self.control.exclude_terminal_if_not_taken
-            || self.control.exclude_condition_not_taken_from_exception
-        {
-            let exclude_from_generator = self.control.exclude_condition_not_taken_from_exception
-                && self.control.generator_region_start.is_some();
-            let exclude_from_exception = self.control.exclude_condition_not_taken_from_exception
-                || (self.control.exclude_terminal_if_not_taken
-                    && !self.control.active_with_region_exclusions.is_empty());
-            self.control.exclude_terminal_if_not_taken = false;
-            let exclusion_start = self.assembler.label();
-            self.assembler.mark(exclusion_start);
-            self.emit_with_exception_policy(
-                NOT_TAKEN,
-                0,
-                0,
-                ExceptionPolicy::normalized_owner(comparison_is_boolean),
-            )?;
-            let exclusion_end = self.assembler.label();
-            self.assembler.mark(exclusion_end);
-            if exclude_from_generator {
-                self.control
-                    .generator_region_exclusions
-                    .push((exclusion_start, exclusion_end));
-            }
-            for exclusions in &mut self.control.active_with_region_exclusions {
-                exclusions.push((exclusion_start, exclusion_end));
-            }
-            if exclude_from_exception {
-                if self
-                    .control
-                    .exclude_condition_not_taken_from_all_exception_regions
-                {
-                    for exclusions in &mut self.control.active_exception_region_exclusions {
-                        exclusions.push((exclusion_start, exclusion_end));
-                    }
-                } else if let Some(exclusions) =
-                    self.control.active_exception_region_exclusions.last_mut()
-                {
-                    exclusions.push((exclusion_start, exclusion_end));
-                }
-            }
-            Ok(())
-        } else {
-            self.emit_with_exception_policy(
-                NOT_TAKEN,
-                0,
-                0,
-                ExceptionPolicy::normalized_owner(
-                    comparison_is_boolean || self.control.active_normal_finally_bodies > 0,
-                ),
-            )?;
-            Ok(())
-        }
+        self.emit_condition_not_taken(ConditionMarkerPolicy {
+            excluded: ExceptionPolicy::normalized_owner(comparison_is_boolean),
+            ordinary: ExceptionPolicy::normalized_owner(
+                comparison_is_boolean || self.control.active_normal_finally_bodies > 0,
+            ),
+        })
     }
 
     pub(super) fn compile_store_target(&mut self, expression: &Expr) -> Result<(), CompileError> {
