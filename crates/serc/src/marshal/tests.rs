@@ -108,6 +108,26 @@ fn keeps_identity_and_value_keys_separate() {
 }
 
 #[test]
+fn bypasses_value_lookup_for_structurally_unique_objects() {
+    let mut inner = code_object(vec![Constant::Slice {
+        lower: Box::new(Constant::Int(257)),
+        upper: Box::new(Constant::None),
+        step: Box::new(Constant::None),
+    }]);
+    inner.bytecode.push(0);
+    inner.locals.push("value".to_string());
+    inner.local_kinds.push(1);
+    inner.marshal_hints.locals_identity = LocalsIdentity::Fresh;
+
+    let code = code_object(vec![Constant::Code(Box::new(inner))]);
+    let graph = ObjectGraph::for_code(&code);
+
+    // The code objects, their bytecode buffers, the outer identity-bearing constants tuple, fresh
+    // locals, nonempty local kinds, and uncached scalar slice member all have a unique parent.
+    assert_eq!(graph.object_count() - graph.keyed_object_count(), 8);
+}
+
+#[test]
 fn borrowed_string_tuple_keys_compare_across_sources() {
     let constants = vec![
         Constant::String("alpha".to_string()),

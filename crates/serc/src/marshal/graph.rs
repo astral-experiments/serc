@@ -1,6 +1,8 @@
 use std::collections::hash_map::Entry;
 
 use rustc_hash::FxHashMap;
+#[cfg(debug_assertions)]
+use rustc_hash::FxHashSet;
 
 use crate::code_object::{CodeObject, Constant};
 
@@ -44,6 +46,8 @@ pub(super) struct ObjectGraph<'a> {
     occurrences: Vec<ObjectId>,
     #[cfg(debug_assertions)]
     occurrence_locations: Vec<ObjectLocation>,
+    #[cfg(debug_assertions)]
+    unique_objects: FxHashSet<HashedObjectKey<'a>>,
     explicitly_interned: Vec<&'a str>,
 }
 
@@ -83,6 +87,25 @@ impl<'a> ObjectGraph<'a> {
         first
     }
 
+    /// Records an identity-bearing object that is structurally owned by a unique parent.
+    fn record_unique_at(&mut self, _location: ObjectLocation, _key: ObjectKey<'a>) {
+        #[cfg(debug_assertions)]
+        debug_assert!(
+            self.unique_objects.insert(_key.into()),
+            "identity-bearing marshal object was recorded twice at {_location:?}"
+        );
+
+        let id = ObjectId(self.objects_by_id.len());
+        self.objects_by_id.push(Object {
+            count: 1,
+            cached: false,
+            interned: false,
+        });
+        self.occurrences.push(id);
+        #[cfg(debug_assertions)]
+        self.occurrence_locations.push(_location);
+    }
+
     fn record_object(&mut self, key: HashedObjectKey<'a>, interned: bool) -> (ObjectId, bool) {
         let next_id = ObjectId(self.objects_by_id.len());
         match self.objects.entry(key) {
@@ -110,28 +133,23 @@ impl<'a> ObjectGraph<'a> {
 
     fn visit_code(&mut self, code: &'a CodeObject) {
         let address = std::ptr::from_ref(code).addr();
-        if !self.record_at(ObjectLocation::Code(address), code_key(code), false) {
-            return;
-        }
+        self.record_unique_at(ObjectLocation::Code(address), code_key(code));
         self.explicitly_interned.extend(
             code.marshal_hints
                 .explicitly_interned_strings
                 .iter()
                 .map(String::as_str),
         );
-        self.record_at(
-            ObjectLocation::CodeBytes(address),
-            code_bytes_key(code),
-            false,
-        );
+        self.record_unique_at(ObjectLocation::CodeBytes(address), code_bytes_key(code));
         self.visit_constants_tuple(&code.constants);
         self.visit_strings_tuple(&code.names);
         self.visit_locals_tuple(code);
-        self.record_at(
-            ObjectLocation::LocalKinds(address),
-            local_kinds_key(code),
-            false,
-        );
+        let local_kinds_key = local_kinds_key(code);
+        if matches!(&local_kinds_key, ObjectKey::LocalKinds(_)) {
+            self.record_unique_at(ObjectLocation::LocalKinds(address), local_kinds_key);
+        } else {
+            self.record_at(ObjectLocation::LocalKinds(address), local_kinds_key, false);
+        }
         self.visit_metadata_string(&code.filename);
         self.visit_metadata_string(&code.name);
         self.visit_metadata_string(&code.qualified_name);
@@ -148,12 +166,14 @@ impl<'a> ObjectGraph<'a> {
     }
 
     fn visit_constants_tuple(&mut self, values: &'a [Constant]) {
+        let location = ObjectLocation::ConstantsTuple(values.as_ptr().addr());
         let key = constants_tuple_key(values);
-        if !self.record_at(
-            ObjectLocation::ConstantsTuple(values.as_ptr().addr()),
-            key,
-            false,
-        ) {
+        if values
+            .iter()
+            .any(|value| matches!(value, Constant::Code(_)))
+        {
+            self.record_unique_at(location, key);
+        } else if !self.record_at(location, key, false) {
             return;
         }
         for value in values {
@@ -176,12 +196,15 @@ impl<'a> ObjectGraph<'a> {
     }
 
     fn visit_locals_tuple(&mut self, code: &'a CodeObject) {
+        let location = ObjectLocation::LocalsTuple(std::ptr::from_ref(code).addr());
         let key = locals_tuple_key(code);
-        if !self.record_at(
-            ObjectLocation::LocalsTuple(std::ptr::from_ref(code).addr()),
-            key,
-            false,
-        ) {
+        let first = if matches!(&key, ObjectKey::AnnotationLocals(_)) {
+            self.record_unique_at(location, key);
+            true
+        } else {
+            self.record_at(location, key, false)
+        };
+        if !first {
             return;
         }
         for value in &code.locals {
@@ -253,10 +276,9 @@ impl<'a> ObjectGraph<'a> {
     fn visit_slice_member(&mut self, value: &'a Constant) {
         if slice_member_uses_identity(value) {
             let address = std::ptr::from_ref(value).addr();
-            self.record_at(
+            self.record_unique_at(
                 ObjectLocation::SliceMember(address),
                 ObjectKey::SliceMember(address),
-                false,
             );
         } else {
             self.visit_constant(value);
@@ -297,6 +319,11 @@ impl<'a> ObjectGraph<'a> {
 
     pub(super) fn occurrence_count(&self) -> usize {
         self.occurrences.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn keyed_object_count(&self) -> usize {
+        self.objects.len()
     }
 
     pub(super) fn occurrence(&self, index: usize, _expected: ObjectLocation) -> ObjectId {
