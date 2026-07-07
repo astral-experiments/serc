@@ -317,7 +317,7 @@ impl Compiler {
                         let previous = self.assembler.location();
                         self.assembler
                             .set_location(self.source_location(statement.range));
-                        let result = self.compile_try_inner(statement, true, true, false);
+                        let result = self.compile_try_inner(statement, TryCompileOptions::TERMINAL);
                         self.assembler.set_location(previous);
                         result?;
                         self.control.emitted_fallthrough_return = true;
@@ -1860,12 +1860,12 @@ impl Compiler {
         &mut self,
         body: &[Stmt],
         restart: Label,
-    ) -> Result<bool, CompileError> {
+    ) -> Result<LoopBackedge, CompileError> {
         match body.split_last() {
             Some((Stmt::If(statement), leading)) => {
                 self.compile_suite(leading)?;
                 self.compile_loop_tail_if(statement, restart)?;
-                Ok(true)
+                Ok(LoopBackedge::Emitted)
             }
             Some((Stmt::While(statement), leading))
                 if statement.orelse.is_empty()
@@ -1878,18 +1878,18 @@ impl Compiler {
             {
                 self.compile_suite(leading)?;
                 self.compile_loop_tail_while(statement, restart)?;
-                Ok(true)
+                Ok(LoopBackedge::Emitted)
             }
             Some((Stmt::Assert(statement), leading))
                 if early_condition_truthiness(&statement.test).is_none() =>
             {
                 self.compile_suite(leading)?;
                 self.compile_loop_tail_assert(statement, restart)?;
-                Ok(true)
+                Ok(LoopBackedge::Emitted)
             }
             _ => {
                 self.compile_suite(body)?;
-                Ok(false)
+                Ok(LoopBackedge::Required)
             }
         }
     }
@@ -2055,7 +2055,7 @@ impl Compiler {
                 |compiler| compiler.compile_while_tail_suite(&statement.body, start),
             )
         })?;
-        if !tail_jumps && !suite_terminates(&statement.body) {
+        if tail_jumps == LoopBackedge::Required && !suite_terminates(&statement.body) {
             self.emit_while_backedge(&statement.body, body_start, start)?;
         }
         Ok(())
@@ -2065,13 +2065,13 @@ impl Compiler {
         &mut self,
         body: &[Stmt],
         restart: Label,
-    ) -> Result<bool, CompileError> {
+    ) -> Result<LoopBackedge, CompileError> {
         if let Some((Stmt::Try(statement), leading)) = body.split_last()
             && try_requires_loop_tail_inlining(statement)
         {
             self.compile_suite(leading)?;
-            self.compile_try_inner(statement, false, true, true)?;
-            Ok(false)
+            self.compile_try_inner(statement, TryCompileOptions::LOOP_TAIL)?;
+            Ok(LoopBackedge::Required)
         } else {
             self.compile_loop_tail_suite(body, restart)
         }
@@ -2177,7 +2177,7 @@ impl Compiler {
                 matches!(statement.test.as_ref(), Expr::If(_)),
                 |compiler| compiler.compile_loop_tail_suite(body, restart),
             )?;
-            if !nested_tail && !suite_terminates(body) {
+            if nested_tail == LoopBackedge::Required && !suite_terminates(body) {
                 self.set_branch_end_location(body, body_start);
                 self.emit_jump_backward(JUMP_BACKWARD, restart, 0)?;
             }
@@ -2230,7 +2230,7 @@ impl Compiler {
                     .compile_with_strict_owned_loads(matches!(test, Expr::If(_)), |compiler| {
                         compiler.compile_loop_tail_suite(body, restart)
                     })?;
-                if !nested_tail && !suite_terminates(body) {
+                if nested_tail == LoopBackedge::Required && !suite_terminates(body) {
                     self.set_branch_end_location(body, body_start);
                     self.emit_jump_backward(JUMP_BACKWARD, restart, 0)?;
                 }
@@ -2263,7 +2263,7 @@ impl Compiler {
                 test.is_some_and(|test| matches!(test, Expr::If(_))),
                 |compiler| compiler.compile_loop_tail_suite(body, restart),
             )?;
-            if !nested_tail && !suite_terminates(body) {
+            if nested_tail == LoopBackedge::Required && !suite_terminates(body) {
                 if let Some(location) = self.assembler.last_instruction_location() {
                     self.assembler.set_location(location);
                 } else if let Some(statement) = body.last() {
@@ -2401,7 +2401,7 @@ impl Compiler {
         self.set_depth(base_depth);
         let body_start = self.assembler.instruction_count();
         let nested_tail = self.compile_loop_tail_suite(&statement.body, restart)?;
-        if !nested_tail && !suite_terminates(&statement.body) {
+        if nested_tail == LoopBackedge::Required && !suite_terminates(&statement.body) {
             self.set_branch_end_location(&statement.body, body_start);
             self.emit_jump_backward(JUMP_BACKWARD, restart, 0)?;
         }
@@ -2448,7 +2448,7 @@ impl Compiler {
             let tail_jumps = self.with_loop_context(context, |compiler| {
                 compiler.compile_while_tail_suite(&statement.body, start)
             })?;
-            if !tail_jumps && !suite_terminates(&statement.body) {
+            if tail_jumps == LoopBackedge::Required && !suite_terminates(&statement.body) {
                 self.emit_while_backedge(&statement.body, body_start, start)?;
             }
             self.pre_register_suite_names(&statement.orelse)?;
@@ -2490,7 +2490,7 @@ impl Compiler {
         let tail_jumps = self.with_loop_context(context, |compiler| {
             compiler.compile_while_tail_suite(&statement.body, start)
         })?;
-        if !tail_jumps && !suite_terminates(&statement.body) {
+        if tail_jumps == LoopBackedge::Required && !suite_terminates(&statement.body) {
             self.emit_while_backedge(&statement.body, body_start, start)?;
         }
 
@@ -2555,7 +2555,7 @@ impl Compiler {
         let tail_jumps = self.with_loop_context(context, |compiler| {
             compiler.compile_loop_tail_suite(&statement.body, start)
         })?;
-        if !tail_jumps && !suite_terminates(&statement.body) {
+        if tail_jumps == LoopBackedge::Required && !suite_terminates(&statement.body) {
             if self.assembler.instruction_count() > body_start
                 && let Some(location) = self.assembler.last_instruction_location()
             {
@@ -2662,7 +2662,7 @@ impl Compiler {
         let tail_jumps = self.with_loop_context(context, |compiler| {
             compiler.compile_loop_tail_suite(&statement.body, start)
         })?;
-        if !tail_jumps && !suite_terminates(&statement.body) {
+        if tail_jumps == LoopBackedge::Required && !suite_terminates(&statement.body) {
             if self.assembler.instruction_count() > body_start
                 && let Some(location) = self.assembler.last_instruction_location()
             {
@@ -2993,34 +2993,30 @@ impl Compiler {
     }
 
     fn compile_try(&mut self, statement: &ruff_python_ast::StmtTry) -> Result<(), CompileError> {
-        self.compile_try_inner(statement, false, true, false)
+        self.compile_try_inner(statement, TryCompileOptions::STANDARD)
     }
 
     fn compile_try_inner(
         &mut self,
         statement: &ruff_python_ast::StmtTry,
-        terminal: bool,
-        emit_statement_nop: bool,
-        exclude_terminal_body_not_taken: bool,
+        options: TryCompileOptions,
     ) -> Result<(), CompileError> {
         if !statement.finalbody.is_empty() {
-            return self.compile_try_finally(statement, terminal);
+            return self.compile_try_finally(statement, options.terminal);
         }
-        self.compile_try_except(
-            statement,
-            terminal,
-            emit_statement_nop,
-            exclude_terminal_body_not_taken,
-        )
+        self.compile_try_except(statement, options)
     }
 
     fn compile_try_except(
         &mut self,
         statement: &ruff_python_ast::StmtTry,
-        terminal: bool,
-        emit_statement_nop: bool,
-        exclude_terminal_body_not_taken: bool,
+        options: TryCompileOptions,
     ) -> Result<(), CompileError> {
+        let TryCompileOptions {
+            terminal,
+            emit_statement_nop,
+            exclude_terminal_body_not_taken,
+        } = options;
         if statement.is_star {
             return self.compile_try_star_except(statement, terminal, emit_statement_nop);
         }
@@ -4188,7 +4184,12 @@ impl Compiler {
                         compiler.with_control_override(
                             |control| &mut control.prevent_try_exit_inlining,
                             true,
-                            |compiler| compiler.compile_try_except(statement, false, false, false),
+                            |compiler| {
+                                compiler.compile_try_except(
+                                    statement,
+                                    TryCompileOptions::NESTED_HANDLER,
+                                )
+                            },
                         )?;
                         Ok(true)
                     }
