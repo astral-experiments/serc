@@ -1276,10 +1276,10 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_> {
     }
 }
 #[derive(Debug, Default)]
-pub(super) struct LocalCollector {
-    pub(super) names: Vec<String>,
-    pub(super) seen: HashSet<String>,
-    pub(super) comprehension_targets: Vec<String>,
+struct LocalCollector {
+    names: Vec<String>,
+    seen: HashSet<String>,
+    comprehension_targets: Vec<String>,
     seen_comprehension_targets: HashSet<String>,
     candidate_bindings: Option<HashMap<String, bool>>,
     annotation_only: HashSet<String>,
@@ -1347,7 +1347,7 @@ impl LocalCollector {
         }
     }
 
-    pub(super) fn collect_suite(&mut self, body: &[Stmt]) {
+    fn collect_suite(&mut self, body: &[Stmt]) {
         for statement in body {
             match statement {
                 Stmt::Assign(assignment) => {
