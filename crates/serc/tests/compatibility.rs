@@ -242,6 +242,55 @@ class ____PrivateContainer:
     }
 
     #[test]
+    fn matches_cpython_marshal_for_nested_function_decorator_closures() {
+        let source = r"def method_decorators(decorator, decorator_factory):
+    class Container:
+        @decorator
+        def method(self):
+            pass
+
+        @classmethod
+        @decorator
+        def class_method(cls):
+            pass
+
+        @decorator
+        @staticmethod
+        def static_method():
+            pass
+
+        @decorator_factory(1)
+        async def coroutine(self):
+            pass
+
+    return Container
+
+
+def nested_function_decorator(decorator):
+    def parent():
+        @decorator
+        def child():
+            pass
+
+        return child
+
+    return parent
+
+
+def shadowed_class_decorator(decorator, local):
+    class Container:
+        decorator = local
+
+        @decorator
+        def method(self):
+            pass
+
+    return Container
+";
+        assert_matches_cpython_marshal(source, "function_decorator_closures.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_closure_load_fusion_boundaries() {
         let source = "def tuple_value(label, url):\n    return label, lambda: url\n\ndef keyword_call(label, url):\n    return register(label=label, command=lambda: open(url))\n";
         assert_matches_cpython_marshal(source, "closure_fusion.py");
