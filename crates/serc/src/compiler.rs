@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::BTreeSet;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use ruff_python_ast::token::{TokenKind, Tokens};
 use ruff_python_ast::visitor::{Visitor, walk_expr, walk_pattern, walk_stmt};
@@ -197,7 +197,8 @@ struct CompilationContext {
     source: Arc<str>,
     tokens: Tokens,
     line_index: LineIndex,
-    scopes: OnceLock<ScopeArena>,
+    module_plan: ModulePlan,
+    scopes: ScopeArena,
 }
 
 #[derive(Debug)]

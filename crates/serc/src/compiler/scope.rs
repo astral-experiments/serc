@@ -4,18 +4,15 @@
 use super::*;
 
 impl Compiler {
-    pub(super) fn scope_arena(&self) -> Result<&ScopeArena, CompileError> {
-        self.context
-            .scopes
-            .get()
-            .ok_or_else(|| CompileError::Internal("scope arena was not initialized".to_string()))
+    pub(super) fn scope_arena(&self) -> &ScopeArena {
+        &self.context.scopes
     }
 
     pub(super) fn function_scope_id(
         &self,
         definition: &StmtFunctionDef,
     ) -> Result<ScopeId, CompileError> {
-        self.scope_arena()?
+        self.scope_arena()
             .child(self.unit.scope_id, ScopeOrigin::function(definition))
             .ok_or_else(|| {
                 CompileError::Internal(format!(
@@ -26,7 +23,7 @@ impl Compiler {
     }
 
     fn class_scope_id(&self, definition: &StmtClassDef) -> Result<ScopeId, CompileError> {
-        self.scope_arena()?
+        self.scope_arena()
             .child(self.unit.scope_id, ScopeOrigin::class(definition))
             .ok_or_else(|| {
                 CompileError::Internal(format!(
@@ -41,7 +38,7 @@ impl Compiler {
         definition: &StmtFunctionDef,
     ) -> Result<(ScopeId, LoweringFunctionPlan), CompileError> {
         let scope_id = self.function_scope_id(definition)?;
-        let arena = self.scope_arena()?;
+        let arena = self.scope_arena();
         let mut plan = arena
             .function(scope_id)
             .ok_or_else(|| CompileError::Internal("function scope has no plan".to_string()))?
@@ -87,7 +84,7 @@ impl Compiler {
         definition: &StmtClassDef,
     ) -> Result<(ScopeId, LoweringClassPlan), CompileError> {
         let scope_id = self.class_scope_id(definition)?;
-        let arena = self.scope_arena()?;
+        let arena = self.scope_arena();
         let plan = arena
             .class(scope_id)
             .ok_or_else(|| CompileError::Internal("class scope has no plan".to_string()))?
@@ -712,6 +709,67 @@ pub(super) struct ScopeArena {
     by_parent_and_origin: FxHashMap<(ScopeId, ScopeOrigin), ScopeId>,
 }
 
+#[derive(Debug)]
+pub(super) struct ModulePlan {
+    pub(super) future_flags: u32,
+    pub(super) module_globals: NameSet,
+    pub(super) imported_scope_names: NameSet,
+    pub(super) comprehension_targets: Vec<NameId>,
+    pub(super) comprehension_cell_names: NameSet,
+    pub(super) has_annotations: bool,
+    pub(super) has_simple_annotations: bool,
+}
+
+#[derive(Debug, Default)]
+struct ModulePlanBuilder {
+    module_globals: HashSet<String>,
+    imported_scope_names: HashSet<String>,
+    comprehension_cell_names: HashSet<String>,
+    has_annotations: bool,
+    has_simple_annotations: bool,
+}
+
+impl ModulePlan {
+    fn build(
+        names: &NameInterner,
+        future_flags: u32,
+        mut facts: ModulePlanBuilder,
+        bindings: LocalCollector,
+    ) -> Self {
+        let name_id = |name: String| {
+            names
+                .get(&name)
+                .unwrap_or_else(|| panic!("module analysis did not intern `{name}`"))
+        };
+        let mut imported_scope_names: NameSet =
+            facts.imported_scope_names.drain().map(&name_id).collect();
+        if bindings.seen.contains("super") {
+            imported_scope_names.insert(
+                names
+                    .get(SHADOWED_SUPER_SENTINEL)
+                    .expect("module analysis should intern the shadowed-super sentinel"),
+            );
+        }
+        Self {
+            future_flags,
+            module_globals: facts.module_globals.drain().map(&name_id).collect(),
+            imported_scope_names,
+            comprehension_targets: bindings
+                .comprehension_targets
+                .into_iter()
+                .map(&name_id)
+                .collect(),
+            comprehension_cell_names: facts
+                .comprehension_cell_names
+                .drain()
+                .map(name_id)
+                .collect(),
+            has_annotations: facts.has_annotations,
+            has_simple_annotations: facts.has_simple_annotations,
+        }
+    }
+}
+
 impl Default for ScopeArena {
     fn default() -> Self {
         Self {
@@ -726,7 +784,9 @@ impl Default for ScopeArena {
 }
 
 impl ScopeArena {
-    pub(super) fn analyze(body: &[Stmt], future_annotations: bool) -> Self {
+    pub(super) fn analyze(body: &[Stmt]) -> (Self, ModulePlan) {
+        let future_flags = future_feature_flags(body);
+        let future_annotations = future_flags & CO_FUTURE_ANNOTATIONS != 0;
         let mut arena = Self::default();
         for name in [
             SHADOWED_SUPER_SENTINEL,
@@ -758,13 +818,14 @@ impl ScopeArena {
         ] {
             arena.names.intern(name);
         }
-        ModuleNameCollector {
-            names: &mut arena.names,
-            private_name: None,
-        }
-        .collect_suite(body);
+        // Unordered module facts share the existing name walk. The separate local collector is
+        // retained only for its CPython-sensitive comprehension-target ordering.
+        let facts = ModuleNameCollector::collect(&mut arena.names, body);
+        let mut bindings = LocalCollector::default();
+        bindings.collect_suite(body);
         arena.build_suite(ScopeId::MODULE, body, future_annotations);
-        arena
+        let module = ModulePlan::build(&arena.names, future_flags, facts, bindings);
+        (arena, module)
     }
 
     fn build_suite(&mut self, parent: ScopeId, body: &[Stmt], future_annotations: bool) {
@@ -950,9 +1011,26 @@ impl ScopeArena {
 struct ModuleNameCollector<'a> {
     names: &'a mut NameInterner,
     private_name: Option<String>,
+    facts: ModulePlanBuilder,
+    nested_scope_depth: usize,
+    comprehension_depth: usize,
+    generator_depth: usize,
 }
 
-impl ModuleNameCollector<'_> {
+impl<'a> ModuleNameCollector<'a> {
+    fn collect(names: &'a mut NameInterner, body: &[Stmt]) -> ModulePlanBuilder {
+        let mut collector = Self {
+            names,
+            private_name: None,
+            facts: ModulePlanBuilder::default(),
+            nested_scope_depth: 0,
+            comprehension_depth: 0,
+            generator_depth: 0,
+        };
+        collector.collect_suite(body);
+        collector.facts
+    }
+
     fn intern(&mut self, name: &str) {
         let mangled = mangle_name(name, self.private_name.as_deref());
         self.names.intern(name);
@@ -995,15 +1073,21 @@ impl ModuleNameCollector<'_> {
 
 impl<'ast> Visitor<'ast> for ModuleNameCollector<'_> {
     fn visit_stmt(&mut self, statement: &'ast Stmt) {
+        let at_module_scope = self.nested_scope_depth == 0;
         match statement {
             Stmt::FunctionDef(definition) => {
                 self.intern(definition.name.as_str());
                 self.collect_parameters(&definition.parameters);
                 self.collect_type_parameters(definition.type_params.as_deref());
+                self.nested_scope_depth += 1;
+                walk_stmt(self, statement);
+                self.nested_scope_depth -= 1;
+                return;
             }
             Stmt::ClassDef(definition) => {
                 self.intern(definition.name.as_str());
                 self.collect_type_parameters(definition.type_params.as_deref());
+                self.nested_scope_depth += 1;
                 for decorator in &definition.decorator_list {
                     self.visit_decorator(decorator);
                 }
@@ -1018,14 +1102,20 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_> {
                     .replace(definition.name.as_str().to_string());
                 self.collect_suite(&definition.body);
                 self.private_name = outer_private_name;
+                self.nested_scope_depth -= 1;
                 return;
             }
             Stmt::TypeAlias(statement) => {
                 self.collect_type_parameters(statement.type_params.as_deref());
             }
+            Stmt::AnnAssign(annotation) if at_module_scope => {
+                self.facts.has_annotations = true;
+                self.facts.has_simple_annotations |= annotation.simple;
+            }
             Stmt::Global(statement) => {
                 for name in &statement.names {
                     self.intern(name.as_str());
+                    self.facts.module_globals.insert(name.as_str().to_string());
                 }
             }
             Stmt::Nonlocal(statement) => {
@@ -1045,9 +1135,18 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_> {
                         |name| name.as_str(),
                     );
                     self.intern(bound_name);
+                    if at_module_scope {
+                        self.facts
+                            .imported_scope_names
+                            .insert(bound_name.to_string());
+                    }
                 }
             }
             Stmt::ImportFrom(statement) => {
+                let is_future = statement
+                    .module
+                    .as_ref()
+                    .is_some_and(|module| module.as_str() == "__future__");
                 self.intern(
                     statement
                         .module
@@ -1062,6 +1161,11 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_> {
                             .as_ref()
                             .map_or(alias.name.as_str(), |name| name.as_str());
                         self.intern(bound_name);
+                        if at_module_scope && !is_future {
+                            self.facts
+                                .imported_scope_names
+                                .insert(bound_name.to_string());
+                        }
                     }
                 }
             }
@@ -1091,8 +1195,69 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_> {
                 if let Some(parameters) = lambda.parameters.as_deref() {
                     self.collect_parameters(parameters);
                 }
+                self.nested_scope_depth += 1;
+                walk_expr(self, expression);
+                self.nested_scope_depth -= 1;
+                return;
             }
             _ => {}
+        }
+
+        if self.nested_scope_depth == 0 && self.generator_depth == 0 {
+            match expression {
+                Expr::ListComp(comprehension) => {
+                    self.facts
+                        .comprehension_cell_names
+                        .extend(comprehension_cell_names(
+                            &comprehension.generators,
+                            None,
+                            &comprehension.elt,
+                        ));
+                }
+                Expr::SetComp(comprehension) => {
+                    self.facts
+                        .comprehension_cell_names
+                        .extend(comprehension_cell_names(
+                            &comprehension.generators,
+                            None,
+                            &comprehension.elt,
+                        ));
+                }
+                Expr::DictComp(comprehension) => {
+                    self.facts
+                        .comprehension_cell_names
+                        .extend(comprehension_cell_names(
+                            &comprehension.generators,
+                            comprehension.key.as_deref(),
+                            &comprehension.value,
+                        ));
+                }
+                _ => {}
+            }
+        }
+        if self.nested_scope_depth == 0
+            && self.comprehension_depth > 0
+            && let Expr::Named(named) = expression
+            && let Expr::Name(name) = named.target.as_ref()
+        {
+            self.facts
+                .module_globals
+                .insert(name.id.as_str().to_string());
+        }
+
+        let is_generator = matches!(expression, Expr::Generator(_));
+        let is_comprehension = is_generator
+            || matches!(
+                expression,
+                Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_)
+            );
+        if is_comprehension {
+            self.comprehension_depth += 1;
+            self.generator_depth += usize::from(is_generator);
+            walk_expr(self, expression);
+            self.generator_depth -= usize::from(is_generator);
+            self.comprehension_depth -= 1;
+            return;
         }
         walk_expr(self, expression);
     }
@@ -1111,10 +1276,10 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_> {
     }
 }
 #[derive(Debug, Default)]
-pub(super) struct LocalCollector {
-    pub(super) names: Vec<String>,
-    pub(super) seen: HashSet<String>,
-    pub(super) comprehension_targets: Vec<String>,
+struct LocalCollector {
+    names: Vec<String>,
+    seen: HashSet<String>,
+    comprehension_targets: Vec<String>,
     seen_comprehension_targets: HashSet<String>,
     candidate_bindings: Option<HashMap<String, bool>>,
     annotation_only: HashSet<String>,
@@ -1182,7 +1347,7 @@ impl LocalCollector {
         }
     }
 
-    pub(super) fn collect_suite(&mut self, body: &[Stmt]) {
+    fn collect_suite(&mut self, body: &[Stmt]) {
         for statement in body {
             match statement {
                 Stmt::Assign(assignment) => {
@@ -2050,35 +2215,6 @@ fn inlined_comprehension_cell_names_in_expression(expression: &Expr) -> HashSet<
     collector.names
 }
 
-pub(super) fn inlined_comprehension_cell_names_in_suite(body: &[Stmt]) -> HashSet<String> {
-    #[derive(Default)]
-    struct Collector {
-        names: HashSet<String>,
-    }
-
-    impl<'ast> Visitor<'ast> for Collector {
-        fn visit_stmt(&mut self, statement: &'ast Stmt) {
-            if matches!(statement, Stmt::FunctionDef(_) | Stmt::ClassDef(_)) {
-                return;
-            }
-            walk_stmt(self, statement);
-        }
-
-        fn visit_expr(&mut self, expression: &'ast Expr) {
-            self.names
-                .extend(inlined_comprehension_cell_names_in_expression(expression));
-            // The expression helper recursively handles every inlined comprehension below this
-            // node, so walking again is unnecessary and would only repeat the same analysis.
-        }
-    }
-
-    let mut collector = Collector::default();
-    for statement in body {
-        collector.visit_stmt(statement);
-    }
-    collector.names
-}
-
 pub(super) fn collect_named_expression_target_names(expression: &Expr, names: &mut Vec<String>) {
     struct Collector<'a> {
         names: &'a mut Vec<String>,
@@ -2187,7 +2323,7 @@ pub(super) fn generator_cellvars(generator: &ruff_python_ast::ExprGenerator) -> 
         .filter(|name| local_names.contains(name))
         .collect()
 }
-pub(super) fn future_feature_flags(body: &[Stmt]) -> u32 {
+fn future_feature_flags(body: &[Stmt]) -> u32 {
     body.iter()
         .filter_map(|statement| {
             let Stmt::ImportFrom(import) = statement else {
@@ -2210,147 +2346,10 @@ pub(super) fn future_feature_flags(body: &[Stmt]) -> u32 {
         })
 }
 
-pub(super) fn module_global_names(body: &[Stmt]) -> HashSet<String> {
-    #[derive(Default)]
-    struct Collector {
-        names: HashSet<String>,
-        comprehension_depth: usize,
-        nested_scope_depth: usize,
-    }
-
-    impl<'ast> Visitor<'ast> for Collector {
-        fn visit_stmt(&mut self, statement: &'ast Stmt) {
-            if matches!(statement, Stmt::FunctionDef(_) | Stmt::ClassDef(_)) {
-                self.nested_scope_depth += 1;
-                walk_stmt(self, statement);
-                self.nested_scope_depth -= 1;
-                return;
-            }
-            if let Stmt::Global(global) = statement {
-                self.names
-                    .extend(global.names.iter().map(|name| name.as_str().to_string()));
-            }
-            walk_stmt(self, statement);
-        }
-
-        fn visit_expr(&mut self, expression: &'ast Expr) {
-            if matches!(expression, Expr::Lambda(_)) {
-                return;
-            }
-            let is_comprehension = matches!(
-                expression,
-                Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_) | Expr::Generator(_)
-            );
-            if is_comprehension {
-                self.comprehension_depth += 1;
-            }
-            if self.nested_scope_depth == 0
-                && self.comprehension_depth > 0
-                && let Expr::Named(named) = expression
-                && let Expr::Name(name) = named.target.as_ref()
-            {
-                self.names.insert(name.id.as_str().to_string());
-            }
-            walk_expr(self, expression);
-            if is_comprehension {
-                self.comprehension_depth -= 1;
-            }
-        }
-    }
-
-    let mut collector = Collector::default();
-    for statement in body {
-        collector.visit_stmt(statement);
-    }
-    collector.names
-}
-
-pub(super) fn module_imported_names(body: &[Stmt]) -> HashSet<String> {
-    #[derive(Default)]
-    struct Collector {
-        names: HashSet<String>,
-    }
-
-    impl<'ast> Visitor<'ast> for Collector {
-        fn visit_stmt(&mut self, statement: &'ast Stmt) {
-            match statement {
-                Stmt::FunctionDef(_) | Stmt::ClassDef(_) => return,
-                Stmt::Import(import) => {
-                    for alias in &import.names {
-                        let module = alias.name.as_str();
-                        let bound = alias.asname.as_ref().map_or_else(
-                            || module.split('.').next().unwrap_or(module),
-                            |name| name.as_str(),
-                        );
-                        self.names.insert(bound.to_string());
-                    }
-                }
-                Stmt::ImportFrom(import)
-                    if import
-                        .module
-                        .as_ref()
-                        .is_none_or(|module| module.as_str() != "__future__") =>
-                {
-                    for alias in &import.names {
-                        if alias.name.as_str() != "*" {
-                            let bound = alias.asname.as_ref().unwrap_or(&alias.name);
-                            self.names.insert(bound.as_str().to_string());
-                        }
-                    }
-                }
-                _ => {}
-            }
-            walk_stmt(self, statement);
-        }
-    }
-
-    let mut collector = Collector::default();
-    for statement in body {
-        collector.visit_stmt(statement);
-    }
-    collector.names
-}
-
 pub(super) fn has_simple_annotations(body: &[Stmt]) -> bool {
     let mut annotations = Vec::new();
     collect_simple_annotations(body, &mut annotations);
     !annotations.is_empty()
-}
-
-pub(super) fn has_annotations(body: &[Stmt]) -> bool {
-    body.iter().any(|statement| match statement {
-        Stmt::AnnAssign(_) => true,
-        Stmt::If(statement) => {
-            has_annotations(&statement.body)
-                || statement
-                    .elif_else_clauses
-                    .iter()
-                    .any(|clause| has_annotations(&clause.body))
-        }
-        Stmt::For(statement) => {
-            has_annotations(&statement.body) || has_annotations(&statement.orelse)
-        }
-        Stmt::While(statement) => {
-            has_annotations(&statement.body) || has_annotations(&statement.orelse)
-        }
-        Stmt::Try(statement) => {
-            has_annotations(&statement.body)
-                || statement
-                    .handlers
-                    .iter()
-                    .filter_map(ruff_python_ast::ExceptHandler::as_except_handler)
-                    .any(|handler| has_annotations(&handler.body))
-                || has_annotations(&statement.orelse)
-                || has_annotations(&statement.finalbody)
-        }
-        Stmt::With(statement) => has_annotations(&statement.body),
-        Stmt::Match(statement) => statement
-            .cases
-            .iter()
-            .any(|case| has_annotations(&case.body)),
-        Stmt::FunctionDef(_) | Stmt::ClassDef(_) => false,
-        _ => false,
-    })
 }
 
 pub(super) fn collect_simple_annotations<'a>(
