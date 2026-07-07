@@ -37,6 +37,9 @@ impl OptimizationPipeline {
 
     pub(in crate::assembler) fn remove_unreachable_instructions(&mut self) -> Option<u32> {
         let graph = &mut self.graph;
+        if self.exception_regions.is_empty() && graph.len() == 1 {
+            return None;
+        }
         let reachable = graph.reachable_blocks(&self.exception_regions);
         let mut removed_max_depth = None;
         let order = graph.order().to_vec();
@@ -171,6 +174,19 @@ impl OptimizationPipeline {
         // inner jump skips the redundant outer test and enters its POP_TOP
         // fallthrough path directly.
         let graph = &self.graph;
+        if !graph.iter_items().any(|item| {
+            matches!(
+                item,
+                Item::Instruction(instruction)
+                    if matches!(
+                        instruction.opcode,
+                        JUMP_FORWARD | POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE
+                    )
+                        && matches!(instruction.operand, Operand::Forward(_))
+            )
+        }) {
+            return;
+        }
         let mut positions = graph.item_positions();
         let mut items = positions
             .iter()
