@@ -5,7 +5,9 @@ use ruff_text_size::Ranged;
 
 use crate::assembler::SourceLocation;
 
-use super::{Compiler, Constant, FunctionPlan, NameId, NameInterner, ScopeBodyFacts, clean_doc};
+use crate::code_object::Constant;
+
+use super::{Compiler, FunctionPlan, NameId, NameInterner, ScopeBodyFacts, clean_doc};
 
 #[test]
 fn interns_adversarial_identifier_families_densely() {

@@ -2,7 +2,7 @@ use std::collections::hash_map::Entry;
 
 use rustc_hash::FxHashMap;
 
-use crate::compiler::{CodeObject, Constant};
+use crate::code_object::{CodeObject, Constant};
 
 use super::key::{
     ObjectKey, code_bytes_key, code_key, constant_key, constants_tuple_key,
