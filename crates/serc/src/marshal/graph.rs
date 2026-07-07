@@ -278,9 +278,9 @@ impl<'a> ObjectGraph<'a> {
         }
     }
 
-    pub(super) fn is_shared_object(&self, id: ObjectId, force_reference: bool) -> bool {
+    pub(super) fn is_shared_object(&self, id: ObjectId) -> bool {
         let object = &self.objects_by_id[id.0];
-        force_reference || object.count > 1 || object.cached
+        object.count > 1 || object.cached
     }
 
     pub(super) fn object_count(&self) -> usize {
