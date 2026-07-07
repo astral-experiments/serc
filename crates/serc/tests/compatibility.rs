@@ -242,6 +242,12 @@ class ____PrivateContainer:
     }
 
     #[test]
+    fn matches_cpython_marshal_for_closure_load_fusion_boundaries() {
+        let source = "def tuple_value(label, url):\n    return label, lambda: url\n\ndef keyword_call(label, url):\n    return register(label=label, command=lambda: open(url))\n";
+        assert_matches_cpython_marshal(source, "closure_fusion.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_annotation_scope_closures() {
         let source = include_str!("fixtures/benchmark/annotation_scopes.py");
         assert_matches_cpython_marshal(source, "annotation_scopes.py");

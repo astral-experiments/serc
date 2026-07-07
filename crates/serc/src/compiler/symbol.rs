@@ -545,12 +545,13 @@ impl Compiler {
     }
 
     pub(super) fn emit_closure_tuple(&mut self, names: &[NameId]) -> Result<(), CompileError> {
-        for (index, name) in names.iter().enumerate() {
-            if index > 0 {
-                self.assembler.fusion_barrier();
-            }
+        for name in names {
             let local = self.closure_index_id(*name)?;
             self.emit(LOAD_FAST, local, 1)?;
+            // CPython inserts pseudo `LOAD_CLOSURE` instructions after forming
+            // superinstructions, without introducing a control-flow boundary.
+            self.assembler
+                .prevent_last_instruction_fusion_with_previous();
         }
         self.emit_build(BUILD_TUPLE, names.len())
     }
