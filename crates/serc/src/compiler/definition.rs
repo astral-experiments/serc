@@ -45,25 +45,31 @@ impl Compiler {
         type_params: &ruff_python_ast::TypeParams,
         statement: &ruff_python_ast::StmtTypeAlias,
     ) -> Result<(), CompileError> {
-        let type_names: BTreeSet<_> = type_params
+        let type_names: FxHashSet<_> = type_params
             .iter()
-            .map(|parameter| parameter.name().as_str().to_string())
+            .map(|parameter| self.required_name_id(parameter.name().as_str()))
             .collect();
         let locals = type_params
             .iter()
-            .map(|parameter| parameter.name().as_str().to_string())
+            .map(|parameter| self.required_name_id(parameter.name().as_str()))
             .collect();
         let mut requirements = type_parameter_required_names(type_params);
         requirements.extend(expression_required_names(value));
-        let cellvars = requirements.intersection(&type_names).cloned().collect();
-        let mut freevars: BTreeSet<_> = requirements
+        let requirements = self.name_ids(&requirements);
+        let cellvars = requirements
+            .iter()
+            .filter(|name| type_names.contains(*name))
+            .copied()
+            .collect();
+        let mut freevars = requirements
             .iter()
             .filter(|name| !type_names.contains(*name))
-            .filter(|name| self.can_provide_closure(name))
-            .cloned()
+            .filter(|name| self.can_provide_closure_id(**name))
+            .copied()
             .collect();
         if matches!(self.unit.scope, Scope::Class { .. }) {
-            freevars.insert("__classdict__".to_string());
+            let classdict = self.required_name_id("__classdict__");
+            self.insert_lexical_name(&mut freevars, classdict);
         }
         let plan = LoweringFunctionPlan {
             locals,
@@ -97,10 +103,7 @@ impl Compiler {
             .symbols
             .imported_scope_names
             .clone_from(&self.symbols.imported_scope_names);
-        let type_parameter_names = type_names
-            .iter()
-            .map(|name| wrapper.required_name_id(name))
-            .collect();
+        let type_parameter_names = type_names.iter().copied().collect();
         wrapper.symbols.type_parameter_names = type_parameter_names;
         wrapper.unit.generic_target_qualified_name = Some(self.child_qualified_name(name));
         if matches!(self.unit.scope, Scope::Class { .. }) {
@@ -117,14 +120,7 @@ impl Compiler {
         wrapper.emit_unary_intrinsic(UnaryIntrinsic::TYPEALIAS)?;
         wrapper.emit(RETURN_VALUE, 0, -1)?;
         let wrapper = wrapper.finish_inner(false)?;
-
-        let wrapper_closure_names: Vec<_> = wrapper
-            .locals
-            .iter()
-            .zip(&wrapper.local_kinds)
-            .filter(|(_, kind)| **kind & CO_FAST_FREE != 0)
-            .map(|(name, _)| name.clone())
-            .collect();
+        let wrapper_closure_names = plan.freevars;
         if !wrapper_closure_names.is_empty() {
             self.emit_closure_tuple(&wrapper_closure_names)?;
         }
@@ -169,9 +165,9 @@ impl Compiler {
             self.assembler.set_location(definition_location);
             self.emit(SWAP, 2, 0)?;
         }
-        let type_names: BTreeSet<_> = type_params
+        let type_names: FxHashSet<_> = type_params
             .iter()
-            .map(|parameter| parameter.name().as_str().to_string())
+            .map(|parameter| self.required_name_id(parameter.name().as_str()))
             .collect();
         let child_scope_id = self.function_scope_id(definition)?;
         let arena = self.scope_arena()?;
@@ -180,52 +176,52 @@ impl Compiler {
             .ok_or_else(|| CompileError::Internal("function scope has no plan".to_string()))?
             .clone();
         for name in child_plan.required.iter().copied().collect::<Vec<_>>() {
-            let spelling = arena.names.resolve(name);
-            if type_names.contains(spelling) || self.can_provide_closure(spelling) {
+            if type_names.contains(&name) || self.can_provide_closure_id(name) {
                 child_plan.insert_freevar(&arena.names, name);
             } else {
                 child_plan.mark_global(name);
             }
         }
-        let child_plan = child_plan.materialize(&arena.names);
+        let child_plan = child_plan.into_lowering_plan();
 
-        let mut locals = vec![".defaults".to_string()];
+        let mut locals = vec![self.required_name_id(".defaults")];
         if defaults.keyword {
-            locals.push(".kwdefaults".to_string());
+            locals.push(self.required_name_id(".kwdefaults"));
         }
         locals.extend(
             type_params
                 .iter()
-                .map(|parameter| parameter.name().as_str().to_string()),
+                .map(|parameter| self.required_name_id(parameter.name().as_str())),
         );
-        let type_parameter_requirements = type_parameter_required_names(type_params);
-        let wrapper_local_names: HashSet<_> = locals.iter().cloned().collect();
+        let type_parameter_requirements = self.name_ids(type_parameter_required_names(type_params));
+        let wrapper_local_names: FxHashSet<_> = locals.iter().copied().collect();
         let mut wrapper_plan = LoweringFunctionPlan {
             locals,
             cellvars: type_parameter_requirements
-                .intersection(&type_names)
-                .cloned()
+                .iter()
+                .filter(|name| type_names.contains(*name))
+                .copied()
                 .collect(),
             required: type_parameter_requirements
                 .iter()
                 .filter(|name| !wrapper_local_names.contains(*name))
-                .cloned()
+                .copied()
                 .collect(),
             ..LoweringFunctionPlan::default()
         };
         wrapper_plan.absorb_child_requirements(
-            child_plan.required.iter().cloned(),
-            child_plan.annotation_references.iter().cloned(),
+            child_plan.required.iter().copied(),
+            child_plan.annotation_references.iter().copied(),
         );
-        for name in wrapper_plan.required.iter().cloned().collect::<Vec<_>>() {
-            if self.can_provide_closure(&name) {
-                wrapper_plan.freevars.insert(name);
+        for name in wrapper_plan.required.iter().copied().collect::<Vec<_>>() {
+            if self.can_provide_closure_id(name) {
+                wrapper_plan.insert_freevar(&arena.names, name);
             } else {
-                wrapper_plan.mark_global(&name);
+                wrapper_plan.mark_global(name);
             }
         }
         if matches!(self.unit.scope, Scope::Class { .. }) {
-            wrapper_plan.freevars.insert("__classdict__".to_string());
+            wrapper_plan.insert_freevar(&arena.names, self.required_name_id("__classdict__"));
         }
         let wrapper_name = format!("<generic parameters of {}>", definition.name);
         let target_qualified_name = self.child_qualified_name(definition.name.as_str());
@@ -264,10 +260,7 @@ impl Compiler {
             .symbols
             .imported_scope_names
             .clone_from(&self.symbols.imported_scope_names);
-        let type_parameter_names = type_names
-            .iter()
-            .map(|name| wrapper.required_name_id(name))
-            .collect();
+        let type_parameter_names = type_names.iter().copied().collect();
         wrapper.symbols.type_parameter_names = type_parameter_names;
         wrapper.unit.generic_target_qualified_name = Some(target_qualified_name);
         if matches!(self.unit.scope, Scope::Class { .. }) {
@@ -297,14 +290,7 @@ impl Compiler {
         wrapper.emit_binary_intrinsic(BinaryIntrinsic::SET_FUNCTION_TYPE_PARAMS)?;
         wrapper.emit(RETURN_VALUE, 0, -1)?;
         let wrapper = wrapper.finish_inner(false)?;
-
-        let wrapper_closure_names: Vec<_> = wrapper
-            .locals
-            .iter()
-            .zip(&wrapper.local_kinds)
-            .filter(|(_, kind)| **kind & CO_FAST_FREE != 0)
-            .map(|(name, _)| name.clone())
-            .collect();
+        let wrapper_closure_names = wrapper_plan.freevars;
         if !wrapper_closure_names.is_empty() {
             self.emit_closure_tuple(&wrapper_closure_names)?;
         }
@@ -371,7 +357,7 @@ impl Compiler {
         };
 
         let (scope_id, plan) = self.resolved_function_plan(definition)?;
-        let closure_names: Vec<_> = plan.freevars.iter().cloned().collect();
+        let closure_names = plan.freevars.clone();
         let annotation_child = self.compile_function_annotations(definition, &plan)?;
 
         let arg_count = to_u32(
@@ -447,14 +433,7 @@ impl Compiler {
         let child = child.compile_function_body(&definition.body)?;
 
         self.assembler.set_location(definition_location);
-        if let Some(annotation_child) = annotation_child {
-            let annotation_closure_names: Vec<_> = annotation_child
-                .locals
-                .iter()
-                .zip(&annotation_child.local_kinds)
-                .filter(|(_, kind)| **kind & CO_FAST_FREE != 0)
-                .map(|(name, _)| name.clone())
-                .collect();
+        if let Some((annotation_child, annotation_closure_names)) = annotation_child {
             if !annotation_closure_names.is_empty() {
                 self.emit_closure_tuple(&annotation_closure_names)?;
             }
@@ -576,16 +555,16 @@ impl Compiler {
         for decorator in &definition.decorator_list {
             self.compile_expression(&decorator.expression)?;
         }
-        let type_names: BTreeSet<_> = type_params
+        let type_names: FxHashSet<_> = type_params
             .iter()
-            .map(|parameter| parameter.name().as_str().to_string())
+            .map(|parameter| self.required_name_id(parameter.name().as_str()))
             .collect();
         let mut locals: Vec<_> = type_params
             .iter()
-            .map(|parameter| parameter.name().as_str().to_string())
+            .map(|parameter| self.required_name_id(parameter.name().as_str()))
             .collect();
-        locals.push(".generic_base".to_string());
-        locals.push(".type_params".to_string());
+        locals.push(self.required_name_id(".generic_base"));
+        locals.push(self.required_name_id(".type_params"));
         let (_, class_plan) = self.class_plan(definition)?;
         let required_names = &class_plan.required;
         let type_parameter_requirements = type_parameter_required_names(type_params);
@@ -602,24 +581,30 @@ impl Compiler {
                     .extend(nested_expression_required_names(&keyword.value));
             }
         }
-        let mut cellvars: HashSet<_> = type_names
+        let type_parameter_cell_requirements = self.name_id_set(type_parameter_cell_requirements);
+        let wrapper_requirements = self.name_id_set(wrapper_requirements);
+        let mut cellvars: FxHashSet<_> = type_names
             .intersection(required_names)
             .chain(type_names.intersection(&type_parameter_cell_requirements))
-            .cloned()
+            .copied()
             .collect();
-        cellvars.insert(".type_params".to_string());
-        let mut freevars: BTreeSet<_> = required_names
+        cellvars.insert(self.required_name_id(".type_params"));
+        let mut freevars = Vec::new();
+        for name in required_names
             .iter()
             .chain(&wrapper_requirements)
             .filter(|name| !type_names.contains(*name))
-            .filter(|name| self.can_provide_closure(name))
-            .cloned()
-            .collect();
+            .filter(|name| self.can_provide_closure_id(**name))
+            .copied()
+        {
+            self.insert_lexical_name(&mut freevars, name);
+        }
         // A type-parameter scope nested directly in a class can resolve names through the
         // class namespace. CPython provides that namespace through the synthetic
         // `__classdict__` closure, even when no type-parameter expression uses a class name.
         if matches!(self.unit.scope, Scope::Class { .. }) {
-            freevars.insert("__classdict__".to_string());
+            let classdict = self.required_name_id("__classdict__");
+            self.insert_lexical_name(&mut freevars, classdict);
         }
         let plan = LoweringFunctionPlan {
             locals,
@@ -665,10 +650,7 @@ impl Compiler {
             .symbols
             .imported_scope_names
             .clone_from(&self.symbols.imported_scope_names);
-        let type_parameter_names = type_names
-            .iter()
-            .map(|name| wrapper.required_name_id(name))
-            .collect();
+        let type_parameter_names = type_names.iter().copied().collect();
         wrapper.symbols.type_parameter_names = type_parameter_names;
         wrapper.unit.generic_target_qualified_name = Some(target_qualified_name);
         wrapper.unit.child_qualified_name_parent = Some(wrapper_child_qualified_name_parent);
@@ -688,13 +670,7 @@ impl Compiler {
             .compile_plain_class_definition(definition, DefinitionDecorators::AlreadyCompiled)?;
         wrapper.emit(RETURN_VALUE, 0, -1)?;
         let wrapper = wrapper.finish_inner(false)?;
-        let wrapper_closure_names: Vec<_> = wrapper
-            .locals
-            .iter()
-            .zip(&wrapper.local_kinds)
-            .filter(|(_, kind)| **kind & CO_FAST_FREE != 0)
-            .map(|(name, _)| name.clone())
-            .collect();
+        let wrapper_closure_names = plan.freevars;
 
         let definition_location = self.definition_location(
             definition.range,
@@ -736,13 +712,15 @@ impl Compiler {
         let is_generic = self.unit.generic_target_qualified_name.is_some();
 
         let (scope_id, class_plan) = self.class_plan(definition)?;
-        let mut freevars = class_plan
+        let mut freevars = Vec::new();
+        for name in class_plan
             .required
             .iter()
+            .copied()
             .filter(|name| match &self.unit.scope {
                 Scope::Module => false,
                 Scope::Class { free_indices, .. } => {
-                    self.is_cell(name) || self.scope_index(free_indices, name).is_some()
+                    self.symbols.cell_names.contains(*name) || free_indices.contains_key(name)
                 }
                 Scope::Function {
                     indices,
@@ -750,16 +728,18 @@ impl Compiler {
                     cells,
                     ..
                 } => {
-                    self.scope_index(indices, name).is_some() && self.contains_name(cells, name)
-                        || self.scope_index(free_indices, name).is_some()
+                    indices.contains_key(name) && cells.contains(*name)
+                        || free_indices.contains_key(name)
                 }
             })
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        if is_generic {
-            freevars.insert(".type_params".to_string());
+        {
+            self.insert_lexical_name(&mut freevars, name);
         }
-        let closure_names = freevars.iter().cloned().collect::<Vec<_>>();
+        if is_generic {
+            let type_params = self.required_name_id(".type_params");
+            self.insert_lexical_name(&mut freevars, type_params);
+        }
+        let closure_names = freevars.clone();
         let qualified_name = self
             .unit
             .generic_target_qualified_name
@@ -785,7 +765,7 @@ impl Compiler {
             scope_id,
             class_plan.globals,
             class_plan.nonlocals,
-            freevars,
+            &freevars,
             class_plan.bound_names,
             class_plan.needs_class_closure,
             class_plan.needs_classdict,
@@ -1047,33 +1027,35 @@ impl Compiler {
     ) -> Result<(), CompileError> {
         let mut references = ReferenceCollector::default();
         references.visit_expr(expression);
-        let required_names = expression_required_names(expression);
-        let mut freevars: BTreeSet<_> = required_names
+        let required_names = self.name_ids(expression_required_names(expression));
+        let mut freevars: Vec<_> = required_names
             .iter()
-            .filter(|name| self.is_type_parameter(name) || self.can_provide_closure(name))
-            .cloned()
+            .filter(|name| self.is_type_parameter_id(**name) || self.can_provide_closure_id(**name))
+            .copied()
             .collect();
         let can_see_class_scope = matches!(self.unit.scope, Scope::Class { .. })
             || self
                 .symbols
                 .free_names
-                .iter()
-                .any(|name| name == "__classdict__");
+                .contains(&self.required_name_id("__classdict__"));
         if can_see_class_scope {
-            freevars.insert("__classdict__".to_string());
+            let classdict = self.required_name_id("__classdict__");
+            self.insert_lexical_name(&mut freevars, classdict);
         }
+        let freevar_set: FxHashSet<_> = freevars.iter().copied().collect();
         let globals = references
             .references
-            .difference(&freevars.iter().cloned().collect())
-            .cloned()
+            .iter()
+            .map(|name| self.required_name_id(name))
+            .filter(|name| !freevar_set.contains(name))
             .collect();
-        let closure_names: Vec<_> = freevars.iter().cloned().collect();
         let plan = LoweringFunctionPlan {
-            locals: vec![".format".to_string()],
+            locals: vec![self.required_name_id(".format")],
             globals,
             freevars,
             ..LoweringFunctionPlan::default()
         };
+        let closure_names = plan.freevars.clone();
         // Definitions inside an annotation scope are qualified against that
         // scope's parent. Generic-parameter wrappers are themselves annotation
         // scopes even though this compiler represents them as functions.
@@ -1122,7 +1104,7 @@ impl Compiler {
         child
             .assembler
             .set_location(child.source_location(setup_range));
-        child.emit_annotation_format_guard()?;
+        child.emit_annotation_format_guard(".format")?;
         child.compile_expression(expression)?;
         child
             .assembler
@@ -1146,13 +1128,8 @@ impl Compiler {
         self.emit_function_attribute(FunctionAttribute::DEFAULTS)
     }
 
-    fn emit_annotation_format_guard(&mut self) -> Result<(), CompileError> {
-        let parameter = self
-            .symbols
-            .locals
-            .first()
-            .map_or_else(|| "format".to_string(), Clone::clone);
-        self.load_name(&parameter)?;
+    fn emit_annotation_format_guard(&mut self, parameter: &str) -> Result<(), CompileError> {
+        self.load_name(parameter)?;
         self.add_constant(Constant::Int(2))?;
         self.emit(LOAD_SMALL_INT, 2, 1)?;
         self.emit_comparison(ComparisonOperation::GT, ComparisonMode::Value)?;
@@ -1170,7 +1147,7 @@ impl Compiler {
         &self,
         definition: &StmtFunctionDef,
         function_plan: &LoweringFunctionPlan,
-    ) -> Result<Option<CodeObject>, CompileError> {
+    ) -> Result<Option<(CodeObject, Vec<NameId>)>, CompileError> {
         let parameters = &definition.parameters;
         let mut annotations = Vec::<(String, &Expr)>::new();
         for parameter in parameters.args.iter().chain(&parameters.posonlyargs) {
@@ -1202,26 +1179,27 @@ impl Compiler {
 
         let mut freevars = function_plan.annotation_freevars.clone();
         if self.unit.flags & CO_FUTURE_ANNOTATIONS == 0 {
-            freevars.extend(
-                function_plan
-                    .annotation_references
-                    .iter()
-                    .filter(|name| self.is_type_parameter(name))
-                    .cloned(),
-            );
+            for name in function_plan
+                .annotation_references
+                .iter()
+                .filter(|name| self.is_type_parameter_id(**name))
+                .copied()
+            {
+                self.insert_lexical_name(&mut freevars, name);
+            }
         }
         let can_see_class_scope = self.unit.flags & CO_FUTURE_ANNOTATIONS == 0
             && (matches!(self.unit.scope, Scope::Class { .. })
                 || self
                     .symbols
                     .free_names
-                    .iter()
-                    .any(|name| name == "__classdict__"));
+                    .contains(&self.required_name_id("__classdict__")));
         if can_see_class_scope {
-            freevars.insert("__classdict__".to_string());
+            let classdict = self.required_name_id("__classdict__");
+            self.insert_lexical_name(&mut freevars, classdict);
         }
         let plan = LoweringFunctionPlan {
-            locals: vec!["format".to_string()],
+            locals: vec![self.required_name_id("format")],
             freevars,
             ..LoweringFunctionPlan::default()
         };
@@ -1271,7 +1249,7 @@ impl Compiler {
         );
         child.assembler.set_location(location);
 
-        child.emit_annotation_format_guard()?;
+        child.emit_annotation_format_guard("format")?;
 
         let future_annotations = self.unit.flags & CO_FUTURE_ANNOTATIONS != 0;
         for (name, annotation) in &annotations {
@@ -1295,13 +1273,14 @@ impl Compiler {
         let count = to_u32(annotations.len(), "annotation count")?;
         child.emit(BUILD_MAP, count, 1 - i32::try_from(count).unwrap() * 2)?;
         child.emit(RETURN_VALUE, 0, -1)?;
-        child.finish_inner(false).map(Some)
+        let child = child.finish_inner(false)?;
+        Ok(Some((child, plan.freevars)))
     }
 
     pub(super) fn compile_class_annotations(
         &self,
         body: &[Stmt],
-    ) -> Result<Option<(CodeObject, Vec<String>)>, CompileError> {
+    ) -> Result<Option<(CodeObject, Vec<NameId>)>, CompileError> {
         let mut annotations = Vec::new();
         collect_simple_annotations(body, &mut annotations);
         if annotations.is_empty() {
@@ -1312,23 +1291,26 @@ impl Compiler {
         for annotation in &annotations {
             references.visit_expr(&annotation.annotation);
         }
-        let available_freevars: HashSet<_> = self.symbols.free_names.iter().cloned().collect();
-        let mut freevars: BTreeSet<_> = references
-            .references
+        let available_freevars: FxHashSet<_> = self.symbols.free_names.iter().copied().collect();
+        let reference_ids = self.name_id_set(&references.references);
+        let mut freevars = Vec::new();
+        for name in reference_ids
             .iter()
             .filter(|name| available_freevars.contains(*name))
-            .cloned()
+            .copied()
+        {
+            self.insert_lexical_name(&mut freevars, name);
+        }
+        let classdict = self.required_name_id("__classdict__");
+        self.insert_lexical_name(&mut freevars, classdict);
+        let freevar_set: FxHashSet<_> = freevars.iter().copied().collect();
+        let globals = reference_ids
+            .into_iter()
+            .filter(|name| !freevar_set.contains(name))
             .collect();
-        freevars.insert("__classdict__".to_string());
-        let globals = references
-            .references
-            .iter()
-            .filter(|name| !freevars.contains(*name))
-            .cloned()
-            .collect();
-        let closure_names: Vec<_> = freevars.iter().cloned().collect();
+        let closure_names = freevars.clone();
         let plan = LoweringFunctionPlan {
-            locals: vec!["format".to_string()],
+            locals: vec![self.required_name_id("format")],
             globals,
             freevars,
             ..LoweringFunctionPlan::default()
@@ -1362,7 +1344,7 @@ impl Compiler {
         let line = i32::try_from(self.unit.first_line_number).unwrap_or(i32::MAX);
         let setup_location = SourceLocation::new(line, line, 0, 0);
         child.assembler.set_location(setup_location);
-        child.emit_annotation_format_guard()?;
+        child.emit_annotation_format_guard("format")?;
         child.emit(BUILD_MAP, 0, 1)?;
 
         for annotation in annotations {
@@ -1398,7 +1380,7 @@ impl Compiler {
             CompileError::Internal("module annotation thunk has no annotations".to_string())
         })?;
         let plan = LoweringFunctionPlan {
-            locals: vec!["format".to_string()],
+            locals: vec![self.required_name_id("format")],
             ..LoweringFunctionPlan::default()
         };
         let mut child = Self::function(

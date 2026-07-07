@@ -1885,10 +1885,10 @@ impl Compiler {
                 let Some(class_index) = self.scope_index(free_indices, "__class__") else {
                     return Ok(SpecializedLowering::NotApplicable);
                 };
-                let Some(first_parameter) = self.symbols.locals.first() else {
+                let Some(first_parameter) = self.symbols.locals.first().copied() else {
                     return Ok(SpecializedLowering::NotApplicable);
                 };
-                let Some(first_parameter) = self.scope_index(indices, first_parameter) else {
+                let Some(first_parameter) = indices.get(&first_parameter).copied() else {
                     return Ok(SpecializedLowering::NotApplicable);
                 };
                 (class_index, first_parameter)
@@ -2007,19 +2007,21 @@ impl Compiler {
         }
 
         let analysis = analyze_lambda_scope(lambda);
-        let freevars = analysis
+        let freevar_names = analysis
             .required
             .iter()
             .filter(|name| self.can_provide_closure(name))
             .cloned()
             .collect::<BTreeSet<_>>();
-        let globals = analysis.required.difference(&freevars).cloned().collect();
-        let closure_names = freevars.iter().cloned().collect::<Vec<_>>();
+        let globals = self.name_id_set(analysis.required.difference(&freevar_names));
+        let freevars = self.name_ids(&freevar_names);
+        let closure_names = freevars.clone();
         let plan = LoweringFunctionPlan {
-            locals: analysis.locals,
+            locals: self.name_ids(analysis.locals),
             globals,
-            cellvars: analysis.cellvars,
-            inlined_comprehension_cellvars: analysis.inlined_comprehension_cellvars,
+            cellvars: self.name_id_set(analysis.cellvars),
+            inlined_comprehension_cellvars: self
+                .name_id_set(analysis.inlined_comprehension_cellvars),
             freevars,
             ..LoweringFunctionPlan::default()
         };
@@ -2380,7 +2382,11 @@ impl Compiler {
                 globals.insert(name);
             }
         }
-        let closure_names: Vec<_> = freevars.iter().cloned().collect();
+        let locals = self.name_ids(locals);
+        let globals = self.name_id_set(globals);
+        let generator_cellvars = self.name_id_set(generator_cellvars);
+        let freevars = self.name_ids(freevars);
+        let closure_names = freevars.clone();
         let generator_range = self.generator_expression_range(generator);
         let plan = LoweringFunctionPlan {
             locals,
@@ -3242,7 +3248,7 @@ impl Compiler {
             index
         } else {
             let index = to_u32(self.symbols.locals.len(), "comprehension local count")?;
-            self.symbols.locals.push(name.to_string());
+            self.symbols.locals.push(name_id);
             if !matches!(self.unit.scope, Scope::Function { .. }) {
                 self.symbols.hidden_names.insert(name_id);
             }

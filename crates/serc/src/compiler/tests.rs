@@ -110,10 +110,19 @@ fn name_ids_do_not_define_observable_name_order() {
         freevars: lexical_order,
         ..FunctionPlan::default()
     }
-    .materialize(&interner);
-    assert_eq!(plan.locals, ["zeta", "alpha", "beta", "_hidden", "éclair"]);
+    .into_lowering_plan();
     assert_eq!(
-        plan.freevars.into_iter().collect::<Vec<_>>(),
+        plan.locals
+            .iter()
+            .map(|name| interner.resolve(*name))
+            .collect::<Vec<_>>(),
+        ["zeta", "alpha", "beta", "_hidden", "éclair"]
+    );
+    assert_eq!(
+        plan.freevars
+            .into_iter()
+            .map(|name| interner.resolve(name))
+            .collect::<Vec<_>>(),
         ["_hidden", "alpha", "beta", "zeta", "éclair"]
     );
 }
@@ -179,6 +188,66 @@ fn single_pass_local_collection_preserves_source_order() {
     assert_eq!(
         function.locals,
         ["target", "later", "earlier", "annotation_only"]
+    );
+}
+
+#[test]
+fn symbol_name_ids_preserve_mangled_cell_and_freevar_order() {
+    let source = r"class ____Container:
+    def outer(self):
+        zeta = 1
+        __private = 2
+        éclair = 3
+        alpha = 4
+
+        def inner():
+            return zeta, __private, éclair, alpha
+
+        return inner
+";
+    let parsed = parse_module(source).unwrap();
+    let module = Compiler::module("example.py", source, parsed.tokens().clone())
+        .compile_module(parsed.suite())
+        .unwrap();
+    let class = module
+        .constants
+        .iter()
+        .find_map(|constant| match constant {
+            Constant::Code(code) if code.name == "____Container" => Some(code),
+            _ => None,
+        })
+        .expect("module should contain the class body");
+    let outer = class
+        .constants
+        .iter()
+        .find_map(|constant| match constant {
+            Constant::Code(code) if code.name == "outer" => Some(code),
+            _ => None,
+        })
+        .expect("class should contain the outer function");
+    let inner = outer
+        .constants
+        .iter()
+        .find_map(|constant| match constant {
+            Constant::Code(code) if code.name == "inner" => Some(code),
+            _ => None,
+        })
+        .expect("outer should contain the inner function");
+
+    assert_eq!(
+        outer.locals,
+        [
+            "self",
+            "inner",
+            "_Container__private",
+            "alpha",
+            "zeta",
+            "éclair"
+        ]
+    );
+    assert_eq!(
+        inner.locals,
+        ["_Container__private", "alpha", "zeta", "éclair"]
     );
 }
 

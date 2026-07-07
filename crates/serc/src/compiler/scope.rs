@@ -48,13 +48,11 @@ impl Compiler {
             .clone();
         let required = plan.required.iter().copied().collect::<Vec<_>>();
         for name in required {
-            let spelling = arena.names.resolve(name);
             let captures_name = match &self.unit.scope {
-                Scope::Class { .. } => {
-                    spelling == "__class__"
-                        || self.symbols.free_names.iter().any(|free| free == spelling)
+                Scope::Class { free_indices, .. } => {
+                    arena.names.get("__class__") == Some(name) || free_indices.contains_key(&name)
                 }
-                Scope::Module | Scope::Function { .. } => self.can_provide_closure(spelling),
+                Scope::Module | Scope::Function { .. } => self.can_provide_closure_id(name),
             };
             if captures_name {
                 plan.insert_freevar(&arena.names, name);
@@ -68,18 +66,17 @@ impl Compiler {
             .copied()
             .collect::<Vec<_>>()
         {
-            let spelling = arena.names.resolve(name);
             let captures_name = match &self.unit.scope {
                 // Method annotation thunks are created by the class body and can capture the
                 // class body's free variables, but not arbitrary class-local bindings.
-                Scope::Class { .. } => self.symbols.free_names.iter().any(|free| free == spelling),
-                Scope::Module | Scope::Function { .. } => self.can_provide_closure(spelling),
+                Scope::Class { free_indices, .. } => free_indices.contains_key(&name),
+                Scope::Module | Scope::Function { .. } => self.can_provide_closure_id(name),
             };
             if captures_name {
                 plan.insert_annotation_freevar(&arena.names, name);
             }
         }
-        Ok((scope_id, plan.materialize(&arena.names)))
+        Ok((scope_id, plan.into_lowering_plan()))
     }
 
     pub(super) fn class_plan(
@@ -91,7 +88,7 @@ impl Compiler {
         let plan = arena
             .class(scope_id)
             .ok_or_else(|| CompileError::Internal("class scope has no plan".to_string()))?
-            .materialize(&arena.names);
+            .lowering_plan();
         Ok((scope_id, plan))
     }
 }
@@ -216,20 +213,6 @@ impl NameInterner {
             Err(index) => names.insert(index, id),
         }
     }
-
-    fn materialize_set(&self, names: &FxHashSet<NameId>) -> HashSet<String> {
-        names
-            .iter()
-            .map(|name| self.resolve(*name).to_string())
-            .collect()
-    }
-
-    fn materialize_ordered(&self, names: &[NameId]) -> BTreeSet<String> {
-        names
-            .iter()
-            .map(|name| self.resolve(*name).to_string())
-            .collect()
-    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -266,32 +249,32 @@ pub(super) struct ScopeBodyFacts {
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct LoweringFunctionPlan {
-    pub(super) locals: Vec<String>,
-    pub(super) globals: HashSet<String>,
-    pub(super) annotation_references: HashSet<String>,
-    pub(super) cellvars: HashSet<String>,
-    pub(super) inlined_comprehension_cellvars: HashSet<String>,
-    pub(super) freevars: BTreeSet<String>,
-    pub(super) annotation_freevars: BTreeSet<String>,
-    pub(super) required: BTreeSet<String>,
+    pub(super) locals: Vec<NameId>,
+    pub(super) globals: FxHashSet<NameId>,
+    pub(super) annotation_references: FxHashSet<NameId>,
+    pub(super) cellvars: FxHashSet<NameId>,
+    pub(super) inlined_comprehension_cellvars: FxHashSet<NameId>,
+    pub(super) freevars: Vec<NameId>,
+    pub(super) annotation_freevars: Vec<NameId>,
+    pub(super) required: FxHashSet<NameId>,
 }
 
 impl LoweringFunctionPlan {
     pub(super) fn absorb_child_requirements(
         &mut self,
-        required_names: impl IntoIterator<Item = String>,
-        annotation_references: impl IntoIterator<Item = String>,
+        required_names: impl IntoIterator<Item = NameId>,
+        annotation_references: impl IntoIterator<Item = NameId>,
     ) {
-        let local_names: HashSet<_> = self.locals.iter().map(String::as_str).collect();
+        let local_names: FxHashSet<_> = self.locals.iter().copied().collect();
         for name in required_names {
-            if local_names.contains(name.as_str()) {
+            if local_names.contains(&name) {
                 self.cellvars.insert(name);
             } else if !self.globals.contains(&name) {
                 self.required.insert(name);
             }
         }
         for name in annotation_references {
-            if local_names.contains(name.as_str()) {
+            if local_names.contains(&name) {
                 self.cellvars.insert(name);
             } else if !self.globals.contains(&name) {
                 self.required.insert(name);
@@ -299,14 +282,19 @@ impl LoweringFunctionPlan {
         }
     }
 
-    pub(super) fn mark_global(&mut self, name: &str) {
-        self.annotation_freevars.remove(name);
-        if self.locals.iter().any(|local| local == name) {
+    pub(super) fn insert_freevar(&mut self, names: &NameInterner, name: NameId) {
+        names.insert_lexical(&mut self.freevars, name);
+    }
+
+    pub(super) fn mark_global(&mut self, name: NameId) {
+        self.annotation_freevars
+            .retain(|candidate| *candidate != name);
+        if self.locals.contains(&name) {
             return;
         }
-        self.freevars.remove(name);
-        self.globals.insert(name.to_string());
-        self.required.remove(name);
+        self.freevars.retain(|candidate| *candidate != name);
+        self.globals.insert(name);
+        self.required.remove(&name);
     }
 }
 
@@ -522,21 +510,16 @@ impl FunctionPlan {
         self.required.remove(&name);
     }
 
-    pub(super) fn materialize(&self, names: &NameInterner) -> LoweringFunctionPlan {
+    pub(super) fn into_lowering_plan(self) -> LoweringFunctionPlan {
         LoweringFunctionPlan {
-            locals: self
-                .locals
-                .iter()
-                .map(|name| names.resolve(*name).to_string())
-                .collect(),
-            globals: names.materialize_set(&self.globals),
-            annotation_references: names.materialize_set(&self.annotation_references),
-            cellvars: names.materialize_set(&self.cellvars),
-            inlined_comprehension_cellvars: names
-                .materialize_set(&self.inlined_comprehension_cellvars),
-            freevars: names.materialize_ordered(&self.freevars),
-            annotation_freevars: names.materialize_ordered(&self.annotation_freevars),
-            required: names.materialize_set(&self.required).into_iter().collect(),
+            locals: self.locals,
+            globals: self.globals,
+            annotation_references: self.annotation_references,
+            cellvars: self.cellvars,
+            inlined_comprehension_cellvars: self.inlined_comprehension_cellvars,
+            freevars: self.freevars,
+            annotation_freevars: self.annotation_freevars,
+            required: self.required,
         }
     }
 }
@@ -553,10 +536,10 @@ struct ClassPlan {
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct LoweringClassPlan {
-    pub(super) globals: HashSet<String>,
-    pub(super) nonlocals: HashSet<String>,
-    pub(super) bound_names: HashSet<String>,
-    pub(super) required: BTreeSet<String>,
+    pub(super) globals: FxHashSet<NameId>,
+    pub(super) nonlocals: FxHashSet<NameId>,
+    pub(super) bound_names: FxHashSet<NameId>,
+    pub(super) required: FxHashSet<NameId>,
     pub(super) needs_class_closure: bool,
     pub(super) needs_classdict: bool,
 }
@@ -651,12 +634,12 @@ impl ClassPlan {
         }
     }
 
-    fn materialize(&self, names: &NameInterner) -> LoweringClassPlan {
+    fn lowering_plan(&self) -> LoweringClassPlan {
         LoweringClassPlan {
-            globals: names.materialize_set(&self.globals),
-            nonlocals: names.materialize_set(&self.nonlocals),
-            bound_names: names.materialize_set(&self.bound_names),
-            required: names.materialize_set(&self.required).into_iter().collect(),
+            globals: self.globals.clone(),
+            nonlocals: self.nonlocals.clone(),
+            bound_names: self.bound_names.clone(),
+            required: self.required.clone(),
             needs_class_closure: self.needs_class_closure,
             needs_classdict: self.needs_classdict,
         }
