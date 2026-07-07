@@ -1,9 +1,22 @@
-// Compiler submodules intentionally share the parent-owned state and lowering vocabulary.
-#![allow(clippy::wildcard_imports)]
+use std::borrow::Cow;
 
+use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
+use ruff_python_ast::{
+    BoolOp, Expr, ExprBinOp, ExprContext, FStringPart, InterpolatedStringElement, Number, Operator,
+    Stmt, UnaryOp,
+};
+use ruff_text_size::Ranged;
+use rustc_hash::{FxHashMap, FxHashSet};
+
+use super::{LOAD_CONST, LOAD_SMALL_INT, NOP, STORE_NAME};
+use crate::CompileError;
 use crate::assembler::InstructionId;
+use crate::target::operands::Conversion;
 
-use super::*;
+use super::expression::literal_truthiness;
+use super::scope::NameId;
+use super::symbol::{mangle_name, to_u32};
+use super::{CodeObject, Compiler, Constant};
 
 #[derive(Debug, Default)]
 pub(super) struct OutputState {
@@ -12,8 +25,8 @@ pub(super) struct OutputState {
     pub(super) deferred_constants: Vec<(Option<InstructionId>, Constant)>,
     pub(super) deferred_names: Vec<(InstructionId, String)>,
     pub(super) names: Vec<String>,
-    pub(super) name_indices: FxHashMap<NameId, u32>,
-    pub(super) interned_constant_strings: HashSet<String>,
+    name_indices: FxHashMap<NameId, u32>,
+    pub(super) interned_constant_strings: FxHashSet<String>,
 }
 
 impl Compiler {
