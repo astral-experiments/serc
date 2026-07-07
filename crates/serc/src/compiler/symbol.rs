@@ -3,6 +3,33 @@
 
 use super::*;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ReraiseStackState {
+    /// Only the exception remains, as in comprehension and exception-group cleanup.
+    ExceptionOnly,
+    /// The exception is being propagated from an active exception or finally handler.
+    ActiveExceptionHandler,
+    /// The generator or coroutine stop-iteration handler retains physical interpreter state that
+    /// is not part of the compiler's logical stack.
+    StopIterationHandler,
+    /// CPython's standard `[exc_info, lasti, exc]` handler-cleanup sequence.
+    HandlerCleanup,
+    /// An unsuccessful synchronous or asynchronous `with` handler retains five logical values.
+    WithHandler,
+}
+
+impl ReraiseStackState {
+    pub(super) const fn argument_and_effect(self) -> (u32, i32) {
+        match self {
+            Self::ExceptionOnly => (0, -1),
+            Self::ActiveExceptionHandler => (0, -2),
+            Self::StopIterationHandler => (1, -1),
+            Self::HandlerCleanup => (1, -3),
+            Self::WithHandler => (2, -5),
+        }
+    }
+}
+
 impl Compiler {
     fn name_id(&self, name: &str) -> Option<NameId> {
         self.context.scopes.get()?.names.get(name)
@@ -728,6 +755,18 @@ impl Compiler {
         Ok(())
     }
 
+    pub(super) fn emit_reraise(&mut self, state: ReraiseStackState) -> Result<(), CompileError> {
+        let (argument, effect) = state.argument_and_effect();
+        self.apply_stack_effect(effect)?;
+        self.assembler.emit_with_depth(
+            RERAISE,
+            argument,
+            self.control.depth.cast_unsigned(),
+            ExceptionPolicy::default(),
+        );
+        Ok(())
+    }
+
     pub(super) fn emit_unary_intrinsic(
         &mut self,
         intrinsic: UnaryIntrinsic,
@@ -946,10 +985,9 @@ pub(super) fn validate_compiler_stack_effect(
             )))
         }
         CompilerStackEffect::Fixed(expected) => Ok(expected),
-        CompilerStackEffect::ContextDependent if declared < 0 => Ok(declared),
         CompilerStackEffect::ContextDependent => Err(CompileError::Internal(format!(
-            "compiler declared non-consuming stack effect {declared} for context-dependent opcode {}",
-            opcode.code()
+            "compiler declared stack effect {declared} for context-dependent opcode {} with argument {argument}; use its typed emitter",
+            opcode.code(),
         ))),
     }
 }

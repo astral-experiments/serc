@@ -2246,7 +2246,7 @@ impl Compiler {
             }
             self.emit(STORE_FAST, *index, -1)?;
         }
-        self.emit(RERAISE, 0, -1)?;
+        self.emit_reraise(ReraiseStackState::ExceptionOnly)?;
         let cleanup_end = self.assembler.label();
         self.assembler.mark(cleanup_end);
         if let Some((parent, depth)) = parent_cleanup {
