@@ -554,6 +554,17 @@ class Shadowed:
     }
 
     #[test]
+    fn matches_cpython_marshal_for_fresh_annotation_locals_and_explicit_interns() {
+        let source = r"def consume(**kwargs):
+    return kwargs
+
+class Container:
+    value: (consume(format=int), consume(méthode=str))
+";
+        assert_matches_cpython_marshal(source, "marshal_hints.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_annotations_in_compound_suites() {
         let source = r"with manager:
     in_with: WithAnnotation = 1

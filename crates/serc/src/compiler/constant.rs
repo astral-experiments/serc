@@ -587,7 +587,9 @@ fn code_objects_equal(left: &CodeObject, right: &CodeObject) -> bool {
         && left.first_line_number == right.first_line_number
         && left.line_table == right.line_table
         && left.exception_table == right.exception_table
-        && left.annotation_thunk == right.annotation_thunk
+        && left
+            .marshal_hints
+            .equal_for_constant_pool(&right.marshal_hints)
 }
 pub(super) fn literal_constant(expression: &Expr) -> Option<Constant> {
     match expression {
@@ -1389,4 +1391,59 @@ pub(super) fn big_integer_digits(token: &str) -> Vec<u16> {
         value.pop();
     }
     value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::constants_equal;
+    use crate::code_object::{CodeObject, Constant, LocalsIdentity, MarshalHints};
+
+    fn code_object(constants: Vec<Constant>) -> CodeObject {
+        CodeObject {
+            arg_count: 0,
+            positional_only_arg_count: 0,
+            keyword_only_arg_count: 0,
+            stack_size: 1,
+            flags: 0,
+            bytecode: Vec::new(),
+            constants,
+            names: Vec::new(),
+            locals: vec!["value".to_string()],
+            local_kinds: Vec::new(),
+            filename: "module.py".to_string(),
+            name: "<module>".to_string(),
+            qualified_name: "<module>".to_string(),
+            first_line_number: 1,
+            line_table: Vec::new(),
+            exception_table: Vec::new(),
+            marshal_hints: MarshalHints::default(),
+        }
+    }
+
+    #[test]
+    fn code_constant_equality_includes_locals_identity() {
+        let by_value = code_object(Vec::new());
+        let mut fresh = by_value.clone();
+        fresh.marshal_hints.locals_identity = LocalsIdentity::Fresh;
+
+        assert!(!constants_equal(
+            &Constant::Code(Box::new(by_value)),
+            &Constant::Code(Box::new(fresh))
+        ));
+    }
+
+    #[test]
+    fn code_constant_equality_ignores_explicit_intern_hints() {
+        let unhinted = code_object(vec![Constant::String("méthode".to_string())]);
+        let mut hinted = unhinted.clone();
+        hinted
+            .marshal_hints
+            .explicitly_interned_strings
+            .insert("méthode".to_string());
+
+        assert!(constants_equal(
+            &Constant::Code(Box::new(unhinted)),
+            &Constant::Code(Box::new(hinted))
+        ));
+    }
 }

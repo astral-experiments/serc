@@ -773,8 +773,14 @@ impl Compiler {
             first_line_number: self.unit.first_line_number,
             line_table,
             exception_table,
-            annotation_thunk: self.unit.annotation_thunk,
-            interned_constant_strings: self.output.interned_constant_strings,
+            marshal_hints: MarshalHints {
+                locals_identity: if self.unit.annotation_thunk {
+                    LocalsIdentity::Fresh
+                } else {
+                    LocalsIdentity::ByValue
+                },
+                explicitly_interned_strings: self.output.interned_constant_strings,
+            },
         })
     }
 

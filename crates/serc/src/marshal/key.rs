@@ -1,4 +1,4 @@
-use crate::code_object::{CodeObject, Constant};
+use crate::code_object::{CodeObject, Constant, LocalsIdentity};
 
 use super::v5::{
     FLAG_REF, TYPE_ASCII, TYPE_ASCII_INTERNED, TYPE_BINARY_COMPLEX, TYPE_BINARY_FLOAT, TYPE_CODE,
@@ -293,10 +293,11 @@ pub(super) fn strings_tuple_key(values: &[String]) -> ObjectKey<'_> {
 pub(super) fn locals_tuple_key(code: &CodeObject) -> ObjectKey<'_> {
     if code.locals.is_empty() {
         ObjectKey::EmptyTuple
-    } else if code.annotation_thunk {
-        ObjectKey::AnnotationLocals(std::ptr::from_ref(code).addr())
     } else {
-        strings_tuple_key(&code.locals)
+        match code.marshal_hints.locals_identity {
+            LocalsIdentity::ByValue => strings_tuple_key(&code.locals),
+            LocalsIdentity::Fresh => ObjectKey::AnnotationLocals(std::ptr::from_ref(code).addr()),
+        }
     }
 }
 

@@ -1,5 +1,28 @@
 use rustc_hash::FxHashSet;
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum LocalsIdentity {
+    #[default]
+    ByValue,
+    Fresh,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct MarshalHints {
+    pub(crate) locals_identity: LocalsIdentity,
+    pub(crate) explicitly_interned_strings: FxHashSet<String>,
+}
+
+impl MarshalHints {
+    /// Compares the subset of marshal hints that participates in code-constant equality.
+    pub(crate) fn equal_for_constant_pool(&self, other: &Self) -> bool {
+        // CPython gives annotation-scope locals fresh identity, which distinguishes otherwise
+        // equal code constants. Explicit intern hints only affect the later marshal traversal and
+        // are intentionally omitted from constant-pool equality.
+        self.locals_identity == other.locals_identity
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum Constant {
     None,
@@ -47,6 +70,5 @@ pub(crate) struct CodeObject {
     pub(crate) first_line_number: u32,
     pub(crate) line_table: Vec<u8>,
     pub(crate) exception_table: Vec<u8>,
-    pub(crate) annotation_thunk: bool,
-    pub(crate) interned_constant_strings: FxHashSet<String>,
+    pub(crate) marshal_hints: MarshalHints,
 }
