@@ -3841,13 +3841,12 @@ impl Compiler {
         self.emit(POP_EXCEPT, 0, -1)?;
         self.emit_reraise(ReraiseStackState::HandlerCleanup)?;
 
+        // CPython's final borrowed-load traversal leaves the normal continuation unvisited
+        // when every exception handler terminates, so its local loads remain owned.
         if statement.handlers.iter().all(|handler| {
-            handler.as_except_handler().is_some_and(|handler| {
-                matches!(
-                    handler.body.last(),
-                    Some(Stmt::Break(_) | Stmt::Continue(_))
-                )
-            })
+            handler
+                .as_except_handler()
+                .is_some_and(|handler| suite_terminates(&handler.body))
         }) {
             self.assembler.prevent_borrow_reachability(end);
         }
