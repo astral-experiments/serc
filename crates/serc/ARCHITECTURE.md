@@ -174,7 +174,7 @@ These checks diagnose structural corruption; the byte-for-byte oracle remains th
 
 ### Marshal encoding and `.pyc` output
 
-Marshal encoding is deliberately split into three responsibilities:
+Marshal encoding is deliberately split into four responsibilities:
 
 - `marshal/key.rs` defines when values compare equal and when CPython preserves object identity. It
     also defines deterministic sort keys for unordered constants such as frozen sets.
