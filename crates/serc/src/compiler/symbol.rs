@@ -5,7 +5,7 @@ use super::*;
 
 impl Compiler {
     fn name_id(&self, name: &str) -> Option<NameId> {
-        self.context.scopes.get()?.names.get(name)
+        self.context.scopes.names.get(name)
     }
 
     pub(super) fn required_name_id(&self, name: &str) -> NameId {

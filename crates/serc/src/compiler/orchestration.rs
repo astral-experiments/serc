@@ -16,13 +16,15 @@ impl Compiler {
         }
     }
 
-    pub(crate) fn module(filename: &str, source: &str, tokens: Tokens) -> Self {
+    pub(crate) fn module(filename: &str, source: &str, tokens: Tokens, body: &Suite) -> Self {
+        let future_flags = future_feature_flags(body);
+        let scopes = ScopeArena::analyze(body, future_flags & CO_FUTURE_ANNOTATIONS != 0);
         let context = Arc::new(CompilationContext {
             filename: filename.to_string(),
             source: Arc::from(source),
             tokens,
             line_index: LineIndex::from_source_text(source),
-            scopes: OnceLock::new(),
+            scopes,
         });
         let unit = CodeUnit::from_spec(CodeUnitSpec {
             scope: Scope::Module,
@@ -33,7 +35,7 @@ impl Compiler {
             arg_count: 0,
             positional_only_arg_count: 0,
             keyword_only_arg_count: 0,
-            flags: 0,
+            flags: future_flags,
             first_line_number: 1,
         });
         Self::new(context, unit, SymbolState::default())
@@ -83,11 +85,7 @@ impl Compiler {
             .collect();
         cell_only_locals.sort();
         locals.extend(cell_only_locals);
-        let names = &context
-            .scopes
-            .get()
-            .expect("scope arena should be initialized before child compilation")
-            .names;
+        let names = &context.scopes.names;
         let indices = locals
             .iter()
             .enumerate()
@@ -184,11 +182,7 @@ impl Compiler {
     ) -> Self {
         let mut locals = Vec::new();
         let mut cell_names = NameSet::default();
-        let names = &context
-            .scopes
-            .get()
-            .expect("scope arena should be initialized before child compilation")
-            .names;
+        let names = &context.scopes.names;
         if needs_class_closure {
             locals.push("__class__".to_string());
             cell_names.insert(
@@ -269,13 +263,6 @@ impl Compiler {
     }
 
     pub(crate) fn compile_module(mut self, body: &Suite) -> Result<CodeObject, CompileError> {
-        let future_flags = future_feature_flags(body);
-        let arena = ScopeArena::analyze(body, future_flags & CO_FUTURE_ANNOTATIONS != 0);
-        if self.context.scopes.set(arena).is_err() {
-            return Err(CompileError::Internal(
-                "scope arena was initialized more than once".to_string(),
-            ));
-        }
         self.symbols.module_globals = module_global_names(body)
             .into_iter()
             .map(|name| self.required_name_id(&name))
@@ -318,7 +305,6 @@ impl Compiler {
             let sentinel = self.required_name_id(SHADOWED_SUPER_SENTINEL);
             self.symbols.imported_scope_names.insert(sentinel);
         }
-        self.unit.flags |= future_flags;
         let simple_module_annotations = has_simple_annotations(body);
         let module_annotations = has_annotations(body);
         let future_module_annotations =

@@ -4,18 +4,15 @@
 use super::*;
 
 impl Compiler {
-    pub(super) fn scope_arena(&self) -> Result<&ScopeArena, CompileError> {
-        self.context
-            .scopes
-            .get()
-            .ok_or_else(|| CompileError::Internal("scope arena was not initialized".to_string()))
+    pub(super) fn scope_arena(&self) -> &ScopeArena {
+        &self.context.scopes
     }
 
     pub(super) fn function_scope_id(
         &self,
         definition: &StmtFunctionDef,
     ) -> Result<ScopeId, CompileError> {
-        self.scope_arena()?
+        self.scope_arena()
             .child(self.unit.scope_id, ScopeOrigin::function(definition))
             .ok_or_else(|| {
                 CompileError::Internal(format!(
@@ -26,7 +23,7 @@ impl Compiler {
     }
 
     fn class_scope_id(&self, definition: &StmtClassDef) -> Result<ScopeId, CompileError> {
-        self.scope_arena()?
+        self.scope_arena()
             .child(self.unit.scope_id, ScopeOrigin::class(definition))
             .ok_or_else(|| {
                 CompileError::Internal(format!(
@@ -41,7 +38,7 @@ impl Compiler {
         definition: &StmtFunctionDef,
     ) -> Result<(ScopeId, LoweringFunctionPlan), CompileError> {
         let scope_id = self.function_scope_id(definition)?;
-        let arena = self.scope_arena()?;
+        let arena = self.scope_arena();
         let mut plan = arena
             .function(scope_id)
             .ok_or_else(|| CompileError::Internal("function scope has no plan".to_string()))?
@@ -87,7 +84,7 @@ impl Compiler {
         definition: &StmtClassDef,
     ) -> Result<(ScopeId, LoweringClassPlan), CompileError> {
         let scope_id = self.class_scope_id(definition)?;
-        let arena = self.scope_arena()?;
+        let arena = self.scope_arena();
         let plan = arena
             .class(scope_id)
             .ok_or_else(|| CompileError::Internal("class scope has no plan".to_string()))?
