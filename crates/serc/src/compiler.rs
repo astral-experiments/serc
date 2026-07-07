@@ -140,9 +140,9 @@ struct LoopContext {
     preserve_break_exit: bool,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 struct ExceptionHandlerContext {
-    name: Option<String>,
+    name: Option<NameId>,
     loop_depth: usize,
 }
 
@@ -162,7 +162,7 @@ struct WithExitContext {
 
 #[derive(Debug)]
 struct MatchContext {
-    stores: Vec<String>,
+    stores: Vec<NameId>,
     fail_pop: Vec<Label>,
     on_top: usize,
 }

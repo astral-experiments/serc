@@ -245,6 +245,21 @@ impl Compiler {
 
     pub(super) fn store_name(&mut self, name: &str) -> Result<(), CompileError> {
         let name_id = self.required_name_id(name);
+        self.store_name_with_id(name, name_id)
+    }
+
+    pub(super) fn store_name_id(&mut self, name_id: NameId) -> Result<(), CompileError> {
+        let context = Arc::clone(&self.context);
+        let name = context
+            .scopes
+            .get()
+            .expect("scope arena should be initialized before lowering")
+            .names
+            .resolve(name_id);
+        self.store_name_with_id(name, name_id)
+    }
+
+    fn store_name_with_id(&mut self, name: &str, name_id: NameId) -> Result<(), CompileError> {
         if self.symbols.active_temporaries.contains(name_id) {
             let index = self
                 .symbols
@@ -320,6 +335,21 @@ impl Compiler {
 
     pub(super) fn delete_name(&mut self, name: &str) -> Result<(), CompileError> {
         let name_id = self.required_name_id(name);
+        self.delete_name_with_id(name, name_id)
+    }
+
+    pub(super) fn delete_name_id(&mut self, name_id: NameId) -> Result<(), CompileError> {
+        let context = Arc::clone(&self.context);
+        let name = context
+            .scopes
+            .get()
+            .expect("scope arena should be initialized before lowering")
+            .names
+            .resolve(name_id);
+        self.delete_name_with_id(name, name_id)
+    }
+
+    fn delete_name_with_id(&mut self, name: &str, name_id: NameId) -> Result<(), CompileError> {
         if self.symbols.active_temporaries.contains(name_id) {
             let index = self
                 .symbols
