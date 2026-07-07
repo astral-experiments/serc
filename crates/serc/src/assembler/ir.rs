@@ -406,10 +406,16 @@ pub(super) enum Item {
 }
 
 #[derive(Debug)]
+pub(super) enum UnoptimizedCode {
+    /// Instructions are still being emitted and patched by the compiler.
+    Linear(Vec<Item>),
+    /// Constant reachability has prepared the graph that the CFG pipeline will consume.
+    Prepared(BlockGraph),
+}
+
+#[derive(Debug)]
 pub(crate) struct Assembler {
-    pub(super) items: Vec<Item>,
-    /// The block IR exists only while the assembler pass pipeline is running.
-    pub(super) graph: Option<BlockGraph>,
+    pub(super) code: UnoptimizedCode,
     pub(super) next_label: u32,
     pub(super) location: SourceLocation,
     pub(super) exception_regions: Vec<ExceptionRegion>,
@@ -417,6 +423,28 @@ pub(crate) struct Assembler {
     pub(super) borrow_unreachable_blocks: FxHashSet<Label>,
     pub(super) load_fast_borrowing_enabled: bool,
     pub(super) strict_owned_loads: bool,
+}
+
+/// The block-aware assembler state used by CFG optimization passes.
+///
+/// Keeping this separate from [`Assembler`] makes it impossible to run a CFG
+/// pass before instruction emission is complete.
+#[derive(Debug)]
+pub(super) struct OptimizationPipeline {
+    pub(super) graph: BlockGraph,
+    pub(super) next_label: u32,
+    pub(super) exception_regions: Vec<ExceptionRegion>,
+    pub(super) preserved_block_boundaries: FxHashSet<Label>,
+    pub(super) borrow_unreachable_blocks: FxHashSet<Label>,
+}
+
+/// The linear assembler state used after CFG optimization is complete.
+#[derive(Debug)]
+pub(super) struct LayoutAssembler {
+    pub(super) items: Vec<Item>,
+    pub(super) exception_regions: Vec<ExceptionRegion>,
+    pub(super) preserved_block_boundaries: FxHashSet<Label>,
+    pub(super) removed_max_depth: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -457,8 +485,7 @@ impl SourceLocation {
 impl Default for Assembler {
     fn default() -> Self {
         Self {
-            items: Vec::new(),
-            graph: None,
+            code: UnoptimizedCode::Linear(Vec::new()),
             next_label: 0,
             location: SourceLocation::NONE,
             exception_regions: Vec::new(),

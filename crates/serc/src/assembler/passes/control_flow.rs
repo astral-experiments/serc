@@ -5,20 +5,17 @@ use super::super::{
     JUMP_BACKWARD_NO_INTERRUPT, JUMP_FORWARD, NOP, NOT_TAKEN, Operand, POP_JUMP_IF_FALSE,
     POP_JUMP_IF_TRUE, POP_TOP, STORE_FAST, TO_BOOL, UNARY_NOT, ends_scope, is_unconditional_jump,
 };
-use crate::assembler::Assembler;
+use crate::assembler::OptimizationPipeline;
 use crate::target::Opcode;
 use crate::target::operands::ComparisonOperation;
 
-impl Assembler {
+impl OptimizationPipeline {
     /// Replaces an overwritten local store with a stack pop.
     ///
     /// CPython applies this peephole before superinstruction fusion when two
     /// adjacent stores target the same local on the same traced line.
     pub(in crate::assembler) fn optimize_redundant_store_fast(&mut self) {
-        let graph = self
-            .graph
-            .as_mut()
-            .expect("assembler pass requires the block graph");
+        let graph = &mut self.graph;
         let order = graph.order().to_vec();
         for block in order {
             let items = graph[block].items_mut();
@@ -44,10 +41,7 @@ impl Assembler {
     }
 
     pub(in crate::assembler) fn remove_unreachable_instructions(&mut self) -> Option<u32> {
-        let graph = self
-            .graph
-            .as_mut()
-            .expect("assembler pass requires the block graph");
+        let graph = &mut self.graph;
         let reachable = graph.reachable_blocks(&self.exception_regions);
         let mut removed_max_depth = None;
         let order = graph.order().to_vec();
@@ -77,22 +71,11 @@ impl Assembler {
     }
 
     pub(in crate::assembler) fn reachable_items(&self) -> Vec<bool> {
-        if let Some(graph) = &self.graph {
-            graph.item_reachability(&self.exception_regions)
-        } else {
-            super::super::block_graph::BlockGraph::from_items(
-                self.items.clone(),
-                &self.preserved_block_boundaries,
-            )
-            .item_reachability(&self.exception_regions)
-        }
+        self.graph.item_reachability(&self.exception_regions)
     }
 
     pub(in crate::assembler) fn optimize_boolean_conversions(&mut self) {
-        let graph = self
-            .graph
-            .as_mut()
-            .expect("assembler pass requires the block graph");
+        let graph = &mut self.graph;
         let order = graph.order().to_vec();
         for block in order {
             let items = graph[block].items_mut();
@@ -197,10 +180,7 @@ impl Assembler {
         // the same truth value, they share the final target. Otherwise the
         // inner jump skips the redundant outer test and enters its POP_TOP
         // fallthrough path directly.
-        let graph = self
-            .graph
-            .as_ref()
-            .expect("assembler pass requires the block graph");
+        let graph = &self.graph;
         let mut positions = graph.item_positions();
         let mut items = positions
             .iter()
@@ -276,19 +256,13 @@ impl Assembler {
             .map(|index| (*index, self.label()))
             .collect::<FxHashMap<_, _>>();
         {
-            let graph = self
-                .graph
-                .as_mut()
-                .expect("assembler pass requires the block graph");
+            let graph = &mut self.graph;
             for index in fallthrough_indices.into_iter().rev() {
                 graph.insert_item(positions[index], Item::Label(fallthrough_labels[&index]));
             }
         }
 
-        let graph = self
-            .graph
-            .as_ref()
-            .expect("assembler pass requires the block graph");
+        let graph = &self.graph;
         positions = graph.item_positions();
         items = positions
             .iter()
@@ -297,10 +271,7 @@ impl Assembler {
         let value_preserving_jumps = (0..items.len())
             .filter(|index| is_value_preserving_jump(&items, *index))
             .collect::<FxHashSet<_>>();
-        let graph = self
-            .graph
-            .as_mut()
-            .expect("assembler pass requires the block graph");
+        let graph = &mut self.graph;
         for (index, position) in positions.iter().copied().enumerate() {
             let Item::Instruction(instruction) = graph.item_mut(position) else {
                 continue;
@@ -337,10 +308,7 @@ impl Assembler {
             }
         }
 
-        let graph = self
-            .graph
-            .as_ref()
-            .expect("assembler pass requires the block graph");
+        let graph = &self.graph;
         items = graph.iter_items().copied().collect();
         let mut jump_targets = FxHashMap::default();
         for (index, item) in items.iter().enumerate() {
@@ -363,10 +331,7 @@ impl Assembler {
             }
         }
 
-        let graph = self
-            .graph
-            .as_mut()
-            .expect("assembler pass requires the block graph");
+        let graph = &mut self.graph;
         let order = graph.order().to_vec();
         for block in order {
             for item in graph[block].items_mut() {
@@ -410,10 +375,7 @@ impl Assembler {
     }
 
     pub(in crate::assembler) fn remove_redundant_forward_jumps(&mut self) {
-        let graph = self
-            .graph
-            .as_mut()
-            .expect("assembler pass requires the block graph");
+        let graph = &mut self.graph;
         if !graph.iter_items().any(|item| {
             matches!(
                 item,
@@ -529,10 +491,7 @@ impl Assembler {
     }
 
     pub(in crate::assembler) fn propagate_locations_within_blocks(&mut self) {
-        let graph = self
-            .graph
-            .as_mut()
-            .expect("assembler pass requires the block graph");
+        let graph = &mut self.graph;
         let order = graph.order().to_vec();
         for block in order {
             let mut previous = None;
@@ -567,10 +526,7 @@ impl Assembler {
     }
 
     pub(in crate::assembler) fn remove_redundant_nops(&mut self) {
-        let graph = self
-            .graph
-            .as_ref()
-            .expect("assembler pass requires the block graph");
+        let graph = &self.graph;
         let instructions = graph
             .item_positions()
             .into_iter()
@@ -602,10 +558,7 @@ impl Assembler {
             }
         }
 
-        let graph = self
-            .graph
-            .as_mut()
-            .expect("assembler pass requires the block graph");
+        let graph = &mut self.graph;
         for position in redundant.into_iter().rev() {
             graph.remove_item(position);
         }
