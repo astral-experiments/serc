@@ -26,6 +26,38 @@ jobs:
         run: rustup component add rustfmt
       - run: cargo fmt --all --check
 
+  check-pinned-inputs:
+    name: "pinned compiler inputs"
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          submodules: true
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: python/cpython
+          ref: 5607950ef232dad16d75c0cf53101d9649d89115
+          path: target/cpython
+          persist-credentials: false
+          sparse-checkout: |
+            Include
+            Python/codegen.c
+            Python/flowgraph.c
+            Python/marshal.c
+          sparse-checkout-cone-mode: false
+      - name: "Install Rustfmt"
+        run: rustup component add rustfmt
+      - name: "Check Ruff revision"
+        run: ./scripts/check-ruff-pin
+      - name: "Test target generator"
+        run: python -m unittest discover -s crates/serc/scripts -p 'test_*.py'
+      - name: "Check generated target"
+        run: python crates/serc/scripts/generate_cpython_target.py --cpython target/cpython --check
+
   check-lint:
     name: "clippy on linux"
     timeout-minutes: 10

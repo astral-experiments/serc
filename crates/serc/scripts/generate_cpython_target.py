@@ -87,15 +87,34 @@ def verify_checkout(checkout: Path) -> None:
         )
 
 
+def read_committed_file(checkout: Path, relative: str) -> str:
+    """Read an input from the pinned commit, ignoring working-tree changes."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(checkout), "show", f"{TARGET_COMMIT}:{relative}"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except subprocess.CalledProcessError as error:
+        detail = error.stderr.decode(errors="replace").strip()
+        message = f"failed to read {relative} from CPython commit {TARGET_COMMIT}"
+        if detail:
+            message = f"{message}: {detail}"
+        raise ValueError(message) from error
+    try:
+        return result.stdout.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError(
+            f"CPython input {relative} at {TARGET_COMMIT} is not UTF-8"
+        ) from error
+
+
 def read_inputs(checkout: Path) -> dict[str, str]:
-    sources = {}
-    for relative in TARGET_INPUTS + MARSHAL_INPUTS:
-        path = checkout / relative
-        try:
-            sources[relative] = path.read_text()
-        except OSError as error:
-            raise ValueError(f"failed to read {path}: {error}") from error
-    return sources
+    return {
+        relative: read_committed_file(checkout, relative)
+        for relative in TARGET_INPUTS + MARSHAL_INPUTS
+    }
 
 
 def parse_opcodes(source: str) -> list[tuple[str, int]]:
