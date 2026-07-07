@@ -510,32 +510,8 @@ pub(super) fn unparse_annotation(expression: &Expr) -> String {
 }
 
 fn python_string_repr(value: &str) -> String {
-    let quote = if value.contains('\'') && !value.contains('"') {
-        '"'
-    } else {
-        '\''
-    };
-    let mut repr = String::with_capacity(value.len() + 2);
-    repr.push(quote);
-    for character in value.chars() {
-        match character {
-            '\\' => repr.push_str("\\\\"),
-            '\n' => repr.push_str("\\n"),
-            '\r' => repr.push_str("\\r"),
-            '\t' => repr.push_str("\\t"),
-            '\x08' => repr.push_str("\\b"),
-            '\x0c' => repr.push_str("\\f"),
-            character if character == quote => {
-                repr.push('\\');
-                repr.push(character);
-            }
-            character if character.is_control() => {
-                use std::fmt::Write;
-                write!(repr, "\\x{:02x}", u32::from(character)).unwrap();
-            }
-            character => repr.push(character),
-        }
-    }
-    repr.push(quote);
-    repr
+    ruff_python_literal::escape::UnicodeEscape::new_repr(value)
+        .str_repr(ruff_python_ast::str::TripleQuotes::No)
+        .to_string()
+        .expect("Python string representation length fits in usize")
 }

@@ -493,6 +493,25 @@ fn annotation_unparsing_uses_tokens_for_nested_delimiters() {
 }
 
 #[test]
+fn annotation_unparsing_matches_cpython_string_repr_categories() {
+    for (literal, expected) in [
+        (r#""\u200e""#, r"'\u200e'"),
+        (r#""\u2028""#, r"'\u2028'"),
+        (r#""\ue000""#, r"'\ue000'"),
+        (r#""\u0378""#, r"'\u0378'"),
+        (r#""\u00a0""#, r"'\xa0'"),
+        (r#""\x08\x0c""#, r"'\x08\x0c'"),
+        (r#""\U0001f600""#, "'😀'"),
+    ] {
+        let module = parse_module(&format!("value: {literal}")).unwrap();
+        let [Stmt::AnnAssign(assignment)] = module.suite().as_slice() else {
+            panic!("expected an annotated assignment");
+        };
+        assert_eq!(unparse_annotation(&assignment.annotation), expected);
+    }
+}
+
+#[test]
 fn source_positions_use_utf8_byte_columns() {
     let source = "α = 1\nβγ = 2\n";
     let parsed = parse_module(source).unwrap();
