@@ -49,7 +49,8 @@ Each stage has one primary owner:
 
 | Concern                                                                      | Owner              |
 | ---------------------------------------------------------------------------- | ------------------ |
-| Public API, input normalization, parser setup, `.pyc` header                 | `src/lib.rs`       |
+| Public library API, input normalization, parser setup, `.pyc` header         | `src/lib.rs`       |
+| Filesystem CLI, source discovery, and timestamp-cache writes                 | `../serc_cli/`  |
 | Scope analysis, AST lowering, constants/names/locals, stack-depth accounting | `src/compiler.rs`, `src/compiler/` |
 | Labels, control-flow rewrites, instruction layout, line and exception tables | `src/assembler/`   |
 | CPython IDs, widths, flags, stack metadata, version and provenance           | `src/target/`      |
@@ -259,7 +260,7 @@ marshal output. From the repository root, with `RUFF` pointing to a Ruff checkou
 
 ```console
 SERC_TEST_PYTHON=/path/to/python3.14 \
-  cargo test --locked -p serc --all-targets
+  cargo test --locked --workspace --all-targets
 
 cargo run --locked -p serc --example compare_cpython_corpus -- \
   --python /path/to/python3.14 \

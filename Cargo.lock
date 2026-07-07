@@ -847,7 +847,6 @@ dependencies = [
 name = "serc"
 version = "0.1.0"
 dependencies = [
- "clap",
  "cpu-time",
  "fs-err",
  "serc_workloads",
@@ -858,6 +857,17 @@ dependencies = [
  "ruff_source_file",
  "ruff_text_size",
  "rustc-hash",
+ "tempfile",
+ "walkdir",
+]
+
+[[package]]
+name = "serc-cli"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "fs-err",
+ "serc",
  "tempfile",
  "walkdir",
 ]
