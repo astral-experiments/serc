@@ -78,17 +78,21 @@ under the ignored `target/` directory:
 ./scripts/setup-mypy-primer-corpus
 ```
 
-Then run the strict CPython 3.14.5 comparison:
+Then run the frozen CPython 3.14.5 outcome comparison:
 
 ```console
 ./scripts/check-mypy-primer-compatibility /path/to/python3.14.5
 ```
 
 The check first rejects missing files, content-identity drift, tracked
-modifications, and untracked files. Every CPython-accepted `.py` or `.pyi` file
-must then produce byte-identical marshal output. The command exits unsuccessfully
-while any compatibility gaps remain; it does not accept current mismatches as a
-baseline.
+modifications, and untracked files. The initial outcome baseline requires 52,080
+byte-identical files, 21,298 failures, and 159 files rejected by CPython. The
+failures comprise 21,276 byte mismatches, 12 parse or decode gaps, nine compiler
+panics, and one oracle failure.
+
+A full run exits unsuccessfully when either exact matches or CPython rejections
+change, so improvements and regressions both require an intentional baseline
+update. Failure categories remain diagnostic; the baseline freezes their aggregate.
 
 For a faster local smoke diagnostic, limit the sorted corpus prefix explicitly:
 

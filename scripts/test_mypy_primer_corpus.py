@@ -150,6 +150,27 @@ def get_projects():
         with self.assertRaisesRegex(corpus.CorpusError, "invalid revision"):
             corpus.validate_lock(short)
 
+    def test_compatibility_command_freezes_the_full_failure_count(self) -> None:
+        roots = [Path("/corpus/first"), Path("/corpus/second")]
+        full = corpus.compatibility_command("python3.14", roots, 73_537, None)
+        expected_exact_index = full.index("--expected-exact") + 1
+        rejected_index = full.index("--expected-cpython-rejected") + 1
+        expected_exact = int(full[expected_exact_index])
+        expected_rejected = int(full[rejected_index])
+
+        self.assertEqual(expected_exact, 52_080)
+        self.assertEqual(expected_rejected, 159)
+        self.assertEqual(
+            73_537 - expected_exact - expected_rejected, corpus.EXPECTED_FAILURES
+        )
+        self.assertNotIn("--require-all", full)
+
+        limited = corpus.compatibility_command("python3.14", roots, 73_537, 100)
+        self.assertNotIn("--expected-exact", limited)
+        self.assertNotIn("--expected-cpython-rejected", limited)
+        self.assertEqual(limited[limited.index("--limit") + 1], "100")
+        self.assertIn("--require-all", limited)
+
 
 if __name__ == "__main__":
     unittest.main()

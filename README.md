@@ -57,9 +57,10 @@ network, storage, and CPU resources:
 ./scripts/check-mypy-primer-compatibility /path/to/python3.14.5
 ```
 
-The second command is a strict diagnostic: every CPython-accepted file must
-produce byte-identical marshal output, and the command exits unsuccessfully
-while compatibility gaps remain. CI validates the pinned catalog and the
+The second command freezes an initial outcome baseline of 52,080 byte-identical
+files, 21,298 failures, and 159 files rejected by CPython. It exits unsuccessfully
+when the outcome counts change so compatibility improvements advance the baseline
+explicitly. CI validates the pinned catalog and the
 corpus-management scripts, but the full comparison does not replace or weaken
 the Ruff compatibility gate above. See [`corpora/README.md`](corpora/README.md)
 for the exact snapshot boundary and reproducibility details.

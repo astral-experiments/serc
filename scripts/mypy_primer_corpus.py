@@ -25,6 +25,8 @@ DEFAULT_CORPUS = REPO_ROOT / "target" / "corpora" / "mypy-primer"
 CATALOG_URL = "https://github.com/hauntsaninja/mypy_primer"
 SOURCE_SUFFIXES = (".py", ".pyi")
 LOCK_FORMAT = 1
+EXPECTED_FAILURES = 21_298
+EXPECTED_CPYTHON_REJECTED = 159
 HEX_REVISION = re.compile(r"[0-9a-f]{40}\Z")
 SAFE_ID = re.compile(r"[A-Za-z0-9._-]+\Z")
 
@@ -552,11 +554,12 @@ def lock_content(args: argparse.Namespace) -> None:
     )
 
 
-def check_compatibility(args: argparse.Namespace) -> None:
-    lock = read_lock(args.lock)
-    content = verify_checkouts(args.corpus_root, lock)
-    assert content is not None
-    roots = [str(checkout_path(args.corpus_root, repository)) for repository in lock["repositories"]]
+def compatibility_command(
+    python: str,
+    roots: Sequence[Path],
+    files: int,
+    limit: int | None,
+) -> list[str]:
     command = [
         "cargo",
         "run",
@@ -569,17 +572,38 @@ def check_compatibility(args: argparse.Namespace) -> None:
         "compare_cpython_corpus",
         "--",
         "--python",
-        args.python,
+        python,
         "--expected-files",
-        str(content["files"]),
+        str(files),
         "--source-bytes",
         "--extension",
         "pyi",
-        "--require-all",
     ]
-    if args.limit is not None:
-        command.extend(["--limit", str(args.limit)])
-    command.extend(roots)
+    if limit is None:
+        expected_exact = files - EXPECTED_FAILURES - EXPECTED_CPYTHON_REJECTED
+        command.extend(
+            [
+                "--expected-exact",
+                str(expected_exact),
+                "--expected-cpython-rejected",
+                str(EXPECTED_CPYTHON_REJECTED),
+            ]
+        )
+    else:
+        command.extend(["--limit", str(limit), "--require-all"])
+    command.extend(map(str, roots))
+    return command
+
+
+def check_compatibility(args: argparse.Namespace) -> None:
+    lock = read_lock(args.lock)
+    content = verify_checkouts(args.corpus_root, lock)
+    assert content is not None
+    roots = [
+        checkout_path(args.corpus_root, repository)
+        for repository in lock["repositories"]
+    ]
+    command = compatibility_command(args.python, roots, content["files"], args.limit)
     os.execvp(command[0], command)
 
 
