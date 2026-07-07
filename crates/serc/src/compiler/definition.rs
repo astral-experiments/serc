@@ -160,7 +160,7 @@ impl Compiler {
         let definition_location = self.definition_location(
             definition.range,
             definition.name.range(),
-            b"def",
+            TokenKind::Def,
             definition.is_async,
         );
         let defaults = self.compile_function_defaults(definition, definition_location)?;
@@ -360,7 +360,7 @@ impl Compiler {
         let definition_location = self.definition_location(
             definition.range,
             definition.name.range(),
-            b"def",
+            TokenKind::Def,
             definition.is_async,
         );
 
@@ -681,7 +681,7 @@ impl Compiler {
         wrapper.assembler.set_location(wrapper.definition_location(
             definition.range,
             definition.name.range(),
-            b"class",
+            TokenKind::Class,
             false,
         ));
         wrapper.store_name(".type_params")?;
@@ -697,8 +697,12 @@ impl Compiler {
             .map(|(name, _)| name.clone())
             .collect();
 
-        let definition_location =
-            self.definition_location(definition.range, definition.name.range(), b"class", false);
+        let definition_location = self.definition_location(
+            definition.range,
+            definition.name.range(),
+            TokenKind::Class,
+            false,
+        );
         self.assembler.set_location(definition_location);
         if !wrapper_closure_names.is_empty() {
             self.emit_closure_tuple(&wrapper_closure_names)?;
@@ -799,8 +803,12 @@ impl Compiler {
             .clone_from(&self.symbols.imported_scope_names);
         let child = child.compile_class_body(&definition.body)?;
 
-        let definition_location =
-            self.definition_location(definition.range, definition.name.range(), b"class", false);
+        let definition_location = self.definition_location(
+            definition.range,
+            definition.name.range(),
+            TokenKind::Class,
+            false,
+        );
         self.assembler.set_location(definition_location);
         self.emit(LOAD_BUILD_CLASS, 0, 1)?;
         self.emit(PUSH_NULL, 0, 1)?;
@@ -1259,7 +1267,7 @@ impl Compiler {
         let location = self.definition_location(
             definition.range,
             definition.name.range(),
-            b"def",
+            TokenKind::Def,
             definition.is_async,
         );
         child.assembler.set_location(location);

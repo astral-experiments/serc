@@ -1,5 +1,9 @@
-use ruff_python_ast::Stmt;
+use ruff_python_ast::token::TokenKind;
+use ruff_python_ast::{Expr, Stmt};
 use ruff_python_parser::parse_module;
+use ruff_text_size::Ranged;
+
+use crate::assembler::SourceLocation;
 
 use super::{Compiler, Constant, FunctionPlan, NameId, NameInterner, ScopeBodyFacts, clean_doc};
 
@@ -210,6 +214,112 @@ fn retains_parser_tokens_in_the_shared_compilation_context() {
     let compiler = Compiler::module("example.py", source, parsed.tokens().clone());
 
     assert_eq!(compiler.context.tokens, expected);
+}
+
+#[test]
+fn definition_locations_start_at_keyword_tokens() {
+    let source = r#"@decorate("class def async")
+async \
+    def function():
+    pass
+@decorate("def class")
+class Container:
+    pass
+"#;
+    let parsed = parse_module(source).unwrap();
+    let compiler = Compiler::module("example.py", source, parsed.tokens().clone());
+    let [Stmt::FunctionDef(function), Stmt::ClassDef(class)] = parsed.suite().as_slice() else {
+        panic!("expected a function and a class");
+    };
+
+    assert_eq!(
+        compiler.definition_location(
+            function.range,
+            function.name.range(),
+            TokenKind::Def,
+            function.is_async,
+        ),
+        SourceLocation::new(2, 4, 0, 8),
+    );
+    assert_eq!(
+        compiler.definition_location(class.range, class.name.range(), TokenKind::Class, false),
+        SourceLocation::new(6, 7, 0, 8),
+    );
+}
+
+#[test]
+fn trailing_semicolon_locations_follow_token_boundaries() {
+    let source = r#"first = "not; boundary"; second = 2
+continued = 1 \
+    ; third = 3
+commented = 4  # ; not a boundary
+"#;
+    let parsed = parse_module(source).unwrap();
+    let compiler = Compiler::module("example.py", source, parsed.tokens().clone());
+    let locations = parsed
+        .suite()
+        .iter()
+        .map(|statement| compiler.source_location_including_trailing_semicolon(statement.range()))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        locations,
+        [
+            SourceLocation::new(1, 1, 0, 24),
+            SourceLocation::new(1, 1, 25, 35),
+            SourceLocation::new(2, 3, 0, 5),
+            SourceLocation::new(3, 3, 6, 15),
+            SourceLocation::new(4, 4, 0, 13),
+        ],
+    );
+}
+
+#[test]
+fn generator_expression_ranges_follow_parser_tokens() {
+    for (source, expected) in [
+        (
+            "result = consume(\n    # before\n    value for value in values\n    # after\n)\n",
+            "(\n    # before\n    value for value in values\n    # after\n)",
+        ),
+        (
+            "result = consume(\\\n    value for value in values\\\n)\n",
+            "(\\\n    value for value in values\\\n)",
+        ),
+        (
+            r#"result = consume((value, nested[")"], {"(": value}) for value in values if predicate(")#"))
+"#,
+            r#"((value, nested[")"], {"(": value}) for value in values if predicate(")#"))"#,
+        ),
+        (
+            r#"result = (((")", {"(": value}) for value in values))
+"#,
+            r#"((")", {"(": value}) for value in values)"#,
+        ),
+    ] {
+        let parsed = parse_module(source).unwrap();
+        let Stmt::Assign(assignment) = &parsed.suite()[0] else {
+            panic!("expected an assignment");
+        };
+        let generator = match assignment.value.as_ref() {
+            Expr::Generator(generator) => generator,
+            Expr::Call(call) => {
+                let [Expr::Generator(generator)] = call.arguments.args.as_ref() else {
+                    panic!("expected a generator call argument");
+                };
+                generator
+            }
+            expression => panic!("expected a generator or call, got {expression:?}"),
+        };
+        let compiler = Compiler::module("example.py", source, parsed.tokens().clone());
+        let range = compiler.generator_expression_range(generator);
+        let expected_start = source.find(expected).unwrap();
+        let actual_start = usize::from(range.start());
+        let actual_end = usize::from(range.end());
+
+        assert_eq!(actual_start, expected_start);
+        assert_eq!(actual_end, expected_start + expected.len());
+        assert_eq!(&source[actual_start..actual_end], expected);
+    }
 }
 
 #[test]

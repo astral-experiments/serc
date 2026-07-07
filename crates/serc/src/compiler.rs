@@ -3,7 +3,7 @@ use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
 
-use ruff_python_ast::token::Tokens;
+use ruff_python_ast::token::{TokenKind, Tokens};
 use ruff_python_ast::visitor::{Visitor, walk_expr, walk_pattern, walk_stmt};
 use ruff_python_ast::{
     BoolOp, CmpOp, ConversionFlag, Expr, ExprBinOp, ExprContext, FStringPart, Identifier,
@@ -195,7 +195,6 @@ enum DefinitionDecorators {
 struct CompilationContext {
     filename: String,
     source: Arc<str>,
-    #[cfg_attr(not(test), expect(dead_code))]
     tokens: Tokens,
     line_index: LineIndex,
     scopes: OnceLock<ScopeArena>,
