@@ -21,6 +21,25 @@ fn instruction_constructors_set_audited_defaults() {
 }
 
 #[test]
+fn fusion_classifies_every_instruction_flag() {
+    let mut classified = InstructionFlags::empty();
+    for policy in [
+        InstructionFlags::FUSE_OR,
+        InstructionFlags::FUSE_AND,
+        InstructionFlags::FUSE_FROM_FIRST,
+        InstructionFlags::FUSE_FROM_SECOND,
+        InstructionFlags::FUSE_CLEARED,
+    ] {
+        assert!(
+            (classified & policy).is_empty(),
+            "fusion policies overlap at {policy:?}"
+        );
+        classified.insert(policy);
+    }
+    assert_eq!(classified, InstructionFlags::all());
+}
+
+#[test]
 fn fusion_uses_each_flags_propagation_policy() {
     let mut first = Instruction::new(
         LOAD_FAST,
