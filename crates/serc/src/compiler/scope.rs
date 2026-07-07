@@ -76,7 +76,7 @@ impl Compiler {
                 plan.insert_annotation_freevar(&arena.names, name);
             }
         }
-        Ok((scope_id, plan.lowering_plan()))
+        Ok((scope_id, plan.into_lowering_plan()))
     }
 
     pub(super) fn class_plan(
@@ -510,16 +510,16 @@ impl FunctionPlan {
         self.required.remove(&name);
     }
 
-    pub(super) fn lowering_plan(&self) -> LoweringFunctionPlan {
+    pub(super) fn into_lowering_plan(self) -> LoweringFunctionPlan {
         LoweringFunctionPlan {
-            locals: self.locals.clone(),
-            globals: self.globals.clone(),
-            annotation_references: self.annotation_references.clone(),
-            cellvars: self.cellvars.clone(),
-            inlined_comprehension_cellvars: self.inlined_comprehension_cellvars.clone(),
-            freevars: self.freevars.clone(),
-            annotation_freevars: self.annotation_freevars.clone(),
-            required: self.required.clone(),
+            locals: self.locals,
+            globals: self.globals,
+            annotation_references: self.annotation_references,
+            cellvars: self.cellvars,
+            inlined_comprehension_cellvars: self.inlined_comprehension_cellvars,
+            freevars: self.freevars,
+            annotation_freevars: self.annotation_freevars,
+            required: self.required,
         }
     }
 }
