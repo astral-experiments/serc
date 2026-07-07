@@ -1,6 +1,6 @@
 use crate::code_object::{CodeObject, Constant};
 
-use super::graph::{ObjectGraph, ObjectId, ObjectLocation};
+use super::graph::{ObjectGraph, ObjectId, ObjectLocation, OccurrenceCursor};
 use super::key::{frozen_set_members_in_wire_order, slice_member_uses_identity};
 use super::v5::{
     FLAG_REF, TYPE_ASCII, TYPE_ASCII_INTERNED, TYPE_BINARY_COMPLEX, TYPE_BINARY_FLOAT, TYPE_CODE,
@@ -22,10 +22,10 @@ pub(crate) fn encode_code_into(code: &CodeObject, output: &mut Vec<u8>) {
         output,
         references: vec![None; graph.object_count()],
         reference_count: 0,
-        next_occurrence: 0,
+        occurrences: graph.occurrence_cursor(),
     };
     writer.write_code(code, ReferenceMode::Forced);
-    debug_assert_eq!(writer.next_occurrence, graph.occurrence_count());
+    writer.finish();
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -39,14 +39,16 @@ struct Writer<'output, 'graph, 'code> {
     output: &'output mut Vec<u8>,
     references: Vec<Option<u32>>,
     reference_count: usize,
-    next_occurrence: usize,
+    occurrences: OccurrenceCursor<'graph>,
 }
 
 impl Writer<'_, '_, '_> {
+    fn finish(self) {
+        self.occurrences.finish();
+    }
+
     fn next_object(&mut self, location: ObjectLocation) -> ObjectId {
-        let object = self.graph.occurrence(self.next_occurrence, location);
-        self.next_occurrence += 1;
-        object
+        self.occurrences.consume(location)
     }
 
     fn constant_object(&mut self, value: &Constant) -> ObjectId {
