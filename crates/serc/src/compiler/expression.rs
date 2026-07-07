@@ -3295,7 +3295,7 @@ impl Compiler {
                     for constant in constants {
                         if !unique
                             .iter()
-                            .any(|existing| python_constants_equal(existing, &constant))
+                            .any(|existing| python_constant_values_equal(existing, &constant))
                         {
                             unique.push(constant);
                         }
@@ -3341,7 +3341,7 @@ impl Compiler {
                 for constant in constants {
                     if !unique
                         .iter()
-                        .any(|existing| python_constants_equal(existing, &constant))
+                        .any(|existing| python_constant_values_equal(existing, &constant))
                     {
                         unique.push(constant);
                     }
@@ -3417,7 +3417,7 @@ impl Compiler {
                     let constant = fold_constant(element).unwrap();
                     if !unique
                         .iter()
-                        .any(|existing| python_constants_equal(existing, &constant))
+                        .any(|existing| python_constant_values_equal(existing, &constant))
                     {
                         unique.push(constant);
                     }

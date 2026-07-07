@@ -109,8 +109,12 @@ impl<'a> ObjectGraph<'a> {
         if !self.record_at(ObjectLocation::Code(address), code_key(code), false) {
             return;
         }
-        self.explicitly_interned
-            .extend(code.interned_constant_strings.iter().map(String::as_str));
+        self.explicitly_interned.extend(
+            code.marshal_hints
+                .explicitly_interned_strings
+                .iter()
+                .map(String::as_str),
+        );
         self.record_at(
             ObjectLocation::CodeBytes(address),
             code_bytes_key(code),

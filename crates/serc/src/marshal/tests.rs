@@ -1,6 +1,4 @@
-use std::collections::HashSet;
-
-use crate::code_object::{CodeObject, Constant};
+use crate::code_object::{CodeObject, Constant, LocalsIdentity, MarshalHints};
 
 use super::encode_code;
 use super::graph::ObjectGraph;
@@ -27,8 +25,7 @@ fn code_object(constants: Vec<Constant>) -> CodeObject {
         first_line_number: 1,
         line_table: Vec::new(),
         exception_table: Vec::new(),
-        annotation_thunk: false,
-        interned_constant_strings: HashSet::default(),
+        marshal_hints: MarshalHints::default(),
     }
 }
 
@@ -76,7 +73,9 @@ fn tracks_interned_strings_from_constants_and_metadata() {
         Constant::String("méthode".to_string()),
         Constant::String("not interned".to_string()),
     ]);
-    code.interned_constant_strings.insert("méthode".to_string());
+    code.marshal_hints
+        .explicitly_interned_strings
+        .insert("méthode".to_string());
     code.names.push("metadata name with spaces".to_string());
     let graph = ObjectGraph::for_code(&code);
 
@@ -102,8 +101,9 @@ fn keeps_identity_and_value_keys_separate() {
     first.locals.push("value".to_string());
     second.locals.push("value".to_string());
     assert_eq!(locals_tuple_key(&first), locals_tuple_key(&second));
-    first.annotation_thunk = true;
-    second.annotation_thunk = true;
+    second.marshal_hints.locals_identity = LocalsIdentity::Fresh;
+    assert_ne!(locals_tuple_key(&first), locals_tuple_key(&second));
+    first.marshal_hints.locals_identity = LocalsIdentity::Fresh;
     assert_ne!(locals_tuple_key(&first), locals_tuple_key(&second));
 }
 

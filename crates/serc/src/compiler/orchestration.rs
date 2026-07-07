@@ -785,14 +785,14 @@ impl Compiler {
         } else {
             max_depth.max(1)
         };
-        Ok(CodeObject {
+        let code = CodeObject {
             arg_count: self.unit.arg_count,
             positional_only_arg_count: self.unit.positional_only_arg_count,
             keyword_only_arg_count: self.unit.keyword_only_arg_count,
             stack_size,
             flags: self.unit.flags,
             bytecode,
-            constants: self.output.constants,
+            constants: self.output.constants.into_values(),
             names: self.output.names,
             locals: output_locals,
             local_kinds,
@@ -802,9 +802,17 @@ impl Compiler {
             first_line_number: self.unit.first_line_number,
             line_table,
             exception_table,
-            annotation_thunk: self.unit.annotation_thunk,
-            interned_constant_strings: self.output.interned_constant_strings,
-        })
+            marshal_hints: MarshalHints {
+                locals_identity: if self.unit.annotation_thunk {
+                    LocalsIdentity::Fresh
+                } else {
+                    LocalsIdentity::ByValue
+                },
+                explicitly_interned_strings: self.output.interned_constant_strings,
+            },
+        };
+        code.validate()?;
+        Ok(code)
     }
 
     pub(super) fn emit_function_prologue(&mut self) -> Result<(), CompileError> {

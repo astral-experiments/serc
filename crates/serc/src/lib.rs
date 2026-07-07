@@ -14,7 +14,7 @@ mod target;
 use std::error::Error;
 use std::fmt;
 
-use code_object::CodeObject;
+use code_object::{CodeObject, CodeObjectValidationError};
 use compiler::Compiler;
 use ruff_text_size::TextRange;
 pub use source::{SourceDecodeError, decode_source};
@@ -149,6 +149,12 @@ impl Error for CompileError {
             Self::Parse(error) => Some(error),
             Self::InvalidPattern { .. } | Self::Unsupported(_) | Self::Internal(_) => None,
         }
+    }
+}
+
+impl From<CodeObjectValidationError> for CompileError {
+    fn from(error: CodeObjectValidationError) -> Self {
+        Self::Internal(error.to_string())
     }
 }
 
