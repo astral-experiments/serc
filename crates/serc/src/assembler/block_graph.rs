@@ -129,6 +129,42 @@ impl BlockGraph {
         self.order.len()
     }
 
+    /// Returns whether normalization would leave one jump-free block unchanged.
+    pub(super) fn is_normalized_jump_free_single_block(
+        &self,
+        preserved_block_boundaries: &FxHashSet<Label>,
+    ) -> bool {
+        let [block] = self.order.as_slice() else {
+            return false;
+        };
+        let items = self[*block].items();
+        if items.is_empty() {
+            return false;
+        }
+
+        let mut has_instruction = false;
+        for (index, item) in items.iter().enumerate() {
+            match item {
+                Item::Label(label) => {
+                    if has_instruction || (index > 0 && preserved_block_boundaries.contains(label))
+                    {
+                        return false;
+                    }
+                }
+                Item::Instruction(instruction) => {
+                    if !matches!(instruction.operand, Operand::Value(_)) {
+                        return false;
+                    }
+                    has_instruction = true;
+                    if ends_scope(instruction.opcode) && index + 1 < items.len() {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
     pub(super) fn order(&self) -> &[BasicBlockId] {
         &self.order
     }
@@ -325,6 +361,38 @@ impl BlockGraph {
         self.label_blocks = label_blocks;
     }
 
+    /// Removes the extra label-only blocks introduced by the preserved
+    /// boundaries used for the pre-assembly reachability scan.
+    ///
+    /// This is only valid before any pass has reordered or allocated blocks.
+    pub(super) fn remove_initial_preserved_boundaries(&mut self) {
+        debug_assert_eq!(self.order.len(), self.blocks.len());
+        debug_assert!(
+            self.order
+                .iter()
+                .enumerate()
+                .all(|(index, block)| block.index() == index)
+        );
+
+        let original = std::mem::take(&mut self.blocks);
+        let mut blocks: Vec<BasicBlock> = Vec::with_capacity(original.len());
+        for mut block in original {
+            if blocks.last().is_some_and(|previous| {
+                previous
+                    .items()
+                    .iter()
+                    .all(|item| matches!(item, Item::Label(_)))
+            }) {
+                blocks.last_mut().unwrap().items.append(&mut block.items);
+            } else {
+                blocks.push(block);
+            }
+        }
+        self.blocks = blocks;
+        self.order = (0..self.blocks.len()).map(BasicBlockId).collect();
+        self.rebuild_label_index();
+    }
+
     pub(super) fn iter(&self) -> impl Iterator<Item = (BasicBlockId, &BasicBlock)> {
         self.order
             .iter()
@@ -334,6 +402,15 @@ impl BlockGraph {
 
     pub(super) fn iter_items(&self) -> impl Iterator<Item = &Item> {
         self.iter().flat_map(|(_, block)| block.items())
+    }
+
+    pub(super) fn for_each_item_mut(&mut self, mut visit: impl FnMut(&mut Item)) {
+        let blocks = &mut self.blocks;
+        for block in self.order.iter().copied() {
+            for item in &mut blocks[block.index()].items {
+                visit(item);
+            }
+        }
     }
 
     pub(super) fn item_positions(&self) -> Vec<ItemPosition> {
@@ -658,6 +735,87 @@ mod tests {
         assert_ne!(suffix, first);
         assert_eq!(graph.label_block(first_label), Some(first));
         assert_eq!(graph.label_block(second_label), Some(suffix));
+        graph.validate().unwrap();
+    }
+
+    #[test]
+    fn recognizes_a_normalized_jump_free_single_block() {
+        let label = Label(0);
+        let graph = BlockGraph::from_items(
+            vec![
+                Item::Label(label),
+                instruction(NOP, Operand::Value(0)),
+                instruction(RETURN_VALUE, Operand::Value(0)),
+            ],
+            &FxHashSet::default(),
+        );
+
+        assert!(graph.is_normalized_jump_free_single_block(&FxHashSet::default()));
+    }
+
+    #[test]
+    fn single_block_fast_path_rejects_normalization_boundaries_and_jumps() {
+        let first = Label(0);
+        let internal = Label(1);
+        let mut graph = BlockGraph::from_items(
+            vec![
+                Item::Label(first),
+                instruction(NOP, Operand::Value(0)),
+                instruction(RETURN_VALUE, Operand::Value(0)),
+            ],
+            &FxHashSet::default(),
+        );
+        let block = graph.block_at(0);
+        graph.insert_label(block, 2, internal);
+        assert!(!graph.is_normalized_jump_free_single_block(&FxHashSet::default()));
+
+        let target = Label(2);
+        let graph = BlockGraph::from_items(
+            vec![
+                Item::Label(first),
+                instruction(JUMP_FORWARD, Operand::Forward(target)),
+            ],
+            &FxHashSet::default(),
+        );
+        assert!(!graph.is_normalized_jump_free_single_block(&FxHashSet::default()));
+
+        let preserved = Label(3);
+        let graph = BlockGraph::from_items(
+            vec![
+                Item::Label(first),
+                Item::Label(preserved),
+                instruction(NOP, Operand::Value(0)),
+            ],
+            &FxHashSet::default(),
+        );
+        assert!(!graph.is_normalized_jump_free_single_block(&FxHashSet::from_iter([preserved,])));
+    }
+
+    #[test]
+    fn removes_only_initial_preserved_boundaries() {
+        let entry = Label(0);
+        let preserved = Label(1);
+        let target = Label(2);
+        let mut graph = BlockGraph::from_items(
+            vec![
+                Item::Label(entry),
+                Item::Label(preserved),
+                instruction(NOP, Operand::Value(0)),
+                Item::Label(target),
+                instruction(RETURN_VALUE, Operand::Value(0)),
+            ],
+            &FxHashSet::from_iter([preserved]),
+        );
+        assert_eq!(graph.len(), 3);
+
+        graph.remove_initial_preserved_boundaries();
+
+        assert_eq!(graph.len(), 2);
+        assert_eq!(graph.block_at(0).index(), 0);
+        assert_eq!(graph.block_at(1).index(), 1);
+        assert_eq!(graph.label_block(entry), Some(graph.block_at(0)));
+        assert_eq!(graph.label_block(preserved), Some(graph.block_at(0)));
+        assert_eq!(graph.label_block(target), Some(graph.block_at(1)));
         graph.validate().unwrap();
     }
 }

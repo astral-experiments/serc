@@ -127,11 +127,15 @@ impl Assembler {
         local_count: usize,
         parameter_count: usize,
     ) -> Result<AssembledCode, CompileError> {
-        debug_assert!(self.graph.is_none());
-        self.graph = Some(BlockGraph::from_items(
-            std::mem::take(&mut self.items),
-            &rustc_hash::FxHashSet::default(),
-        ));
+        if let Some(graph) = &mut self.graph {
+            debug_assert!(self.items.is_empty());
+            graph.remove_initial_preserved_boundaries();
+        } else {
+            self.graph = Some(BlockGraph::from_items(
+                std::mem::take(&mut self.items),
+                &rustc_hash::FxHashSet::default(),
+            ));
+        }
         let mut removed_max_depth = self.remove_unreachable_instructions();
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::RemoveUnreachableInitial)?;

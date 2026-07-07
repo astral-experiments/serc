@@ -247,6 +247,50 @@ fn removes_an_overwritten_local_store() {
     );
 }
 
+fn assembler_with_preserved_constant_boundary() -> Assembler {
+    let entry = super::Label(0);
+    let preserved = super::Label(1);
+    let target = super::Label(2);
+    Assembler {
+        items: vec![
+            Item::Label(entry),
+            Item::Label(preserved),
+            pass_instruction(LOAD_CONST, 0, 1),
+            Item::Instruction(Instruction::new(
+                JUMP_FORWARD,
+                Operand::Forward(target),
+                SourceLocation::new(1, 1, 0, 0),
+                None,
+            )),
+            pass_instruction(LOAD_CONST, 1, 1),
+            Item::Label(target),
+            pass_instruction(LOAD_CONST, 2, 2),
+            pass_instruction(RETURN_VALUE, 0, 2),
+        ],
+        next_label: 3,
+        preserved_block_boundaries: rustc_hash::FxHashSet::from_iter([preserved]),
+        ..Assembler::default()
+    }
+}
+
+#[test]
+fn reuses_constant_reachability_graph_with_finish_partitioning() {
+    let expected = assembler_with_preserved_constant_boundary()
+        .finish()
+        .unwrap();
+    let mut assembler = assembler_with_preserved_constant_boundary();
+
+    assert_eq!(
+        assembler.used_constant_indices(LOAD_CONST),
+        rustc_hash::FxHashSet::from_iter([0, 2])
+    );
+    assert!(assembler.items.is_empty());
+    assert!(assembler.graph.is_some());
+    assembler.remap_constant_indices(LOAD_CONST, &[Some(0), Some(1), Some(2)]);
+
+    assert_eq!(assembler.finish().unwrap(), expected);
+}
+
 fn pass_instruction(opcode: crate::target::Opcode, argument: u32, line: i32) -> Item {
     Item::Instruction(Instruction::new(
         opcode,
