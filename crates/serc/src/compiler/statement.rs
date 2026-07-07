@@ -2699,7 +2699,7 @@ impl Compiler {
         }
         self.set_depth(base_depth + 2);
         self.assembler.set_location(iterator_location);
-        self.apply_stack_effect(-2)?;
+        self.apply_compiler_stack_effect(END_ASYNC_FOR, 0, -2)?;
         self.assembler.emit_backward(END_ASYNC_FOR, send_end);
         self.assembler.add_exception_region(
             protected_start,
@@ -3346,7 +3346,7 @@ impl Compiler {
                     self.emit(LOAD_CONST, none, 1)?;
                     self.store_name(name.as_str())?;
                     self.delete_name(name.as_str())?;
-                    self.emit(RERAISE, 1, -3)?;
+                    self.emit_reraise(ReraiseStackState::HandlerCleanup)?;
                 }
                 self.assembler.mark(next_handler);
                 dispatch_start = if handler.name.is_some() {
@@ -3605,7 +3605,7 @@ impl Compiler {
                 self.emit(LOAD_CONST, none, 1)?;
                 self.store_name(name.as_str())?;
                 self.delete_name(name.as_str())?;
-                self.emit(RERAISE, 1, -3)?;
+                self.emit_reraise(ReraiseStackState::HandlerCleanup)?;
             }
 
             self.assembler.mark(next_handler);
@@ -3623,7 +3623,7 @@ impl Compiler {
         }) {
             self.set_depth(base_depth + 2);
             self.assembler.set_location(final_handler_location);
-            self.emit(RERAISE, 0, -2)?;
+            self.emit_reraise(ReraiseStackState::ActiveExceptionHandler)?;
             let dispatch_end = self.assembler.label();
             self.assembler.mark(dispatch_end);
             self.assembler.add_exception_region(
@@ -3640,7 +3640,7 @@ impl Compiler {
         self.assembler.set_location(SourceLocation::NONE);
         self.emit(COPY, 3, 1)?;
         self.emit(POP_EXCEPT, 0, -1)?;
-        self.emit(RERAISE, 1, -3)?;
+        self.emit_reraise(ReraiseStackState::HandlerCleanup)?;
 
         if statement.handlers.iter().all(|handler| {
             handler.as_except_handler().is_some_and(|handler| {
@@ -3915,7 +3915,7 @@ impl Compiler {
         self.set_depth(base_depth + 2);
         self.emit(SWAP, 2, 0)?;
         self.emit(POP_EXCEPT, 0, -1)?;
-        self.emit(RERAISE, 0, -1)?;
+        self.emit_reraise(ReraiseStackState::ExceptionOnly)?;
         self.add_exception_regions_with_exclusions(
             handler_region_start,
             handler_region_end,
@@ -3930,7 +3930,7 @@ impl Compiler {
         self.assembler.set_location(SourceLocation::NONE);
         self.emit(COPY, 3, 1)?;
         self.emit(POP_EXCEPT, 0, -1)?;
-        self.emit(RERAISE, 1, -3)?;
+        self.emit_reraise(ReraiseStackState::HandlerCleanup)?;
 
         self.assembler.mark(orelse);
         self.set_depth(base_depth);
@@ -4356,13 +4356,13 @@ impl Compiler {
                 if let Some(location) = self.assembler.last_instruction_location() {
                     self.assembler.set_location(location);
                 }
-                self.emit(RERAISE, 0, -2)?;
+                self.emit_reraise(ReraiseStackState::ActiveExceptionHandler)?;
             }
             self.assembler.mark(condition_false);
             self.set_depth(base_depth + 2);
             self.assembler
                 .set_location(self.source_location(final_if.test.range()));
-            self.emit(RERAISE, 0, -2)?;
+            self.emit_reraise(ReraiseStackState::ActiveExceptionHandler)?;
         } else {
             if let Some(location) = pass_finally_location {
                 self.assembler.set_location(location);
@@ -4384,7 +4384,7 @@ impl Compiler {
                 } else if let Some(location) = self.assembler.last_instruction_location() {
                     self.assembler.set_location(location);
                 }
-                self.emit(RERAISE, 0, -2)?;
+                self.emit_reraise(ReraiseStackState::ActiveExceptionHandler)?;
             }
         }
         let handler_end = if let Some(handler_end) = explicit_handler_end {
@@ -4413,7 +4413,7 @@ impl Compiler {
         self.assembler.set_location(SourceLocation::NONE);
         self.emit(COPY, 3, 1)?;
         self.emit(POP_EXCEPT, 0, -1)?;
-        self.emit(RERAISE, 1, -3)?;
+        self.emit_reraise(ReraiseStackState::HandlerCleanup)?;
         self.assembler.mark(end);
         self.set_depth(base_depth);
         Ok(())
@@ -4494,7 +4494,7 @@ impl Compiler {
         self.assembler.set_location(SourceLocation::NONE);
         self.emit(COPY, 3, 1)?;
         self.emit(POP_EXCEPT, 0, -1)?;
-        self.emit(RERAISE, 1, -3)?;
+        self.emit_reraise(ReraiseStackState::HandlerCleanup)?;
         self.set_depth(base_depth);
         Ok(())
     }
@@ -4762,7 +4762,7 @@ impl Compiler {
         self.emit(TO_BOOL, 0, 0)?;
         self.emit_jump_forward(POP_JUMP_IF_TRUE, suppress, -1)?;
         self.emit(NOT_TAKEN, 0, 0)?;
-        self.emit(RERAISE, 2, -5)?;
+        self.emit_reraise(ReraiseStackState::WithHandler)?;
         self.assembler.mark(suppress);
         self.set_depth(base_depth + 5);
         self.emit(POP_TOP, 0, -1)?;
@@ -4792,7 +4792,7 @@ impl Compiler {
         self.assembler.set_location(SourceLocation::NONE);
         self.emit(COPY, 3, 1)?;
         self.emit(POP_EXCEPT, 0, -1)?;
-        self.emit(RERAISE, 1, -3)?;
+        self.emit_reraise(ReraiseStackState::HandlerCleanup)?;
         self.assembler.mark(end);
         self.set_depth(base_depth);
         for name in newly_initialized_targets {
@@ -4944,7 +4944,7 @@ impl Compiler {
         for exclusions in &mut self.control.active_with_region_exclusions {
             exclusions.push((not_taken_start, not_taken_end));
         }
-        self.emit(RERAISE, 2, -5)?;
+        self.emit_reraise(ReraiseStackState::WithHandler)?;
         self.assembler.mark(suppress);
         self.set_depth(base_depth + 5);
         self.emit(POP_TOP, 0, -1)?;
@@ -4978,7 +4978,7 @@ impl Compiler {
         self.assembler.set_location(SourceLocation::NONE);
         self.emit(COPY, 3, 1)?;
         self.emit(POP_EXCEPT, 0, -1)?;
-        self.emit(RERAISE, 1, -3)?;
+        self.emit_reraise(ReraiseStackState::HandlerCleanup)?;
         self.assembler.mark(end);
         self.set_depth(base_depth);
         for name in newly_initialized_targets {
