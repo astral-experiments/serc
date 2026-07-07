@@ -245,18 +245,14 @@ impl Assembler {
             let Item::Instruction(instruction) = graph.item_mut(position) else {
                 continue;
             };
-            if instruction.opcode == LOAD_FAST_CHECK
-                && !checked_loads_needing_check.contains(&position)
-            {
-                instruction.opcode = LOAD_FAST;
-            }
-        }
-        for position in needs_check {
-            let Item::Instruction(instruction) = graph.item_mut(position) else {
-                unreachable!();
-            };
-            if instruction.opcode == LOAD_FAST {
-                instruction.opcode = LOAD_FAST_CHECK;
+            match instruction.opcode {
+                LOAD_FAST_CHECK if !checked_loads_needing_check.contains(&position) => {
+                    instruction.opcode = LOAD_FAST;
+                }
+                LOAD_FAST if needs_check.contains(&position) => {
+                    instruction.opcode = LOAD_FAST_CHECK;
+                }
+                _ => {}
             }
         }
     }

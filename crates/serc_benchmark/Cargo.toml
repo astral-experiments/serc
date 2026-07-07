@@ -21,6 +21,8 @@ workspace = true
 [dependencies]
 codspeed-criterion-compat = { workspace = true, optional = true }
 criterion = { workspace = true, optional = true }
+
+[dev-dependencies]
 serc = { path = "../serc" }
 
 [features]
