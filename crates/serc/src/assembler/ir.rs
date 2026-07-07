@@ -88,55 +88,53 @@ pub(super) enum Operand {
     Backward(Label),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct InstructionFlags(u16);
+bitflags::bitflags! {
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(super) struct InstructionFlags: u16 {
+        const FORCE_OWNED_LOAD = 1 << 0;
+        const STRICT_OWNED_LOAD = 1 << 1;
+        const INLINE_SMALL_EXIT = 1 << 2;
+        const PRESERVE_INLINED_JUMP_NOP = 1 << 3;
+        // Whether an incoming jump may be threaded through this instruction.
+        const ALLOW_JUMP_THREADING_TARGET = 1 << 4;
+        // Whether an unlocated block ending here may be inlined into predecessors.
+        const ALLOW_NO_LOCATION_BLOCK_INLINING = 1 << 5;
+        const PRESERVE_NO_LOCATION = 1 << 6;
+        const PREVENT_FUSION_WITH_NEXT = 1 << 7;
+        const PREVENT_FUSION_WITH_PREVIOUS = 1 << 8;
+        const DEFER_REDUNDANT_JUMP_REMOVAL = 1 << 9;
+        const PRESERVE_NOP_AFTER_JUMP_THREADING = 1 << 10;
+        const CONVERTED_POP_BLOCK = 1 << 11;
+        // Exclude this instruction from every exception region after CFG normalization.
+        const EXCLUDE_EXCEPTION = 1 << 12;
+        // CPython retains stale exception ownership for the short form of some synthetic
+        // handler-exit jumps, but not once the jump needs an `EXTENDED_ARG`.
+        const EXCLUDE_EXCEPTION_IF_EXTENDED = 1 << 13;
+        // Stop borrowed-load traversal at an optimized-away empty CFG block without exposing a
+        // label to the other assembler passes.
+        const BORROW_UNREACHABLE_ENTRY = 1 << 14;
+    }
+}
 
 impl InstructionFlags {
-    pub(super) const FORCE_OWNED_LOAD: Self = Self(1 << 0);
-    pub(super) const STRICT_OWNED_LOAD: Self = Self(1 << 1);
-    pub(super) const INLINE_SMALL_EXIT: Self = Self(1 << 2);
-    pub(super) const PRESERVE_INLINED_JUMP_NOP: Self = Self(1 << 3);
-    // Whether an incoming jump may be threaded through this instruction.
-    pub(super) const ALLOW_JUMP_THREADING_TARGET: Self = Self(1 << 4);
-    // Whether an unlocated block ending here may be inlined into predecessors.
-    pub(super) const ALLOW_NO_LOCATION_BLOCK_INLINING: Self = Self(1 << 5);
-    pub(super) const PRESERVE_NO_LOCATION: Self = Self(1 << 6);
-    pub(super) const PREVENT_FUSION_WITH_NEXT: Self = Self(1 << 7);
-    pub(super) const PREVENT_FUSION_WITH_PREVIOUS: Self = Self(1 << 8);
-    pub(super) const DEFER_REDUNDANT_JUMP_REMOVAL: Self = Self(1 << 9);
-    pub(super) const PRESERVE_NOP_AFTER_JUMP_THREADING: Self = Self(1 << 10);
-    pub(super) const CONVERTED_POP_BLOCK: Self = Self(1 << 11);
-    // Exclude this instruction from every exception region after CFG normalization.
-    pub(super) const EXCLUDE_EXCEPTION: Self = Self(1 << 12);
-    // CPython retains stale exception ownership for the short form of some synthetic handler-exit
-    // jumps, but not once the jump needs an `EXTENDED_ARG`.
-    pub(super) const EXCLUDE_EXCEPTION_IF_EXTENDED: Self = Self(1 << 13);
-    // Stop borrowed-load traversal at an optimized-away empty CFG block without exposing a label
-    // to the other assembler passes.
-    pub(super) const BORROW_UNREACHABLE_ENTRY: Self = Self(1 << 14);
-
     pub(super) const DEFAULT: Self =
-        Self(Self::INLINE_SMALL_EXIT.0 | Self::ALLOW_JUMP_THREADING_TARGET.0);
+        Self::INLINE_SMALL_EXIT.union(Self::ALLOW_JUMP_THREADING_TARGET);
 
-    const fn contains(self, flag: Self) -> bool {
-        self.0 & flag.0 != 0
-    }
-
-    fn insert(&mut self, flag: Self) {
-        self.0 |= flag.0;
-    }
-
-    fn remove(&mut self, flag: Self) {
-        self.0 &= !flag.0;
-    }
-
-    fn set(&mut self, flag: Self, enabled: bool) {
-        if enabled {
-            self.insert(flag);
-        } else {
-            self.remove(flag);
-        }
-    }
+    pub(super) const FUSE_OR: Self = Self::FORCE_OWNED_LOAD
+        .union(Self::STRICT_OWNED_LOAD)
+        .union(Self::ALLOW_NO_LOCATION_BLOCK_INLINING)
+        .union(Self::PRESERVE_NO_LOCATION)
+        .union(Self::DEFER_REDUNDANT_JUMP_REMOVAL)
+        .union(Self::PRESERVE_NOP_AFTER_JUMP_THREADING)
+        .union(Self::CONVERTED_POP_BLOCK)
+        .union(Self::EXCLUDE_EXCEPTION)
+        .union(Self::EXCLUDE_EXCEPTION_IF_EXTENDED);
+    pub(super) const FUSE_AND: Self =
+        Self::INLINE_SMALL_EXIT.union(Self::ALLOW_JUMP_THREADING_TARGET);
+    pub(super) const FUSE_FROM_FIRST: Self =
+        Self::PREVENT_FUSION_WITH_PREVIOUS.union(Self::BORROW_UNREACHABLE_ENTRY);
+    pub(super) const FUSE_FROM_SECOND: Self = Self::PREVENT_FUSION_WITH_NEXT;
+    pub(super) const FUSE_CLEARED: Self = Self::PRESERVE_INLINED_JUMP_NOP;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -206,50 +204,11 @@ impl Instruction {
 
     /// Combines the provenance of two instructions replaced by one superinstruction.
     pub(super) fn fused(opcode: Opcode, operand: Operand, first: Self, second: Self) -> Self {
-        let mut flags = InstructionFlags(0);
-        flags.set(
-            InstructionFlags::FORCE_OWNED_LOAD,
-            first.has_flag(InstructionFlags::FORCE_OWNED_LOAD)
-                || second.has_flag(InstructionFlags::FORCE_OWNED_LOAD),
-        );
-        flags.set(
-            InstructionFlags::STRICT_OWNED_LOAD,
-            first.has_flag(InstructionFlags::STRICT_OWNED_LOAD)
-                || second.has_flag(InstructionFlags::STRICT_OWNED_LOAD),
-        );
-        flags.set(
-            InstructionFlags::INLINE_SMALL_EXIT,
-            first.has_flag(InstructionFlags::INLINE_SMALL_EXIT)
-                && second.has_flag(InstructionFlags::INLINE_SMALL_EXIT),
-        );
-        flags.set(
-            InstructionFlags::ALLOW_JUMP_THREADING_TARGET,
-            first.has_flag(InstructionFlags::ALLOW_JUMP_THREADING_TARGET)
-                && second.has_flag(InstructionFlags::ALLOW_JUMP_THREADING_TARGET),
-        );
-        for flag in [
-            InstructionFlags::ALLOW_NO_LOCATION_BLOCK_INLINING,
-            InstructionFlags::PRESERVE_NO_LOCATION,
-            InstructionFlags::DEFER_REDUNDANT_JUMP_REMOVAL,
-            InstructionFlags::PRESERVE_NOP_AFTER_JUMP_THREADING,
-            InstructionFlags::CONVERTED_POP_BLOCK,
-            InstructionFlags::EXCLUDE_EXCEPTION,
-            InstructionFlags::EXCLUDE_EXCEPTION_IF_EXTENDED,
-        ] {
-            flags.set(flag, first.has_flag(flag) || second.has_flag(flag));
-        }
-        flags.set(
-            InstructionFlags::PREVENT_FUSION_WITH_NEXT,
-            second.has_flag(InstructionFlags::PREVENT_FUSION_WITH_NEXT),
-        );
-        flags.set(
-            InstructionFlags::PREVENT_FUSION_WITH_PREVIOUS,
-            first.has_flag(InstructionFlags::PREVENT_FUSION_WITH_PREVIOUS),
-        );
-        flags.set(
-            InstructionFlags::BORROW_UNREACHABLE_ENTRY,
-            first.has_flag(InstructionFlags::BORROW_UNREACHABLE_ENTRY),
-        );
+        let mut flags = ((first.flags | second.flags) & InstructionFlags::FUSE_OR)
+            | ((first.flags & second.flags) & InstructionFlags::FUSE_AND)
+            | (first.flags & InstructionFlags::FUSE_FROM_FIRST)
+            | (second.flags & InstructionFlags::FUSE_FROM_SECOND);
+        flags.remove(InstructionFlags::FUSE_CLEARED);
 
         Self {
             opcode,

@@ -19,6 +19,7 @@ doctest = false
 workspace = true
 
 [dependencies]
+bitflags = { workspace = true }
 clap = { workspace = true }
 fs-err = { workspace = true }
 ruff_python_ast = { workspace = true }
