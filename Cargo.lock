@@ -847,7 +847,6 @@ dependencies = [
 name = "serc"
 version = "0.1.0"
 dependencies = [
- "bitflags",
  "clap",
  "cpu-time",
  "fs-err",

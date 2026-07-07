@@ -31,7 +31,7 @@ pub(crate) use ir::{
     AssembledCode, Assembler, ExceptionPolicy, InstructionId, Label, SourceLocation,
 };
 use ir::{
-    BorrowFallthrough, ExceptionExclusion, ExceptionRegion, Instruction, InstructionFlags, Item,
+    BorrowFallthrough, ExceptionExclusion, ExceptionRegion, Instruction, Item, LoadPolicy,
     NormalizedExceptionOwner, Operand,
 };
 
@@ -67,10 +67,13 @@ impl Assembler {
         })
     }
 
+    fn required_last_instruction_mut(&mut self, operation: &str) -> &mut Instruction {
+        self.last_instruction_mut()
+            .unwrap_or_else(|| panic!("{operation} requires a preceding instruction"))
+    }
+
     fn last_jump_instruction_mut(&mut self, operation: &str) -> &mut Instruction {
-        let instruction = self
-            .last_instruction_mut()
-            .unwrap_or_else(|| panic!("{operation} requires a preceding instruction"));
+        let instruction = self.required_last_instruction_mut(operation);
         assert!(
             matches!(
                 instruction.operand,
@@ -151,7 +154,7 @@ impl Assembler {
         let Some((mut index, instruction)) = instructions.next() else {
             return false;
         };
-        if !instruction.has_flag(InstructionFlags::CONVERTED_POP_BLOCK) {
+        if !instruction.converted_pop_block {
             return false;
         }
         if let Some((previous_index, previous)) = instructions.next()
@@ -170,16 +173,16 @@ impl Assembler {
 
     /// Prevents fusion with the next instruction without introducing a CFG boundary.
     pub(crate) fn prevent_last_instruction_fusion(&mut self) {
-        if let Some(instruction) = self.last_instruction_mut() {
-            instruction.insert_flag(InstructionFlags::PREVENT_FUSION_WITH_NEXT);
-        }
+        self.required_last_instruction_mut("preventing fusion with the next instruction")
+            .fusion_policy
+            .prevent_with_next = true;
     }
 
     /// Prevents fusion with the previous instruction without introducing a CFG boundary.
     pub(crate) fn prevent_last_instruction_fusion_with_previous(&mut self) {
-        if let Some(instruction) = self.last_instruction_mut() {
-            instruction.insert_flag(InstructionFlags::PREVENT_FUSION_WITH_PREVIOUS);
-        }
+        self.required_last_instruction_mut("preventing fusion with the previous instruction")
+            .fusion_policy
+            .prevent_with_previous = true;
     }
 
     /// Defers a redundant jump until the pass after exit-block duplication.
@@ -228,19 +231,18 @@ impl Assembler {
             self.last_jump_instruction_mut("preparing a no-location block for inlining");
         instruction.location = SourceLocation::NONE;
         instruction.jump_policy.prevent_threading_target();
-        instruction.insert_flag(InstructionFlags::ALLOW_NO_LOCATION_BLOCK_INLINING);
+        instruction.no_location_policy.allow_block_inlining = true;
     }
 
     pub(crate) fn preserve_last_no_location(&mut self) {
-        if let Some(instruction) = self.last_instruction_mut() {
-            instruction.insert_flag(InstructionFlags::PRESERVE_NO_LOCATION);
-        }
+        self.required_last_instruction_mut("preserving a no-location instruction")
+            .no_location_policy
+            .preserve = true;
     }
 
     pub(crate) fn mark_last_as_converted_pop_block(&mut self) {
-        if let Some(instruction) = self.last_instruction_mut() {
-            instruction.insert_flag(InstructionFlags::CONVERTED_POP_BLOCK);
-        }
+        self.required_last_instruction_mut("marking a converted POP_BLOCK")
+            .converted_pop_block = true;
     }
 
     /// Removes a trailing NOP and returns its location and immediate exclusion labels, if any.
@@ -556,8 +558,10 @@ impl Assembler {
             || (opcode == LOAD_FAST && !self.load_fast_borrowing_enabled);
         let mut instruction = Instruction::new(opcode, operand, self.location, depth_after);
         instruction.exception_policy = exception_policy;
-        instruction.set_flag(InstructionFlags::FORCE_OWNED_LOAD, force_owned_load);
-        instruction.set_flag(InstructionFlags::STRICT_OWNED_LOAD, strict_owned_load);
+        instruction.load_policy = LoadPolicy {
+            force_owned: force_owned_load,
+            strict_owned: strict_owned_load,
+        };
         self.items.push(Item::Instruction(instruction));
     }
 }

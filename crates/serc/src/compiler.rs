@@ -138,8 +138,36 @@ struct LoopContext {
     with_depth: usize,
     finally_end_depth: usize,
     exception_region_depth: usize,
-    break_returns: bool,
-    preserve_break_exit: bool,
+    break_policy: LoopBreakPolicy,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LoopBreakPolicy {
+    Return,
+    Jump,
+    PreserveJumpExit,
+}
+
+impl LoopBreakPolicy {
+    const fn returns(self) -> bool {
+        matches!(self, Self::Return)
+    }
+
+    const fn preserves_jump_exit(self) -> bool {
+        matches!(self, Self::PreserveJumpExit)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResumeDepth {
+    Zero,
+    One,
+}
+
+impl ResumeDepth {
+    const fn is_one(self) -> bool {
+        matches!(self, Self::One)
+    }
 }
 
 #[derive(Debug)]
