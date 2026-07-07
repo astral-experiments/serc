@@ -107,6 +107,12 @@ enum LoopBackedge {
 }
 
 #[derive(Clone, Copy, Debug)]
+enum NestedIfExitLocation<'a> {
+    Located(&'a Expr),
+    Unlocated,
+}
+
+#[derive(Clone, Copy, Debug)]
 struct TryCompileOptions {
     terminal: bool,
     emit_statement_nop: bool,
@@ -1993,12 +1999,10 @@ impl Compiler {
                     first_branch_max_depth = Some(self.control.max_depth);
                 }
                 if !suite_terminates(body) && branch_index + 1 < branch_count {
-                    let nested_if_body_falls_through = matches!(
-                        body.last(),
-                        Some(Stmt::If(statement))
-                            if early_condition_truthiness(&statement.test).is_none()
-                                && !suite_terminates(&statement.body)
-                    );
+                    let nested_if_exit = body.last().and_then(|statement| match statement {
+                        Stmt::If(statement) => nested_if_exit_location(statement),
+                        _ => None,
+                    });
                     let nested_if_ends_in_break = matches!(
                         body.last(),
                         Some(Stmt::If(statement))
@@ -2010,7 +2014,10 @@ impl Compiler {
                         };
                         self.assembler
                             .set_location(self.source_location(statement.test.range()));
-                    } else if nested_if_body_falls_through {
+                    } else if let Some(NestedIfExitLocation::Located(test)) = nested_if_exit {
+                        self.assembler
+                            .set_location(self.source_location(test.range()));
+                    } else if matches!(nested_if_exit, Some(NestedIfExitLocation::Unlocated)) {
                         self.assembler.set_location(SourceLocation::NONE);
                     } else {
                         self.set_branch_end_location(body, body_start);
@@ -2018,7 +2025,7 @@ impl Compiler {
                     self.emit_jump_forward(JUMP_FORWARD, end, 0)?;
                     if nested_if_ends_in_break && has_terminating_else {
                         self.assembler.preserve_last_inlined_jump_nop();
-                    } else if nested_if_body_falls_through {
+                    } else if matches!(nested_if_exit, Some(NestedIfExitLocation::Unlocated)) {
                         self.assembler.preserve_last_no_location();
                     } else if pass_only_body {
                         self.assembler.preserve_last_direct_inlined_jump_nop();
@@ -5472,6 +5479,27 @@ fn statement_terminates(statement: &Stmt) -> bool {
         Stmt::Try(statement) => suite_terminates(&statement.finalbody),
         _ => false,
     }
+}
+
+fn nested_if_exit_location(
+    statement: &ruff_python_ast::StmtIf,
+) -> Option<NestedIfExitLocation<'_>> {
+    if early_condition_truthiness(&statement.test).is_some() {
+        return None;
+    }
+    let (test, body) = if let Some(clause) = statement.elif_else_clauses.last() {
+        (clause.test.as_ref()?, clause.body.as_slice())
+    } else {
+        (statement.test.as_ref(), statement.body.as_slice())
+    };
+    if early_condition_truthiness(test).is_some() {
+        return None;
+    }
+    Some(if suite_terminates(body) {
+        NestedIfExitLocation::Located(test)
+    } else {
+        NestedIfExitLocation::Unlocated
+    })
 }
 
 fn terminating_if_fallthrough_test(statement: &ruff_python_ast::StmtIf) -> Option<&Expr> {

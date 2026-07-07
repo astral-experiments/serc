@@ -742,6 +742,67 @@ class Child(Base):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_nested_if_final_clause_exits() {
+        let source = r"def final_else(outer, inner):
+    if outer:
+        if inner:
+            first()
+        else:
+            second()
+    else:
+        other()
+    after()
+
+def terminal_final_elif(outer, inner, last):
+    if outer:
+        if inner:
+            first()
+        elif last:
+            raise Error()
+    else:
+        other()
+    after()
+
+def nonterminal_final_elif(outer, inner, last):
+    if outer:
+        if inner:
+            raise Error()
+        elif last:
+            body()
+    else:
+        other()
+    after()
+
+def terminal_final_else(outer, inner):
+    if outer:
+        if inner:
+            first()
+        else:
+            raise Error()
+    else:
+        other()
+    after()
+
+def no_else_nonterminal(outer, inner):
+    if outer:
+        if inner:
+            body()
+    else:
+        other()
+    after()
+
+def folded_nested(outer):
+    if outer:
+        if True:
+            body()
+    else:
+        other()
+    after()
+";
+        assert_matches_cpython_marshal(source, "nested_if_final_clause.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_an_unreachable_assertion_message() {
         let source = "seed = '\u{a0}'\nassert True, print('hidden', print.__name__, sep=None)\ncondition = 'used'\n\ndef loop_tail_assert(values):\n    for value in values:\n        assert value\n";
         assert_matches_cpython_marshal(source, "assert.py");
