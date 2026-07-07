@@ -7,12 +7,14 @@
 mod assembler;
 mod compiler;
 mod marshal;
+mod source;
 mod target;
 
 use std::error::Error;
 use std::fmt;
 
 use compiler::{CodeObject, Compiler};
+pub use source::{SourceDecodeError, decode_source};
 
 /// The exact CPython implementation targeted by this compiler backend.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -81,20 +83,22 @@ impl CompiledModule {
     /// Unix epoch. `source_size` is the source file's byte length, truncated to 32 bits as
     /// required by CPython's cache format.
     pub fn to_timestamp_pyc(&self, source_mtime: u32, source_size: u32) -> Vec<u8> {
-        let marshalled = self.marshal();
-        let mut output = Vec::with_capacity(16 + marshalled.len());
+        let mut output = Vec::with_capacity(16 + self.code.bytecode.len());
         output.extend_from_slice(&CPYTHON_TARGET.magic_number);
         output.extend_from_slice(&0_u32.to_le_bytes());
         output.extend_from_slice(&source_mtime.to_le_bytes());
         output.extend_from_slice(&source_size.to_le_bytes());
-        output.extend_from_slice(&marshalled);
+        marshal::encode_code_into(&self.code, &mut output);
         output
     }
 }
 
-/// A source parsing or bytecode generation error.
+/// A source decoding, parsing, or bytecode generation error.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum CompileError {
+    /// The Python source bytes could not be decoded.
+    Decode(SourceDecodeError),
     /// Ruff rejected the Python source.
     Parse(String),
     /// The source uses valid Python syntax that this backend does not support yet.
@@ -106,6 +110,7 @@ pub enum CompileError {
 impl fmt::Display for CompileError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Decode(error) => write!(formatter, "failed to decode Python source: {error}"),
             Self::Parse(message) => write!(formatter, "failed to parse Python source: {message}"),
             Self::Unsupported(message) => formatter.write_str(message),
             Self::Internal(message) => write!(formatter, "internal compiler error: {message}"),
@@ -113,18 +118,31 @@ impl fmt::Display for CompileError {
     }
 }
 
-impl Error for CompileError {}
+impl Error for CompileError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Decode(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 /// Compile a Python module for CPython 3.14.5.
 pub fn compile(source: &str, filename: &str) -> Result<CompiledModule, CompileError> {
-    let normalized;
-    let source = if source.contains('\r') {
-        normalized = source.replace("\r\n", "\n").replace('\r', "\n");
-        normalized.as_str()
-    } else {
-        source
-    };
-    let source = source.strip_prefix('\u{feff}').unwrap_or(source);
+    let source = source::normalize_source(source);
+    compile_normalized(&source, filename)
+}
+
+/// Decode and compile Python source bytes for CPython 3.14.5.
+///
+/// This function performs no filesystem I/O. See [`decode_source`] for the accepted source
+/// encoding and normalization behavior.
+pub fn compile_bytes(source: &[u8], filename: &str) -> Result<CompiledModule, CompileError> {
+    let source = decode_source(source).map_err(CompileError::Decode)?;
+    compile_normalized(&source, filename)
+}
+
+fn compile_normalized(source: &str, filename: &str) -> Result<CompiledModule, CompileError> {
     let options = ruff_python_parser::ParseOptions::from(ruff_python_parser::Mode::Module)
         .with_target_version(ruff_python_ast::PythonVersion::PY314);
     let parsed = ruff_python_parser::parse(source, options)
@@ -133,6 +151,21 @@ pub fn compile(source: &str, filename: &str) -> Result<CompiledModule, CompileEr
         .ok_or_else(|| CompileError::Internal("parser did not return a module".to_string()))?;
     let code = Compiler::module(filename, source).compile_module(parsed.suite())?;
     Ok(CompiledModule { code })
+}
+
+/// Compile Python source bytes directly to a CPython 3.14.5 `.pyc` file.
+///
+/// This function performs no filesystem I/O. `source_mtime` is written to the timestamp header,
+/// and its source-size field uses the original byte length before decoding or normalization.
+pub fn compile_bytes_to_pyc(
+    source: &[u8],
+    filename: &str,
+    source_mtime: u32,
+) -> Result<Vec<u8>, CompileError> {
+    let source_size = u32::try_from(source.len()).map_err(|_| {
+        CompileError::Unsupported("Python source exceeds the 4 GiB `.pyc` limit".to_string())
+    })?;
+    Ok(compile_bytes(source, filename)?.to_timestamp_pyc(source_mtime, source_size))
 }
 
 /// Compile a Python module directly to a timestamp-invalidated CPython 3.14.5 `.pyc` file.

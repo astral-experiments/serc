@@ -498,11 +498,25 @@ fn compare(path: &Path, python: &str) -> Outcome {
                 detail: message,
             };
         }
+        Ok(Err(CompileError::Decode(error))) => {
+            return Outcome {
+                path: path.to_path_buf(),
+                kind: OutcomeKind::ParseMismatch,
+                detail: error.to_string(),
+            };
+        }
         Ok(Err(CompileError::Internal(message))) => {
             return Outcome {
                 path: path.to_path_buf(),
                 kind: OutcomeKind::CompilerPanic,
                 detail: message,
+            };
+        }
+        Ok(Err(error)) => {
+            return Outcome {
+                path: path.to_path_buf(),
+                kind: OutcomeKind::CompilerPanic,
+                detail: error.to_string(),
             };
         }
         Err(_) => {

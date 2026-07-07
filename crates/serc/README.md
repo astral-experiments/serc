@@ -35,6 +35,24 @@ Paths default to the current directory. Pass `--check` to compile without writin
 compared directly with single-worker CPython `compileall`. Source files must use UTF-8, either by
 default or with a UTF-8 encoding cookie; other source encodings are unsupported.
 
+## Library source API
+
+`compile_bytes` is the reusable file-input boundary for callers that already own source bytes. It
+performs no filesystem I/O: it validates a UTF-8 BOM and encoding cookie, rejects null bytes, and
+normalizes CRLF and CR newlines in one pass before compiling. Sources that need no normalization
+remain borrowed internally. For callers that already have source metadata,
+`compile_bytes_to_pyc` constructs a timestamp-invalidated cache file and records the original raw
+byte length:
+
+```rust
+let source = b"# coding: utf-8\r\nanswer = 42\r\n";
+let pyc = serc::compile_bytes_to_pyc(source, "module.py", 1_700_000_000).unwrap();
+```
+
+Filesystem-aware callers that must sample metadata after compilation can call `compile_bytes`,
+sample the mtime and size, then call `CompiledModule::to_timestamp_pyc`. The CLI uses this order so
+a source changed during compilation gets the same timestamp-header behavior as before.
+
 ## CPython corpus comparison
 
 The `compare_cpython_corpus` example discovers every `.py` file under the vendored Ruff
