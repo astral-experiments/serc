@@ -5,9 +5,9 @@ use rustc_hash::FxHashMap;
 use crate::compiler::{CodeObject, Constant};
 
 use super::key::{
-    ObjectKey, code_bytes_key, code_key, constant_key, constant_sort_key, constants_tuple_key,
-    local_kinds_key, locals_tuple_key, should_intern, slice_member_uses_identity,
-    strings_tuple_key,
+    ObjectKey, code_bytes_key, code_key, constant_key, constants_tuple_key,
+    frozen_set_members_in_wire_order, local_kinds_key, locals_tuple_key, should_intern,
+    slice_member_uses_identity, strings_tuple_key,
 };
 
 // Source addresses are graph-local lookup keys only. They remain valid while `encode_code` holds
@@ -225,9 +225,7 @@ impl<'a> ObjectGraph<'a> {
             Constant::FrozenSet(values) => {
                 let key = constant_key(value);
                 if self.record_at(location, key, false) {
-                    let mut values: Vec<_> = values.iter().collect();
-                    values.sort_by_key(|value| constant_sort_key(value));
-                    for value in values {
+                    for (_, value) in frozen_set_members_in_wire_order(values) {
                         self.visit_constant(value);
                     }
                 }
