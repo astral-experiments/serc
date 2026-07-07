@@ -249,6 +249,9 @@ pub(super) fn constant_sort_key(value: &Constant) -> Vec<u8> {
                         .expect("sort-key frozenset length fits in u32")
                         .to_le_bytes(),
                 );
+                for (sort_key, _) in frozen_set_members_in_wire_order(values) {
+                    output.extend_from_slice(&sort_key);
+                }
             }
             Constant::Slice { lower, upper, step } => {
                 output.push(TYPE_SLICE | flag);
@@ -263,6 +266,15 @@ pub(super) fn constant_sort_key(value: &Constant) -> Vec<u8> {
     let mut output = Vec::new();
     append(&mut output, value, true);
     output
+}
+
+pub(super) fn frozen_set_members_in_wire_order(values: &[Constant]) -> Vec<(Vec<u8>, &Constant)> {
+    let mut members = values
+        .iter()
+        .map(|value| (constant_sort_key(value), value))
+        .collect::<Vec<_>>();
+    members.sort_by(|(left, _), (right, _)| left.cmp(right));
+    members
 }
 
 pub(super) fn constants_tuple_key(values: &[Constant]) -> ObjectKey<'_> {
