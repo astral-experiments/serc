@@ -128,68 +128,6 @@ enum Scope {
     },
 }
 
-#[derive(Clone, Copy, Debug)]
-struct LoopContext {
-    continue_label: Label,
-    break_label: Label,
-    iterator_cleanup: IteratorCleanup,
-    with_depth: usize,
-    finally_end_depth: usize,
-    exception_region_depth: usize,
-    break_returns: bool,
-    preserve_break_exit: bool,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct ExceptionHandlerContext {
-    name: Option<NameId>,
-    loop_depth: usize,
-}
-
-#[derive(Debug)]
-struct ReturnFinallyContext {
-    body: Vec<Stmt>,
-    loop_depth: usize,
-    handler: Label,
-    depth: u32,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct WithExitContext {
-    location: SourceLocation,
-    is_async: bool,
-}
-
-#[derive(Debug)]
-struct MatchContext {
-    stores: Vec<NameId>,
-    fail_pop: Vec<Label>,
-    on_top: usize,
-}
-
-type RegionExclusions = Vec<(Label, Label)>;
-type RegionExclusionStack = Vec<RegionExclusions>;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum IteratorCleanup {
-    None,
-    Sync,
-    Async,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CollectionKind {
-    List,
-    Tuple,
-    Set,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DefinitionDecorators {
-    Compile,
-    AlreadyCompiled,
-}
-
 #[derive(Debug)]
 pub(crate) struct Compiler {
     context: Arc<CompilationContext>,

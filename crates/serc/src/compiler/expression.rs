@@ -3,6 +3,20 @@
 
 use super::*;
 
+#[derive(Debug)]
+struct MatchContext {
+    stores: Vec<NameId>,
+    fail_pop: Vec<Label>,
+    on_top: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CollectionKind {
+    List,
+    Tuple,
+    Set,
+}
+
 impl Compiler {
     pub(super) fn compile_match(
         &mut self,

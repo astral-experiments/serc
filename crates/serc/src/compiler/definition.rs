@@ -3,6 +3,12 @@
 
 use super::*;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DefinitionDecorators {
+    Compile,
+    AlreadyCompiled,
+}
+
 impl Compiler {
     pub(super) fn compile_type_alias(
         &mut self,
