@@ -1,7 +1,68 @@
 use ruff_python_ast::Stmt;
 use ruff_python_parser::parse_module;
 
-use super::{Compiler, Constant, FunctionPlan, NameId, NameInterner, ScopeBodyFacts, clean_doc};
+use crate::target::opcodes::{BUILD_TUPLE, LOAD_CONST, RAISE_VARARGS, RERAISE, RETURN_VALUE};
+
+use super::{
+    Compiler, CompilerStackEffect, Constant, FunctionPlan, NameId, NameInterner, ReraiseStackState,
+    ScopeBodyFacts, clean_doc, compiler_stack_effect, validate_compiler_stack_effect,
+};
+
+#[test]
+fn compiler_stack_effects_distinguish_values_from_scope_exit_bookkeeping() {
+    assert_eq!(
+        compiler_stack_effect(LOAD_CONST, 0),
+        CompilerStackEffect::Fixed(1)
+    );
+    assert_eq!(
+        compiler_stack_effect(BUILD_TUPLE, 3),
+        CompilerStackEffect::Fixed(-2)
+    );
+    assert_eq!(
+        compiler_stack_effect(RETURN_VALUE, 0),
+        CompilerStackEffect::Fixed(-1)
+    );
+    assert_eq!(
+        compiler_stack_effect(RAISE_VARARGS, 1),
+        CompilerStackEffect::Fixed(-1)
+    );
+    assert_eq!(
+        compiler_stack_effect(RERAISE, 1),
+        CompilerStackEffect::ContextDependent
+    );
+}
+
+#[test]
+fn reraise_stack_states_cover_every_supported_logical_shape() {
+    assert_eq!(
+        [
+            ReraiseStackState::ExceptionOnly.argument_and_effect(),
+            ReraiseStackState::ActiveExceptionHandler.argument_and_effect(),
+            ReraiseStackState::StopIterationHandler.argument_and_effect(),
+            ReraiseStackState::HandlerCleanup.argument_and_effect(),
+            ReraiseStackState::WithHandler.argument_and_effect(),
+        ],
+        [(0, -1), (0, -2), (1, -1), (1, -3), (2, -5)]
+    );
+}
+
+#[test]
+fn generic_stack_effect_validation_rejects_context_dependent_reraise() {
+    for (argument, effect) in [(0, -1), (1, -3), (2, -5), (0, -3), (3, -1)] {
+        let error = validate_compiler_stack_effect(RERAISE, argument, effect).unwrap_err();
+        assert!(
+            matches!(error, crate::CompileError::Internal(message) if message.contains("context-dependent opcode") && message.contains("typed emitter"))
+        );
+    }
+}
+
+#[test]
+fn compiler_stack_effect_validation_rejects_stale_lowering_metadata() {
+    let error = validate_compiler_stack_effect(LOAD_CONST, 0, 0).unwrap_err();
+    assert!(
+        matches!(error, crate::CompileError::Internal(message) if message.contains("declared stack effect 0") && message.contains("expected 1"))
+    );
+}
 
 #[test]
 fn interns_adversarial_identifier_families_densely() {

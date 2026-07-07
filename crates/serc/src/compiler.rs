@@ -37,7 +37,9 @@ use crate::target::operands::{
     BinaryIntrinsic, BinaryOperation, CommonConstant, ComparisonOperation, Conversion,
     FunctionAttribute, ResumeLocation, SpecialMethod, UnaryIntrinsic,
 };
-use crate::target::{Opcode, is_unconditional_jump};
+use crate::target::{
+    Opcode, is_unconditional_jump, num_popped as opcode_num_popped, num_pushed as opcode_num_pushed,
+};
 
 mod constant;
 mod definition;
