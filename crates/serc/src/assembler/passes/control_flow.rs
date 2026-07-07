@@ -72,7 +72,7 @@ impl Assembler {
             }
         }
         if !empty.is_empty() {
-            graph.order_mut().retain(|block| !empty.contains(block));
+            graph.retain_order(|block| !empty.contains(&block));
         }
         removed_max_depth
     }

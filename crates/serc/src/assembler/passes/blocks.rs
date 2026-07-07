@@ -288,8 +288,9 @@ impl Assembler {
         }
         self.exception_regions = rebuilt_regions;
 
-        *graph.order_mut() = order;
-        graph.rebuild_label_index();
+        graph
+            .replace_order(order)
+            .expect("cold-block pass produced an invalid emission order");
         let item_positions = graph.item_positions();
         let label_positions = item_positions
             .iter()
@@ -834,12 +835,8 @@ impl Assembler {
                 );
             }
         }
-        *graph.order_mut() = final_order;
-        if graph.is_normalized(&self.preserved_block_boundaries) {
-            graph.rebuild_label_index();
-        } else {
-            // Appended no-location copies temporarily cross physical block boundaries.
-            graph.normalize_blocks(&self.preserved_block_boundaries);
-        }
+        graph
+            .replace_order_and_normalize(final_order, &self.preserved_block_boundaries)
+            .expect("exit-block duplication produced an invalid emission order");
     }
 }

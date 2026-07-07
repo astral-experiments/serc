@@ -208,8 +208,40 @@ impl BlockGraph {
         &self.order
     }
 
-    pub(super) fn order_mut(&mut self) -> &mut Vec<BasicBlockId> {
-        &mut self.order
+    /// Replaces the emission order without changing block identities.
+    ///
+    /// Blocks allocated in the arena may be omitted, but every emitted block
+    /// must be a unique, valid arena entry.
+    pub(super) fn replace_order(&mut self, order: Vec<BasicBlockId>) -> Result<(), String> {
+        self.validate_order(&order)?;
+        self.order = order;
+        self.rebuild_label_index();
+        Ok(())
+    }
+
+    /// Replaces the emission order and restores normalized block boundaries.
+    ///
+    /// Label lookup is rebuilt exactly once, either directly when the new
+    /// order is already normalized or as part of repartitioning.
+    pub(super) fn replace_order_and_normalize(
+        &mut self,
+        order: Vec<BasicBlockId>,
+        preserved_block_boundaries: &FxHashSet<Label>,
+    ) -> Result<(), String> {
+        self.validate_order(&order)?;
+        self.order = order;
+        if self.is_normalized(preserved_block_boundaries) {
+            self.rebuild_label_index();
+        } else {
+            self.normalize_blocks(preserved_block_boundaries);
+        }
+        Ok(())
+    }
+
+    /// Retains emitted blocks that satisfy `keep` and refreshes label lookup.
+    pub(super) fn retain_order(&mut self, mut keep: impl FnMut(BasicBlockId) -> bool) {
+        self.order.retain(|block| keep(*block));
+        self.rebuild_label_index();
     }
 
     pub(super) fn block_at(&self, position: usize) -> BasicBlockId {
@@ -429,7 +461,7 @@ impl BlockGraph {
         self.bind_label(label, block);
     }
 
-    pub(super) fn rebuild_label_index(&mut self) {
+    fn rebuild_label_index(&mut self) {
         let mut label_blocks = std::mem::take(&mut self.label_blocks);
         label_blocks.fill(UNBOUND_BLOCK);
         for block in self.order.iter().copied() {
@@ -445,6 +477,19 @@ impl BlockGraph {
             }
         }
         self.label_blocks = label_blocks;
+    }
+
+    fn validate_order(&self, order: &[BasicBlockId]) -> Result<(), String> {
+        let mut seen_blocks = FxHashSet::default();
+        for block in order.iter().copied() {
+            if !seen_blocks.insert(block) {
+                return Err(format!("block {} appears more than once", block.index()));
+            }
+            if self.blocks.get(block.index()).is_none() {
+                return Err(format!("block {} is outside the arena", block.index()));
+            }
+        }
+        Ok(())
     }
 
     /// Removes the extra label-only blocks introduced by the preserved
@@ -664,15 +709,10 @@ impl BlockGraph {
 
     #[cfg(any(test, debug_assertions))]
     pub(super) fn validate(&self) -> Result<(), String> {
-        let mut seen_blocks = FxHashSet::default();
+        self.validate_order(&self.order)?;
         let mut labels = Vec::new();
         for block in self.order.iter().copied() {
-            if !seen_blocks.insert(block) {
-                return Err(format!("block {} appears more than once", block.index()));
-            }
-            let Some(contents) = self.blocks.get(block.index()) else {
-                return Err(format!("block {} is outside the arena", block.index()));
-            };
+            let contents = &self.blocks[block.index()];
             if contents.items.is_empty() {
                 return Err(format!("block {} is empty", block.index()));
             }
@@ -748,7 +788,7 @@ mod tests {
         let first = graph.block_at(0);
         let second = graph.block_at(1);
 
-        graph.order_mut().swap(0, 1);
+        graph.replace_order(vec![second, first]).unwrap();
         let inserted = graph.insert_block(
             1,
             vec![
@@ -761,6 +801,68 @@ mod tests {
         assert_eq!(graph.label_block(first_label), Some(first));
         assert_eq!(graph.label_block(second_label), Some(second));
         assert_eq!(graph.label_block(inserted_label), Some(inserted));
+        graph.validate().unwrap();
+    }
+
+    #[test]
+    fn replacing_order_rejects_duplicate_blocks() {
+        let mut graph = BlockGraph::from_items(
+            vec![instruction(RETURN_VALUE, Operand::Value(0))],
+            &FxHashSet::default(),
+        );
+        let block = graph.block_at(0);
+
+        let error = graph.replace_order(vec![block, block]).unwrap_err();
+
+        assert_eq!(error, "block 0 appears more than once");
+        assert_eq!(graph.order(), &[block]);
+        graph.validate().unwrap();
+    }
+
+    #[test]
+    fn replacing_order_rejects_blocks_outside_the_arena() {
+        let mut graph = BlockGraph::from_items(
+            vec![instruction(RETURN_VALUE, Operand::Value(0))],
+            &FxHashSet::default(),
+        );
+        let block = graph.block_at(0);
+
+        let error = graph.replace_order(vec![BasicBlockId(1)]).unwrap_err();
+
+        assert_eq!(error, "block 1 is outside the arena");
+        assert_eq!(graph.order(), &[block]);
+        graph.validate().unwrap();
+    }
+
+    #[test]
+    fn retaining_order_drops_labels_without_reusing_block_ids() {
+        let dropped_label = Label(0);
+        let retained_label = Label(1);
+        let inserted_label = Label(2);
+        let mut graph = BlockGraph::from_items(
+            vec![
+                Item::Label(dropped_label),
+                instruction(JUMP_FORWARD, Operand::Forward(retained_label)),
+                Item::Label(retained_label),
+                instruction(RETURN_VALUE, Operand::Value(0)),
+            ],
+            &FxHashSet::default(),
+        );
+        let dropped = graph.block_at(0);
+        let retained = graph.block_at(1);
+
+        graph.retain_order(|block| block != dropped);
+        let inserted = graph.push_block(vec![
+            Item::Label(inserted_label),
+            instruction(RETURN_VALUE, Operand::Value(0)),
+        ]);
+
+        assert_eq!(graph.order(), &[retained, inserted]);
+        assert_eq!(graph.label_block(dropped_label), None);
+        assert_eq!(graph.label_block(retained_label), Some(retained));
+        assert_eq!(graph.label_block(inserted_label), Some(inserted));
+        assert_eq!(inserted.index(), 2);
+        assert!(!graph[dropped].items().is_empty());
         graph.validate().unwrap();
     }
 
