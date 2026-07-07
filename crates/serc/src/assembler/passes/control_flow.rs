@@ -54,7 +54,7 @@ impl Assembler {
         let order = graph.order().to_vec();
         let mut empty = FxHashSet::default();
         for block in order {
-            if reachable.contains(&block) {
+            if reachable[block.index()] {
                 continue;
             }
             graph[block].items_mut().retain(|item| match item {
@@ -415,6 +415,16 @@ impl Assembler {
             .graph
             .as_mut()
             .expect("assembler pass requires the block graph");
+        if !graph.iter_items().any(|item| {
+            matches!(
+                item,
+                Item::Instruction(instruction)
+                    if instruction.opcode == JUMP_FORWARD
+                        && matches!(instruction.operand, Operand::Forward(_))
+            )
+        }) {
+            return;
+        }
         let mut items = graph
             .iter()
             .flat_map(|(block, contents)| {

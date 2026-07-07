@@ -1,4 +1,4 @@
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashSet;
 
 use super::super::{
     BorrowFallthrough, CHECK_EXC_MATCH, COMPARE_OP, COPY, DELETE_DEREF, DELETE_FAST, DICT_MERGE,
@@ -395,32 +395,43 @@ impl Assembler {
             },
         );
         let blocks = graph.order().to_vec();
-        let mut borrow_unreachable_blocks = self
-            .borrow_unreachable_blocks
+        let block_slot_count = blocks
             .iter()
-            .filter_map(|label| graph.label_block(*label))
-            .collect::<FxHashSet<_>>();
-        borrow_unreachable_blocks.extend(blocks.windows(2).filter_map(|blocks| {
-            (graph[blocks[0]]
+            .map(|block| block.index())
+            .max()
+            .map_or(0, |index| index + 1);
+        let mut borrow_unreachable_blocks = vec![false; block_slot_count];
+        for block in blocks.iter().copied() {
+            if graph[block].items().iter().any(|item| {
+                matches!(
+                    item,
+                    Item::Label(label) if self.borrow_unreachable_blocks.contains(label)
+                )
+            }) {
+                borrow_unreachable_blocks[block.index()] = true;
+            }
+        }
+        for blocks in blocks.windows(2) {
+            if graph[blocks[0]]
                 .last_instruction()
                 .is_some_and(|instruction| {
                     instruction.borrow_fallthrough == BorrowFallthrough::Barrier
-                }))
-            .then_some(blocks[1])
-        }));
-        let block_positions = blocks
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(position, block)| (block, position))
-            .collect::<FxHashMap<_, _>>();
-        let mut reachable = FxHashSet::default();
+                })
+            {
+                borrow_unreachable_blocks[blocks[1].index()] = true;
+            }
+        }
+        let mut block_positions = vec![usize::MAX; block_slot_count];
+        for (position, block) in blocks.iter().copied().enumerate() {
+            block_positions[block.index()] = position;
+        }
+        let mut reachable = vec![false; block_slot_count];
         let mut pending = blocks.first().copied().into_iter().collect::<Vec<_>>();
         while let Some(block) = pending.pop() {
-            if borrow_unreachable_blocks.contains(&block) {
+            if borrow_unreachable_blocks[block.index()] {
                 continue;
             }
-            if !reachable.insert(block) {
+            if std::mem::replace(&mut reachable[block.index()], true) {
                 continue;
             }
             let Some(last) = graph[block].last_instruction() else {
@@ -430,7 +441,7 @@ impl Assembler {
                 last.opcode == NOP && last.has_flag(InstructionFlags::PRESERVE_INLINED_JUMP_NOP);
             if !folded_jump_has_no_fallthrough
                 && block_has_fallthrough(&[Item::Instruction(*last)])
-                && let Some(next) = blocks.get(block_positions[&block] + 1)
+                && let Some(next) = blocks.get(block_positions[block.index()] + 1)
             {
                 pending.push(*next);
             }
@@ -442,7 +453,7 @@ impl Assembler {
         }
 
         for block in blocks {
-            if !reachable.contains(&block) {
+            if !reachable[block.index()] {
                 continue;
             }
             let instruction_positions = graph
