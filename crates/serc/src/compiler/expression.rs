@@ -1161,7 +1161,7 @@ impl Compiler {
         let large = component_count > 30;
         let outer_location = self.source_location(fstring.range);
         let single_literal_range = if component_count == 1 && !has_interpolation {
-            Some(self.fstring_result_range(fstring))
+            Some(Self::fstring_result_range(fstring))
         } else {
             None
         };

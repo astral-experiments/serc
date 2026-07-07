@@ -525,7 +525,7 @@ impl Compiler {
             && fold_constant(&expression.value).is_some()
         {
             let range = if let Expr::FString(fstring) = expression.value.as_ref() {
-                self.fstring_result_range(fstring)
+                Self::fstring_result_range(fstring)
             } else {
                 expression.range
             };

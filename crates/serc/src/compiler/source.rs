@@ -176,40 +176,7 @@ impl Compiler {
             .unwrap_or(generator.range)
     }
 
-    fn interpolated_string_content_range(
-        &self,
-        range: ruff_text_size::TextRange,
-    ) -> ruff_text_size::TextRange {
-        let start = usize::from(range.start());
-        let end = usize::from(range.end());
-        let text = &self.context.source.as_bytes()[start..end];
-        let Some(quote_offset) = text.iter().position(|byte| matches!(byte, b'\'' | b'"')) else {
-            return range;
-        };
-        let quote = text[quote_offset];
-        let quote_len = if text.get(quote_offset..quote_offset + 3) == Some(&[quote; 3]) {
-            3
-        } else {
-            1
-        };
-        let content_start = start + quote_offset + quote_len;
-        let has_closing_quote = text.len() >= quote_len
-            && text[text.len() - quote_len..]
-                .iter()
-                .all(|byte| *byte == quote);
-        let content_end = if has_closing_quote {
-            end - quote_len
-        } else {
-            end
-        };
-        ruff_text_size::TextRange::new(
-            ruff_text_size::TextSize::new(u32::try_from(content_start).unwrap_or(u32::MAX)),
-            ruff_text_size::TextSize::new(u32::try_from(content_end).unwrap_or(u32::MAX)),
-        )
-    }
-
     pub(super) fn fstring_result_range(
-        &self,
         fstring: &ruff_python_ast::ExprFString,
     ) -> ruff_text_size::TextRange {
         let mut component_count = 0;
@@ -248,7 +215,7 @@ impl Compiler {
         if component_count == 1 {
             only_interpolation.unwrap_or_else(|| {
                 fstring_literal_span(fstring)
-                    .unwrap_or_else(|| self.interpolated_string_content_range(fstring.range))
+                    .unwrap_or_else(|| interpolated_string_content_range(fstring.into()))
             })
         } else {
             fstring.range
@@ -303,6 +270,18 @@ impl Compiler {
         };
         (!self.imported_module_attribute(attribute)).then_some(attribute)
     }
+}
+
+pub(super) fn interpolated_string_content_range(
+    string: ruff_python_ast::StringLike<'_>,
+) -> ruff_text_size::TextRange {
+    debug_assert!(string.is_interpolated_string());
+    let mut parts = string.parts();
+    let Some(first) = parts.next() else {
+        return string.range();
+    };
+    let last = parts.next_back().unwrap_or(first);
+    ruff_text_size::TextRange::new(first.content_range().start(), last.content_range().end())
 }
 
 pub(super) fn debug_text_range(
@@ -421,7 +400,7 @@ pub(super) fn implicit_return_range(
                 last_store_target_range(compiler, target)
             }),
         Stmt::Expr(expression) => match expression.value.as_ref() {
-            Expr::FString(fstring) => compiler.fstring_result_range(fstring),
+            Expr::FString(fstring) => Compiler::fstring_result_range(fstring),
             expression => expression.range(),
         },
         Stmt::AnnAssign(assignment) => {

@@ -569,6 +569,28 @@ class Shadowed:
     }
 
     #[test]
+    fn matches_cpython_marshal_for_interpolated_string_boundaries() {
+        let source = r#"
+def render(item, nested):
+    rf'raw\path {item}'
+    f'''first
+{item!r}
+# literal
+last'''
+    r'left' f"middle {item}" '''right'''
+    t'left' tr"""right {item}
+# literal"""
+    f"""start {(
+        {'}': nested['{']}  # expression comment
+    ) = } end"""
+    t"""{(
+        nested["key"]  # expression comment
+    ) = }"""
+"#;
+        assert_matches_cpython_marshal(source, "interpolated_string_boundaries.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_an_irrefutable_constant_match_guard() {
         let source = "match subject:\n    case value if True:\n        pass\n    case _:\n        unreachable()\nafter()\n";
         assert_matches_cpython_marshal(source, "match.py");
