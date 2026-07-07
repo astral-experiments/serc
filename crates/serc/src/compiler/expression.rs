@@ -2381,7 +2381,7 @@ impl Compiler {
             }
         }
         let closure_names: Vec<_> = freevars.iter().cloned().collect();
-        let generator_range = self.generator_expression_range(generator.range);
+        let generator_range = self.generator_expression_range(generator);
         let plan = LoweringFunctionPlan {
             locals,
             globals,
