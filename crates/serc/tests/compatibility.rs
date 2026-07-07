@@ -504,6 +504,13 @@ except Error:
     }
 
     #[test]
+    fn matches_cpython_marshal_for_negated_generator_filters() {
+        let source =
+            "def filtered(items):\n    return (item for item in items if not predicate(item))\n";
+        assert_matches_cpython_marshal(source, "negated_generator_filter.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_inlined_comprehension_cells() {
         let source = r"module_result = [lambda: x for x in range(2)]
 

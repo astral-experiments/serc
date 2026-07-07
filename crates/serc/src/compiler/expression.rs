@@ -2789,6 +2789,27 @@ impl Compiler {
             }
             return self.compile_generator_filter(last, element, accepted, restart);
         }
+        if let Expr::UnaryOp(unary) = condition
+            && unary.op == UnaryOp::Not
+        {
+            self.compile_expression(&unary.operand)?;
+            self.assembler
+                .set_location(self.source_location(unary.operand.range()));
+            self.emit(TO_BOOL, 0, 0)?;
+            let exclusion_start = self.assembler.label();
+            self.assembler.mark(exclusion_start);
+            self.assembler
+                .set_location(self.source_location(element.range()));
+            self.emit_jump_forward(POP_JUMP_IF_FALSE, accepted, -1)?;
+            self.emit(NOT_TAKEN, 0, 0)?;
+            self.emit_jump_backward(JUMP_BACKWARD, restart, 0)?;
+            let exclusion_end = self.assembler.label();
+            self.assembler.mark(exclusion_end);
+            self.control
+                .generator_region_exclusions
+                .push((exclusion_start, exclusion_end));
+            return Ok(());
+        }
         if let Expr::Compare(comparison) = condition
             && comparison.ops.len() == 1
             && matches!(comparison.comparators[0], Expr::NoneLiteral(_))
