@@ -9,7 +9,7 @@ use crate::CompileError;
 use crate::target::code_flags::{CO_FUTURE_ANNOTATIONS, CO_FUTURE_BARRY_AS_BDFL};
 
 use super::symbol::mangle_name;
-use super::{Compiler, HashMap, HashSet, SHADOWED_SUPER_SENTINEL, Scope};
+use super::{Compiler, SHADOWED_SUPER_SENTINEL, Scope};
 
 impl Compiler {
     pub(super) fn scope_arena(&self) -> Result<&ScopeArena, CompileError> {
@@ -107,7 +107,7 @@ pub(super) struct NameId(pub(super) u32);
 #[derive(Debug, Default)]
 pub(super) struct NameInterner {
     names: Vec<String>,
-    by_name: HashMap<String, NameId>,
+    by_name: FxHashMap<String, NameId>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -240,15 +240,15 @@ pub(super) struct FunctionPlan {
 // belong to their own `ScopeArena` nodes; only their headers contribute facts to the parent.
 #[derive(Debug, Default)]
 pub(super) struct ScopeBodyFacts {
-    pub(super) globals: HashSet<String>,
-    pub(super) nonlocals: HashSet<String>,
-    pub(super) references: HashSet<String>,
+    pub(super) globals: FxHashSet<String>,
+    pub(super) nonlocals: FxHashSet<String>,
+    pub(super) references: FxHashSet<String>,
     explicit_dunder_class_reference: bool,
     pub(super) nested_lambda_requirements: BTreeSet<String>,
     pub(super) nested_generator_requirements: BTreeSet<String>,
     pub(super) nested_annotation_scope_requirements: BTreeSet<String>,
-    pub(super) generator_named_targets: HashSet<String>,
-    pub(super) inlined_comprehension_cellvars: HashSet<String>,
+    pub(super) generator_named_targets: FxHashSet<String>,
+    pub(super) inlined_comprehension_cellvars: FxHashSet<String>,
     pub(super) has_function_definition: bool,
     pub(super) has_generic_definition: bool,
     pub(super) has_type_alias: bool,
@@ -355,7 +355,7 @@ impl FunctionPlan {
         // potential names after the pass preserves CPython's load-before-store local ordering
         // without walking the body once just to discover its complete binding set.
         let mut locals = LocalCollector {
-            candidate_bindings: Some(HashMap::default()),
+            candidate_bindings: Some(FxHashMap::default()),
             globals,
             nonlocals,
             ..LocalCollector::default()
@@ -413,7 +413,7 @@ impl FunctionPlan {
         if locals.annotation_only.contains("__class__") && !explicit_dunder_class_reference {
             references.remove("__class__");
         }
-        let local_names: HashSet<_> = locals.names.iter().cloned().collect();
+        let local_names: FxHashSet<_> = locals.names.iter().cloned().collect();
         locals.names.retain(|name| {
             !locals.annotation_only.contains(name)
                 || references.contains(name)
@@ -439,7 +439,7 @@ impl FunctionPlan {
         let mut cellvars = generator_named_targets
             .into_iter()
             .filter(|name| local_names.contains(name))
-            .collect::<HashSet<_>>();
+            .collect::<FxHashSet<_>>();
         cellvars.extend(
             class_requirements
                 .iter()
@@ -462,7 +462,7 @@ impl FunctionPlan {
                 .into_iter()
                 .filter(|name| local_names.contains(name)),
         );
-        let retained_local_names: HashSet<_> = locals.names.iter().map(String::as_str).collect();
+        let retained_local_names: FxHashSet<_> = locals.names.iter().map(String::as_str).collect();
         let required: BTreeSet<_> = references
             .iter()
             .chain(&locals.nonlocals)
@@ -1103,14 +1103,14 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_> {
 }
 #[derive(Debug, Default)]
 pub(super) struct LocalCollector {
-    pub(super) names: Vec<String>,
-    pub(super) seen: HashSet<String>,
+    names: Vec<String>,
+    pub(super) seen: FxHashSet<String>,
     pub(super) comprehension_targets: Vec<String>,
-    seen_comprehension_targets: HashSet<String>,
-    candidate_bindings: Option<HashMap<String, bool>>,
-    annotation_only: HashSet<String>,
-    globals: HashSet<String>,
-    nonlocals: HashSet<String>,
+    seen_comprehension_targets: FxHashSet<String>,
+    candidate_bindings: Option<FxHashMap<String, bool>>,
+    annotation_only: FxHashSet<String>,
+    globals: FxHashSet<String>,
+    nonlocals: FxHashSet<String>,
 }
 
 impl LocalCollector {
@@ -1673,7 +1673,7 @@ impl<'ast> Visitor<'ast> for ScopeBodyFactsCollector {
 
 #[derive(Default)]
 pub(super) struct ReferenceCollector {
-    pub(super) references: HashSet<String>,
+    pub(super) references: FxHashSet<String>,
     skip_annotations: bool,
     explicit_dunder_class_reference: bool,
 }
@@ -1713,7 +1713,7 @@ impl<'ast> Visitor<'ast> for ReferenceCollector {
     }
 }
 
-pub(super) fn definitely_evaluated_references(expression: &Expr) -> Option<HashSet<String>> {
+pub(super) fn definitely_evaluated_references(expression: &Expr) -> Option<FxHashSet<String>> {
     #[derive(Default)]
     struct ConditionalEvaluationDetector(bool);
 
@@ -1749,8 +1749,8 @@ pub(super) fn definitely_evaluated_references(expression: &Expr) -> Option<HashS
 
 pub(super) struct LambdaScopeAnalysis {
     pub(super) locals: Vec<String>,
-    pub(super) cellvars: HashSet<String>,
-    pub(super) inlined_comprehension_cellvars: HashSet<String>,
+    pub(super) cellvars: FxHashSet<String>,
+    pub(super) inlined_comprehension_cellvars: FxHashSet<String>,
     pub(super) required: BTreeSet<String>,
 }
 
@@ -1778,7 +1778,7 @@ pub(super) fn analyze_lambda_scope(lambda: &ruff_python_ast::ExprLambda) -> Lamb
     references.visit_expr(&lambda.body);
     let mut nested_requirements = nested_lambda_required_names_in_expression(&lambda.body);
     nested_requirements.extend(nested_generator_required_names_in_expression(&lambda.body));
-    let local_names = locals.names.iter().cloned().collect::<HashSet<_>>();
+    let local_names = locals.names.iter().cloned().collect::<FxHashSet<_>>();
     let cellvars = nested_requirements
         .iter()
         .filter(|name| local_names.contains(*name))
@@ -1972,7 +1972,7 @@ pub(super) fn comprehension_cell_names(
     generators: &[ruff_python_ast::Comprehension],
     key: Option<&Expr>,
     value: &Expr,
-) -> HashSet<String> {
+) -> FxHashSet<String> {
     fn extend_requirements(expression: &Expr, required: &mut BTreeSet<String>) {
         required.extend(nested_lambda_required_names_in_expression(expression));
         required.extend(nested_generator_required_names_in_expression(expression));
@@ -1998,17 +1998,17 @@ pub(super) fn comprehension_cell_names(
     collect_nested_comprehension_target_names(value, &mut targets);
     extend_requirements(value, &mut required);
 
-    let targets = targets.into_iter().collect::<HashSet<_>>();
+    let targets = targets.into_iter().collect::<FxHashSet<_>>();
     required
         .into_iter()
         .filter(|name| targets.contains(name))
         .collect()
 }
 
-fn inlined_comprehension_cell_names_in_expression(expression: &Expr) -> HashSet<String> {
+fn inlined_comprehension_cell_names_in_expression(expression: &Expr) -> FxHashSet<String> {
     #[derive(Default)]
     struct Collector {
-        names: HashSet<String>,
+        names: FxHashSet<String>,
     }
 
     impl<'ast> Visitor<'ast> for Collector {
@@ -2041,10 +2041,10 @@ fn inlined_comprehension_cell_names_in_expression(expression: &Expr) -> HashSet<
     collector.names
 }
 
-pub(super) fn inlined_comprehension_cell_names_in_suite(body: &[Stmt]) -> HashSet<String> {
+pub(super) fn inlined_comprehension_cell_names_in_suite(body: &[Stmt]) -> FxHashSet<String> {
     #[derive(Default)]
     struct Collector {
-        names: HashSet<String>,
+        names: FxHashSet<String>,
     }
 
     impl<'ast> Visitor<'ast> for Collector {
@@ -2094,10 +2094,10 @@ pub(super) fn collect_named_expression_target_names(expression: &Expr, names: &m
 
 pub(super) fn generator_named_targets(
     generator: &ruff_python_ast::ExprGenerator,
-) -> HashSet<String> {
+) -> FxHashSet<String> {
     #[derive(Default)]
     struct Collector {
-        names: HashSet<String>,
+        names: FxHashSet<String>,
     }
 
     impl<'ast> Visitor<'ast> for Collector {
@@ -2125,7 +2125,7 @@ pub(super) fn generator_named_targets(
 pub(super) fn generator_required_names(
     generator: &ruff_python_ast::ExprGenerator,
 ) -> BTreeSet<String> {
-    let mut local_names = HashSet::default();
+    let mut local_names = FxHashSet::default();
     for comprehension in &generator.generators {
         let mut names = Vec::new();
         collect_target_names(&comprehension.target, &mut names);
@@ -2154,8 +2154,8 @@ pub(super) fn generator_required_names(
         .collect()
 }
 
-pub(super) fn generator_cellvars(generator: &ruff_python_ast::ExprGenerator) -> HashSet<String> {
-    let mut local_names = HashSet::default();
+pub(super) fn generator_cellvars(generator: &ruff_python_ast::ExprGenerator) -> FxHashSet<String> {
+    let mut local_names = FxHashSet::default();
     for comprehension in &generator.generators {
         let mut names = Vec::new();
         collect_target_names(&comprehension.target, &mut names);
@@ -2201,10 +2201,10 @@ pub(super) fn future_feature_flags(body: &[Stmt]) -> u32 {
         })
 }
 
-pub(super) fn module_global_names(body: &[Stmt]) -> HashSet<String> {
+pub(super) fn module_global_names(body: &[Stmt]) -> FxHashSet<String> {
     #[derive(Default)]
     struct Collector {
-        names: HashSet<String>,
+        names: FxHashSet<String>,
         comprehension_depth: usize,
         nested_scope_depth: usize,
     }
@@ -2256,10 +2256,10 @@ pub(super) fn module_global_names(body: &[Stmt]) -> HashSet<String> {
     collector.names
 }
 
-pub(super) fn module_imported_names(body: &[Stmt]) -> HashSet<String> {
+pub(super) fn module_imported_names(body: &[Stmt]) -> FxHashSet<String> {
     #[derive(Default)]
     struct Collector {
-        names: HashSet<String>,
+        names: FxHashSet<String>,
     }
 
     impl<'ast> Visitor<'ast> for Collector {

@@ -72,7 +72,7 @@ impl Compiler {
             .collect()
     }
 
-    pub(super) fn name_strings(&self, names: impl IntoIterator<Item = NameId>) -> Vec<String> {
+    fn name_strings(&self, names: impl IntoIterator<Item = NameId>) -> Vec<String> {
         let interner = &self
             .context
             .scopes

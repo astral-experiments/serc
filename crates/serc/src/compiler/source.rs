@@ -16,7 +16,7 @@ use super::{CachedSourceLine, Compiler, Constant};
 pub(super) struct CompilationContext {
     pub(super) filename: String,
     pub(super) source: Arc<str>,
-    pub(super) line_index: LineIndex,
+    line_index: LineIndex,
     pub(super) scopes: OnceLock<ScopeArena>,
 }
 
