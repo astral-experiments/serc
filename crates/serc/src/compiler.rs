@@ -19,7 +19,7 @@ type HashSet<T> = FxHashSet<T>;
 
 use crate::CompileError;
 use crate::assembler::{AssembledCode, Assembler, InstructionId, Label, SourceLocation};
-use crate::code_object::{CodeObject, Constant};
+use crate::code_object::{CodeObject, Constant, LocalsIdentity, MarshalHints};
 use crate::target::code_flags::{
     CO_ASYNC_GENERATOR, CO_COROUTINE, CO_FUTURE_ANNOTATIONS, CO_FUTURE_BARRY_AS_BDFL, CO_GENERATOR,
     CO_HAS_DOCSTRING, CO_METHOD, CO_NESTED, CO_NEWLOCALS, CO_OPTIMIZED, CO_VARARGS, CO_VARKEYWORDS,
@@ -184,7 +184,7 @@ struct CodeUnitSpec {
 
 #[derive(Debug, Default)]
 struct OutputState {
-    constants: Vec<Constant>,
+    constants: ConstantPool,
     deferred_constants_before_return: Vec<(InstructionId, Constant)>,
     deferred_constants: Vec<(Option<InstructionId>, Constant)>,
     deferred_names: Vec<(InstructionId, String)>,

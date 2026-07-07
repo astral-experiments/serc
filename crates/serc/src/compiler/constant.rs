@@ -3,6 +3,52 @@
 
 use super::*;
 
+#[derive(Debug, Default)]
+pub(super) struct ConstantPool {
+    values: Vec<Constant>,
+}
+
+impl ConstantPool {
+    pub(super) fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    pub(super) fn intern(&mut self, constant: Constant) -> Result<u32, CompileError> {
+        if let Some(index) = self
+            .values
+            .iter()
+            .position(|existing| ConstantEquality::PoolKey.equal(existing, &constant))
+        {
+            return to_u32(index, "constant index");
+        }
+        let index = to_u32(self.values.len(), "constant count")?;
+        self.values.push(constant);
+        Ok(index)
+    }
+
+    pub(super) fn retain_used(
+        &mut self,
+        used: &HashSet<u32>,
+    ) -> Result<Vec<Option<u32>>, CompileError> {
+        let mut index_map = vec![None; self.values.len()];
+        let mut retained = Vec::with_capacity(self.values.len());
+        for (old_index, constant) in std::mem::take(&mut self.values).into_iter().enumerate() {
+            let old_index_u32 = to_u32(old_index, "constant index")?;
+            if old_index == 0 || used.contains(&old_index_u32) {
+                let new_index = to_u32(retained.len(), "constant count")?;
+                index_map[old_index] = Some(new_index);
+                retained.push(constant);
+            }
+        }
+        self.values = retained;
+        Ok(index_map)
+    }
+
+    pub(super) fn into_values(self) -> Vec<Constant> {
+        self.values
+    }
+}
+
 impl Compiler {
     pub(super) fn emit_folded_constant(
         &mut self,
@@ -168,17 +214,7 @@ impl Compiler {
     }
 
     pub(super) fn add_constant(&mut self, constant: Constant) -> Result<u32, CompileError> {
-        if let Some(index) = self
-            .output
-            .constants
-            .iter()
-            .position(|existing| constants_equal(existing, &constant))
-        {
-            return to_u32(index, "constant index");
-        }
-        let index = to_u32(self.output.constants.len(), "constant count")?;
-        self.output.constants.push(constant);
-        Ok(index)
+        self.output.constants.intern(constant)
     }
 
     pub(super) fn add_interned_string_tuple(
@@ -196,21 +232,9 @@ impl Compiler {
 
     pub(super) fn remove_unused_constants(&mut self) -> Result<(), CompileError> {
         let used = self.assembler.used_constant_indices(LOAD_CONST);
-        let mut index_map = vec![None; self.output.constants.len()];
-        let mut retained = Vec::with_capacity(self.output.constants.len());
-        for (old_index, constant) in std::mem::take(&mut self.output.constants)
-            .into_iter()
-            .enumerate()
-        {
-            if old_index == 0 || used.contains(&u32::try_from(old_index).unwrap()) {
-                let new_index = to_u32(retained.len(), "constant count")?;
-                index_map[old_index] = Some(new_index);
-                retained.push(constant);
-            }
-        }
+        let index_map = self.output.constants.retain_used(&used)?;
         self.assembler
             .remap_constant_indices(LOAD_CONST, &index_map);
-        self.output.constants = retained;
         Ok(())
     }
 
@@ -346,70 +370,93 @@ pub(super) fn explicit_surrogate_string(value: &str, source: &str) -> Option<Vec
     replaced.then_some(bytes)
 }
 
-fn constants_equal(left: &Constant, right: &Constant) -> bool {
-    match (left, right) {
-        (Constant::None, Constant::None) | (Constant::Ellipsis, Constant::Ellipsis) => true,
-        (Constant::Bool(left), Constant::Bool(right)) => left == right,
-        (Constant::Int(left), Constant::Int(right)) => left == right,
-        (Constant::SignedInt(left), Constant::SignedInt(right)) => left == right,
-        (
-            Constant::BigInt {
-                negative: left_negative,
-                digits: left_digits,
-            },
-            Constant::BigInt {
-                negative: right_negative,
-                digits: right_digits,
-            },
-        ) => left_negative == right_negative && left_digits == right_digits,
-        (Constant::Float(left), Constant::Float(right)) => left.to_bits() == right.to_bits(),
-        (
-            Constant::Complex {
-                real: left_real,
-                imag: left_imag,
-            },
-            Constant::Complex {
-                real: right_real,
-                imag: right_imag,
-            },
-        ) => {
-            left_real.to_bits() == right_real.to_bits()
-                && left_imag.to_bits() == right_imag.to_bits()
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConstantEquality {
+    /// Equality for CPython's constant table, including type and floating-point bit identity.
+    PoolKey,
+    /// Python value equality used while folding set-like literals and membership tests.
+    PythonValue,
+}
+
+impl ConstantEquality {
+    #[expect(
+        clippy::float_cmp,
+        reason = "CPython constant deduplication uses exact numeric equality"
+    )]
+    fn equal(self, left: &Constant, right: &Constant) -> bool {
+        if matches!(self, Self::PythonValue)
+            && let (Some((left_real, left_imag)), Some((right_real, right_imag))) =
+                (numeric_parts(left), numeric_parts(right))
+        {
+            return left_imag == right_imag && numeric_reals_equal(&left_real, &right_real);
         }
-        (Constant::String(left), Constant::String(right)) => left == right,
-        (Constant::SurrogateString(left), Constant::SurrogateString(right)) => left == right,
-        (Constant::Bytes(left), Constant::Bytes(right)) => left == right,
-        (Constant::Tuple(left), Constant::Tuple(right)) => {
-            left.len() == right.len()
-                && left
-                    .iter()
-                    .zip(right)
-                    .all(|(left, right)| constants_equal(left, right))
+
+        match (left, right) {
+            (Constant::None, Constant::None) | (Constant::Ellipsis, Constant::Ellipsis) => true,
+            (Constant::Bool(left), Constant::Bool(right)) => left == right,
+            (Constant::Int(left), Constant::Int(right)) => left == right,
+            (Constant::SignedInt(left), Constant::SignedInt(right)) => left == right,
+            (
+                Constant::BigInt {
+                    negative: left_negative,
+                    digits: left_digits,
+                },
+                Constant::BigInt {
+                    negative: right_negative,
+                    digits: right_digits,
+                },
+            ) => left_negative == right_negative && left_digits == right_digits,
+            (Constant::Float(left), Constant::Float(right)) => left.to_bits() == right.to_bits(),
+            (
+                Constant::Complex {
+                    real: left_real,
+                    imag: left_imag,
+                },
+                Constant::Complex {
+                    real: right_real,
+                    imag: right_imag,
+                },
+            ) => {
+                left_real.to_bits() == right_real.to_bits()
+                    && left_imag.to_bits() == right_imag.to_bits()
+            }
+            (Constant::String(left), Constant::String(right)) => left == right,
+            (Constant::SurrogateString(left), Constant::SurrogateString(right)) => left == right,
+            (Constant::Bytes(left), Constant::Bytes(right)) => left == right,
+            (Constant::Tuple(left), Constant::Tuple(right)) => {
+                left.len() == right.len()
+                    && left
+                        .iter()
+                        .zip(right)
+                        .all(|(left, right)| self.equal(left, right))
+            }
+            (Constant::FrozenSet(left), Constant::FrozenSet(right)) => {
+                left.len() == right.len()
+                    && left
+                        .iter()
+                        .all(|left| right.iter().any(|right| self.equal(left, right)))
+            }
+            (
+                Constant::Slice {
+                    lower: left_lower,
+                    upper: left_upper,
+                    step: left_step,
+                },
+                Constant::Slice {
+                    lower: right_lower,
+                    upper: right_upper,
+                    step: right_step,
+                },
+            ) => {
+                // Python-value comparison is recursive only for tuple and frozenset constants.
+                // Slice objects retain the constant-pool identity of their members.
+                Self::PoolKey.equal(left_lower, right_lower)
+                    && Self::PoolKey.equal(left_upper, right_upper)
+                    && Self::PoolKey.equal(left_step, right_step)
+            }
+            (Constant::Code(left), Constant::Code(right)) => code_objects_equal(left, right),
+            (_, _) => false,
         }
-        (Constant::FrozenSet(left), Constant::FrozenSet(right)) => {
-            left.len() == right.len()
-                && left
-                    .iter()
-                    .all(|left| right.iter().any(|right| constants_equal(left, right)))
-        }
-        (
-            Constant::Slice {
-                lower: left_lower,
-                upper: left_upper,
-                step: left_step,
-            },
-            Constant::Slice {
-                lower: right_lower,
-                upper: right_upper,
-                step: right_step,
-            },
-        ) => {
-            constants_equal(left_lower, right_lower)
-                && constants_equal(left_upper, right_upper)
-                && constants_equal(left_step, right_step)
-        }
-        (Constant::Code(left), Constant::Code(right)) => code_objects_equal(left, right),
-        (_, _) => false,
     }
 }
 
@@ -419,34 +466,8 @@ enum NumericReal {
     Float(f64),
 }
 
-#[expect(
-    clippy::float_cmp,
-    reason = "CPython constant deduplication uses exact numeric equality"
-)]
-pub(super) fn python_constants_equal(left: &Constant, right: &Constant) -> bool {
-    if let (Some((left_real, left_imag)), Some((right_real, right_imag))) =
-        (numeric_parts(left), numeric_parts(right))
-    {
-        return left_imag == right_imag && numeric_reals_equal(&left_real, &right_real);
-    }
-    match (left, right) {
-        (Constant::Tuple(left), Constant::Tuple(right)) => {
-            left.len() == right.len()
-                && left
-                    .iter()
-                    .zip(right)
-                    .all(|(left, right)| python_constants_equal(left, right))
-        }
-        (Constant::FrozenSet(left), Constant::FrozenSet(right)) => {
-            left.len() == right.len()
-                && left.iter().all(|left| {
-                    right
-                        .iter()
-                        .any(|right| python_constants_equal(left, right))
-                })
-        }
-        _ => constants_equal(left, right),
-    }
+pub(super) fn python_constant_values_equal(left: &Constant, right: &Constant) -> bool {
+    ConstantEquality::PythonValue.equal(left, right)
 }
 
 fn numeric_parts(value: &Constant) -> Option<(NumericReal, f64)> {
@@ -577,7 +598,7 @@ fn code_objects_equal(left: &CodeObject, right: &CodeObject) -> bool {
             .constants
             .iter()
             .zip(&right.constants)
-            .all(|(left, right)| constants_equal(left, right))
+            .all(|(left, right)| ConstantEquality::PoolKey.equal(left, right))
         && left.names == right.names
         && left.locals == right.locals
         && left.local_kinds == right.local_kinds
@@ -587,7 +608,9 @@ fn code_objects_equal(left: &CodeObject, right: &CodeObject) -> bool {
         && left.first_line_number == right.first_line_number
         && left.line_table == right.line_table
         && left.exception_table == right.exception_table
-        && left.annotation_thunk == right.annotation_thunk
+        && left
+            .marshal_hints
+            .equal_for_constant_pool(&right.marshal_hints)
 }
 pub(super) fn literal_constant(expression: &Expr) -> Option<Constant> {
     match expression {
@@ -1389,4 +1412,90 @@ pub(super) fn big_integer_digits(token: &str) -> Vec<u16> {
         value.pop();
     }
     value
+}
+
+#[cfg(test)]
+mod tests {
+    use rustc_hash::FxHashSet;
+
+    use super::{ConstantEquality, ConstantPool};
+    use crate::code_object::{CodeObject, Constant, LocalsIdentity, MarshalHints};
+
+    fn code_object(constants: Vec<Constant>) -> CodeObject {
+        CodeObject {
+            arg_count: 0,
+            positional_only_arg_count: 0,
+            keyword_only_arg_count: 0,
+            stack_size: 1,
+            flags: 0,
+            bytecode: Vec::new(),
+            constants,
+            names: Vec::new(),
+            locals: vec!["value".to_string()],
+            local_kinds: Vec::new(),
+            filename: "module.py".to_string(),
+            name: "<module>".to_string(),
+            qualified_name: "<module>".to_string(),
+            first_line_number: 1,
+            line_table: Vec::new(),
+            exception_table: Vec::new(),
+            marshal_hints: MarshalHints::default(),
+        }
+    }
+
+    #[test]
+    fn equality_domains_distinguish_pool_keys_from_python_values() {
+        let boolean = Constant::Tuple(vec![Constant::Bool(true), Constant::Float(-0.0)]);
+        let integer = Constant::Tuple(vec![Constant::Int(1), Constant::Float(0.0)]);
+
+        assert!(!ConstantEquality::PoolKey.equal(&boolean, &integer));
+        assert!(ConstantEquality::PythonValue.equal(&boolean, &integer));
+    }
+
+    #[test]
+    fn constant_pool_owns_deduplication_and_retention() {
+        let mut pool = ConstantPool::default();
+        assert_eq!(pool.intern(Constant::None).unwrap(), 0);
+        assert_eq!(pool.intern(Constant::None).unwrap(), 0);
+        assert_eq!(pool.intern(Constant::Int(1)).unwrap(), 1);
+        assert_eq!(
+            pool.intern(Constant::String("kept".to_string())).unwrap(),
+            2
+        );
+
+        let index_map = pool.retain_used(&FxHashSet::from_iter([2])).unwrap();
+
+        assert_eq!(index_map, [Some(0), None, Some(1)]);
+        assert!(matches!(
+            pool.into_values().as_slice(),
+            [Constant::None, Constant::String(value)] if value == "kept"
+        ));
+    }
+
+    #[test]
+    fn code_constant_equality_includes_locals_identity() {
+        let by_value = code_object(Vec::new());
+        let mut fresh = by_value.clone();
+        fresh.marshal_hints.locals_identity = LocalsIdentity::Fresh;
+
+        assert!(!ConstantEquality::PoolKey.equal(
+            &Constant::Code(Box::new(by_value)),
+            &Constant::Code(Box::new(fresh))
+        ));
+    }
+
+    #[test]
+    fn code_constant_equality_ignores_explicit_intern_hints() {
+        let unhinted = code_object(vec![Constant::String("méthode".to_string())]);
+        let mut hinted = unhinted.clone();
+        hinted
+            .marshal_hints
+            .explicitly_interned_strings
+            .insert("méthode".to_string());
+
+        assert!(ConstantEquality::PoolKey.equal(
+            &Constant::Code(Box::new(unhinted)),
+            &Constant::Code(Box::new(hinted))
+        ));
+    }
 }
