@@ -133,15 +133,7 @@ impl Compiler {
         let cell_names: NameSet = plan.cellvars.iter().copied().collect();
         let global_names = plan.globals.iter().copied().collect();
         let initialized_locals = locals.iter().take(parameter_count).copied().collect();
-        let free_names = plan
-            .freevars
-            .iter()
-            .map(|name| names.resolve(*name).to_string())
-            .collect();
-        let locals = locals
-            .iter()
-            .map(|name| names.resolve(*name).to_string())
-            .collect();
+        let free_names = plan.freevars.clone();
 
         let symbols = SymbolState {
             locals,
@@ -213,14 +205,7 @@ impl Compiler {
             .map(|(index, name)| (*name, u32::try_from(free_start + index).unwrap_or(u32::MAX)))
             .collect();
         locals.extend(freevars.iter().copied());
-        let free_names = freevars
-            .iter()
-            .map(|name| names.resolve(*name).to_string())
-            .collect();
-        let locals = locals
-            .iter()
-            .map(|name| names.resolve(*name).to_string())
-            .collect();
+        let free_names = freevars.to_vec();
         let globals = globals.into_iter().collect();
         let nonlocals = nonlocals.into_iter().collect();
         let bound_names = bound_names.into_iter().collect();
@@ -270,8 +255,8 @@ impl Compiler {
         module_bindings.collect_suite(body);
         for name in &module_bindings.comprehension_targets {
             let index = to_u32(self.symbols.locals.len(), "module local count")?;
-            self.symbols.locals.push(name.clone());
             let name = self.required_name_id(name);
+            self.symbols.locals.push(name);
             self.symbols.temporary_indices.insert(name, index);
             self.symbols.hidden_names.insert(name);
         }
@@ -287,7 +272,7 @@ impl Compiler {
             .locals
             .iter()
             .enumerate()
-            .filter(|(_, name)| self.is_cell(name))
+            .filter(|(_, name)| self.is_cell_id(**name))
             .map(|(index, _)| index)
             .collect::<Vec<_>>();
         for index in comprehension_cells {
@@ -308,10 +293,8 @@ impl Compiler {
         if module_annotations {
             let annotation_cell =
                 to_u32(self.symbols.locals.len(), "module annotation cell index")?;
-            self.symbols
-                .locals
-                .push("__conditional_annotations__".to_string());
             let annotation_name = self.required_name_id("__conditional_annotations__");
+            self.symbols.locals.push(annotation_name);
             self.symbols.cell_names.insert(annotation_name);
             self.assembler.set_location(SourceLocation::NONE);
             self.emit(MAKE_CELL, annotation_cell, 0)?;
@@ -439,7 +422,7 @@ impl Compiler {
             .iter()
             .take(self.symbols.locals.len() - self.symbols.free_names.len())
             .enumerate()
-            .filter(|(_, name)| self.is_cell(name))
+            .filter(|(_, name)| self.is_cell_id(**name))
             .map(|(index, _)| index)
             .collect::<Vec<_>>();
         for index in cell_indices {
@@ -467,7 +450,7 @@ impl Compiler {
             .symbols
             .free_names
             .iter()
-            .any(|name| name == ".type_params")
+            .any(|name| *name == self.required_name_id(".type_params"))
         {
             self.load_name(".type_params")?;
             self.store_name("__type_params__")?;
@@ -478,7 +461,7 @@ impl Compiler {
                 .symbols
                 .locals
                 .iter()
-                .position(|name| name == "__classdict__")
+                .position(|name| *name == self.required_name_id("__classdict__"))
                 .expect("classdict cell is present");
             self.emit(STORE_DEREF, to_u32(index, "classdict cell index")?, -1)?;
         }
@@ -564,7 +547,7 @@ impl Compiler {
                 .symbols
                 .locals
                 .iter()
-                .position(|name| name == "__classdict__")
+                .position(|name| *name == self.required_name_id("__classdict__"))
                 .expect("classdict cell is present");
             self.emit(LOAD_FAST, to_u32(index, "classdict cell index")?, 1)?;
             self.store_name("__classdictcell__")?;
@@ -574,7 +557,7 @@ impl Compiler {
                 .symbols
                 .locals
                 .iter()
-                .position(|name| name == "__class__")
+                .position(|name| *name == self.required_name_id("__class__"))
                 .expect("class cell is present");
             self.emit(LOAD_FAST, to_u32(index, "class cell index")?, 1)?;
             self.emit(COPY, 1, 1)?;
@@ -682,7 +665,7 @@ impl Compiler {
                 let storage_kind =
                     if index >= self.symbols.locals.len() - self.symbols.free_names.len() {
                         CO_FAST_FREE
-                    } else if self.is_cell(name) {
+                    } else if self.is_cell_id(*name) {
                         if index < self.symbols.fast_local_count {
                             CO_FAST_LOCAL | CO_FAST_CELL
                         } else {
@@ -693,7 +676,7 @@ impl Compiler {
                     };
                 argument_kind
                     | storage_kind
-                    | if self.is_hidden(name) {
+                    | if self.is_hidden_id(*name) {
                         CO_FAST_HIDDEN
                     } else {
                         0
@@ -704,7 +687,7 @@ impl Compiler {
             .symbols
             .locals
             .iter()
-            .map(|name| self.mangled_name(name))
+            .map(|name| self.mangled_name(self.resolve_name(*name)))
             .collect();
         let parameter_count = usize::try_from(
             self.unit.arg_count
@@ -784,7 +767,7 @@ impl Compiler {
             .iter()
             .take(self.symbols.locals.len() - self.symbols.free_names.len())
             .enumerate()
-            .filter(|(_, name)| self.is_cell(name))
+            .filter(|(_, name)| self.is_cell_id(**name))
             .map(|(index, _)| index)
             .collect();
         for index in cells {

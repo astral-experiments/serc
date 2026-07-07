@@ -5,10 +5,10 @@ use super::*;
 
 #[derive(Debug, Default)]
 pub(super) struct SymbolState {
-    pub(super) locals: Vec<String>,
+    pub(super) locals: Vec<NameId>,
     pub(super) fast_local_count: usize,
     pub(super) cell_names: NameSet,
-    pub(super) free_names: Vec<String>,
+    pub(super) free_names: Vec<NameId>,
     pub(super) temporary_indices: FxHashMap<NameId, u32>,
     pub(super) hidden_names: NameSet,
     pub(super) active_temporaries: NameSet,
@@ -104,6 +104,15 @@ impl Compiler {
         self.name_id(name).is_some_and(|name| names.contains(name))
     }
 
+    pub(super) fn resolve_name(&self, name: NameId) -> &str {
+        self.context
+            .scopes
+            .get()
+            .expect("scope arena should be initialized before lowering")
+            .names
+            .resolve(name)
+    }
+
     pub(super) fn scope_index(&self, indices: &FxHashMap<NameId, u32>, name: &str) -> Option<u32> {
         self.name_id(name)
             .and_then(|name| indices.get(&name).copied())
@@ -113,8 +122,12 @@ impl Compiler {
         self.contains_name(&self.symbols.cell_names, name)
     }
 
-    pub(super) fn is_hidden(&self, name: &str) -> bool {
-        self.contains_name(&self.symbols.hidden_names, name)
+    pub(super) fn is_cell_id(&self, name: NameId) -> bool {
+        self.symbols.cell_names.contains(name)
+    }
+
+    pub(super) fn is_hidden_id(&self, name: NameId) -> bool {
+        self.symbols.hidden_names.contains(name)
     }
 
     pub(super) fn is_initialized(&self, name: &str) -> bool {
@@ -409,24 +422,37 @@ impl Compiler {
 
     pub(super) fn closure_index(&self, name: &str) -> Result<u32, CompileError> {
         let name_id = self.required_name_id(name);
+        self.closure_index_id(name_id)
+    }
+
+    fn closure_index_id(&self, name: NameId) -> Result<u32, CompileError> {
         match &self.unit.scope {
             Scope::Module => self
-                .temporary_index(name)
-                .filter(|_| self.is_cell(name))
+                .symbols
+                .temporary_indices
+                .get(&name)
+                .copied()
+                .filter(|_| self.is_cell_id(name))
                 .ok_or_else(|| {
                     CompileError::Internal(format!(
-                        "module cannot provide closure variable `{name}`"
+                        "module cannot provide closure variable `{}`",
+                        self.resolve_name(name)
                     ))
                 }),
-            Scope::Class { .. } => self.symbols.locals
+            Scope::Class { .. } => self
+                .symbols
+                .locals
                 .iter()
-                .position(|local| local == name)
+                .position(|local| *local == name)
                 .map(|index| to_u32(index, "class closure variable index"))
                 .transpose()?
                 .ok_or_else(|| {
+                    let name = self.resolve_name(name);
+                    let locals = self.name_strings(self.symbols.locals.iter().copied());
+                    let free_names = self.name_strings(self.symbols.free_names.iter().copied());
                     CompileError::Internal(format!(
                         "class `{}` cannot provide closure variable `{name}` (locals: {:?}; free names: {:?})",
-                        self.unit.qualified_name, self.symbols.locals, self.symbols.free_names
+                        self.unit.qualified_name, locals, free_names
                     ))
                 }),
             Scope::Function {
@@ -434,11 +460,14 @@ impl Compiler {
                 free_indices,
                 ..
             } => indices
-                .get(&name_id)
-                .or_else(|| free_indices.get(&name_id))
+                .get(&name)
+                .or_else(|| free_indices.get(&name))
                 .copied()
                 .ok_or_else(|| {
-                    CompileError::Internal(format!("missing closure variable `{name}`"))
+                    CompileError::Internal(format!(
+                        "missing closure variable `{}`",
+                        self.resolve_name(name)
+                    ))
                 }),
         }
     }
@@ -468,12 +497,12 @@ impl Compiler {
         }
     }
 
-    pub(super) fn emit_closure_tuple(&mut self, names: &[String]) -> Result<(), CompileError> {
+    pub(super) fn emit_closure_tuple(&mut self, names: &[NameId]) -> Result<(), CompileError> {
         for (index, name) in names.iter().enumerate() {
             if index > 0 {
                 self.assembler.fusion_barrier();
             }
-            let local = self.closure_index(name)?;
+            let local = self.closure_index_id(*name)?;
             self.emit(LOAD_FAST, local, 1)?;
         }
         self.emit_build(BUILD_TUPLE, names.len())
