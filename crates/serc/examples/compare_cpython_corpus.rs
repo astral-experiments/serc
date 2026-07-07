@@ -68,6 +68,8 @@ struct Options {
     roots: Vec<PathBuf>,
     limit: Option<usize>,
     expected_files: Option<usize>,
+    expected_exact: Option<usize>,
+    expected_cpython_rejected: Option<usize>,
     require_all: bool,
     examples: usize,
     dump_mismatches: Option<PathBuf>,
@@ -183,12 +185,62 @@ fn main() -> ExitCode {
         }
     }
 
-    let has_failures = outcomes.iter().any(|outcome| outcome.kind.is_failure());
-    if options.require_all && has_failures {
-        ExitCode::FAILURE
-    } else {
-        ExitCode::SUCCESS
+    let gate_failures = validate_outcome_counts(
+        &counts,
+        options.expected_exact,
+        options.expected_cpython_rejected,
+        options.require_all,
+    );
+    for failure in &gate_failures {
+        eprintln!("compatibility gate failed: {failure}");
     }
+    if gate_failures.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+fn validate_outcome_counts(
+    counts: &BTreeMap<OutcomeKind, usize>,
+    expected_exact: Option<usize>,
+    expected_cpython_rejected: Option<usize>,
+    require_all: bool,
+) -> Vec<String> {
+    let count = |kind| counts.get(&kind).copied().unwrap_or_default();
+    let exact = count(OutcomeKind::Exact);
+    let cpython_rejected = count(OutcomeKind::CpythonRejected);
+    let mut failures = Vec::new();
+
+    if let Some(expected) = expected_exact
+        && exact != expected
+    {
+        failures.push(format!(
+            "found {exact} exact matches, but expected {expected}"
+        ));
+    }
+    if let Some(expected) = expected_cpython_rejected
+        && cpython_rejected != expected
+    {
+        failures.push(format!(
+            "CPython rejected {cpython_rejected} files, but expected {expected}"
+        ));
+    }
+    if require_all {
+        let failed = counts
+            .iter()
+            .filter(|(kind, _)| kind.is_failure())
+            .map(|(_, count)| count)
+            .sum::<usize>();
+        if failed != 0 {
+            failures.push(format!("{failed} files did not match CPython exactly"));
+        }
+        if exact == 0 {
+            failures.push("no files matched CPython exactly".to_string());
+        }
+    }
+
+    failures
 }
 
 fn verify_python(python: &str) -> Result<(), String> {
@@ -196,6 +248,8 @@ fn verify_python(python: &str) -> Result<(), String> {
     let magic = CPYTHON_TARGET.magic_hex();
     let output = Command::new(python)
         .args([
+            "-I",
+            "-S",
             "-c",
             "import importlib.util, sys; actual = sys.version_info[:3]; magic = importlib.util.MAGIC_NUMBER.hex(); print(f'{sys.implementation.name} {'.'.join(map(str, actual))} magic {magic}'); expected = tuple(map(int, sys.argv[2].split('.'))); raise SystemExit(sys.implementation.name != sys.argv[1] or actual != expected or magic != sys.argv[3])",
             CPYTHON_TARGET.implementation,
@@ -220,6 +274,8 @@ fn parse_options() -> Result<Options, String> {
     let mut roots = Vec::new();
     let mut limit = None;
     let mut expected_files = None;
+    let mut expected_exact = None;
+    let mut expected_cpython_rejected = None;
     let mut require_all = false;
     let mut examples = 10;
     let mut dump_mismatches = None;
@@ -257,6 +313,24 @@ fn parse_options() -> Result<Options, String> {
                         .map_err(|_| "--expected-files requires a number".to_string())?,
                 );
             }
+            "--expected-exact" => {
+                expected_exact = Some(
+                    arguments
+                        .next()
+                        .ok_or_else(|| "--expected-exact requires a number".to_string())?
+                        .parse()
+                        .map_err(|_| "--expected-exact requires a number".to_string())?,
+                );
+            }
+            "--expected-cpython-rejected" => {
+                expected_cpython_rejected = Some(
+                    arguments
+                        .next()
+                        .ok_or_else(|| "--expected-cpython-rejected requires a number".to_string())?
+                        .parse()
+                        .map_err(|_| "--expected-cpython-rejected requires a number".to_string())?,
+                );
+            }
             "--dump-mismatches" => {
                 dump_mismatches =
                     Some(PathBuf::from(arguments.next().ok_or_else(|| {
@@ -266,7 +340,7 @@ fn parse_options() -> Result<Options, String> {
             "--require-all" => require_all = true,
             "--help" | "-h" => {
                 return Err(
-                    "usage: compare_cpython_corpus [--python PATH] [--limit N] [--expected-files N] [--examples N] [--require-all] [--dump-mismatches DIR] [ROOT ...]"
+                    "usage: compare_cpython_corpus [--python PATH] [--limit N] [--expected-files N] [--expected-exact N] [--expected-cpython-rejected N] [--examples N] [--require-all] [--dump-mismatches DIR] [ROOT ...]"
                         .to_string(),
                 );
             }
@@ -295,6 +369,8 @@ fn parse_options() -> Result<Options, String> {
         roots,
         limit,
         expected_files,
+        expected_exact,
+        expected_cpython_rejected,
         require_all,
         examples,
         dump_mismatches,
@@ -318,7 +394,7 @@ fn dump_mismatches(
                 .expect("a mismatch compiled successfully in the first pass")
                 .marshal();
             let oracle = Command::new(python)
-                .args(["-c", ORACLE])
+                .args(["-I", "-S", "-c", ORACLE])
                 .arg(&outcome.path)
                 .output()?
                 .stdout;
@@ -352,7 +428,11 @@ fn discover(roots: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
 }
 
 fn compare(path: &Path, python: &str) -> Outcome {
-    let oracle = match Command::new(python).args(["-c", ORACLE]).arg(path).output() {
+    let oracle = match Command::new(python)
+        .args(["-I", "-S", "-c", ORACLE])
+        .arg(path)
+        .output()
+    {
         Ok(output) if output.status.success() => output.stdout,
         Ok(output) if output.status.code() == Some(2) => {
             return Outcome {
@@ -467,4 +547,37 @@ fn one_line(bytes: &[u8]) -> String {
         .next()
         .unwrap_or_default()
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{OutcomeKind, validate_outcome_counts};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn require_all_rejects_a_corpus_without_exact_matches() {
+        let counts = BTreeMap::from([(OutcomeKind::CpythonRejected, 3)]);
+
+        let failures = validate_outcome_counts(&counts, None, None, true);
+
+        assert!(
+            failures
+                .iter()
+                .any(|failure| failure == "no files matched CPython exactly")
+        );
+    }
+
+    #[test]
+    fn validates_expected_outcome_counts() {
+        let counts = BTreeMap::from([(OutcomeKind::Exact, 2), (OutcomeKind::CpythonRejected, 1)]);
+
+        assert!(validate_outcome_counts(&counts, Some(2), Some(1), true).is_empty());
+        assert_eq!(
+            validate_outcome_counts(&counts, Some(3), Some(2), false),
+            [
+                "found 2 exact matches, but expected 3",
+                "CPython rejected 1 files, but expected 2",
+            ]
+        );
+    }
 }

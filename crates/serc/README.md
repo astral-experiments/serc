@@ -42,18 +42,16 @@ parser, and ty semantic test resources. For each CPython-accepted file it compar
 `marshal.dumps(compile(...))` directly with this crate's marshal output:
 
 ```console
-cargo run -p serc --example compare_cpython_corpus -- \
-  --python /path/to/cpython-3.14.5 \
-  --expected-files 2451 \
-  --require-all
+./scripts/check-cpython-compatibility /path/to/cpython-3.14.5
 ```
 
 The comparator refuses any interpreter whose implementation, three-part version, or magic number
 does not exactly match this backend. It also fails on a missing corpus root or an empty corpus.
-Pass `--require-all` to return a failure status unless every CPython-accepted file matches exactly.
-CPython-rejected fixtures are reported separately and are outside the bytecode-compatibility gate.
-Additional roots can be supplied explicitly, and `--python`, `--limit`, and `--examples` control
-the oracle executable and report size. `--expected-files` pins the discovered corpus size. Pass
+Pass `--require-all` to return a failure status unless the corpus contains at least one exact match
+and every CPython-accepted file matches exactly. CPython-rejected fixtures are reported separately.
+The authoritative wrapper also pins the exact and rejected outcome counts, so a changed rejection
+boundary fails the gate. Additional roots can be supplied directly to the example, and `--python`,
+`--limit`, and `--examples` control the oracle executable and report size. Pass
 `--dump-mismatches DIR` to save mismatch inputs and outputs for inspection.
 
 The frozen compatibility gate is pinned to CPython 3.14.5 with magic number `2b0e0d0a` and 2,451
@@ -96,8 +94,8 @@ file that contributes target or marshal-format metadata. Instruction metadata is
 The Ruff dependencies are pinned to a specific Git revision because Ruff's parser crates are not
 published independently.
 
-From the workspace root, `./scripts/check-cpython-compatibility /path/to/python3.14` initializes
-the matching Ruff corpus and runs the complete frozen gate.
+From the workspace root, `./scripts/check-cpython-compatibility /path/to/python3.14` requires the
+initialized matching Ruff submodule and runs the complete frozen gate without mutating the checkout.
 
 ## Benchmarks
 
