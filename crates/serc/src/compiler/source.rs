@@ -313,68 +313,37 @@ fn fstring_literal_span(
     Some(ruff_text_size::TextRange::new(first?, last?))
 }
 
-/// Removes Python comments while preserving the whitespace and newlines around
-/// them, as CPython does for the source text stored by a t-string interpolation.
+/// Removes expression-level Python comments while preserving every other byte,
+/// as CPython does for the source text stored by a t-string interpolation.
 pub(super) fn strip_expression_comments(source: &str) -> String {
-    let bytes = source.as_bytes();
-    let mut output = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    let mut quote = None;
-    let mut triple_quoted = false;
-
-    while index < bytes.len() {
-        if let Some(delimiter) = quote {
-            if bytes[index] == b'\\' {
-                output.push(bytes[index]);
-                index += 1;
-                if index < bytes.len() {
-                    output.push(bytes[index]);
-                    index += 1;
-                }
-                continue;
+    let parsed = ruff_python_parser::parse_unchecked(
+        source,
+        ruff_python_parser::ParseOptions::from(ruff_python_parser::Mode::ParenthesizedExpression),
+    );
+    let mut output = String::with_capacity(source.len());
+    let mut copied = 0;
+    // Ruff tokenizes comments inside nested interpolated strings. They are part of the nested
+    // string's source from the outer expression's perspective, so preserve them here.
+    let mut interpolated_string_depth = 0_u32;
+    for token in parsed.tokens() {
+        match token.kind() {
+            TokenKind::FStringStart | TokenKind::TStringStart => {
+                interpolated_string_depth += 1;
             }
-            if bytes[index] == delimiter {
-                if triple_quoted {
-                    if bytes.get(index..index + 3) == Some(&[delimiter; 3]) {
-                        output.extend_from_slice(&bytes[index..index + 3]);
-                        index += 3;
-                        quote = None;
-                        triple_quoted = false;
-                        continue;
-                    }
-                } else {
-                    output.push(bytes[index]);
-                    index += 1;
-                    quote = None;
-                    continue;
-                }
+            TokenKind::FStringEnd | TokenKind::TStringEnd => {
+                interpolated_string_depth = interpolated_string_depth.saturating_sub(1);
             }
-            output.push(bytes[index]);
-            index += 1;
-            continue;
-        }
-
-        match bytes[index] {
-            b'#' => {
-                while index < bytes.len() && !matches!(bytes[index], b'\n' | b'\r') {
-                    index += 1;
-                }
+            TokenKind::Comment if interpolated_string_depth == 0 => {
+                let start = usize::from(token.start());
+                let end = usize::from(token.end());
+                output.push_str(&source[copied..start]);
+                copied = end;
             }
-            delimiter @ (b'\'' | b'"') => {
-                triple_quoted = bytes.get(index..index + 3) == Some(&[delimiter; 3]);
-                let length = if triple_quoted { 3 } else { 1 };
-                output.extend_from_slice(&bytes[index..index + length]);
-                index += length;
-                quote = Some(delimiter);
-            }
-            byte => {
-                output.push(byte);
-                index += 1;
-            }
+            _ => {}
         }
     }
-
-    String::from_utf8(output).expect("removing ASCII comments preserves UTF-8")
+    output.push_str(&source[copied..]);
+    output
 }
 pub(super) fn implicit_return_range(
     compiler: &Compiler,
