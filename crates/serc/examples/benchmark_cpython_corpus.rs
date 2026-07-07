@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fmt::Write as _;
 use std::hint::black_box;
-use std::io::{self, BufRead, BufReader, Write as _};
+use std::io::{self, BufRead, BufReader, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitCode, Stdio};
 use std::thread;
@@ -90,7 +90,10 @@ while True:
             accepted.append((filename, source))
             precompiled.append(code)
             accepted_bytes += len(source.encode("utf-8"))
-            print(f"ACCEPT\t{index}")
+            serialized = marshal.dumps(code)
+            print(f"ACCEPT\t{index}\t{len(serialized)}", flush=True)
+            sys.stdout.buffer.write(serialized)
+            sys.stdout.buffer.flush()
         sources = accepted
         print(
             f"MANIFEST\t{len(accepted)}\t{rejected}\t{accepted_bytes}",
@@ -295,8 +298,24 @@ struct PythonRunner {
 #[derive(Debug)]
 struct PythonManifest {
     accepted_indices: Vec<usize>,
+    marshaled: Vec<Vec<u8>>,
     rejected: usize,
     source_bytes: usize,
+}
+
+#[derive(Debug)]
+struct ArtifactIdentity {
+    profile: String,
+    serc_commit: String,
+    serc_dirty: bool,
+    serc_diff_hash: String,
+    cargo_lock_hash: String,
+    corpus_content_hash: String,
+    benchmark_executable: String,
+    benchmark_executable_hash: String,
+    python_realpath: String,
+    python_executable_hash: String,
+    hash_scheme: String,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -340,7 +359,7 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), String> {
     let options = parse_options_from(env::args().skip(1))?;
-    let paths = discover(&options.roots, options.limit);
+    let paths = discover(&options.roots, options.limit)?;
     if paths.is_empty() {
         return Err("no Python files discovered".to_string());
     }
@@ -349,9 +368,10 @@ fn run() -> Result<(), String> {
         .iter()
         .map(|source| source.source.len())
         .sum::<usize>();
+    let identity = ArtifactIdentity::capture(&options.python, &sources)?;
 
     let mut python = PythonRunner::start(&options.python)?;
-    let manifest = python.initialize(&sources)?;
+    let mut manifest = python.initialize(&sources)?;
     if manifest.accepted_indices.len() + manifest.rejected != sources.len() {
         return Err(format!(
             "CPython manifest is incomplete: {} accepted + {} rejected != {} discovered",
@@ -391,6 +411,9 @@ fn run() -> Result<(), String> {
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
+    verify_exact_marshal(&accepted, &precompiled, &manifest.marshaled)?;
+    manifest.marshaled.clear();
+    manifest.marshaled.shrink_to_fit();
 
     let expected_rows = expected_row_count(&options)?;
     let mut rows = Vec::with_capacity(expected_rows);
@@ -427,6 +450,7 @@ fn run() -> Result<(), String> {
 
     let metadata = metadata(
         &options,
+        &identity,
         &sources,
         discovered_source_bytes,
         &manifest,
@@ -555,13 +579,13 @@ fn parse_duration(value: &str) -> Result<Duration, String> {
         .map_err(|_| "--cooldown-ms requires a non-negative integer".to_string())
 }
 
-fn discover(roots: &[PathBuf], limit: Option<usize>) -> Vec<PathBuf> {
+fn discover(roots: &[PathBuf], limit: Option<usize>) -> Result<Vec<PathBuf>, String> {
     let mut paths = Vec::new();
     for root in roots {
         for entry in WalkDir::new(root).follow_links(false) {
-            let Ok(entry) = entry else {
-                continue;
-            };
+            let entry = entry.map_err(|error| {
+                format!("failed to walk corpus root {}: {error}", root.display())
+            })?;
             if entry.file_type().is_file()
                 && entry
                     .path()
@@ -577,7 +601,7 @@ fn discover(roots: &[PathBuf], limit: Option<usize>) -> Vec<PathBuf> {
     if let Some(limit) = limit {
         paths.truncate(limit);
     }
-    paths
+    Ok(paths)
 }
 
 fn load_sources(paths: Vec<PathBuf>) -> Result<Vec<SourceFile>, String> {
@@ -678,15 +702,26 @@ impl PythonRunner {
             .map_err(|error| format!("failed to flush CPython input: {error}"))?;
 
         let mut accepted_indices = Vec::new();
+        let mut marshaled = Vec::new();
         loop {
             let line = self.read_line()?;
             let fields = line.split('\t').collect::<Vec<_>>();
             match fields.as_slice() {
-                ["ACCEPT", index] => accepted_indices.push(
-                    index
+                ["ACCEPT", index, length] => {
+                    accepted_indices.push(
+                        index
+                            .parse::<usize>()
+                            .map_err(|_| format!("invalid accepted index: {line}"))?,
+                    );
+                    let length = length
                         .parse::<usize>()
-                        .map_err(|_| format!("invalid accepted index: {line}"))?,
-                ),
+                        .map_err(|_| format!("invalid marshal length: {line}"))?;
+                    let mut bytes = vec![0; length];
+                    self.stdout.read_exact(&mut bytes).map_err(|error| {
+                        format!("failed to read CPython marshal output: {error}")
+                    })?;
+                    marshaled.push(bytes);
+                }
                 ["MANIFEST", accepted, rejected, source_bytes] => {
                     let accepted = accepted
                         .parse::<usize>()
@@ -699,6 +734,7 @@ impl PythonRunner {
                     }
                     return Ok(PythonManifest {
                         accepted_indices,
+                        marshaled,
                         rejected: rejected
                             .parse::<usize>()
                             .map_err(|_| format!("invalid manifest: {line}"))?,
@@ -746,6 +782,41 @@ impl PythonRunner {
         }
         Ok(())
     }
+}
+
+fn verify_exact_marshal(
+    accepted: &[&SourceFile],
+    precompiled: &[CompiledModule],
+    cpython_marshaled: &[Vec<u8>],
+) -> Result<(), String> {
+    if accepted.is_empty() {
+        return Err("exact-marshal preflight has no CPython-accepted files".to_string());
+    }
+    if precompiled.len() != accepted.len() || cpython_marshaled.len() != accepted.len() {
+        return Err(format!(
+            "exact-marshal preflight is incomplete: {} sources, {} Rust modules, {} CPython outputs",
+            accepted.len(),
+            precompiled.len(),
+            cpython_marshaled.len(),
+        ));
+    }
+    for ((source, module), cpython) in accepted.iter().zip(precompiled).zip(cpython_marshaled) {
+        let rust = module.marshal();
+        if rust != *cpython {
+            let difference = rust
+                .iter()
+                .zip(cpython)
+                .position(|(rust, cpython)| rust != cpython)
+                .unwrap_or_else(|| rust.len().min(cpython.len()));
+            return Err(format!(
+                "exact-marshal preflight failed for {} at byte {difference}: Rust={} bytes, CPython={} bytes",
+                source.path.display(),
+                rust.len(),
+                cpython.len(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn parse_sample_response(line: &str) -> Result<SampleResult, String> {
@@ -898,8 +969,197 @@ fn duration_ns(duration: Duration, clock: &str) -> Result<u64, String> {
         .map_err(|_| format!("{clock} sample duration exceeds u64 nanoseconds"))
 }
 
+impl ArtifactIdentity {
+    fn capture(python: &str, sources: &[SourceFile]) -> Result<Self, String> {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .map_err(|error| format!("failed to locate the Serc workspace: {error}"))?;
+        let object_format = git_output(&workspace, &["rev-parse", "--show-object-format"])?;
+        let serc_commit = git_output(&workspace, &["rev-parse", "HEAD^{commit}"])?;
+        let status = git_output_bytes(
+            &workspace,
+            &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+        )?;
+        let mut dirty_identity = Vec::new();
+        append_hash_record(&mut dirty_identity, &status);
+        append_hash_record(
+            &mut dirty_identity,
+            &git_output_bytes(
+                &workspace,
+                &["diff", "--binary", "--no-ext-diff", "HEAD", "--", "."],
+            )?,
+        );
+        let untracked = git_output_bytes(
+            &workspace,
+            &["ls-files", "--others", "--exclude-standard", "-z"],
+        )?;
+        for relative in untracked
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+        {
+            let relative = std::str::from_utf8(relative)
+                .map_err(|_| "Serc has a non-UTF-8 untracked path".to_string())?;
+            append_hash_record(&mut dirty_identity, relative.as_bytes());
+            let contents = fs_err::read(workspace.join(relative)).map_err(|error| {
+                format!("failed to read untracked file {relative} for identity: {error}")
+            })?;
+            append_hash_record(&mut dirty_identity, &contents);
+        }
+
+        let mut corpus_identity = Vec::new();
+        for source in sources {
+            append_hash_record(&mut corpus_identity, source.filename.as_bytes());
+            append_hash_record(&mut corpus_identity, source.source.as_bytes());
+        }
+
+        let benchmark_executable = env::current_exe()
+            .and_then(std::fs::canonicalize)
+            .map_err(|error| format!("failed to resolve benchmark executable: {error}"))?;
+        let profile = profile_from_executable(&benchmark_executable)?;
+        let benchmark_contents = fs_err::read(&benchmark_executable).map_err(|error| {
+            format!(
+                "failed to read benchmark executable {}: {error}",
+                benchmark_executable.display()
+            )
+        })?;
+        let python_realpath = python_realpath(python)?;
+        let python_contents = fs_err::read(&python_realpath).map_err(|error| {
+            format!(
+                "failed to read Python executable {}: {error}",
+                python_realpath.display()
+            )
+        })?;
+        let cargo_lock = fs_err::read(workspace.join("Cargo.lock"))
+            .map_err(|error| format!("failed to read Cargo.lock: {error}"))?;
+        let hash_scheme = format!("git-{object_format}-blob");
+
+        Ok(Self {
+            profile,
+            serc_commit,
+            serc_dirty: !status.is_empty(),
+            serc_diff_hash: git_hash_bytes(&workspace, &dirty_identity)?,
+            cargo_lock_hash: git_hash_bytes(&workspace, &cargo_lock)?,
+            corpus_content_hash: git_hash_bytes(&workspace, &corpus_identity)?,
+            benchmark_executable: benchmark_executable.display().to_string(),
+            benchmark_executable_hash: git_hash_bytes(&workspace, &benchmark_contents)?,
+            python_realpath: python_realpath.display().to_string(),
+            python_executable_hash: git_hash_bytes(&workspace, &python_contents)?,
+            hash_scheme,
+        })
+    }
+}
+
+fn git_output(workspace: &Path, arguments: &[&str]) -> Result<String, String> {
+    let output = git_output_bytes(workspace, arguments)?;
+    String::from_utf8(output)
+        .map(|output| output.trim().to_string())
+        .map_err(|error| format!("git output is not UTF-8: {error}"))
+}
+
+fn git_output_bytes(workspace: &Path, arguments: &[&str]) -> Result<Vec<u8>, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args(arguments)
+        .output()
+        .map_err(|error| format!("failed to run git: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git {} failed with {}: {}",
+            arguments.join(" "),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim(),
+        ));
+    }
+    Ok(output.stdout)
+}
+
+fn git_hash_bytes(workspace: &Path, contents: &[u8]) -> Result<String, String> {
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args(["hash-object", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("failed to start git hash-object: {error}"))?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| "failed to open git hash-object stdin".to_string())?
+        .write_all(contents)
+        .map_err(|error| format!("failed to hash artifact contents: {error}"))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("failed to wait for git hash-object: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git hash-object failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim(),
+        ));
+    }
+    String::from_utf8(output.stdout)
+        .map(|output| output.trim().to_string())
+        .map_err(|error| format!("git hash-object output is not UTF-8: {error}"))
+}
+
+fn append_hash_record(identity: &mut Vec<u8>, value: &[u8]) {
+    identity.extend_from_slice(
+        &u64::try_from(value.len())
+            .expect("artifact identity input length fits in u64")
+            .to_be_bytes(),
+    );
+    identity.extend_from_slice(value);
+}
+
+fn profile_from_executable(executable: &Path) -> Result<String, String> {
+    let directory = executable
+        .parent()
+        .ok_or_else(|| "benchmark executable has no parent directory".to_string())?;
+    let profile_directory = if directory
+        .file_name()
+        .is_some_and(|name| name == "examples" || name == "deps")
+    {
+        directory
+            .parent()
+            .ok_or_else(|| "benchmark executable has no Cargo profile directory".to_string())?
+    } else {
+        directory
+    };
+    profile_directory
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_string)
+        .ok_or_else(|| "Cargo profile directory is not UTF-8".to_string())
+}
+
+fn python_realpath(python: &str) -> Result<PathBuf, String> {
+    let output = Command::new(python)
+        .args([
+            "-I",
+            "-S",
+            "-c",
+            "import os, sys; print(os.path.realpath(sys.executable))",
+        ])
+        .output()
+        .map_err(|error| format!("failed to identify {python}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{python} identity command exited with {}",
+            output.status
+        ));
+    }
+    let path = String::from_utf8(output.stdout)
+        .map_err(|error| format!("{python} executable path is not UTF-8: {error}"))?;
+    Ok(PathBuf::from(path.trim()))
+}
+
 fn metadata(
     options: &Options,
+    identity: &ArtifactIdentity,
     sources: &[SourceFile],
     discovered_source_bytes: usize,
     manifest: &PythonManifest,
@@ -919,13 +1179,11 @@ fn metadata(
         ("python_requested".to_string(), options.python.clone()),
         (
             "python_realpath".to_string(),
-            command_output(
-                &options.python,
-                &[
-                    "-c",
-                    "import os, sys; print(os.path.realpath(sys.executable))",
-                ],
-            )?,
+            identity.python_realpath.clone(),
+        ),
+        (
+            "python_executable_hash".to_string(),
+            identity.python_executable_hash.clone(),
         ),
         (
             "python_version".to_string(),
@@ -979,13 +1237,50 @@ fn metadata(
             accepted_source_bytes.to_string(),
         ),
         (
+            "exact_marshal_preflight".to_string(),
+            "passed".to_string(),
+        ),
+        (
+            "exact_marshal_files".to_string(),
+            manifest.accepted_indices.len().to_string(),
+        ),
+        ("hash_scheme".to_string(), identity.hash_scheme.clone()),
+        (
+            "serc_commit".to_string(),
+            identity.serc_commit.clone(),
+        ),
+        (
+            "serc_dirty".to_string(),
+            identity.serc_dirty.to_string(),
+        ),
+        (
+            "serc_diff_hash".to_string(),
+            identity.serc_diff_hash.clone(),
+        ),
+        (
+            "cargo_lock_hash".to_string(),
+            identity.cargo_lock_hash.clone(),
+        ),
+        (
+            "corpus_content_hash".to_string(),
+            identity.corpus_content_hash.clone(),
+        ),
+        (
+            "benchmark_executable".to_string(),
+            identity.benchmark_executable.clone(),
+        ),
+        (
+            "benchmark_executable_hash".to_string(),
+            identity.benchmark_executable_hash.clone(),
+        ),
+        (
             "rustc".to_string(),
             command_output("rustc", &["-Vv"])?.replace('\n', " | "),
         ),
         ("cargo".to_string(), command_output("cargo", &["-V"])?),
         ("os".to_string(), env::consts::OS.to_string()),
         ("arch".to_string(), env::consts::ARCH.to_string()),
-        ("profile".to_string(), "release".to_string()),
+        ("profile".to_string(), identity.profile.clone()),
         (
             "target_dir".to_string(),
             env::var("CARGO_TARGET_DIR").unwrap_or_else(|_| "target".to_string()),
@@ -1309,8 +1604,9 @@ mod tests {
     use super::{
         BOOTSTRAP_SEED, BlockSample, Engine, Metric, Options, Phase, RawRow, SourceFile, Timings,
         block_order, block_order_label, block_samples, bootstrap_median_ci, cooldown_metadata,
-        expected_row_count, parse_options_from, parse_sample_response, process_timer_result,
-        ratio_statistics, summarize, write_raw,
+        discover, expected_row_count, parse_options_from, parse_sample_response,
+        process_timer_result, profile_from_executable, ratio_statistics, summarize,
+        verify_exact_marshal, write_raw,
     };
 
     fn raw_row(
@@ -1363,6 +1659,58 @@ mod tests {
         assert_eq!(options.cooldown, Duration::from_millis(5000));
         assert_eq!(options.limit, Some(10));
         assert_eq!(options.roots.len(), 1);
+    }
+
+    #[test]
+    fn corpus_discovery_fails_closed() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let missing = directory.path().join("missing");
+
+        let error = discover(std::slice::from_ref(&missing), None)
+            .expect_err("a missing corpus root must fail");
+
+        assert!(error.contains("failed to walk corpus root"));
+        assert!(error.contains(&missing.display().to_string()));
+    }
+
+    #[test]
+    fn exact_marshal_preflight_rejects_mismatches() {
+        assert_eq!(
+            verify_exact_marshal(&[], &[], &[]),
+            Err("exact-marshal preflight has no CPython-accepted files".to_string())
+        );
+
+        let source = SourceFile {
+            path: PathBuf::from("source.py"),
+            filename: "source.py".to_string(),
+            source: "pass\n".to_string(),
+        };
+        let module = serc::compile(&source.source, &source.filename).expect("compile source");
+        let expected = module.marshal();
+        verify_exact_marshal(
+            &[&source],
+            std::slice::from_ref(&module),
+            &[expected.clone()],
+        )
+        .expect("identical marshal output");
+
+        let mut mismatched = expected;
+        mismatched[0] ^= 1;
+        let error = verify_exact_marshal(&[&source], &[module], &[mismatched])
+            .expect_err("different marshal output must fail");
+        assert!(error.contains("exact-marshal preflight failed for source.py at byte 0"));
+    }
+
+    #[test]
+    fn derives_the_actual_cargo_profile_from_the_executable() {
+        assert_eq!(
+            profile_from_executable(PathBuf::from("target/profiling/examples/benchmark").as_path()),
+            Ok("profiling".to_string())
+        );
+        assert_eq!(
+            profile_from_executable(PathBuf::from("target/debug/deps/benchmark-hash").as_path()),
+            Ok("debug".to_string())
+        );
     }
 
     #[test]

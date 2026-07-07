@@ -18,10 +18,12 @@ if [[ $# -gt 2 ]]; then
     exit 2
 fi
 
-repo_root="$(git rev-parse --show-toplevel)"
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+repo_root="$(cd "$script_dir/../.." && pwd -P)"
 numpy_checkout="$repo_root/target/benchmarks/numpy"
 numpy_revision="b832a09cf2a169c833dd2371e7c07aa00b293242"
 default_corpus="$numpy_checkout/numpy"
+serc_profile="release"
 
 python="${PYTHON:-python3.14}"
 corpus="${1:-$default_corpus}"
@@ -56,6 +58,43 @@ clean_caches() {
     find "$corpus" -type d -name __pycache__ -prune -exec rm -rf {} +
 }
 
+tree_summary() {
+    "$python" -I -S -c '
+import hashlib
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+suffix = sys.argv[2]
+paths = sorted(path for path in root.rglob(f"*{suffix}") if path.is_file())
+digest = hashlib.sha256()
+size = 0
+for path in paths:
+    relative = path.relative_to(root).as_posix().encode()
+    contents = path.read_bytes()
+    digest.update(len(relative).to_bytes(8, "big"))
+    digest.update(relative)
+    digest.update(len(contents).to_bytes(8, "big"))
+    digest.update(contents)
+    size += len(contents)
+print(len(paths), size, digest.hexdigest(), sep="\t")
+' "$1" "$2"
+}
+
+sha256_file() {
+    "$python" -I -S -c '
+import hashlib
+import pathlib
+import sys
+
+print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())
+' "$1"
+}
+
+sha256_stdin() {
+    "$python" -I -S -c 'import hashlib, sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())'
+}
+
 if [[ "$using_pinned_numpy" == true ]]; then
     clean_caches
     actual_revision="$(git -C "$numpy_checkout" rev-parse HEAD)"
@@ -80,7 +119,7 @@ else
     results_metadata="$results_json.metadata.txt"
 fi
 
-"$python" -I -c '
+"$python" -I -S -c '
 import importlib.util
 import sys
 
@@ -94,62 +133,75 @@ if actual != expected:
     raise SystemExit(f"expected {expected}, got {actual}")
 '
 
-echo "Building Serc in release mode"
+echo "Building Serc with the $serc_profile profile"
 serc="$(
     CARGO_INCREMENTAL=0 cargo build \
         --manifest-path "$repo_root/Cargo.toml" \
-        --release \
+        --profile "$serc_profile" \
         --locked \
         --package serc \
         --bin serc \
         --message-format json-render-diagnostics \
         | bash "$repo_root/scripts/benchmarks/resolve-cargo-artifact.sh" "$python"
 )"
+if [[ ! -x "$serc" ]]; then
+    echo "error: Cargo reported a Serc executable that is missing or not executable: $serc" >&2
+    exit 1
+fi
+serc="$(cd "$(dirname "$serc")" && pwd -P)/$(basename "$serc")"
 
-source_count="$("$python" -I -c '
-import pathlib
-import sys
-
-root = pathlib.Path(sys.argv[1])
-print(sum(1 for path in root.rglob("*.py") if path.is_file()))
-' "$corpus")"
+source_summary="$(tree_summary "$corpus" .py)"
+read -r source_count source_bytes corpus_sha256 <<< "$source_summary"
+if [[ ! "$source_count" =~ ^[0-9]+$ || ! "$source_bytes" =~ ^[0-9]+$ || ${#corpus_sha256} -ne 64 ]]; then
+    echo "error: failed to summarize the benchmark corpus: $source_summary" >&2
+    exit 1
+fi
+if [[ "$source_count" -eq 0 ]]; then
+    echo "error: benchmark corpus contains no Python sources: $corpus" >&2
+    exit 1
+fi
 if [[ "$using_pinned_numpy" == true && "$source_count" != 505 ]]; then
     echo "error: expected 505 NumPy Python files, found $source_count" >&2
     exit 1
 fi
-source_bytes="$("$python" -I -c '
-import pathlib
-import sys
-
-root = pathlib.Path(sys.argv[1])
-print(sum(path.stat().st_size for path in root.rglob("*.py") if path.is_file()))
-' "$corpus")"
 echo "Preflighting CPython and Serc on $source_count files ($source_bytes bytes) in $corpus"
 
 clean_caches
-"$python" -I -m compileall \
+"$python" -I -S -m compileall \
     -q \
     -f \
     -j 1 \
     -o 0 \
     --invalidation-mode timestamp \
     "$corpus"
-cpython_count="$(find "$corpus" -type f -path '*/__pycache__/*.pyc' | wc -l | tr -d ' ')"
+cpython_summary="$(tree_summary "$corpus" .pyc)"
+read -r cpython_count _cpython_bytes cpython_pyc_sha256 <<< "$cpython_summary"
 
 clean_caches
 "$serc" compile --quiet "$corpus"
-serc_count="$(find "$corpus" -type f -path '*/__pycache__/*.pyc' | wc -l | tr -d ' ')"
+serc_summary="$(tree_summary "$corpus" .pyc)"
+read -r serc_count _serc_bytes serc_pyc_sha256 <<< "$serc_summary"
 
 if [[ "$cpython_count" != "$source_count" || "$serc_count" != "$source_count" ]]; then
     echo "error: expected $source_count outputs; CPython wrote $cpython_count and Serc wrote $serc_count" >&2
     exit 1
 fi
+if [[ ${#cpython_pyc_sha256} -ne 64 || ${#serc_pyc_sha256} -ne 64 ]]; then
+    echo "error: failed to hash preflight bytecode outputs" >&2
+    exit 1
+fi
+if [[ "$cpython_pyc_sha256" != "$serc_pyc_sha256" ]]; then
+    echo "error: preflight bytecode differs from CPython" >&2
+    echo "CPython aggregate: $cpython_pyc_sha256" >&2
+    echo "Serc aggregate:  $serc_pyc_sha256" >&2
+    exit 1
+fi
 
-echo "Preflight checks successful compilation and output counts, not byte identity"
+echo "Preflight verified byte-identical outputs ($cpython_pyc_sha256)"
 clean_caches
 
 printf -v cpython_command \
-    '%q -I -m compileall -q -f -j 1 -o 0 --invalidation-mode timestamp %q' \
+    '%q -I -S -m compileall -q -f -j 1 -o 0 --invalidation-mode timestamp %q' \
     "$python" \
     "$corpus"
 printf -v serc_command '%q compile --quiet %q' "$serc" "$corpus"
@@ -157,18 +209,31 @@ printf -v prepare_command \
     'find %q -type d -name __pycache__ -prune -exec rm -rf {} +' \
     "$corpus"
 
-serc_revision="$(git -C "$repo_root" rev-parse --short HEAD)"
-if [[ -n "$(git -C "$repo_root" status --short)" ]]; then
+serc_commit="$(git -C "$repo_root" rev-parse 'HEAD^{commit}')"
+serc_status="$(git -C "$repo_root" status --short)"
+serc_dirty_diff_sha256="$(git -C "$repo_root" diff --binary --full-index --no-ext-diff --no-textconv HEAD -- | sha256_stdin)"
+serc_revision="${serc_commit:0:12}"
+if [[ -n "$serc_status" ]]; then
     serc_revision="$serc_revision+dirty"
 fi
 corpus_revision="$(git -C "$corpus" rev-parse HEAD 2>/dev/null || echo unavailable)"
+cargo_lock_sha256="$(sha256_file "$repo_root/Cargo.lock")"
+serc_binary_sha256="$(sha256_file "$serc")"
 {
     echo "timestamp_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "corpus=$corpus"
     echo "corpus_revision=$corpus_revision"
     echo "source_files=$source_count"
     echo "source_bytes=$source_bytes"
+    echo "corpus_sha256=$corpus_sha256"
     echo "serc_revision=$serc_revision"
+    echo "serc_commit=$serc_commit"
+    echo "serc_dirty_diff_sha256=$serc_dirty_diff_sha256"
+    echo "cargo_lock_sha256=$cargo_lock_sha256"
+    echo "serc_binary=$serc"
+    echo "serc_binary_sha256=$serc_binary_sha256"
+    echo "serc_profile=$serc_profile"
+    echo "preflight_pyc_sha256=$serc_pyc_sha256"
     echo "python_executable=$python"
     echo
     echo "[python]"
@@ -190,7 +255,7 @@ corpus_revision="$(git -C "$corpus" rev-parse HEAD 2>/dev/null || echo unavailab
     fi
     echo
     echo "[serc status]"
-    git -C "$repo_root" status --short
+    printf '%s\n' "$serc_status"
     echo
     echo "[corpus status]"
     git -C "$corpus" status --short 2>/dev/null || true

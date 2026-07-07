@@ -55,7 +55,10 @@ fn pinned_corpus_validation_rejects_ignored_non_python_artifacts() {
 }
 
 #[test]
-fn cargo_artifact_parser_ignores_python_site_configuration() {
+#[cfg(unix)]
+fn cargo_artifact_parser_uses_isolated_no_site_python() {
+    use std::os::unix::fs::PermissionsExt;
+
     let site = tempfile::tempdir().unwrap();
     fs_err::write(
         site.path().join("sitecustomize.py"),
@@ -67,13 +70,27 @@ fn cargo_artifact_parser_ignores_python_site_configuration() {
         "raise RuntimeError('shadowed json')\n",
     )
     .unwrap();
+    let wrapper = site.path().join("python-wrapper");
+    fs_err::write(
+        &wrapper,
+        r#"#!/usr/bin/env bash
+if [[ "$1" != "-I" || "$2" != "-S" ]]; then
+    echo "expected -I -S, got: $*" >&2
+    exit 64
+fi
+exec "$SERC_REAL_PYTHON" "$@"
+"#,
+    )
+    .unwrap();
+    fs_err::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     let resolver = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../scripts/benchmarks/resolve-cargo-artifact.sh");
     let python = std::env::var("SERC_TEST_PYTHON").unwrap_or_else(|_| "python3".to_string());
     let mut child = Command::new("bash")
         .arg(resolver)
-        .arg(python)
+        .arg(wrapper)
+        .env("SERC_REAL_PYTHON", python)
         .env("PYTHONPATH", site.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
