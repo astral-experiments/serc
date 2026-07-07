@@ -1,7 +1,28 @@
-// Compiler submodules intentionally share the parent-owned state and lowering vocabulary.
-#![allow(clippy::wildcard_imports)]
+use std::borrow::Cow;
+use std::sync::Arc;
 
-use super::*;
+use ruff_python_ast::visitor::{Visitor, walk_expr, walk_pattern, walk_stmt};
+use ruff_python_ast::{Expr, Pattern, Stmt};
+use rustc_hash::{FxHashMap, FxHashSet};
+
+use super::{
+    BINARY_OP, BUILD_TUPLE, CALL_INTRINSIC_1, CALL_INTRINSIC_2, COMPARE_OP, CONVERT_VALUE,
+    DELETE_DEREF, DELETE_FAST, DELETE_GLOBAL, DELETE_NAME, LOAD_COMMON_CONSTANT, LOAD_DEREF,
+    LOAD_FAST, LOAD_FAST_CHECK, LOAD_FROM_DICT_OR_DEREF, LOAD_FROM_DICT_OR_GLOBALS, LOAD_GLOBAL,
+    LOAD_LOCALS, LOAD_NAME, LOAD_SPECIAL, RESUME, SET_FUNCTION_ATTRIBUTE, STORE_DEREF, STORE_FAST,
+    STORE_GLOBAL, STORE_NAME,
+};
+use crate::CompileError;
+use crate::assembler::{Label, SourceLocation};
+use crate::target::operands::{
+    BinaryIntrinsic, BinaryOperation, CommonConstant, ComparisonOperation, Conversion,
+    FunctionAttribute, ResumeLocation, SpecialMethod, UnaryIntrinsic,
+};
+use crate::target::{Opcode, is_unconditional_jump};
+
+use super::constant::literal_constant;
+use super::scope::{NameId, NameSet, definitely_evaluated_references};
+use super::{Compiler, Constant, Scope};
 
 #[derive(Debug, Default)]
 pub(super) struct SymbolState {
@@ -51,7 +72,7 @@ impl Compiler {
             .collect()
     }
 
-    pub(super) fn name_strings(&self, names: impl IntoIterator<Item = NameId>) -> Vec<String> {
+    fn name_strings(&self, names: impl IntoIterator<Item = NameId>) -> Vec<String> {
         let interner = &self
             .context
             .scopes

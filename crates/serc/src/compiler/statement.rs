@@ -1,7 +1,78 @@
-// Compiler submodules intentionally share the parent-owned state and lowering vocabulary.
-#![allow(clippy::wildcard_imports)]
+use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
+use ruff_python_ast::{BoolOp, Expr, Pattern, Stmt, UnaryOp};
+use ruff_text_size::Ranged;
 
-use super::*;
+use super::{
+    BINARY_SLICE, BUILD_LIST, BUILD_MAP, BUILD_SET, BUILD_TUPLE, CALL, CHECK_EG_MATCH,
+    CHECK_EXC_MATCH, CLEANUP_THROW, COPY, END_ASYNC_FOR, END_FOR, END_SEND, FOR_ITER, GET_AITER,
+    GET_ANEXT, GET_ITER, IMPORT_FROM, IMPORT_NAME, JUMP_BACKWARD, JUMP_BACKWARD_NO_INTERRUPT,
+    JUMP_FORWARD, LIST_APPEND, LOAD_ATTR, LOAD_CONST, LOAD_SMALL_INT, MAP_ADD, NOP, NOT_TAKEN,
+    POP_EXCEPT, POP_ITER, POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE,
+    POP_JUMP_IF_TRUE, POP_TOP, PUSH_EXC_INFO, RAISE_VARARGS, RERAISE, RETURN_VALUE, SEND, SET_ADD,
+    STORE_ATTR, STORE_SLICE, STORE_SUBSCR, SWAP, TO_BOOL, WITH_EXCEPT_START, YIELD_VALUE,
+};
+use crate::CompileError;
+use crate::assembler::{Label, SourceLocation};
+use crate::target::code_flags::{CO_ASYNC_GENERATOR, CO_COROUTINE, CO_FUTURE_ANNOTATIONS};
+use crate::target::operands::{
+    BinaryIntrinsic, BinaryOperation, CommonConstant, ResumeLocation, SpecialMethod, UnaryIntrinsic,
+};
+
+use super::constant::{
+    first_literal_constant, first_suite_literal_constant, fold_constant, is_literal_constant,
+    literal_constant, optimized_percent_format, two_element_slice_optimization,
+};
+use super::expression::{
+    binary_operator, comparison_operator, comparison_operator_boolean, early_condition_truthiness,
+    expression_defers_async_comprehension_restore, jump_constant_truthiness,
+    optimized_generator_callable,
+};
+use super::scope::{NameId, ReferenceCollector, collect_target_names};
+use super::source::{implicit_return_range, unparse_annotation};
+use super::symbol::{statement_name, to_u32, unsupported};
+use super::{Compiler, Constant, Scope};
+
+#[derive(Clone, Copy, Debug)]
+struct LoopContext {
+    continue_label: Label,
+    break_label: Label,
+    iterator_cleanup: IteratorCleanup,
+    with_depth: usize,
+    finally_end_depth: usize,
+    exception_region_depth: usize,
+    break_returns: bool,
+    preserve_break_exit: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ExceptionHandlerContext {
+    name: Option<NameId>,
+    loop_depth: usize,
+}
+
+#[derive(Debug)]
+struct ReturnFinallyContext {
+    body: Vec<Stmt>,
+    loop_depth: usize,
+    handler: Label,
+    depth: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct WithExitContext {
+    location: SourceLocation,
+    is_async: bool,
+}
+
+type RegionExclusions = Vec<(Label, Label)>;
+type RegionExclusionStack = Vec<RegionExclusions>;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IteratorCleanup {
+    None,
+    Sync,
+    Async,
+}
 
 #[derive(Debug, Default)]
 pub(super) struct ControlFlowState {
@@ -10,32 +81,32 @@ pub(super) struct ControlFlowState {
     pub(super) pending_comprehension_restores: Vec<(Vec<u32>, SourceLocation)>,
     pub(super) active_comprehension_cleanups: Vec<(Label, u32)>,
     pub(super) active_comprehension_region_exclusions: Vec<Vec<(Label, Label)>>,
-    pub(super) active_with_exits: Vec<WithExitContext>,
+    active_with_exits: Vec<WithExitContext>,
     pub(super) active_with_region_exclusions: Vec<Vec<(Label, Label)>>,
-    pub(super) active_terminal_withs: usize,
+    active_terminal_withs: usize,
     // CPython retains the empty end block when an async for ends a protected suite.
-    pub(super) emit_protected_async_for_end_nop: bool,
+    emit_protected_async_for_end_nop: bool,
     pub(super) active_exception_region_exclusions: Vec<Vec<(Label, Label)>>,
-    pub(super) active_exception_handlers: Vec<ExceptionHandlerContext>,
-    pub(super) active_return_finally_contexts: Vec<ReturnFinallyContext>,
+    active_exception_handlers: Vec<ExceptionHandlerContext>,
+    active_return_finally_contexts: Vec<ReturnFinallyContext>,
     // CPython's normalized `NOT_TAKEN` can reuse a normal-finally CFG slot that still owns the
     // coroutine stop-iteration handler.
     pub(super) active_normal_finally_bodies: usize,
-    pub(super) active_finally_end_blocks: usize,
-    pub(super) active_finally_try_bodies: usize,
-    pub(super) active_pass_finally_locations: Vec<SourceLocation>,
-    pub(super) active_overriding_finally_returns: usize,
-    pub(super) preserve_finally_break_exit_loop_range: Option<ruff_text_size::TextRange>,
+    active_finally_end_blocks: usize,
+    active_finally_try_bodies: usize,
+    active_pass_finally_locations: Vec<SourceLocation>,
+    active_overriding_finally_returns: usize,
+    preserve_finally_break_exit_loop_range: Option<ruff_text_size::TextRange>,
     pub(super) exclude_terminal_if_not_taken: bool,
     pub(super) exclude_condition_not_taken_from_exception: bool,
     pub(super) exclude_condition_not_taken_from_all_exception_regions: bool,
-    pub(super) exclude_loop_tail_not_taken_from_control_flow_regions: bool,
-    pub(super) unwind_exception_handlers_for_implicit_return: bool,
-    pub(super) prevent_try_exit_inlining: bool,
+    exclude_loop_tail_not_taken_from_control_flow_regions: bool,
+    unwind_exception_handlers_for_implicit_return: bool,
+    prevent_try_exit_inlining: bool,
     pub(super) generator_region_start: Option<Label>,
     pub(super) generator_region_exclusions: Vec<(Label, Label)>,
     pub(super) emitted_fallthrough_return: bool,
-    pub(super) loops: Vec<LoopContext>,
+    loops: Vec<LoopContext>,
     pub(super) depth: i32,
     pub(super) max_depth: u32,
 }
