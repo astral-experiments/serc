@@ -28,7 +28,10 @@ use crate::target::{
 #[cfg(any(test, debug_assertions))]
 use ir::AssemblerStage;
 pub(crate) use ir::{AssembledCode, Assembler, InstructionId, Label, SourceLocation};
-use ir::{ExceptionRegion, Instruction, InstructionFlags, Item, Operand};
+use ir::{
+    ExceptionExclusion, ExceptionRegion, Instruction, InstructionFlags, Item,
+    NormalizedExceptionOwner, Operand,
+};
 
 impl Assembler {
     pub(crate) fn disable_load_fast_borrowing(&mut self) {
@@ -272,19 +275,27 @@ impl Assembler {
 
     pub(crate) fn exclude_last_instruction_from_exception_if_extended(&mut self) {
         if let Some(instruction) = self.last_instruction_mut() {
-            instruction.insert_flag(InstructionFlags::EXCLUDE_EXCEPTION_IF_EXTENDED);
+            instruction
+                .exception_policy
+                .exclude(ExceptionExclusion::IfExtended);
         }
     }
 
     pub(crate) fn exclude_last_instruction_from_exception(&mut self) {
         if let Some(instruction) = self.last_instruction_mut() {
-            instruction.insert_flag(InstructionFlags::EXCLUDE_EXCEPTION);
+            instruction
+                .exception_policy
+                .exclude(ExceptionExclusion::Always);
         }
     }
 
     pub(crate) fn set_last_normalized_exception_owner(&mut self, has_owner: bool) {
         if let Some(instruction) = self.last_instruction_mut() {
-            instruction.normalized_exception_owner = Some(has_owner);
+            instruction.exception_policy.normalized_owner = if has_owner {
+                NormalizedExceptionOwner::Present
+            } else {
+                NormalizedExceptionOwner::Absent
+            };
         }
     }
 

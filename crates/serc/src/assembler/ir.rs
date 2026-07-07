@@ -105,14 +105,9 @@ bitflags::bitflags! {
         const DEFER_REDUNDANT_JUMP_REMOVAL = 1 << 9;
         const PRESERVE_NOP_AFTER_JUMP_THREADING = 1 << 10;
         const CONVERTED_POP_BLOCK = 1 << 11;
-        // Exclude this instruction from every exception region after CFG normalization.
-        const EXCLUDE_EXCEPTION = 1 << 12;
-        // CPython retains stale exception ownership for the short form of some synthetic
-        // handler-exit jumps, but not once the jump needs an `EXTENDED_ARG`.
-        const EXCLUDE_EXCEPTION_IF_EXTENDED = 1 << 13;
         // Stop borrowed-load traversal at an optimized-away empty CFG block without exposing a
         // label to the other assembler passes.
-        const BORROW_UNREACHABLE_ENTRY = 1 << 14;
+        const BORROW_UNREACHABLE_ENTRY = 1 << 12;
     }
 }
 
@@ -126,15 +121,76 @@ impl InstructionFlags {
         .union(Self::PRESERVE_NO_LOCATION)
         .union(Self::DEFER_REDUNDANT_JUMP_REMOVAL)
         .union(Self::PRESERVE_NOP_AFTER_JUMP_THREADING)
-        .union(Self::CONVERTED_POP_BLOCK)
-        .union(Self::EXCLUDE_EXCEPTION)
-        .union(Self::EXCLUDE_EXCEPTION_IF_EXTENDED);
+        .union(Self::CONVERTED_POP_BLOCK);
     pub(super) const FUSE_AND: Self =
         Self::INLINE_SMALL_EXIT.union(Self::ALLOW_JUMP_THREADING_TARGET);
     pub(super) const FUSE_FROM_FIRST: Self =
         Self::PREVENT_FUSION_WITH_PREVIOUS.union(Self::BORROW_UNREACHABLE_ENTRY);
     pub(super) const FUSE_FROM_SECOND: Self = Self::PREVENT_FUSION_WITH_NEXT;
     pub(super) const FUSE_CLEARED: Self = Self::PRESERVE_INLINED_JUMP_NOP;
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) enum ExceptionExclusion {
+    #[default]
+    None,
+    IfExtended,
+    Always,
+}
+
+impl ExceptionExclusion {
+    const fn merged(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Always, _) | (_, Self::Always) => Self::Always,
+            (Self::IfExtended, _) | (_, Self::IfExtended) => Self::IfExtended,
+            (Self::None, Self::None) => Self::None,
+        }
+    }
+
+    pub(super) const fn applies(self, extended_args: u8) -> bool {
+        match self {
+            Self::None => false,
+            Self::IfExtended => extended_args > 0,
+            Self::Always => true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) enum NormalizedExceptionOwner {
+    #[default]
+    Unchanged,
+    Present,
+    Absent,
+}
+
+impl NormalizedExceptionOwner {
+    const fn merged(self, other: Self) -> Self {
+        if matches!(self, Self::Unchanged) {
+            other
+        } else {
+            self
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct ExceptionPolicy {
+    pub(super) exclusion: ExceptionExclusion,
+    pub(super) normalized_owner: NormalizedExceptionOwner,
+}
+
+impl ExceptionPolicy {
+    const fn merged(self, other: Self) -> Self {
+        Self {
+            exclusion: self.exclusion.merged(other.exclusion),
+            normalized_owner: self.normalized_owner.merged(other.normalized_owner),
+        }
+    }
+
+    pub(super) fn exclude(&mut self, exclusion: ExceptionExclusion) {
+        self.exclusion = self.exclusion.merged(exclusion);
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -148,7 +204,7 @@ pub(super) struct Instruction {
     pub(super) preserve_direct_inlined_jump_nop: Option<Label>,
     // `NOT_TAKEN` is added after CPython labels exception handlers. The new instruction keeps
     // whatever exception target remains in its reused CFG slot, if there is one.
-    pub(super) normalized_exception_owner: Option<bool>,
+    pub(super) exception_policy: ExceptionPolicy,
 }
 
 impl Instruction {
@@ -165,7 +221,7 @@ impl Instruction {
             depth_after,
             flags: InstructionFlags::DEFAULT,
             preserve_direct_inlined_jump_nop: None,
-            normalized_exception_owner: None,
+            exception_policy: ExceptionPolicy::default(),
         }
     }
 
@@ -197,11 +253,6 @@ impl Instruction {
         self.flags.set(flag, enabled);
     }
 
-    pub(super) fn with_flag(mut self, flag: InstructionFlags, enabled: bool) -> Self {
-        self.set_flag(flag, enabled);
-        self
-    }
-
     /// Combines the provenance of two instructions replaced by one superinstruction.
     pub(super) fn fused(opcode: Opcode, operand: Operand, first: Self, second: Self) -> Self {
         let mut flags = ((first.flags | second.flags) & InstructionFlags::FUSE_OR)
@@ -217,9 +268,7 @@ impl Instruction {
             depth_after: second.depth_after,
             flags,
             preserve_direct_inlined_jump_nop: None,
-            normalized_exception_owner: first
-                .normalized_exception_owner
-                .or(second.normalized_exception_owner),
+            exception_policy: first.exception_policy.merged(second.exception_policy),
         }
     }
 }

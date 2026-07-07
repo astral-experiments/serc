@@ -1,5 +1,7 @@
+use super::ir::ExceptionPolicy;
 use super::{
-    Assembler, AssemblerStage, Instruction, InstructionFlags, Item, Operand, SourceLocation,
+    Assembler, AssemblerStage, ExceptionExclusion, Instruction, InstructionFlags, Item,
+    NormalizedExceptionOwner, Operand, SourceLocation,
 };
 use crate::target::opcodes::*;
 
@@ -17,7 +19,7 @@ fn instruction_constructors_set_audited_defaults() {
         synthetic.preserve_direct_inlined_jump_nop, None,
         "synthetic instructions do not inherit jump provenance"
     );
-    assert_eq!(synthetic.normalized_exception_owner, None);
+    assert_eq!(synthetic.exception_policy, ExceptionPolicy::default());
 }
 
 #[test]
@@ -40,6 +42,14 @@ fn fusion_classifies_every_instruction_flag() {
 }
 
 #[test]
+fn exception_exclusion_names_layout_policy() {
+    assert!(!ExceptionExclusion::None.applies(1));
+    assert!(!ExceptionExclusion::IfExtended.applies(0));
+    assert!(ExceptionExclusion::IfExtended.applies(1));
+    assert!(ExceptionExclusion::Always.applies(0));
+}
+
+#[test]
 fn fusion_uses_each_flags_propagation_policy() {
     let mut first = Instruction::new(
         LOAD_FAST,
@@ -52,7 +62,6 @@ fn fusion_uses_each_flags_propagation_policy() {
         InstructionFlags::ALLOW_NO_LOCATION_BLOCK_INLINING,
         InstructionFlags::DEFER_REDUNDANT_JUMP_REMOVAL,
         InstructionFlags::CONVERTED_POP_BLOCK,
-        InstructionFlags::EXCLUDE_EXCEPTION_IF_EXTENDED,
         InstructionFlags::PREVENT_FUSION_WITH_NEXT,
         InstructionFlags::PRESERVE_INLINED_JUMP_NOP,
     ] {
@@ -60,7 +69,10 @@ fn fusion_uses_each_flags_propagation_policy() {
     }
     first.remove_flag(InstructionFlags::ALLOW_JUMP_THREADING_TARGET);
     first.preserve_direct_inlined_jump_nop = Some(super::Label(1));
-    first.normalized_exception_owner = Some(false);
+    first
+        .exception_policy
+        .exclude(ExceptionExclusion::IfExtended);
+    first.exception_policy.normalized_owner = NormalizedExceptionOwner::Absent;
 
     let mut second = Instruction::new(
         LOAD_FAST,
@@ -72,7 +84,6 @@ fn fusion_uses_each_flags_propagation_policy() {
         InstructionFlags::STRICT_OWNED_LOAD,
         InstructionFlags::PRESERVE_NO_LOCATION,
         InstructionFlags::PRESERVE_NOP_AFTER_JUMP_THREADING,
-        InstructionFlags::EXCLUDE_EXCEPTION,
         InstructionFlags::PREVENT_FUSION_WITH_PREVIOUS,
         InstructionFlags::BORROW_UNREACHABLE_ENTRY,
         InstructionFlags::PRESERVE_INLINED_JUMP_NOP,
@@ -81,7 +92,8 @@ fn fusion_uses_each_flags_propagation_policy() {
     }
     second.remove_flag(InstructionFlags::INLINE_SMALL_EXIT);
     second.preserve_direct_inlined_jump_nop = Some(super::Label(2));
-    second.normalized_exception_owner = Some(true);
+    second.exception_policy.exclude(ExceptionExclusion::Always);
+    second.exception_policy.normalized_owner = NormalizedExceptionOwner::Present;
 
     let fused = Instruction::fused(LOAD_FAST_LOAD_FAST, Operand::Value(0x12), first, second);
 
@@ -93,8 +105,6 @@ fn fusion_uses_each_flags_propagation_policy() {
         InstructionFlags::DEFER_REDUNDANT_JUMP_REMOVAL,
         InstructionFlags::PRESERVE_NOP_AFTER_JUMP_THREADING,
         InstructionFlags::CONVERTED_POP_BLOCK,
-        InstructionFlags::EXCLUDE_EXCEPTION,
-        InstructionFlags::EXCLUDE_EXCEPTION_IF_EXTENDED,
     ] {
         assert!(fused.has_flag(flag), "missing merged flag {flag:?}");
     }
@@ -111,7 +121,13 @@ fn fusion_uses_each_flags_propagation_policy() {
     assert_eq!(fused.location, first.location);
     assert_eq!(fused.depth_after, second.depth_after);
     assert_eq!(fused.preserve_direct_inlined_jump_nop, None);
-    assert_eq!(fused.normalized_exception_owner, Some(false));
+    assert_eq!(
+        fused.exception_policy,
+        ExceptionPolicy {
+            exclusion: ExceptionExclusion::Always,
+            normalized_owner: NormalizedExceptionOwner::Absent,
+        }
+    );
 
     let mut first_edge = Instruction::new(LOAD_FAST, Operand::Value(1), SourceLocation::NONE, None);
     first_edge.insert_flag(InstructionFlags::PREVENT_FUSION_WITH_PREVIOUS);
