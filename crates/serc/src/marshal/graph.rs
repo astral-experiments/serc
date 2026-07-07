@@ -8,29 +8,9 @@ use crate::code_object::{CodeObject, Constant};
 
 use super::key::{
     HashedObjectKey, ObjectKey, code_bytes_key, code_key, constant_key, constants_tuple_key,
-    frozen_set_members_in_wire_order, local_kinds_key, locals_tuple_key, should_intern,
-    slice_member_uses_identity, strings_tuple_key,
+    local_kinds_key, locals_tuple_key, should_intern, strings_tuple_key,
 };
-
-// Source addresses are graph-local lookup keys only. They remain valid while `encode_code` holds
-// the immutable `CodeObject`, and are never written to the marshal stream.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(super) enum ObjectLocation {
-    Bytes(usize),
-    Code(usize),
-    CodeBytes(usize),
-    Constant(usize),
-    ConstantsTuple(usize),
-    LocalKinds(usize),
-    LocalsTuple(usize),
-    MetadataString(usize),
-    SliceMember(usize),
-    StringsTuple(usize),
-}
-
-// Equal value keys share an ID; identity-based keys remain distinct exactly as `ObjectKey` does.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct ObjectId(pub(super) usize);
+use super::plan::{MarshalVisitor, ObjectId, ReferenceMode, traverse_code};
 
 #[derive(Debug)]
 struct Object {
@@ -39,13 +19,83 @@ struct Object {
     interned: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(super) enum OccurrenceKind {
+    Bytes,
+    Code,
+    CodeBytes,
+    Constant,
+    Constants,
+    LocalKinds,
+    Locals,
+    MetadataString,
+    SliceMember,
+    Strings,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Occurrence {
+    object: ObjectId,
+    kind: OccurrenceKind,
+}
+
+const _: [(); 8] = [(); std::mem::size_of::<Occurrence>()];
+
+#[derive(Debug)]
+pub(super) struct OccurrenceCursor<'a> {
+    occurrences: &'a [Occurrence],
+    next: usize,
+}
+
+impl OccurrenceCursor<'_> {
+    #[inline]
+    pub(super) fn consume(&mut self, expected: OccurrenceKind) -> ObjectId {
+        let index = self.next;
+        let Some(occurrence) = self.occurrences.get(index).copied() else {
+            missing_occurrence(index, expected, self.occurrences.len());
+        };
+        if occurrence.kind != expected {
+            mismatched_occurrence(index, expected, occurrence.kind);
+        }
+        self.next += 1;
+        occurrence.object
+    }
+
+    pub(super) fn finish(self) {
+        assert_eq!(
+            self.next,
+            self.occurrences.len(),
+            "marshal writer consumed {} of {} recorded occurrences",
+            self.next,
+            self.occurrences.len()
+        );
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn missing_occurrence(index: usize, expected: OccurrenceKind, count: usize) -> ! {
+    panic!(
+        "marshal writer requested occurrence {index} ({expected:?}), but the graph recorded {count} occurrences"
+    );
+}
+
+#[cold]
+#[inline(never)]
+fn mismatched_occurrence(index: usize, expected: OccurrenceKind, recorded: OccurrenceKind) -> ! {
+    panic!(
+        "marshal occurrence {index} mismatch: writer requested {expected:?}, graph recorded {recorded:?}"
+    );
+}
+
+const CODE_OBJECT_CHILDREN: usize = 10;
+
 #[derive(Debug, Default)]
 pub(super) struct ObjectGraph<'a> {
     objects: FxHashMap<HashedObjectKey<'a>, ObjectId>,
     objects_by_id: Vec<Object>,
-    occurrences: Vec<ObjectId>,
-    #[cfg(debug_assertions)]
-    occurrence_locations: Vec<ObjectLocation>,
+    occurrences: Vec<Occurrence>,
     #[cfg(debug_assertions)]
     unique_objects: FxHashSet<HashedObjectKey<'a>>,
     explicitly_interned: Vec<&'a str>,
@@ -54,9 +104,40 @@ pub(super) struct ObjectGraph<'a> {
 impl<'a> ObjectGraph<'a> {
     pub(super) fn for_code(code: &'a CodeObject) -> Self {
         let mut graph = Self::default();
-        graph.visit_code(code);
+        traverse_code(code, &mut GraphVisitor { graph: &mut graph });
         graph.mark_explicitly_interned();
         graph
+    }
+
+    fn reserve_for_code(&mut self, code: &CodeObject) {
+        // Every code object contributes ten object-bearing structural children, plus at most one
+        // object for each direct constant, name, and local. Leave geometric headroom for
+        // descendants of container constants; nested code objects refine the estimate when they
+        // are visited.
+        let direct_children = code
+            .constants
+            .len()
+            .saturating_add(code.names.len())
+            .saturating_add(code.locals.len())
+            .saturating_add(CODE_OBJECT_CHILDREN);
+        let estimated_descendants = direct_children.saturating_mul(2);
+        self.objects.reserve(estimated_descendants);
+        self.objects_by_id
+            .reserve(estimated_descendants.saturating_add(1));
+        self.occurrences
+            .reserve(estimated_descendants.saturating_add(1));
+    }
+
+    fn record_keyed(&mut self, kind: OccurrenceKind, key: ObjectKey<'a>, interned: bool) -> bool {
+        let (id, first) = self.record_object(key.into(), interned);
+        self.occurrences.push(Occurrence { object: id, kind });
+        first
+    }
+
+    fn record_unique_value(&mut self, kind: OccurrenceKind, key: ObjectKey<'a>) -> bool {
+        let id = self.record_unique(key);
+        self.occurrences.push(Occurrence { object: id, kind });
+        true
     }
 
     fn mark_explicitly_interned(&mut self) {
@@ -68,7 +149,7 @@ impl<'a> ObjectGraph<'a> {
             else {
                 continue;
             };
-            let object = &mut self.objects_by_id[id.0];
+            let object = &mut self.objects_by_id[id.index()];
             object.cached = true;
             object.interned = true;
         }
@@ -79,40 +160,30 @@ impl<'a> ObjectGraph<'a> {
         self.record_object(key.into(), false).1
     }
 
-    fn record_at(&mut self, _location: ObjectLocation, key: ObjectKey<'a>, interned: bool) -> bool {
-        let (id, first) = self.record_object(key.into(), interned);
-        self.occurrences.push(id);
-        #[cfg(debug_assertions)]
-        self.occurrence_locations.push(_location);
-        first
-    }
-
     /// Records an identity-bearing object that is structurally owned by a unique parent.
-    fn record_unique_at(&mut self, _location: ObjectLocation, _key: ObjectKey<'a>) {
+    fn record_unique(&mut self, _key: ObjectKey<'a>) -> ObjectId {
         #[cfg(debug_assertions)]
         debug_assert!(
             self.unique_objects.insert(_key.into()),
-            "identity-bearing marshal object was recorded twice at {_location:?}"
+            "identity-bearing marshal object was recorded twice"
         );
 
-        let id = ObjectId(self.objects_by_id.len());
+        let id = ObjectId::from_index(self.objects_by_id.len());
         self.objects_by_id.push(Object {
             count: 1,
             cached: false,
             interned: false,
         });
-        self.occurrences.push(id);
-        #[cfg(debug_assertions)]
-        self.occurrence_locations.push(_location);
+        id
     }
 
     fn record_object(&mut self, key: HashedObjectKey<'a>, interned: bool) -> (ObjectId, bool) {
-        let next_id = ObjectId(self.objects_by_id.len());
+        let next_id = ObjectId::from_index(self.objects_by_id.len());
         match self.objects.entry(key) {
             Entry::Occupied(entry) => {
                 let cached = interned || Self::is_cached(entry.key().key());
                 let id = *entry.get();
-                let object = &mut self.objects_by_id[id.0];
+                let object = &mut self.objects_by_id[id.index()];
                 object.count += 1;
                 object.cached |= cached;
                 object.interned |= interned;
@@ -131,167 +202,13 @@ impl<'a> ObjectGraph<'a> {
         }
     }
 
-    fn visit_code(&mut self, code: &'a CodeObject) {
-        let address = std::ptr::from_ref(code).addr();
-        self.record_unique_at(ObjectLocation::Code(address), code_key(code));
-        self.explicitly_interned.extend(
-            code.marshal_hints
-                .explicitly_interned_strings
-                .iter()
-                .map(String::as_str),
-        );
-        self.record_unique_at(ObjectLocation::CodeBytes(address), code_bytes_key(code));
-        self.visit_constants_tuple(&code.constants);
-        self.visit_strings_tuple(&code.names);
-        self.visit_locals_tuple(code);
-        let local_kinds_key = local_kinds_key(code);
-        if matches!(&local_kinds_key, ObjectKey::LocalKinds(_)) {
-            self.record_unique_at(ObjectLocation::LocalKinds(address), local_kinds_key);
-        } else {
-            self.record_at(ObjectLocation::LocalKinds(address), local_kinds_key, false);
-        }
-        self.visit_metadata_string(&code.filename);
-        self.visit_metadata_string(&code.name);
-        self.visit_metadata_string(&code.qualified_name);
-        self.record_at(
-            ObjectLocation::Bytes(code.line_table.as_ptr().addr()),
-            ObjectKey::Bytes(&code.line_table),
-            false,
-        );
-        self.record_at(
-            ObjectLocation::Bytes(code.exception_table.as_ptr().addr()),
-            ObjectKey::Bytes(&code.exception_table),
-            false,
-        );
-    }
-
-    fn visit_constants_tuple(&mut self, values: &'a [Constant]) {
-        let location = ObjectLocation::ConstantsTuple(values.as_ptr().addr());
-        let key = constants_tuple_key(values);
-        if values
-            .iter()
-            .any(|value| matches!(value, Constant::Code(_)))
-        {
-            self.record_unique_at(location, key);
-        } else if !self.record_at(location, key, false) {
-            return;
-        }
-        for value in values {
-            self.visit_constant(value);
-        }
-    }
-
-    fn visit_strings_tuple(&mut self, values: &'a [String]) {
-        let key = strings_tuple_key(values);
-        if !self.record_at(
-            ObjectLocation::StringsTuple(values.as_ptr().addr()),
-            key,
-            false,
-        ) {
-            return;
-        }
-        for value in values {
-            self.visit_metadata_string(value);
-        }
-    }
-
-    fn visit_locals_tuple(&mut self, code: &'a CodeObject) {
-        let location = ObjectLocation::LocalsTuple(std::ptr::from_ref(code).addr());
-        let key = locals_tuple_key(code);
-        let first = if matches!(&key, ObjectKey::AnnotationLocals(_)) {
-            self.record_unique_at(location, key);
-            true
-        } else {
-            self.record_at(location, key, false)
-        };
-        if !first {
-            return;
-        }
-        for value in &code.locals {
-            self.visit_metadata_string(value);
-        }
-    }
-
-    fn visit_metadata_string(&mut self, value: &'a str) {
-        self.record_at(
-            ObjectLocation::MetadataString(value.as_ptr().addr()),
-            ObjectKey::String(value),
-            true,
-        );
-    }
-
-    fn visit_constant(&mut self, value: &'a Constant) {
-        let location = ObjectLocation::Constant(std::ptr::from_ref(value).addr());
-        match value {
-            Constant::None | Constant::Bool(_) | Constant::Ellipsis => {}
-            Constant::Int(value) => {
-                self.record_at(location, ObjectKey::Int(*value), false);
-            }
-            Constant::SignedInt(value) => {
-                self.record_at(location, ObjectKey::SignedInt(*value), false);
-            }
-            Constant::BigInt { negative, digits } => {
-                self.record_at(location, ObjectKey::BigInt(*negative, digits), false);
-            }
-            Constant::Float(value) => {
-                self.record_at(location, ObjectKey::Float(value.to_bits()), false);
-            }
-            Constant::Complex { real, imag } => {
-                self.record_at(
-                    location,
-                    ObjectKey::Complex(real.to_bits(), imag.to_bits()),
-                    false,
-                );
-            }
-            Constant::String(value) => {
-                self.record_at(location, ObjectKey::String(value), should_intern(value));
-            }
-            Constant::SurrogateString(value) => {
-                self.record_at(location, ObjectKey::SurrogateString(value), false);
-            }
-            Constant::Bytes(value) => {
-                self.record_at(location, ObjectKey::Bytes(value), false);
-            }
-            Constant::Tuple(values) => self.visit_constants_tuple(values),
-            Constant::FrozenSet(values) => {
-                let key = constant_key(value);
-                if self.record_at(location, key, false) {
-                    for (_, value) in frozen_set_members_in_wire_order(values) {
-                        self.visit_constant(value);
-                    }
-                }
-            }
-            Constant::Slice { lower, upper, step } => {
-                let key = constant_key(value);
-                if self.record_at(location, key, false) {
-                    self.visit_slice_member(lower);
-                    self.visit_slice_member(upper);
-                    self.visit_slice_member(step);
-                }
-            }
-            Constant::Code(code) => self.visit_code(code),
-        }
-    }
-
-    fn visit_slice_member(&mut self, value: &'a Constant) {
-        if slice_member_uses_identity(value) {
-            let address = std::ptr::from_ref(value).addr();
-            self.record_unique_at(
-                ObjectLocation::SliceMember(address),
-                ObjectKey::SliceMember(address),
-            );
-        } else {
-            self.visit_constant(value);
-        }
-    }
-
     #[cfg(test)]
     pub(super) fn is_shared(&self, key: &ObjectKey<'a>, force_reference: bool) -> bool {
         if force_reference
             || self
                 .objects
                 .get(&HashedObjectKey::from(key.clone()))
-                .is_some_and(|id| self.objects_by_id[id.0].count > 1)
+                .is_some_and(|id| self.objects_by_id[id.index()].count > 1)
         {
             return true;
         }
@@ -309,7 +226,7 @@ impl<'a> ObjectGraph<'a> {
     }
 
     pub(super) fn is_shared_object(&self, id: ObjectId) -> bool {
-        let object = &self.objects_by_id[id.0];
+        let object = &self.objects_by_id[id.index()];
         object.count > 1 || object.cached
     }
 
@@ -317,23 +234,20 @@ impl<'a> ObjectGraph<'a> {
         self.objects_by_id.len()
     }
 
-    pub(super) fn occurrence_count(&self) -> usize {
-        self.occurrences.len()
-    }
-
     #[cfg(test)]
     pub(super) fn keyed_object_count(&self) -> usize {
         self.objects.len()
     }
 
-    pub(super) fn occurrence(&self, index: usize, _expected: ObjectLocation) -> ObjectId {
-        #[cfg(debug_assertions)]
-        debug_assert_eq!(self.occurrence_locations[index], _expected);
-        self.occurrences[index]
+    pub(super) fn occurrence_cursor(&self) -> OccurrenceCursor<'_> {
+        OccurrenceCursor {
+            occurrences: &self.occurrences,
+            next: 0,
+        }
     }
 
     pub(super) fn is_interned_object(&self, id: ObjectId) -> bool {
-        self.objects_by_id[id.0].interned
+        self.objects_by_id[id.index()].interned
     }
 
     #[cfg(test)]
@@ -344,6 +258,117 @@ impl<'a> ObjectGraph<'a> {
                 ObjectKey::String(string) if *string == value => Some(*id),
                 _ => None,
             })
-            .is_some_and(|id| self.objects_by_id[id.0].interned)
+            .is_some_and(|id| self.objects_by_id[id.index()].interned)
+    }
+}
+
+struct GraphVisitor<'graph, 'code> {
+    graph: &'graph mut ObjectGraph<'code>,
+}
+
+impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
+    #[inline]
+    fn code(&mut self, code: &'code CodeObject, _reference_mode: ReferenceMode) -> bool {
+        self.graph.reserve_for_code(code);
+        self.graph.explicitly_interned.extend(
+            code.marshal_hints
+                .explicitly_interned_strings
+                .iter()
+                .map(String::as_str),
+        );
+        self.graph
+            .record_unique_value(OccurrenceKind::Code, code_key(code))
+    }
+
+    #[inline]
+    fn code_bytes(&mut self, code: &'code CodeObject) {
+        self.graph
+            .record_unique_value(OccurrenceKind::CodeBytes, code_bytes_key(code));
+    }
+
+    #[inline]
+    fn constants(&mut self, values: &'code [Constant], _reference_mode: ReferenceMode) -> bool {
+        let key = constants_tuple_key(values);
+        if values
+            .iter()
+            .any(|value| matches!(value, Constant::Code(_)))
+        {
+            self.graph
+                .record_unique_value(OccurrenceKind::Constants, key)
+        } else {
+            self.graph
+                .record_keyed(OccurrenceKind::Constants, key, false)
+        }
+    }
+
+    #[inline]
+    fn strings(&mut self, values: &'code [String]) -> bool {
+        self.graph
+            .record_keyed(OccurrenceKind::Strings, strings_tuple_key(values), false)
+    }
+
+    #[inline]
+    fn locals(&mut self, code: &'code CodeObject) -> bool {
+        let key = locals_tuple_key(code);
+        if matches!(&key, ObjectKey::AnnotationLocals(_)) {
+            self.graph.record_unique_value(OccurrenceKind::Locals, key)
+        } else {
+            self.graph.record_keyed(OccurrenceKind::Locals, key, false)
+        }
+    }
+
+    #[inline]
+    fn local_kinds(&mut self, code: &'code CodeObject) {
+        let key = local_kinds_key(code);
+        if matches!(&key, ObjectKey::LocalKinds(_)) {
+            self.graph
+                .record_unique_value(OccurrenceKind::LocalKinds, key);
+        } else {
+            self.graph
+                .record_keyed(OccurrenceKind::LocalKinds, key, false);
+        }
+    }
+
+    #[inline]
+    fn metadata_string(&mut self, value: &'code str) {
+        self.graph.record_keyed(
+            OccurrenceKind::MetadataString,
+            ObjectKey::String(value),
+            true,
+        );
+    }
+
+    #[inline]
+    fn first_line(&mut self, _value: u32) {}
+
+    #[inline]
+    fn bytes(&mut self, value: &'code [u8]) {
+        self.graph
+            .record_keyed(OccurrenceKind::Bytes, ObjectKey::Bytes(value), false);
+    }
+
+    #[inline]
+    fn constant(&mut self, value: &'code Constant, _reference_mode: ReferenceMode) -> bool {
+        match value {
+            Constant::None | Constant::Bool(_) | Constant::Ellipsis => true,
+            Constant::Tuple(_) | Constant::Code(_) => {
+                unreachable!("tuple and code constants have dedicated traversal methods")
+            }
+            Constant::String(value) => self.graph.record_keyed(
+                OccurrenceKind::Constant,
+                ObjectKey::String(value),
+                should_intern(value),
+            ),
+            _ => self
+                .graph
+                .record_keyed(OccurrenceKind::Constant, constant_key(value), false),
+        }
+    }
+
+    #[inline]
+    fn slice_member(&mut self, value: &'code Constant) {
+        let address = std::ptr::from_ref(value).addr();
+        self.graph
+            .record_unique_value(OccurrenceKind::SliceMember, ObjectKey::SliceMember(address));
     }
 }

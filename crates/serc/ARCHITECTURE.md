@@ -188,19 +188,25 @@ These checks diagnose structural corruption; the byte-for-byte oracle remains th
 
 ### Marshal encoding and `.pyc` output
 
-Marshal encoding is deliberately split into three responsibilities:
+Marshal encoding is deliberately split into four responsibilities:
 
 - `marshal/key.rs` defines when values compare equal and when CPython preserves object identity. It
     also defines deterministic sort keys for unordered constants such as frozen sets.
-- `marshal/graph.rs` walks the complete code-object graph first. It counts repeated objects and
-    records strings that CPython will intern.
-- `marshal/writer.rs` uses that graph to assign reference indices and encode code objects,
-    constants, strings, tuples, local-kind bytes, line tables, and exception tables in CPython's
-    order.
+- `marshal/plan.rs` owns the exact recursive traversal of code fields and constant children,
+    including wire order and forced-reference policy.
+- `marshal/graph.rs` runs that traversal to assign object IDs, count repeated objects, record strings
+    that CPython will intern, and retain the object ID for each visited occurrence.
+- `marshal/writer.rs` runs the same traversal, consumes the recorded occurrence IDs, assigns
+    reference indices, and encodes every value in CPython's order.
 
-The graph pass must precede writing because whether an object's first occurrence receives
-`FLAG_REF` depends on later occurrences. Replacing the two-pass design with opportunistic
-single-pass serialization changes bytes even when decoded values are equal.
+Graph analysis must precede writing because whether an object's first occurrence receives
+`FLAG_REF` depends on later occurrences. Replacing that analysis with opportunistic single-pass
+serialization changes bytes even when decoded values are equal. Both passes use the same pruned
+preorder traversal: repeated containers remain leaves in the graph pass, while emitted references
+remain leaves in the writer pass. A compact occurrence cursor connects the passes and verifies that
+the writer consumes every recorded object ID. Object-table capacity is reserved only from each code
+object's known structural children and direct constants, names, and locals; graph analysis does not
+guess output size or add a preliminary traversal.
 
 `CompiledModule::to_timestamp_pyc` prefixes the marshalled code object with the generated magic
 number, timestamp-invalidation flags, source modification time, and source size. The runtime is

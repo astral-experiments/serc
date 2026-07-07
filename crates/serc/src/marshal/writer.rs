@@ -1,7 +1,7 @@
 use crate::code_object::{CodeObject, Constant};
 
-use super::graph::{ObjectGraph, ObjectId, ObjectLocation};
-use super::key::{frozen_set_members_in_wire_order, slice_member_uses_identity};
+use super::graph::{ObjectGraph, OccurrenceCursor, OccurrenceKind};
+use super::plan::{MarshalVisitor, ObjectId, ReferenceMode, traverse_code};
 use super::v5::{
     FLAG_REF, TYPE_ASCII, TYPE_ASCII_INTERNED, TYPE_BINARY_COMPLEX, TYPE_BINARY_FLOAT, TYPE_CODE,
     TYPE_ELLIPSIS, TYPE_FALSE, TYPE_FROZENSET, TYPE_INT, TYPE_INTERNED, TYPE_LONG, TYPE_NONE,
@@ -22,16 +22,10 @@ pub(crate) fn encode_code_into(code: &CodeObject, output: &mut Vec<u8>) {
         output,
         references: vec![None; graph.object_count()],
         reference_count: 0,
-        next_occurrence: 0,
+        occurrences: graph.occurrence_cursor(),
     };
-    writer.write_code(code, ReferenceMode::Forced);
-    debug_assert_eq!(writer.next_occurrence, graph.occurrence_count());
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ReferenceMode {
-    IfShared,
-    Forced,
+    traverse_code(code, &mut writer);
+    writer.finish();
 }
 
 struct Writer<'output, 'graph, 'code> {
@@ -39,18 +33,16 @@ struct Writer<'output, 'graph, 'code> {
     output: &'output mut Vec<u8>,
     references: Vec<Option<u32>>,
     reference_count: usize,
-    next_occurrence: usize,
+    occurrences: OccurrenceCursor<'graph>,
 }
 
 impl Writer<'_, '_, '_> {
-    fn next_object(&mut self, location: ObjectLocation) -> ObjectId {
-        let object = self.graph.occurrence(self.next_occurrence, location);
-        self.next_occurrence += 1;
-        object
+    fn finish(self) {
+        self.occurrences.finish();
     }
 
-    fn constant_object(&mut self, value: &Constant) -> ObjectId {
-        self.next_object(ObjectLocation::Constant(std::ptr::from_ref(value).addr()))
+    fn next_object(&mut self, kind: OccurrenceKind) -> ObjectId {
+        self.occurrences.consume(kind)
     }
 
     fn byte(&mut self, value: u8) {
@@ -65,20 +57,15 @@ impl Writer<'_, '_, '_> {
         if reference_mode == ReferenceMode::IfShared && !self.graph.is_shared_object(object) {
             return Some(0);
         }
-        if let Some(index) = self.references[object.0] {
+        if let Some(index) = self.references[object.index()] {
             self.byte(TYPE_REF);
             self.long(index);
             return None;
         }
         let index = u32::try_from(self.reference_count).expect("marshal reference limit exceeded");
         self.reference_count += 1;
-        self.references[object.0] = Some(index);
+        self.references[object.index()] = Some(index);
         Some(FLAG_REF)
-    }
-
-    fn bytes(&mut self, value: &[u8], reference_mode: ReferenceMode) {
-        let object = self.next_object(ObjectLocation::Bytes(value.as_ptr().addr()));
-        self.bytes_with_object(object, value, reference_mode);
     }
 
     fn bytes_with_object(&mut self, object: ObjectId, value: &[u8], reference_mode: ReferenceMode) {
@@ -88,11 +75,6 @@ impl Writer<'_, '_, '_> {
         self.byte(TYPE_STRING | flag);
         self.long(value.len().try_into().expect("marshal value exceeds 4 GiB"));
         self.output.extend_from_slice(value);
-    }
-
-    fn string(&mut self, value: &str) {
-        let object = self.next_object(ObjectLocation::MetadataString(value.as_ptr().addr()));
-        self.string_with_object(object, value, ReferenceMode::IfShared);
     }
 
     fn string_with_object(&mut self, object: ObjectId, value: &str, reference_mode: ReferenceMode) {
@@ -177,89 +159,80 @@ impl Writer<'_, '_, '_> {
         true
     }
 
-    fn strings(&mut self, values: &[String], reference_mode: ReferenceMode) {
-        let object = self.next_object(ObjectLocation::StringsTuple(values.as_ptr().addr()));
-        if self.tuple_header(object, values.len(), reference_mode) {
-            for value in values {
-                self.string(value);
-            }
-        }
-    }
-
-    fn locals(&mut self, code: &CodeObject) {
-        let object = self.next_object(ObjectLocation::LocalsTuple(std::ptr::from_ref(code).addr()));
-        if self.tuple_header(object, code.locals.len(), ReferenceMode::IfShared) {
-            for value in &code.locals {
-                self.string(value);
-            }
-        }
-    }
-
-    fn constants(&mut self, values: &[Constant], reference_mode: ReferenceMode) {
-        let object = self.next_object(ObjectLocation::ConstantsTuple(values.as_ptr().addr()));
-        if self.tuple_header(object, values.len(), reference_mode) {
-            for value in values {
-                self.constant(value);
-            }
-        }
-    }
-
-    fn constant(&mut self, value: &Constant) {
-        self.constant_with_reference_mode(value, ReferenceMode::IfShared);
-    }
-
-    fn constant_with_reference_mode(&mut self, value: &Constant, reference_mode: ReferenceMode) {
+    fn write_constant_value(&mut self, value: &Constant, reference_mode: ReferenceMode) -> bool {
         match value {
-            Constant::None => self.byte(TYPE_NONE),
-            Constant::Bool(false) => self.byte(TYPE_FALSE),
-            Constant::Bool(true) => self.byte(TYPE_TRUE),
-            Constant::Ellipsis => self.byte(TYPE_ELLIPSIS),
+            Constant::None => {
+                self.byte(TYPE_NONE);
+                true
+            }
+            Constant::Bool(false) => {
+                self.byte(TYPE_FALSE);
+                true
+            }
+            Constant::Bool(true) => {
+                self.byte(TYPE_TRUE);
+                true
+            }
+            Constant::Ellipsis => {
+                self.byte(TYPE_ELLIPSIS);
+                true
+            }
             Constant::Int(integer) => {
-                let object = self.constant_object(value);
+                let object = self.next_object(OccurrenceKind::Constant);
                 self.integer(object, *integer, reference_mode);
+                true
             }
             Constant::SignedInt(integer) => {
-                let object = self.constant_object(value);
+                let object = self.next_object(OccurrenceKind::Constant);
                 self.signed_integer(object, *integer, reference_mode);
+                true
             }
             Constant::BigInt { negative, digits } => {
-                let object = self.constant_object(value);
+                let object = self.next_object(OccurrenceKind::Constant);
                 self.big_integer(object, digits, *negative, reference_mode);
+                true
             }
             Constant::Float(float) => {
-                let object = self.constant_object(value);
+                let object = self.next_object(OccurrenceKind::Constant);
                 let Some(flag) = self.begin_object(object, reference_mode) else {
-                    return;
+                    return false;
                 };
                 self.byte(TYPE_BINARY_FLOAT | flag);
                 self.output.extend_from_slice(&float.to_le_bytes());
+                true
             }
             Constant::Complex { real, imag } => {
-                let object = self.constant_object(value);
+                let object = self.next_object(OccurrenceKind::Constant);
                 let Some(flag) = self.begin_object(object, reference_mode) else {
-                    return;
+                    return false;
                 };
                 self.byte(TYPE_BINARY_COMPLEX | flag);
                 self.output.extend_from_slice(&real.to_le_bytes());
                 self.output.extend_from_slice(&imag.to_le_bytes());
+                true
             }
             Constant::String(string) => {
-                let object = self.constant_object(value);
+                let object = self.next_object(OccurrenceKind::Constant);
                 self.string_with_object(object, string, reference_mode);
+                true
             }
             Constant::SurrogateString(string) => {
-                let object = self.constant_object(value);
+                let object = self.next_object(OccurrenceKind::Constant);
                 self.surrogate_string_with_object(object, string, reference_mode);
+                true
             }
             Constant::Bytes(bytes) => {
-                let object = self.constant_object(value);
+                let object = self.next_object(OccurrenceKind::Constant);
                 self.bytes_with_object(object, bytes, reference_mode);
+                true
             }
-            Constant::Tuple(values) => self.constants(values, reference_mode),
+            Constant::Tuple(_) | Constant::Code(_) => {
+                unreachable!("tuple and code constants have dedicated traversal methods")
+            }
             Constant::FrozenSet(values) => {
-                let object = self.constant_object(value);
+                let object = self.next_object(OccurrenceKind::Constant);
                 let Some(flag) = self.begin_object(object, reference_mode) else {
-                    return;
+                    return false;
                 };
                 self.byte(TYPE_FROZENSET | flag);
                 self.long(
@@ -268,32 +241,20 @@ impl Writer<'_, '_, '_> {
                         .try_into()
                         .expect("marshal frozenset exceeds 4 GiB"),
                 );
-                for (_, value) in frozen_set_members_in_wire_order(values) {
-                    self.constant_with_reference_mode(value, ReferenceMode::Forced);
-                }
+                true
             }
-            Constant::Slice { lower, upper, step } => {
-                let object = self.constant_object(value);
+            Constant::Slice { .. } => {
+                let object = self.next_object(OccurrenceKind::Constant);
                 let Some(flag) = self.begin_object(object, reference_mode) else {
-                    return;
+                    return false;
                 };
                 self.byte(TYPE_SLICE | flag);
-                self.slice_member(lower);
-                self.slice_member(upper);
-                self.slice_member(step);
+                true
             }
-            Constant::Code(code) => self.write_code(code, ReferenceMode::IfShared),
         }
     }
 
-    fn slice_member(&mut self, value: &Constant) {
-        if !slice_member_uses_identity(value) {
-            self.constant(value);
-            return;
-        }
-        let object = self.next_object(ObjectLocation::SliceMember(
-            std::ptr::from_ref(value).addr(),
-        ));
+    fn write_slice_member(&mut self, object: ObjectId, value: &Constant) {
         let Some(flag) = self.begin_object(object, ReferenceMode::IfShared) else {
             return;
         };
@@ -458,11 +419,14 @@ impl Writer<'_, '_, '_> {
             self.output.extend_from_slice(&digit.to_le_bytes());
         }
     }
+}
 
-    fn write_code(&mut self, code: &CodeObject, reference_mode: ReferenceMode) {
-        let object = self.next_object(ObjectLocation::Code(std::ptr::from_ref(code).addr()));
+impl<'code> MarshalVisitor<'code> for Writer<'_, '_, 'code> {
+    #[inline]
+    fn code(&mut self, code: &'code CodeObject, reference_mode: ReferenceMode) -> bool {
+        let object = self.next_object(OccurrenceKind::Code);
         let Some(flag) = self.begin_object(object, reference_mode) else {
-            return;
+            return false;
         };
         self.byte(TYPE_CODE | flag);
         self.long(code.arg_count);
@@ -470,19 +434,64 @@ impl Writer<'_, '_, '_> {
         self.long(code.keyword_only_arg_count);
         self.long(code.stack_size);
         self.long(code.flags);
-        let bytecode = self.next_object(ObjectLocation::CodeBytes(std::ptr::from_ref(code).addr()));
-        self.bytes_with_object(bytecode, &code.bytecode, ReferenceMode::Forced);
-        self.constants(&code.constants, ReferenceMode::IfShared);
-        self.strings(&code.names, ReferenceMode::IfShared);
-        self.locals(code);
-        let local_kinds =
-            self.next_object(ObjectLocation::LocalKinds(std::ptr::from_ref(code).addr()));
-        self.bytes_with_object(local_kinds, &code.local_kinds, ReferenceMode::IfShared);
-        self.string(&code.filename);
-        self.string(&code.name);
-        self.string(&code.qualified_name);
-        self.long(code.first_line_number);
-        self.bytes(&code.line_table, ReferenceMode::IfShared);
-        self.bytes(&code.exception_table, ReferenceMode::IfShared);
+        true
+    }
+
+    #[inline]
+    fn code_bytes(&mut self, code: &'code CodeObject) {
+        let object = self.next_object(OccurrenceKind::CodeBytes);
+        self.bytes_with_object(object, &code.bytecode, ReferenceMode::Forced);
+    }
+
+    #[inline]
+    fn constants(&mut self, values: &'code [Constant], reference_mode: ReferenceMode) -> bool {
+        let object = self.next_object(OccurrenceKind::Constants);
+        self.tuple_header(object, values.len(), reference_mode)
+    }
+
+    #[inline]
+    fn strings(&mut self, values: &'code [String]) -> bool {
+        let object = self.next_object(OccurrenceKind::Strings);
+        self.tuple_header(object, values.len(), ReferenceMode::IfShared)
+    }
+
+    #[inline]
+    fn locals(&mut self, code: &'code CodeObject) -> bool {
+        let object = self.next_object(OccurrenceKind::Locals);
+        self.tuple_header(object, code.locals.len(), ReferenceMode::IfShared)
+    }
+
+    #[inline]
+    fn local_kinds(&mut self, code: &'code CodeObject) {
+        let object = self.next_object(OccurrenceKind::LocalKinds);
+        self.bytes_with_object(object, &code.local_kinds, ReferenceMode::IfShared);
+    }
+
+    #[inline]
+    fn metadata_string(&mut self, value: &'code str) {
+        let object = self.next_object(OccurrenceKind::MetadataString);
+        self.string_with_object(object, value, ReferenceMode::IfShared);
+    }
+
+    #[inline]
+    fn first_line(&mut self, value: u32) {
+        self.long(value);
+    }
+
+    #[inline]
+    fn bytes(&mut self, value: &'code [u8]) {
+        let object = self.next_object(OccurrenceKind::Bytes);
+        self.bytes_with_object(object, value, ReferenceMode::IfShared);
+    }
+
+    #[inline]
+    fn constant(&mut self, value: &'code Constant, reference_mode: ReferenceMode) -> bool {
+        self.write_constant_value(value, reference_mode)
+    }
+
+    #[inline]
+    fn slice_member(&mut self, value: &'code Constant) {
+        let object = self.next_object(OccurrenceKind::SliceMember);
+        self.write_slice_member(object, value);
     }
 }
