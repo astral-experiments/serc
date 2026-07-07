@@ -211,6 +211,9 @@ fn decode_source(bytes: &[u8]) -> Result<String, String> {
     let (bytes, has_bom) = bytes
         .strip_prefix(UTF8_BOM)
         .map_or((bytes, false), |bytes| (bytes, true));
+    if has_bom && bytes.starts_with(UTF8_BOM) {
+        return Err("source contains multiple UTF-8 BOMs".to_string());
+    }
     if let Some(cookie) = declared_encoding(bytes) {
         let Some(bom_compatible) = classify_utf8_encoding(cookie) else {
             return Err(format!("unsupported source encoding `{cookie}`"));

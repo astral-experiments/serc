@@ -126,6 +126,24 @@ fn compile_rejects_null_bytes() {
 }
 
 #[test]
+fn compile_rejects_repeated_utf8_boms() {
+    let directory = tempfile::tempdir().unwrap();
+    let source_path = directory.path().join("repeated_bom.py");
+    fs_err::write(&source_path, b"\xef\xbb\xbf\xef\xbb\xbfvalue = 1\n").unwrap();
+
+    let output = serc()
+        .args(["compile", "--quiet"])
+        .arg(&source_path)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("source contains multiple UTF-8 BOMs"));
+    assert!(!directory.path().join("__pycache__").exists());
+}
+
+#[test]
 fn compile_matches_cpython_pyc() {
     let Some(python) = common::python_3145() else {
         return;
