@@ -19,21 +19,47 @@ struct Object {
     interned: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(super) enum OccurrenceKind {
+    Bytes,
+    Code,
+    CodeBytes,
+    Constant,
+    Constants,
+    LocalKinds,
+    Locals,
+    MetadataString,
+    SliceMember,
+    Strings,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Occurrence {
+    object: ObjectId,
+    kind: OccurrenceKind,
+}
+
+const _: [(); 8] = [(); std::mem::size_of::<Occurrence>()];
+
 #[derive(Debug)]
 pub(super) struct OccurrenceCursor<'a> {
-    occurrences: &'a [ObjectId],
+    occurrences: &'a [Occurrence],
     next: usize,
 }
 
 impl OccurrenceCursor<'_> {
     #[inline]
-    pub(super) fn consume(&mut self) -> ObjectId {
+    pub(super) fn consume(&mut self, expected: OccurrenceKind) -> ObjectId {
         let index = self.next;
-        let Some(object) = self.occurrences.get(index).copied() else {
-            missing_occurrence(index, self.occurrences.len());
+        let Some(occurrence) = self.occurrences.get(index).copied() else {
+            missing_occurrence(index, expected, self.occurrences.len());
         };
+        if occurrence.kind != expected {
+            mismatched_occurrence(index, expected, occurrence.kind);
+        }
         self.next += 1;
-        object
+        occurrence.object
     }
 
     pub(super) fn finish(self) {
@@ -49,9 +75,17 @@ impl OccurrenceCursor<'_> {
 
 #[cold]
 #[inline(never)]
-fn missing_occurrence(index: usize, count: usize) -> ! {
+fn missing_occurrence(index: usize, expected: OccurrenceKind, count: usize) -> ! {
     panic!(
-        "marshal writer requested occurrence {index}, but the graph recorded {count} occurrences"
+        "marshal writer requested occurrence {index} ({expected:?}), but the graph recorded {count} occurrences"
+    );
+}
+
+#[cold]
+#[inline(never)]
+fn mismatched_occurrence(index: usize, expected: OccurrenceKind, recorded: OccurrenceKind) -> ! {
+    panic!(
+        "marshal occurrence {index} mismatch: writer requested {expected:?}, graph recorded {recorded:?}"
     );
 }
 
@@ -61,7 +95,7 @@ const CODE_OBJECT_CHILDREN: usize = 10;
 pub(super) struct ObjectGraph<'a> {
     objects: FxHashMap<HashedObjectKey<'a>, ObjectId>,
     objects_by_id: Vec<Object>,
-    occurrences: Vec<ObjectId>,
+    occurrences: Vec<Occurrence>,
     #[cfg(debug_assertions)]
     unique_objects: FxHashSet<HashedObjectKey<'a>>,
     explicitly_interned: Vec<&'a str>,
@@ -94,15 +128,15 @@ impl<'a> ObjectGraph<'a> {
             .reserve(estimated_descendants.saturating_add(1));
     }
 
-    fn record_keyed(&mut self, key: ObjectKey<'a>, interned: bool) -> bool {
+    fn record_keyed(&mut self, kind: OccurrenceKind, key: ObjectKey<'a>, interned: bool) -> bool {
         let (id, first) = self.record_object(key.into(), interned);
-        self.occurrences.push(id);
+        self.occurrences.push(Occurrence { object: id, kind });
         first
     }
 
-    fn record_unique_value(&mut self, key: ObjectKey<'a>) -> bool {
+    fn record_unique_value(&mut self, kind: OccurrenceKind, key: ObjectKey<'a>) -> bool {
         let id = self.record_unique(key);
-        self.occurrences.push(id);
+        self.occurrences.push(Occurrence { object: id, kind });
         true
     }
 
@@ -242,12 +276,14 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
                 .iter()
                 .map(String::as_str),
         );
-        self.graph.record_unique_value(code_key(code))
+        self.graph
+            .record_unique_value(OccurrenceKind::Code, code_key(code))
     }
 
     #[inline]
     fn code_bytes(&mut self, code: &'code CodeObject) {
-        self.graph.record_unique_value(code_bytes_key(code));
+        self.graph
+            .record_unique_value(OccurrenceKind::CodeBytes, code_bytes_key(code));
     }
 
     #[inline]
@@ -257,24 +293,27 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
             .iter()
             .any(|value| matches!(value, Constant::Code(_)))
         {
-            self.graph.record_unique_value(key)
+            self.graph
+                .record_unique_value(OccurrenceKind::Constants, key)
         } else {
-            self.graph.record_keyed(key, false)
+            self.graph
+                .record_keyed(OccurrenceKind::Constants, key, false)
         }
     }
 
     #[inline]
     fn strings(&mut self, values: &'code [String]) -> bool {
-        self.graph.record_keyed(strings_tuple_key(values), false)
+        self.graph
+            .record_keyed(OccurrenceKind::Strings, strings_tuple_key(values), false)
     }
 
     #[inline]
     fn locals(&mut self, code: &'code CodeObject) -> bool {
         let key = locals_tuple_key(code);
         if matches!(&key, ObjectKey::AnnotationLocals(_)) {
-            self.graph.record_unique_value(key)
+            self.graph.record_unique_value(OccurrenceKind::Locals, key)
         } else {
-            self.graph.record_keyed(key, false)
+            self.graph.record_keyed(OccurrenceKind::Locals, key, false)
         }
     }
 
@@ -282,15 +321,21 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
     fn local_kinds(&mut self, code: &'code CodeObject) {
         let key = local_kinds_key(code);
         if matches!(&key, ObjectKey::LocalKinds(_)) {
-            self.graph.record_unique_value(key);
+            self.graph
+                .record_unique_value(OccurrenceKind::LocalKinds, key);
         } else {
-            self.graph.record_keyed(key, false);
+            self.graph
+                .record_keyed(OccurrenceKind::LocalKinds, key, false);
         }
     }
 
     #[inline]
     fn metadata_string(&mut self, value: &'code str) {
-        self.graph.record_keyed(ObjectKey::String(value), true);
+        self.graph.record_keyed(
+            OccurrenceKind::MetadataString,
+            ObjectKey::String(value),
+            true,
+        );
     }
 
     #[inline]
@@ -298,7 +343,8 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
 
     #[inline]
     fn bytes(&mut self, value: &'code [u8]) {
-        self.graph.record_keyed(ObjectKey::Bytes(value), false);
+        self.graph
+            .record_keyed(OccurrenceKind::Bytes, ObjectKey::Bytes(value), false);
     }
 
     #[inline]
@@ -308,10 +354,14 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
             Constant::Tuple(_) | Constant::Code(_) => {
                 unreachable!("tuple and code constants have dedicated traversal methods")
             }
-            Constant::String(value) => self
+            Constant::String(value) => self.graph.record_keyed(
+                OccurrenceKind::Constant,
+                ObjectKey::String(value),
+                should_intern(value),
+            ),
+            _ => self
                 .graph
-                .record_keyed(ObjectKey::String(value), should_intern(value)),
-            _ => self.graph.record_keyed(constant_key(value), false),
+                .record_keyed(OccurrenceKind::Constant, constant_key(value), false),
         }
     }
 
@@ -319,6 +369,6 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
     fn slice_member(&mut self, value: &'code Constant) {
         let address = std::ptr::from_ref(value).addr();
         self.graph
-            .record_unique_value(ObjectKey::SliceMember(address));
+            .record_unique_value(OccurrenceKind::SliceMember, ObjectKey::SliceMember(address));
     }
 }

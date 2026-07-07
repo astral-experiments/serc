@@ -1,7 +1,7 @@
 use crate::code_object::{CodeObject, Constant, LocalsIdentity, MarshalHints};
 
 use super::encode_code;
-use super::graph::ObjectGraph;
+use super::graph::{ObjectGraph, OccurrenceKind};
 use super::key::{
     ObjectKey, code_bytes_key, code_key, constant_key, constant_sort_key, constants_tuple_key,
     local_kinds_key, locals_tuple_key, slice_member_uses_identity, strings_tuple_key,
@@ -31,11 +31,22 @@ fn code_object(constants: Vec<Constant>) -> CodeObject {
 }
 
 #[test]
+#[should_panic(expected = "marshal occurrence 0 mismatch")]
+fn occurrence_cursor_rejects_a_mismatched_kind() {
+    let code = code_object(Vec::new());
+    let graph = ObjectGraph::for_code(&code);
+
+    graph
+        .occurrence_cursor()
+        .consume(OccurrenceKind::MetadataString);
+}
+
+#[test]
 #[should_panic(expected = "marshal writer requested occurrence 0")]
 fn occurrence_cursor_rejects_over_consumption() {
     let graph = ObjectGraph::default();
 
-    graph.occurrence_cursor().consume();
+    graph.occurrence_cursor().consume(OccurrenceKind::Code);
 }
 
 #[test]
