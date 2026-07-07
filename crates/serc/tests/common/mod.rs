@@ -6,7 +6,7 @@ use tempfile::tempdir;
 
 const CPYTHON_MARSHAL: &str = "import marshal, sys; code = compile(sys.stdin.read(), sys.argv[1], 'exec', dont_inherit=True, optimize=0); sys.stdout.buffer.write(marshal.dumps(code))";
 
-fn python_3145() -> Option<String> {
+pub(crate) fn python_3145() -> Option<String> {
     let configured = std::env::var("SERC_TEST_PYTHON").ok();
     let executable = configured.as_deref().unwrap_or("python3.14");
     let version = CPYTHON_TARGET.version_string();

@@ -21,6 +21,20 @@ The backend currently implements:
 - classes with bases, metaclass keywords, decorators, methods, class namespace metadata, class
   dictionary cells, and static-attribute metadata.
 
+## Command-line interface
+
+The `serc` binary accepts Python files and directories, recursively compiles directory inputs,
+and writes standard timestamp-invalidated `.pyc` files under `__pycache__`:
+
+```console
+cargo run --release -p serc -- compile path/to/package
+```
+
+Paths default to the current directory. Pass `--check` to compile without writing cache files and
+`--quiet` to suppress the success summary. Compilation is sequential so the command can be
+compared directly with single-worker CPython `compileall`. Source files must use UTF-8, either by
+default or with a UTF-8 encoding cookie; other source encodings are unsupported.
+
 ## CPython corpus comparison
 
 The `compare_cpython_corpus` example discovers every `.py` file under Ruff's linter, formatter,
@@ -90,3 +104,7 @@ the matching Ruff corpus and runs the complete frozen gate.
 The [Serc benchmark suite](../serc_benchmark/README.md) measures the public compile and
 marshal boundaries over fixed, CPython-validated workloads. Its documentation records the stable
 benchmark identities and the canonical local Criterion and CodSpeed simulation commands.
+
+The [end-to-end Hyperfine harness](../../scripts/benchmarks/README.md) compares CPython
+`compileall` with the `serc compile` workflow on a pinned NumPy checkout, including process
+startup, source discovery, marshaling, and `.pyc` writes.
