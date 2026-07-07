@@ -165,6 +165,15 @@ fn compile_matches_cpython_for_encoding_cookies() {
             "windows_1252",
             b"# coding: cp1252\nvalue = '\x80'\n".as_slice(),
         ),
+        (
+            "windows_1252_alias",
+            b"# coding: windows_1252\nvalue = '\x80'\n".as_slice(),
+        ),
+        (
+            "iso_8859_9",
+            b"# coding: iso-8859-9\nvalue = '\x80'\n".as_slice(),
+        ),
+        ("cp437", b"# coding: cp437\nvalue = '\x80'\n".as_slice()),
         ("ascii", b"# coding: ascii\nvalue = 'ascii'\n".as_slice()),
     ] {
         let source_path = directory.path().join(format!("{name}.py"));

@@ -199,6 +199,8 @@ enum SourceEncoding {
     Utf8,
     Latin1,
     Ascii,
+    Iso8859_9,
+    Cp437,
     Standard(&'static encoding_rs::Encoding),
 }
 
@@ -236,6 +238,30 @@ fn decode_source(bytes: &[u8]) -> Result<String, String> {
                 .map(str::to_owned)
                 .map_err(|error| format!("source is not valid ASCII: {error}"))
         }
+        SourceEncoding::Iso8859_9 => Ok(bytes
+            .iter()
+            .copied()
+            .map(|byte| match byte {
+                0xd0 => '\u{011e}',
+                0xdd => '\u{0130}',
+                0xde => '\u{015e}',
+                0xf0 => '\u{011f}',
+                0xfd => '\u{0131}',
+                0xfe => '\u{015f}',
+                _ => char::from(byte),
+            })
+            .collect()),
+        SourceEncoding::Cp437 => Ok(bytes
+            .iter()
+            .copied()
+            .map(|byte| {
+                if byte.is_ascii() {
+                    char::from(byte)
+                } else {
+                    CP437_HIGH[usize::from(byte - 0x80)]
+                }
+            })
+            .collect()),
         SourceEncoding::Standard(encoding) => encoding
             .decode_without_bom_handling_and_without_replacement(bytes)
             .map(std::borrow::Cow::into_owned)
@@ -332,9 +358,16 @@ fn classify_encoding(name: &str) -> Option<(SourceEncoding, bool)> {
         "ascii" | "646" | "cp367" | "ibm367" | "csascii" | "us" | "us_ascii" | "iso646_us"
         | "iso_646.irv_1991" | "iso_ir_6" | "ansi_x3.4_1968" | "ansi_x3_4_1968"
         | "ansi_x3.4_1986" => SourceEncoding::Ascii,
-        _ => SourceEncoding::Standard(encoding_rs::Encoding::for_label_no_replacement(
-            name.as_bytes(),
-        )?),
+        "iso8859_9" | "iso_8859_9" | "iso_8859_9_1989" | "iso_ir_148" | "latin5" | "l5"
+        | "csisolatin5" => SourceEncoding::Iso8859_9,
+        "cp437" | "437" | "ibm437" | "cspc8codepage437" => SourceEncoding::Cp437,
+        "cp1252" | "1252" | "windows_1252" => SourceEncoding::Standard(encoding_rs::WINDOWS_1252),
+        _ => {
+            let label = codec_name.replace('_', "-");
+            SourceEncoding::Standard(encoding_rs::Encoding::for_label_no_replacement(
+                label.as_bytes(),
+            )?)
+        }
     };
     Some((encoding, false))
 }
@@ -355,6 +388,25 @@ fn normalize_codec_name(name: &str) -> String {
     }
     normalized
 }
+
+const CP437_HIGH: [char; 128] = [
+    '\u{00c7}', '\u{00fc}', '\u{00e9}', '\u{00e2}', '\u{00e4}', '\u{00e0}', '\u{00e5}', '\u{00e7}',
+    '\u{00ea}', '\u{00eb}', '\u{00e8}', '\u{00ef}', '\u{00ee}', '\u{00ec}', '\u{00c4}', '\u{00c5}',
+    '\u{00c9}', '\u{00e6}', '\u{00c6}', '\u{00f4}', '\u{00f6}', '\u{00f2}', '\u{00fb}', '\u{00f9}',
+    '\u{00ff}', '\u{00d6}', '\u{00dc}', '\u{00a2}', '\u{00a3}', '\u{00a5}', '\u{20a7}', '\u{0192}',
+    '\u{00e1}', '\u{00ed}', '\u{00f3}', '\u{00fa}', '\u{00f1}', '\u{00d1}', '\u{00aa}', '\u{00ba}',
+    '\u{00bf}', '\u{2310}', '\u{00ac}', '\u{00bd}', '\u{00bc}', '\u{00a1}', '\u{00ab}', '\u{00bb}',
+    '\u{2591}', '\u{2592}', '\u{2593}', '\u{2502}', '\u{2524}', '\u{2561}', '\u{2562}', '\u{2556}',
+    '\u{2555}', '\u{2563}', '\u{2551}', '\u{2557}', '\u{255d}', '\u{255c}', '\u{255b}', '\u{2510}',
+    '\u{2514}', '\u{2534}', '\u{252c}', '\u{251c}', '\u{2500}', '\u{253c}', '\u{255e}', '\u{255f}',
+    '\u{255a}', '\u{2554}', '\u{2569}', '\u{2566}', '\u{2560}', '\u{2550}', '\u{256c}', '\u{2567}',
+    '\u{2568}', '\u{2564}', '\u{2565}', '\u{2559}', '\u{2558}', '\u{2552}', '\u{2553}', '\u{256b}',
+    '\u{256a}', '\u{2518}', '\u{250c}', '\u{2588}', '\u{2584}', '\u{258c}', '\u{2590}', '\u{2580}',
+    '\u{03b1}', '\u{00df}', '\u{0393}', '\u{03c0}', '\u{03a3}', '\u{03c3}', '\u{00b5}', '\u{03c4}',
+    '\u{03a6}', '\u{0398}', '\u{03a9}', '\u{03b4}', '\u{221e}', '\u{03c6}', '\u{03b5}', '\u{2229}',
+    '\u{2261}', '\u{00b1}', '\u{2265}', '\u{2264}', '\u{2320}', '\u{2321}', '\u{00f7}', '\u{2248}',
+    '\u{00b0}', '\u{2219}', '\u{00b7}', '\u{221a}', '\u{207f}', '\u{00b2}', '\u{25a0}', '\u{00a0}',
+];
 
 fn encode_mtime(modified: SystemTime) -> u32 {
     match modified.duration_since(UNIX_EPOCH) {
