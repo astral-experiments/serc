@@ -184,7 +184,7 @@ struct CodeUnitSpec {
 
 #[derive(Debug, Default)]
 struct OutputState {
-    constants: Vec<Constant>,
+    constants: ConstantPool,
     deferred_constants_before_return: Vec<(InstructionId, Constant)>,
     deferred_constants: Vec<(Option<InstructionId>, Constant)>,
     deferred_names: Vec<(InstructionId, String)>,
