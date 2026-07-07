@@ -646,7 +646,7 @@ impl Compiler {
             self.assembler.set_location(SourceLocation::NONE);
             self.set_depth(1);
             self.emit_unary_intrinsic(UnaryIntrinsic::STOPITERATION_ERROR)?;
-            self.emit(RERAISE, 1, -1)?;
+            self.emit_reraise(ReraiseStackState::StopIterationHandler)?;
         }
 
         if self.control.depth != 0 {
