@@ -86,6 +86,11 @@ impl Compiler {
                 + u32::from(parameter_flags & CO_VARKEYWORDS != 0),
         )
         .unwrap_or(usize::MAX);
+        let names = &context
+            .scopes
+            .get()
+            .expect("scope arena should be initialized before child compilation")
+            .names;
         let mut locals: Vec<_> = plan
             .locals
             .iter()
@@ -95,7 +100,7 @@ impl Compiler {
                     || !plan.cellvars.contains(*name)
                     || plan.inlined_comprehension_cellvars.contains(*name)
             })
-            .map(|(_, name)| name.clone())
+            .map(|(_, name)| *name)
             .collect();
         let fast_local_count = locals.len();
         let mut cell_only_locals: Vec<_> = plan
@@ -107,72 +112,42 @@ impl Compiler {
                     && plan.cellvars.contains(*name)
                     && !plan.inlined_comprehension_cellvars.contains(*name)
             })
-            .map(|(_, name)| name.clone())
+            .map(|(_, name)| *name)
             .collect();
-        cell_only_locals.sort();
+        cell_only_locals.sort_by(|left, right| names.resolve(*left).cmp(names.resolve(*right)));
         locals.extend(cell_only_locals);
-        let names = &context
-            .scopes
-            .get()
-            .expect("scope arena should be initialized before child compilation")
-            .names;
         let indices = locals
             .iter()
             .enumerate()
-            .map(|(index, name)| {
-                let name = names
-                    .get(name)
-                    .unwrap_or_else(|| panic!("module analysis did not intern `{name}`"));
-                Ok((name, to_u32(index, "local variable count")?))
-            })
+            .map(|(index, name)| Ok((*name, to_u32(index, "local variable count")?)))
             .collect::<Result<FxHashMap<_, _>, CompileError>>()?;
         let local_count = locals.len();
         let free_indices = plan
             .freevars
             .iter()
             .enumerate()
-            .map(|(index, name)| {
-                let name = names
-                    .get(name)
-                    .unwrap_or_else(|| panic!("module analysis did not intern `{name}`"));
-                Ok((name, to_u32(local_count + index, "free variable count")?))
-            })
+            .map(|(index, name)| Ok((*name, to_u32(local_count + index, "free variable count")?)))
             .collect::<Result<FxHashMap<_, _>, CompileError>>()?;
-        locals.extend(plan.freevars.iter().cloned());
+        locals.extend(plan.freevars.iter().copied());
 
-        let cell_names: NameSet = plan
-            .cellvars
+        let cell_names: NameSet = plan.cellvars.iter().copied().collect();
+        let global_names = plan.globals.iter().copied().collect();
+        let initialized_locals = locals.iter().take(parameter_count).copied().collect();
+        let free_names = plan
+            .freevars
             .iter()
-            .map(|name| {
-                names
-                    .get(name)
-                    .unwrap_or_else(|| panic!("module analysis did not intern `{name}`"))
-            })
+            .map(|name| names.resolve(*name).to_string())
             .collect();
-        let global_names = plan
-            .globals
+        let locals = locals
             .iter()
-            .map(|name| {
-                names
-                    .get(name)
-                    .unwrap_or_else(|| panic!("module analysis did not intern `{name}`"))
-            })
-            .collect();
-        let initialized_locals = locals
-            .iter()
-            .take(parameter_count)
-            .map(|name| {
-                names
-                    .get(name)
-                    .unwrap_or_else(|| panic!("module analysis did not intern `{name}`"))
-            })
+            .map(|name| names.resolve(*name).to_string())
             .collect();
 
         let symbols = SymbolState {
             locals,
             fast_local_count,
             cell_names: cell_names.clone(),
-            free_names: plan.freevars.iter().cloned().collect(),
+            free_names,
             initialized_locals,
             ..SymbolState::default()
         };
@@ -202,10 +177,10 @@ impl Compiler {
         qualified_name: String,
         first_line_number: u32,
         scope_id: ScopeId,
-        globals: HashSet<String>,
-        nonlocals: HashSet<String>,
-        freevars: BTreeSet<String>,
-        bound_names: HashSet<String>,
+        globals: FxHashSet<NameId>,
+        nonlocals: FxHashSet<NameId>,
+        freevars: &[NameId],
+        bound_names: FxHashSet<NameId>,
         needs_class_closure: bool,
         has_methods: bool,
         future_flags: u32,
@@ -218,58 +193,37 @@ impl Compiler {
             .expect("scope arena should be initialized before child compilation")
             .names;
         if needs_class_closure {
-            locals.push("__class__".to_string());
-            cell_names.insert(
-                names
-                    .get("__class__")
-                    .expect("module analysis should intern `__class__`"),
-            );
+            let name = names
+                .get("__class__")
+                .expect("module analysis should intern `__class__`");
+            locals.push(name);
+            cell_names.insert(name);
         }
         if has_methods {
-            locals.push("__classdict__".to_string());
-            cell_names.insert(
-                names
-                    .get("__classdict__")
-                    .expect("module analysis should intern `__classdict__`"),
-            );
+            let name = names
+                .get("__classdict__")
+                .expect("module analysis should intern `__classdict__`");
+            locals.push(name);
+            cell_names.insert(name);
         }
         let free_start = locals.len();
         let free_indices = freevars
             .iter()
             .enumerate()
-            .map(|(index, name)| {
-                let name = names
-                    .get(name)
-                    .unwrap_or_else(|| panic!("module analysis did not intern `{name}`"));
-                (name, u32::try_from(free_start + index).unwrap_or(u32::MAX))
-            })
+            .map(|(index, name)| (*name, u32::try_from(free_start + index).unwrap_or(u32::MAX)))
             .collect();
-        let free_names: Vec<_> = freevars.into_iter().collect();
-        locals.extend(free_names.iter().cloned());
-        let globals = globals
-            .into_iter()
-            .map(|name| {
-                names
-                    .get(&name)
-                    .unwrap_or_else(|| panic!("module analysis did not intern `{name}`"))
-            })
+        locals.extend(freevars.iter().copied());
+        let free_names = freevars
+            .iter()
+            .map(|name| names.resolve(*name).to_string())
             .collect();
-        let nonlocals = nonlocals
-            .into_iter()
-            .map(|name| {
-                names
-                    .get(&name)
-                    .unwrap_or_else(|| panic!("module analysis did not intern `{name}`"))
-            })
+        let locals = locals
+            .iter()
+            .map(|name| names.resolve(*name).to_string())
             .collect();
-        let bound_names = bound_names
-            .into_iter()
-            .map(|name| {
-                names
-                    .get(&name)
-                    .unwrap_or_else(|| panic!("module analysis did not intern `{name}`"))
-            })
-            .collect();
+        let globals = globals.into_iter().collect();
+        let nonlocals = nonlocals.into_iter().collect();
+        let bound_names = bound_names.into_iter().collect();
         let symbols = SymbolState {
             locals,
             cell_names,
