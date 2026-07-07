@@ -682,10 +682,7 @@ impl OptimizationPipeline {
     }
 
     pub(in crate::assembler) fn fuse_superinstructions(&mut self) {
-        fn fuse_pair(first: Item, second: Item) -> Option<Item> {
-            let (Item::Instruction(first), Item::Instruction(second)) = (first, second) else {
-                return None;
-            };
+        fn fuse_pair(first: Instruction, second: Instruction) -> Option<Instruction> {
             if first.fusion_policy.prevent_with_next
                 || first.borrow_fallthrough == BorrowFallthrough::Barrier
                 || second.fusion_policy.prevent_with_previous
@@ -710,35 +707,18 @@ impl OptimizationPipeline {
                 (STORE_FAST, STORE_FAST) => STORE_FAST_STORE_FAST,
                 _ => return None,
             };
-            Some(Item::Instruction(Instruction::fused(
+            Some(Instruction::fused(
                 opcode,
                 Operand::Value((first_argument << 4) | second_argument),
                 first,
                 second,
-            )))
+            ))
         }
 
         let graph = &mut self.graph;
         let order = graph.order().to_vec();
         for block in order {
-            graph.mutate_items_preserving_labels(block, |items| {
-                let original_len = items.len();
-                let mut read = 0;
-                let mut write = 0;
-                while read < original_len {
-                    if let Some(second) = read.checked_add(1).filter(|index| *index < original_len)
-                        && let Some(fused) = fuse_pair(items[read], items[second])
-                    {
-                        items[write] = fused;
-                        read += 2;
-                    } else {
-                        items[write] = items[read];
-                        read += 1;
-                    }
-                    write += 1;
-                }
-                items.truncate(write);
-            });
+            graph.fuse_adjacent_instructions(block, fuse_pair);
         }
     }
 }

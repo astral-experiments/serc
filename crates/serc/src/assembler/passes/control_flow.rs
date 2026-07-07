@@ -6,6 +6,7 @@ use super::super::{
     POP_JUMP_IF_TRUE, POP_TOP, STORE_FAST, TO_BOOL, UNARY_NOT, ends_scope, is_unconditional_jump,
 };
 use crate::assembler::OptimizationPipeline;
+use crate::assembler::block_graph::ItemMut;
 use crate::target::Opcode;
 use crate::target::operands::ComparisonOperation;
 
@@ -468,57 +469,56 @@ impl OptimizationPipeline {
         }
 
         let order = graph.order().to_vec();
-        let mut items = items.into_iter().peekable();
+        let mut start = 0;
         for block in order {
-            graph.mutate_items_preserving_labels(block, |block_items| {
-                block_items.clear();
-                while items
-                    .peek()
-                    .is_some_and(|(item_block, _)| *item_block == block)
-                {
-                    block_items.push(items.next().unwrap().1);
-                }
-            });
+            let mut end = start;
+            while items
+                .get(end)
+                .is_some_and(|(item_block, _)| *item_block == block)
+            {
+                end += 1;
+            }
+            graph.replace_items_preserving_labels(
+                block,
+                items[start..end].iter().map(|(_, item)| *item),
+            );
+            start = end;
         }
-        let remaining = items.next();
-        debug_assert!(remaining.is_none());
+        debug_assert_eq!(start, items.len());
     }
 
     pub(in crate::assembler) fn propagate_locations_within_blocks(&mut self) {
         let graph = &mut self.graph;
         let order = graph.order().to_vec();
         for block in order {
-            graph.mutate_items_preserving_labels(block, |items| {
-                let mut previous = None;
-                let mut block_has_instruction = false;
-                for item in items {
-                    match item {
-                        Item::Label(_) if block_has_instruction => {
+            let mut previous = None;
+            let mut block_has_instruction = false;
+            for item in graph.iter_items_mut(block) {
+                match item {
+                    ItemMut::Label if block_has_instruction => {
+                        previous = None;
+                        block_has_instruction = false;
+                    }
+                    ItemMut::Label => {}
+                    ItemMut::Instruction(instruction) => {
+                        block_has_instruction = true;
+                        if instruction.location.line < 0 && !instruction.no_location_policy.preserve
+                        {
+                            if let Some(location) = previous {
+                                instruction.location = location;
+                            }
+                        } else {
+                            previous = Some(instruction.location);
+                        }
+                        if !matches!(instruction.operand, Operand::Value(_))
+                            || ends_scope(instruction.opcode)
+                        {
                             previous = None;
                             block_has_instruction = false;
                         }
-                        Item::Label(_) => {}
-                        Item::Instruction(instruction) => {
-                            block_has_instruction = true;
-                            if instruction.location.line < 0
-                                && !instruction.no_location_policy.preserve
-                            {
-                                if let Some(location) = previous {
-                                    instruction.location = location;
-                                }
-                            } else {
-                                previous = Some(instruction.location);
-                            }
-                            if !matches!(instruction.operand, Operand::Value(_))
-                                || ends_scope(instruction.opcode)
-                            {
-                                previous = None;
-                                block_has_instruction = false;
-                            }
-                        }
                     }
                 }
-            });
+            }
         }
     }
 

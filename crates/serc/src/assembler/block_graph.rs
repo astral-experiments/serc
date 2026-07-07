@@ -33,6 +33,12 @@ pub(super) struct ItemPosition {
     offset: usize,
 }
 
+/// A mutable view of a block item that keeps labels opaque and immutable.
+pub(super) enum ItemMut<'a> {
+    Label,
+    Instruction(&'a mut Instruction),
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct BasicBlock {
     items: Vec<Item>,
@@ -510,36 +516,71 @@ impl BlockGraph {
         self.label_blocks = label_blocks;
     }
 
-    #[cfg(debug_assertions)]
-    fn block_labels(&self, block: BasicBlockId) -> Vec<Label> {
-        self[block]
-            .items()
-            .iter()
-            .filter_map(|item| match item {
-                Item::Label(label) => Some(*label),
-                Item::Instruction(_) => None,
-            })
-            .collect()
-    }
-
-    /// Mutates block contents without changing their labels.
-    ///
-    /// This keeps instruction-only hot paths free from label-index maintenance;
-    /// debug builds verify the contract at the API boundary.
-    pub(super) fn mutate_items_preserving_labels(
+    /// Returns mutable instructions while exposing labels only as markers.
+    pub(super) fn iter_items_mut(
         &mut self,
         block: BasicBlockId,
-        mutate: impl FnOnce(&mut Vec<Item>),
+    ) -> impl Iterator<Item = ItemMut<'_>> {
+        self.blocks[block.index()]
+            .items
+            .iter_mut()
+            .map(|item| match item {
+                Item::Label(_) => ItemMut::Label,
+                Item::Instruction(instruction) => ItemMut::Instruction(instruction),
+            })
+    }
+
+    /// Replaces block contents while preserving the exact label sequence.
+    pub(super) fn replace_items_preserving_labels(
+        &mut self,
+        block: BasicBlockId,
+        items: impl Iterator<Item = Item> + Clone,
     ) {
-        #[cfg(debug_assertions)]
-        let labels = self.block_labels(block);
-        mutate(&mut self.blocks[block.index()].items);
-        #[cfg(debug_assertions)]
-        debug_assert_eq!(
-            self.block_labels(block),
-            labels,
-            "label-preserving mutation changed block labels"
+        let old_labels = self[block].items().iter().filter_map(|item| match item {
+            Item::Label(label) => Some(*label),
+            Item::Instruction(_) => None,
+        });
+        let new_labels = items.clone().filter_map(|item| match item {
+            Item::Label(label) => Some(label),
+            Item::Instruction(_) => None,
+        });
+        assert!(
+            old_labels.eq(new_labels),
+            "label-preserving replacement changed block labels"
         );
+        let block_items = &mut self.blocks[block.index()].items;
+        block_items.clear();
+        block_items.extend(items);
+    }
+
+    /// Fuses non-overlapping adjacent instruction pairs without exposing labels.
+    pub(super) fn fuse_adjacent_instructions(
+        &mut self,
+        block: BasicBlockId,
+        mut fuse: impl FnMut(Instruction, Instruction) -> Option<Instruction>,
+    ) {
+        let items = &mut self.blocks[block.index()].items;
+        let original_len = items.len();
+        let mut read = 0;
+        let mut write = 0;
+        while read < original_len {
+            let fused = read
+                .checked_add(1)
+                .filter(|second| *second < original_len)
+                .and_then(|second| match (items[read], items[second]) {
+                    (Item::Instruction(first), Item::Instruction(second)) => fuse(first, second),
+                    (Item::Label(_), _) | (_, Item::Label(_)) => None,
+                });
+            if let Some(instruction) = fused {
+                items[write] = Item::Instruction(instruction);
+                read += 2;
+            } else {
+                items[write] = items[read];
+                read += 1;
+            }
+            write += 1;
+        }
+        items.truncate(write);
     }
 
     fn validate_order(&self, order: &[BasicBlockId]) -> Result<(), String> {
@@ -1001,6 +1042,30 @@ mod tests {
         assert_eq!(graph.label_block(removed_label), None);
         assert_eq!(graph.label_block(retained_label), Some(block));
         graph.validate().unwrap();
+    }
+
+    #[test]
+    #[should_panic(expected = "label-preserving replacement changed block labels")]
+    fn replacing_items_preserving_labels_rejects_changed_labels() {
+        let old_label = Label(0);
+        let new_label = Label(1);
+        let mut graph = BlockGraph::from_items(
+            vec![
+                Item::Label(old_label),
+                instruction(RETURN_VALUE, Operand::Value(0)),
+            ],
+            &FxHashSet::default(),
+        );
+        let block = graph.block_at(0);
+
+        graph.replace_items_preserving_labels(
+            block,
+            [
+                Item::Label(new_label),
+                instruction(RETURN_VALUE, Operand::Value(0)),
+            ]
+            .into_iter(),
+        );
     }
 
     #[test]
