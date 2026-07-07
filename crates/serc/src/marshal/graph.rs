@@ -28,9 +28,122 @@ pub(super) enum ObjectLocation {
     StringsTuple(usize),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum ObjectLocationKind {
+    Bytes,
+    Code,
+    CodeBytes,
+    Constant,
+    ConstantsTuple,
+    LocalKinds,
+    LocalsTuple,
+    MetadataString,
+    SliceMember,
+    StringsTuple,
+}
+
+impl ObjectLocation {
+    fn into_parts(self) -> (ObjectLocationKind, usize) {
+        match self {
+            Self::Bytes(address) => (ObjectLocationKind::Bytes, address),
+            Self::Code(address) => (ObjectLocationKind::Code, address),
+            Self::CodeBytes(address) => (ObjectLocationKind::CodeBytes, address),
+            Self::Constant(address) => (ObjectLocationKind::Constant, address),
+            Self::ConstantsTuple(address) => (ObjectLocationKind::ConstantsTuple, address),
+            Self::LocalKinds(address) => (ObjectLocationKind::LocalKinds, address),
+            Self::LocalsTuple(address) => (ObjectLocationKind::LocalsTuple, address),
+            Self::MetadataString(address) => (ObjectLocationKind::MetadataString, address),
+            Self::SliceMember(address) => (ObjectLocationKind::SliceMember, address),
+            Self::StringsTuple(address) => (ObjectLocationKind::StringsTuple, address),
+        }
+    }
+}
+
 // Equal value keys share an ID; identity-based keys remain distinct exactly as `ObjectKey` does.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct ObjectId(pub(super) usize);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Occurrence {
+    address: usize,
+    object: u32,
+    kind: ObjectLocationKind,
+}
+
+impl Occurrence {
+    fn new(location: ObjectLocation, object: ObjectId) -> Self {
+        let (kind, address) = location.into_parts();
+        Self {
+            address,
+            object: object.0.try_into().expect("marshal object limit exceeded"),
+            kind,
+        }
+    }
+
+    fn location(self) -> ObjectLocation {
+        match self.kind {
+            ObjectLocationKind::Bytes => ObjectLocation::Bytes(self.address),
+            ObjectLocationKind::Code => ObjectLocation::Code(self.address),
+            ObjectLocationKind::CodeBytes => ObjectLocation::CodeBytes(self.address),
+            ObjectLocationKind::Constant => ObjectLocation::Constant(self.address),
+            ObjectLocationKind::ConstantsTuple => ObjectLocation::ConstantsTuple(self.address),
+            ObjectLocationKind::LocalKinds => ObjectLocation::LocalKinds(self.address),
+            ObjectLocationKind::LocalsTuple => ObjectLocation::LocalsTuple(self.address),
+            ObjectLocationKind::MetadataString => ObjectLocation::MetadataString(self.address),
+            ObjectLocationKind::SliceMember => ObjectLocation::SliceMember(self.address),
+            ObjectLocationKind::StringsTuple => ObjectLocation::StringsTuple(self.address),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct OccurrenceCursor<'a> {
+    occurrences: &'a [Occurrence],
+    next: usize,
+}
+
+impl OccurrenceCursor<'_> {
+    #[inline]
+    pub(super) fn consume(&mut self, expected: ObjectLocation) -> ObjectId {
+        let index = self.next;
+        let Some(occurrence) = self.occurrences.get(index) else {
+            missing_occurrence(index, expected, self.occurrences.len());
+        };
+        let (kind, address) = expected.into_parts();
+        if occurrence.kind != kind || occurrence.address != address {
+            mismatched_occurrence(index, expected, occurrence.location());
+        }
+        self.next += 1;
+        ObjectId(occurrence.object as usize)
+    }
+
+    pub(super) fn finish(self) {
+        assert_eq!(
+            self.next,
+            self.occurrences.len(),
+            "marshal writer consumed {} of {} recorded occurrences",
+            self.next,
+            self.occurrences.len()
+        );
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn missing_occurrence(index: usize, expected: ObjectLocation, count: usize) -> ! {
+    panic!(
+        "marshal writer requested occurrence {index} ({expected:?}), but the graph recorded {count} occurrences"
+    );
+}
+
+#[cold]
+#[inline(never)]
+fn mismatched_occurrence(index: usize, expected: ObjectLocation, recorded: ObjectLocation) -> ! {
+    panic!(
+        "marshal occurrence {index} mismatch: writer requested {expected:?}, graph recorded {recorded:?}"
+    );
+}
 
 #[derive(Debug)]
 struct Object {
@@ -43,9 +156,7 @@ struct Object {
 pub(super) struct ObjectGraph<'a> {
     objects: FxHashMap<HashedObjectKey<'a>, ObjectId>,
     objects_by_id: Vec<Object>,
-    occurrences: Vec<ObjectId>,
-    #[cfg(debug_assertions)]
-    occurrence_locations: Vec<ObjectLocation>,
+    occurrences: Vec<Occurrence>,
     #[cfg(debug_assertions)]
     unique_objects: FxHashSet<HashedObjectKey<'a>>,
     explicitly_interned: Vec<&'a str>,
@@ -79,20 +190,18 @@ impl<'a> ObjectGraph<'a> {
         self.record_object(key.into(), false).1
     }
 
-    fn record_at(&mut self, _location: ObjectLocation, key: ObjectKey<'a>, interned: bool) -> bool {
+    fn record_at(&mut self, location: ObjectLocation, key: ObjectKey<'a>, interned: bool) -> bool {
         let (id, first) = self.record_object(key.into(), interned);
-        self.occurrences.push(id);
-        #[cfg(debug_assertions)]
-        self.occurrence_locations.push(_location);
+        self.occurrences.push(Occurrence::new(location, id));
         first
     }
 
     /// Records an identity-bearing object that is structurally owned by a unique parent.
-    fn record_unique_at(&mut self, _location: ObjectLocation, _key: ObjectKey<'a>) {
+    fn record_unique_at(&mut self, location: ObjectLocation, _key: ObjectKey<'a>) {
         #[cfg(debug_assertions)]
         debug_assert!(
             self.unique_objects.insert(_key.into()),
-            "identity-bearing marshal object was recorded twice at {_location:?}"
+            "identity-bearing marshal object was recorded twice at {location:?}"
         );
 
         let id = ObjectId(self.objects_by_id.len());
@@ -101,9 +210,7 @@ impl<'a> ObjectGraph<'a> {
             cached: false,
             interned: false,
         });
-        self.occurrences.push(id);
-        #[cfg(debug_assertions)]
-        self.occurrence_locations.push(_location);
+        self.occurrences.push(Occurrence::new(location, id));
     }
 
     fn record_object(&mut self, key: HashedObjectKey<'a>, interned: bool) -> (ObjectId, bool) {
@@ -317,19 +424,16 @@ impl<'a> ObjectGraph<'a> {
         self.objects_by_id.len()
     }
 
-    pub(super) fn occurrence_count(&self) -> usize {
-        self.occurrences.len()
-    }
-
     #[cfg(test)]
     pub(super) fn keyed_object_count(&self) -> usize {
         self.objects.len()
     }
 
-    pub(super) fn occurrence(&self, index: usize, _expected: ObjectLocation) -> ObjectId {
-        #[cfg(debug_assertions)]
-        debug_assert_eq!(self.occurrence_locations[index], _expected);
-        self.occurrences[index]
+    pub(super) fn occurrence_cursor(&self) -> OccurrenceCursor<'_> {
+        OccurrenceCursor {
+            occurrences: &self.occurrences,
+            next: 0,
+        }
     }
 
     pub(super) fn is_interned_object(&self, id: ObjectId) -> bool {

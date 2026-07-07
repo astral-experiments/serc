@@ -1,7 +1,7 @@
 use crate::code_object::{CodeObject, Constant, LocalsIdentity, MarshalHints};
 
 use super::encode_code;
-use super::graph::ObjectGraph;
+use super::graph::{ObjectGraph, ObjectLocation};
 use super::key::{
     ObjectKey, code_bytes_key, code_key, constant_key, constant_sort_key, constants_tuple_key,
     local_kinds_key, locals_tuple_key, slice_member_uses_identity, strings_tuple_key,
@@ -27,6 +27,34 @@ fn code_object(constants: Vec<Constant>) -> CodeObject {
         exception_table: Vec::new(),
         marshal_hints: MarshalHints::default(),
     }
+}
+
+#[test]
+#[should_panic(expected = "marshal occurrence 0 mismatch")]
+fn occurrence_cursor_rejects_a_mismatched_location() {
+    let code = code_object(Vec::new());
+    let graph = ObjectGraph::for_code(&code);
+    let mut occurrences = graph.occurrence_cursor();
+
+    occurrences.consume(ObjectLocation::Bytes(0));
+}
+
+#[test]
+#[should_panic(expected = "marshal writer requested occurrence 0")]
+fn occurrence_cursor_rejects_over_consumption() {
+    let graph = ObjectGraph::default();
+    let mut occurrences = graph.occurrence_cursor();
+
+    occurrences.consume(ObjectLocation::Bytes(0));
+}
+
+#[test]
+#[should_panic(expected = "marshal writer consumed 0 of")]
+fn occurrence_cursor_rejects_under_consumption() {
+    let code = code_object(Vec::new());
+    let graph = ObjectGraph::for_code(&code);
+
+    graph.occurrence_cursor().finish();
 }
 
 #[test]
