@@ -191,7 +191,9 @@ Planning and graph analysis must precede writing because whether an object's fir
 receives `FLAG_REF` depends on later occurrences. Replacing that analysis with opportunistic
 single-pass serialization changes bytes even when decoded values are equal. The completed plan is
 already pruned and ordered, so the writer does not reconstruct a recursive object walk or maintain
-a parallel occurrence cursor.
+a parallel occurrence cursor. Object-table capacity is reserved only from each code object's known
+structural children and direct constants, names, and locals; marshal planning does not guess output
+size or add a second traversal.
 
 `CompiledModule::to_timestamp_pyc` prefixes the marshalled code object with the generated magic
 number, timestamp-invalidation flags, source modification time, and source size. The runtime is
