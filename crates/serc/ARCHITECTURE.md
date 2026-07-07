@@ -259,7 +259,7 @@ marshal output. From the repository root, with `RUFF` pointing to a Ruff checkou
 
 ```console
 SERC_TEST_PYTHON=/path/to/python3.14 \
-  cargo test --locked -p serc --all-targets
+  cargo test --locked --workspace --all-targets
 
 cargo run --locked -p serc --example compare_cpython_corpus -- \
   --python /path/to/python3.14 \

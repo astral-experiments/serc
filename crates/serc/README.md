@@ -27,7 +27,7 @@ The `serc` binary accepts Python files and directories, recursively compiles dir
 and writes standard timestamp-invalidated `.pyc` files under `__pycache__`:
 
 ```console
-cargo run --release -p serc -- compile path/to/package
+cargo run --release -p serc-cli -- compile path/to/package
 ```
 
 Paths default to the current directory. Pass `--check` to compile without writing cache files and

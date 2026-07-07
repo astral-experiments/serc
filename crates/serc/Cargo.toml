@@ -3,7 +3,6 @@ name = "serc"
 version = "0.1.0"
 publish = false
 description = "A Rust compiler from Python source to CPython bytecode"
-default-run = "serc"
 edition = { workspace = true }
 rust-version = { workspace = true }
 homepage = { workspace = true }
@@ -19,18 +18,17 @@ doctest = false
 workspace = true
 
 [dependencies]
-clap = { workspace = true }
-fs-err = { workspace = true }
 ruff_python_ast = { workspace = true }
 ruff_python_codegen = { workspace = true }
 ruff_python_parser = { workspace = true }
 ruff_source_file = { workspace = true }
 ruff_text_size = { workspace = true }
 rustc-hash = { workspace = true }
-tempfile = { workspace = true }
-walkdir = { workspace = true }
 
 [dev-dependencies]
 cpu-time = { workspace = true }
+fs-err = { workspace = true }
 serc_workloads = { workspace = true }
 rayon = { workspace = true }
+tempfile = { workspace = true }
+walkdir = { workspace = true }

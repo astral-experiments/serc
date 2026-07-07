@@ -139,7 +139,7 @@ serc="$(
         --manifest-path "$repo_root/Cargo.toml" \
         --profile "$serc_profile" \
         --locked \
-        --package serc \
+        --package serc-cli \
         --bin serc \
         --message-format json-render-diagnostics \
         | bash "$repo_root/scripts/benchmarks/resolve-cargo-artifact.sh" "$python"

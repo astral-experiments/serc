@@ -9,7 +9,8 @@ A Rust compiler from Python source to byte-for-byte-compatible CPython bytecode.
 public consumption. Use at your own risk.
 
 Serc compiles Python without embedding or starting a Python runtime. The
-[`serc`](crates/serc) crate currently targets CPython 3.14.5.
+[`serc`](crates/serc) compiler library currently targets CPython 3.14.5, and the
+[`serc-cli`](crates/serc_cli) package provides the `serc` executable.
 
 ## Development
 

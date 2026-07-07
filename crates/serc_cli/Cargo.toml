@@ -1,0 +1,26 @@
+[package]
+name = "serc-cli"
+version = "0.1.0"
+publish = false
+description = "Command-line interface for the Serc Python bytecode compiler"
+default-run = "serc"
+edition = { workspace = true }
+rust-version = { workspace = true }
+homepage = { workspace = true }
+repository = { workspace = true }
+authors = { workspace = true }
+license = { workspace = true }
+
+[lints]
+workspace = true
+
+[dependencies]
+clap = { workspace = true }
+fs-err = { workspace = true }
+serc = { path = "../serc" }
+tempfile = { workspace = true }
+walkdir = { workspace = true }
+
+[[bin]]
+name = "serc"
+path = "src/main.rs"
