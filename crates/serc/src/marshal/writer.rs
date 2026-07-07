@@ -1,7 +1,7 @@
 use crate::compiler::{CodeObject, Constant};
 
 use super::graph::{ObjectGraph, ObjectId, ObjectLocation};
-use super::key::{constant_sort_key, slice_member_uses_identity};
+use super::key::{frozen_set_members_in_wire_order, slice_member_uses_identity};
 use super::v5::{
     FLAG_REF, TYPE_ASCII, TYPE_ASCII_INTERNED, TYPE_BINARY_COMPLEX, TYPE_BINARY_FLOAT, TYPE_CODE,
     TYPE_ELLIPSIS, TYPE_FALSE, TYPE_FROZENSET, TYPE_INT, TYPE_INTERNED, TYPE_LONG, TYPE_NONE,
@@ -252,9 +252,7 @@ impl Writer<'_, '_, '_> {
                         .try_into()
                         .expect("marshal frozenset exceeds 4 GiB"),
                 );
-                let mut values: Vec<_> = values.iter().collect();
-                values.sort_by_key(|value| constant_sort_key(value));
-                for value in values {
+                for (_, value) in frozen_set_members_in_wire_order(values) {
                     self.constant_with_force(value, true);
                 }
             }
