@@ -71,6 +71,9 @@ struct Occurrence {
     kind: ObjectLocationKind,
 }
 
+#[cfg(target_pointer_width = "64")]
+const _: [(); 16] = [(); std::mem::size_of::<Occurrence>()];
+
 impl Occurrence {
     fn new(location: ObjectLocation, object: ObjectId) -> Self {
         let (kind, address) = location.into_parts();
@@ -151,6 +154,8 @@ struct Object {
     cached: bool,
     interned: bool,
 }
+
+const CODE_STRUCTURAL_CHILDREN: usize = 10;
 
 #[derive(Debug, Default)]
 pub(super) struct ObjectGraph<'a> {
@@ -240,6 +245,22 @@ impl<'a> ObjectGraph<'a> {
 
     fn visit_code(&mut self, code: &'a CodeObject) {
         let address = std::ptr::from_ref(code).addr();
+        // Every code object contributes ten object-bearing structural children, plus at most one
+        // object for each direct constant, name, and local. Leave geometric headroom for
+        // descendants of container constants; nested code objects refine the estimate when they
+        // are visited.
+        let direct_children = code
+            .constants
+            .len()
+            .saturating_add(code.names.len())
+            .saturating_add(code.locals.len())
+            .saturating_add(CODE_STRUCTURAL_CHILDREN);
+        let estimated_descendants = direct_children.saturating_mul(2);
+        self.objects.reserve(estimated_descendants);
+        self.objects_by_id
+            .reserve(estimated_descendants.saturating_add(1));
+        self.occurrences
+            .reserve(estimated_descendants.saturating_add(1));
         self.record_unique_at(ObjectLocation::Code(address), code_key(code));
         self.explicitly_interned.extend(
             code.marshal_hints
