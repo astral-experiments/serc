@@ -70,8 +70,10 @@ pub(super) struct PlanEntry<'a> {
     pub(super) force_reference: bool,
 }
 
-// The plan is a flat preorder traversal. Graph construction makes repeated objects leaf entries,
-// so the writer can consume it linearly without reconstructing the tree.
+/// An immutable, flat preorder shared by graph analysis and byte emission.
+///
+/// Graph construction makes repeated objects leaf entries, so the writer can consume the plan
+/// linearly without reconstructing the tree or maintaining a second occurrence cursor.
 #[derive(Debug, Default)]
 pub(super) struct MarshalPlan<'a> {
     entries: Vec<PlanEntry<'a>>,
