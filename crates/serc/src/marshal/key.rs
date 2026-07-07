@@ -1,6 +1,8 @@
 use std::cmp::Ordering;
 use std::hash::{Hash, Hasher};
 
+use rustc_hash::FxHasher;
+
 use crate::code_object::{CodeObject, Constant, LocalsIdentity};
 
 use super::v5::{
@@ -38,6 +40,59 @@ pub(super) enum ObjectKey<'a> {
     Code(usize),
     CodeBytes(usize),
     LocalKinds(usize),
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct HashedObjectKey<'a> {
+    key: ObjectKey<'a>,
+    hash: u64,
+}
+
+impl<'a> HashedObjectKey<'a> {
+    fn new(key: ObjectKey<'a>) -> Self {
+        let mut hasher = FxHasher::default();
+        key.hash(&mut hasher);
+        Self {
+            key,
+            hash: hasher.finish(),
+        }
+    }
+
+    pub(super) fn key(&self) -> &ObjectKey<'a> {
+        &self.key
+    }
+}
+
+impl<'a> From<ObjectKey<'a>> for HashedObjectKey<'a> {
+    fn from(key: ObjectKey<'a>) -> Self {
+        Self::new(key)
+    }
+}
+
+impl PartialEq for HashedObjectKey<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.hash == other.hash && self.key == other.key
+    }
+}
+
+impl Eq for HashedObjectKey<'_> {}
+
+impl PartialOrd for HashedObjectKey<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for HashedObjectKey<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.key.cmp(&other.key)
+    }
+}
+
+impl Hash for HashedObjectKey<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.hash);
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
