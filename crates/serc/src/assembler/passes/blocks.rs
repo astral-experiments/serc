@@ -304,6 +304,9 @@ impl OptimizationPipeline {
             let target = match instruction.operand {
                 Operand::Forward(target) | Operand::Backward(target) => target,
                 Operand::Value(_) => continue,
+                Operand::Deferred(_) => {
+                    unreachable!("operand patches are resolved before assembler passes")
+                }
             };
             let Some(target_position) = label_positions.get(&target).copied() else {
                 continue;

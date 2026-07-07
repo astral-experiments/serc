@@ -587,7 +587,7 @@ impl Compiler {
             std::mem::take(&mut self.output.deferred_constants_before_return)
         {
             let index = self.add_constant(constant)?;
-            self.assembler.patch_argument(instruction, index);
+            self.assembler.patch_argument(instruction, index)?;
         }
         if add_implicit_return {
             let none = self.add_constant(Constant::None)?;
@@ -631,13 +631,14 @@ impl Compiler {
         for (instruction, constant) in std::mem::take(&mut self.output.deferred_constants) {
             let index = self.add_constant(constant)?;
             if let Some(instruction) = instruction {
-                self.assembler.patch_argument(instruction, index);
+                self.assembler.patch_argument(instruction, index)?;
             }
         }
         for (instruction, name) in std::mem::take(&mut self.output.deferred_names) {
             let index = self.name_index(&name)?;
-            self.assembler.patch_argument(instruction, index);
+            self.assembler.patch_argument(instruction, index)?;
         }
+        self.assembler.resolve_operand_patches()?;
         self.assembler.optimize_constant_pops();
         self.remove_unused_constants()?;
 

@@ -478,6 +478,9 @@ impl OptimizationPipeline {
                 let argument = match instruction.operand {
                     Operand::Value(argument) => argument,
                     Operand::Forward(_) | Operand::Backward(_) => 0,
+                    Operand::Deferred(_) => {
+                        unreachable!("operand patches are resolved before assembler passes")
+                    }
                 };
                 match instruction.opcode {
                     DELETE_FAST => kill_local(&mut unsafe_loads, &stack, argument),

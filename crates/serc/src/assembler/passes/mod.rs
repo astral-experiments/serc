@@ -48,6 +48,12 @@ fn validate_structure(
         };
         let (target, is_forward) = match instruction.operand {
             Operand::Value(_) => continue,
+            Operand::Deferred(id) => {
+                return Err(invariant_error(format!(
+                    "instruction {index} has unresolved operand patch {}",
+                    id.0
+                )));
+            }
             Operand::Forward(target) => (target, true),
             Operand::Backward(target) => (target, false),
         };
@@ -163,11 +169,12 @@ impl Assembler {
     }
 
     pub(crate) fn finish_code(
-        self,
+        mut self,
         first_line_number: u32,
         local_count: usize,
         parameter_count: usize,
     ) -> Result<AssembledCode, CompileError> {
+        self.resolve_operand_patches()?;
         self.into_optimization_pipeline()
             .optimize(local_count, parameter_count)?
             .finish(first_line_number)
@@ -294,6 +301,12 @@ impl LayoutAssembler {
                 let jump_base = opcode_position + 1 + u32::from(instruction.opcode.caches());
                 let argument = match instruction.operand {
                     Operand::Value(argument) => argument,
+                    Operand::Deferred(id) => {
+                        return Err(CompileError::Internal(format!(
+                            "unresolved operand patch {} reached final layout",
+                            id.0
+                        )));
+                    }
                     Operand::Forward(label) => {
                         let target = *labels.get(&label).ok_or_else(|| {
                             CompileError::Internal("unbound forward jump label".to_string())
