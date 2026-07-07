@@ -23,6 +23,65 @@ fn instruction_constructors_set_audited_defaults() {
 }
 
 #[test]
+fn value_emission_attaches_exception_policy_across_intervening_labels() {
+    let mut assembler = Assembler::default();
+    let normalized_owner = ExceptionPolicy::normalized_owner(false);
+    assembler.emit_with_depth(NOT_TAKEN, 0, 0, normalized_owner);
+    let first_boundary = assembler.label();
+    assembler.mark(first_boundary);
+    assembler.emit_with_depth(NOP, 0, 0, ExceptionPolicy::EXCLUDE_ALWAYS);
+    let second_boundary = assembler.label();
+    assembler.mark(second_boundary);
+    assembler.emit_with_depth(NOP, 0, 0, ExceptionPolicy::default());
+
+    let [
+        Item::Instruction(normalized),
+        Item::Label(actual_first_boundary),
+        Item::Instruction(excluded),
+        Item::Label(actual_second_boundary),
+        Item::Instruction(default),
+    ] = assembler.items.as_slice()
+    else {
+        panic!("expected three instructions separated by labels");
+    };
+    assert_eq!(*actual_first_boundary, first_boundary);
+    assert_eq!(*actual_second_boundary, second_boundary);
+    assert_eq!(normalized.exception_policy, normalized_owner);
+    assert_eq!(excluded.exception_policy, ExceptionPolicy::EXCLUDE_ALWAYS);
+    assert_eq!(default.exception_policy, ExceptionPolicy::default());
+}
+
+#[test]
+fn jump_emission_attaches_exception_policy_after_an_intervening_label() {
+    let mut assembler = Assembler::default();
+    assembler.emit_with_depth(NOP, 0, 0, ExceptionPolicy::default());
+    let boundary = assembler.label();
+    assembler.mark(boundary);
+    let target = assembler.label();
+    assembler.emit_forward_with_depth(
+        JUMP_FORWARD,
+        target,
+        0,
+        ExceptionPolicy::EXCLUDE_IF_EXTENDED,
+    );
+
+    let [
+        Item::Instruction(default),
+        Item::Label(actual_boundary),
+        Item::Instruction(excluded),
+    ] = assembler.items.as_slice()
+    else {
+        panic!("expected two instructions separated by one label");
+    };
+    assert_eq!(*actual_boundary, boundary);
+    assert_eq!(default.exception_policy, ExceptionPolicy::default());
+    assert_eq!(
+        excluded.exception_policy,
+        ExceptionPolicy::EXCLUDE_IF_EXTENDED
+    );
+}
+
+#[test]
 fn fusion_classifies_every_instruction_flag() {
     let mut classified = InstructionFlags::empty();
     for policy in [

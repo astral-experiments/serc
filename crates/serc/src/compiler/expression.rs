@@ -3938,9 +3938,12 @@ impl Compiler {
                 }
                 return Ok(());
             }
-            self.emit(NOT_TAKEN, 0, 0)?;
-            self.assembler
-                .set_last_normalized_exception_owner(self.control.active_normal_finally_bodies > 0);
+            self.emit_with_exception_policy(
+                NOT_TAKEN,
+                0,
+                0,
+                ExceptionPolicy::normalized_owner(self.control.active_normal_finally_bodies > 0),
+            )?;
             return Ok(());
         }
         let comparison_is_boolean = if let Expr::Compare(comparison) = expression
@@ -3982,9 +3985,12 @@ impl Compiler {
             self.control.exclude_terminal_if_not_taken = false;
             let exclusion_start = self.assembler.label();
             self.assembler.mark(exclusion_start);
-            self.emit(NOT_TAKEN, 0, 0)?;
-            self.assembler
-                .set_last_normalized_exception_owner(comparison_is_boolean);
+            self.emit_with_exception_policy(
+                NOT_TAKEN,
+                0,
+                0,
+                ExceptionPolicy::normalized_owner(comparison_is_boolean),
+            )?;
             let exclusion_end = self.assembler.label();
             self.assembler.mark(exclusion_end);
             if exclude_from_generator {
@@ -4011,10 +4017,14 @@ impl Compiler {
             }
             Ok(())
         } else {
-            self.emit(NOT_TAKEN, 0, 0)?;
-            self.assembler.set_last_normalized_exception_owner(
-                comparison_is_boolean || self.control.active_normal_finally_bodies > 0,
-            );
+            self.emit_with_exception_policy(
+                NOT_TAKEN,
+                0,
+                0,
+                ExceptionPolicy::normalized_owner(
+                    comparison_is_boolean || self.control.active_normal_finally_bodies > 0,
+                ),
+            )?;
             Ok(())
         }
     }

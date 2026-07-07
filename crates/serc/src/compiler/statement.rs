@@ -3119,13 +3119,15 @@ impl Compiler {
                     .filter(|previous| previous.line == location.line)
                     .unwrap_or(location);
                 self.assembler.set_location(location);
-                self.emit(NOP, 0, 0)?;
                 // The no-op body does not inherit an enclosing finally's exception owner.
-                if self.control.prevent_try_exit_inlining
+                let exception_policy = if self.control.prevent_try_exit_inlining
                     && self.control.active_exception_region_exclusions.len() > 1
                 {
-                    self.assembler.exclude_last_instruction_from_exception();
-                }
+                    ExceptionPolicy::EXCLUDE_ALWAYS
+                } else {
+                    ExceptionPolicy::default()
+                };
+                self.emit_with_exception_policy(NOP, 0, 0, exception_policy)?;
             }
             location
         };
@@ -3196,16 +3198,18 @@ impl Compiler {
                 } else {
                     None
                 };
-            self.emit_jump_forward(JUMP_FORWARD, end, 0)?;
             // A pass-only nested try leaves an ownerless exit NOP unless the enclosing region
             // is the synthetic protected body of try/finally.
-            if body_noop_location.is_some()
+            let exception_policy = if body_noop_location.is_some()
                 && statement.orelse.is_empty()
                 && !self.control.active_exception_region_exclusions.is_empty()
                 && self.control.active_finally_try_bodies == 0
             {
-                self.assembler.exclude_last_instruction_from_exception();
-            }
+                ExceptionPolicy::EXCLUDE_ALWAYS
+            } else {
+                ExceptionPolicy::default()
+            };
+            self.emit_jump_forward_with_exception_policy(JUMP_FORWARD, end, 0, exception_policy)?;
             if body_ends_with_break_loop {
                 // CPython's `POP_BLOCK` initially prevents the loop break from threading
                 // through this normal try exit. Once `POP_BLOCK` disappears, the exit jump
@@ -3564,20 +3568,26 @@ impl Compiler {
                 if terminal {
                     self.emit_deferred_implicit_return()?;
                 } else {
-                    self.emit_jump_forward(JUMP_FORWARD, end, 0)?;
+                    // A pass-only finally keeps these extended handler exits in its protected
+                    // region; executable finally bodies use CPython's stale-owner exclusion.
+                    let exception_policy = if !handler_body_has_instructions
+                        && !self.control.active_exception_region_exclusions.is_empty()
+                        && self.control.active_pass_finally_locations.is_empty()
+                    {
+                        ExceptionPolicy::EXCLUDE_IF_EXTENDED
+                    } else {
+                        ExceptionPolicy::default()
+                    };
+                    self.emit_jump_forward_with_exception_policy(
+                        JUMP_FORWARD,
+                        end,
+                        0,
+                        exception_policy,
+                    )?;
                     if handler.name.is_some() && matches!(handler.body.last(), Some(Stmt::Try(_))) {
                         // The cleanup is larger than a small exit, but is still eligible because
                         // it has no line number and cannot fall through.
                         self.assembler.prepare_last_no_location_block_for_inlining();
-                    }
-                    // A pass-only finally keeps these extended handler exits in its protected
-                    // region; executable finally bodies use CPython's stale-owner exclusion.
-                    if !handler_body_has_instructions
-                        && !self.control.active_exception_region_exclusions.is_empty()
-                        && self.control.active_pass_finally_locations.is_empty()
-                    {
-                        self.assembler
-                            .exclude_last_instruction_from_exception_if_extended();
                     }
                     let return_is_overridden = self.control.active_overriding_finally_returns > 0
                         && matches!(handler.body.last(), Some(Stmt::Return(_)));
@@ -4177,11 +4187,14 @@ impl Compiler {
                                     .assembler
                                     .set_location(compiler.source_location(last.range()));
                             }
-                            compiler.emit(NOP, 0, 0)?;
                             // A no-op protected body does not acquire an enclosing try's handler.
-                            if compiler.control.active_exception_region_exclusions.len() > 1 {
-                                compiler.assembler.exclude_last_instruction_from_exception();
-                            }
+                            let exception_policy =
+                                if compiler.control.active_exception_region_exclusions.len() > 1 {
+                                    ExceptionPolicy::EXCLUDE_ALWAYS
+                                } else {
+                                    ExceptionPolicy::default()
+                                };
+                            compiler.emit_with_exception_policy(NOP, 0, 0, exception_policy)?;
                         }
                         Ok(has_instructions)
                     } else {
@@ -4253,8 +4266,12 @@ impl Compiler {
                     // Mark both the pass and its exit because CFG optimization can keep either NOP.
                     let pass_start = compiler.assembler.label();
                     compiler.assembler.mark(pass_start);
-                    compiler.emit(NOP, 0, 0)?;
-                    compiler.assembler.exclude_last_instruction_from_exception();
+                    compiler.emit_with_exception_policy(
+                        NOP,
+                        0,
+                        0,
+                        ExceptionPolicy::EXCLUDE_ALWAYS,
+                    )?;
                     let pass_end = compiler.assembler.label();
                     compiler.assembler.mark(pass_end);
                     for exclusions in &mut compiler.control.active_exception_region_exclusions {
@@ -4285,12 +4302,14 @@ impl Compiler {
             if let Some(location) = self.assembler.last_instruction_location() {
                 self.assembler.set_location(location);
             }
-            self.emit_jump_forward(JUMP_FORWARD, end, 0)?;
-            if pass_finally_location.is_some()
+            let exception_policy = if pass_finally_location.is_some()
                 && !self.control.active_exception_region_exclusions.is_empty()
             {
-                self.assembler.exclude_last_instruction_from_exception();
-            }
+                ExceptionPolicy::EXCLUDE_ALWAYS
+            } else {
+                ExceptionPolicy::default()
+            };
+            self.emit_jump_forward_with_exception_policy(JUMP_FORWARD, end, 0, exception_policy)?;
         }
         if protected_has_instructions {
             self.add_exception_regions_with_exclusions(

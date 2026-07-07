@@ -175,12 +175,33 @@ impl NormalizedExceptionOwner {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(super) struct ExceptionPolicy {
+pub(crate) struct ExceptionPolicy {
     pub(super) exclusion: ExceptionExclusion,
     pub(super) normalized_owner: NormalizedExceptionOwner,
 }
 
 impl ExceptionPolicy {
+    pub(crate) const EXCLUDE_IF_EXTENDED: Self = Self {
+        exclusion: ExceptionExclusion::IfExtended,
+        normalized_owner: NormalizedExceptionOwner::Unchanged,
+    };
+
+    pub(crate) const EXCLUDE_ALWAYS: Self = Self {
+        exclusion: ExceptionExclusion::Always,
+        normalized_owner: NormalizedExceptionOwner::Unchanged,
+    };
+
+    pub(crate) const fn normalized_owner(has_owner: bool) -> Self {
+        Self {
+            exclusion: ExceptionExclusion::None,
+            normalized_owner: if has_owner {
+                NormalizedExceptionOwner::Present
+            } else {
+                NormalizedExceptionOwner::Absent
+            },
+        }
+    }
+
     const fn merged(self, other: Self) -> Self {
         Self {
             exclusion: self.exclusion.merged(other.exclusion),

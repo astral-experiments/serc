@@ -708,9 +708,23 @@ impl Compiler {
         argument: u32,
         effect: i32,
     ) -> Result<(), CompileError> {
+        self.emit_with_exception_policy(opcode, argument, effect, ExceptionPolicy::default())
+    }
+
+    pub(super) fn emit_with_exception_policy(
+        &mut self,
+        opcode: Opcode,
+        argument: u32,
+        effect: i32,
+        exception_policy: ExceptionPolicy,
+    ) -> Result<(), CompileError> {
         self.apply_stack_effect(effect)?;
-        self.assembler
-            .emit_with_depth(opcode, argument, self.control.depth.cast_unsigned());
+        self.assembler.emit_with_depth(
+            opcode,
+            argument,
+            self.control.depth.cast_unsigned(),
+            exception_policy,
+        );
         Ok(())
     }
 
@@ -798,14 +812,33 @@ impl Compiler {
         label: Label,
         effect: i32,
     ) -> Result<(), CompileError> {
+        self.emit_jump_forward_with_exception_policy(
+            opcode,
+            label,
+            effect,
+            ExceptionPolicy::default(),
+        )
+    }
+
+    pub(super) fn emit_jump_forward_with_exception_policy(
+        &mut self,
+        opcode: Opcode,
+        label: Label,
+        effect: i32,
+        exception_policy: ExceptionPolicy,
+    ) -> Result<(), CompileError> {
         if is_unconditional_jump(opcode)
             && let Some(location) = self.take_trailing_nop_location()
         {
             self.assembler.set_location(location);
         }
         self.apply_stack_effect(effect)?;
-        self.assembler
-            .emit_forward_with_depth(opcode, label, self.control.depth.cast_unsigned());
+        self.assembler.emit_forward_with_depth(
+            opcode,
+            label,
+            self.control.depth.cast_unsigned(),
+            exception_policy,
+        );
         Ok(())
     }
 
