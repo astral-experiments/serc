@@ -159,6 +159,16 @@ mod tests {
 class Generic[T]:
     def method[U](self):
         return T, U
+
+
+class ____PrivateContainer:
+    def outer(self):
+        __value = int
+
+        def generic[T: __value]() -> __value:
+            return T, __value
+
+        return generic
 ";
         assert_matches_cpython_marshal(source, "generic_closures.py");
     }
