@@ -1957,7 +1957,8 @@ impl Compiler {
                 (attribute_index << 2) | 2 | kind.method_flag(),
                 kind.stack_effect(),
             )?;
-            if matches!(kind, SuperAttributeKind::Attribute) {
+            let attribute_location = self.source_location(attribute.range);
+            if attribute_location.line != attribute_location.end_line {
                 self.assembler
                     .set_location(self.source_location(self.attribute_opcode_range(attribute)));
                 self.emit(NOP, 0, 0)?;
@@ -2007,7 +2008,8 @@ impl Compiler {
             (attribute_index << 2) | kind.method_flag(),
             kind.stack_effect(),
         )?;
-        if matches!(kind, SuperAttributeKind::Attribute) {
+        let attribute_location = self.source_location(attribute.range);
+        if attribute_location.line != attribute_location.end_line {
             self.assembler
                 .set_location(self.source_location(self.attribute_opcode_range(attribute)));
             self.emit(NOP, 0, 0)?;
