@@ -174,10 +174,13 @@ These checks diagnose structural corruption; the byte-for-byte oracle remains th
 
 ### Marshal encoding and `.pyc` output
 
-Marshal encoding is deliberately split into four responsibilities:
+Marshal encoding is deliberately split into five responsibilities:
 
 - `marshal/key.rs` defines when values compare equal and when CPython preserves object identity. It
     also defines deterministic sort keys for unordered constants such as frozen sets.
+- `marshal/scalar.rs` owns scalar wire tags, lengths, payload bytes, and base-2^15 integer encoding.
+    Canonical sort keys and the writer share it without moving identity, reference, or interning
+    decisions out of their existing owners.
 - `marshal/plan.rs` owns the pruned preorder traversal of code fields and constant children. Each
     entry records its object ID and forced-reference policy; repeated containers remain as leaf
     entries, so their children are never traversed twice.
