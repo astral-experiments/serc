@@ -1,7 +1,41 @@
-// Compiler submodules intentionally share the parent-owned state and lowering vocabulary.
-#![allow(clippy::wildcard_imports)]
+use std::cell::Cell;
+use std::sync::Arc;
 
-use super::*;
+use ruff_python_ast::token::Tokens;
+use ruff_python_ast::{Expr, Stmt, Suite};
+use ruff_text_size::Ranged;
+use rustc_hash::{FxHashMap, FxHashSet};
+
+use super::{
+    BUILD_SET, COPY, COPY_FREE_VARS, LOAD_CONST, LOAD_FAST, LOAD_LOCALS, LOAD_SMALL_INT, MAKE_CELL,
+    MAKE_FUNCTION, NOP, POP_TOP, RETURN_GENERATOR, RETURN_VALUE, SETUP_ANNOTATIONS, STORE_DEREF,
+};
+use crate::CompileError;
+use crate::assembler::{AssembledCode, Assembler, SourceLocation};
+use crate::code_object::{CodeObject, Constant, LocalsIdentity, MarshalHints};
+use crate::target::code_flags::{
+    CO_ASYNC_GENERATOR, CO_COROUTINE, CO_FUTURE_ANNOTATIONS, CO_GENERATOR, CO_HAS_DOCSTRING,
+    CO_NEWLOCALS, CO_OPTIMIZED, CO_VARARGS, CO_VARKEYWORDS,
+};
+use crate::target::local_kinds::{
+    CO_FAST_ARG_KW, CO_FAST_ARG_POS, CO_FAST_ARG_VAR, CO_FAST_CELL, CO_FAST_FREE, CO_FAST_HIDDEN,
+    CO_FAST_LOCAL,
+};
+use crate::target::operands::{FunctionAttribute, ResumeLocation, UnaryIntrinsic};
+
+use super::constant::{OutputState, fold_constant};
+use super::definition::clean_doc;
+use super::scope::{
+    LocalCollector, LoweringFunctionPlan, NameId, NameSet, ScopeArena, ScopeId,
+    class_static_attributes, future_feature_flags, has_annotations, has_simple_annotations,
+    inlined_comprehension_cell_names_in_suite, module_global_names, module_imported_names,
+};
+use super::source::{CompilationContext, implicit_return_range};
+use super::statement::{
+    ControlFlowState, statement_uses_implicit_return_location, suite_terminates,
+};
+use super::symbol::{ReraiseStackState, SymbolState, to_u32};
+use super::{Compiler, SHADOWED_SUPER_SENTINEL, Scope};
 
 #[derive(Debug)]
 pub(super) struct CodeUnit {
@@ -12,29 +46,29 @@ pub(super) struct CodeUnit {
     pub(super) class_scope_is_nested: bool,
     pub(super) module_annotation_index: u32,
     pub(super) annotation_classdict_index: Option<u32>,
-    pub(super) name: String,
+    name: String,
     pub(super) qualified_name: String,
     pub(super) private_name: Option<String>,
     pub(super) arg_count: u32,
-    pub(super) positional_only_arg_count: u32,
-    pub(super) keyword_only_arg_count: u32,
+    positional_only_arg_count: u32,
+    keyword_only_arg_count: u32,
     pub(super) flags: u32,
     pub(super) first_line_number: u32,
     pub(super) annotation_thunk: bool,
 }
 
 #[derive(Debug)]
-pub(super) struct CodeUnitSpec {
-    pub(super) scope: Scope,
-    pub(super) scope_id: ScopeId,
-    pub(super) name: String,
-    pub(super) qualified_name: String,
-    pub(super) private_name: Option<String>,
-    pub(super) arg_count: u32,
-    pub(super) positional_only_arg_count: u32,
-    pub(super) keyword_only_arg_count: u32,
-    pub(super) flags: u32,
-    pub(super) first_line_number: u32,
+struct CodeUnitSpec {
+    scope: Scope,
+    scope_id: ScopeId,
+    name: String,
+    qualified_name: String,
+    private_name: Option<String>,
+    arg_count: u32,
+    positional_only_arg_count: u32,
+    keyword_only_arg_count: u32,
+    flags: u32,
+    first_line_number: u32,
 }
 
 impl Compiler {

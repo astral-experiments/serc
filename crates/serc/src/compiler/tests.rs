@@ -7,9 +7,11 @@ use crate::assembler::SourceLocation;
 use crate::code_object::Constant;
 use crate::target::opcodes::{BUILD_TUPLE, LOAD_CONST, RAISE_VARARGS, RERAISE, RETURN_VALUE};
 
-use super::{
-    Compiler, CompilerStackEffect, FunctionPlan, NameId, NameInterner, ReraiseStackState,
-    ScopeBodyFacts, clean_doc, compiler_stack_effect, validate_compiler_stack_effect,
+use super::Compiler;
+use super::definition::clean_doc;
+use super::scope::{FunctionPlan, NameId, NameInterner, ScopeBodyFacts};
+use super::symbol::{
+    CompilerStackEffect, ReraiseStackState, compiler_stack_effect, validate_compiler_stack_effect,
 };
 
 #[test]
