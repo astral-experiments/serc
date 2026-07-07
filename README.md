@@ -25,7 +25,8 @@ CPython 3.14.5 target, including its expected bytecode magic number.
 
 Serc has both focused Criterion/CodSpeed benchmarks and an
 [end-to-end Hyperfine harness](scripts/benchmarks/README.md) that compares CPython `compileall`
-with `serc compile` on a pinned NumPy source tree.
+with `serc compile` on a pinned NumPy source tree. See [`BENCHMARKS.md`](BENCHMARKS.md) for
+published results.
 
 ## CPython compatibility
 
