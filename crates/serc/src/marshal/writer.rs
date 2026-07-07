@@ -10,29 +10,33 @@ use super::v5::{
 };
 
 pub(crate) fn encode_code(code: &CodeObject) -> Vec<u8> {
+    let mut output = Vec::new();
+    encode_code_into(code, &mut output);
+    output
+}
+
+pub(crate) fn encode_code_into(code: &CodeObject, output: &mut Vec<u8>) {
     let graph = ObjectGraph::for_code(code);
     let mut writer = Writer {
         graph: &graph,
-        output: Vec::new(),
+        output,
         references: vec![None; graph.object_count()],
         reference_count: 0,
         next_occurrence: 0,
     };
     writer.write_code(code, true);
     debug_assert_eq!(writer.next_occurrence, graph.occurrence_count());
-    writer.output
 }
 
-#[derive(Debug)]
-struct Writer<'graph, 'code> {
+struct Writer<'output, 'graph, 'code> {
     graph: &'graph ObjectGraph<'code>,
-    output: Vec<u8>,
+    output: &'output mut Vec<u8>,
     references: Vec<Option<u32>>,
     reference_count: usize,
     next_occurrence: usize,
 }
 
-impl Writer<'_, '_> {
+impl Writer<'_, '_, '_> {
     fn next_object(&mut self, location: ObjectLocation) -> ObjectId {
         let object = self.graph.occurrence(self.next_occurrence, location);
         self.next_occurrence += 1;

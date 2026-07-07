@@ -11,7 +11,10 @@ mod tests {
 
     use super::common::{assert_executes, assert_matches_cpython_marshal};
     use crate::benchmark_workloads;
-    use serc::{CPYTHON_TARGET, compile, compile_to_pyc};
+    use serc::{
+        CPYTHON_TARGET, CompileError, SourceDecodeError, compile, compile_bytes,
+        compile_bytes_to_pyc, compile_to_pyc, decode_source,
+    };
 
     #[test]
     fn exposes_the_pinned_cpython_source_identity() {
@@ -29,6 +32,38 @@ mod tests {
         assert_eq!(&pyc[4..8], &0_u32.to_le_bytes());
         assert_eq!(&pyc[8..12], &123_u32.to_le_bytes());
         assert_eq!(&pyc[12..16], &12_u32.to_le_bytes());
+    }
+
+    #[test]
+    fn compiles_source_bytes_and_uses_the_raw_size_in_pyc_headers() {
+        let source = b"\xef\xbb\xbf# coding: utf-8\r\nanswer = 42\r\n";
+        let pyc = compile_bytes_to_pyc(source, "answer.py", 123).unwrap();
+
+        assert_eq!(&pyc[8..12], &123_u32.to_le_bytes());
+        assert_eq!(
+            &pyc[12..16],
+            &u32::try_from(source.len()).unwrap().to_le_bytes()
+        );
+        assert_eq!(
+            &pyc[16..],
+            compile("# coding: utf-8\nanswer = 42\n", "answer.py")
+                .unwrap()
+                .marshal()
+        );
+    }
+
+    #[test]
+    fn exposes_source_decoding_without_filesystem_io() {
+        assert_eq!(
+            decode_source(b"\xef\xbb\xbf# coding: utf-8\r\nvalue = '\xc3\xa9'\r").unwrap(),
+            "# coding: utf-8\nvalue = '\u{e9}'\n"
+        );
+        assert!(matches!(
+            compile_bytes(b"# coding: latin-1\nvalue = 'ascii'\n", "value.py"),
+            Err(CompileError::Decode(SourceDecodeError::UnsupportedEncoding(encoding)))
+                if encoding == "latin-1"
+        ));
+        assert!(compile("# coding: latin-1\nvalue = 'already decoded'\n", "value.py").is_ok());
     }
 
     #[test]
