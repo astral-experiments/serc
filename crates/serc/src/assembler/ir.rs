@@ -88,54 +88,132 @@ pub(super) enum Operand {
     Backward(Label),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct InstructionFlags(u16);
+bitflags::bitflags! {
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(super) struct InstructionFlags: u16 {
+        const FORCE_OWNED_LOAD = 1 << 0;
+        const STRICT_OWNED_LOAD = 1 << 1;
+        const INLINE_SMALL_EXIT = 1 << 2;
+        const PRESERVE_INLINED_JUMP_NOP = 1 << 3;
+        // Whether an incoming jump may be threaded through this instruction.
+        const ALLOW_JUMP_THREADING_TARGET = 1 << 4;
+        // Whether an unlocated block ending here may be inlined into predecessors.
+        const ALLOW_NO_LOCATION_BLOCK_INLINING = 1 << 5;
+        const PRESERVE_NO_LOCATION = 1 << 6;
+        const PREVENT_FUSION_WITH_NEXT = 1 << 7;
+        const PREVENT_FUSION_WITH_PREVIOUS = 1 << 8;
+        const DEFER_REDUNDANT_JUMP_REMOVAL = 1 << 9;
+        const PRESERVE_NOP_AFTER_JUMP_THREADING = 1 << 10;
+        const CONVERTED_POP_BLOCK = 1 << 11;
+    }
+}
 
 impl InstructionFlags {
-    pub(super) const FORCE_OWNED_LOAD: Self = Self(1 << 0);
-    pub(super) const STRICT_OWNED_LOAD: Self = Self(1 << 1);
-    pub(super) const INLINE_SMALL_EXIT: Self = Self(1 << 2);
-    pub(super) const PRESERVE_INLINED_JUMP_NOP: Self = Self(1 << 3);
-    // Whether an incoming jump may be threaded through this instruction.
-    pub(super) const ALLOW_JUMP_THREADING_TARGET: Self = Self(1 << 4);
-    // Whether an unlocated block ending here may be inlined into predecessors.
-    pub(super) const ALLOW_NO_LOCATION_BLOCK_INLINING: Self = Self(1 << 5);
-    pub(super) const PRESERVE_NO_LOCATION: Self = Self(1 << 6);
-    pub(super) const PREVENT_FUSION_WITH_NEXT: Self = Self(1 << 7);
-    pub(super) const PREVENT_FUSION_WITH_PREVIOUS: Self = Self(1 << 8);
-    pub(super) const DEFER_REDUNDANT_JUMP_REMOVAL: Self = Self(1 << 9);
-    pub(super) const PRESERVE_NOP_AFTER_JUMP_THREADING: Self = Self(1 << 10);
-    pub(super) const CONVERTED_POP_BLOCK: Self = Self(1 << 11);
-    // Exclude this instruction from every exception region after CFG normalization.
-    pub(super) const EXCLUDE_EXCEPTION: Self = Self(1 << 12);
-    // CPython retains stale exception ownership for the short form of some synthetic handler-exit
-    // jumps, but not once the jump needs an `EXTENDED_ARG`.
-    pub(super) const EXCLUDE_EXCEPTION_IF_EXTENDED: Self = Self(1 << 13);
-    // Stop borrowed-load traversal at an optimized-away empty CFG block without exposing a label
-    // to the other assembler passes.
-    pub(super) const BORROW_UNREACHABLE_ENTRY: Self = Self(1 << 14);
-
     pub(super) const DEFAULT: Self =
-        Self(Self::INLINE_SMALL_EXIT.0 | Self::ALLOW_JUMP_THREADING_TARGET.0);
+        Self::INLINE_SMALL_EXIT.union(Self::ALLOW_JUMP_THREADING_TARGET);
 
-    const fn contains(self, flag: Self) -> bool {
-        self.0 & flag.0 != 0
-    }
+    pub(super) const FUSE_OR: Self = Self::FORCE_OWNED_LOAD
+        .union(Self::STRICT_OWNED_LOAD)
+        .union(Self::ALLOW_NO_LOCATION_BLOCK_INLINING)
+        .union(Self::PRESERVE_NO_LOCATION)
+        .union(Self::DEFER_REDUNDANT_JUMP_REMOVAL)
+        .union(Self::PRESERVE_NOP_AFTER_JUMP_THREADING)
+        .union(Self::CONVERTED_POP_BLOCK);
+    pub(super) const FUSE_AND: Self =
+        Self::INLINE_SMALL_EXIT.union(Self::ALLOW_JUMP_THREADING_TARGET);
+    pub(super) const FUSE_FROM_FIRST: Self = Self::PREVENT_FUSION_WITH_PREVIOUS;
+    pub(super) const FUSE_FROM_SECOND: Self = Self::PREVENT_FUSION_WITH_NEXT;
+    pub(super) const FUSE_CLEARED: Self = Self::PRESERVE_INLINED_JUMP_NOP;
+}
 
-    fn insert(&mut self, flag: Self) {
-        self.0 |= flag.0;
-    }
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) enum BorrowFallthrough {
+    #[default]
+    Reachable,
+    Barrier,
+}
 
-    fn remove(&mut self, flag: Self) {
-        self.0 &= !flag.0;
-    }
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) enum ExceptionExclusion {
+    #[default]
+    None,
+    IfExtended,
+    Always,
+}
 
-    fn set(&mut self, flag: Self, enabled: bool) {
-        if enabled {
-            self.insert(flag);
-        } else {
-            self.remove(flag);
+impl ExceptionExclusion {
+    const fn merged(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Always, _) | (_, Self::Always) => Self::Always,
+            (Self::IfExtended, _) | (_, Self::IfExtended) => Self::IfExtended,
+            (Self::None, Self::None) => Self::None,
         }
+    }
+
+    pub(super) const fn applies(self, extended_args: u8) -> bool {
+        match self {
+            Self::None => false,
+            Self::IfExtended => extended_args > 0,
+            Self::Always => true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) enum NormalizedExceptionOwner {
+    #[default]
+    Unchanged,
+    Present,
+    Absent,
+}
+
+impl NormalizedExceptionOwner {
+    const fn merged(self, other: Self) -> Self {
+        if matches!(self, Self::Unchanged) {
+            other
+        } else {
+            self
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ExceptionPolicy {
+    pub(super) exclusion: ExceptionExclusion,
+    pub(super) normalized_owner: NormalizedExceptionOwner,
+}
+
+impl ExceptionPolicy {
+    pub(crate) const EXCLUDE_IF_EXTENDED: Self = Self {
+        exclusion: ExceptionExclusion::IfExtended,
+        normalized_owner: NormalizedExceptionOwner::Unchanged,
+    };
+
+    pub(crate) const EXCLUDE_ALWAYS: Self = Self {
+        exclusion: ExceptionExclusion::Always,
+        normalized_owner: NormalizedExceptionOwner::Unchanged,
+    };
+
+    pub(crate) const fn normalized_owner(has_owner: bool) -> Self {
+        Self {
+            exclusion: ExceptionExclusion::None,
+            normalized_owner: if has_owner {
+                NormalizedExceptionOwner::Present
+            } else {
+                NormalizedExceptionOwner::Absent
+            },
+        }
+    }
+
+    const fn merged(self, other: Self) -> Self {
+        Self {
+            exclusion: self.exclusion.merged(other.exclusion),
+            normalized_owner: self.normalized_owner.merged(other.normalized_owner),
+        }
+    }
+
+    pub(super) fn exclude(&mut self, exclusion: ExceptionExclusion) {
+        self.exclusion = self.exclusion.merged(exclusion);
     }
 }
 
@@ -150,7 +228,10 @@ pub(super) struct Instruction {
     pub(super) preserve_direct_inlined_jump_nop: Option<Label>,
     // `NOT_TAKEN` is added after CPython labels exception handlers. The new instruction keeps
     // whatever exception target remains in its reused CFG slot, if there is one.
-    pub(super) normalized_exception_owner: Option<bool>,
+    pub(super) exception_policy: ExceptionPolicy,
+    // A boundary used only by the final borrowed-load analysis. Earlier CFG passes must continue
+    // to see ordinary fallthrough across this edge.
+    pub(super) borrow_fallthrough: BorrowFallthrough,
 }
 
 impl Instruction {
@@ -167,7 +248,8 @@ impl Instruction {
             depth_after,
             flags: InstructionFlags::DEFAULT,
             preserve_direct_inlined_jump_nop: None,
-            normalized_exception_owner: None,
+            exception_policy: ExceptionPolicy::default(),
+            borrow_fallthrough: BorrowFallthrough::default(),
         }
     }
 
@@ -199,57 +281,13 @@ impl Instruction {
         self.flags.set(flag, enabled);
     }
 
-    pub(super) fn with_flag(mut self, flag: InstructionFlags, enabled: bool) -> Self {
-        self.set_flag(flag, enabled);
-        self
-    }
-
     /// Combines the provenance of two instructions replaced by one superinstruction.
     pub(super) fn fused(opcode: Opcode, operand: Operand, first: Self, second: Self) -> Self {
-        let mut flags = InstructionFlags(0);
-        flags.set(
-            InstructionFlags::FORCE_OWNED_LOAD,
-            first.has_flag(InstructionFlags::FORCE_OWNED_LOAD)
-                || second.has_flag(InstructionFlags::FORCE_OWNED_LOAD),
-        );
-        flags.set(
-            InstructionFlags::STRICT_OWNED_LOAD,
-            first.has_flag(InstructionFlags::STRICT_OWNED_LOAD)
-                || second.has_flag(InstructionFlags::STRICT_OWNED_LOAD),
-        );
-        flags.set(
-            InstructionFlags::INLINE_SMALL_EXIT,
-            first.has_flag(InstructionFlags::INLINE_SMALL_EXIT)
-                && second.has_flag(InstructionFlags::INLINE_SMALL_EXIT),
-        );
-        flags.set(
-            InstructionFlags::ALLOW_JUMP_THREADING_TARGET,
-            first.has_flag(InstructionFlags::ALLOW_JUMP_THREADING_TARGET)
-                && second.has_flag(InstructionFlags::ALLOW_JUMP_THREADING_TARGET),
-        );
-        for flag in [
-            InstructionFlags::ALLOW_NO_LOCATION_BLOCK_INLINING,
-            InstructionFlags::PRESERVE_NO_LOCATION,
-            InstructionFlags::DEFER_REDUNDANT_JUMP_REMOVAL,
-            InstructionFlags::PRESERVE_NOP_AFTER_JUMP_THREADING,
-            InstructionFlags::CONVERTED_POP_BLOCK,
-            InstructionFlags::EXCLUDE_EXCEPTION,
-            InstructionFlags::EXCLUDE_EXCEPTION_IF_EXTENDED,
-        ] {
-            flags.set(flag, first.has_flag(flag) || second.has_flag(flag));
-        }
-        flags.set(
-            InstructionFlags::PREVENT_FUSION_WITH_NEXT,
-            second.has_flag(InstructionFlags::PREVENT_FUSION_WITH_NEXT),
-        );
-        flags.set(
-            InstructionFlags::PREVENT_FUSION_WITH_PREVIOUS,
-            first.has_flag(InstructionFlags::PREVENT_FUSION_WITH_PREVIOUS),
-        );
-        flags.set(
-            InstructionFlags::BORROW_UNREACHABLE_ENTRY,
-            first.has_flag(InstructionFlags::BORROW_UNREACHABLE_ENTRY),
-        );
+        let mut flags = ((first.flags | second.flags) & InstructionFlags::FUSE_OR)
+            | ((first.flags & second.flags) & InstructionFlags::FUSE_AND)
+            | (first.flags & InstructionFlags::FUSE_FROM_FIRST)
+            | (second.flags & InstructionFlags::FUSE_FROM_SECOND);
+        flags.remove(InstructionFlags::FUSE_CLEARED);
 
         Self {
             opcode,
@@ -258,9 +296,8 @@ impl Instruction {
             depth_after: second.depth_after,
             flags,
             preserve_direct_inlined_jump_nop: None,
-            normalized_exception_owner: first
-                .normalized_exception_owner
-                .or(second.normalized_exception_owner),
+            exception_policy: first.exception_policy.merged(second.exception_policy),
+            borrow_fallthrough: second.borrow_fallthrough,
         }
     }
 }
@@ -283,7 +320,6 @@ pub(crate) struct Assembler {
     pub(super) borrow_unreachable_blocks: FxHashSet<Label>,
     pub(super) load_fast_borrowing_enabled: bool,
     pub(super) strict_owned_loads: bool,
-    pub(super) next_instruction_borrow_unreachable: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -333,7 +369,6 @@ impl Default for Assembler {
             borrow_unreachable_blocks: FxHashSet::default(),
             load_fast_borrowing_enabled: true,
             strict_owned_loads: false,
-            next_instruction_borrow_unreachable: false,
         }
     }
 }

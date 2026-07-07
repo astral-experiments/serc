@@ -675,7 +675,7 @@ impl Compiler {
             self.assembler.set_location(SourceLocation::NONE);
             self.set_depth(1);
             self.emit_unary_intrinsic(UnaryIntrinsic::STOPITERATION_ERROR)?;
-            self.emit(RERAISE, 1, -1)?;
+            self.emit_reraise(ReraiseStackState::StopIterationHandler)?;
         }
 
         if self.control.depth != 0 {
@@ -840,6 +840,8 @@ impl Compiler {
             let line = i32::try_from(self.unit.first_line_number).unwrap_or(i32::MAX);
             self.assembler
                 .set_location(SourceLocation::new(line, line, -1, -1));
+            // This physical +1/-1 frame-startup pair precedes logical expression lowering and
+            // intentionally does not participate in the compiler's value-depth accounting.
             self.assembler.emit(RETURN_GENERATOR, 0);
             self.assembler.emit(POP_TOP, 0);
             let start = self.assembler.label();

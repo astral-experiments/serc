@@ -27,8 +27,13 @@ use crate::target::{
 
 #[cfg(any(test, debug_assertions))]
 use ir::AssemblerStage;
-pub(crate) use ir::{AssembledCode, Assembler, InstructionId, Label, SourceLocation};
-use ir::{ExceptionRegion, Instruction, InstructionFlags, Item, Operand};
+pub(crate) use ir::{
+    AssembledCode, Assembler, ExceptionPolicy, InstructionId, Label, SourceLocation,
+};
+use ir::{
+    BorrowFallthrough, ExceptionExclusion, ExceptionRegion, Instruction, InstructionFlags, Item,
+    NormalizedExceptionOwner, Operand,
+};
 
 impl Assembler {
     pub(crate) fn disable_load_fast_borrowing(&mut self) {
@@ -95,8 +100,11 @@ impl Assembler {
         self.borrow_unreachable_blocks.insert(label);
     }
 
-    pub(crate) fn prevent_next_borrow_reachability(&mut self) {
-        self.next_instruction_borrow_unreachable = true;
+    /// Stops the final borrowed-load analysis at the last emitted instruction.
+    pub(crate) fn mark_last_borrow_fallthrough_barrier(&mut self) {
+        self.last_instruction_mut()
+            .expect("borrow fallthrough barrier requires a preceding instruction")
+            .borrow_fallthrough = BorrowFallthrough::Barrier;
     }
 
     pub(crate) fn mark_before_trailing_instructions(&mut self, label: Label, count: usize) {
@@ -270,30 +278,23 @@ impl Assembler {
         });
     }
 
-    pub(crate) fn exclude_last_instruction_from_exception_if_extended(&mut self) {
-        if let Some(instruction) = self.last_instruction_mut() {
-            instruction.insert_flag(InstructionFlags::EXCLUDE_EXCEPTION_IF_EXTENDED);
-        }
-    }
-
-    pub(crate) fn exclude_last_instruction_from_exception(&mut self) {
-        if let Some(instruction) = self.last_instruction_mut() {
-            instruction.insert_flag(InstructionFlags::EXCLUDE_EXCEPTION);
-        }
-    }
-
-    pub(crate) fn set_last_normalized_exception_owner(&mut self, has_owner: bool) {
-        if let Some(instruction) = self.last_instruction_mut() {
-            instruction.normalized_exception_owner = Some(has_owner);
-        }
-    }
-
     pub(crate) fn emit(&mut self, opcode: Opcode, argument: u32) {
         self.emit_operand(opcode, Operand::Value(argument));
     }
 
-    pub(crate) fn emit_with_depth(&mut self, opcode: Opcode, argument: u32, depth_after: u32) {
-        self.emit_operand_with_depth(opcode, Operand::Value(argument), Some(depth_after));
+    pub(crate) fn emit_with_depth(
+        &mut self,
+        opcode: Opcode,
+        argument: u32,
+        depth_after: u32,
+        exception_policy: ExceptionPolicy,
+    ) {
+        self.emit_operand_with_depth_and_exception_policy(
+            opcode,
+            Operand::Value(argument),
+            Some(depth_after),
+            exception_policy,
+        );
     }
 
     pub(crate) fn emit_owned_fast_with_depth(&mut self, argument: u32, depth_after: u32) {
@@ -302,6 +303,7 @@ impl Assembler {
             Operand::Value(argument),
             Some(depth_after),
             true,
+            ExceptionPolicy::default(),
         );
     }
 
@@ -469,8 +471,14 @@ impl Assembler {
         opcode: Opcode,
         label: Label,
         depth_after: u32,
+        exception_policy: ExceptionPolicy,
     ) {
-        self.emit_operand_with_depth(opcode, Operand::Forward(label), Some(depth_after));
+        self.emit_operand_with_depth_and_exception_policy(
+            opcode,
+            Operand::Forward(label),
+            Some(depth_after),
+            exception_policy,
+        );
     }
 
     pub(crate) fn emit_backward(&mut self, opcode: Opcode, label: Label) {
@@ -496,7 +504,28 @@ impl Assembler {
         operand: Operand,
         depth_after: Option<u32>,
     ) {
-        self.emit_operand_with_depth_and_ownership(opcode, operand, depth_after, false);
+        self.emit_operand_with_depth_and_exception_policy(
+            opcode,
+            operand,
+            depth_after,
+            ExceptionPolicy::default(),
+        );
+    }
+
+    fn emit_operand_with_depth_and_exception_policy(
+        &mut self,
+        opcode: Opcode,
+        operand: Operand,
+        depth_after: Option<u32>,
+        exception_policy: ExceptionPolicy,
+    ) {
+        self.emit_operand_with_depth_and_ownership(
+            opcode,
+            operand,
+            depth_after,
+            false,
+            exception_policy,
+        );
     }
 
     fn emit_operand_with_depth_and_ownership(
@@ -505,20 +534,16 @@ impl Assembler {
         operand: Operand,
         depth_after: Option<u32>,
         explicitly_owned: bool,
+        exception_policy: ExceptionPolicy,
     ) {
         let strict_owned_load = self.strict_owned_loads && opcode == LOAD_FAST;
         let force_owned_load = explicitly_owned
             || strict_owned_load
             || (opcode == LOAD_FAST && !self.load_fast_borrowing_enabled);
-        let borrow_unreachable_entry =
-            std::mem::take(&mut self.next_instruction_borrow_unreachable);
         let mut instruction = Instruction::new(opcode, operand, self.location, depth_after);
+        instruction.exception_policy = exception_policy;
         instruction.set_flag(InstructionFlags::FORCE_OWNED_LOAD, force_owned_load);
         instruction.set_flag(InstructionFlags::STRICT_OWNED_LOAD, strict_owned_load);
-        instruction.set_flag(
-            InstructionFlags::BORROW_UNREACHABLE_ENTRY,
-            borrow_unreachable_entry,
-        );
         self.items.push(Item::Instruction(instruction));
     }
 }
