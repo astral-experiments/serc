@@ -225,6 +225,27 @@ fn source_positions_clamp_to_eof() {
 }
 
 #[test]
+fn source_positions_preserve_crlf_boundaries_and_eof() {
+    let source = "one\r\ntwo";
+    let compiler = Compiler::module("example.py", source);
+
+    assert_eq!(compiler.source_position(2), (1, 2));
+    assert_eq!(compiler.source_position(5), (2, 0));
+    assert_eq!(compiler.source_position(8), (2, 3));
+    assert_eq!(compiler.source_position(4), (1, 4));
+    assert_eq!(compiler.source_position(u32::MAX), (2, 3));
+
+    let source = "one\r\ntwo\r\n";
+    let compiler = Compiler::module("example.py", source);
+
+    assert_eq!(compiler.source_position(8), (2, 3));
+    assert_eq!(compiler.source_position(9), (2, 4));
+    assert_eq!(compiler.source_position(10), (3, 0));
+    assert_eq!(compiler.source_position(5), (2, 0));
+    assert_eq!(compiler.source_position(u32::MAX), (3, 0));
+}
+
+#[test]
 fn cleans_docstrings_like_cpython() {
     assert_eq!(
         clean_doc("  first\n        second\n      third\n"),

@@ -5,13 +5,7 @@ use super::*;
 
 impl Compiler {
     pub(super) fn line_number(&self, offset: u32) -> u32 {
-        u32::try_from(
-            self.context
-                .line_index
-                .line_index(self.source_offset(offset))
-                .get(),
-        )
-        .unwrap_or(u32::MAX)
+        self.source_line(self.source_offset(offset)).number
     }
 
     pub(super) fn source_location(&self, range: ruff_text_size::TextRange) -> SourceLocation {
@@ -92,15 +86,36 @@ impl Compiler {
 
     pub(super) fn source_position(&self, offset: u32) -> (i32, i32) {
         let offset = self.source_offset(offset);
-        let line = self.context.line_index.line_index(offset);
-        let line_start = self
-            .context
-            .line_index
-            .line_start(line, &self.context.source);
+        let line = self.source_line(offset);
         (
-            i32::try_from(line.get()).unwrap_or(i32::MAX),
-            i32::try_from(u32::from(offset - line_start)).unwrap_or(i32::MAX),
+            i32::try_from(line.number).unwrap_or(i32::MAX),
+            i32::try_from(u32::from(offset - line.start)).unwrap_or(i32::MAX),
         )
+    }
+
+    fn source_line(&self, offset: TextSize) -> CachedSourceLine {
+        if let Some(line) = self.cached_source_line.get()
+            && line.contains(offset)
+        {
+            return line;
+        }
+
+        let line = self.context.line_index.line_index(offset);
+        let line_index = line.to_zero_indexed();
+        let line_starts = self.context.line_index.line_starts();
+        let start = line_starts[line_index];
+        let end = line_starts
+            .get(line_index + 1)
+            .copied()
+            .unwrap_or_else(|| self.source_offset(u32::MAX));
+        let cached = CachedSourceLine {
+            number: u32::try_from(line.get()).unwrap_or(u32::MAX),
+            start,
+            end,
+            is_last: line_index + 1 == line_starts.len(),
+        };
+        self.cached_source_line.set(Some(cached));
+        cached
     }
 
     fn source_offset(&self, offset: u32) -> TextSize {
