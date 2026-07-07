@@ -19,9 +19,7 @@ use crate::target::operands::{
     BinaryIntrinsic, BinaryOperation, CommonConstant, ComparisonOperation, Conversion,
     FunctionAttribute, ResumeLocation, SpecialMethod, UnaryIntrinsic,
 };
-use crate::target::{
-    Opcode, is_unconditional_jump, num_popped as opcode_num_popped, num_pushed as opcode_num_pushed,
-};
+use crate::target::{Opcode, is_unconditional_jump, stack_effect as opcode_stack_effect};
 
 use super::constant::literal_constant;
 use super::scope::{NameId, NameSet, definitely_evaluated_references};
@@ -1098,10 +1096,8 @@ pub(super) fn compiler_stack_effect(opcode: Opcode, argument: u32) -> CompilerSt
         // surrounding lowering path. Its effect is supplied by that path explicitly.
         RERAISE => CompilerStackEffect::ContextDependent,
         _ => CompilerStackEffect::Fixed(
-            i32::try_from(opcode_num_pushed(opcode, argument))
-                .expect("opcode push count fits in i32")
-                - i32::try_from(opcode_num_popped(opcode, argument))
-                    .expect("opcode pop count fits in i32"),
+            i32::try_from(opcode_stack_effect(opcode, argument))
+                .expect("opcode stack effect fits in i32"),
         ),
     }
 }

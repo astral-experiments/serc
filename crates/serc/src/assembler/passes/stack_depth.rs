@@ -1,7 +1,5 @@
-use rustc_hash::FxHashMap;
-
 use super::super::block_graph::BasicBlockId;
-use super::super::{Item, Label, Operand, OptimizationPipeline, ends_scope, opcode_stack_effect};
+use super::super::{Item, Operand, OptimizationPipeline, ends_scope, opcode_stack_effect};
 use crate::CompileError;
 use crate::target::is_unconditional_jump;
 use crate::target::opcodes::END_ASYNC_FOR;
@@ -15,11 +13,12 @@ struct ExceptionEdge {
 }
 
 #[derive(Clone, Copy)]
-struct SetupEdge {
-    target: BasicBlockId,
-    source_depth: i64,
-    target_depth: i64,
+struct BlockState {
+    position: usize,
+    start_depth: i64,
 }
+
+const UNREACHED_DEPTH: i64 = i64::MIN;
 
 impl OptimizationPipeline {
     /// Calculates CPython's physical value-stack size from the final reachable CFG.
@@ -32,13 +31,20 @@ impl OptimizationPipeline {
         let Some(entry) = graph.order().first().copied() else {
             return Ok(0);
         };
-        let positions = graph
+        let arena_len = graph
             .order()
             .iter()
-            .copied()
-            .enumerate()
-            .map(|(position, block)| (block, position))
-            .collect::<FxHashMap<_, _>>();
+            .fold(0, |len, block| len.max(block.index() + 1));
+        let mut block_states = vec![
+            BlockState {
+                position: usize::MAX,
+                start_depth: UNREACHED_DEPTH,
+            };
+            arena_len
+        ];
+        for (position, block) in graph.order().iter().copied().enumerate() {
+            block_states[block.index()].position = position;
+        }
         let exception_edges = self
             .exception_regions
             .iter()
@@ -54,8 +60,8 @@ impl OptimizationPipeline {
                 };
                 let start_block = block(region.start, "start")?;
                 let end_block = block(region.end, "end")?;
-                let start = positions[&start_block];
-                let end = positions[&end_block];
+                let start = block_states[start_block.index()].position;
+                let end = block_states[end_block.index()].position;
                 if start > end {
                     return Err(stack_error(format!(
                         "exception region {index} starts after it ends"
@@ -69,40 +75,22 @@ impl OptimizationPipeline {
                 })
             })
             .collect::<Result<Vec<_>, CompileError>>()?;
-        let mut setup_edges = FxHashMap::<Label, Vec<SetupEdge>>::default();
-        for entry in &self.exception_handler_entries {
-            if graph.label_block(entry.source).is_none() {
-                continue;
-            }
-            let Some(target) = graph.label_block(entry.target) else {
-                continue;
-            };
-            setup_edges
-                .entry(entry.source)
-                .or_default()
-                .push(SetupEdge {
-                    target,
-                    source_depth: i64::from(entry.source_depth),
-                    target_depth: i64::from(entry.target_depth),
-                });
-        }
-        let mut start_depths = FxHashMap::default();
-        let mut pending = Vec::new();
-        push_start_depth(&mut start_depths, &mut pending, entry, 0)?;
+        let mut pending = Vec::with_capacity(graph.len());
+        push_start_depth(&mut block_states, &mut pending, entry, 0)?;
 
         let mut maximum = 0_i64;
         while let Some(block) = pending.pop() {
-            let position = positions[&block];
+            let position = block_states[block.index()].position;
             // A real exception can enter the innermost handler from any reachable instruction in
             // the final half-open exception-table range.
             for edge in exception_edges
                 .iter()
                 .filter(|edge| edge.start <= position && position < edge.end)
             {
-                push_start_depth(&mut start_depths, &mut pending, edge.target, edge.depth)?;
+                push_start_depth(&mut block_states, &mut pending, edge.target, edge.depth)?;
             }
 
-            let mut depth = start_depths[&block];
+            let mut depth = block_states[block.index()].start_depth;
             let mut has_fallthrough = true;
             for item in graph[block].items() {
                 let instruction = match item {
@@ -112,17 +100,20 @@ impl OptimizationPipeline {
                         // is reached at its original depth. This excludes setup labels left behind
                         // by folded branches. If source and target collapsed into one final block,
                         // no distinct handler instructions survived for the edge to reach.
-                        for edge in setup_edges
-                            .get(label)
-                            .into_iter()
-                            .flatten()
-                            .filter(|edge| edge.source_depth == depth && edge.target != block)
-                        {
+                        for entry in self.exception_handler_entries.iter().filter(|entry| {
+                            entry.source == *label && i64::from(entry.source_depth) == depth
+                        }) {
+                            let Some(target) = graph.label_block(entry.target) else {
+                                continue;
+                            };
+                            if target == block {
+                                continue;
+                            }
                             push_start_depth(
-                                &mut start_depths,
+                                &mut block_states,
                                 &mut pending,
-                                edge.target,
-                                edge.target_depth,
+                                target,
+                                i64::from(entry.target_depth),
                             )?;
                         }
                         continue;
@@ -130,9 +121,9 @@ impl OptimizationPipeline {
                     Item::Instruction(instruction) => instruction,
                 };
                 maximum = maximum.max(depth);
-                let argument = match instruction.operand {
-                    Operand::Value(argument) => argument,
-                    Operand::Forward(_) | Operand::Backward(_) => 0,
+                let (argument, jump_target) = match instruction.operand {
+                    Operand::Value(argument) => (argument, None),
+                    Operand::Forward(label) | Operand::Backward(label) => (0, Some(label)),
                 };
                 depth = depth
                     .checked_add(opcode_stack_effect(instruction.opcode, argument))
@@ -146,22 +137,25 @@ impl OptimizationPipeline {
 
                 // CPython explicitly excludes END_ASYNC_FOR's cleanup label from the jump-edge
                 // traversal; its physical continuation is the ordinary fallthrough edge.
-                if instruction.opcode != END_ASYNC_FOR
-                    && let Operand::Forward(label) | Operand::Backward(label) = instruction.operand
-                {
-                    let target = graph.label_block(label).ok_or_else(|| {
-                        stack_error(format!("jump targets unbound label {}", label.0))
-                    })?;
-                    push_start_depth(&mut start_depths, &mut pending, target, depth)?;
-                }
-                if is_unconditional_jump(instruction.opcode) || ends_scope(instruction.opcode) {
+                let ends_block = if let Some(label) = jump_target {
+                    if instruction.opcode != END_ASYNC_FOR {
+                        let target = graph.label_block(label).ok_or_else(|| {
+                            stack_error(format!("jump targets unbound label {}", label.0))
+                        })?;
+                        push_start_depth(&mut block_states, &mut pending, target, depth)?;
+                    }
+                    is_unconditional_jump(instruction.opcode)
+                } else {
+                    ends_scope(instruction.opcode)
+                };
+                if ends_block {
                     has_fallthrough = false;
                     break;
                 }
             }
 
             if has_fallthrough && let Some(next) = graph.order().get(position + 1) {
-                push_start_depth(&mut start_depths, &mut pending, *next, depth)?;
+                push_start_depth(&mut block_states, &mut pending, *next, depth)?;
             }
         }
 
@@ -172,22 +166,23 @@ impl OptimizationPipeline {
 }
 
 fn push_start_depth(
-    start_depths: &mut FxHashMap<BasicBlockId, i64>,
+    block_states: &mut [BlockState],
     pending: &mut Vec<BasicBlockId>,
     block: BasicBlockId,
     depth: i64,
 ) -> Result<(), CompileError> {
-    match start_depths.get(&block) {
-        Some(current) if *current != depth => Err(stack_error(format!(
+    let start_depth = &mut block_states[block.index()].start_depth;
+    match *start_depth {
+        current if current != UNREACHED_DEPTH && current != depth => Err(stack_error(format!(
             "inconsistent stack depth at block {}: {current} != {depth}",
             block.index()
         ))),
-        Some(_) => Ok(()),
-        None => {
-            start_depths.insert(block, depth);
+        UNREACHED_DEPTH => {
+            *start_depth = depth;
             pending.push(block);
             Ok(())
         }
+        _ => Ok(()),
     }
 }
 
@@ -381,6 +376,23 @@ mod tests {
             instruction(RETURN_VALUE, Operand::Value(0)),
         ]);
         let pipeline = pipeline(items);
+
+        assert_eq!(pipeline.calculate_stack_size().unwrap(), 1);
+    }
+
+    #[test]
+    fn handles_sparse_block_ids() {
+        let exit = Label(0);
+        let mut pipeline = pipeline(vec![
+            instruction(LOAD_CONST, Operand::Value(0)),
+            instruction(JUMP_FORWARD, Operand::Forward(exit)),
+            instruction(LOAD_CONST, Operand::Value(1)),
+            instruction(RETURN_VALUE, Operand::Value(0)),
+            Item::Label(exit),
+            instruction(RETURN_VALUE, Operand::Value(0)),
+        ]);
+        let unreachable = pipeline.graph.order()[1];
+        pipeline.graph.retain_order(|block| block != unreachable);
 
         assert_eq!(pipeline.calculate_stack_size().unwrap(), 1);
     }

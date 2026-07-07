@@ -461,6 +461,34 @@ fn exception_regions_only_require_final_order_after_cfg_passes() {
 }
 
 #[test]
+fn resolves_exception_handler_depths_in_one_pass() {
+    let mut assembler = Assembler::default();
+    let outer = assembler.label();
+    let inner = assembler.label();
+    let end = assembler.label();
+    let target = assembler.label();
+    assembler.mark(outer);
+    assembler.mark(inner);
+    assembler.emit_with_depth(LOAD_CONST, 0, 5, ExceptionPolicy::default());
+    assembler.mark(end);
+    assembler.mark(target);
+    assembler.add_exception_region(outer, end, target, 1, false);
+    assembler.add_exception_region(inner, end, target, 2, false);
+    assembler.add_exception_region(end, end, target, 3, false);
+
+    assembler.resolve_exception_handler_depths();
+
+    assert_eq!(
+        assembler
+            .exception_handler_entries
+            .iter()
+            .map(|entry| entry.source_depth)
+            .collect::<Vec<_>>(),
+        [4, 4, 3]
+    );
+}
+
+#[test]
 fn removes_unreachable_jumps() {
     let jump = JUMP_FORWARD;
     let resume = RESUME;

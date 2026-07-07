@@ -23,6 +23,7 @@ use crate::target::opcodes::{
 use crate::target::{
     Opcode, is_conditional_jump, is_scope_exit as ends_scope, is_unconditional_jump,
     num_popped as opcode_num_popped, num_pushed as opcode_num_pushed,
+    stack_effect as target_stack_effect,
 };
 
 #[cfg(any(test, debug_assertions))]
@@ -328,14 +329,13 @@ impl Assembler {
         depth: u32,
         preserve_lasti: bool,
     ) {
-        let source_depth = self.emitted_region_start_depth(start, end).unwrap_or(depth);
         let target_depth = depth
             .checked_add(1 + u32::from(preserve_lasti))
             .expect("exception handler depth fits in u32");
         self.exception_handler_entries.push(ExceptionHandlerEntry {
             source: start,
             target,
-            source_depth,
+            source_depth: depth,
             target_depth,
         });
         self.exception_regions.push(ExceptionRegion {
@@ -347,36 +347,62 @@ impl Assembler {
         });
     }
 
-    /// Recovers the physical stack depth at an exception region's emitted start label.
+    /// Recovers the physical stack depth at every exception region's emitted start label.
     ///
     /// The exception table stores the depth to restore, which differs from the depth at the
     /// corresponding `SETUP_*` pseudo-instruction for constructs such as `with`. The compiler's
     /// first depth annotation inside the region, adjusted by the generated opcode effects, gives
     /// us the pseudo-instruction's original entry depth before CFG optimization removes it.
-    fn emitted_region_start_depth(&self, start: Label, end: Label) -> Option<u32> {
-        if start == end {
-            return None;
-        }
-        let mut in_region = false;
-        let mut cumulative_effect = 0_i64;
-        for item in self.linear_items() {
+    fn resolve_exception_handler_depths(&mut self) {
+        let UnoptimizedCode::Linear(items) = &self.code else {
+            return;
+        };
+        debug_assert_eq!(
+            self.exception_handler_entries.len(),
+            self.exception_regions.len()
+        );
+
+        let regions = &self.exception_regions;
+        let entries = &mut self.exception_handler_entries;
+        let mut active: Vec<(usize, i64)> = Vec::with_capacity(self.exception_regions.len());
+        for item in items {
             match item {
-                Item::Label(label) if *label == start => in_region = true,
-                Item::Label(label) if in_region && *label == end => break,
-                Item::Instruction(instruction) if in_region => {
+                Item::Label(label) => {
+                    active.retain(|(index, _)| regions[*index].end != *label);
+                    active.extend(
+                        regions
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, region)| {
+                                region.start == *label && region.start != region.end
+                            })
+                            .map(|(index, _)| (index, 0_i64)),
+                    );
+                }
+                Item::Instruction(instruction) => {
+                    if active.is_empty() {
+                        continue;
+                    }
                     let argument = match instruction.operand {
                         Operand::Value(argument) => argument,
                         Operand::Forward(_) | Operand::Backward(_) => 0,
                     };
-                    cumulative_effect += opcode_stack_effect(instruction.opcode, argument);
-                    if let Some(depth_after) = instruction.depth_after {
-                        return u32::try_from(i64::from(depth_after) - cumulative_effect).ok();
-                    }
+                    let effect = opcode_stack_effect(instruction.opcode, argument);
+                    active.retain_mut(|(index, cumulative_effect)| {
+                        *cumulative_effect += effect;
+                        let Some(depth_after) = instruction.depth_after else {
+                            return true;
+                        };
+                        if let Ok(source_depth) =
+                            u32::try_from(i64::from(depth_after) - *cumulative_effect)
+                        {
+                            entries[*index].source_depth = source_depth;
+                        }
+                        false
+                    });
                 }
-                Item::Instruction(_) | Item::Label(_) => {}
             }
         }
-        None
     }
 
     pub(crate) fn emit(&mut self, opcode: Opcode, argument: u32) {
@@ -452,6 +478,7 @@ impl Assembler {
             return used;
         }
 
+        self.resolve_exception_handler_depths();
         let UnoptimizedCode::Linear(items) =
             std::mem::replace(&mut self.code, UnoptimizedCode::Linear(Vec::new()))
         else {
@@ -644,8 +671,7 @@ impl Assembler {
 }
 
 fn opcode_stack_effect(opcode: Opcode, argument: u32) -> i64 {
-    i64::try_from(opcode_num_pushed(opcode, argument)).unwrap()
-        - i64::try_from(opcode_num_popped(opcode, argument)).unwrap()
+    target_stack_effect(opcode, argument)
 }
 
 fn block_has_fallthrough(block: &[Item]) -> bool {

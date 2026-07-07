@@ -174,7 +174,8 @@ impl Assembler {
             .finish(first_line_number)
     }
 
-    pub(in crate::assembler) fn into_optimization_pipeline(self) -> OptimizationPipeline {
+    pub(in crate::assembler) fn into_optimization_pipeline(mut self) -> OptimizationPipeline {
+        self.resolve_exception_handler_depths();
         let graph = match self.code {
             UnoptimizedCode::Linear(items) => {
                 BlockGraph::from_items(items, &rustc_hash::FxHashSet::default())

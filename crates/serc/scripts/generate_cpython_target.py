@@ -706,6 +706,28 @@ def render(sources: dict[str, str]) -> str:
                 "",
             ]
         )
+    lines.extend(
+        [
+            "#[allow(clippy::eq_op, clippy::identity_op)]",
+            "pub(crate) fn stack_effect(opcode: Opcode, argument: u32) -> i64 {",
+            "    let argument = i64::from(argument);",
+            "    match opcode {",
+        ]
+    )
+    for name, _ in opcodes:
+        pushed_expression = rust_stack_expression(pushed[name])
+        popped_expression = rust_stack_expression(popped[name])
+        lines.append(
+            f"        opcodes::{name} => ({pushed_expression}) - ({popped_expression}),"
+        )
+    lines.extend(
+        [
+            '        _ => unreachable!("missing generated stack metadata for opcode {}", opcode.code()),',
+            "    }",
+            "}",
+            "",
+        ]
+    )
     return "\n".join(lines) + "\n"
 
 
