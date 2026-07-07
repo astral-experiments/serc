@@ -759,9 +759,9 @@ impl Compiler {
     pub(super) fn emit_resume(
         &mut self,
         location: ResumeLocation,
-        depth_one: bool,
+        depth: ResumeDepth,
     ) -> Result<(), CompileError> {
-        self.emit(RESUME, location.at_depth(depth_one), 0)
+        self.emit(RESUME, location.at_depth(depth.is_one()), 0)
     }
 
     pub(super) fn emit_binary_operation(

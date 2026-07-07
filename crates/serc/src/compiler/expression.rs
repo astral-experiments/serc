@@ -3,6 +3,12 @@
 
 use super::*;
 
+#[derive(Clone, Copy, Debug)]
+struct ConditionMarkerPolicy {
+    excluded: ExceptionPolicy,
+    ordinary: ExceptionPolicy,
+}
+
 impl Compiler {
     pub(super) fn compile_match(
         &mut self,
@@ -906,10 +912,12 @@ impl Compiler {
                     self.control.generator_region_start.is_some()
                         && self.control.active_exception_region_exclusions.is_empty()
                         && self.control.active_with_region_exclusions.is_empty();
-                self.emit_resume(
-                    ResumeLocation::AFTER_YIELD,
-                    wrapper_is_only_exception_region,
-                )?;
+                let resume_depth = if wrapper_is_only_exception_region {
+                    ResumeDepth::One
+                } else {
+                    ResumeDepth::Zero
+                };
+                self.emit_resume(ResumeLocation::AFTER_YIELD, resume_depth)?;
             }
             Expr::YieldFrom(expression) => {
                 if self.unit.flags & CO_GENERATOR == 0 {
@@ -929,10 +937,12 @@ impl Compiler {
                 self.assembler.mark(yielded);
                 self.emit(YIELD_VALUE, 1, 0)?;
                 self.assembler.mark(yielded_end);
-                self.emit_resume(
-                    ResumeLocation::AFTER_YIELD_FROM,
-                    self.control.generator_region_start.is_none(),
-                )?;
+                let resume_depth = if self.control.generator_region_start.is_none() {
+                    ResumeDepth::One
+                } else {
+                    ResumeDepth::Zero
+                };
+                self.emit_resume(ResumeLocation::AFTER_YIELD_FROM, resume_depth)?;
                 self.emit_jump_backward(JUMP_BACKWARD_NO_INTERRUPT, send, 0)?;
                 self.assembler.mark(cleanup);
                 self.assembler.add_exception_region(
@@ -1460,7 +1470,7 @@ impl Compiler {
         self.assembler.mark(yielded);
         self.emit(YIELD_VALUE, 1, 0)?;
         self.assembler.mark(yielded_end);
-        self.emit_resume(ResumeLocation::AFTER_AWAIT, false)?;
+        self.emit_resume(ResumeLocation::AFTER_AWAIT, ResumeDepth::Zero)?;
         self.emit_jump_backward(JUMP_BACKWARD_NO_INTERRUPT, send, 0)?;
 
         self.assembler.mark(cleanup);
@@ -2512,7 +2522,7 @@ impl Compiler {
                 self.emit_unary_intrinsic(UnaryIntrinsic::ASYNC_GEN_WRAP)?;
             }
             self.emit(YIELD_VALUE, 0, 0)?;
-            self.emit_resume(ResumeLocation::AFTER_YIELD, true)?;
+            self.emit_resume(ResumeLocation::AFTER_YIELD, ResumeDepth::One)?;
             self.emit(POP_TOP, 0, -1)?;
         }
         self.emit_jump_backward(JUMP_BACKWARD, start, 0)?;
@@ -2556,7 +2566,7 @@ impl Compiler {
         self.assembler.mark(yielded);
         self.emit(YIELD_VALUE, 1, 0)?;
         self.assembler.mark(yielded_end);
-        self.emit_resume(ResumeLocation::AFTER_AWAIT, false)?;
+        self.emit_resume(ResumeLocation::AFTER_AWAIT, ResumeDepth::Zero)?;
         self.emit_jump_backward(JUMP_BACKWARD_NO_INTERRUPT, send, 0)?;
         self.assembler.mark(send_end);
         self.set_depth(loop_depth + 2);
@@ -2600,7 +2610,7 @@ impl Compiler {
                 .set_location(self.source_location(element.range()));
             self.emit_unary_intrinsic(UnaryIntrinsic::ASYNC_GEN_WRAP)?;
             self.emit(YIELD_VALUE, 0, 0)?;
-            self.emit_resume(ResumeLocation::AFTER_YIELD, true)?;
+            self.emit_resume(ResumeLocation::AFTER_YIELD, ResumeDepth::One)?;
             self.emit(POP_TOP, 0, -1)?;
         }
         self.emit_jump_backward(JUMP_BACKWARD, start, 0)?;
@@ -3071,7 +3081,7 @@ impl Compiler {
         self.assembler.mark(yielded);
         self.emit(YIELD_VALUE, 1, 0)?;
         self.assembler.mark(yielded_end);
-        self.emit_resume(ResumeLocation::AFTER_AWAIT, false)?;
+        self.emit_resume(ResumeLocation::AFTER_AWAIT, ResumeDepth::Zero)?;
         self.emit_jump_backward(JUMP_BACKWARD_NO_INTERRUPT, send, 0)?;
         if reorder_cleanup {
             self.assembler.mark(protected_before_cleanup_end);
@@ -3725,6 +3735,54 @@ impl Compiler {
         }
     }
 
+    fn emit_condition_not_taken(
+        &mut self,
+        policy: ConditionMarkerPolicy,
+    ) -> Result<(), CompileError> {
+        if !self.control.exclude_terminal_if_not_taken
+            && !self.control.exclude_condition_not_taken_from_exception
+        {
+            return self.emit_with_exception_policy(NOT_TAKEN, 0, 0, policy.ordinary);
+        }
+
+        let exclude_from_generator = self.control.exclude_condition_not_taken_from_exception
+            && self.control.generator_region_start.is_some();
+        let exclude_from_exception = self.control.exclude_condition_not_taken_from_exception
+            || (self.control.exclude_terminal_if_not_taken
+                && !self.control.active_with_region_exclusions.is_empty());
+        self.control.exclude_terminal_if_not_taken = false;
+
+        let exclusion_start = self.assembler.label();
+        self.assembler.mark(exclusion_start);
+        self.emit_with_exception_policy(NOT_TAKEN, 0, 0, policy.excluded)?;
+        let exclusion_end = self.assembler.label();
+        self.assembler.mark(exclusion_end);
+
+        if exclude_from_generator {
+            self.control
+                .generator_region_exclusions
+                .push((exclusion_start, exclusion_end));
+        }
+        for exclusions in &mut self.control.active_with_region_exclusions {
+            exclusions.push((exclusion_start, exclusion_end));
+        }
+        if exclude_from_exception {
+            if self
+                .control
+                .exclude_condition_not_taken_from_all_exception_regions
+            {
+                for exclusions in &mut self.control.active_exception_region_exclusions {
+                    exclusions.push((exclusion_start, exclusion_end));
+                }
+            } else if let Some(exclusions) =
+                self.control.active_exception_region_exclusions.last_mut()
+            {
+                exclusions.push((exclusion_start, exclusion_end));
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn compile_jump_if(
         &mut self,
         expression: &Expr,
@@ -3899,53 +3957,12 @@ impl Compiler {
                 label,
                 -1,
             )?;
-            if self.control.exclude_terminal_if_not_taken
-                || self.control.exclude_condition_not_taken_from_exception
-            {
-                let exclude_from_generator =
-                    self.control.exclude_condition_not_taken_from_exception
-                        && self.control.generator_region_start.is_some();
-                let exclude_from_exception =
-                    self.control.exclude_condition_not_taken_from_exception
-                        || (self.control.exclude_terminal_if_not_taken
-                            && !self.control.active_with_region_exclusions.is_empty());
-                self.control.exclude_terminal_if_not_taken = false;
-                let exclusion_start = self.assembler.label();
-                self.assembler.mark(exclusion_start);
-                self.emit(NOT_TAKEN, 0, 0)?;
-                let exclusion_end = self.assembler.label();
-                self.assembler.mark(exclusion_end);
-                if exclude_from_generator {
-                    self.control
-                        .generator_region_exclusions
-                        .push((exclusion_start, exclusion_end));
-                }
-                for exclusions in &mut self.control.active_with_region_exclusions {
-                    exclusions.push((exclusion_start, exclusion_end));
-                }
-                if exclude_from_exception {
-                    if self
-                        .control
-                        .exclude_condition_not_taken_from_all_exception_regions
-                    {
-                        for exclusions in &mut self.control.active_exception_region_exclusions {
-                            exclusions.push((exclusion_start, exclusion_end));
-                        }
-                    } else if let Some(exclusions) =
-                        self.control.active_exception_region_exclusions.last_mut()
-                    {
-                        exclusions.push((exclusion_start, exclusion_end));
-                    }
-                }
-                return Ok(());
-            }
-            self.emit_with_exception_policy(
-                NOT_TAKEN,
-                0,
-                0,
-                ExceptionPolicy::normalized_owner(self.control.active_normal_finally_bodies > 0),
-            )?;
-            return Ok(());
+            return self.emit_condition_not_taken(ConditionMarkerPolicy {
+                excluded: ExceptionPolicy::default(),
+                ordinary: ExceptionPolicy::normalized_owner(
+                    self.control.active_normal_finally_bodies > 0,
+                ),
+            });
         }
         let comparison_is_boolean = if let Expr::Compare(comparison) = expression
             && comparison.ops.len() == 1
@@ -3975,59 +3992,12 @@ impl Compiler {
             label,
             -1,
         )?;
-        if self.control.exclude_terminal_if_not_taken
-            || self.control.exclude_condition_not_taken_from_exception
-        {
-            let exclude_from_generator = self.control.exclude_condition_not_taken_from_exception
-                && self.control.generator_region_start.is_some();
-            let exclude_from_exception = self.control.exclude_condition_not_taken_from_exception
-                || (self.control.exclude_terminal_if_not_taken
-                    && !self.control.active_with_region_exclusions.is_empty());
-            self.control.exclude_terminal_if_not_taken = false;
-            let exclusion_start = self.assembler.label();
-            self.assembler.mark(exclusion_start);
-            self.emit_with_exception_policy(
-                NOT_TAKEN,
-                0,
-                0,
-                ExceptionPolicy::normalized_owner(comparison_is_boolean),
-            )?;
-            let exclusion_end = self.assembler.label();
-            self.assembler.mark(exclusion_end);
-            if exclude_from_generator {
-                self.control
-                    .generator_region_exclusions
-                    .push((exclusion_start, exclusion_end));
-            }
-            for exclusions in &mut self.control.active_with_region_exclusions {
-                exclusions.push((exclusion_start, exclusion_end));
-            }
-            if exclude_from_exception {
-                if self
-                    .control
-                    .exclude_condition_not_taken_from_all_exception_regions
-                {
-                    for exclusions in &mut self.control.active_exception_region_exclusions {
-                        exclusions.push((exclusion_start, exclusion_end));
-                    }
-                } else if let Some(exclusions) =
-                    self.control.active_exception_region_exclusions.last_mut()
-                {
-                    exclusions.push((exclusion_start, exclusion_end));
-                }
-            }
-            Ok(())
-        } else {
-            self.emit_with_exception_policy(
-                NOT_TAKEN,
-                0,
-                0,
-                ExceptionPolicy::normalized_owner(
-                    comparison_is_boolean || self.control.active_normal_finally_bodies > 0,
-                ),
-            )?;
-            Ok(())
-        }
+        self.emit_condition_not_taken(ConditionMarkerPolicy {
+            excluded: ExceptionPolicy::normalized_owner(comparison_is_boolean),
+            ordinary: ExceptionPolicy::normalized_owner(
+                comparison_is_boolean || self.control.active_normal_finally_bodies > 0,
+            ),
+        })
     }
 
     pub(super) fn compile_store_target(&mut self, expression: &Expr) -> Result<(), CompileError> {
