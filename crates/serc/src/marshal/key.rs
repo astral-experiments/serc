@@ -7,7 +7,7 @@ use super::v5::{
     TYPE_TRUE, TYPE_TUPLE, TYPE_UNICODE,
 };
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(super) enum ObjectKey<'a> {
     // Scalar and immutable-container keys use Python value equality.
     None,
@@ -89,7 +89,7 @@ pub(super) fn constant_key(value: &Constant) -> ObjectKey<'_> {
         Constant::Tuple(values) => constants_tuple_key(values),
         Constant::FrozenSet(values) => {
             let mut values: Vec<_> = values.iter().map(constant_key).collect();
-            values.sort_by_key(|value| format!("{value:?}"));
+            values.sort_unstable();
             ObjectKey::FrozenSet(values)
         }
         Constant::Slice { lower, upper, step } => ObjectKey::Slice(
