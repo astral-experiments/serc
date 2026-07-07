@@ -14,6 +14,7 @@ use std::error::Error;
 use std::fmt;
 
 use compiler::{CodeObject, Compiler};
+use ruff_text_size::TextRange;
 pub use source::{SourceDecodeError, decode_source};
 
 /// The exact CPython implementation targeted by this compiler backend.
@@ -100,18 +101,39 @@ pub enum CompileError {
     /// The Python source bytes could not be decoded.
     Decode(SourceDecodeError),
     /// Ruff rejected the Python source.
-    Parse(String),
+    Parse(ruff_python_parser::ParseError),
+    /// A pattern violates Python's semantic restrictions.
+    InvalidPattern {
+        /// The restriction violated by the pattern.
+        message: String,
+        /// The byte range of the invalid pattern in the normalized source.
+        range: TextRange,
+    },
     /// The source uses valid Python syntax that this backend does not support yet.
     Unsupported(String),
     /// The compiler violated one of its own invariants.
     Internal(String),
 }
 
+impl CompileError {
+    /// Return the byte range associated with this error, if available.
+    pub fn range(&self) -> Option<TextRange> {
+        match self {
+            Self::Parse(error) => Some(error.location),
+            Self::InvalidPattern { range, .. } => Some(*range),
+            Self::Decode(_) | Self::Unsupported(_) | Self::Internal(_) => None,
+        }
+    }
+}
+
 impl fmt::Display for CompileError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Decode(error) => write!(formatter, "failed to decode Python source: {error}"),
-            Self::Parse(message) => write!(formatter, "failed to parse Python source: {message}"),
+            Self::Parse(error) => write!(formatter, "failed to parse Python source: {error}"),
+            Self::InvalidPattern { message, .. } => {
+                write!(formatter, "failed to parse Python source: {message}")
+            }
             Self::Unsupported(message) => formatter.write_str(message),
             Self::Internal(message) => write!(formatter, "internal compiler error: {message}"),
         }
@@ -122,7 +144,8 @@ impl Error for CompileError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Decode(error) => Some(error),
-            _ => None,
+            Self::Parse(error) => Some(error),
+            Self::InvalidPattern { .. } | Self::Unsupported(_) | Self::Internal(_) => None,
         }
     }
 }
@@ -146,7 +169,7 @@ fn compile_normalized(source: &str, filename: &str) -> Result<CompiledModule, Co
     let options = ruff_python_parser::ParseOptions::from(ruff_python_parser::Mode::Module)
         .with_target_version(ruff_python_ast::PythonVersion::PY314);
     let parsed = ruff_python_parser::parse(source, options)
-        .map_err(|error| CompileError::Parse(error.to_string()))?
+        .map_err(CompileError::Parse)?
         .try_into_module()
         .ok_or_else(|| CompileError::Internal("parser did not return a module".to_string()))?;
     let code = Compiler::module(filename, source).compile_module(parsed.suite())?;

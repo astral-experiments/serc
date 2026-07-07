@@ -396,9 +396,10 @@ impl Compiler {
             if index != 0 {
                 let control = control.as_ref().unwrap();
                 if alternative_context.stores.len() != control.len() {
-                    return Err(CompileError::Parse(
-                        "alternative patterns bind different names".to_string(),
-                    ));
+                    return Err(CompileError::InvalidPattern {
+                        message: "alternative patterns bind different names".to_string(),
+                        range: alternative.range(),
+                    });
                 }
                 for control_index in (0..control.len()).rev() {
                     let Some(store_index) = alternative_context
@@ -406,9 +407,10 @@ impl Compiler {
                         .iter()
                         .position(|name| name == &control[control_index])
                     else {
-                        return Err(CompileError::Parse(
-                            "alternative patterns bind different names".to_string(),
-                        ));
+                        return Err(CompileError::InvalidPattern {
+                            message: "alternative patterns bind different names".to_string(),
+                            range: alternative.range(),
+                        });
                     };
                     if control_index != store_index {
                         debug_assert!(store_index < control_index);
@@ -455,9 +457,10 @@ impl Compiler {
         for name in control {
             self.rotate_match_stack(rotations)?;
             if context.stores.contains(&name) {
-                return Err(CompileError::Parse(format!(
-                    "multiple assignments to name '{name}' in pattern"
-                )));
+                return Err(CompileError::InvalidPattern {
+                    message: format!("multiple assignments to name '{name}' in pattern"),
+                    range: pattern.range,
+                });
             }
             context.stores.push(name);
         }
