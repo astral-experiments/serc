@@ -1,6 +1,6 @@
 use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
 use ruff_python_ast::{BoolOp, Expr, Pattern, Stmt, UnaryOp};
-use ruff_text_size::Ranged;
+use ruff_text_size::{Ranged, TextRange};
 
 use super::{
     BINARY_SLICE, BUILD_LIST, BUILD_MAP, BUILD_SET, BUILD_TUPLE, CALL, CHECK_EG_MATCH,
@@ -81,6 +81,12 @@ struct ReturnFinallyContext {
 struct WithExitContext {
     location: SourceLocation,
     is_async: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum WithBodyExitNoop {
+    Located(TextRange),
+    ConvertedPopBlock,
 }
 
 type RegionExclusions = Vec<(Label, Label)>;
@@ -3154,12 +3160,7 @@ impl Compiler {
         }
         let base_depth = self.control.depth;
         let end = self.assembler.label();
-        let exclude_not_taken = !self.control.active_with_region_exclusions.is_empty();
-        self.with_control_override(
-            |control| &mut control.exclude_terminal_if_not_taken,
-            exclude_not_taken,
-            |compiler| compiler.compile_jump_if(&statement.test, true, end),
-        )?;
+        self.compile_jump_if(&statement.test, true, end)?;
         self.assembler
             .set_location(self.source_location(statement.range));
         self.emit_common_constant(CommonConstant::ASSERTIONERROR)?;
@@ -4780,7 +4781,7 @@ impl Compiler {
         &mut self,
         remaining: &[ruff_python_ast::WithItem],
         body: &[Stmt],
-    ) -> Result<Option<ruff_text_size::TextRange>, CompileError> {
+    ) -> Result<Option<WithBodyExitNoop>, CompileError> {
         let mut body_noop = None;
         if remaining.is_empty() {
             let body_start = self.assembler.instruction_count();
@@ -4828,9 +4829,15 @@ impl Compiler {
                     previous.line != self.source_location(statement.range()).line
                 })
             {
-                body_noop = Some(statement.range());
+                body_noop = Some(WithBodyExitNoop::Located(statement.range()));
             } else if terminal_if && let Some(Stmt::If(statement)) = body.last() {
-                body_noop = Some(statement.test.range());
+                body_noop = Some(WithBodyExitNoop::Located(statement.test.range()));
+            } else if let Some(Stmt::Assert(statement)) = body.last() {
+                if condition_jump_target_count(&statement.test, true) == 1 {
+                    // CPython converts the with block's trailing `POP_BLOCK` to an unlocated
+                    // NOP. Its sole successful assert predecessor supplies the visible line.
+                    body_noop = Some(WithBodyExitNoop::ConvertedPopBlock);
+                }
             }
         } else {
             self.compile_with_items(remaining, body, false)?;
@@ -4901,11 +4908,18 @@ impl Compiler {
                 .set_location(self.source_location(remaining[0].context_expr.range()));
             self.emit(NOP, 0, 0)?;
         }
-        if let Some(range) = body_noop {
+        if let Some(body_noop) = body_noop {
             let noop_start = self.assembler.label();
             self.assembler.mark(noop_start);
-            self.assembler.set_location(self.source_location(range));
+            let (location, converted_pop_block) = match body_noop {
+                WithBodyExitNoop::Located(range) => (self.source_location(range), false),
+                WithBodyExitNoop::ConvertedPopBlock => (SourceLocation::NONE, true),
+            };
+            self.assembler.set_location(location);
             self.emit(NOP, 0, 0)?;
+            if converted_pop_block {
+                self.assembler.mark_last_as_converted_pop_block();
+            }
             let noop_end = self.assembler.label();
             self.assembler.mark(noop_end);
             self.control
@@ -5272,6 +5286,56 @@ impl Compiler {
         }
         self.emit(POP_TOP, 0, -1)
     }
+}
+
+// Mirrors the edges that `compile_jump_if` emits directly to its caller-provided target. The
+// converted with-body `POP_BLOCK` only retains a location when that target has one predecessor.
+fn condition_jump_target_count(expression: &Expr, jump_on: bool) -> usize {
+    if let Expr::UnaryOp(unary) = expression
+        && unary.op == UnaryOp::Not
+    {
+        return condition_jump_target_count(&unary.operand, !jump_on);
+    }
+    if let Expr::If(conditional) = expression
+        && let Some(truthiness) = early_condition_truthiness(&conditional.test)
+    {
+        return condition_jump_target_count(
+            if truthiness {
+                &conditional.body
+            } else {
+                &conditional.orelse
+            },
+            jump_on,
+        );
+    }
+    if let Some(truthiness) = jump_constant_truthiness(expression) {
+        return usize::from(truthiness == jump_on);
+    }
+    if let Expr::BoolOp(boolean) = expression {
+        let Some((last, leading)) = boolean.values.split_last() else {
+            return 0;
+        };
+        let short_circuit_jumps_to_target = matches!(boolean.op, BoolOp::Or) == jump_on;
+        if short_circuit_jumps_to_target {
+            return leading
+                .iter()
+                .chain(std::iter::once(last))
+                .map(|value| condition_jump_target_count(value, jump_on))
+                .sum();
+        }
+        return condition_jump_target_count(last, jump_on);
+    }
+    if let Expr::If(conditional) = expression {
+        return condition_jump_target_count(&conditional.body, jump_on)
+            + condition_jump_target_count(&conditional.orelse, jump_on);
+    }
+    if let Expr::Compare(comparison) = expression
+        && comparison.ops.len() > 1
+        && !jump_on
+    {
+        return 2;
+    }
+    1
 }
 
 pub(super) fn suite_terminates(body: &[Stmt]) -> bool {

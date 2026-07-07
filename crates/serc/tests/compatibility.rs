@@ -313,6 +313,12 @@ except Exception:
     }
 
     #[test]
+    fn matches_cpython_marshal_for_terminal_assertions_in_with_bodies() {
+        let source = "def simple(manager, condition):\n    with manager:\n        assert condition\n\ndef message(manager, condition):\n    with manager:\n        use()\n        assert condition, make_message()\n\ndef boolean(manager, first, second):\n    with manager:\n        assert first or second\n\ndef conjunction(manager, first, second):\n    with manager:\n        assert first and second\n\ndef conditional(manager, first, second, condition):\n    with manager:\n        assert first if condition else second\n\ndef constant_true():\n    with manager:\n        assert True\n\ndef constant_false():\n    with manager:\n        assert False\n\ndef followed(manager, condition):\n    with manager:\n        assert condition\n    use()\n\ndef same_line(manager, condition):\n    with manager: assert condition\n\ndef nested(outer, inner, condition):\n    try:\n        with outer:\n            with inner:\n                assert condition\n    finally:\n        cleanup()\n\nasync def asynchronous(manager, condition):\n    async with manager:\n        assert condition\n";
+        assert_matches_cpython_marshal(source, "with_assert.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_async_with_returns() {
         let source = "async def value(manager):\n    async with manager as result:\n        return result.value\n\nasync def constant(manager):\n    async with manager:\n        return 1\n\nasync def nested(outer, inner):\n    async with outer:\n        with inner:\n            return value\n";
         assert_matches_cpython_marshal(source, "async_with_return.py");
