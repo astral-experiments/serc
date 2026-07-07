@@ -39,7 +39,9 @@ The main path is:
 source
   -> normalization and Ruff parsing
   -> scope planning and AST lowering
-  -> symbolic instruction stream and assembler passes
+  -> symbolic instruction emission
+  -> CFG optimization and physical stack-size analysis
+  -> final bytecode and table layout
   -> CodeObject
   -> marshal object graph and writer
   -> optional timestamp-based .pyc header
@@ -51,9 +53,9 @@ Each stage has one primary owner:
 | ---------------------------------------------------------------------------- | ------------------ |
 | Public library API, input normalization, parser setup, `.pyc` header         | `src/lib.rs`       |
 | Filesystem CLI, source discovery, and timestamp-cache writes                 | `../serc_cli/`  |
-| Scope analysis, AST lowering, constants/names/locals, stack-depth accounting | `src/compiler.rs`, `src/compiler/` |
+| Scope analysis, AST lowering, constants/names/locals, logical emission-depth invariants | `src/compiler.rs`, `src/compiler/` |
 | Finished constant and code-object model                                      | `src/code_object.rs` |
-| Labels, control-flow rewrites, instruction layout, line and exception tables | `src/assembler/`   |
+| Labels, instruction policies/provenance, CFG rewrites, physical stack-size analysis, final layout | `src/assembler/` |
 | CPython IDs, widths, flags, stack metadata, version and provenance           | `src/target/`      |
 | Marshal equality/identity keys, reference graph, binary encoding             | `src/marshal/`     |
 
@@ -101,7 +103,8 @@ retained only where CPython source order is observable.
 
 `Compiler` then lowers the Ruff AST into symbolic `Instruction` values. At this point jumps still
 refer to `Label`s rather than byte offsets. The compiler also owns constant and name tables, local
-layout, exception-region declarations, source locations, and the logical operand-stack depth.
+layout, exception-region declarations, source locations, and a logical operand-stack depth used to
+check emission. That logical depth is not the code object's authoritative physical stack size.
 Nested functions, classes, comprehensions, and annotation thunks are recursively compiled into
 `Constant::Code` values.
 
@@ -115,6 +118,10 @@ Before assembly, `Compiler::finish_inner`:
 1. computes CPython local-kind bytes; and
 1. passes the symbolic stream to `Assembler::finish_code`.
 
+Compiler depth tracking ensures that lowering emits balanced instruction sequences and supplies
+depth provenance where exception setup edges require it. The assembler independently derives the
+physical maximum after optimization.
+
 `src/code_object.rs` owns the finished `Constant` and `CodeObject` model. It is a neutral leaf
 shared by the compiler and marshal layers, so binary encoding does not depend on compiler
 implementation details. The resulting `CodeObject` is the complete handwritten representation
@@ -122,21 +129,45 @@ consumed by the marshal layer.
 
 ### Assembler
 
-During lowering, the assembler collects a linear sequence of labels and symbolic instructions plus
-exception-region descriptions. `Assembler::finish_code` converts that builder stream once into a
-`BlockGraph`: an append-only arena of blocks, a separate emission-order vector, and a shared
-label-to-block index. `BasicBlockId` therefore remains stable when passes reorder blocks or append
-duplicated and synthetic blocks. Pass-local `ItemPosition` cursors may shift when a pass inserts or
-removes an item and must not escape that pass.
+The assembler pipeline has three ownership phases:
+
+1. `Assembler` is the compiler-facing emission builder. It owns the symbolic instruction stream,
+   labels, exception declarations, and compiler-time patching and constant-index operations.
+2. `OptimizationPipeline` owns the `BlockGraph` and is the only phase on which CFG and dataflow
+   passes are available.
+3. `LayoutAssembler` owns the flattened final order, resolves physical instruction widths, and
+   encodes bytecode, line tables, and exception tables.
+
+`Assembler::finish_code` consumes the builder into `OptimizationPipeline`, reusing a graph already
+prepared for constant reachability or constructing one from the linear stream. The `BlockGraph`
+uses an append-only block arena, a separate emission-order vector, and a shared label-to-block
+index. `BasicBlockId` therefore remains stable when passes reorder blocks or append duplicated and
+synthetic blocks. Pass-local `ItemPosition` cursors may shift when a pass inserts or removes an
+item and must not escape that pass. The phase types prevent CFG passes from running while the
+compiler can still emit or patch instructions, and prevent block-aware passes after flattening.
 
 The graph remains the owning representation through all control-flow and dataflow passes. Passes
 whose CPython block boundary rules are narrower than the structural graph use ordered position
 views without moving graph-owned items. Exit duplication allocates stable IDs for copied blocks,
 and cold-block collection changes only the emission order. The graph is flattened only after the
-last block-aware pass, immediately before jump-width convergence and final layout.
+last block-aware pass and physical stack-size analysis, immediately before jump-width convergence
+and final layout.
 
-An instruction carries its opcode, value or label operand, source location, optional
-post-instruction stack depth, and provenance flags used by later passes.
+An `Instruction` carries its opcode, typed `Operand`, source location, and optional compiler-depth
+provenance. Pass-sensitive semantics are represented by dedicated policy types and narrowly named
+provenance rather than a generic flag bag:
+
+- `LoadPolicy`, `NoLocationPolicy`, and `FusionPolicy` describe ownership, no-location handling,
+  and neighboring-instruction fusion constraints.
+- `JumpPolicy` and `RetainedJumpNop` describe threading, exit duplication, redundant removal, and
+  line-event preservation.
+- `ExceptionPolicy` describes exception-range exclusion and normalized exception ownership.
+- `BorrowFallthrough` and the converted-`POP_BLOCK` marker retain the remaining pass-specific
+  provenance.
+
+Constructors for emitted, synthetic, and fused instructions initialize or combine each policy
+according to its own semantics. A pass that replaces an instruction must therefore make an
+explicit policy decision instead of accidentally copying unrelated generic bits.
 
 `Assembler::finish_code` runs the following order. This is a compatibility contract, not a menu of
 independent optimizations.
@@ -167,10 +198,23 @@ Several dependencies are explicit in the implementation:
 
 - redundant-store and static-swap optimization must happen before superinstruction fusion;
 - borrowed-load conversion runs after the control-flow graph has its final shape;
-- instruction provenance flags must be deliberately preserved, combined, or cleared when a pass
-    replaces an instruction; and
+- instruction policies and provenance must be deliberately preserved, combined according to
+    their type-specific rules, or cleared when a pass replaces an instruction; and
 - source locations and exception ownership are observable output, even when an opcode becomes a
     `NOP` or is removed.
+
+After the final CFG optimization, `OptimizationPipeline::calculate_stack_size` traverses the final
+reachable graph. Target stack effects define each instruction's physical effect; ordinary jump and
+fallthrough edges define normal reachability. Exception regions add handler edges at their restored
+depths, while retained `ExceptionHandlerEntry` provenance preserves the original `SETUP_*` edge
+when optimization has collapsed the corresponding emitted region. The traversal rejects stack
+underflow and inconsistent block-entry depths.
+
+This result is the authoritative `CodeObject::stack_size`. The compiler's logical depth remains an
+emission invariant and limited source of setup-edge provenance; it is not a pre-optimization
+maximum used for the code object. When `OptimizationPipeline` is consumed, layout receives the
+stack analysis only as its computed scalar alongside the flattened items and table inputs—no
+compiler depth state or CFG depth map crosses into `LayoutAssembler`.
 
 Final layout repeatedly computes label positions and jump arguments over the flattened final order
 while accounting for inline caches and `EXTENDED_ARG`. It stops when every instruction's width is
