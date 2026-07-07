@@ -18,7 +18,6 @@ doctest = false
 workspace = true
 
 [dependencies]
-bitflags = { workspace = true }
 ruff_python_ast = { workspace = true }
 ruff_python_codegen = { workspace = true }
 ruff_python_literal = { workspace = true }

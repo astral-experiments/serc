@@ -50,6 +50,18 @@ pub(super) enum ComparisonMode {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ResumeDepth {
+    Zero,
+    One,
+}
+
+impl ResumeDepth {
+    const fn is_one(self) -> bool {
+        matches!(self, Self::One)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ReraiseStackState {
     /// Only the exception remains, as in comprehension and exception-group cleanup.
     ExceptionOnly,
@@ -926,9 +938,9 @@ impl Compiler {
     pub(super) fn emit_resume(
         &mut self,
         location: ResumeLocation,
-        depth_one: bool,
+        depth: ResumeDepth,
     ) -> Result<(), CompileError> {
-        self.emit(RESUME, location.at_depth(depth_one), 0)
+        self.emit(RESUME, location.at_depth(depth.is_one()), 0)
     }
 
     pub(super) fn emit_binary_operation(
