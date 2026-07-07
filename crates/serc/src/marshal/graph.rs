@@ -1,3 +1,5 @@
+use std::collections::hash_map::Entry;
+
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::compiler::{CodeObject, Constant};
@@ -32,89 +34,121 @@ pub(super) struct ObjectId(pub(super) usize);
 struct Object {
     count: usize,
     cached: bool,
+    interned: bool,
 }
 
 #[derive(Debug, Default)]
-pub(super) struct ObjectGraph {
-    objects: FxHashMap<ObjectKey, ObjectId>,
+pub(super) struct ObjectGraph<'a> {
+    objects: FxHashMap<ObjectKey<'a>, ObjectId>,
     objects_by_id: Vec<Object>,
     locations: FxHashMap<ObjectLocation, ObjectId>,
-    interned_strings: FxHashSet<String>,
 }
 
-impl ObjectGraph {
-    pub(super) fn for_code(code: &CodeObject) -> Self {
+impl<'a> ObjectGraph<'a> {
+    pub(super) fn for_code(code: &'a CodeObject) -> Self {
+        let mut explicitly_interned = FxHashSet::default();
+        collect_explicitly_interned(code, &mut explicitly_interned);
         let mut graph = Self::default();
-        graph.visit_code(code);
+        graph.visit_code(code, &explicitly_interned);
         graph
     }
 
     #[cfg(test)]
-    pub(super) fn record(&mut self, key: ObjectKey) -> bool {
-        self.record_object(key).1
+    pub(super) fn record(&mut self, key: ObjectKey<'a>) -> bool {
+        self.record_object(key, false).1
     }
 
-    fn record_at(&mut self, location: ObjectLocation, key: ObjectKey) -> bool {
-        let (id, first) = self.record_object(key);
+    fn record_at(&mut self, location: ObjectLocation, key: ObjectKey<'a>, interned: bool) -> bool {
+        let (id, first) = self.record_object(key, interned);
         if let Some(previous) = self.locations.insert(location, id) {
             debug_assert_eq!(previous, id, "object location changed identity");
         }
         first
     }
 
-    fn record_object(&mut self, key: ObjectKey) -> (ObjectId, bool) {
-        let cached = self.is_cached(&key);
-        if let Some(&id) = self.objects.get(&key) {
-            let object = &mut self.objects_by_id[id.0];
-            object.count += 1;
-            object.cached |= cached;
-            return (id, false);
+    fn record_object(&mut self, key: ObjectKey<'a>, interned: bool) -> (ObjectId, bool) {
+        let next_id = ObjectId(self.objects_by_id.len());
+        match self.objects.entry(key) {
+            Entry::Occupied(entry) => {
+                let cached = interned || Self::is_cached(entry.key());
+                let id = *entry.get();
+                let object = &mut self.objects_by_id[id.0];
+                object.count += 1;
+                object.cached |= cached;
+                object.interned |= interned;
+                (id, false)
+            }
+            Entry::Vacant(entry) => {
+                let cached = interned || Self::is_cached(entry.key());
+                entry.insert(next_id);
+                self.objects_by_id.push(Object {
+                    count: 1,
+                    cached,
+                    interned,
+                });
+                (next_id, true)
+            }
         }
-
-        let id = ObjectId(self.objects_by_id.len());
-        self.objects.insert(key, id);
-        self.objects_by_id.push(Object { count: 1, cached });
-        (id, true)
     }
 
-    fn visit_code(&mut self, code: &CodeObject) {
+    fn visit_code(&mut self, code: &'a CodeObject, explicitly_interned: &FxHashSet<&'a str>) {
         let address = std::ptr::from_ref(code).addr();
-        if !self.record_at(ObjectLocation::Code(address), code_key(code)) {
+        if !self.record_at(ObjectLocation::Code(address), code_key(code), false) {
             return;
         }
-        self.record_at(ObjectLocation::CodeBytes(address), code_bytes_key(code));
-        self.interned_strings
-            .extend(code.interned_constant_strings.iter().cloned());
-        self.visit_constants_tuple(&code.constants);
+        self.record_at(
+            ObjectLocation::CodeBytes(address),
+            code_bytes_key(code),
+            false,
+        );
+        self.visit_constants_tuple(&code.constants, explicitly_interned);
         self.visit_strings_tuple(&code.names);
         self.visit_locals_tuple(code);
-        self.record_at(ObjectLocation::LocalKinds(address), local_kinds_key(code));
+        self.record_at(
+            ObjectLocation::LocalKinds(address),
+            local_kinds_key(code),
+            false,
+        );
         self.visit_metadata_string(&code.filename);
         self.visit_metadata_string(&code.name);
         self.visit_metadata_string(&code.qualified_name);
         self.record_at(
             ObjectLocation::Bytes(code.line_table.as_ptr().addr()),
-            ObjectKey::Bytes(code.line_table.clone()),
+            ObjectKey::Bytes(&code.line_table),
+            false,
         );
         self.record_at(
             ObjectLocation::Bytes(code.exception_table.as_ptr().addr()),
-            ObjectKey::Bytes(code.exception_table.clone()),
+            ObjectKey::Bytes(&code.exception_table),
+            false,
         );
     }
 
-    fn visit_constants_tuple(&mut self, values: &[Constant]) {
+    fn visit_constants_tuple(
+        &mut self,
+        values: &'a [Constant],
+        explicitly_interned: &FxHashSet<&'a str>,
+    ) {
         let key = constants_tuple_key(values);
-        if !self.record_at(ObjectLocation::ConstantsTuple(values.as_ptr().addr()), key) {
+        if !self.record_at(
+            ObjectLocation::ConstantsTuple(values.as_ptr().addr()),
+            key,
+            false,
+        ) {
             return;
         }
         for value in values {
-            self.visit_constant(value);
+            self.visit_constant(value, explicitly_interned);
         }
     }
 
-    fn visit_strings_tuple(&mut self, values: &[String]) {
+    fn visit_strings_tuple(&mut self, values: &'a [String]) {
         let key = strings_tuple_key(values);
-        if !self.record_at(ObjectLocation::StringsTuple(values.as_ptr().addr()), key) {
+        if !self.record_at(
+            ObjectLocation::StringsTuple(values.as_ptr().addr()),
+            key,
+            false,
+        ) {
             return;
         }
         for value in values {
@@ -122,11 +156,12 @@ impl ObjectGraph {
         }
     }
 
-    fn visit_locals_tuple(&mut self, code: &CodeObject) {
+    fn visit_locals_tuple(&mut self, code: &'a CodeObject) {
         let key = locals_tuple_key(code);
         if !self.record_at(
             ObjectLocation::LocalsTuple(std::ptr::from_ref(code).addr()),
             key,
+            false,
         ) {
             return;
         }
@@ -135,82 +170,92 @@ impl ObjectGraph {
         }
     }
 
-    fn visit_metadata_string(&mut self, value: &str) {
-        self.interned_strings.insert(value.to_string());
+    fn visit_metadata_string(&mut self, value: &'a str) {
         self.record_at(
             ObjectLocation::MetadataString(value.as_ptr().addr()),
-            ObjectKey::String(value.to_string()),
+            ObjectKey::String(value),
+            true,
         );
     }
 
-    fn visit_constant(&mut self, value: &Constant) {
+    fn visit_constant(&mut self, value: &'a Constant, explicitly_interned: &FxHashSet<&'a str>) {
         let location = ObjectLocation::Constant(std::ptr::from_ref(value).addr());
         match value {
             Constant::None | Constant::Bool(_) | Constant::Ellipsis => {}
             Constant::Int(value) => {
-                self.record_at(location, ObjectKey::Int(*value));
+                self.record_at(location, ObjectKey::Int(*value), false);
             }
             Constant::SignedInt(value) => {
-                self.record_at(location, ObjectKey::SignedInt(*value));
+                self.record_at(location, ObjectKey::SignedInt(*value), false);
             }
             Constant::BigInt { negative, digits } => {
-                self.record_at(location, ObjectKey::BigInt(*negative, digits.clone()));
+                self.record_at(location, ObjectKey::BigInt(*negative, digits), false);
             }
             Constant::Float(value) => {
-                self.record_at(location, ObjectKey::Float(value.to_bits()));
+                self.record_at(location, ObjectKey::Float(value.to_bits()), false);
             }
             Constant::Complex { real, imag } => {
-                self.record_at(location, ObjectKey::Complex(real.to_bits(), imag.to_bits()));
+                self.record_at(
+                    location,
+                    ObjectKey::Complex(real.to_bits(), imag.to_bits()),
+                    false,
+                );
             }
             Constant::String(value) => {
-                if should_intern(value) {
-                    self.interned_strings.insert(value.clone());
-                }
-                self.record_at(location, ObjectKey::String(value.clone()));
+                self.record_at(
+                    location,
+                    ObjectKey::String(value),
+                    explicitly_interned.contains(value.as_str()) || should_intern(value),
+                );
             }
             Constant::SurrogateString(value) => {
-                self.record_at(location, ObjectKey::SurrogateString(value.clone()));
+                self.record_at(location, ObjectKey::SurrogateString(value), false);
             }
             Constant::Bytes(value) => {
-                self.record_at(location, ObjectKey::Bytes(value.clone()));
+                self.record_at(location, ObjectKey::Bytes(value), false);
             }
-            Constant::Tuple(values) => self.visit_constants_tuple(values),
+            Constant::Tuple(values) => self.visit_constants_tuple(values, explicitly_interned),
             Constant::FrozenSet(values) => {
                 let key = constant_key(value);
-                if self.record_at(location, key) {
+                if self.record_at(location, key, false) {
                     let mut values: Vec<_> = values.iter().collect();
                     values.sort_by_key(|value| constant_sort_key(value));
                     for value in values {
-                        self.visit_constant(value);
+                        self.visit_constant(value, explicitly_interned);
                     }
                 }
             }
             Constant::Slice { lower, upper, step } => {
                 let key = constant_key(value);
-                if self.record_at(location, key) {
-                    self.visit_slice_member(lower);
-                    self.visit_slice_member(upper);
-                    self.visit_slice_member(step);
+                if self.record_at(location, key, false) {
+                    self.visit_slice_member(lower, explicitly_interned);
+                    self.visit_slice_member(upper, explicitly_interned);
+                    self.visit_slice_member(step, explicitly_interned);
                 }
             }
-            Constant::Code(code) => self.visit_code(code),
+            Constant::Code(code) => self.visit_code(code, explicitly_interned),
         }
     }
 
-    fn visit_slice_member(&mut self, value: &Constant) {
+    fn visit_slice_member(
+        &mut self,
+        value: &'a Constant,
+        explicitly_interned: &FxHashSet<&'a str>,
+    ) {
         if slice_member_uses_identity(value) {
             let address = std::ptr::from_ref(value).addr();
             self.record_at(
                 ObjectLocation::SliceMember(address),
                 ObjectKey::SliceMember(address),
+                false,
             );
         } else {
-            self.visit_constant(value);
+            self.visit_constant(value, explicitly_interned);
         }
     }
 
     #[cfg(test)]
-    pub(super) fn is_shared(&self, key: &ObjectKey, force_reference: bool) -> bool {
+    pub(super) fn is_shared(&self, key: &ObjectKey<'a>, force_reference: bool) -> bool {
         if force_reference
             || self
                 .objects
@@ -219,14 +264,13 @@ impl ObjectGraph {
         {
             return true;
         }
-        self.is_cached(key)
+        Self::is_cached(key)
     }
 
-    fn is_cached(&self, key: &ObjectKey) -> bool {
+    fn is_cached(key: &ObjectKey<'_>) -> bool {
         match key {
             ObjectKey::Int(value) => *value <= 256,
             ObjectKey::SignedInt(value) => (-5..=256).contains(value),
-            ObjectKey::String(value) => self.interned_strings.contains(value),
             ObjectKey::Bytes(value) => value.len() <= 1,
             ObjectKey::EmptyTuple => true,
             _ => false,
@@ -288,7 +332,45 @@ impl ObjectGraph {
         self.object_at(ObjectLocation::StringsTuple(values.as_ptr().addr()))
     }
 
+    pub(super) fn is_interned_object(&self, id: ObjectId) -> bool {
+        self.objects_by_id[id.0].interned
+    }
+
+    #[cfg(test)]
     pub(super) fn is_interned(&self, value: &str) -> bool {
-        self.interned_strings.contains(value)
+        self.objects
+            .iter()
+            .find_map(|(key, id)| match key {
+                ObjectKey::String(string) if *string == value => Some(*id),
+                _ => None,
+            })
+            .is_some_and(|id| self.objects_by_id[id.0].interned)
+    }
+}
+
+fn collect_explicitly_interned<'a>(code: &'a CodeObject, strings: &mut FxHashSet<&'a str>) {
+    strings.extend(code.interned_constant_strings.iter().map(String::as_str));
+    for constant in &code.constants {
+        collect_nested_explicitly_interned(constant, strings);
+    }
+}
+
+fn collect_nested_explicitly_interned<'a>(
+    constant: &'a Constant,
+    strings: &mut FxHashSet<&'a str>,
+) {
+    match constant {
+        Constant::Tuple(values) | Constant::FrozenSet(values) => {
+            for value in values {
+                collect_nested_explicitly_interned(value, strings);
+            }
+        }
+        Constant::Slice { lower, upper, step } => {
+            collect_nested_explicitly_interned(lower, strings);
+            collect_nested_explicitly_interned(upper, strings);
+            collect_nested_explicitly_interned(step, strings);
+        }
+        Constant::Code(code) => collect_explicitly_interned(code, strings),
+        _ => {}
     }
 }

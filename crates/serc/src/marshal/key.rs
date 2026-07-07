@@ -8,22 +8,22 @@ use super::v5::{
 };
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(super) enum ObjectKey {
+pub(super) enum ObjectKey<'a> {
     // Scalar and immutable-container keys use Python value equality.
     None,
     Bool(bool),
     Ellipsis,
     Int(u64),
     SignedInt(i64),
-    BigInt(bool, Vec<u16>),
+    BigInt(bool, &'a [u16]),
     Float(u64),
     Complex(u64, u64),
-    String(String),
-    SurrogateString(Vec<u8>),
-    Bytes(Vec<u8>),
+    String(&'a str),
+    SurrogateString(&'a [u8]),
+    Bytes(&'a [u8]),
     ConstantTuple(Vec<Self>),
     FrozenSet(Vec<Self>),
-    StringTuple(Vec<String>),
+    StringTuple(Vec<&'a str>),
     // Annotation-scope locals retain identity even when their contents compare equal.
     AnnotationLocals(usize),
     // CPython reuses one canonical empty tuple.
@@ -37,17 +37,17 @@ pub(super) enum ObjectKey {
     LocalKinds(usize),
 }
 
-pub(super) fn code_key(code: &CodeObject) -> ObjectKey {
+pub(super) fn code_key(code: &CodeObject) -> ObjectKey<'_> {
     ObjectKey::Code(std::ptr::from_ref(code).addr())
 }
 
-pub(super) fn code_bytes_key(code: &CodeObject) -> ObjectKey {
+pub(super) fn code_bytes_key(code: &CodeObject) -> ObjectKey<'_> {
     ObjectKey::CodeBytes(std::ptr::from_ref(code).addr())
 }
 
-pub(super) fn local_kinds_key(code: &CodeObject) -> ObjectKey {
+pub(super) fn local_kinds_key(code: &CodeObject) -> ObjectKey<'_> {
     if code.local_kinds.is_empty() {
-        ObjectKey::Bytes(Vec::new())
+        ObjectKey::Bytes(&code.local_kinds)
     } else {
         ObjectKey::LocalKinds(std::ptr::from_ref(code).addr())
     }
@@ -73,19 +73,19 @@ pub(super) fn slice_member_uses_identity(value: &Constant) -> bool {
 }
 
 /// Builds the value key used for constants, except for code objects whose identity is significant.
-pub(super) fn constant_key(value: &Constant) -> ObjectKey {
+pub(super) fn constant_key(value: &Constant) -> ObjectKey<'_> {
     match value {
         Constant::None => ObjectKey::None,
         Constant::Bool(value) => ObjectKey::Bool(*value),
         Constant::Ellipsis => ObjectKey::Ellipsis,
         Constant::Int(value) => ObjectKey::Int(*value),
         Constant::SignedInt(value) => ObjectKey::SignedInt(*value),
-        Constant::BigInt { negative, digits } => ObjectKey::BigInt(*negative, digits.clone()),
+        Constant::BigInt { negative, digits } => ObjectKey::BigInt(*negative, digits),
         Constant::Float(value) => ObjectKey::Float(value.to_bits()),
         Constant::Complex { real, imag } => ObjectKey::Complex(real.to_bits(), imag.to_bits()),
-        Constant::String(value) => ObjectKey::String(value.clone()),
-        Constant::SurrogateString(value) => ObjectKey::SurrogateString(value.clone()),
-        Constant::Bytes(value) => ObjectKey::Bytes(value.clone()),
+        Constant::String(value) => ObjectKey::String(value),
+        Constant::SurrogateString(value) => ObjectKey::SurrogateString(value),
+        Constant::Bytes(value) => ObjectKey::Bytes(value),
         Constant::Tuple(values) => constants_tuple_key(values),
         Constant::FrozenSet(values) => {
             let mut values: Vec<_> = values.iter().map(constant_key).collect();
@@ -265,13 +265,13 @@ pub(super) fn constant_sort_key(value: &Constant) -> Vec<u8> {
     output
 }
 
-pub(super) fn constants_tuple_key(values: &[Constant]) -> ObjectKey {
+pub(super) fn constants_tuple_key(values: &[Constant]) -> ObjectKey<'_> {
     if values.is_empty() {
         ObjectKey::EmptyTuple
     } else if let Some(values) = values
         .iter()
         .map(|value| match value {
-            Constant::String(value) => Some(value.clone()),
+            Constant::String(value) => Some(value.as_str()),
             _ => None,
         })
         .collect::<Option<Vec<_>>>()
@@ -282,15 +282,15 @@ pub(super) fn constants_tuple_key(values: &[Constant]) -> ObjectKey {
     }
 }
 
-pub(super) fn strings_tuple_key(values: &[String]) -> ObjectKey {
+pub(super) fn strings_tuple_key(values: &[String]) -> ObjectKey<'_> {
     if values.is_empty() {
         ObjectKey::EmptyTuple
     } else {
-        ObjectKey::StringTuple(values.to_vec())
+        ObjectKey::StringTuple(values.iter().map(String::as_str).collect())
     }
 }
 
-pub(super) fn locals_tuple_key(code: &CodeObject) -> ObjectKey {
+pub(super) fn locals_tuple_key(code: &CodeObject) -> ObjectKey<'_> {
     if code.locals.is_empty() {
         ObjectKey::EmptyTuple
     } else if code.annotation_thunk {

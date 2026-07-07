@@ -22,14 +22,14 @@ pub(crate) fn encode_code(code: &CodeObject) -> Vec<u8> {
 }
 
 #[derive(Debug)]
-struct Writer<'a> {
-    graph: &'a ObjectGraph,
+struct Writer<'graph, 'code> {
+    graph: &'graph ObjectGraph<'code>,
     output: Vec<u8>,
     references: Vec<Option<u32>>,
     reference_count: usize,
 }
 
-impl Writer<'_> {
+impl Writer<'_, '_> {
     fn byte(&mut self, value: u8) {
         self.output.push(value);
     }
@@ -73,7 +73,7 @@ impl Writer<'_> {
     }
 
     fn string_with_object(&mut self, object: ObjectId, value: &str, force_reference: bool) {
-        let interned = self.graph.is_interned(value);
+        let interned = self.graph.is_interned_object(object);
         let Some(flag) = self.begin_object(object, force_reference || interned) else {
             return;
         };
