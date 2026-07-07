@@ -3,8 +3,8 @@ use crate::code_object::{CodeObject, Constant, LocalsIdentity, MarshalHints};
 use super::encode_code;
 use super::graph::ObjectGraph;
 use super::key::{
-    ObjectKey, code_bytes_key, code_key, constant_key, constant_sort_key, local_kinds_key,
-    locals_tuple_key, slice_member_uses_identity,
+    ObjectKey, code_bytes_key, code_key, constant_key, constant_sort_key, constants_tuple_key,
+    local_kinds_key, locals_tuple_key, slice_member_uses_identity, strings_tuple_key,
 };
 
 fn code_object(constants: Vec<Constant>) -> CodeObject {
@@ -105,6 +105,62 @@ fn keeps_identity_and_value_keys_separate() {
     assert_ne!(locals_tuple_key(&first), locals_tuple_key(&second));
     first.marshal_hints.locals_identity = LocalsIdentity::Fresh;
     assert_ne!(locals_tuple_key(&first), locals_tuple_key(&second));
+}
+
+#[test]
+fn borrowed_string_tuple_keys_compare_across_sources() {
+    let constants = vec![
+        Constant::String("alpha".to_string()),
+        Constant::String("beta".to_string()),
+    ];
+    let strings = vec!["alpha".to_string(), "beta".to_string()];
+    let constant_key = constants_tuple_key(&constants);
+    let string_key = strings_tuple_key(&strings);
+
+    assert_eq!(constant_key, string_key);
+
+    let mut graph = ObjectGraph::default();
+    assert!(graph.record(constant_key));
+    assert!(!graph.record(string_key));
+}
+
+#[test]
+fn borrowed_constant_tuple_keys_preserve_recursive_value_and_identity() {
+    let first = vec![
+        Constant::Tuple(vec![Constant::Int(1), Constant::Float(-0.0)]),
+        Constant::FrozenSet(vec![
+            Constant::String("value".to_string()),
+            Constant::SignedInt(-1),
+        ]),
+        Constant::Slice {
+            lower: Box::new(Constant::None),
+            upper: Box::new(Constant::Int(10)),
+            step: Box::new(Constant::Int(2)),
+        },
+    ];
+    let second = vec![
+        Constant::Tuple(vec![Constant::Int(1), Constant::Float(-0.0)]),
+        Constant::FrozenSet(vec![
+            Constant::SignedInt(-1),
+            Constant::String("value".to_string()),
+        ]),
+        Constant::Slice {
+            lower: Box::new(Constant::None),
+            upper: Box::new(Constant::Int(10)),
+            step: Box::new(Constant::Int(2)),
+        },
+    ];
+
+    let mut graph = ObjectGraph::default();
+    assert!(graph.record(constants_tuple_key(&first)));
+    assert!(!graph.record(constants_tuple_key(&second)));
+
+    let first_code = vec![Constant::Code(Box::new(code_object(Vec::new())))];
+    let second_code = vec![Constant::Code(Box::new(code_object(Vec::new())))];
+    assert_ne!(
+        constants_tuple_key(&first_code),
+        constants_tuple_key(&second_code)
+    );
 }
 
 #[test]

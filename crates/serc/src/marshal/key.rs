@@ -1,3 +1,6 @@
+use std::cmp::Ordering;
+use std::hash::{Hash, Hasher};
+
 use crate::code_object::{CodeObject, Constant, LocalsIdentity};
 
 use super::v5::{
@@ -21,9 +24,9 @@ pub(super) enum ObjectKey<'a> {
     String(&'a str),
     SurrogateString(&'a [u8]),
     Bytes(&'a [u8]),
-    ConstantTuple(Vec<Self>),
+    ConstantTuple(ConstantTupleKey<'a>),
     FrozenSet(Vec<Self>),
-    StringTuple(Vec<&'a str>),
+    StringTuple(StringTupleKey<'a>),
     // Annotation-scope locals retain identity even when their contents compare equal.
     AnnotationLocals(usize),
     // CPython reuses one canonical empty tuple.
@@ -35,6 +38,280 @@ pub(super) enum ObjectKey<'a> {
     Code(usize),
     CodeBytes(usize),
     LocalKinds(usize),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ConstantTupleKey<'a>(&'a [Constant]);
+
+impl PartialEq for ConstantTupleKey<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.len() == other.0.len()
+            && self
+                .0
+                .iter()
+                .zip(other.0)
+                .all(|(left, right)| constants_equal(left, right))
+    }
+}
+
+impl Eq for ConstantTupleKey<'_> {}
+
+impl Hash for ConstantTupleKey<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.len().hash(state);
+        for value in self.0 {
+            hash_constant(value, state);
+        }
+    }
+}
+
+impl PartialOrd for ConstantTupleKey<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ConstantTupleKey<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0
+            .iter()
+            .map(constant_key)
+            .cmp(other.0.iter().map(constant_key))
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct StringTupleKey<'a>(StringTupleKind<'a>);
+
+#[derive(Clone, Copy, Debug)]
+enum StringTupleKind<'a> {
+    Constants(&'a [Constant]),
+    Strings(&'a [String]),
+}
+
+impl<'a> StringTupleKey<'a> {
+    fn constants(values: &'a [Constant]) -> Self {
+        debug_assert!(
+            values
+                .iter()
+                .all(|value| matches!(value, Constant::String(_)))
+        );
+        Self(StringTupleKind::Constants(values))
+    }
+
+    fn strings(values: &'a [String]) -> Self {
+        Self(StringTupleKind::Strings(values))
+    }
+}
+
+impl PartialEq for StringTupleKey<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        match (self.0, other.0) {
+            (StringTupleKind::Constants(left), StringTupleKind::Constants(right)) => {
+                left.len() == right.len()
+                    && left
+                        .iter()
+                        .zip(right)
+                        .all(|(left, right)| constant_string(left) == constant_string(right))
+            }
+            (StringTupleKind::Constants(left), StringTupleKind::Strings(right)) => {
+                left.len() == right.len()
+                    && left
+                        .iter()
+                        .zip(right)
+                        .all(|(left, right)| constant_string(left) == right)
+            }
+            (StringTupleKind::Strings(left), StringTupleKind::Constants(right)) => {
+                left.len() == right.len()
+                    && left
+                        .iter()
+                        .zip(right)
+                        .all(|(left, right)| left == constant_string(right))
+            }
+            (StringTupleKind::Strings(left), StringTupleKind::Strings(right)) => left == right,
+        }
+    }
+}
+
+impl Eq for StringTupleKey<'_> {}
+
+impl Hash for StringTupleKey<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self.0 {
+            StringTupleKind::Constants(values) => {
+                values.len().hash(state);
+                for value in values {
+                    constant_string(value).hash(state);
+                }
+            }
+            StringTupleKind::Strings(values) => values.hash(state),
+        }
+    }
+}
+
+impl PartialOrd for StringTupleKey<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for StringTupleKey<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (self.0, other.0) {
+            (StringTupleKind::Constants(left), StringTupleKind::Constants(right)) => left
+                .iter()
+                .map(constant_string)
+                .cmp(right.iter().map(constant_string)),
+            (StringTupleKind::Constants(left), StringTupleKind::Strings(right)) => left
+                .iter()
+                .map(constant_string)
+                .cmp(right.iter().map(String::as_str)),
+            (StringTupleKind::Strings(left), StringTupleKind::Constants(right)) => left
+                .iter()
+                .map(String::as_str)
+                .cmp(right.iter().map(constant_string)),
+            (StringTupleKind::Strings(left), StringTupleKind::Strings(right)) => left.cmp(right),
+        }
+    }
+}
+
+fn constant_string(value: &Constant) -> &str {
+    let Constant::String(value) = value else {
+        unreachable!("string tuple contains a non-string constant");
+    };
+    value
+}
+
+fn constants_equal(left: &Constant, right: &Constant) -> bool {
+    match (left, right) {
+        (Constant::None, Constant::None) | (Constant::Ellipsis, Constant::Ellipsis) => true,
+        (Constant::Bool(left), Constant::Bool(right)) => left == right,
+        (Constant::Int(left), Constant::Int(right)) => left == right,
+        (Constant::SignedInt(left), Constant::SignedInt(right)) => left == right,
+        (
+            Constant::BigInt {
+                negative: left_negative,
+                digits: left_digits,
+            },
+            Constant::BigInt {
+                negative: right_negative,
+                digits: right_digits,
+            },
+        ) => left_negative == right_negative && left_digits == right_digits,
+        (Constant::Float(left), Constant::Float(right)) => left.to_bits() == right.to_bits(),
+        (
+            Constant::Complex {
+                real: left_real,
+                imag: left_imag,
+            },
+            Constant::Complex {
+                real: right_real,
+                imag: right_imag,
+            },
+        ) => {
+            left_real.to_bits() == right_real.to_bits()
+                && left_imag.to_bits() == right_imag.to_bits()
+        }
+        (Constant::String(left), Constant::String(right)) => left == right,
+        (Constant::SurrogateString(left), Constant::SurrogateString(right)) => left == right,
+        (Constant::Bytes(left), Constant::Bytes(right)) => left == right,
+        (Constant::Tuple(left), Constant::Tuple(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|(left, right)| constants_equal(left, right))
+        }
+        (Constant::FrozenSet(_), Constant::FrozenSet(_)) => {
+            constant_key(left) == constant_key(right)
+        }
+        (
+            Constant::Slice {
+                lower: left_lower,
+                upper: left_upper,
+                step: left_step,
+            },
+            Constant::Slice {
+                lower: right_lower,
+                upper: right_upper,
+                step: right_step,
+            },
+        ) => {
+            constants_equal(left_lower, right_lower)
+                && constants_equal(left_upper, right_upper)
+                && constants_equal(left_step, right_step)
+        }
+        (Constant::Code(left), Constant::Code(right)) => {
+            std::ptr::eq(left.as_ref(), right.as_ref())
+        }
+        (_, _) => false,
+    }
+}
+
+fn hash_constant<H: Hasher>(value: &Constant, state: &mut H) {
+    match value {
+        Constant::None => 0_u8.hash(state),
+        Constant::Bool(value) => {
+            1_u8.hash(state);
+            value.hash(state);
+        }
+        Constant::Ellipsis => 2_u8.hash(state),
+        Constant::Int(value) => {
+            3_u8.hash(state);
+            value.hash(state);
+        }
+        Constant::SignedInt(value) => {
+            4_u8.hash(state);
+            value.hash(state);
+        }
+        Constant::BigInt { negative, digits } => {
+            5_u8.hash(state);
+            negative.hash(state);
+            digits.hash(state);
+        }
+        Constant::Float(value) => {
+            6_u8.hash(state);
+            value.to_bits().hash(state);
+        }
+        Constant::Complex { real, imag } => {
+            7_u8.hash(state);
+            real.to_bits().hash(state);
+            imag.to_bits().hash(state);
+        }
+        Constant::String(value) => {
+            8_u8.hash(state);
+            value.hash(state);
+        }
+        Constant::SurrogateString(value) => {
+            9_u8.hash(state);
+            value.hash(state);
+        }
+        Constant::Bytes(value) => {
+            10_u8.hash(state);
+            value.hash(state);
+        }
+        Constant::Tuple(values) => {
+            11_u8.hash(state);
+            values.len().hash(state);
+            for value in values {
+                hash_constant(value, state);
+            }
+        }
+        Constant::FrozenSet(_) => {
+            12_u8.hash(state);
+            constant_key(value).hash(state);
+        }
+        Constant::Slice { lower, upper, step } => {
+            13_u8.hash(state);
+            hash_constant(lower, state);
+            hash_constant(upper, state);
+            hash_constant(step, state);
+        }
+        Constant::Code(code) => {
+            14_u8.hash(state);
+            std::ptr::from_ref(code.as_ref()).addr().hash(state);
+        }
+    }
 }
 
 pub(super) fn code_key(code: &CodeObject) -> ObjectKey<'_> {
@@ -280,17 +557,13 @@ pub(super) fn frozen_set_members_in_wire_order(values: &[Constant]) -> Vec<(Vec<
 pub(super) fn constants_tuple_key(values: &[Constant]) -> ObjectKey<'_> {
     if values.is_empty() {
         ObjectKey::EmptyTuple
-    } else if let Some(values) = values
+    } else if values
         .iter()
-        .map(|value| match value {
-            Constant::String(value) => Some(value.as_str()),
-            _ => None,
-        })
-        .collect::<Option<Vec<_>>>()
+        .all(|value| matches!(value, Constant::String(_)))
     {
-        ObjectKey::StringTuple(values)
+        ObjectKey::StringTuple(StringTupleKey::constants(values))
     } else {
-        ObjectKey::ConstantTuple(values.iter().map(constant_key).collect())
+        ObjectKey::ConstantTuple(ConstantTupleKey(values))
     }
 }
 
@@ -298,7 +571,7 @@ pub(super) fn strings_tuple_key(values: &[String]) -> ObjectKey<'_> {
     if values.is_empty() {
         ObjectKey::EmptyTuple
     } else {
-        ObjectKey::StringTuple(values.iter().map(String::as_str).collect())
+        ObjectKey::StringTuple(StringTupleKey::strings(values))
     }
 }
 
