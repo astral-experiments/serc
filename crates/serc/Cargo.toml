@@ -32,4 +32,5 @@ walkdir = { workspace = true }
 
 [dev-dependencies]
 cpu-time = { workspace = true }
+serc_workloads = { workspace = true }
 rayon = { workspace = true }

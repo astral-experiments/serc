@@ -1,0 +1,19 @@
+[package]
+name = "serc_workloads"
+version = "0.0.0"
+publish = false
+description = "Shared source workloads for Serc compatibility tests and benchmarks"
+edition = { workspace = true }
+rust-version = { workspace = true }
+homepage = { workspace = true }
+repository = { workspace = true }
+authors = { workspace = true }
+license = { workspace = true }
+
+[lib]
+bench = false
+test = false
+doctest = false
+
+[lints]
+workspace = true
