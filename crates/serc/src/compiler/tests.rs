@@ -1,11 +1,14 @@
 use ruff_python_ast::token::TokenKind;
-use ruff_python_ast::{Expr, Stmt};
+use ruff_python_ast::{Expr, Stmt, StringLike};
 use ruff_python_parser::parse_module;
 use ruff_text_size::Ranged;
 
 use crate::assembler::SourceLocation;
 
-use super::{Compiler, Constant, FunctionPlan, NameId, NameInterner, ScopeBodyFacts, clean_doc};
+use super::{
+    Compiler, Constant, FunctionPlan, NameId, NameInterner, ScopeBodyFacts, clean_doc,
+    interpolated_string_content_range,
+};
 
 #[test]
 fn interns_adversarial_identifier_families_densely() {
@@ -312,6 +315,52 @@ fn generator_expression_ranges_follow_parser_tokens() {
         };
         let compiler = Compiler::module("example.py", source, parsed.tokens().clone());
         let range = compiler.generator_expression_range(generator);
+        let expected_start = source.find(expected).unwrap();
+        let actual_start = usize::from(range.start());
+        let actual_end = usize::from(range.end());
+
+        assert_eq!(actual_start, expected_start);
+        assert_eq!(actual_end, expected_start + expected.len());
+        assert_eq!(&source[actual_start..actual_end], expected);
+    }
+}
+
+#[test]
+fn interpolated_string_content_ranges_follow_ast_parts() {
+    for (source, expected) in [
+        (
+            r"value = rf'raw\path {item}'
+",
+            r"raw\path {item}",
+        ),
+        (
+            "value = f'''first\n{item!r}\n# literal\nlast'''\n",
+            "first\n{item!r}\n# literal\nlast",
+        ),
+        (
+            r#"value = r'left' f"middle {item}" '''right'''
+"#,
+            r#"left' f"middle {item}" '''right"#,
+        ),
+        (
+            "value = t'left' tr\"\"\"right {item}\n# literal\"\"\"\n",
+            "left' tr\"\"\"right {item}\n# literal",
+        ),
+        (
+            "value = f\"\"\"start {(\n    {'}': nested['{']}  # expression comment\n)} end\"\"\"\n",
+            "start {(\n    {'}': nested['{']}  # expression comment\n)} end",
+        ),
+    ] {
+        let parsed = parse_module(source).unwrap();
+        let Stmt::Assign(assignment) = &parsed.suite()[0] else {
+            panic!("expected an assignment");
+        };
+        let string = match assignment.value.as_ref() {
+            Expr::FString(fstring) => StringLike::FString(fstring),
+            Expr::TString(tstring) => StringLike::TString(tstring),
+            expression => panic!("expected an interpolated string, got {expression:?}"),
+        };
+        let range = interpolated_string_content_range(string);
         let expected_start = source.find(expected).unwrap();
         let actual_start = usize::from(range.start());
         let actual_end = usize::from(range.end());

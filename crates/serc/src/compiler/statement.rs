@@ -376,7 +376,7 @@ impl Compiler {
                     self.record_folded_value(&expression.value)?;
                 }
                 let range = if let Expr::FString(fstring) = expression.value.as_ref() {
-                    self.fstring_result_range(fstring)
+                    Self::fstring_result_range(fstring)
                 } else {
                     statement.range()
                 };
@@ -1233,7 +1233,7 @@ impl Compiler {
                         Expr::Named(named) => named.target.range(),
                         Expr::Attribute(attribute) => self.attribute_opcode_range(attribute),
                         Expr::Call(call) => self.call_opcode_range(call),
-                        Expr::FString(fstring) => self.fstring_result_range(fstring),
+                        Expr::FString(fstring) => Self::fstring_result_range(fstring),
                         expression => expression.range(),
                     };
                     if matches!(expression.value.as_ref(), Expr::BinOp(binary) if optimized_percent_format(binary).is_some())
