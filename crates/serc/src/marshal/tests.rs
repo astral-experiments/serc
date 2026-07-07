@@ -5,8 +5,8 @@ use crate::compiler::{CodeObject, Constant};
 use super::encode_code;
 use super::graph::ObjectGraph;
 use super::key::{
-    ObjectKey, code_bytes_key, code_key, constant_key, local_kinds_key, locals_tuple_key,
-    slice_member_uses_identity,
+    ObjectKey, code_bytes_key, code_key, constant_key, constant_sort_key, local_kinds_key,
+    locals_tuple_key, slice_member_uses_identity,
 };
 use super::plan::PlannedValue;
 
@@ -276,4 +276,26 @@ fn marshal_plan_preserves_force_mode_and_slice_member_identity() {
     assert!(!entry_for(slices[0].0).force_reference);
     assert_ne!(entry_for(slices[0].0).object, entry_for(slices[1].0).object);
     assert_eq!(entry_for(slices[0].1).object, entry_for(slices[1].1).object);
+}
+
+#[test]
+fn nested_frozen_set_wire_order_uses_recursive_member_keys() {
+    let first_nested = Constant::FrozenSet(vec![
+        Constant::Int(1),
+        Constant::String("alpha".to_string()),
+    ]);
+    let second_nested =
+        Constant::FrozenSet(vec![Constant::Int(2), Constant::String("beta".to_string())]);
+    assert_ne!(
+        constant_sort_key(&first_nested),
+        constant_sort_key(&second_nested)
+    );
+
+    let first = code_object(vec![Constant::FrozenSet(vec![
+        first_nested.clone(),
+        second_nested.clone(),
+    ])]);
+    let second = code_object(vec![Constant::FrozenSet(vec![second_nested, first_nested])]);
+
+    assert_eq!(encode_code(&first), encode_code(&second));
 }

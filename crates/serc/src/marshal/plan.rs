@@ -1,9 +1,9 @@
 use crate::compiler::{CodeObject, Constant};
 
 use super::key::{
-    ObjectKey, code_bytes_key, code_key, constant_key, constant_sort_key, constants_tuple_key,
-    local_kinds_key, locals_tuple_key, should_intern, slice_member_uses_identity,
-    strings_tuple_key,
+    ObjectKey, code_bytes_key, code_key, constant_key, constants_tuple_key,
+    frozen_set_members_in_wire_order, local_kinds_key, locals_tuple_key, should_intern,
+    slice_member_uses_identity, strings_tuple_key,
 };
 
 // Equal value keys share an ID; identity-based keys remain distinct exactly as `ObjectKey` does.
@@ -193,9 +193,7 @@ where
             Constant::FrozenSet(values) => {
                 let (index, descend) = self.begin(PlannedValue::Constant(value), force_reference);
                 if descend {
-                    let mut values: Vec<_> = values.iter().collect();
-                    values.sort_by_key(|value| constant_sort_key(value));
-                    for value in values {
+                    for (_, value) in frozen_set_members_in_wire_order(values) {
                         self.push_constant(value, true);
                     }
                 }
