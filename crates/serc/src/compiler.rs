@@ -12,7 +12,7 @@ use ruff_python_ast::{
 };
 use ruff_python_codegen::{Generator, Indentation, Mode as CodegenMode};
 use ruff_source_file::{LineEnding, LineIndex};
-use ruff_text_size::{Ranged, TextSize};
+use ruff_text_size::{Ranged, TextLen, TextSize};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 type HashMap<K, V> = FxHashMap<K, V>;

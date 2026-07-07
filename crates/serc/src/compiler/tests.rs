@@ -7,7 +7,7 @@ use crate::assembler::SourceLocation;
 
 use super::{
     Compiler, Constant, FunctionPlan, NameId, NameInterner, ScopeBodyFacts, clean_doc,
-    interpolated_string_content_range,
+    debug_text_range, interpolated_string_content_range, strip_expression_comments,
 };
 
 #[test]
@@ -368,6 +368,101 @@ fn interpolated_string_content_ranges_follow_ast_parts() {
         assert_eq!(actual_start, expected_start);
         assert_eq!(actual_end, expected_start + expected.len());
         assert_eq!(&source[actual_start..actual_end], expected);
+    }
+}
+
+#[test]
+fn debug_text_ranges_follow_ast_text_and_marker_tokens() {
+    fn first_interpolation(expression: &Expr) -> &ruff_python_ast::InterpolatedElement {
+        match expression {
+            Expr::FString(fstring) => fstring
+                .value
+                .elements()
+                .find_map(|element| element.as_interpolation()),
+            Expr::TString(tstring) => tstring
+                .value
+                .elements()
+                .find_map(|element| element.as_interpolation()),
+            expression => panic!("expected an interpolated string, got {expression:?}"),
+        }
+        .expect("expected a debug interpolation")
+    }
+
+    for (source, expected_debug, expected_expression) in [
+        (
+            "value = f\"{  item   =   !r}\"\n",
+            "  item   =   ",
+            "  item   ",
+        ),
+        (
+            "value = t\"\"\"{(\n    mapping[\"=\"]  # = inside comment\n)   =   :>{width}}\"\"\"\n",
+            "(\n    mapping[\"=\"]  # = inside comment\n)   =   ",
+            "(\n    mapping[\"=\"]  # = inside comment\n)   ",
+        ),
+        (
+            "value = t\"\"\"{f\"{item=} = literal\" = !s:^10}\"\"\"\n",
+            "f\"{item=} = literal\" = ",
+            "f\"{item=} = literal\" ",
+        ),
+        (
+            "value = f\"\"\"{item=  # after marker\n}\"\"\"\n",
+            "item=  # after marker\n",
+            "item",
+        ),
+    ] {
+        let parsed = parse_module(source).unwrap();
+        let Stmt::Assign(assignment) = &parsed.suite()[0] else {
+            panic!("expected an assignment");
+        };
+        let interpolation = first_interpolation(&assignment.value);
+        let compiler = Compiler::module("example.py", source, parsed.tokens().clone());
+        let debug_range = debug_text_range(interpolation);
+        let expression_range = compiler.debug_expression_source_range(interpolation);
+
+        assert_eq!(
+            &source[usize::from(debug_range.start())..usize::from(debug_range.end())],
+            expected_debug,
+        );
+        assert_eq!(
+            interpolation.debug_text.as_ref().unwrap().as_str(),
+            expected_debug,
+        );
+        assert_eq!(
+            &source[usize::from(expression_range.start())..usize::from(expression_range.end())],
+            expected_expression,
+        );
+    }
+}
+
+#[test]
+fn expression_comment_stripping_uses_ruff_comment_tokens() {
+    for (source, expected) in [
+        (
+            "(r'# raw', R\"# raw double\", b'# bytes', rb'# raw bytes', u'# unicode', '# single', \"# double\", '''# triple''', \"\"\"# triple double\"\"\")  # remove\r\nnext",
+            "(r'# raw', R\"# raw double\", b'# bytes', rb'# raw bytes', u'# unicode', '# single', \"# double\", '''# triple''', \"\"\"# triple double\"\"\")  \r\nnext",
+        ),
+        (
+            "\"escaped \\\" # string\" + '\\\\ # string'  # remove\nvalue",
+            "\"escaped \\\" # string\" + '\\\\ # string'  \nvalue",
+        ),
+        (
+            "f\"\"\"outer # {\n    f'inner # {value}'  # nested comment\n} tail #\"\"\"  # remove\n",
+            "f\"\"\"outer # {\n    f'inner # {value}'  # nested comment\n} tail #\"\"\"  \n",
+        ),
+        (
+            "rf\"literal # {value}\" + tr'''template # {value}'''  # remove\n",
+            "rf\"literal # {value}\" + tr'''template # {value}'''  \n",
+        ),
+        (
+            "  call('#')  # generated comment\r\n =   # trailing debug comment\r\n",
+            "  call('#')  \r\n =   \r\n",
+        ),
+        (
+            "value  # first\n    # own line\nother  # last",
+            "value  \n    \nother  ",
+        ),
+    ] {
+        assert_eq!(strip_expression_comments(source), expected, "{source:?}");
     }
 }
 
