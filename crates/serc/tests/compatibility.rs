@@ -590,6 +590,36 @@ class Shadowed:
     }
 
     #[test]
+    fn matches_cpython_marshal_for_captured_implicit_super_receivers() {
+        let source = r"class Base:
+    def method(self):
+        pass
+
+
+class Child(Base):
+    def captured_self(self):
+        def capture():
+            return self
+        return super().method()
+
+    @classmethod
+    def captured_cls(cls):
+        def capture():
+            return cls
+        return super().method()
+
+    def ordinary(self):
+        return super().method()
+
+    def explicit(self):
+        def capture():
+            return self
+        return super(Child, self).method()
+";
+        assert_matches_cpython_marshal(source, "captured_super.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_multiline_super_method_arguments() {
         let source = "class Base:\n    pass\n\nclass Child(Base):\n    def implicit(self, value):\n        return super().method(\n            value\n        )\n\n    def explicit(self, value):\n        return super(Child, self).method(\n            value\n        )\n\n    def keyword(self, value):\n        return super().method(\n            option=value,\n        )\n\n    def split_super(self, value):\n        return super(\n        ).method(\n            value,\n        )\n\n    def multiline_attribute(self):\n        return super().\\\n            value\n";
         assert_matches_cpython_marshal(source, "super_method_lines.py");

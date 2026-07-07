@@ -1969,25 +1969,26 @@ impl Compiler {
         if self.unit.arg_count == 0 {
             return Ok(SpecializedLowering::NotApplicable);
         }
-        let (class_index, first_parameter) = match &self.unit.scope {
+        let (class_index, first_parameter, first_parameter_is_cell) = match &self.unit.scope {
             Scope::Function {
                 indices,
                 free_indices,
+                cells,
                 globals,
-                ..
             } if self.contains_name(globals, "super")
                 && self.scope_index(indices, "super").is_none() =>
             {
                 let Some(class_index) = self.scope_index(free_indices, "__class__") else {
                     return Ok(SpecializedLowering::NotApplicable);
                 };
-                let Some(first_parameter) = self.symbols.locals.first().copied() else {
+                let Some(first_parameter_name) = self.symbols.locals.first().copied() else {
                     return Ok(SpecializedLowering::NotApplicable);
                 };
-                let Some(first_parameter) = indices.get(&first_parameter).copied() else {
+                let first_parameter_is_cell = cells.contains(first_parameter_name);
+                let Some(first_parameter) = indices.get(&first_parameter_name).copied() else {
                     return Ok(SpecializedLowering::NotApplicable);
                 };
-                (class_index, first_parameter)
+                (class_index, first_parameter, first_parameter_is_cell)
             }
             _ => return Ok(SpecializedLowering::NotApplicable),
         };
@@ -1999,7 +2000,12 @@ impl Compiler {
         self.assembler
             .set_location(self.source_location(call.range));
         self.emit(LOAD_DEREF, class_index, 1)?;
-        self.emit(LOAD_FAST, first_parameter, 1)?;
+        let receiver_opcode = if first_parameter_is_cell {
+            LOAD_DEREF
+        } else {
+            LOAD_FAST
+        };
+        self.emit(receiver_opcode, first_parameter, 1)?;
         self.assembler
             .set_location(self.source_location(attribute.range));
         let attribute_index = self.name_index(attribute.attr.as_str())?;
