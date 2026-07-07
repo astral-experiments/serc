@@ -512,6 +512,7 @@ pub(super) struct LayoutAssembler {
     pub(super) exception_regions: Vec<ExceptionRegion>,
     pub(super) preserved_block_boundaries: FxHashSet<Label>,
     pub(super) removed_max_depth: Option<u32>,
+    pub(super) next_label: u32,
 }
 
 #[derive(Clone, Copy, Debug)]

@@ -1,4 +1,4 @@
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashSet;
 
 use super::{
     EXTENDED_ARG, Item, LOAD_FAST_BORROW_LOAD_FAST_BORROW, LOAD_FAST_LOAD_FAST, LOAD_GLOBAL,
@@ -14,24 +14,24 @@ impl LayoutAssembler {
     pub(in crate::assembler) fn exception_table(
         &self,
         extended_args: &[u8],
+        labels: &[Option<u32>],
     ) -> Result<Vec<u8>, CompileError> {
         if self.exception_regions.is_empty() {
             return Ok(Vec::new());
         }
 
-        let (positions, labels) = self.positions(extended_args);
         let regions = self
             .exception_regions
             .iter()
             .enumerate()
             .map(|(index, region)| {
-                let start = *labels.get(&region.start).ok_or_else(|| {
+                let start = label_position(labels, region.start).ok_or_else(|| {
                     CompileError::Internal("unbound exception region start".to_string())
                 })?;
-                let end = *labels.get(&region.end).ok_or_else(|| {
+                let end = label_position(labels, region.end).ok_or_else(|| {
                     CompileError::Internal("unbound exception region end".to_string())
                 })?;
-                let target = *labels.get(&region.target).ok_or_else(|| {
+                let target = label_position(labels, region.target).ok_or_else(|| {
                     CompileError::Internal("unbound exception handler target".to_string())
                 })?;
                 Ok((
@@ -44,31 +44,7 @@ impl LayoutAssembler {
                 ))
             })
             .collect::<Result<Vec<_>, CompileError>>()?;
-        let mut late_exception_exclusions = self
-            .items
-            .iter()
-            .filter_map(|item| {
-                let Item::Instruction(instruction) = item else {
-                    return None;
-                };
-                Some(instruction)
-            })
-            .zip(&positions)
-            .zip(extended_args)
-            .filter_map(|((instruction, position), extended)| {
-                instruction
-                    .exception_policy
-                    .exclusion
-                    .applies(*extended)
-                    .then_some((
-                        *position,
-                        *position
-                            + u32::from(*extended)
-                            + 1
-                            + u32::from(instruction.opcode.caches()),
-                    ))
-            })
-            .collect::<Vec<_>>();
+        let mut late_exception_exclusions = Vec::new();
         let mut block_labels = self.preserved_block_boundaries.clone();
         let mut setup_labels = FxHashSet::default();
         for region in &self.exception_regions {
@@ -84,6 +60,7 @@ impl LayoutAssembler {
                 block_labels.insert(*label);
             }
         }
+        let mut position = 0;
         let mut instruction_index = 0;
         let mut block_has_instruction = false;
         let mut block_has_stale_exception_owner = false;
@@ -99,18 +76,22 @@ impl LayoutAssembler {
                     }
                 }
                 Item::Instruction(instruction) => {
+                    let end = position
+                        + u32::from(extended_args[instruction_index])
+                        + 1
+                        + u32::from(instruction.opcode.caches());
+                    if instruction
+                        .exception_policy
+                        .exclusion
+                        .applies(extended_args[instruction_index])
+                    {
+                        late_exception_exclusions.push((position, end));
+                    }
                     if instruction.exception_policy.normalized_owner
                         == NormalizedExceptionOwner::Absent
                         && !block_has_stale_exception_owner
                     {
-                        let position = positions[instruction_index];
-                        late_exception_exclusions.push((
-                            position,
-                            position
-                                + u32::from(extended_args[instruction_index])
-                                + 1
-                                + u32::from(instruction.opcode.caches()),
-                        ));
+                        late_exception_exclusions.push((position, end));
                     }
                     if matches!(
                         instruction.opcode,
@@ -124,6 +105,7 @@ impl LayoutAssembler {
                     ) {
                         block_has_stale_exception_owner = true;
                     }
+                    position = end;
                     instruction_index += 1;
                     block_has_instruction = true;
                     if instruction.opcode == NOT_TAKEN
@@ -188,7 +170,7 @@ impl LayoutAssembler {
             }
         }
 
-        let mut output = Vec::new();
+        let mut output = Vec::with_capacity(flattened.len().saturating_mul(8));
         for (start, end, target, depth, preserve_lasti) in flattened {
             write_exception_varint(&mut output, start, true);
             write_exception_varint(&mut output, end - start, false);
@@ -203,7 +185,9 @@ impl LayoutAssembler {
         extended_args: &[u8],
         first_line_number: u32,
     ) -> Vec<u8> {
-        let mut locations = Vec::<(SourceLocation, u32)>::new();
+        let mut output = Vec::with_capacity(extended_args.len().saturating_mul(2));
+        let mut current_line = i32::try_from(first_line_number).unwrap_or(i32::MAX);
+        let mut run = None::<(SourceLocation, u32)>;
         let mut instruction_index = 0_usize;
         for item in &self.items {
             let Item::Instruction(instruction) = item else {
@@ -212,63 +196,56 @@ impl LayoutAssembler {
             let size = u32::from(extended_args[instruction_index])
                 + 1
                 + u32::from(instruction.opcode.caches());
-            if let Some((location, length)) = locations.last_mut()
+            if let Some((location, length)) = &mut run
                 && *location == instruction.location
             {
                 *length += size;
             } else {
-                locations.push((instruction.location, size));
+                if let Some((location, length)) = run {
+                    write_location_run(&mut output, location, length, &mut current_line);
+                }
+                run = Some((instruction.location, size));
             }
             instruction_index += 1;
         }
-
-        let mut output = Vec::new();
-        let mut current_line = i32::try_from(first_line_number).unwrap_or(i32::MAX);
-        for (location, mut length) in locations {
-            while length > 8 {
-                write_location(&mut output, location, 8, &mut current_line);
-                length -= 8;
-            }
-            if length > 0 {
-                write_location(&mut output, location, length, &mut current_line);
-            }
+        if let Some((location, length)) = run {
+            write_location_run(&mut output, location, length, &mut current_line);
         }
         output
     }
 
-    pub(in crate::assembler) fn positions(
+    pub(in crate::assembler) fn label_positions(
         &self,
         extended_args: &[u8],
-    ) -> (Vec<u32>, FxHashMap<Label, u32>) {
-        let mut positions = Vec::with_capacity(extended_args.len());
-        let mut labels = FxHashMap::default();
+        labels: &mut [Option<u32>],
+    ) -> u32 {
         let mut position = 0_u32;
         let mut instruction_index = 0;
 
         for item in &self.items {
             match *item {
                 Item::Instruction(instruction) => {
-                    positions.push(position);
                     position += u32::from(extended_args[instruction_index])
                         + 1
                         + u32::from(instruction.opcode.caches());
                     instruction_index += 1;
                 }
                 Item::Label(label) => {
-                    labels.insert(label, position);
+                    labels[usize::try_from(label.0).unwrap()] = Some(position);
                 }
             }
         }
 
-        (positions, labels)
+        position
     }
 
     pub(in crate::assembler) fn encode(
         &self,
         extended_args: &[u8],
         resolved_arguments: &[u32],
+        code_units: u32,
     ) -> Vec<u8> {
-        let mut output = Vec::new();
+        let mut output = Vec::with_capacity(usize::try_from(code_units).unwrap().saturating_mul(2));
         let mut instruction_index = 0;
 
         for item in &self.items {
@@ -284,14 +261,37 @@ impl LayoutAssembler {
             }
             output.push(instruction.opcode.code());
             output.push((argument & 0xff) as u8);
-            for _ in 0..instruction.opcode.caches() {
-                output.extend_from_slice(&[0, 0]);
-            }
+            output.resize(
+                output.len() + usize::from(instruction.opcode.caches()) * 2,
+                0,
+            );
 
             instruction_index += 1;
         }
 
         output
+    }
+}
+
+pub(super) fn label_position(labels: &[Option<u32>], label: Label) -> Option<u32> {
+    labels
+        .get(usize::try_from(label.0).unwrap())
+        .copied()
+        .flatten()
+}
+
+fn write_location_run(
+    output: &mut Vec<u8>,
+    location: SourceLocation,
+    mut length: u32,
+    current_line: &mut i32,
+) {
+    while length > 8 {
+        write_location(output, location, 8, current_line);
+        length -= 8;
+    }
+    if length > 0 {
+        write_location(output, location, length, current_line);
     }
 }
 
