@@ -29,6 +29,50 @@ impl Compiler {
             .unwrap_or_else(|| panic!("module analysis did not intern `{name}`"))
     }
 
+    pub(super) fn name_ids<I, S>(&self, names: I) -> Vec<NameId>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        names
+            .into_iter()
+            .map(|name| self.required_name_id(name.as_ref()))
+            .collect()
+    }
+
+    pub(super) fn name_id_set<I, S>(&self, names: I) -> FxHashSet<NameId>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        names
+            .into_iter()
+            .map(|name| self.required_name_id(name.as_ref()))
+            .collect()
+    }
+
+    pub(super) fn name_strings(&self, names: impl IntoIterator<Item = NameId>) -> Vec<String> {
+        let interner = &self
+            .context
+            .scopes
+            .get()
+            .expect("scope arena should be initialized before lowering")
+            .names;
+        names
+            .into_iter()
+            .map(|name| interner.resolve(name).to_string())
+            .collect()
+    }
+
+    pub(super) fn insert_lexical_name(&self, names: &mut Vec<NameId>, name: NameId) {
+        self.context
+            .scopes
+            .get()
+            .expect("scope arena should be initialized before lowering")
+            .names
+            .insert_lexical(names, name);
+    }
+
     pub(super) fn contains_name(&self, names: &NameSet, name: &str) -> bool {
         self.name_id(name).is_some_and(|name| names.contains(name))
     }
@@ -54,8 +98,8 @@ impl Compiler {
         self.contains_name(&self.symbols.imported_scope_names, name)
     }
 
-    pub(super) fn is_type_parameter(&self, name: &str) -> bool {
-        self.contains_name(&self.symbols.type_parameter_names, name)
+    pub(super) fn is_type_parameter_id(&self, name: NameId) -> bool {
+        self.symbols.type_parameter_names.contains(name)
     }
 
     pub(super) fn temporary_index(&self, name: &str) -> Option<u32> {
@@ -376,10 +420,14 @@ impl Compiler {
         let Some(name_id) = self.name_id(name) else {
             return false;
         };
+        self.can_provide_closure_id(name_id)
+    }
+
+    pub(super) fn can_provide_closure_id(&self, name: NameId) -> bool {
         match &self.unit.scope {
-            Scope::Module => self.is_cell(name),
+            Scope::Module => self.symbols.cell_names.contains(name),
             Scope::Class { free_indices, .. } => {
-                self.is_cell(name) || free_indices.contains_key(&name_id)
+                self.symbols.cell_names.contains(name) || free_indices.contains_key(&name)
             }
             Scope::Function {
                 indices,
@@ -387,8 +435,8 @@ impl Compiler {
                 cells,
                 ..
             } => {
-                indices.contains_key(&name_id) && cells.contains(name_id)
-                    || free_indices.contains_key(&name_id)
+                indices.contains_key(&name) && cells.contains(name)
+                    || free_indices.contains_key(&name)
             }
         }
     }

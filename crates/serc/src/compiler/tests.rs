@@ -45,10 +45,19 @@ fn name_ids_do_not_define_observable_name_order() {
         freevars: lexical_order,
         ..FunctionPlan::default()
     }
-    .materialize(&interner);
-    assert_eq!(plan.locals, ["zeta", "alpha", "beta", "_hidden", "éclair"]);
+    .lowering_plan();
     assert_eq!(
-        plan.freevars.into_iter().collect::<Vec<_>>(),
+        plan.locals
+            .iter()
+            .map(|name| interner.resolve(*name))
+            .collect::<Vec<_>>(),
+        ["zeta", "alpha", "beta", "_hidden", "éclair"]
+    );
+    assert_eq!(
+        plan.freevars
+            .into_iter()
+            .map(|name| interner.resolve(name))
+            .collect::<Vec<_>>(),
         ["_hidden", "alpha", "beta", "zeta", "éclair"]
     );
 }
