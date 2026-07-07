@@ -336,7 +336,9 @@ impl Assembler {
             return;
         }
 
-        graph.normalize_blocks(&self.preserved_block_boundaries);
+        if !graph.is_normalized(&self.preserved_block_boundaries) {
+            graph.normalize_blocks(&self.preserved_block_boundaries);
+        }
         if graph.len() < 2 {
             return;
         }
@@ -830,9 +832,11 @@ impl Assembler {
             }
         }
         *graph.order_mut() = final_order;
-        graph.rebuild_label_index();
-        // `inline_no_location_block` temporarily appends its copy to the source so earlier
-        // predecessors can see the copied terminal jump. Restore explicit block boundaries now.
-        graph.normalize_blocks(&self.preserved_block_boundaries);
+        if graph.is_normalized(&self.preserved_block_boundaries) {
+            graph.rebuild_label_index();
+        } else {
+            // Appended no-location copies temporarily cross physical block boundaries.
+            graph.normalize_blocks(&self.preserved_block_boundaries);
+        }
     }
 }

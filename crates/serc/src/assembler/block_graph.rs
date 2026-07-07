@@ -77,34 +77,71 @@ pub(super) struct BlockGraph {
     label_blocks: FxHashMap<Label, BasicBlockId>,
 }
 
+fn normalized_segment_lengths<'a>(
+    items: impl IntoIterator<Item = &'a Item>,
+    item_count: usize,
+    preserved_block_boundaries: &FxHashSet<Label>,
+) -> Vec<usize> {
+    let mut lengths = Vec::with_capacity(item_count);
+    let mut length = 0;
+    let mut has_instruction = false;
+    for item in items {
+        if let Item::Label(label) = item
+            && (has_instruction || (length > 0 && preserved_block_boundaries.contains(label)))
+        {
+            lengths.push(length);
+            length = 0;
+            has_instruction = false;
+        }
+        let ends_block = matches!(item, Item::Instruction(instruction) if
+            !matches!(instruction.operand, Operand::Value(_))
+                || ends_scope(instruction.opcode));
+        length += 1;
+        has_instruction |= matches!(item, Item::Instruction(_));
+        if ends_block {
+            lengths.push(length);
+            length = 0;
+            has_instruction = false;
+        }
+    }
+    if length > 0 {
+        lengths.push(length);
+    }
+    lengths
+}
+
+fn collect_segments<T>(
+    items: impl IntoIterator<Item = T>,
+    segment_lengths: Vec<usize>,
+) -> Vec<Vec<T>> {
+    let mut items = items.into_iter();
+    let mut segments = Vec::with_capacity(segment_lengths.len());
+    for length in segment_lengths {
+        debug_assert!(length > 0);
+        let mut segment = Vec::with_capacity(length);
+        for _ in 0..length {
+            segment.push(
+                items
+                    .next()
+                    .expect("block segment plan exceeds available items"),
+            );
+        }
+        segments.push(segment);
+    }
+    assert!(
+        items.next().is_none(),
+        "block segment plan did not consume every item"
+    );
+    segments
+}
+
 impl BlockGraph {
     fn partition_items(
         items: Vec<Item>,
         preserved_block_boundaries: &FxHashSet<Label>,
     ) -> Vec<Vec<Item>> {
-        let mut blocks = Vec::new();
-        let mut block = Vec::new();
-        for item in items {
-            if let Item::Label(label) = item
-                && (block
-                    .iter()
-                    .any(|item| matches!(item, Item::Instruction(_)))
-                    || (!block.is_empty() && preserved_block_boundaries.contains(&label)))
-            {
-                blocks.push(std::mem::take(&mut block));
-            }
-            let ends_block = matches!(item, Item::Instruction(instruction) if
-                !matches!(instruction.operand, Operand::Value(_))
-                    || ends_scope(instruction.opcode));
-            block.push(item);
-            if ends_block {
-                blocks.push(std::mem::take(&mut block));
-            }
-        }
-        if !block.is_empty() {
-            blocks.push(block);
-        }
-        blocks
+        let lengths = normalized_segment_lengths(&items, items.len(), preserved_block_boundaries);
+        collect_segments(items, lengths)
     }
 
     pub(super) fn from_items(
@@ -227,31 +264,19 @@ impl BlockGraph {
         // Rebuild the index after repartitioning instead of treating that move
         // as a duplicate binding.
         self.label_blocks.clear();
+        let item_count = self
+            .order
+            .iter()
+            .map(|block| self[*block].items.len())
+            .sum();
+        let segment_lengths =
+            normalized_segment_lengths(self.iter_items(), item_count, preserved_block_boundaries);
         let original_order = std::mem::take(&mut self.order);
-        let mut segment = Vec::new();
-        let mut segments = Vec::new();
-        for block in original_order.iter().copied() {
-            for item in std::mem::take(&mut self[block].items) {
-                if let Item::Label(label) = item
-                    && (segment
-                        .iter()
-                        .any(|item| matches!(item, Item::Instruction(_)))
-                        || (!segment.is_empty() && preserved_block_boundaries.contains(&label)))
-                {
-                    segments.push(std::mem::take(&mut segment));
-                }
-                let ends_block = matches!(item, Item::Instruction(instruction) if
-                    !matches!(instruction.operand, Operand::Value(_))
-                        || ends_scope(instruction.opcode));
-                segment.push(item);
-                if ends_block {
-                    segments.push(std::mem::take(&mut segment));
-                }
-            }
-        }
-        if !segment.is_empty() {
-            segments.push(segment);
-        }
+        let items = original_order
+            .iter()
+            .copied()
+            .flat_map(|block| std::mem::take(&mut self[block].items));
+        let segments = collect_segments(items, segment_lengths);
 
         let mut reusable = original_order.into_iter();
         let mut order = Vec::with_capacity(segments.len());
@@ -267,6 +292,17 @@ impl BlockGraph {
         self.rebuild_label_index();
     }
 
+    /// Returns whether normalization would preserve every physical block boundary.
+    pub(super) fn is_normalized(&self, boundaries: &FxHashSet<Label>) -> bool {
+        let lengths = self
+            .order
+            .iter()
+            .map(|block| self[*block].items.len())
+            .collect::<Vec<_>>();
+        let item_count = lengths.iter().sum();
+        normalized_segment_lengths(self.iter_items(), item_count, boundaries) == lengths
+    }
+
     /// Repartitions the ordered instruction stream for a pass whose logical
     /// block boundaries are narrower than the assembler's structural ones.
     /// Existing block IDs are reused in order; newly split suffixes receive
@@ -277,36 +313,49 @@ impl BlockGraph {
         starts_block: impl Fn(&Instruction) -> bool,
         ends_block: impl Fn(&Instruction) -> bool,
     ) {
-        let original_order = std::mem::take(&mut self.order);
         self.label_blocks.clear();
-        let mut segments = Vec::<Vec<Item>>::new();
-        let mut segment = Vec::new();
+        let item_count = self
+            .order
+            .iter()
+            .map(|block| self[*block].items.len())
+            .sum();
+        let mut segment_lengths = Vec::with_capacity(item_count);
+        let mut segment_length = 0;
         let mut has_instruction = false;
-        for block in original_order.iter().copied() {
-            for item in std::mem::take(&mut self[block].items) {
+        for (_, block) in self.iter() {
+            for item in block.items() {
                 let starts_here = match item {
-                    Item::Label(label) => boundary_labels.contains(&label),
-                    Item::Instruction(instruction) => starts_block(&instruction),
+                    Item::Label(label) => boundary_labels.contains(label),
+                    Item::Instruction(instruction) => starts_block(instruction),
                 };
                 if starts_here && has_instruction {
-                    segments.push(std::mem::take(&mut segment));
+                    segment_lengths.push(segment_length);
+                    segment_length = 0;
                     has_instruction = false;
                 }
                 let ends_here = match item {
-                    Item::Instruction(instruction) => ends_block(&instruction),
+                    Item::Instruction(instruction) => ends_block(instruction),
                     Item::Label(_) => false,
                 };
                 has_instruction |= matches!(item, Item::Instruction(_));
-                segment.push(item);
+                segment_length += 1;
                 if ends_here {
-                    segments.push(std::mem::take(&mut segment));
+                    segment_lengths.push(segment_length);
+                    segment_length = 0;
                     has_instruction = false;
                 }
             }
         }
-        if !segment.is_empty() {
-            segments.push(segment);
+        if segment_length > 0 {
+            segment_lengths.push(segment_length);
         }
+
+        let original_order = std::mem::take(&mut self.order);
+        let items = original_order
+            .iter()
+            .copied()
+            .flat_map(|block| std::mem::take(&mut self[block].items));
+        let segments = collect_segments(items, segment_lengths);
 
         let mut reusable = original_order.into_iter();
         let mut order = Vec::with_capacity(segments.len());
@@ -439,26 +488,29 @@ impl BlockGraph {
         boundary_labels: &FxHashSet<Label>,
         ends_block: impl Fn(&Instruction) -> bool,
     ) -> Vec<Vec<ItemPosition>> {
-        let mut blocks = Vec::new();
-        let mut block = Vec::new();
-        for position in self.item_positions() {
-            let item = self.item(position);
+        let positions = self.item_positions();
+        let mut segment_lengths = Vec::with_capacity(positions.len());
+        let mut segment_length = 0;
+        for position in &positions {
+            let item = self.item(*position);
             if matches!(item, Item::Label(label) if boundary_labels.contains(label))
-                && !block.is_empty()
+                && segment_length > 0
             {
-                blocks.push(std::mem::take(&mut block));
+                segment_lengths.push(segment_length);
+                segment_length = 0;
             }
             let ends_here =
                 matches!(item, Item::Instruction(instruction) if ends_block(instruction));
-            block.push(position);
+            segment_length += 1;
             if ends_here {
-                blocks.push(std::mem::take(&mut block));
+                segment_lengths.push(segment_length);
+                segment_length = 0;
             }
         }
-        if !block.is_empty() {
-            blocks.push(block);
+        if segment_length > 0 {
+            segment_lengths.push(segment_length);
         }
-        blocks
+        collect_segments(positions, segment_lengths)
     }
 
     pub(super) fn item(&self, position: ItemPosition) -> &Item {
@@ -728,7 +780,9 @@ mod tests {
             instruction(RETURN_VALUE, Operand::Value(0)),
         ]);
 
+        assert!(!graph.is_normalized(&FxHashSet::default()));
         graph.normalize_blocks(&FxHashSet::default());
+        assert!(graph.is_normalized(&FxHashSet::default()));
 
         let suffix = graph.block_at(1);
         assert_eq!(graph.block_at(0), first);
