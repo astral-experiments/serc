@@ -144,6 +144,29 @@ impl Compiler {
             .unwrap_or(generator.range)
     }
 
+    pub(super) fn debug_expression_source_range(
+        &self,
+        interpolation: &ruff_python_ast::InterpolatedElement,
+    ) -> ruff_text_size::TextRange {
+        assert!(
+            interpolation.debug_text.is_some(),
+            "debug expression range requires debug text"
+        );
+        let tokens = self.context.tokens.in_range(interpolation.range);
+        let opening = tokens
+            .first()
+            .filter(|token| token.kind() == TokenKind::Lbrace)
+            .expect("interpolation should start with an opening brace");
+        let marker = tokens
+            .iter()
+            .find(|token| {
+                token.start() >= interpolation.expression.range().end()
+                    && token.kind() == TokenKind::Equal
+            })
+            .expect("debug interpolation should contain an equals token");
+        ruff_text_size::TextRange::new(opening.end(), marker.start())
+    }
+
     pub(super) fn fstring_result_range(
         fstring: &ruff_python_ast::ExprFString,
     ) -> ruff_text_size::TextRange {
@@ -259,12 +282,9 @@ pub(super) fn debug_text_range(
         .debug_text
         .as_ref()
         .expect("debug text range requires debug text");
-    let start = u32::from(interpolation.range.start()).saturating_add(1);
-    let length = debug.leading().len() + debug.expression().len() + debug.trailing().len();
-    let end = start.saturating_add(u32::try_from(length).unwrap_or(u32::MAX));
-    ruff_text_size::TextRange::new(
-        ruff_text_size::TextSize::new(start),
-        ruff_text_size::TextSize::new(end),
+    ruff_text_size::TextRange::at(
+        interpolation.range.start() + "{".text_len(),
+        debug.as_str().text_len(),
     )
 }
 

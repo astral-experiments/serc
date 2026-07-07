@@ -498,6 +498,24 @@ last'''
     }
 
     #[test]
+    fn matches_cpython_marshal_for_debug_interpolation_text() {
+        let source = r#"
+def render(item, mapping, width):
+    f"{  item   =   !r}"
+    t"{  item   =   !r}"
+    t"""{(
+        mapping["="]  # = inside comment
+    )   =   :>{width}}"""
+    t"""{f"{item=} = literal" = !s:^10}"""
+    f"""{item=  # after marker
+}"""
+    t"""{item=  # after marker
+}"""
+"#;
+        assert_matches_cpython_marshal(source, "debug_interpolation_text.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_an_irrefutable_constant_match_guard() {
         let source = "match subject:\n    case value if True:\n        pass\n    case _:\n        unreachable()\nafter()\n";
         assert_matches_cpython_marshal(source, "match.py");
