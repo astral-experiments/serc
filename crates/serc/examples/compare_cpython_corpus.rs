@@ -491,7 +491,14 @@ fn compare(path: &Path, python: &str) -> Outcome {
                 detail: message,
             };
         }
-        Ok(Err(CompileError::Parse(message))) => {
+        Ok(Err(CompileError::Parse(error))) => {
+            return Outcome {
+                path: path.to_path_buf(),
+                kind: OutcomeKind::ParseMismatch,
+                detail: error.to_string(),
+            };
+        }
+        Ok(Err(CompileError::InvalidPattern { message, .. })) => {
             return Outcome {
                 path: path.to_path_buf(),
                 kind: OutcomeKind::ParseMismatch,

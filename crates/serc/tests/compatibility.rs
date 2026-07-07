@@ -2,6 +2,7 @@ mod common;
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error as _;
     use std::fmt::Write as _;
 
     use super::common::{assert_executes, assert_matches_cpython_marshal};
@@ -71,6 +72,56 @@ mod tests {
             compile(source, "greet.py").unwrap().marshal(),
             compile(normalized, "greet.py").unwrap().marshal()
         );
+    }
+
+    #[test]
+    fn structured_parse_error_preserves_ruff_context() {
+        let source = "if True print('no')\n";
+        let error = compile(source, "invalid.py").unwrap_err();
+
+        let CompileError::Parse(parse_error) = &error else {
+            panic!("expected Ruff parse error, got {error:?}");
+        };
+        assert_eq!(error.range(), Some(parse_error.location));
+        assert_eq!(&source[parse_error.location], "print");
+
+        let source_error = error.source().unwrap();
+        assert!(source_error.is::<ruff_python_parser::ParseError>());
+        assert!(source_error.source().is_some());
+        assert_eq!(
+            error.to_string(),
+            format!("failed to parse Python source: {parse_error}")
+        );
+    }
+
+    #[test]
+    fn structured_parse_error_separates_invalid_patterns() {
+        let source = "match value:\n    case [left] | [right]:\n        pass\n";
+        let error = compile(source, "invalid_pattern.py").unwrap_err();
+
+        let CompileError::InvalidPattern { message, range } = &error else {
+            panic!("expected invalid pattern error, got {error:?}");
+        };
+        assert_eq!(message, "alternative patterns bind different names");
+        assert_eq!(error.range(), Some(*range));
+        assert_eq!(&source[*range], "[right]");
+        assert!(error.source().is_none());
+        assert_eq!(
+            error.to_string(),
+            "failed to parse Python source: alternative patterns bind different names"
+        );
+    }
+
+    #[test]
+    fn structured_parse_error_ranges_duplicate_pattern_bindings() {
+        let source = "match value:\n    case [x, [x] | [x]]:\n        pass\n";
+        let error = compile(source, "duplicate_pattern.py").unwrap_err();
+
+        let CompileError::InvalidPattern { message, range } = &error else {
+            panic!("expected invalid pattern error, got {error:?}");
+        };
+        assert_eq!(message, "multiple assignments to name 'x' in pattern");
+        assert_eq!(&source[*range], "[x] | [x]");
     }
 
     #[test]
