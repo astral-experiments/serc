@@ -67,10 +67,13 @@ impl Assembler {
         })
     }
 
+    fn required_last_instruction_mut(&mut self, operation: &str) -> &mut Instruction {
+        self.last_instruction_mut()
+            .unwrap_or_else(|| panic!("{operation} requires a preceding instruction"))
+    }
+
     fn last_jump_instruction_mut(&mut self, operation: &str) -> &mut Instruction {
-        let instruction = self
-            .last_instruction_mut()
-            .unwrap_or_else(|| panic!("{operation} requires a preceding instruction"));
+        let instruction = self.required_last_instruction_mut(operation);
         assert!(
             matches!(
                 instruction.operand,
@@ -170,16 +173,16 @@ impl Assembler {
 
     /// Prevents fusion with the next instruction without introducing a CFG boundary.
     pub(crate) fn prevent_last_instruction_fusion(&mut self) {
-        if let Some(instruction) = self.last_instruction_mut() {
-            instruction.fusion_policy.prevent_with_next = true;
-        }
+        self.required_last_instruction_mut("preventing fusion with the next instruction")
+            .fusion_policy
+            .prevent_with_next = true;
     }
 
     /// Prevents fusion with the previous instruction without introducing a CFG boundary.
     pub(crate) fn prevent_last_instruction_fusion_with_previous(&mut self) {
-        if let Some(instruction) = self.last_instruction_mut() {
-            instruction.fusion_policy.prevent_with_previous = true;
-        }
+        self.required_last_instruction_mut("preventing fusion with the previous instruction")
+            .fusion_policy
+            .prevent_with_previous = true;
     }
 
     /// Defers a redundant jump until the pass after exit-block duplication.
@@ -232,15 +235,14 @@ impl Assembler {
     }
 
     pub(crate) fn preserve_last_no_location(&mut self) {
-        if let Some(instruction) = self.last_instruction_mut() {
-            instruction.no_location_policy.preserve = true;
-        }
+        self.required_last_instruction_mut("preserving a no-location instruction")
+            .no_location_policy
+            .preserve = true;
     }
 
     pub(crate) fn mark_last_as_converted_pop_block(&mut self) {
-        if let Some(instruction) = self.last_instruction_mut() {
-            instruction.converted_pop_block = true;
-        }
+        self.required_last_instruction_mut("marking a converted POP_BLOCK")
+            .converted_pop_block = true;
     }
 
     /// Removes a trailing NOP and returns its location and immediate exclusion labels, if any.

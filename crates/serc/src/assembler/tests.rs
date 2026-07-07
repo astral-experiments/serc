@@ -123,6 +123,14 @@ fn jump_policy_mutation_requires_a_preceding_instruction() {
 }
 
 #[test]
+#[should_panic(
+    expected = "preventing fusion with the next instruction requires a preceding instruction"
+)]
+fn instruction_policy_mutation_requires_a_preceding_instruction() {
+    Assembler::default().prevent_last_instruction_fusion();
+}
+
+#[test]
 #[should_panic(expected = "preventing jump inlining requires a jump instruction")]
 fn jump_policy_mutation_requires_a_jump() {
     let mut assembler = Assembler::default();
