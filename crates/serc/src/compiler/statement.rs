@@ -49,6 +49,8 @@ struct LoopContext {
 struct ExceptionHandlerContext {
     name: Option<NameId>,
     loop_depth: usize,
+    common_cleanup: Label,
+    common_cleanup_depth: u32,
 }
 
 #[derive(Debug)]
@@ -577,6 +579,10 @@ impl Compiler {
     }
 
     fn emit_implicit_return(&mut self) -> Result<(), CompileError> {
+        if self.control.unwind_exception_handlers_for_implicit_return {
+            // Terminal nested suites return while the enclosing handler is still active.
+            return self.emit_deferred_implicit_return();
+        }
         let none = self.add_constant(Constant::None)?;
         self.emit(LOAD_CONST, none, 1)?;
         self.emit(RETURN_VALUE, 0, -1)
@@ -1603,13 +1609,36 @@ impl Compiler {
                 };
                 let mut next_loop = self.control.loops.len();
                 for handler_index in (0..handler_count).rev() {
-                    let (loop_depth, name) = {
+                    let (loop_depth, name, common_cleanup, common_cleanup_depth) = {
                         let handler = &self.control.active_exception_handlers[handler_index];
-                        (handler.loop_depth, handler.name)
+                        (
+                            handler.loop_depth,
+                            handler.name,
+                            handler.common_cleanup,
+                            handler.common_cleanup_depth,
+                        )
                     };
                     self.emit_loop_iterator_cleanup(loop_depth, next_loop, preserve_tos)?;
                     if preserve_tos {
+                        let common_cleanup_start = name.is_some().then(|| {
+                            let start = self.assembler.label();
+                            self.assembler.mark(start);
+                            start
+                        });
                         self.emit(SWAP, 2, 0)?;
+                        if let Some(common_cleanup_start) = common_cleanup_start {
+                            // Named-handler cleanup stops owning the stack before `POP_EXCEPT`,
+                            // while the value-preserving swap belongs to the common cleanup.
+                            let common_cleanup_end = self.assembler.label();
+                            self.assembler.mark(common_cleanup_end);
+                            self.assembler.add_exception_region(
+                                common_cleanup_start,
+                                common_cleanup_end,
+                                common_cleanup,
+                                common_cleanup_depth,
+                                true,
+                            );
+                        }
                     }
                     if delay_exception_unwind_start && exception_unwind_start.is_none() {
                         let start = self.assembler.label();
@@ -3617,6 +3646,8 @@ impl Compiler {
                     let context = ExceptionHandlerContext {
                         name: handler_name,
                         loop_depth: self.control.loops.len(),
+                        common_cleanup,
+                        common_cleanup_depth: (base_depth + 1).cast_unsigned(),
                     };
                     let ((), exclusions) = self.with_exception_handler(context, |compiler| {
                         compiler.with_control_override(
