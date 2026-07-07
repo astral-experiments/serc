@@ -1,7 +1,30 @@
 // Compiler submodules intentionally share the parent-owned state and lowering vocabulary.
 #![allow(clippy::wildcard_imports)]
 
+use std::sync::OnceLock;
+
+use ruff_source_file::{LineEnding, LineIndex};
+
 use super::*;
+
+#[derive(Debug)]
+pub(super) struct CompilationContext {
+    pub(super) filename: String,
+    pub(super) source: Arc<str>,
+    pub(super) line_index: LineIndex,
+    pub(super) scopes: OnceLock<ScopeArena>,
+}
+
+impl CompilationContext {
+    pub(super) fn new(filename: &str, source: &str) -> Self {
+        Self {
+            filename: filename.to_string(),
+            source: Arc::from(source),
+            line_index: LineIndex::from_source_text(source),
+            scopes: OnceLock::new(),
+        }
+    }
+}
 
 impl Compiler {
     pub(super) fn line_number(&self, offset: u32) -> u32 {
