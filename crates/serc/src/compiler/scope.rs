@@ -173,10 +173,21 @@ impl FromIterator<NameId> for NameSet {
 }
 
 impl NameInterner {
-    pub(super) fn intern(&mut self, name: String) -> NameId {
-        if let Some(id) = self.by_name.get(&name) {
+    pub(super) fn intern(&mut self, name: &str) -> NameId {
+        if let Some(id) = self.by_name.get(name) {
             return *id;
         }
+        self.insert_owned(name.to_string())
+    }
+
+    fn intern_owned(&mut self, name: String) -> NameId {
+        if let Some(id) = self.by_name.get(name.as_str()) {
+            return *id;
+        }
+        self.insert_owned(name)
+    }
+
+    fn insert_owned(&mut self, name: String) -> NameId {
         let id = NameId(u32::try_from(self.names.len()).expect("too many interned names"));
         self.names.push(name.clone());
         self.by_name.insert(name, id);
@@ -188,7 +199,10 @@ impl NameInterner {
     }
 
     fn intern_set(&mut self, names: impl IntoIterator<Item = String>) -> FxHashSet<NameId> {
-        names.into_iter().map(|name| self.intern(name)).collect()
+        names
+            .into_iter()
+            .map(|name| self.intern_owned(name))
+            .collect()
     }
 
     pub(super) fn resolve(&self, id: NameId) -> &str {
@@ -341,18 +355,11 @@ impl FunctionPlan {
             ..
         } = facts;
 
-        // This preliminary pass cannot be folded into the real locals pass: named-expression and
-        // match-subject handling need to know every binding in the scope before visiting source
-        // expressions in order. Global and nonlocal declarations come from the shared facts pass
-        // because their effect applies to the entire scope regardless of source position.
-        let mut bindings = LocalCollector {
-            globals: globals.clone(),
-            nonlocals: nonlocals.clone(),
-            ..LocalCollector::default()
-        };
-        bindings.collect_suite(&definition.body);
+        // Record potential local loads and actual bindings in one source-order pass. Filtering the
+        // potential names after the pass preserves CPython's load-before-store local ordering
+        // without walking the body once just to discover its complete binding set.
         let mut locals = LocalCollector {
-            known_bindings: bindings.names.into_iter().collect(),
+            candidate_bindings: Some(HashMap::default()),
             globals,
             nonlocals,
             ..LocalCollector::default()
@@ -373,6 +380,7 @@ impl FunctionPlan {
             locals.insert(parameter.name.as_str());
         }
         locals.collect_suite(&definition.body);
+        locals.retain_bindings();
 
         let mut annotation_collector = ReferenceCollector::default();
         if !future_annotations {
@@ -477,7 +485,7 @@ impl FunctionPlan {
             locals: locals
                 .names
                 .into_iter()
-                .map(|name| names.intern(name))
+                .map(|name| names.intern_owned(name))
                 .collect(),
             globals: names.intern_set(locals.globals),
             annotation_references: names.intern_set(annotation_collector.references),
@@ -748,7 +756,7 @@ impl ScopeArena {
             "join",
             "super",
         ] {
-            arena.names.intern(name.to_string());
+            arena.names.intern(name);
         }
         ModuleNameCollector {
             names: &mut arena.names,
@@ -947,11 +955,9 @@ struct ModuleNameCollector<'a> {
 impl ModuleNameCollector<'_> {
     fn intern(&mut self, name: &str) {
         let mangled = mangle_name(name, self.private_name.as_deref());
-        if mangled == name {
-            self.names.intern(mangled);
-        } else {
-            self.names.intern(name.to_string());
-            self.names.intern(mangled);
+        self.names.intern(name);
+        if let Cow::Owned(mangled) = mangled {
+            self.names.intern_owned(mangled);
         }
     }
 
@@ -1108,9 +1114,9 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_> {
 pub(super) struct LocalCollector {
     pub(super) names: Vec<String>,
     pub(super) seen: HashSet<String>,
-    known_bindings: HashSet<String>,
     pub(super) comprehension_targets: Vec<String>,
     seen_comprehension_targets: HashSet<String>,
+    candidate_bindings: Option<HashMap<String, bool>>,
     annotation_only: HashSet<String>,
     globals: HashSet<String>,
     nonlocals: HashSet<String>,
@@ -1123,22 +1129,55 @@ impl LocalCollector {
         }
     }
 
-    fn insert(&mut self, name: &str) {
-        self.annotation_only.remove(name);
+    fn mark_binding(&mut self, name: &str) -> bool {
         if self.globals.contains(name) || self.nonlocals.contains(name) {
-            return;
+            return false;
+        }
+        if let Some(candidate_bindings) = &mut self.candidate_bindings {
+            if let Some(binding) = candidate_bindings.get_mut(name) {
+                *binding = true;
+                return false;
+            }
+            candidate_bindings.insert(name.to_string(), true);
+            self.names.push(name.to_string());
+            return true;
         }
         if self.seen.insert(name.to_string()) {
             self.names.push(name.to_string());
+            true
+        } else {
+            false
         }
     }
 
-    fn insert_annotation_only(&mut self, name: &str) {
+    fn insert_candidate(&mut self, name: &str) {
         if self.globals.contains(name) || self.nonlocals.contains(name) {
             return;
         }
-        if self.seen.insert(name.to_string()) {
-            self.names.push(name.to_string());
+        let Some(candidate_bindings) = &mut self.candidate_bindings else {
+            return;
+        };
+        if candidate_bindings.contains_key(name) {
+            return;
+        }
+        candidate_bindings.insert(name.to_string(), false);
+        self.names.push(name.to_string());
+    }
+
+    fn retain_bindings(&mut self) {
+        let Some(candidate_bindings) = self.candidate_bindings.take() else {
+            return;
+        };
+        self.names.retain(|name| candidate_bindings[name]);
+    }
+
+    fn insert(&mut self, name: &str) {
+        self.annotation_only.remove(name);
+        self.mark_binding(name);
+    }
+
+    fn insert_annotation_only(&mut self, name: &str) {
+        if self.mark_binding(name) {
             self.annotation_only.insert(name.to_string());
         }
     }
@@ -1258,12 +1297,6 @@ impl LocalCollector {
                     self.collect_suite(&statement.body);
                 }
                 Stmt::Match(statement) => {
-                    if let Expr::Name(name) = statement.subject.as_ref()
-                        && name.ctx == ExprContext::Load
-                        && self.known_bindings.contains(name.id.as_str())
-                    {
-                        self.insert(name.id.as_str());
-                    }
                     self.collect_expression(&statement.subject);
                     for case in &statement.cases {
                         self.collect_pattern(&case.pattern);
@@ -1398,9 +1431,8 @@ impl<'ast> Visitor<'ast> for NamedExpressionCollector<'_> {
         if self.collect_known_loads
             && let Expr::Name(name) = expression
             && name.ctx == ExprContext::Load
-            && self.collector.known_bindings.contains(name.id.as_str())
         {
-            self.collector.insert(name.id.as_str());
+            self.collector.insert_candidate(name.id.as_str());
         }
         let generators = match expression {
             Expr::ListComp(comprehension) => Some(comprehension.generators.as_slice()),

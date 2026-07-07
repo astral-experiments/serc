@@ -7,6 +7,7 @@ impl Compiler {
     fn new(context: Arc<CompilationContext>, unit: CodeUnit, symbols: SymbolState) -> Self {
         Self {
             context,
+            cached_source_line: Cell::new(None),
             unit,
             output: OutputState::default(),
             symbols,

@@ -144,13 +144,25 @@ impl Compiler {
     }
 
     pub(super) fn name_index(&mut self, name: &str) -> Result<u32, CompileError> {
-        let name = self.mangled_name(name);
-        let name_id = self.required_name_id(&name);
+        let name_id = self.required_name_id(name);
+        self.name_index_with_id(name, name_id)
+    }
+
+    pub(super) fn name_index_with_id(
+        &mut self,
+        name: &str,
+        name_id: NameId,
+    ) -> Result<u32, CompileError> {
+        let name = mangle_name(name, self.unit.private_name.as_deref());
+        let name_id = match &name {
+            Cow::Borrowed(_) => name_id,
+            Cow::Owned(name) => self.required_name_id(name),
+        };
         if let Some(index) = self.output.name_indices.get(&name_id) {
             return Ok(*index);
         }
         let index = to_u32(self.output.names.len(), "name count")?;
-        self.output.names.push(name);
+        self.output.names.push(name.into_owned());
         self.output.name_indices.insert(name_id, index);
         Ok(index)
     }

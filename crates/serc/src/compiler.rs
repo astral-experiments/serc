@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
 
@@ -297,9 +299,24 @@ struct ControlFlowState {
 #[derive(Debug)]
 pub(crate) struct Compiler {
     context: Arc<CompilationContext>,
+    cached_source_line: Cell<Option<CachedSourceLine>>,
     unit: CodeUnit,
     output: OutputState,
     symbols: SymbolState,
     control: ControlFlowState,
     assembler: Assembler,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CachedSourceLine {
+    number: u32,
+    start: TextSize,
+    end: TextSize,
+    is_last: bool,
+}
+
+impl CachedSourceLine {
+    fn contains(self, offset: TextSize) -> bool {
+        self.start <= offset && (offset < self.end || self.is_last && offset == self.end)
+    }
 }

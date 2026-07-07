@@ -30,16 +30,8 @@ impl Compiler {
         self.contains_name(&self.symbols.hidden_names, name)
     }
 
-    fn is_active_temporary(&self, name: &str) -> bool {
-        self.contains_name(&self.symbols.active_temporaries, name)
-    }
-
     pub(super) fn is_initialized(&self, name: &str) -> bool {
         self.contains_name(&self.symbols.initialized_locals, name)
-    }
-
-    fn is_owned_load(&self, name: &str) -> bool {
-        self.contains_name(&self.symbols.owned_load_locals, name)
     }
 
     pub(super) fn is_imported(&self, name: &str) -> bool {
@@ -50,22 +42,22 @@ impl Compiler {
         self.contains_name(&self.symbols.type_parameter_names, name)
     }
 
-    fn is_module_global(&self, name: &str) -> bool {
-        self.contains_name(&self.symbols.module_globals, name)
-    }
-
     pub(super) fn temporary_index(&self, name: &str) -> Option<u32> {
         self.name_id(name)
             .and_then(|name| self.symbols.temporary_indices.get(&name).copied())
     }
 
     pub(super) fn load_name(&mut self, name: &str) -> Result<(), CompileError> {
-        if self.is_active_temporary(name) {
+        let name_id = self.required_name_id(name);
+        if self.symbols.active_temporaries.contains(name_id) {
             let index = self
-                .temporary_index(name)
+                .symbols
+                .temporary_indices
+                .get(&name_id)
+                .copied()
                 .expect("active temporary should have an index");
             return self.emit(
-                if self.is_cell(name) {
+                if self.symbols.cell_names.contains(name_id) {
                     LOAD_DEREF
                 } else {
                     LOAD_FAST
@@ -74,12 +66,11 @@ impl Compiler {
                 1,
             );
         }
-        let name_id = self.required_name_id(name);
         let annotation_classdict_index = self.unit.annotation_classdict_index;
         match &self.unit.scope {
             Scope::Module => {
-                let index = self.name_index(name)?;
-                if self.is_module_global(name) {
+                let index = self.name_index_with_id(name, name_id)?;
+                if self.symbols.module_globals.contains(name_id) {
                     self.emit(LOAD_GLOBAL, index << 1, 1)
                 } else {
                     self.emit(LOAD_NAME, index, 1)
@@ -91,13 +82,13 @@ impl Compiler {
                 ..
             } => {
                 if globals.contains(name_id) {
-                    let index = self.name_index(name)?;
+                    let index = self.name_index_with_id(name, name_id)?;
                     self.emit(LOAD_GLOBAL, index << 1, 1)
                 } else if let Some(index) = free_indices.get(&name_id).copied() {
                     self.emit(LOAD_LOCALS, 0, 1)?;
                     self.emit(LOAD_FROM_DICT_OR_DEREF, index, 0)
                 } else {
-                    let index = self.name_index(name)?;
+                    let index = self.name_index_with_id(name, name_id)?;
                     self.emit(LOAD_NAME, index, 1)
                 }
             }
@@ -116,7 +107,7 @@ impl Compiler {
                         let index = self.name_index(&name)?;
                         return self.emit(LOAD_FROM_DICT_OR_GLOBALS, index, 0);
                     }
-                    let index = self.name_index(name)?;
+                    let index = self.name_index_with_id(name, name_id)?;
                     return self.emit(LOAD_GLOBAL, index << 1, 1);
                 }
                 if let Some(index) = indices.get(&name_id).copied() {
@@ -129,8 +120,8 @@ impl Compiler {
                         } else {
                             self.emit(LOAD_DEREF, index, 1)
                         }
-                    } else if self.is_initialized(name) {
-                        if self.is_owned_load(name) {
+                    } else if self.symbols.initialized_locals.contains(name_id) {
+                        if self.symbols.owned_load_locals.contains(name_id) {
                             self.emit_owned_fast(index, 1)
                         } else {
                             self.emit(LOAD_FAST, index, 1)
@@ -150,10 +141,10 @@ impl Compiler {
                 } else {
                     if let Some(classdict) = annotation_classdict_index {
                         self.emit(LOAD_DEREF, classdict, 1)?;
-                        let index = self.name_index(name)?;
+                        let index = self.name_index_with_id(name, name_id)?;
                         return self.emit(LOAD_FROM_DICT_OR_GLOBALS, index, 0);
                     }
-                    let index = self.name_index(name)?;
+                    let index = self.name_index_with_id(name, name_id)?;
                     self.emit(LOAD_GLOBAL, index << 1, 1)
                 }
             }
@@ -180,12 +171,16 @@ impl Compiler {
     }
 
     pub(super) fn store_name(&mut self, name: &str) -> Result<(), CompileError> {
-        if self.is_active_temporary(name) {
+        let name_id = self.required_name_id(name);
+        if self.symbols.active_temporaries.contains(name_id) {
             let index = self
-                .temporary_index(name)
+                .symbols
+                .temporary_indices
+                .get(&name_id)
+                .copied()
                 .expect("active temporary should have an index");
             return self.emit(
-                if self.is_cell(name) {
+                if self.symbols.cell_names.contains(name_id) {
                     STORE_DEREF
                 } else {
                     STORE_FAST
@@ -194,11 +189,10 @@ impl Compiler {
                 -1,
             );
         }
-        let name_id = self.required_name_id(name);
         match &self.unit.scope {
             Scope::Module => {
-                let index = self.name_index(name)?;
-                if self.is_module_global(name) {
+                let index = self.name_index_with_id(name, name_id)?;
+                if self.symbols.module_globals.contains(name_id) {
                     self.emit(STORE_GLOBAL, index, -1)
                 } else {
                     self.emit(STORE_NAME, index, -1)
@@ -211,7 +205,7 @@ impl Compiler {
                 ..
             } => {
                 if globals.contains(name_id) {
-                    let index = self.name_index(name)?;
+                    let index = self.name_index_with_id(name, name_id)?;
                     self.emit(STORE_GLOBAL, index, -1)
                 } else if nonlocals.contains(name_id) {
                     let index = free_indices.get(&name_id).copied().ok_or_else(|| {
@@ -219,7 +213,7 @@ impl Compiler {
                     })?;
                     self.emit(STORE_DEREF, index, -1)
                 } else {
-                    let index = self.name_index(name)?;
+                    let index = self.name_index_with_id(name, name_id)?;
                     self.emit(STORE_NAME, index, -1)
                 }
             }
@@ -230,7 +224,7 @@ impl Compiler {
                 globals,
             } => {
                 if globals.contains(name_id) {
-                    let index = self.name_index(name)?;
+                    let index = self.name_index_with_id(name, name_id)?;
                     return self.emit(STORE_GLOBAL, index, -1);
                 }
                 if let Some(index) = indices.get(&name_id).copied() {
@@ -252,12 +246,16 @@ impl Compiler {
     }
 
     pub(super) fn delete_name(&mut self, name: &str) -> Result<(), CompileError> {
-        if self.is_active_temporary(name) {
+        let name_id = self.required_name_id(name);
+        if self.symbols.active_temporaries.contains(name_id) {
             let index = self
-                .temporary_index(name)
+                .symbols
+                .temporary_indices
+                .get(&name_id)
+                .copied()
                 .expect("active temporary should have an index");
             return self.emit(
-                if self.is_cell(name) {
+                if self.symbols.cell_names.contains(name_id) {
                     DELETE_DEREF
                 } else {
                     DELETE_FAST
@@ -266,11 +264,10 @@ impl Compiler {
                 0,
             );
         }
-        let name_id = self.required_name_id(name);
         match &self.unit.scope {
             Scope::Module => {
-                let index = self.name_index(name)?;
-                if self.is_module_global(name) {
+                let index = self.name_index_with_id(name, name_id)?;
+                if self.symbols.module_globals.contains(name_id) {
                     self.emit(DELETE_GLOBAL, index, 0)
                 } else {
                     self.emit(DELETE_NAME, index, 0)
@@ -283,7 +280,7 @@ impl Compiler {
                 ..
             } => {
                 if globals.contains(name_id) {
-                    let index = self.name_index(name)?;
+                    let index = self.name_index_with_id(name, name_id)?;
                     self.emit(DELETE_GLOBAL, index, 0)
                 } else if nonlocals.contains(name_id) {
                     let index = free_indices.get(&name_id).copied().ok_or_else(|| {
@@ -291,7 +288,7 @@ impl Compiler {
                     })?;
                     self.emit(DELETE_DEREF, index, 0)
                 } else {
-                    let index = self.name_index(name)?;
+                    let index = self.name_index_with_id(name, name_id)?;
                     self.emit(DELETE_NAME, index, 0)
                 }
             }
@@ -302,7 +299,7 @@ impl Compiler {
                 globals,
             } => {
                 if globals.contains(name_id) {
-                    let index = self.name_index(name)?;
+                    let index = self.name_index_with_id(name, name_id)?;
                     return self.emit(DELETE_GLOBAL, index, 0);
                 }
                 if let Some(index) = indices.get(&name_id).copied() {
@@ -462,7 +459,7 @@ impl Compiler {
     }
 
     pub(super) fn mangled_name(&self, name: &str) -> String {
-        mangle_name(name, self.unit.private_name.as_deref())
+        mangle_name(name, self.unit.private_name.as_deref()).into_owned()
     }
 
     pub(super) fn pre_register_suite_names(&mut self, body: &[Stmt]) -> Result<(), CompileError> {
@@ -869,17 +866,17 @@ impl Compiler {
     }
 }
 
-pub(super) fn mangle_name(name: &str, private_name: Option<&str>) -> String {
+pub(super) fn mangle_name<'a>(name: &'a str, private_name: Option<&str>) -> Cow<'a, str> {
     if !name.starts_with("__") || name.ends_with("__") || name.contains('.') {
-        return name.to_string();
+        return Cow::Borrowed(name);
     }
     let Some(class_name) = private_name
         .map(|name| name.trim_start_matches('_'))
         .filter(|name| !name.is_empty())
     else {
-        return name.to_string();
+        return Cow::Borrowed(name);
     };
-    format!("_{class_name}{name}")
+    Cow::Owned(format!("_{class_name}{name}"))
 }
 pub(super) fn to_u32(value: usize, what: &str) -> Result<u32, CompileError> {
     value

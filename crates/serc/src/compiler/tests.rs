@@ -11,23 +11,20 @@ fn interns_adversarial_identifier_families_densely() {
         .collect::<Vec<_>>();
 
     for (index, name) in names.iter().enumerate() {
-        let id = interner.intern(name.clone());
+        let id = interner.intern(name);
         assert_eq!(id, NameId(u32::try_from(index).unwrap()));
         assert_eq!(interner.resolve(id), name);
     }
     for (index, name) in names.iter().enumerate().rev() {
-        assert_eq!(
-            interner.intern(name.clone()),
-            NameId(u32::try_from(index).unwrap())
-        );
+        assert_eq!(interner.intern(name), NameId(u32::try_from(index).unwrap()));
     }
 }
 
 #[test]
 fn name_ids_do_not_define_observable_name_order() {
     let mut interner = NameInterner::default();
-    let source_order = ["zeta", "alpha", "beta", "_hidden", "éclair"]
-        .map(|name| interner.intern(name.to_string()));
+    let source_order =
+        ["zeta", "alpha", "beta", "_hidden", "éclair"].map(|name| interner.intern(name));
     let mut lexical_order = Vec::new();
     for name in source_order {
         interner.insert_lexical(&mut lexical_order, name);
@@ -85,6 +82,38 @@ fn name_ids_deduplicate_private_name_mangling_collisions() {
             .filter(|name| name.as_str() == "_Container__value")
             .count(),
         1
+    );
+}
+
+#[test]
+fn single_pass_local_collection_preserves_source_order() {
+    let source = r"def ordering():
+    target = external + target
+    print(later)
+    earlier = 1
+    later = 2
+    annotation_only
+    annotation_only: int
+";
+    let parsed = parse_module(source).unwrap();
+    let module = Compiler::module("example.py", source)
+        .compile_module(parsed.suite())
+        .unwrap();
+    let function = module
+        .constants
+        .iter()
+        .find_map(|constant| match constant {
+            Constant::Code(code) if code.name == "ordering" => Some(code),
+            _ => None,
+        })
+        .expect("module should contain the function body");
+
+    // A self-referencing assignment target precedes every load in its value, while a local that
+    // is loaded before its eventual store keeps the position of that first load. A referenced
+    // annotation-only local follows the same rule.
+    assert_eq!(
+        function.locals,
+        ["target", "later", "earlier", "annotation_only"]
     );
 }
 
@@ -193,6 +222,27 @@ fn source_positions_clamp_to_eof() {
     assert_eq!(compiler.source_position(eof), (3, 0));
     assert_eq!(compiler.source_position(u32::MAX), (3, 0));
     assert_eq!(compiler.line_number(u32::MAX), 3);
+}
+
+#[test]
+fn source_positions_preserve_crlf_boundaries_and_eof() {
+    let source = "one\r\ntwo";
+    let compiler = Compiler::module("example.py", source);
+
+    assert_eq!(compiler.source_position(2), (1, 2));
+    assert_eq!(compiler.source_position(5), (2, 0));
+    assert_eq!(compiler.source_position(8), (2, 3));
+    assert_eq!(compiler.source_position(4), (1, 4));
+    assert_eq!(compiler.source_position(u32::MAX), (2, 3));
+
+    let source = "one\r\ntwo\r\n";
+    let compiler = Compiler::module("example.py", source);
+
+    assert_eq!(compiler.source_position(8), (2, 3));
+    assert_eq!(compiler.source_position(9), (2, 4));
+    assert_eq!(compiler.source_position(10), (3, 0));
+    assert_eq!(compiler.source_position(5), (2, 0));
+    assert_eq!(compiler.source_position(u32::MAX), (3, 0));
 }
 
 #[test]
