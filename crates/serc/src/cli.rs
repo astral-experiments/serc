@@ -149,11 +149,18 @@ fn has_python_suffix(path: &Path) -> bool {
 }
 
 fn compile_path(path: &Path, check: bool) -> Result<(), String> {
-    // Keep the cache header and permissions tied to the source snapshot that
-    // precedes the bytes being compiled, matching CPython's read ordering.
-    let metadata = fs_err::metadata(path)
-        .map_err(|error| format!("failed to inspect {}: {error}", path.display()))?;
-    let source_size = metadata.len();
+    compile_path_with_metadata(path, check, source_metadata)
+}
+
+fn source_metadata(path: &Path) -> io::Result<std::fs::Metadata> {
+    fs_err::metadata(path)
+}
+
+fn compile_path_with_metadata(
+    path: &Path,
+    check: bool,
+    load_metadata: impl FnOnce(&Path) -> io::Result<std::fs::Metadata>,
+) -> Result<(), String> {
     let source_bytes = fs_err::read(path)
         .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
     let source = decode_source(&source_bytes)
@@ -169,6 +176,9 @@ fn compile_path(path: &Path, check: bool) -> Result<(), String> {
         return Ok(());
     }
 
+    let metadata = load_metadata(path)
+        .map_err(|error| format!("failed to inspect {}: {error}", path.display()))?;
+    let source_size = metadata.len();
     let modified = metadata
         .modified()
         .map_err(|error| format!("failed to read the mtime for {}: {error}", path.display()))?;
@@ -471,7 +481,10 @@ fn write_error(message: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{cache_path, cache_tag, decode_source, discover, encode_mtime, has_python_suffix};
+    use super::{
+        cache_path, cache_tag, compile_path_with_metadata, decode_source, discover, encode_mtime,
+        has_python_suffix,
+    };
     use std::path::{Path, PathBuf};
     use std::time::{Duration, UNIX_EPOCH};
 
@@ -520,6 +533,32 @@ mod tests {
         assert_eq!(
             decode_source(b"# coding: ascii\nvalue = '\x80'\n").unwrap_err(),
             "source is not valid ASCII"
+        );
+    }
+
+    #[test]
+    fn samples_source_metadata_after_compilation() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("module.py");
+        let source = "value = 1\n";
+        let replacement = "value = 2\n";
+        let replacement_mtime = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        fs_err::write(&source_path, source).unwrap();
+
+        compile_path_with_metadata(&source_path, false, |path| {
+            fs_err::write(path, replacement)?;
+            let file = std::fs::OpenOptions::new().write(true).open(path)?;
+            file.set_times(std::fs::FileTimes::new().set_modified(replacement_mtime))?;
+            fs_err::metadata(path)
+        })
+        .unwrap();
+
+        let expected = serc::compile(source, source_path.to_str().unwrap())
+            .unwrap()
+            .to_timestamp_pyc(1_700_000_000, u32::try_from(replacement.len()).unwrap());
+        assert_eq!(
+            fs_err::read(cache_path(&source_path).unwrap()).unwrap(),
+            expected
         );
     }
 
