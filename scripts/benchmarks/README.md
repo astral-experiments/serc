@@ -44,11 +44,17 @@ Run the benchmark:
 PYTHON=/path/to/python3.14.5 ./scripts/benchmarks/run.sh
 ```
 
-The runner builds Serc once in release mode, preflights both commands, then runs Hyperfine with
-three warmups and at least ten measured runs. It writes machine-readable JSON, a Markdown table,
-and a reproducibility sidecar to `target/benchmarks/results/numpy.{json,md,metadata.txt}`. The
-sidecar records the exact corpus and Serc revisions, dirty states, source count and size,
-CPython build, Rust toolchain, Hyperfine version, platform, and available CPU metadata.
+The runner builds Serc once with the release profile, preflights both commands, then runs
+Hyperfine with three warmups and at least ten measured runs. The untimed preflight hashes the
+relative paths and complete contents of every generated `.pyc` and requires Serc's aggregate
+to match CPython's. This does not add work to either measured command.
+
+The runner writes machine-readable JSON, a Markdown table, and a reproducibility sidecar to
+`target/benchmarks/results/numpy.{json,md,metadata.txt}`. The sidecar records the full Serc
+commit, a hash of its tracked working-tree diff, the Cargo lockfile and resolved compiler binary
+hashes, the actual Cargo profile, an aggregate corpus hash, the bytecode preflight hash, source
+count and size, CPython build, Rust toolchain, Hyperfine version, platform, and available CPU
+metadata. The status sections retain human-readable tracked and untracked state.
 
 Override the sampling defaults with `HYPERFINE_WARMUP` and `HYPERFINE_MIN_RUNS`:
 
@@ -67,9 +73,9 @@ removes `__pycache__` directories before every Hyperfine command.
 
 ## Correctness
 
-The preflight requires both commands to compile the entire corpus successfully. It does not make
-this workload a byte-for-byte compatibility oracle. Inspect the pinned NumPy corpus separately
-with:
+The preflight requires both commands to compile the entire corpus successfully and produce
+byte-identical `.pyc` trees. It is an exact check for the selected performance corpus, but it does
+not replace the broader frozen compatibility corpus. Inspect an arbitrary corpus in detail with:
 
 ```console
 cargo run --locked -p serc --example compare_cpython_corpus -- \

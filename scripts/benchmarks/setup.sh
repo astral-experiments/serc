@@ -2,7 +2,8 @@
 
 set -euo pipefail
 
-repo_root="$(git rev-parse --show-toplevel)"
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+repo_root="$(cd "$script_dir/../.." && pwd -P)"
 checkout="$repo_root/target/benchmarks/numpy"
 repository="https://github.com/numpy/numpy.git"
 tag="v2.4.6"

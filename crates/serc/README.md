@@ -106,6 +106,32 @@ The [Serc benchmark suite](../serc_benchmark/README.md) measures the public comp
 marshal boundaries over fixed, CPython-validated workloads. Its documentation records the stable
 benchmark identities and the canonical local Criterion and CodSpeed simulation commands.
 
+The corpus benchmark compares Serc and CPython within one long-lived process per engine. Run
+each phase separately from the workspace root; for example:
+
+```console
+cargo run --locked --profile profiling -p serc --example benchmark_cpython_corpus -- \
+  --python /path/to/python3.14.5 \
+  --phase compiler_core \
+  --warmups 5 \
+  --samples 21 \
+  --cooldown-ms 5000 \
+  --output target/serc-compiler-core.tsv \
+  vendor/ruff/crates/ty_python_semantic/resources/corpus \
+  vendor/ruff/crates/ruff_python_parser/resources/valid \
+  vendor/ruff/crates/ruff_python_parser/resources/inline/ok \
+  vendor/ruff/crates/ruff_linter/resources/test/fixtures \
+  vendor/ruff/crates/ruff_python_formatter/resources/test/fixtures
+```
+
+Repeat with `compile_marshal` and `marshal_only` to measure the other boundaries. Before any
+warmup or measured block, the harness compiles the accepted corpus with both engines and compares
+every marshal payload byte-for-byte. That preflight adds startup work and temporarily retains the
+CPython payloads, but it is outside all timed samples; the existing `compiler_core`,
+`compile_marshal`, and `marshal_only` timing boundaries are unchanged. The TSV records the actual
+Cargo profile, full Serc commit and dirty-diff hash, lockfile and source/filename corpus hashes,
+and the resolved benchmark and Python executable identities.
+
 The [end-to-end Hyperfine harness](../../scripts/benchmarks/README.md) compares CPython
 `compileall` with the `serc compile` workflow on a pinned NumPy checkout, including process
 startup, source discovery, marshaling, and `.pyc` writes.

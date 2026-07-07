@@ -4,7 +4,7 @@ set -euo pipefail
 
 python="$1"
 
-exec "$python" -I -c '
+exec "$python" -I -S -c '
 import json
 import sys
 
