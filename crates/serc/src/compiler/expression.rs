@@ -2261,7 +2261,7 @@ impl Compiler {
             }
             self.emit(STORE_FAST, *index, -1)?;
         }
-        self.emit(RERAISE, 0, -1)?;
+        self.emit_reraise(ReraiseStackState::ExceptionOnly)?;
         let cleanup_end = self.assembler.label();
         self.assembler.mark(cleanup_end);
         if let Some((parent, depth)) = parent_cleanup {
@@ -2639,7 +2639,7 @@ impl Compiler {
             .generator_region_exclusions
             .push((cleanup_throw, async_cleanup));
         self.set_depth(loop_depth + 1);
-        self.apply_stack_effect(-2)?;
+        self.apply_compiler_stack_effect(END_ASYNC_FOR, 0, -2)?;
         self.assembler.emit_backward(END_ASYNC_FOR, send_end);
         self.assembler.add_exception_region(
             protected_start,
@@ -3169,7 +3169,7 @@ impl Compiler {
         );
         self.assembler.mark(async_cleanup);
         self.set_depth(loop_depth + 1);
-        self.apply_stack_effect(-2)?;
+        self.apply_compiler_stack_effect(END_ASYNC_FOR, 0, -2)?;
         self.assembler.emit_backward(
             END_ASYNC_FOR,
             if reorder_cleanup {
@@ -3570,8 +3570,9 @@ impl Compiler {
             self.compile_expression(selected)?;
             // CPython leaves the eliminated branch as an empty CFG block before the join.
             // Stack-depth analysis crosses that block, but borrowed-load analysis does not,
-            // so loads emitted after the folded conditional remain owned.
-            self.assembler.prevent_next_borrow_reachability();
+            // so loads emitted after the folded conditional remain owned. Preserve that edge on
+            // the selected predecessor without exposing a label to the earlier assembler passes.
+            self.assembler.mark_last_borrow_fallthrough_barrier();
             return Ok(());
         }
         let base_depth = self.control.depth;
@@ -3953,9 +3954,12 @@ impl Compiler {
                 }
                 return Ok(());
             }
-            self.emit(NOT_TAKEN, 0, 0)?;
-            self.assembler
-                .set_last_normalized_exception_owner(self.control.active_normal_finally_bodies > 0);
+            self.emit_with_exception_policy(
+                NOT_TAKEN,
+                0,
+                0,
+                ExceptionPolicy::normalized_owner(self.control.active_normal_finally_bodies > 0),
+            )?;
             return Ok(());
         }
         let comparison_is_boolean = if let Expr::Compare(comparison) = expression
@@ -3997,9 +4001,12 @@ impl Compiler {
             self.control.exclude_terminal_if_not_taken = false;
             let exclusion_start = self.assembler.label();
             self.assembler.mark(exclusion_start);
-            self.emit(NOT_TAKEN, 0, 0)?;
-            self.assembler
-                .set_last_normalized_exception_owner(comparison_is_boolean);
+            self.emit_with_exception_policy(
+                NOT_TAKEN,
+                0,
+                0,
+                ExceptionPolicy::normalized_owner(comparison_is_boolean),
+            )?;
             let exclusion_end = self.assembler.label();
             self.assembler.mark(exclusion_end);
             if exclude_from_generator {
@@ -4026,10 +4033,14 @@ impl Compiler {
             }
             Ok(())
         } else {
-            self.emit(NOT_TAKEN, 0, 0)?;
-            self.assembler.set_last_normalized_exception_owner(
-                comparison_is_boolean || self.control.active_normal_finally_bodies > 0,
-            );
+            self.emit_with_exception_policy(
+                NOT_TAKEN,
+                0,
+                0,
+                ExceptionPolicy::normalized_owner(
+                    comparison_is_boolean || self.control.active_normal_finally_bodies > 0,
+                ),
+            )?;
             Ok(())
         }
     }

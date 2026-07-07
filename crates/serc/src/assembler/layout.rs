@@ -6,7 +6,7 @@ use super::{
     is_conditional_jump,
 };
 use crate::CompileError;
-use crate::assembler::{Assembler, Instruction, InstructionFlags, Label, SourceLocation};
+use crate::assembler::{Assembler, Instruction, Label, NormalizedExceptionOwner, SourceLocation};
 
 impl Assembler {
     pub(in crate::assembler) fn exception_table(
@@ -54,9 +54,10 @@ impl Assembler {
             .zip(&positions)
             .zip(extended_args)
             .filter_map(|((instruction, position), extended)| {
-                (instruction.has_flag(InstructionFlags::EXCLUDE_EXCEPTION)
-                    || (instruction.has_flag(InstructionFlags::EXCLUDE_EXCEPTION_IF_EXTENDED)
-                        && *extended > 0))
+                instruction
+                    .exception_policy
+                    .exclusion
+                    .applies(*extended)
                     .then_some((
                         *position,
                         *position
@@ -96,7 +97,8 @@ impl Assembler {
                     }
                 }
                 Item::Instruction(instruction) => {
-                    if instruction.normalized_exception_owner == Some(false)
+                    if instruction.exception_policy.normalized_owner
+                        == NormalizedExceptionOwner::Absent
                         && !block_has_stale_exception_owner
                     {
                         let position = positions[instruction_index];

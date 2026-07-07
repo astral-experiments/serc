@@ -1,9 +1,10 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::super::{
-    COMPARE_OP, CONTAINS_OP, COPY, IS_OP, Instruction, InstructionFlags, Item, JUMP_BACKWARD,
-    JUMP_BACKWARD_NO_INTERRUPT, JUMP_FORWARD, NOP, NOT_TAKEN, Operand, POP_JUMP_IF_FALSE,
-    POP_JUMP_IF_TRUE, POP_TOP, STORE_FAST, TO_BOOL, UNARY_NOT, ends_scope, is_unconditional_jump,
+    COMPARE_OP, CONTAINS_OP, COPY, ExceptionExclusion, IS_OP, Instruction, InstructionFlags, Item,
+    JUMP_BACKWARD, JUMP_BACKWARD_NO_INTERRUPT, JUMP_FORWARD, NOP, NOT_TAKEN, Operand,
+    POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE, POP_TOP, STORE_FAST, TO_BOOL, UNARY_NOT, ends_scope,
+    is_unconditional_jump,
 };
 use crate::assembler::Assembler;
 use crate::target::Opcode;
@@ -484,13 +485,15 @@ impl Assembler {
                     || next_line == Some(instruction.location.line))
             {
                 items.remove(index);
-                if instruction.has_flag(InstructionFlags::EXCLUDE_EXCEPTION_IF_EXTENDED)
+                if instruction.exception_policy.exclusion == ExceptionExclusion::IfExtended
                     && let Some(previous) = previous
                 {
                     let Item::Instruction(previous) = &mut items[previous].1 else {
                         unreachable!();
                     };
-                    previous.insert_flag(InstructionFlags::EXCLUDE_EXCEPTION_IF_EXTENDED);
+                    previous
+                        .exception_policy
+                        .exclude(ExceptionExclusion::IfExtended);
                 }
                 if instruction.location.line >= 0
                     && let Some(next) = next.map(|next| next - 1)

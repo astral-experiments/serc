@@ -1,8 +1,8 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::super::{
-    Assembler, ExceptionRegion, Instruction, InstructionFlags, Item, JUMP_BACKWARD,
-    JUMP_BACKWARD_NO_INTERRUPT, JUMP_FORWARD, Label, Operand, SourceLocation,
+    Assembler, ExceptionExclusion, ExceptionRegion, Instruction, InstructionFlags, Item,
+    JUMP_BACKWARD, JUMP_BACKWARD_NO_INTERRUPT, JUMP_FORWARD, Label, Operand, SourceLocation,
     block_has_fallthrough, block_jump_target, cleanup_block_creation_order, ends_scope,
 };
 use crate::target::opcodes::{
@@ -127,32 +127,35 @@ impl Assembler {
                 label
             };
             let current = graph.block_at(position);
-            let (location, exclude_exception_if_extended) = graph[current]
-                .last_instruction()
-                .map_or((SourceLocation::NONE, false), |instruction| {
-                    (
-                        instruction.location,
-                        instruction.has_flag(InstructionFlags::EXCLUDE_EXCEPTION_IF_EXTENDED),
-                    )
-                });
+            let (location, exception_exclusion) = graph[current].last_instruction().map_or(
+                (SourceLocation::NONE, ExceptionExclusion::None),
+                |instruction| {
+                    let exclusion = if instruction.exception_policy.exclusion
+                        == ExceptionExclusion::IfExtended
+                    {
+                        ExceptionExclusion::IfExtended
+                    } else {
+                        ExceptionExclusion::None
+                    };
+                    (instruction.location, exclusion)
+                },
+            );
             let label = Label(self.next_label);
             self.next_label += 1;
             let block = graph.insert_block(
                 position + 1,
                 vec![
                     Item::Label(label),
-                    Item::Instruction(
-                        Instruction::synthetic(
+                    Item::Instruction({
+                        let mut instruction = Instruction::synthetic(
                             JUMP_BACKWARD_NO_INTERRUPT,
                             Operand::Backward(target),
                             location,
                             None,
-                        )
-                        .with_flag(
-                            InstructionFlags::EXCLUDE_EXCEPTION_IF_EXTENDED,
-                            exclude_exception_if_extended,
-                        ),
-                    ),
+                        );
+                        instruction.exception_policy.exclude(exception_exclusion);
+                        instruction
+                    }),
                 ],
             );
             block_labels.insert(block, label);
