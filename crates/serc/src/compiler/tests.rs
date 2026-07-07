@@ -8,6 +8,7 @@ use crate::assembler::SourceLocation;
 use super::{
     Compiler, Constant, FunctionPlan, NameId, NameInterner, ScopeBodyFacts, clean_doc,
     debug_text_range, interpolated_string_content_range, strip_expression_comments,
+    unparse_annotation,
 };
 
 #[test]
@@ -463,6 +464,31 @@ fn expression_comment_stripping_uses_ruff_comment_tokens() {
         ),
     ] {
         assert_eq!(strip_expression_comments(source), expected, "{source:?}");
+    }
+}
+
+#[test]
+fn annotation_unparsing_uses_tokens_for_nested_delimiters() {
+    for (source, expected) in [
+        ("value: tuple[(int, str)]", "tuple[int, str]"),
+        (
+            "value: dict[str, tuple[(int, str)]]",
+            "dict[str, tuple[int, str]]",
+        ),
+        (
+            "value: Literal[\"[()]\", (int | str)]",
+            "Literal['[()]', int | str]",
+        ),
+        (
+            "value: Callable[[(int, str)], None]",
+            "Callable[[(int, str)], None]",
+        ),
+    ] {
+        let module = parse_module(source).unwrap();
+        let [Stmt::AnnAssign(assignment)] = module.suite().as_slice() else {
+            panic!("expected an annotated assignment");
+        };
+        assert_eq!(unparse_annotation(&assignment.annotation), expected);
     }
 }
 
