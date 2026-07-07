@@ -694,6 +694,42 @@ fn threads_unconditional_forward_jumps_without_conditional_jumps() {
 }
 
 #[test]
+fn redundant_jump_removal_preserves_borrow_traversal_barrier() {
+    let target = super::Label(0);
+    let mut jump = Instruction::new(
+        JUMP_FORWARD,
+        Operand::Forward(target),
+        SourceLocation::NONE,
+        None,
+    );
+    jump.borrow_fallthrough = BorrowFallthrough::Barrier;
+    let mut assembler = optimization_pipeline(vec![
+        pass_instruction(LOAD_CONST, 0, 1),
+        Item::Instruction(jump),
+        Item::Label(target),
+        pass_instruction(RETURN_VALUE, 0, 1),
+    ]);
+
+    assembler.remove_redundant_forward_jumps();
+
+    let instructions = assembler
+        .graph
+        .iter_items()
+        .filter_map(|item| match item {
+            Item::Instruction(instruction) => Some(instruction),
+            Item::Label(_) => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(instructions.len(), 2);
+    assert_eq!(instructions[0].opcode, LOAD_CONST);
+    assert_eq!(
+        instructions[0].borrow_fallthrough,
+        BorrowFallthrough::Barrier
+    );
+    assert_eq!(instructions[1].opcode, RETURN_VALUE);
+}
+
+#[test]
 fn uninitialized_load_analysis_follows_single_block_backedges() {
     let label = super::Label(0);
     let mut assembler = optimization_pipeline(vec![
