@@ -1667,6 +1667,11 @@ impl ScopeBodyFactsCollector {
 
     fn collect_function_header(&mut self, definition: &StmtFunctionDef) {
         self.facts.has_function_definition = true;
+        // A nested function's decorators execute in the current scope and may be that scope's
+        // only reference to an enclosing binding.
+        for decorator in &definition.decorator_list {
+            self.visit_expr(&decorator.expression);
+        }
         let Some(type_params) = definition.type_params.as_deref() else {
             return;
         };
