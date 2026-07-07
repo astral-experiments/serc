@@ -6,6 +6,7 @@ use super::super::{
     POP_JUMP_IF_TRUE, POP_TOP, STORE_FAST, TO_BOOL, UNARY_NOT, ends_scope, is_unconditional_jump,
 };
 use crate::assembler::OptimizationPipeline;
+use crate::assembler::block_graph::ItemMut;
 use crate::target::Opcode;
 use crate::target::operands::ComparisonOperation;
 
@@ -18,13 +19,7 @@ impl OptimizationPipeline {
         let graph = &mut self.graph;
         let order = graph.order().to_vec();
         for block in order {
-            let items = graph[block].items_mut();
-            for index in 0..items.len().saturating_sub(1) {
-                let [Item::Instruction(first), Item::Instruction(second)] =
-                    &mut items[index..index + 2]
-                else {
-                    continue;
-                };
+            graph.for_each_adjacent_instruction_pair_mut(block, |first, second| {
                 if first.opcode == STORE_FAST
                     && second.opcode == STORE_FAST
                     && matches!(
@@ -36,7 +31,7 @@ impl OptimizationPipeline {
                     first.opcode = POP_TOP;
                     first.operand = Operand::Value(0);
                 }
-            }
+            });
         }
     }
 
@@ -50,7 +45,7 @@ impl OptimizationPipeline {
             if reachable[block.index()] {
                 continue;
             }
-            graph[block].items_mut().retain(|item| match item {
+            graph.retain_items(block, |item| match item {
                 Item::Label(_) => true,
                 Item::Instruction(instruction) => {
                     if let Some(depth) = instruction.depth_after {
@@ -79,51 +74,45 @@ impl OptimizationPipeline {
         let graph = &mut self.graph;
         let order = graph.order().to_vec();
         for block in order {
-            let items = graph[block].items_mut();
-            for index in 0..items.len().saturating_sub(1) {
-                let [Item::Instruction(current), Item::Instruction(next)] =
-                    &mut items[index..index + 2]
-                else {
-                    continue;
-                };
+            graph.for_each_adjacent_instruction_pair_mut(block, |current, next| {
                 match (current.opcode, next.opcode) {
                     (TO_BOOL, TO_BOOL) => {
                         current.opcode = NOP;
                         current.operand = Operand::Value(0);
-                        continue;
+                        return;
                     }
                     (UNARY_NOT, TO_BOOL) => {
                         current.opcode = NOP;
                         current.operand = Operand::Value(0);
                         next.opcode = UNARY_NOT;
                         next.operand = Operand::Value(0);
-                        continue;
+                        return;
                     }
                     (UNARY_NOT, UNARY_NOT) => {
                         current.opcode = NOP;
                         current.operand = Operand::Value(0);
                         next.opcode = NOP;
                         next.operand = Operand::Value(0);
-                        continue;
+                        return;
                     }
                     (CONTAINS_OP | IS_OP, UNARY_NOT) => {
                         let Operand::Value(argument) = current.operand else {
-                            continue;
+                            return;
                         };
                         let opcode = current.opcode;
                         current.opcode = NOP;
                         current.operand = Operand::Value(0);
                         next.opcode = opcode;
                         next.operand = Operand::Value(argument ^ 1);
-                        continue;
+                        return;
                     }
                     _ => {}
                 }
                 if next.opcode != TO_BOOL {
-                    continue;
+                    return;
                 }
                 let Operand::Value(argument) = current.operand else {
-                    continue;
+                    return;
                 };
                 let replacement = match current.opcode {
                     COMPARE_OP => Some((COMPARE_OP, ComparisonOperation::force_boolean(argument))),
@@ -132,13 +121,13 @@ impl OptimizationPipeline {
                     _ => None,
                 };
                 let Some((opcode, argument)) = replacement else {
-                    continue;
+                    return;
                 };
                 current.opcode = NOP;
                 current.operand = Operand::Value(0);
                 next.opcode = opcode;
                 next.operand = Operand::Value(argument);
-            }
+            });
         }
     }
 
@@ -274,7 +263,7 @@ impl OptimizationPipeline {
             .collect::<FxHashSet<_>>();
         let graph = &mut self.graph;
         for (index, position) in positions.iter().copied().enumerate() {
-            let Item::Instruction(instruction) = graph.item_mut(position) else {
+            let Some(instruction) = graph.instruction_mut(position) else {
                 continue;
             };
             if !value_preserving_jumps.contains(&index) {
@@ -335,10 +324,7 @@ impl OptimizationPipeline {
         let graph = &mut self.graph;
         let order = graph.order().to_vec();
         for block in order {
-            for item in graph[block].items_mut() {
-                let Item::Instruction(instruction) = item else {
-                    continue;
-                };
+            for instruction in graph.instructions_mut(block) {
                 if instruction.opcode != JUMP_FORWARD
                     || instruction.jump_policy.always_retains_nop()
                 {
@@ -483,12 +469,22 @@ impl OptimizationPipeline {
         }
 
         let order = graph.order().to_vec();
+        let mut start = 0;
         for block in order {
-            graph[block].items_mut().clear();
+            let mut end = start;
+            while items
+                .get(end)
+                .is_some_and(|(item_block, _)| *item_block == block)
+            {
+                end += 1;
+            }
+            graph.replace_items_preserving_labels(
+                block,
+                items[start..end].iter().map(|(_, item)| *item),
+            );
+            start = end;
         }
-        for (block, item) in items {
-            graph[block].items_mut().push(item);
-        }
+        debug_assert_eq!(start, items.len());
     }
 
     pub(in crate::assembler) fn propagate_locations_within_blocks(&mut self) {
@@ -497,14 +493,14 @@ impl OptimizationPipeline {
         for block in order {
             let mut previous = None;
             let mut block_has_instruction = false;
-            for item in graph[block].items_mut() {
+            for item in graph.iter_items_mut(block) {
                 match item {
-                    Item::Label(_) if block_has_instruction => {
+                    ItemMut::Label if block_has_instruction => {
                         previous = None;
                         block_has_instruction = false;
                     }
-                    Item::Label(_) => {}
-                    Item::Instruction(instruction) => {
+                    ItemMut::Label => {}
+                    ItemMut::Instruction(instruction) => {
                         block_has_instruction = true;
                         if instruction.location.line < 0 && !instruction.no_location_policy.preserve
                         {
