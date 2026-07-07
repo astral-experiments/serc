@@ -70,6 +70,7 @@ impl OptimizationPipeline {
         removed_max_depth
     }
 
+    #[cfg(any(test, debug_assertions))]
     pub(in crate::assembler) fn reachable_items(&self) -> Vec<bool> {
         self.graph.item_reachability(&self.exception_regions)
     }
@@ -290,7 +291,7 @@ impl OptimizationPipeline {
                     break;
                 };
                 if instruction.opcode == next.opcode {
-                    instruction.operand = next.operand;
+                    instruction.retarget(next.operand);
                     let Operand::Forward(next_target) = next.operand else {
                         break;
                     };
@@ -302,7 +303,7 @@ impl OptimizationPipeline {
                     let Some(fallthrough) = fallthrough_labels.get(&next.fallthrough_index) else {
                         break;
                     };
-                    instruction.operand = Operand::Forward(*fallthrough);
+                    instruction.retarget(Operand::Forward(*fallthrough));
                     break;
                 }
             }
@@ -322,7 +323,7 @@ impl OptimizationPipeline {
                 continue;
             };
             // A jump retained as a source-position NOP remains a CFG boundary.
-            if instruction.jump_policy.allow_threading_target
+            if instruction.jump_policy.allows_threading_target()
                 && !instruction.jump_policy.always_retains_nop()
                 && is_unconditional_jump(instruction.opcode)
                 && let operand @ (Operand::Forward(_) | Operand::Backward(_)) = instruction.operand
@@ -368,7 +369,7 @@ impl OptimizationPipeline {
                     }
                     target = next;
                 }
-                instruction.operand = operand;
+                instruction.retarget(operand);
                 instruction.opcode = opcode;
             }
         }
@@ -410,7 +411,7 @@ impl OptimizationPipeline {
                 index += 1;
                 continue;
             }
-            if instruction.jump_policy.defer_redundant_removal {
+            if instruction.jump_policy.defers_redundant_removal() {
                 let Item::Instruction(instruction) = &mut items[index].1 else {
                     unreachable!();
                 };

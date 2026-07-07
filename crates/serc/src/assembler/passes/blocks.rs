@@ -309,12 +309,12 @@ impl OptimizationPipeline {
                 continue;
             };
             if target_position < index {
-                instruction.operand = Operand::Backward(target);
+                instruction.retarget(Operand::Backward(target));
                 if instruction.opcode == JUMP_FORWARD {
                     instruction.opcode = JUMP_BACKWARD_NO_INTERRUPT;
                 }
             } else {
-                instruction.operand = Operand::Forward(target);
+                instruction.retarget(Operand::Forward(target));
                 if matches!(
                     instruction.opcode,
                     JUMP_BACKWARD | JUMP_BACKWARD_NO_INTERRUPT
@@ -492,7 +492,7 @@ impl OptimizationPipeline {
                 });
             let source_allows_small_exit_inlining = graph[source]
                 .last_instruction()
-                .is_some_and(|instruction| instruction.jump_policy.inline_small_exit);
+                .is_some_and(|instruction| instruction.jump_policy.inline_small_exit());
             let target_contains_end_send = target_blocks.iter().any(|block| {
                 graph[*block].items().iter().any(|item| {
                     matches!(item, Item::Instruction(instruction) if instruction.opcode == END_SEND)
@@ -672,7 +672,7 @@ impl OptimizationPipeline {
                 .rev()
                 .find(|item| matches!(item, Item::Instruction(_)))
             {
-                instruction.operand = Operand::Forward(copied_label);
+                instruction.retarget(Operand::Forward(copied_label));
             }
             if inline_no_location_block {
                 graph.append_to_block(source, copied);

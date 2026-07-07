@@ -9,6 +9,13 @@ use super::{
 use crate::target::opcodes::*;
 
 #[test]
+#[cfg(target_pointer_width = "64")]
+fn instruction_items_remain_cache_compact() {
+    assert_eq!(std::mem::size_of::<Instruction>(), 48);
+    assert_eq!(std::mem::size_of::<Item>(), 48);
+}
+
+#[test]
 fn instruction_constructors_set_audited_defaults() {
     let regular = Instruction::new(LOAD_CONST, Operand::Value(0), SourceLocation::NONE, None);
     assert_eq!(regular.load_policy, LoadPolicy::default());
@@ -18,14 +25,10 @@ fn instruction_constructors_set_audited_defaults() {
     assert_eq!(regular.jump_policy, JumpPolicy::default());
 
     let synthetic = Instruction::synthetic(NOP, Operand::Value(0), SourceLocation::NONE, None);
-    assert!(!synthetic.jump_policy.inline_small_exit);
-    assert_eq!(
-        synthetic.jump_policy,
-        JumpPolicy {
-            inline_small_exit: false,
-            ..JumpPolicy::default()
-        }
-    );
+    assert!(!synthetic.jump_policy.inline_small_exit());
+    let mut expected_synthetic_policy = JumpPolicy::default();
+    expected_synthetic_policy.prevent_small_exit_inlining();
+    assert_eq!(synthetic.jump_policy, expected_synthetic_policy);
     assert_eq!(synthetic.exception_policy, ExceptionPolicy::default());
     assert_eq!(regular.borrow_fallthrough, BorrowFallthrough::Reachable);
     assert_eq!(synthetic.borrow_fallthrough, BorrowFallthrough::Reachable);
@@ -33,33 +36,41 @@ fn instruction_constructors_set_audited_defaults() {
 
 #[test]
 fn jump_policy_defaults_are_explicit() {
-    assert_eq!(
-        JumpPolicy::default(),
-        JumpPolicy {
-            inline_small_exit: true,
-            retained_nop: RetainedJumpNop::None,
-            allow_threading_target: true,
-            defer_redundant_removal: false,
-            preserve_nop_after_threading: false,
-        }
-    );
+    let policy = JumpPolicy::default();
+    assert!(policy.inline_small_exit());
+    assert_eq!(policy.retained_nop(), RetainedJumpNop::None);
+    assert!(policy.allows_threading_target());
+    assert!(!policy.defers_redundant_removal());
+    assert!(!policy.preserves_nop_after_threading());
 }
 
 #[test]
 fn jump_policy_fusion_is_exhaustive() {
     fn policy(bits: u8, retained_nop: RetainedJumpNop) -> JumpPolicy {
-        JumpPolicy {
-            inline_small_exit: bits & 1 != 0,
-            retained_nop,
-            allow_threading_target: bits & 2 != 0,
-            defer_redundant_removal: bits & 4 != 0,
-            preserve_nop_after_threading: bits & 8 != 0,
+        let mut policy = JumpPolicy::default();
+        if bits & 1 == 0 {
+            policy.prevent_small_exit_inlining();
         }
+        match retained_nop {
+            RetainedJumpNop::None => {}
+            RetainedJumpNop::DirectTarget => policy.retain_nop_for_direct_target(),
+            RetainedJumpNop::Always => policy.retain_nop(),
+        }
+        if bits & 2 == 0 {
+            policy.prevent_threading_target();
+        }
+        if bits & 4 != 0 {
+            policy.defer_removal();
+        }
+        if bits & 8 != 0 {
+            policy.preserve_nop_after_threading_for_test();
+        }
+        policy
     }
 
     let retained_nops = [
         RetainedJumpNop::None,
-        RetainedJumpNop::DirectTarget(super::Label(1)),
+        RetainedJumpNop::DirectTarget,
         RetainedJumpNop::Always,
     ];
     for first_bits in 0..16 {
@@ -68,18 +79,22 @@ fn jump_policy_fusion_is_exhaustive() {
                 for second_retained in retained_nops {
                     let first = policy(first_bits, first_retained);
                     let second = policy(second_bits, second_retained);
+                    let expected_bits =
+                        u8::from(first.inline_small_exit() && second.inline_small_exit())
+                            | (u8::from(
+                                first.allows_threading_target() && second.allows_threading_target(),
+                            ) << 1)
+                            | (u8::from(
+                                first.defers_redundant_removal()
+                                    || second.defers_redundant_removal(),
+                            ) << 2)
+                            | (u8::from(
+                                first.preserves_nop_after_threading()
+                                    || second.preserves_nop_after_threading(),
+                            ) << 3);
                     assert_eq!(
                         JumpPolicy::fused(first, second),
-                        JumpPolicy {
-                            inline_small_exit: first.inline_small_exit && second.inline_small_exit,
-                            retained_nop: RetainedJumpNop::None,
-                            allow_threading_target: first.allow_threading_target
-                                && second.allow_threading_target,
-                            defer_redundant_removal: first.defer_redundant_removal
-                                || second.defer_redundant_removal,
-                            preserve_nop_after_threading: first.preserve_nop_after_threading
-                                || second.preserve_nop_after_threading,
-                        }
+                        policy(expected_bits, RetainedJumpNop::None)
                     );
                 }
             }
@@ -90,30 +105,45 @@ fn jump_policy_fusion_is_exhaustive() {
 #[test]
 fn retained_jump_nop_distinguishes_direct_target_provenance() {
     let expected = super::Label(1);
-    let mut policy = JumpPolicy::default();
-    policy.retain_nop_for_direct_target(expected);
-    assert!(policy.retains_nop_for(Operand::Forward(expected)));
-    assert!(!policy.retains_nop_for(Operand::Forward(super::Label(2))));
-    assert!(!policy.retains_nop_for(Operand::Backward(expected)));
-    assert!(!policy.always_retains_nop());
+    let mut instruction = Instruction::new(
+        JUMP_FORWARD,
+        Operand::Forward(expected),
+        SourceLocation::NONE,
+        None,
+    );
+    instruction.jump_policy.retain_nop_for_direct_target();
+    assert!(instruction.jump_policy.retains_nop_for(instruction.operand));
 
-    policy.retain_nop();
-    policy.retain_nop_for_direct_target(super::Label(2));
-    assert!(policy.always_retains_nop());
-    assert!(policy.retains_nop_for(Operand::Backward(expected)));
+    instruction.retarget(Operand::Forward(expected));
+    assert_eq!(
+        instruction.jump_policy.retained_nop(),
+        RetainedJumpNop::DirectTarget
+    );
+    instruction.retarget(Operand::Forward(super::Label(2)));
+    assert_eq!(
+        instruction.jump_policy.retained_nop(),
+        RetainedJumpNop::None
+    );
+    instruction.retarget(Operand::Forward(expected));
+    assert!(!instruction.jump_policy.retains_nop_for(instruction.operand));
+
+    instruction.jump_policy.retain_nop();
+    instruction.retarget(Operand::Backward(expected));
+    assert!(instruction.jump_policy.always_retains_nop());
+    assert!(instruction.jump_policy.retains_nop_for(instruction.operand));
 }
 
 #[test]
 fn deferred_jump_removal_promotes_post_threading_nop_retention() {
     let mut policy = JumpPolicy::default();
     policy.retain_redundant_nop_after_threading();
-    assert!(policy.defer_redundant_removal);
-    assert!(policy.preserve_nop_after_threading);
+    assert!(policy.defers_redundant_removal());
+    assert!(policy.preserves_nop_after_threading());
 
     policy.resolve_deferred_removal();
-    assert!(!policy.defer_redundant_removal);
-    assert!(!policy.preserve_nop_after_threading);
-    assert_eq!(policy.retained_nop, RetainedJumpNop::Always);
+    assert!(!policy.defers_redundant_removal());
+    assert!(!policy.preserves_nop_after_threading());
+    assert_eq!(policy.retained_nop(), RetainedJumpNop::Always);
 }
 
 #[test]
@@ -260,8 +290,8 @@ fn fusion_preserves_each_typed_instruction_policy() {
     first.no_location_policy.allow_block_inlining = true;
     first.converted_pop_block = true;
     first.fusion_policy.prevent_with_next = true;
-    first.jump_policy.allow_threading_target = false;
-    first.jump_policy.defer_redundant_removal = true;
+    first.jump_policy.prevent_threading_target();
+    first.jump_policy.defer_removal();
     first.jump_policy.retain_nop();
     first
         .exception_policy
@@ -277,11 +307,9 @@ fn fusion_preserves_each_typed_instruction_policy() {
     second.load_policy.strict_owned = true;
     second.no_location_policy.preserve = true;
     second.fusion_policy.prevent_with_previous = true;
-    second.jump_policy.inline_small_exit = false;
-    second.jump_policy.preserve_nop_after_threading = true;
-    second
-        .jump_policy
-        .retain_nop_for_direct_target(super::Label(2));
+    second.jump_policy.prevent_small_exit_inlining();
+    second.jump_policy.retain_redundant_nop_after_threading();
+    second.jump_policy.retain_nop_for_direct_target();
     second.exception_policy.exclude(ExceptionExclusion::Always);
     second.exception_policy.normalized_owner = NormalizedExceptionOwner::Present;
     second.borrow_fallthrough = BorrowFallthrough::Barrier;
@@ -306,16 +334,11 @@ fn fusion_preserves_each_typed_instruction_policy() {
     assert!(fused.converted_pop_block);
     assert_eq!(fused.location, first.location);
     assert_eq!(fused.depth_after, second.depth_after);
-    assert_eq!(
-        fused.jump_policy,
-        JumpPolicy {
-            inline_small_exit: false,
-            retained_nop: RetainedJumpNop::None,
-            allow_threading_target: false,
-            defer_redundant_removal: true,
-            preserve_nop_after_threading: true,
-        }
-    );
+    let mut expected_jump_policy = JumpPolicy::default();
+    expected_jump_policy.prevent_small_exit_inlining();
+    expected_jump_policy.prevent_threading_target();
+    expected_jump_policy.retain_redundant_nop_after_threading();
+    assert_eq!(fused.jump_policy, expected_jump_policy);
     assert_eq!(fused.borrow_fallthrough, BorrowFallthrough::Barrier);
     assert_eq!(
         fused.exception_policy,

@@ -81,7 +81,7 @@ pub(crate) struct Label(pub(super) u32);
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct InstructionId(pub(super) usize);
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Operand {
     Value(u32),
     Forward(Label),
@@ -145,93 +145,140 @@ pub(super) enum BorrowFallthrough {
 pub(super) enum RetainedJumpNop {
     #[default]
     None,
-    // Retain the jump's line event only if its original target is copied directly.
-    DirectTarget(Label),
+    // Retain the jump's line event only while it still points at its original direct target.
+    DirectTarget,
     Always,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct JumpPolicy {
-    pub(super) inline_small_exit: bool,
-    pub(super) retained_nop: RetainedJumpNop,
-    pub(super) allow_threading_target: bool,
-    pub(super) defer_redundant_removal: bool,
-    pub(super) preserve_nop_after_threading: bool,
-}
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) struct JumpPolicy(u8);
 
 impl JumpPolicy {
-    const SYNTHETIC: Self = Self {
-        inline_small_exit: false,
-        ..Self::DEFAULT
-    };
+    const RETAINED_NOP_MASK: u8 = 0b11;
+    const RETAINED_NOP_ALWAYS: u8 = 0b01;
+    const RETAINED_NOP_DIRECT_TARGET: u8 = 0b10;
+    const PREVENT_SMALL_EXIT_INLINING: u8 = 1 << 2;
+    const PREVENT_THREADING_TARGET: u8 = 1 << 3;
+    const DEFER_REDUNDANT_REMOVAL: u8 = 1 << 4;
+    const PRESERVE_NOP_AFTER_THREADING: u8 = 1 << 5;
 
-    const DEFAULT: Self = Self {
-        inline_small_exit: true,
-        retained_nop: RetainedJumpNop::None,
-        allow_threading_target: true,
-        defer_redundant_removal: false,
-        preserve_nop_after_threading: false,
-    };
+    const SYNTHETIC: Self = Self(Self::PREVENT_SMALL_EXIT_INLINING);
+    const DEFAULT: Self = Self(0);
 
     pub(super) const fn fused(first: Self, second: Self) -> Self {
-        Self {
-            inline_small_exit: first.inline_small_exit && second.inline_small_exit,
-            retained_nop: RetainedJumpNop::None,
-            allow_threading_target: first.allow_threading_target && second.allow_threading_target,
-            defer_redundant_removal: first.defer_redundant_removal
-                || second.defer_redundant_removal,
-            preserve_nop_after_threading: first.preserve_nop_after_threading
-                || second.preserve_nop_after_threading,
+        let mut policy = Self::DEFAULT;
+        if !first.inline_small_exit() || !second.inline_small_exit() {
+            policy.0 |= Self::PREVENT_SMALL_EXIT_INLINING;
+        }
+        if !first.allows_threading_target() || !second.allows_threading_target() {
+            policy.0 |= Self::PREVENT_THREADING_TARGET;
+        }
+        if first.defers_redundant_removal() || second.defers_redundant_removal() {
+            policy.0 |= Self::DEFER_REDUNDANT_REMOVAL;
+        }
+        if first.preserves_nop_after_threading() || second.preserves_nop_after_threading() {
+            policy.0 |= Self::PRESERVE_NOP_AFTER_THREADING;
+        }
+        policy
+    }
+
+    pub(super) const fn inline_small_exit(self) -> bool {
+        self.0 & Self::PREVENT_SMALL_EXIT_INLINING == 0
+    }
+
+    pub(super) const fn allows_threading_target(self) -> bool {
+        self.0 & Self::PREVENT_THREADING_TARGET == 0
+    }
+
+    pub(super) const fn defers_redundant_removal(self) -> bool {
+        self.0 & Self::DEFER_REDUNDANT_REMOVAL != 0
+    }
+
+    pub(super) const fn preserves_nop_after_threading(self) -> bool {
+        self.0 & Self::PRESERVE_NOP_AFTER_THREADING != 0
+    }
+
+    pub(super) const fn retained_nop(self) -> RetainedJumpNop {
+        match self.0 & Self::RETAINED_NOP_MASK {
+            0 => RetainedJumpNop::None,
+            Self::RETAINED_NOP_ALWAYS => RetainedJumpNop::Always,
+            Self::RETAINED_NOP_DIRECT_TARGET => RetainedJumpNop::DirectTarget,
+            _ => unreachable!(),
         }
     }
 
     pub(super) const fn always_retains_nop(self) -> bool {
-        matches!(self.retained_nop, RetainedJumpNop::Always)
+        matches!(self.retained_nop(), RetainedJumpNop::Always)
     }
 
     pub(super) fn retains_nop_for(self, operand: Operand) -> bool {
-        match (self.retained_nop, operand) {
+        match (self.retained_nop(), operand) {
             (RetainedJumpNop::Always, _) => true,
-            (RetainedJumpNop::DirectTarget(expected), Operand::Forward(actual)) => {
-                expected == actual
-            }
-            (RetainedJumpNop::None | RetainedJumpNop::DirectTarget(_), _) => false,
+            (RetainedJumpNop::DirectTarget, Operand::Forward(_)) => true,
+            (RetainedJumpNop::None | RetainedJumpNop::DirectTarget, _) => false,
         }
     }
 
     pub(super) fn retain_nop(&mut self) {
-        self.retained_nop = RetainedJumpNop::Always;
+        self.0 = (self.0 & !Self::RETAINED_NOP_MASK) | Self::RETAINED_NOP_ALWAYS;
     }
 
-    pub(super) fn retain_nop_for_direct_target(&mut self, target: Label) {
+    pub(super) fn retain_nop_for_direct_target(&mut self) {
         if !self.always_retains_nop() {
-            self.retained_nop = RetainedJumpNop::DirectTarget(target);
+            self.0 = (self.0 & !Self::RETAINED_NOP_MASK) | Self::RETAINED_NOP_DIRECT_TARGET;
+        }
+    }
+
+    fn clear_direct_target_retention(&mut self) {
+        if matches!(self.retained_nop(), RetainedJumpNop::DirectTarget) {
+            self.0 &= !Self::RETAINED_NOP_MASK;
         }
     }
 
     pub(super) fn defer_removal(&mut self) {
-        self.defer_redundant_removal = true;
+        self.0 |= Self::DEFER_REDUNDANT_REMOVAL;
     }
 
     pub(super) fn retain_redundant_nop_after_threading(&mut self) {
-        self.defer_redundant_removal = true;
-        self.preserve_nop_after_threading = true;
+        self.0 |= Self::DEFER_REDUNDANT_REMOVAL | Self::PRESERVE_NOP_AFTER_THREADING;
+    }
+
+    #[cfg(test)]
+    pub(super) fn preserve_nop_after_threading_for_test(&mut self) {
+        self.0 |= Self::PRESERVE_NOP_AFTER_THREADING;
     }
 
     pub(super) fn prevent_small_exit_inlining(&mut self) {
-        self.inline_small_exit = false;
+        self.0 |= Self::PREVENT_SMALL_EXIT_INLINING;
     }
 
     pub(super) fn prevent_threading_target(&mut self) {
-        self.allow_threading_target = false;
+        self.0 |= Self::PREVENT_THREADING_TARGET;
     }
 
     pub(super) fn resolve_deferred_removal(&mut self) {
-        debug_assert!(self.defer_redundant_removal);
-        self.defer_redundant_removal = false;
-        if std::mem::take(&mut self.preserve_nop_after_threading) {
+        debug_assert!(self.defers_redundant_removal());
+        self.0 &= !Self::DEFER_REDUNDANT_REMOVAL;
+        if self.preserves_nop_after_threading() {
+            self.0 &= !Self::PRESERVE_NOP_AFTER_THREADING;
             self.retain_nop();
         }
+    }
+}
+
+impl std::fmt::Debug for JumpPolicy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("JumpPolicy")
+            .field("inline_small_exit", &self.inline_small_exit())
+            .field("retained_nop", &self.retained_nop())
+            .field("allow_threading_target", &self.allows_threading_target())
+            .field("defer_redundant_removal", &self.defers_redundant_removal())
+            .field(
+                "preserve_nop_after_threading",
+                &self.preserves_nop_after_threading(),
+            )
+            .finish()
     }
 }
 
@@ -363,6 +410,18 @@ impl Instruction {
             jump_policy: JumpPolicy::default(),
             exception_policy: ExceptionPolicy::default(),
             borrow_fallthrough: BorrowFallthrough::default(),
+        }
+    }
+
+    /// Retargets a jump while keeping direct-target line-event provenance honest.
+    pub(super) fn retarget(&mut self, operand: Operand) {
+        debug_assert!(matches!(
+            operand,
+            Operand::Forward(_) | Operand::Backward(_)
+        ));
+        if self.operand != operand {
+            self.jump_policy.clear_direct_target_retention();
+            self.operand = operand;
         }
     }
 

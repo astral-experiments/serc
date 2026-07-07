@@ -255,10 +255,10 @@ impl Assembler {
 
     pub(crate) fn preserve_last_direct_inlined_jump_nop(&mut self) {
         let instruction = self.last_jump_instruction_mut("retaining a directly inlined jump NOP");
-        let Operand::Forward(target) = instruction.operand else {
+        let Operand::Forward(_) = instruction.operand else {
             panic!("retaining a directly inlined jump NOP requires a forward jump");
         };
-        instruction.jump_policy.retain_nop_for_direct_target(target);
+        instruction.jump_policy.retain_nop_for_direct_target();
     }
 
     pub(crate) fn prevent_last_jump_threading_target(&mut self) {
