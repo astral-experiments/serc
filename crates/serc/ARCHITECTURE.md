@@ -49,7 +49,8 @@ Each stage has one primary owner:
 
 | Concern                                                                      | Owner              |
 | ---------------------------------------------------------------------------- | ------------------ |
-| Public API, input normalization, parser setup, `.pyc` header                 | `src/lib.rs`       |
+| Public library API, input normalization, parser setup, `.pyc` header         | `src/lib.rs`       |
+| Filesystem CLI, source discovery, and timestamp-cache writes                 | `../serc_cli/`  |
 | Scope analysis, AST lowering, constants/names/locals, stack-depth accounting | `src/compiler.rs`, `src/compiler/` |
 | Labels, control-flow rewrites, instruction layout, line and exception tables | `src/assembler/`   |
 | CPython IDs, widths, flags, stack metadata, version and provenance           | `src/target/`      |
