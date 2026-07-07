@@ -31,7 +31,7 @@ pub(crate) use ir::{
     AssembledCode, Assembler, ExceptionPolicy, InstructionId, Label, SourceLocation,
 };
 use ir::{
-    ExceptionExclusion, ExceptionRegion, Instruction, InstructionFlags, Item,
+    BorrowFallthrough, ExceptionExclusion, ExceptionRegion, Instruction, InstructionFlags, Item,
     NormalizedExceptionOwner, Operand,
 };
 
@@ -100,8 +100,11 @@ impl Assembler {
         self.borrow_unreachable_blocks.insert(label);
     }
 
-    pub(crate) fn prevent_next_borrow_reachability(&mut self) {
-        self.next_instruction_borrow_unreachable = true;
+    /// Stops the final borrowed-load analysis at the last emitted instruction.
+    pub(crate) fn mark_last_borrow_fallthrough_barrier(&mut self) {
+        self.last_instruction_mut()
+            .expect("borrow fallthrough barrier requires a preceding instruction")
+            .borrow_fallthrough = BorrowFallthrough::Barrier;
     }
 
     pub(crate) fn mark_before_trailing_instructions(&mut self, label: Label, count: usize) {
@@ -537,16 +540,10 @@ impl Assembler {
         let force_owned_load = explicitly_owned
             || strict_owned_load
             || (opcode == LOAD_FAST && !self.load_fast_borrowing_enabled);
-        let borrow_unreachable_entry =
-            std::mem::take(&mut self.next_instruction_borrow_unreachable);
         let mut instruction = Instruction::new(opcode, operand, self.location, depth_after);
         instruction.exception_policy = exception_policy;
         instruction.set_flag(InstructionFlags::FORCE_OWNED_LOAD, force_owned_load);
         instruction.set_flag(InstructionFlags::STRICT_OWNED_LOAD, strict_owned_load);
-        instruction.set_flag(
-            InstructionFlags::BORROW_UNREACHABLE_ENTRY,
-            borrow_unreachable_entry,
-        );
         self.items.push(Item::Instruction(instruction));
     }
 }

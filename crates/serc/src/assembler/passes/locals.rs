@@ -1,10 +1,10 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::super::{
-    CHECK_EXC_MATCH, COMPARE_OP, COPY, DELETE_DEREF, DELETE_FAST, DICT_MERGE, DICT_UPDATE,
-    END_SEND, FOR_ITER, FORMAT_SIMPLE, GET_ANEXT, GET_LEN, GET_YIELD_FROM_ITER, IMPORT_FROM,
-    Instruction, InstructionFlags, Item, LIST_APPEND, LIST_EXTEND, LOAD_ATTR, LOAD_COMMON_CONSTANT,
-    LOAD_CONST, LOAD_FAST, LOAD_FAST_AND_CLEAR, LOAD_FAST_BORROW,
+    BorrowFallthrough, CHECK_EXC_MATCH, COMPARE_OP, COPY, DELETE_DEREF, DELETE_FAST, DICT_MERGE,
+    DICT_UPDATE, END_SEND, FOR_ITER, FORMAT_SIMPLE, GET_ANEXT, GET_LEN, GET_YIELD_FROM_ITER,
+    IMPORT_FROM, Instruction, InstructionFlags, Item, LIST_APPEND, LIST_EXTEND, LOAD_ATTR,
+    LOAD_COMMON_CONSTANT, LOAD_CONST, LOAD_FAST, LOAD_FAST_AND_CLEAR, LOAD_FAST_BORROW,
     LOAD_FAST_BORROW_LOAD_FAST_BORROW, LOAD_FAST_CHECK, LOAD_FAST_LOAD_FAST, LOAD_SMALL_INT,
     LOAD_SPECIAL, LOAD_SUPER_ATTR, MAP_ADD, MATCH_KEYS, MATCH_MAPPING, MATCH_SEQUENCE, NOP,
     Operand, POP_EXCEPT, POP_TOP, PUSH_EXC_INFO, RERAISE, RETURN_VALUE, SEND, SET_ADD,
@@ -385,12 +385,13 @@ impl Assembler {
             .expect("assembler pass requires the block graph");
         graph.repartition(
             &block_labels,
-            |instruction| instruction.has_flag(InstructionFlags::BORROW_UNREACHABLE_ENTRY),
+            |_| false,
             |instruction| {
                 !matches!(instruction.operand, Operand::Value(_))
                     || ends_scope(instruction.opcode)
                     || (instruction.opcode == NOP
                         && instruction.has_flag(InstructionFlags::PRESERVE_INLINED_JUMP_NOP))
+                    || instruction.borrow_fallthrough == BorrowFallthrough::Barrier
             },
         );
         let blocks = graph.order().to_vec();
@@ -399,11 +400,13 @@ impl Assembler {
             .iter()
             .filter_map(|label| graph.label_block(*label))
             .collect::<FxHashSet<_>>();
-        borrow_unreachable_blocks.extend(blocks.iter().copied().filter(|block| {
-            graph[*block].items().iter().any(|item| {
-                matches!(item, Item::Instruction(instruction) if
-                    instruction.has_flag(InstructionFlags::BORROW_UNREACHABLE_ENTRY))
-            })
+        borrow_unreachable_blocks.extend(blocks.windows(2).filter_map(|blocks| {
+            (graph[blocks[0]]
+                .last_instruction()
+                .is_some_and(|instruction| {
+                    instruction.borrow_fallthrough == BorrowFallthrough::Barrier
+                }))
+            .then_some(blocks[1])
         }));
         let block_positions = blocks
             .iter()
@@ -701,8 +704,8 @@ impl Assembler {
                 return None;
             };
             if first.has_flag(InstructionFlags::PREVENT_FUSION_WITH_NEXT)
+                || first.borrow_fallthrough == BorrowFallthrough::Barrier
                 || second.has_flag(InstructionFlags::PREVENT_FUSION_WITH_PREVIOUS)
-                || second.has_flag(InstructionFlags::BORROW_UNREACHABLE_ENTRY)
             {
                 return None;
             }

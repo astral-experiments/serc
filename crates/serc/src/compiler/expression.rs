@@ -3555,8 +3555,9 @@ impl Compiler {
             self.compile_expression(selected)?;
             // CPython leaves the eliminated branch as an empty CFG block before the join.
             // Stack-depth analysis crosses that block, but borrowed-load analysis does not,
-            // so loads emitted after the folded conditional remain owned.
-            self.assembler.prevent_next_borrow_reachability();
+            // so loads emitted after the folded conditional remain owned. Preserve that edge on
+            // the selected predecessor without exposing a label to the earlier assembler passes.
+            self.assembler.mark_last_borrow_fallthrough_barrier();
             return Ok(());
         }
         let base_depth = self.control.depth;
