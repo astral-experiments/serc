@@ -173,10 +173,21 @@ impl FromIterator<NameId> for NameSet {
 }
 
 impl NameInterner {
-    pub(super) fn intern(&mut self, name: String) -> NameId {
-        if let Some(id) = self.by_name.get(&name) {
+    pub(super) fn intern(&mut self, name: &str) -> NameId {
+        if let Some(id) = self.by_name.get(name) {
             return *id;
         }
+        self.insert_owned(name.to_string())
+    }
+
+    fn intern_owned(&mut self, name: String) -> NameId {
+        if let Some(id) = self.by_name.get(name.as_str()) {
+            return *id;
+        }
+        self.insert_owned(name)
+    }
+
+    fn insert_owned(&mut self, name: String) -> NameId {
         let id = NameId(u32::try_from(self.names.len()).expect("too many interned names"));
         self.names.push(name.clone());
         self.by_name.insert(name, id);
@@ -188,7 +199,10 @@ impl NameInterner {
     }
 
     fn intern_set(&mut self, names: impl IntoIterator<Item = String>) -> FxHashSet<NameId> {
-        names.into_iter().map(|name| self.intern(name)).collect()
+        names
+            .into_iter()
+            .map(|name| self.intern_owned(name))
+            .collect()
     }
 
     pub(super) fn resolve(&self, id: NameId) -> &str {
@@ -477,7 +491,7 @@ impl FunctionPlan {
             locals: locals
                 .names
                 .into_iter()
-                .map(|name| names.intern(name))
+                .map(|name| names.intern_owned(name))
                 .collect(),
             globals: names.intern_set(locals.globals),
             annotation_references: names.intern_set(annotation_collector.references),
@@ -748,7 +762,7 @@ impl ScopeArena {
             "join",
             "super",
         ] {
-            arena.names.intern(name.to_string());
+            arena.names.intern(name);
         }
         ModuleNameCollector {
             names: &mut arena.names,
@@ -947,11 +961,9 @@ struct ModuleNameCollector<'a> {
 impl ModuleNameCollector<'_> {
     fn intern(&mut self, name: &str) {
         let mangled = mangle_name(name, self.private_name.as_deref());
-        if mangled == name {
-            self.names.intern(mangled);
-        } else {
-            self.names.intern(name.to_string());
-            self.names.intern(mangled);
+        self.names.intern(name);
+        if let Cow::Owned(mangled) = mangled {
+            self.names.intern_owned(mangled);
         }
     }
 

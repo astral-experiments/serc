@@ -11,23 +11,20 @@ fn interns_adversarial_identifier_families_densely() {
         .collect::<Vec<_>>();
 
     for (index, name) in names.iter().enumerate() {
-        let id = interner.intern(name.clone());
+        let id = interner.intern(name);
         assert_eq!(id, NameId(u32::try_from(index).unwrap()));
         assert_eq!(interner.resolve(id), name);
     }
     for (index, name) in names.iter().enumerate().rev() {
-        assert_eq!(
-            interner.intern(name.clone()),
-            NameId(u32::try_from(index).unwrap())
-        );
+        assert_eq!(interner.intern(name), NameId(u32::try_from(index).unwrap()));
     }
 }
 
 #[test]
 fn name_ids_do_not_define_observable_name_order() {
     let mut interner = NameInterner::default();
-    let source_order = ["zeta", "alpha", "beta", "_hidden", "éclair"]
-        .map(|name| interner.intern(name.to_string()));
+    let source_order =
+        ["zeta", "alpha", "beta", "_hidden", "éclair"].map(|name| interner.intern(name));
     let mut lexical_order = Vec::new();
     for name in source_order {
         interner.insert_lexical(&mut lexical_order, name);
