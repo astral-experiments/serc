@@ -2,19 +2,31 @@
 
 set -euo pipefail
 
-repo_root="$(git rev-parse --show-toplevel)"
+repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 python="${1:-${CPYTHON:-python3.14}}"
 ruff="$repo_root/vendor/ruff"
 
-git -C "$repo_root" submodule update --init --depth 1 vendor/ruff
+corpus_roots=(
+    "$ruff/crates/ty_python_semantic/resources/corpus"
+    "$ruff/crates/ruff_python_parser/resources/valid"
+    "$ruff/crates/ruff_python_parser/resources/inline/ok"
+    "$ruff/crates/ruff_linter/resources/test/fixtures"
+    "$ruff/crates/ruff_python_formatter/resources/test/fixtures"
+)
+
+for corpus_root in "${corpus_roots[@]}"; do
+    if [[ ! -d "$corpus_root" ]]; then
+        echo "error: CPython compatibility corpus is missing: $corpus_root" >&2
+        echo "Initialize it with: git -C '$repo_root' submodule update --init --depth 1 vendor/ruff" >&2
+        exit 2
+    fi
+done
 
 cargo run --locked --manifest-path "$repo_root/Cargo.toml" \
   -p serc --example compare_cpython_corpus -- \
   --python "$python" \
   --expected-files 2451 \
+  --expected-exact 2230 \
+  --expected-cpython-rejected 221 \
   --require-all \
-  "$ruff/crates/ty_python_semantic/resources/corpus" \
-  "$ruff/crates/ruff_python_parser/resources/valid" \
-  "$ruff/crates/ruff_python_parser/resources/inline/ok" \
-  "$ruff/crates/ruff_linter/resources/test/fixtures" \
-  "$ruff/crates/ruff_python_formatter/resources/test/fixtures"
+  "${corpus_roots[@]}"

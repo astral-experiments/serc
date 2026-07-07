@@ -621,6 +621,8 @@ impl PythonRunner {
         let magic = CPYTHON_TARGET.magic_hex();
         let mut child = Command::new(python)
             .args([
+                "-I",
+                "-S",
                 "-u",
                 "-c",
                 PYTHON_HELPER,

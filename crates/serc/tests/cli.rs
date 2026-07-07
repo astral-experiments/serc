@@ -145,17 +145,13 @@ fn compile_rejects_repeated_utf8_boms() {
 
 #[test]
 fn compile_matches_cpython_pyc() {
-    let Some(python) = common::python_3145() else {
-        return;
-    };
     let directory = tempfile::tempdir().unwrap();
     let source_path = directory.path().join("module.py");
     let pyc_path = directory.path().join("__pycache__/module.cpython-314.pyc");
     fs_err::write(&source_path, "def answer():\n    return 42\n").unwrap();
 
-    let cpython = Command::new(python)
+    let cpython = common::python_3145_command()
         .args([
-            "-I",
             "-m",
             "compileall",
             "-q",
@@ -183,9 +179,6 @@ fn compile_matches_cpython_pyc() {
 
 #[test]
 fn compile_matches_cpython_for_utf8_encoding_cookies() {
-    let Some(python) = common::python_3145() else {
-        return;
-    };
     let directory = tempfile::tempdir().unwrap();
 
     for (name, source) in [
@@ -205,9 +198,8 @@ fn compile_matches_cpython_for_utf8_encoding_cookies() {
             .join(format!("__pycache__/{name}.cpython-314.pyc"));
         fs_err::write(&source_path, source).unwrap();
 
-        let cpython = Command::new(&python)
+        let cpython = common::python_3145_command()
             .args([
-                "-I",
                 "-m",
                 "compileall",
                 "-q",

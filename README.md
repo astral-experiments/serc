@@ -14,9 +14,12 @@ Serc compiles Python without embedding or starting a Python runtime. The
 ## Development
 
 ```console
-cargo test --workspace --all-targets
+SERC_TEST_PYTHON=/path/to/python3.14 cargo test --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
 ```
+
+Oracle-dependent tests fail unless `SERC_TEST_PYTHON` names the exact
+CPython 3.14.5 target, including its expected bytecode magic number.
 
 ## Benchmarks
 
@@ -34,11 +37,11 @@ cd serc
 ./scripts/check-cpython-compatibility /path/to/python3.14
 ```
 
-The script initializes the pinned compatibility corpus when needed and
-compares Serc's marshal output with `marshal.dumps(compile(...))` for 2,451
-Python fixtures. Every CPython-accepted file must match byte-for-byte. CI runs
-this gate against the exact supported CPython release on every pull request
-and every push to `main`.
+The script requires the pinned submodule corpus and compares Serc's marshal
+output with `marshal.dumps(compile(...))` for 2,451 Python fixtures. It checks
+the frozen split of 2,230 exact matches and 221 CPython-rejected inputs, with no
+other outcomes. CI runs this gate against the exact supported CPython release
+on every pull request and every push to `main`.
 
 See [`crates/serc/ARCHITECTURE.md`](crates/serc/ARCHITECTURE.md) for
 compiler internals and target-generation details.
