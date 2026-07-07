@@ -2,6 +2,7 @@ use std::cmp::Ordering;
 use std::hash::{Hash, Hasher};
 
 use rustc_hash::FxHasher;
+use smallvec::SmallVec;
 
 use crate::code_object::{CodeObject, Constant, LocalsIdentity};
 
@@ -433,8 +434,11 @@ pub(super) fn constant_key(value: &Constant) -> ObjectKey<'_> {
     }
 }
 
-pub(super) fn constant_sort_key(value: &Constant) -> Vec<u8> {
-    fn append(output: &mut Vec<u8>, value: &Constant, force_reference: bool) {
+pub(super) type ConstantSortKey = SmallVec<[u8; 16]>;
+pub(super) type FrozenSetMembers<'a> = SmallVec<[(ConstantSortKey, &'a Constant); 4]>;
+
+pub(super) fn constant_sort_key(value: &Constant) -> ConstantSortKey {
+    fn append(output: &mut ConstantSortKey, value: &Constant, force_reference: bool) {
         let flag = if force_reference { FLAG_REF } else { 0 };
         match value {
             Constant::None => output.push(TYPE_NONE),
@@ -595,16 +599,16 @@ pub(super) fn constant_sort_key(value: &Constant) -> Vec<u8> {
         }
     }
 
-    let mut output = Vec::new();
+    let mut output = ConstantSortKey::new();
     append(&mut output, value, true);
     output
 }
 
-pub(super) fn frozen_set_members_in_wire_order(values: &[Constant]) -> Vec<(Vec<u8>, &Constant)> {
-    let mut members = values
-        .iter()
-        .map(|value| (constant_sort_key(value), value))
-        .collect::<Vec<_>>();
+pub(super) fn frozen_set_members_in_wire_order(values: &[Constant]) -> FrozenSetMembers<'_> {
+    let mut members = FrozenSetMembers::new();
+    for value in values {
+        members.push((constant_sort_key(value), value));
+    }
     members.sort_by(|(left, _), (right, _)| left.cmp(right));
     members
 }
