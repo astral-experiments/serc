@@ -37,8 +37,9 @@ default or with a UTF-8 encoding cookie; other source encodings are unsupported.
 
 ## CPython corpus comparison
 
-The `compare_cpython_corpus` example discovers every `.py` file under Ruff's linter, formatter,
-parser, and ty semantic test resources. For each CPython-accepted file it compares
+The `compare_cpython_corpus` example discovers every `.py` file under the vendored Ruff
+submodule's linter, formatter, parser, and ty semantic test resources. For each CPython-accepted
+file it compares
 `marshal.dumps(compile(...))` directly with this crate's marshal output:
 
 ```console
@@ -88,13 +89,15 @@ python3 scripts/generate_cpython_target.py --cpython /path/to/cpython
 python3 scripts/generate_cpython_target.py --cpython /path/to/cpython --check
 ```
 
-The generator rejects a checkout at any other commit and records hashes for every CPython source
-file that contributes target or marshal-format metadata. Instruction metadata is emitted under
-`src/target`; the independently versioned marshal protocol constants are emitted under
-`src/marshal`.
+The generator rejects a checkout at any other commit and reads every input through that pinned
+commit, so uncommitted CPython changes cannot be mislabeled as generated target data. It records
+hashes for every CPython source file that contributes target or marshal-format metadata. Instruction
+metadata is emitted under `src/target`; the independently versioned marshal protocol constants are
+emitted under `src/marshal`.
 
 The Ruff dependencies are pinned to a specific Git revision because Ruff's parser crates are not
-published independently.
+published independently. From the workspace root, `./scripts/check-ruff-pin` verifies that the
+Cargo manifest, lockfile, submodule gitlink, and initialized submodule all select the same revision.
 
 From the workspace root, `./scripts/check-cpython-compatibility /path/to/python3.14` initializes
 the matching Ruff corpus and runs the complete frozen gate.

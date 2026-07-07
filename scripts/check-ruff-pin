@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+die() {
+    echo "error: $*" >&2
+    exit 1
+}
+
+count_lines() {
+    awk 'NF { count++ } END { print count + 0 }'
+}
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+repo_root="$(cd "$script_dir/.." && pwd -P)"
+
+if [[ $# -ne 0 ]]; then
+    if [[ $# -ne 2 || "$1" != "--repo-root" ]]; then
+        echo "usage: check-ruff-pin [--repo-root PATH]" >&2
+        exit 2
+    fi
+    repo_root="$(cd "$2" && pwd -P)"
+fi
+
+cargo_toml="$repo_root/Cargo.toml"
+cargo_lock="$repo_root/Cargo.lock"
+ruff="$repo_root/vendor/ruff"
+
+[[ -f "$cargo_toml" ]] || die "Cargo.toml not found at $cargo_toml"
+[[ -f "$cargo_lock" ]] || die "Cargo.lock not found at $cargo_lock"
+
+cargo_dependency_lines="$(awk '
+    /^\[/ { in_workspace_dependencies = ($0 == "[workspace.dependencies]") }
+    in_workspace_dependencies && /^ruff_[[:alnum:]_]*[[:space:]]*=/ && /git[[:space:]]*=/ { print }
+' "$cargo_toml")"
+[[ -n "$cargo_dependency_lines" ]] || die "Cargo.toml has no Git-pinned Ruff workspace dependencies"
+
+cargo_revisions="$(printf '%s\n' "$cargo_dependency_lines" | sed -nE 's/.*rev[[:space:]]*=[[:space:]]*"([0-9a-f]{40})".*/\1/p')"
+dependency_count="$(printf '%s\n' "$cargo_dependency_lines" | count_lines)"
+revision_count="$(printf '%s\n' "$cargo_revisions" | count_lines)"
+[[ "$revision_count" -eq "$dependency_count" ]] || die "every Git-based Ruff dependency in Cargo.toml must have a full 40-character rev"
+
+unique_cargo_revisions="$(printf '%s\n' "$cargo_revisions" | sort -u)"
+[[ "$(printf '%s\n' "$unique_cargo_revisions" | count_lines)" -eq 1 ]] || die "Cargo.toml Ruff dependencies do not share one revision"
+cargo_revision="$unique_cargo_revisions"
+
+lock_sources="$(awk 'index($0, "source = \"git+https://github.com/astral-sh/ruff") { print }' "$cargo_lock")"
+[[ -n "$lock_sources" ]] || die "Cargo.lock has no Ruff Git sources"
+
+lock_revisions="$(printf '%s\n' "$lock_sources" | sed -nE 's/.*[?]rev=([0-9a-f]{40})#([0-9a-f]{40})".*/\1/p')"
+lock_commits="$(printf '%s\n' "$lock_sources" | sed -nE 's/.*[?]rev=([0-9a-f]{40})#([0-9a-f]{40})".*/\2/p')"
+lock_source_count="$(printf '%s\n' "$lock_sources" | count_lines)"
+[[ "$(printf '%s\n' "$lock_revisions" | count_lines)" -eq "$lock_source_count" ]] || die "every Cargo.lock Ruff source must contain full requested and resolved revisions"
+
+unique_lock_revisions="$(printf '%s\n' "$lock_revisions" | sort -u)"
+unique_lock_commits="$(printf '%s\n' "$lock_commits" | sort -u)"
+[[ "$(printf '%s\n' "$unique_lock_revisions" | count_lines)" -eq 1 ]] || die "Cargo.lock Ruff packages do not share one requested revision"
+[[ "$(printf '%s\n' "$unique_lock_commits" | count_lines)" -eq 1 ]] || die "Cargo.lock Ruff packages do not share one resolved commit"
+[[ "$unique_lock_revisions" == "$cargo_revision" ]] || die "Cargo.lock Ruff revision $unique_lock_revisions does not match Cargo.toml revision $cargo_revision"
+[[ "$unique_lock_commits" == "$cargo_revision" ]] || die "Cargo.lock Ruff commit $unique_lock_commits does not match Cargo.toml revision $cargo_revision"
+
+if ! git_toplevel="$(git -C "$repo_root" rev-parse --show-toplevel 2>/dev/null)"; then
+    die "$repo_root is not a Git checkout"
+fi
+git_toplevel="$(cd "$git_toplevel" && pwd -P)"
+[[ "$git_toplevel" == "$repo_root" ]] || die "$repo_root is not the root of its Git checkout"
+
+gitlink_entries="$(git -C "$repo_root" ls-files --stage -- vendor/ruff | awk '$3 == "0" { print }')"
+[[ "$(printf '%s\n' "$gitlink_entries" | count_lines)" -eq 1 ]] || die "vendor/ruff is not recorded as a single Git submodule entry"
+gitlink_mode="$(printf '%s\n' "$gitlink_entries" | awk '{ print $1 }')"
+gitlink_revision="$(printf '%s\n' "$gitlink_entries" | awk '{ print $2 }')"
+[[ "$gitlink_mode" == "160000" ]] || die "vendor/ruff is not recorded as a Git submodule"
+[[ "$gitlink_revision" == "$cargo_revision" ]] || die "vendor/ruff gitlink $gitlink_revision does not match Cargo.toml revision $cargo_revision"
+
+[[ -e "$ruff/.git" ]] || die "Ruff submodule is not initialized at $ruff; run 'git submodule update --init vendor/ruff'"
+if ! ruff_toplevel="$(git -C "$ruff" rev-parse --show-toplevel 2>/dev/null)"; then
+    die "Ruff submodule at $ruff is not a Git checkout"
+fi
+ruff_toplevel="$(cd "$ruff_toplevel" && pwd -P)"
+[[ "$ruff_toplevel" == "$ruff" ]] || die "$ruff is not the root of the Ruff submodule checkout"
+ruff_revision="$(git -C "$ruff" rev-parse 'HEAD^{commit}')"
+[[ "$ruff_revision" == "$gitlink_revision" ]] || die "Ruff submodule HEAD $ruff_revision does not match gitlink $gitlink_revision"
+
+echo "Ruff Cargo dependencies, lockfile, gitlink, and submodule agree on $cargo_revision"

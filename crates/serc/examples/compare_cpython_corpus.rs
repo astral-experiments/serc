@@ -278,15 +278,16 @@ fn parse_options() -> Result<Options, String> {
     }
 
     if roots.is_empty() {
+        let ruff = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vendor/ruff");
         roots = [
-            "../ruff/crates/ty_python_semantic/resources/corpus",
-            "../ruff/crates/ruff_python_parser/resources/valid",
-            "../ruff/crates/ruff_python_parser/resources/inline/ok",
-            "../ruff/crates/ruff_linter/resources/test/fixtures",
-            "../ruff/crates/ruff_python_formatter/resources/test/fixtures",
+            "crates/ty_python_semantic/resources/corpus",
+            "crates/ruff_python_parser/resources/valid",
+            "crates/ruff_python_parser/resources/inline/ok",
+            "crates/ruff_linter/resources/test/fixtures",
+            "crates/ruff_python_formatter/resources/test/fixtures",
         ]
         .into_iter()
-        .map(PathBuf::from)
+        .map(|root| ruff.join(root))
         .collect();
     }
 
