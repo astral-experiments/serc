@@ -1,11 +1,12 @@
 use crate::code_object::{CodeObject, Constant, LocalsIdentity, MarshalHints};
 
 use super::encode_code;
-use super::graph::{ObjectGraph, ObjectLocation};
+use super::graph::ObjectGraph;
 use super::key::{
     ObjectKey, code_bytes_key, code_key, constant_key, constant_sort_key, constants_tuple_key,
     local_kinds_key, locals_tuple_key, slice_member_uses_identity, strings_tuple_key,
 };
+use super::plan::{MarshalVisitor, ReferenceMode, traverse_code};
 
 fn code_object(constants: Vec<Constant>) -> CodeObject {
     CodeObject {
@@ -30,22 +31,11 @@ fn code_object(constants: Vec<Constant>) -> CodeObject {
 }
 
 #[test]
-#[should_panic(expected = "marshal occurrence 0 mismatch")]
-fn occurrence_cursor_rejects_a_mismatched_location() {
-    let code = code_object(Vec::new());
-    let graph = ObjectGraph::for_code(&code);
-    let mut occurrences = graph.occurrence_cursor();
-
-    occurrences.consume(ObjectLocation::Bytes(0));
-}
-
-#[test]
 #[should_panic(expected = "marshal writer requested occurrence 0")]
 fn occurrence_cursor_rejects_over_consumption() {
     let graph = ObjectGraph::default();
-    let mut occurrences = graph.occurrence_cursor();
 
-    occurrences.consume(ObjectLocation::Bytes(0));
+    graph.occurrence_cursor().consume();
 }
 
 #[test]
@@ -273,4 +263,197 @@ fn nested_frozen_set_wire_order_uses_recursive_member_keys() {
     let second = code_object(vec![Constant::FrozenSet(vec![second_nested, first_nested])]);
 
     assert_eq!(encode_code(&first), encode_code(&second));
+}
+
+#[derive(Clone, Copy)]
+enum RecordedValue<'a> {
+    Code(&'a CodeObject),
+    Constants(&'a [Constant]),
+    Constant(&'a Constant),
+    SliceMember(&'a Constant),
+}
+
+#[derive(Default)]
+struct RecordingVisitor<'a> {
+    entries: Vec<(RecordedValue<'a>, ReferenceMode)>,
+    pruned: Option<&'a [Constant]>,
+}
+
+impl<'a> RecordingVisitor<'a> {
+    fn push(&mut self, value: RecordedValue<'a>, reference_mode: ReferenceMode) {
+        self.entries.push((value, reference_mode));
+    }
+}
+
+impl<'a> MarshalVisitor<'a> for RecordingVisitor<'a> {
+    fn code(&mut self, code: &'a CodeObject, reference_mode: ReferenceMode) -> bool {
+        self.push(RecordedValue::Code(code), reference_mode);
+        true
+    }
+
+    fn code_bytes(&mut self, _code: &'a CodeObject) {}
+
+    fn constants(&mut self, values: &'a [Constant], reference_mode: ReferenceMode) -> bool {
+        self.push(RecordedValue::Constants(values), reference_mode);
+        !self
+            .pruned
+            .is_some_and(|pruned| std::ptr::eq(pruned, values))
+    }
+
+    fn strings(&mut self, _values: &'a [String]) -> bool {
+        true
+    }
+
+    fn locals(&mut self, _code: &'a CodeObject) -> bool {
+        true
+    }
+
+    fn local_kinds(&mut self, _code: &'a CodeObject) {}
+
+    fn metadata_string(&mut self, _value: &'a str) {}
+
+    fn first_line(&mut self, _value: u32) {}
+
+    fn bytes(&mut self, _value: &'a [u8]) {}
+
+    fn constant(&mut self, value: &'a Constant, reference_mode: ReferenceMode) -> bool {
+        self.push(RecordedValue::Constant(value), reference_mode);
+        true
+    }
+
+    fn slice_member(&mut self, value: &'a Constant) {
+        self.push(RecordedValue::SliceMember(value), ReferenceMode::IfShared);
+    }
+}
+
+#[test]
+fn marshal_traversal_is_preorder() {
+    let nested = code_object(vec![Constant::Tuple(vec![Constant::Int(7)])]);
+    let code = code_object(vec![
+        Constant::Code(Box::new(nested)),
+        Constant::Tuple(vec![Constant::String("outer".to_string())]),
+    ]);
+    let mut visitor = RecordingVisitor::default();
+    traverse_code(&code, &mut visitor);
+
+    assert!(
+        matches!(visitor.entries[0].0, RecordedValue::Code(value) if std::ptr::eq(value, std::ptr::from_ref(&code)))
+    );
+    let root_constants = visitor
+        .entries
+        .iter()
+        .position(|(value, _)| {
+            matches!(value, RecordedValue::Constants(values) if std::ptr::eq(*values, code.constants.as_slice()))
+        })
+        .unwrap();
+    let Constant::Code(nested) = &code.constants[0] else {
+        unreachable!();
+    };
+    let nested_code = visitor
+        .entries
+        .iter()
+        .position(|(value, _)| {
+            matches!(value, RecordedValue::Code(candidate) if std::ptr::eq(*candidate, nested.as_ref()))
+        })
+        .unwrap();
+    let nested_constants = visitor
+        .entries
+        .iter()
+        .position(|(value, _)| {
+            matches!(value, RecordedValue::Constants(values) if std::ptr::eq(*values, nested.constants.as_slice()))
+        })
+        .unwrap();
+
+    assert!(root_constants < nested_code);
+    assert!(nested_code < nested_constants);
+}
+
+#[test]
+fn marshal_traversal_honors_container_pruning() {
+    let code = code_object(vec![Constant::Tuple(vec![Constant::String(
+        "pruned".to_string(),
+    )])]);
+    let Constant::Tuple(pruned) = &code.constants[0] else {
+        unreachable!();
+    };
+    let child = std::ptr::from_ref(&pruned[0]);
+    let mut visitor = RecordingVisitor {
+        pruned: Some(pruned),
+        ..RecordingVisitor::default()
+    };
+    traverse_code(&code, &mut visitor);
+
+    assert!(visitor.entries.iter().any(
+        |(value, _)| matches!(value, RecordedValue::Constants(values) if std::ptr::eq(*values, pruned.as_slice()))
+    ));
+    assert!(!visitor.entries.iter().any(
+        |(value, _)| matches!(value, RecordedValue::Constant(value) if std::ptr::eq(*value, child))
+    ));
+}
+
+#[test]
+fn marshal_traversal_preserves_reference_mode_and_slice_member_identity() {
+    let code = code_object(vec![
+        Constant::FrozenSet(vec![Constant::String("forced".to_string())]),
+        Constant::Slice {
+            lower: Box::new(Constant::Float(2.5)),
+            upper: Box::new(Constant::Int(256)),
+            step: Box::new(Constant::None),
+        },
+        Constant::Slice {
+            lower: Box::new(Constant::Float(2.5)),
+            upper: Box::new(Constant::Int(256)),
+            step: Box::new(Constant::Bool(false)),
+        },
+    ]);
+    let mut visitor = RecordingVisitor::default();
+    traverse_code(&code, &mut visitor);
+
+    let Constant::FrozenSet(values) = &code.constants[0] else {
+        unreachable!();
+    };
+    let forced = visitor
+        .entries
+        .iter()
+        .find(|(value, _)| {
+            matches!(value, RecordedValue::Constant(value) if std::ptr::eq(*value, std::ptr::from_ref(&values[0])))
+        })
+        .unwrap();
+    assert_eq!(forced.1, ReferenceMode::Forced);
+
+    let slices = [1, 2].map(|index| {
+        let Constant::Slice { lower, upper, .. } = &code.constants[index] else {
+            unreachable!();
+        };
+        (lower.as_ref(), upper.as_ref())
+    });
+    let entry_for = |value: &Constant| {
+        visitor
+            .entries
+            .iter()
+            .find(|(planned, _)| match planned {
+                RecordedValue::Constant(candidate) | RecordedValue::SliceMember(candidate) => {
+                    std::ptr::eq(*candidate, value)
+                }
+                _ => false,
+            })
+            .unwrap()
+    };
+    assert!(matches!(
+        entry_for(slices[0].0).0,
+        RecordedValue::SliceMember(_)
+    ));
+    assert_eq!(entry_for(slices[0].0).1, ReferenceMode::IfShared);
+    assert!(matches!(
+        entry_for(slices[1].0).0,
+        RecordedValue::SliceMember(_)
+    ));
+    assert!(matches!(
+        entry_for(slices[0].1).0,
+        RecordedValue::Constant(_)
+    ));
+    assert!(matches!(
+        entry_for(slices[1].1).0,
+        RecordedValue::Constant(_)
+    ));
 }
