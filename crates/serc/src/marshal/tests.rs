@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use crate::compiler::{CodeObject, Constant};
 
 use super::encode_code;
-use super::graph::ObjectGraph;
+use super::graph::{ObjectGraph, ObjectLocation};
 use super::key::{
     ObjectKey, code_bytes_key, code_key, constant_key, local_kinds_key, locals_tuple_key,
     slice_member_uses_identity,
@@ -30,6 +30,34 @@ fn code_object(constants: Vec<Constant>) -> CodeObject {
         annotation_thunk: false,
         interned_constant_strings: HashSet::default(),
     }
+}
+
+#[test]
+#[should_panic(expected = "marshal occurrence 0 mismatch")]
+fn occurrence_cursor_rejects_a_mismatched_location() {
+    let code = code_object(Vec::new());
+    let graph = ObjectGraph::for_code(&code);
+    let mut occurrences = graph.occurrence_cursor();
+
+    occurrences.consume(ObjectLocation::Bytes(0));
+}
+
+#[test]
+#[should_panic(expected = "marshal writer requested occurrence 0")]
+fn occurrence_cursor_rejects_over_consumption() {
+    let graph = ObjectGraph::default();
+    let mut occurrences = graph.occurrence_cursor();
+
+    occurrences.consume(ObjectLocation::Bytes(0));
+}
+
+#[test]
+#[should_panic(expected = "marshal writer consumed 0 of")]
+fn occurrence_cursor_rejects_under_consumption() {
+    let code = code_object(Vec::new());
+    let graph = ObjectGraph::for_code(&code);
+
+    graph.occurrence_cursor().finish();
 }
 
 #[test]

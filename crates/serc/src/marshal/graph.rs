@@ -30,6 +30,47 @@ pub(super) enum ObjectLocation {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct ObjectId(pub(super) usize);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Occurrence {
+    location: ObjectLocation,
+    object: ObjectId,
+}
+
+#[derive(Debug)]
+pub(super) struct OccurrenceCursor<'a> {
+    occurrences: &'a [Occurrence],
+    next: usize,
+}
+
+impl OccurrenceCursor<'_> {
+    pub(super) fn consume(&mut self, expected: ObjectLocation) -> ObjectId {
+        let index = self.next;
+        let Some(occurrence) = self.occurrences.get(index) else {
+            panic!(
+                "marshal writer requested occurrence {index} ({expected:?}), but the graph recorded {} occurrences",
+                self.occurrences.len()
+            );
+        };
+        assert_eq!(
+            occurrence.location, expected,
+            "marshal occurrence {index} mismatch: writer requested {expected:?}, graph recorded {:?}",
+            occurrence.location
+        );
+        self.next += 1;
+        occurrence.object
+    }
+
+    pub(super) fn finish(self) {
+        assert_eq!(
+            self.next,
+            self.occurrences.len(),
+            "marshal writer consumed {} of {} recorded occurrences",
+            self.next,
+            self.occurrences.len()
+        );
+    }
+}
+
 #[derive(Debug)]
 struct Object {
     count: usize,
@@ -41,9 +82,7 @@ struct Object {
 pub(super) struct ObjectGraph<'a> {
     objects: FxHashMap<ObjectKey<'a>, ObjectId>,
     objects_by_id: Vec<Object>,
-    occurrences: Vec<ObjectId>,
-    #[cfg(debug_assertions)]
-    occurrence_locations: Vec<ObjectLocation>,
+    occurrences: Vec<Occurrence>,
     explicitly_interned: Vec<&'a str>,
 }
 
@@ -71,11 +110,12 @@ impl<'a> ObjectGraph<'a> {
         self.record_object(key, false).1
     }
 
-    fn record_at(&mut self, _location: ObjectLocation, key: ObjectKey<'a>, interned: bool) -> bool {
+    fn record_at(&mut self, location: ObjectLocation, key: ObjectKey<'a>, interned: bool) -> bool {
         let (id, first) = self.record_object(key, interned);
-        self.occurrences.push(id);
-        #[cfg(debug_assertions)]
-        self.occurrence_locations.push(_location);
+        self.occurrences.push(Occurrence {
+            location,
+            object: id,
+        });
         first
     }
 
@@ -289,14 +329,11 @@ impl<'a> ObjectGraph<'a> {
         self.objects_by_id.len()
     }
 
-    pub(super) fn occurrence_count(&self) -> usize {
-        self.occurrences.len()
-    }
-
-    pub(super) fn occurrence(&self, index: usize, _expected: ObjectLocation) -> ObjectId {
-        #[cfg(debug_assertions)]
-        debug_assert_eq!(self.occurrence_locations[index], _expected);
-        self.occurrences[index]
+    pub(super) fn occurrence_cursor(&self) -> OccurrenceCursor<'_> {
+        OccurrenceCursor {
+            occurrences: &self.occurrences,
+            next: 0,
+        }
     }
 
     pub(super) fn is_interned_object(&self, id: ObjectId) -> bool {
