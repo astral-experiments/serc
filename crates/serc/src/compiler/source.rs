@@ -1,17 +1,17 @@
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use ruff_python_ast::token::{TokenKind, Tokens};
-use ruff_python_ast::{Expr, FStringPart, InterpolatedStringElement, Stmt};
+use ruff_python_ast::{Expr, FStringPart, InterpolatedStringElement, Stmt, Suite};
 use ruff_python_codegen::{Generator, Indentation, Mode as CodegenMode};
 use ruff_source_file::{LineEnding, LineIndex};
-use ruff_text_size::{Ranged, TextSize};
+use ruff_text_size::{Ranged, TextLen, TextSize};
 use rustc_hash::FxHashSet;
 
 use crate::assembler::SourceLocation;
 use crate::code_object::Constant;
 
 use super::constant::{explicit_surrogate_string, fold_constant};
-use super::scope::ScopeArena;
+use super::scope::{ModulePlan, ScopeArena};
 use super::{CachedSourceLine, Compiler};
 
 #[derive(Debug)]
@@ -20,17 +20,20 @@ pub(super) struct CompilationContext {
     pub(super) source: Arc<str>,
     pub(super) tokens: Tokens,
     line_index: LineIndex,
-    pub(super) scopes: OnceLock<ScopeArena>,
+    pub(super) module_plan: ModulePlan,
+    pub(super) scopes: ScopeArena,
 }
 
 impl CompilationContext {
-    pub(super) fn new(filename: &str, source: &str, tokens: Tokens) -> Self {
+    pub(super) fn new(filename: &str, source: &str, tokens: Tokens, body: &Suite) -> Self {
+        let (scopes, module_plan) = ScopeArena::analyze(body);
         Self {
             filename: filename.to_string(),
             source: Arc::from(source),
             tokens,
             line_index: LineIndex::from_source_text(source),
-            scopes: OnceLock::new(),
+            module_plan,
+            scopes,
         }
     }
 }
@@ -176,40 +179,30 @@ impl Compiler {
             .unwrap_or(generator.range)
     }
 
-    fn interpolated_string_content_range(
+    pub(super) fn debug_expression_source_range(
         &self,
-        range: ruff_text_size::TextRange,
+        interpolation: &ruff_python_ast::InterpolatedElement,
     ) -> ruff_text_size::TextRange {
-        let start = usize::from(range.start());
-        let end = usize::from(range.end());
-        let text = &self.context.source.as_bytes()[start..end];
-        let Some(quote_offset) = text.iter().position(|byte| matches!(byte, b'\'' | b'"')) else {
-            return range;
-        };
-        let quote = text[quote_offset];
-        let quote_len = if text.get(quote_offset..quote_offset + 3) == Some(&[quote; 3]) {
-            3
-        } else {
-            1
-        };
-        let content_start = start + quote_offset + quote_len;
-        let has_closing_quote = text.len() >= quote_len
-            && text[text.len() - quote_len..]
-                .iter()
-                .all(|byte| *byte == quote);
-        let content_end = if has_closing_quote {
-            end - quote_len
-        } else {
-            end
-        };
-        ruff_text_size::TextRange::new(
-            ruff_text_size::TextSize::new(u32::try_from(content_start).unwrap_or(u32::MAX)),
-            ruff_text_size::TextSize::new(u32::try_from(content_end).unwrap_or(u32::MAX)),
-        )
+        assert!(
+            interpolation.debug_text.is_some(),
+            "debug expression range requires debug text"
+        );
+        let tokens = self.context.tokens.in_range(interpolation.range);
+        let opening = tokens
+            .first()
+            .filter(|token| token.kind() == TokenKind::Lbrace)
+            .expect("interpolation should start with an opening brace");
+        let marker = tokens
+            .iter()
+            .find(|token| {
+                token.start() >= interpolation.expression.range().end()
+                    && token.kind() == TokenKind::Equal
+            })
+            .expect("debug interpolation should contain an equals token");
+        ruff_text_size::TextRange::new(opening.end(), marker.start())
     }
 
     pub(super) fn fstring_result_range(
-        &self,
         fstring: &ruff_python_ast::ExprFString,
     ) -> ruff_text_size::TextRange {
         let mut component_count = 0;
@@ -248,7 +241,7 @@ impl Compiler {
         if component_count == 1 {
             only_interpolation.unwrap_or_else(|| {
                 fstring_literal_span(fstring)
-                    .unwrap_or_else(|| self.interpolated_string_content_range(fstring.range))
+                    .unwrap_or_else(|| interpolated_string_content_range(fstring.into()))
             })
         } else {
             fstring.range
@@ -305,6 +298,18 @@ impl Compiler {
     }
 }
 
+pub(super) fn interpolated_string_content_range(
+    string: ruff_python_ast::StringLike<'_>,
+) -> ruff_text_size::TextRange {
+    debug_assert!(string.is_interpolated_string());
+    let mut parts = string.parts();
+    let Some(first) = parts.next() else {
+        return string.range();
+    };
+    let last = parts.next_back().unwrap_or(first);
+    ruff_text_size::TextRange::new(first.content_range().start(), last.content_range().end())
+}
+
 pub(super) fn debug_text_range(
     interpolation: &ruff_python_ast::InterpolatedElement,
 ) -> ruff_text_size::TextRange {
@@ -312,12 +317,9 @@ pub(super) fn debug_text_range(
         .debug_text
         .as_ref()
         .expect("debug text range requires debug text");
-    let start = u32::from(interpolation.range.start()).saturating_add(1);
-    let length = debug.leading().len() + debug.expression().len() + debug.trailing().len();
-    let end = start.saturating_add(u32::try_from(length).unwrap_or(u32::MAX));
-    ruff_text_size::TextRange::new(
-        ruff_text_size::TextSize::new(start),
-        ruff_text_size::TextSize::new(end),
+    ruff_text_size::TextRange::at(
+        interpolation.range.start() + "{".text_len(),
+        debug.as_str().text_len(),
     )
 }
 
@@ -346,68 +348,37 @@ fn fstring_literal_span(
     Some(ruff_text_size::TextRange::new(first?, last?))
 }
 
-/// Removes Python comments while preserving the whitespace and newlines around
-/// them, as CPython does for the source text stored by a t-string interpolation.
+/// Removes expression-level Python comments while preserving every other byte,
+/// as CPython does for the source text stored by a t-string interpolation.
 pub(super) fn strip_expression_comments(source: &str) -> String {
-    let bytes = source.as_bytes();
-    let mut output = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    let mut quote = None;
-    let mut triple_quoted = false;
-
-    while index < bytes.len() {
-        if let Some(delimiter) = quote {
-            if bytes[index] == b'\\' {
-                output.push(bytes[index]);
-                index += 1;
-                if index < bytes.len() {
-                    output.push(bytes[index]);
-                    index += 1;
-                }
-                continue;
+    let parsed = ruff_python_parser::parse_unchecked(
+        source,
+        ruff_python_parser::ParseOptions::from(ruff_python_parser::Mode::ParenthesizedExpression),
+    );
+    let mut output = String::with_capacity(source.len());
+    let mut copied = 0;
+    // Ruff tokenizes comments inside nested interpolated strings. They are part of the nested
+    // string's source from the outer expression's perspective, so preserve them here.
+    let mut interpolated_string_depth = 0_u32;
+    for token in parsed.tokens() {
+        match token.kind() {
+            TokenKind::FStringStart | TokenKind::TStringStart => {
+                interpolated_string_depth += 1;
             }
-            if bytes[index] == delimiter {
-                if triple_quoted {
-                    if bytes.get(index..index + 3) == Some(&[delimiter; 3]) {
-                        output.extend_from_slice(&bytes[index..index + 3]);
-                        index += 3;
-                        quote = None;
-                        triple_quoted = false;
-                        continue;
-                    }
-                } else {
-                    output.push(bytes[index]);
-                    index += 1;
-                    quote = None;
-                    continue;
-                }
+            TokenKind::FStringEnd | TokenKind::TStringEnd => {
+                interpolated_string_depth = interpolated_string_depth.saturating_sub(1);
             }
-            output.push(bytes[index]);
-            index += 1;
-            continue;
-        }
-
-        match bytes[index] {
-            b'#' => {
-                while index < bytes.len() && !matches!(bytes[index], b'\n' | b'\r') {
-                    index += 1;
-                }
+            TokenKind::Comment if interpolated_string_depth == 0 => {
+                let start = usize::from(token.start());
+                let end = usize::from(token.end());
+                output.push_str(&source[copied..start]);
+                copied = end;
             }
-            delimiter @ (b'\'' | b'"') => {
-                triple_quoted = bytes.get(index..index + 3) == Some(&[delimiter; 3]);
-                let length = if triple_quoted { 3 } else { 1 };
-                output.extend_from_slice(&bytes[index..index + length]);
-                index += length;
-                quote = Some(delimiter);
-            }
-            byte => {
-                output.push(byte);
-                index += 1;
-            }
+            _ => {}
         }
     }
-
-    String::from_utf8(output).expect("removing ASCII comments preserves UTF-8")
+    output.push_str(&source[copied..]);
+    output
 }
 pub(super) fn implicit_return_range(
     compiler: &Compiler,
@@ -421,7 +392,7 @@ pub(super) fn implicit_return_range(
                 last_store_target_range(compiler, target)
             }),
         Stmt::Expr(expression) => match expression.value.as_ref() {
-            Expr::FString(fstring) => compiler.fstring_result_range(fstring),
+            Expr::FString(fstring) => Compiler::fstring_result_range(fstring),
             expression => expression.range(),
         },
         Stmt::AnnAssign(assignment) => {
@@ -515,59 +486,38 @@ pub(super) fn unparse_annotation(expression: &Expr) -> String {
     let mut annotation = Generator::new(&indentation, LineEnding::Lf)
         .with_mode(CodegenMode::AstUnparse)
         .expr(expression);
-    let bytes = annotation.as_bytes();
-    let mut stack = Vec::<(u8, usize)>::new();
+    let parsed = ruff_python_parser::parse_unchecked(
+        &annotation,
+        ruff_python_parser::ParseOptions::from(ruff_python_parser::Mode::ParenthesizedExpression),
+    );
+    let mut stack = Vec::<(TokenKind, usize)>::new();
     let mut parenthesis_pairs = FxHashSet::default();
     let mut bracket_pairs = Vec::new();
-    let mut quote = None::<(u8, bool)>;
-    let mut index = 0_usize;
-    while index < bytes.len() {
-        if let Some((delimiter, triple)) = quote {
-            if bytes[index] == b'\\' {
-                index = (index + 2).min(bytes.len());
-                continue;
+    for token in parsed.tokens() {
+        match token.kind() {
+            opening @ (TokenKind::Lpar | TokenKind::Lsqb | TokenKind::Lbrace) => {
+                stack.push((opening, usize::from(token.start())));
             }
-            if bytes[index] == delimiter
-                && (!triple
-                    || bytes.get(index + 1) == Some(&delimiter)
-                        && bytes.get(index + 2) == Some(&delimiter))
-            {
-                index += if triple { 3 } else { 1 };
-                quote = None;
-                continue;
-            }
-            index += 1;
-            continue;
-        }
-        match bytes[index] {
-            delimiter @ (b'\'' | b'"') => {
-                let triple = bytes.get(index + 1) == Some(&delimiter)
-                    && bytes.get(index + 2) == Some(&delimiter);
-                quote = Some((delimiter, triple));
-                index += if triple { 3 } else { 1 };
-                continue;
-            }
-            delimiter @ (b'(' | b'[' | b'{') => stack.push((delimiter, index)),
-            b')' | b']' | b'}' => {
-                let closing = bytes[index];
+            closing @ (TokenKind::Rpar | TokenKind::Rsqb | TokenKind::Rbrace) => {
                 let expected = match closing {
-                    b')' => b'(',
-                    b']' => b'[',
-                    _ => b'{',
+                    TokenKind::Rpar => TokenKind::Lpar,
+                    TokenKind::Rsqb => TokenKind::Lsqb,
+                    TokenKind::Rbrace => TokenKind::Lbrace,
+                    _ => unreachable!(),
                 };
                 if let Some((opening, opening_index)) = stack.pop()
                     && opening == expected
                 {
-                    if opening == b'(' {
-                        parenthesis_pairs.insert((opening_index, index));
-                    } else if opening == b'[' {
-                        bracket_pairs.push((opening_index, index));
+                    let closing_index = usize::from(token.start());
+                    if opening == TokenKind::Lpar {
+                        parenthesis_pairs.insert((opening_index, closing_index));
+                    } else if opening == TokenKind::Lsqb {
+                        bracket_pairs.push((opening_index, closing_index));
                     }
                 }
             }
             _ => {}
         }
-        index += 1;
     }
     let mut removals = bracket_pairs
         .into_iter()
@@ -595,32 +545,8 @@ pub(super) fn unparse_annotation(expression: &Expr) -> String {
 }
 
 fn python_string_repr(value: &str) -> String {
-    let quote = if value.contains('\'') && !value.contains('"') {
-        '"'
-    } else {
-        '\''
-    };
-    let mut repr = String::with_capacity(value.len() + 2);
-    repr.push(quote);
-    for character in value.chars() {
-        match character {
-            '\\' => repr.push_str("\\\\"),
-            '\n' => repr.push_str("\\n"),
-            '\r' => repr.push_str("\\r"),
-            '\t' => repr.push_str("\\t"),
-            '\x08' => repr.push_str("\\b"),
-            '\x0c' => repr.push_str("\\f"),
-            character if character == quote => {
-                repr.push('\\');
-                repr.push(character);
-            }
-            character if character.is_control() => {
-                use std::fmt::Write;
-                write!(repr, "\\x{:02x}", u32::from(character)).unwrap();
-            }
-            character => repr.push(character),
-        }
-    }
-    repr.push(quote);
-    repr
+    ruff_python_literal::escape::UnicodeEscape::new_repr(value)
+        .str_repr(ruff_python_ast::str::TripleQuotes::No)
+        .to_string()
+        .expect("Python string representation length fits in usize")
 }

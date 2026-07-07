@@ -1161,7 +1161,7 @@ impl Compiler {
         let large = component_count > 30;
         let outer_location = self.source_location(fstring.range);
         let single_literal_range = if component_count == 1 && !has_interpolation {
-            Some(self.fstring_result_range(fstring))
+            Some(Self::fstring_result_range(fstring))
         } else {
             None
         };
@@ -1196,12 +1196,7 @@ impl Compiler {
                             }
                             InterpolatedStringElement::Interpolation(interpolation) => {
                                 if let Some(debug) = &interpolation.debug_text {
-                                    let debug_text = strip_expression_comments(&format!(
-                                        "{}{}{}",
-                                        debug.leading(),
-                                        debug.expression(),
-                                        debug.trailing()
-                                    ));
+                                    let debug_text = strip_expression_comments(debug.as_str());
                                     append_literal(
                                         &mut pending_literal,
                                         &debug_text,
@@ -1258,12 +1253,7 @@ impl Compiler {
                         strings
                             .last_mut()
                             .unwrap()
-                            .push_str(&strip_expression_comments(&format!(
-                                "{}{}{}",
-                                debug.leading(),
-                                debug.expression(),
-                                debug.trailing()
-                            )));
+                            .push_str(&strip_expression_comments(debug.as_str()));
                     }
                     interpolations.push(interpolation);
                     strings.push(String::new());
@@ -1340,11 +1330,14 @@ impl Compiler {
                 self.context.source[start..start + offset].trim_end(),
             );
         }
+        if interpolation.debug_text.is_some() {
+            let range = self.debug_expression_source_range(interpolation);
+            let source = &self.context.source[usize::from(range.start())..usize::from(range.end())];
+            return strip_expression_comments(source).trim_end().to_string();
+        }
         let interpolation_end = usize::from(interpolation.range.end()).saturating_sub(1);
         let trailing = &self.context.source[expression_end..interpolation_end];
-        let delimiter = if interpolation.debug_text.is_some() {
-            trailing.find('=')
-        } else if interpolation.conversion != ConversionFlag::None {
+        let delimiter = if interpolation.conversion != ConversionFlag::None {
             trailing.find('!')
         } else if interpolation.format_spec.is_some() {
             trailing.find(':')
@@ -1400,12 +1393,7 @@ impl Compiler {
                 }
                 InterpolatedStringElement::Interpolation(interpolation) => {
                     if let Some(debug) = &interpolation.debug_text {
-                        let debug_text = strip_expression_comments(&format!(
-                            "{}{}{}",
-                            debug.leading(),
-                            debug.expression(),
-                            debug.trailing()
-                        ));
+                        let debug_text = strip_expression_comments(debug.as_str());
                         append_literal(
                             &mut pending_literal,
                             &debug_text,

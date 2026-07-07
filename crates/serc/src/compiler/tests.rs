@@ -1,18 +1,23 @@
 use ruff_python_ast::token::TokenKind;
-use ruff_python_ast::{Expr, Stmt};
-use ruff_python_parser::parse_module;
+use ruff_python_ast::{Expr, ModModule, Stmt, StringLike};
+use ruff_python_parser::{Parsed, parse_module};
 use ruff_text_size::Ranged;
 
 use crate::assembler::SourceLocation;
 use crate::code_object::Constant;
+use crate::target::code_flags::{CO_FUTURE_ANNOTATIONS, CO_FUTURE_BARRY_AS_BDFL};
 use crate::target::opcodes::{BUILD_TUPLE, LOAD_CONST, RAISE_VARARGS, RERAISE, RETURN_VALUE};
 
-use super::Compiler;
 use super::definition::clean_doc;
 use super::scope::{FunctionPlan, NameId, NameInterner, ScopeBodyFacts};
+use super::source::{
+    debug_text_range, interpolated_string_content_range, strip_expression_comments,
+    unparse_annotation,
+};
 use super::symbol::{
     CompilerStackEffect, ReraiseStackState, compiler_stack_effect, validate_compiler_stack_effect,
 };
+use super::{Compiler, SHADOWED_SUPER_SENTINEL};
 
 #[test]
 fn compiler_stack_effects_distinguish_values_from_scope_exit_bookkeeping() {
@@ -68,6 +73,15 @@ fn compiler_stack_effect_validation_rejects_stale_lowering_metadata() {
     assert!(
         matches!(error, crate::CompileError::Internal(message) if message.contains("declared stack effect 0") && message.contains("expected 1"))
     );
+}
+
+fn module_compiler(source: &str, parsed: &Parsed<ModModule>) -> Compiler {
+    Compiler::module(
+        "example.py",
+        source,
+        parsed.tokens().clone(),
+        parsed.suite(),
+    )
 }
 
 #[test]
@@ -139,7 +153,7 @@ fn name_ids_deduplicate_private_name_mangling_collisions() {
         return self.__value
 ";
     let parsed = parse_module(source).unwrap();
-    let module = Compiler::module("example.py", source, parsed.tokens().clone())
+    let module = module_compiler(source, &parsed)
         .compile_module(parsed.suite())
         .unwrap();
     let class = module
@@ -172,7 +186,7 @@ fn single_pass_local_collection_preserves_source_order() {
     annotation_only: int
 ";
     let parsed = parse_module(source).unwrap();
-    let module = Compiler::module("example.py", source, parsed.tokens().clone())
+    let module = module_compiler(source, &parsed)
         .compile_module(parsed.suite())
         .unwrap();
     let function = module
@@ -208,7 +222,7 @@ fn symbol_name_ids_preserve_mangled_cell_and_freevar_order() {
         return inner
 ";
     let parsed = parse_module(source).unwrap();
-    let module = Compiler::module("example.py", source, parsed.tokens().clone())
+    let module = module_compiler(source, &parsed)
         .compile_module(parsed.suite())
         .unwrap();
     let class = module
@@ -251,6 +265,59 @@ fn symbol_name_ids_preserve_mangled_cell_and_freevar_order() {
         inner.locals,
         ["_Container__private", "alpha", "zeta", "éclair"]
     );
+}
+
+#[test]
+fn module_plan_preserves_ordered_bindings_and_scope_facts() {
+    let source = r"from __future__ import annotations, barry_as_FLUFL
+import package.module as imported
+from package import member as alias
+
+def child():
+    global nested_global
+
+super = object()
+result = [
+    (captured := item, lambda: item, nested)
+    for item in values
+    for nested in others
+]
+if condition:
+    annotated: int
+";
+    let parsed = parse_module(source).unwrap();
+    let compiler = module_compiler(source, &parsed);
+    let plan = &compiler.context.module_plan;
+    let names = &compiler.context.scopes.names;
+    let name_id = |name| {
+        names
+            .get(name)
+            .unwrap_or_else(|| panic!("module analysis did not intern `{name}`"))
+    };
+
+    assert_eq!(
+        plan.future_flags,
+        CO_FUTURE_ANNOTATIONS | CO_FUTURE_BARRY_AS_BDFL
+    );
+    assert_eq!(
+        plan.comprehension_targets
+            .iter()
+            .map(|name| names.resolve(*name))
+            .collect::<Vec<_>>(),
+        ["item", "nested", "captured"]
+    );
+    assert!(plan.module_globals.contains(name_id("nested_global")));
+    assert!(plan.module_globals.contains(name_id("captured")));
+    assert!(plan.imported_scope_names.contains(name_id("imported")));
+    assert!(plan.imported_scope_names.contains(name_id("alias")));
+    assert!(
+        plan.imported_scope_names
+            .contains(name_id(SHADOWED_SUPER_SENTINEL))
+    );
+    assert!(!plan.imported_scope_names.contains(name_id("annotations")));
+    assert!(plan.comprehension_cell_names.contains(name_id("item")));
+    assert!(plan.has_annotations);
+    assert!(plan.has_simple_annotations);
 }
 
 #[test]
@@ -321,7 +388,7 @@ fn scope_body_facts_preserve_named_scope_and_annotation_boundaries() {
 fn compiles_a_simple_module() {
     let source = "answer = 6 * 7\nprint(answer)\n";
     let parsed = parse_module(source).unwrap();
-    let code = Compiler::module("example.py", source, parsed.tokens().clone())
+    let code = module_compiler(source, &parsed)
         .compile_module(parsed.suite())
         .unwrap();
     assert_eq!(code.name, "<module>");
@@ -333,7 +400,7 @@ fn compiles_a_simple_module() {
 fn compiles_type_alias() {
     let source = "type Alias = int\n";
     let parsed = parse_module(source).unwrap();
-    Compiler::module("example.py", source, parsed.tokens().clone())
+    module_compiler(source, &parsed)
         .compile_module(parsed.suite())
         .unwrap();
 }
@@ -343,7 +410,7 @@ fn retains_parser_tokens_in_the_shared_compilation_context() {
     let source = "value = (\n    1  # comment\n)\n";
     let parsed = parse_module(source).unwrap();
     let expected = parsed.tokens().clone();
-    let compiler = Compiler::module("example.py", source, parsed.tokens().clone());
+    let compiler = module_compiler(source, &parsed);
 
     assert_eq!(compiler.context.tokens, expected);
 }
@@ -359,7 +426,7 @@ class Container:
     pass
 "#;
     let parsed = parse_module(source).unwrap();
-    let compiler = Compiler::module("example.py", source, parsed.tokens().clone());
+    let compiler = module_compiler(source, &parsed);
     let [Stmt::FunctionDef(function), Stmt::ClassDef(class)] = parsed.suite().as_slice() else {
         panic!("expected a function and a class");
     };
@@ -387,7 +454,7 @@ continued = 1 \
 commented = 4  # ; not a boundary
 "#;
     let parsed = parse_module(source).unwrap();
-    let compiler = Compiler::module("example.py", source, parsed.tokens().clone());
+    let compiler = module_compiler(source, &parsed);
     let locations = parsed
         .suite()
         .iter()
@@ -442,7 +509,7 @@ fn generator_expression_ranges_follow_parser_tokens() {
             }
             expression => panic!("expected a generator or call, got {expression:?}"),
         };
-        let compiler = Compiler::module("example.py", source, parsed.tokens().clone());
+        let compiler = module_compiler(source, &parsed);
         let range = compiler.generator_expression_range(generator);
         let expected_start = source.find(expected).unwrap();
         let actual_start = usize::from(range.start());
@@ -455,10 +522,195 @@ fn generator_expression_ranges_follow_parser_tokens() {
 }
 
 #[test]
+fn interpolated_string_content_ranges_follow_ast_parts() {
+    for (source, expected) in [
+        (
+            r"value = rf'raw\path {item}'
+",
+            r"raw\path {item}",
+        ),
+        (
+            "value = f'''first\n{item!r}\n# literal\nlast'''\n",
+            "first\n{item!r}\n# literal\nlast",
+        ),
+        (
+            r#"value = r'left' f"middle {item}" '''right'''
+"#,
+            r#"left' f"middle {item}" '''right"#,
+        ),
+        (
+            "value = t'left' tr\"\"\"right {item}\n# literal\"\"\"\n",
+            "left' tr\"\"\"right {item}\n# literal",
+        ),
+        (
+            "value = f\"\"\"start {(\n    {'}': nested['{']}  # expression comment\n)} end\"\"\"\n",
+            "start {(\n    {'}': nested['{']}  # expression comment\n)} end",
+        ),
+    ] {
+        let parsed = parse_module(source).unwrap();
+        let Stmt::Assign(assignment) = &parsed.suite()[0] else {
+            panic!("expected an assignment");
+        };
+        let string = match assignment.value.as_ref() {
+            Expr::FString(fstring) => StringLike::FString(fstring),
+            Expr::TString(tstring) => StringLike::TString(tstring),
+            expression => panic!("expected an interpolated string, got {expression:?}"),
+        };
+        let range = interpolated_string_content_range(string);
+        let expected_start = source.find(expected).unwrap();
+        let actual_start = usize::from(range.start());
+        let actual_end = usize::from(range.end());
+
+        assert_eq!(actual_start, expected_start);
+        assert_eq!(actual_end, expected_start + expected.len());
+        assert_eq!(&source[actual_start..actual_end], expected);
+    }
+}
+
+#[test]
+fn debug_text_ranges_follow_ast_text_and_marker_tokens() {
+    fn first_interpolation(expression: &Expr) -> &ruff_python_ast::InterpolatedElement {
+        match expression {
+            Expr::FString(fstring) => fstring
+                .value
+                .elements()
+                .find_map(|element| element.as_interpolation()),
+            Expr::TString(tstring) => tstring
+                .value
+                .elements()
+                .find_map(|element| element.as_interpolation()),
+            expression => panic!("expected an interpolated string, got {expression:?}"),
+        }
+        .expect("expected a debug interpolation")
+    }
+
+    for (source, expected_debug, expected_expression) in [
+        (
+            "value = f\"{  item   =   !r}\"\n",
+            "  item   =   ",
+            "  item   ",
+        ),
+        (
+            "value = t\"\"\"{(\n    mapping[\"=\"]  # = inside comment\n)   =   :>{width}}\"\"\"\n",
+            "(\n    mapping[\"=\"]  # = inside comment\n)   =   ",
+            "(\n    mapping[\"=\"]  # = inside comment\n)   ",
+        ),
+        (
+            "value = t\"\"\"{f\"{item=} = literal\" = !s:^10}\"\"\"\n",
+            "f\"{item=} = literal\" = ",
+            "f\"{item=} = literal\" ",
+        ),
+        (
+            "value = f\"\"\"{item=  # after marker\n}\"\"\"\n",
+            "item=  # after marker\n",
+            "item",
+        ),
+    ] {
+        let parsed = parse_module(source).unwrap();
+        let Stmt::Assign(assignment) = &parsed.suite()[0] else {
+            panic!("expected an assignment");
+        };
+        let interpolation = first_interpolation(&assignment.value);
+        let compiler = module_compiler(source, &parsed);
+        let debug_range = debug_text_range(interpolation);
+        let expression_range = compiler.debug_expression_source_range(interpolation);
+
+        assert_eq!(
+            &source[usize::from(debug_range.start())..usize::from(debug_range.end())],
+            expected_debug,
+        );
+        assert_eq!(
+            interpolation.debug_text.as_ref().unwrap().as_str(),
+            expected_debug,
+        );
+        assert_eq!(
+            &source[usize::from(expression_range.start())..usize::from(expression_range.end())],
+            expected_expression,
+        );
+    }
+}
+
+#[test]
+fn expression_comment_stripping_uses_ruff_comment_tokens() {
+    for (source, expected) in [
+        (
+            "(r'# raw', R\"# raw double\", b'# bytes', rb'# raw bytes', u'# unicode', '# single', \"# double\", '''# triple''', \"\"\"# triple double\"\"\")  # remove\r\nnext",
+            "(r'# raw', R\"# raw double\", b'# bytes', rb'# raw bytes', u'# unicode', '# single', \"# double\", '''# triple''', \"\"\"# triple double\"\"\")  \r\nnext",
+        ),
+        (
+            "\"escaped \\\" # string\" + '\\\\ # string'  # remove\nvalue",
+            "\"escaped \\\" # string\" + '\\\\ # string'  \nvalue",
+        ),
+        (
+            "f\"\"\"outer # {\n    f'inner # {value}'  # nested comment\n} tail #\"\"\"  # remove\n",
+            "f\"\"\"outer # {\n    f'inner # {value}'  # nested comment\n} tail #\"\"\"  \n",
+        ),
+        (
+            "rf\"literal # {value}\" + tr'''template # {value}'''  # remove\n",
+            "rf\"literal # {value}\" + tr'''template # {value}'''  \n",
+        ),
+        (
+            "  call('#')  # generated comment\r\n =   # trailing debug comment\r\n",
+            "  call('#')  \r\n =   \r\n",
+        ),
+        (
+            "value  # first\n    # own line\nother  # last",
+            "value  \n    \nother  ",
+        ),
+    ] {
+        assert_eq!(strip_expression_comments(source), expected, "{source:?}");
+    }
+}
+
+#[test]
+fn annotation_unparsing_uses_tokens_for_nested_delimiters() {
+    for (source, expected) in [
+        ("value: tuple[(int, str)]", "tuple[int, str]"),
+        (
+            "value: dict[str, tuple[(int, str)]]",
+            "dict[str, tuple[int, str]]",
+        ),
+        (
+            "value: Literal[\"[()]\", (int | str)]",
+            "Literal['[()]', int | str]",
+        ),
+        (
+            "value: Callable[[(int, str)], None]",
+            "Callable[[(int, str)], None]",
+        ),
+    ] {
+        let module = parse_module(source).unwrap();
+        let [Stmt::AnnAssign(assignment)] = module.suite().as_slice() else {
+            panic!("expected an annotated assignment");
+        };
+        assert_eq!(unparse_annotation(&assignment.annotation), expected);
+    }
+}
+
+#[test]
+fn annotation_unparsing_matches_cpython_string_repr_categories() {
+    for (literal, expected) in [
+        (r#""\u200e""#, r"'\u200e'"),
+        (r#""\u2028""#, r"'\u2028'"),
+        (r#""\ue000""#, r"'\ue000'"),
+        (r#""\u0378""#, r"'\u0378'"),
+        (r#""\u00a0""#, r"'\xa0'"),
+        (r#""\x08\x0c""#, r"'\x08\x0c'"),
+        (r#""\U0001f600""#, "'😀'"),
+    ] {
+        let module = parse_module(&format!("value: {literal}")).unwrap();
+        let [Stmt::AnnAssign(assignment)] = module.suite().as_slice() else {
+            panic!("expected an annotated assignment");
+        };
+        assert_eq!(unparse_annotation(&assignment.annotation), expected);
+    }
+}
+
+#[test]
 fn source_positions_use_utf8_byte_columns() {
     let source = "α = 1\nβγ = 2\n";
     let parsed = parse_module(source).unwrap();
-    let compiler = Compiler::module("example.py", source, parsed.tokens().clone());
+    let compiler = module_compiler(source, &parsed);
 
     assert_eq!(compiler.source_position(0), (1, 0));
     assert_eq!(compiler.source_position(2), (1, 2));
@@ -472,7 +724,7 @@ fn source_positions_use_utf8_byte_columns() {
 fn source_positions_clamp_to_eof() {
     let source = "first\né\n";
     let parsed = parse_module(source).unwrap();
-    let compiler = Compiler::module("example.py", source, parsed.tokens().clone());
+    let compiler = module_compiler(source, &parsed);
     let eof = u32::try_from(source.len()).unwrap();
 
     assert_eq!(compiler.source_position(eof), (3, 0));
@@ -484,7 +736,7 @@ fn source_positions_clamp_to_eof() {
 fn source_positions_preserve_crlf_boundaries_and_eof() {
     let source = "one\r\ntwo";
     let parsed = parse_module(source).unwrap();
-    let compiler = Compiler::module("example.py", source, parsed.tokens().clone());
+    let compiler = module_compiler(source, &parsed);
 
     assert_eq!(compiler.source_position(2), (1, 2));
     assert_eq!(compiler.source_position(5), (2, 0));
@@ -494,7 +746,7 @@ fn source_positions_preserve_crlf_boundaries_and_eof() {
 
     let source = "one\r\ntwo\r\n";
     let parsed = parse_module(source).unwrap();
-    let compiler = Compiler::module("example.py", source, parsed.tokens().clone());
+    let compiler = module_compiler(source, &parsed);
 
     assert_eq!(compiler.source_position(8), (2, 3));
     assert_eq!(compiler.source_position(9), (2, 4));

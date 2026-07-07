@@ -596,6 +596,69 @@ class Shadowed:
     }
 
     #[test]
+    fn matches_cpython_marshal_for_interpolated_string_boundaries() {
+        let source = r#"
+def render(item, nested):
+    rf'raw\path {item}'
+    f'''first
+{item!r}
+# literal
+last'''
+    r'left' f"middle {item}" '''right'''
+    t'left' tr"""right {item}
+# literal"""
+    f"""start {(
+        {'}': nested['{']}  # expression comment
+    ) = } end"""
+    t"""{(
+        nested["key"]  # expression comment
+    ) = }"""
+"#;
+        assert_matches_cpython_marshal(source, "interpolated_string_boundaries.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_debug_interpolation_text() {
+        let source = r#"
+def render(item, mapping, width):
+    f"{  item   =   !r}"
+    t"{  item   =   !r}"
+    t"""{(
+        mapping["="]  # = inside comment
+    )   =   :>{width}}"""
+    t"""{f"{item=} = literal" = !s:^10}"""
+    f"""{item=  # after marker
+}"""
+    t"""{item=  # after marker
+}"""
+"#;
+        assert_matches_cpython_marshal(source, "debug_interpolation_text.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_comment_trivia_in_interpolations() {
+        let source = r##"
+def render(value):
+    f"""{(
+        '# single',
+        "# double",
+        r'# raw',
+        '''# triple''',
+        """# triple double""",
+    ) =  # debug comment
+    }"""
+    t"""{"escaped \\\" # still string" = }"""
+    t"""{f"nested # {value}" = !r:^20}"""
+    t"""{(
+        '# literal',
+        f"nested # {value}",
+    )  # expression comment
+    !r:^20}"""
+"##;
+        assert_matches_cpython_marshal(source, "comment_trivia_interpolations.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_an_irrefutable_constant_match_guard() {
         let source = "match subject:\n    case value if True:\n        pass\n    case _:\n        unreachable()\nafter()\n";
         assert_matches_cpython_marshal(source, "match.py");
