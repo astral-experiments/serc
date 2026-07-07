@@ -12,10 +12,10 @@ use super::super::{
     STORE_FAST_STORE_FAST, STORE_GLOBAL, SWAP, WITH_EXCEPT_START, block_has_fallthrough,
     block_jump_target, ends_scope, opcode_num_popped, opcode_num_pushed, opcode_stack_effect,
 };
-use crate::assembler::Assembler;
+use crate::assembler::OptimizationPipeline;
 use crate::assembler::block_graph::ItemPosition;
 
-impl Assembler {
+impl OptimizationPipeline {
     /// Converts potentially uninitialized local loads to checked loads.
     ///
     /// Mirrors CPython's `add_checks_for_loads_of_uninitialized_variables`
@@ -30,10 +30,7 @@ impl Assembler {
             return;
         }
 
-        let graph = self
-            .graph
-            .as_ref()
-            .expect("assembler pass requires the block graph");
+        let graph = &self.graph;
         if !graph.iter_items().any(|item| {
             matches!(
                 item,
@@ -51,10 +48,7 @@ impl Assembler {
             && order.len() == 1
             && block_jump_target(graph[order[0]].items()).is_none()
         {
-            let graph = self
-                .graph
-                .as_mut()
-                .expect("assembler pass requires the block graph");
+            let graph = &mut self.graph;
             let mut unsafe_locals = vec![true; local_count];
             unsafe_locals[..parameter_count.min(local_count).min(64)].fill(false);
             for item in graph[order[0]].items_mut() {
@@ -237,10 +231,7 @@ impl Assembler {
             }
         }
 
-        let graph = self
-            .graph
-            .as_mut()
-            .expect("assembler pass requires the block graph");
+        let graph = &mut self.graph;
         for position in positions {
             let Item::Instruction(instruction) = graph.item_mut(position) else {
                 continue;
@@ -262,10 +253,7 @@ impl Assembler {
     /// Once a checked load succeeds, CPython's definite-assignment scan treats
     /// that local as initialized for subsequent instructions on the same path.
     pub(in crate::assembler) fn remove_redundant_checked_loads(&mut self) {
-        let graph = self
-            .graph
-            .as_mut()
-            .expect("assembler pass requires the block graph");
+        let graph = &mut self.graph;
         if !graph.iter_items().any(|item| {
             matches!(item, Item::Instruction(instruction) if instruction.opcode == LOAD_FAST_CHECK)
         }) {
@@ -347,10 +335,7 @@ impl Assembler {
             }
         }
 
-        let graph = self
-            .graph
-            .as_ref()
-            .expect("assembler pass requires the block graph");
+        let graph = &self.graph;
         if !graph.iter_items().any(|item| {
             matches!(
                 item,
@@ -379,10 +364,7 @@ impl Assembler {
         block_labels.extend(self.borrow_unreachable_blocks.iter().copied());
         block_labels.extend(self.preserved_block_boundaries.iter().copied());
 
-        let graph = self
-            .graph
-            .as_mut()
-            .expect("assembler pass requires the block graph");
+        let graph = &mut self.graph;
         graph.repartition(
             &block_labels,
             |_| false,
@@ -742,10 +724,7 @@ impl Assembler {
             )))
         }
 
-        let graph = self
-            .graph
-            .as_mut()
-            .expect("assembler pass requires the block graph");
+        let graph = &mut self.graph;
         let order = graph.order().to_vec();
         for block in order {
             let items = graph[block].items_mut();

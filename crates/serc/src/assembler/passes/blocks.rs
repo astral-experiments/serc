@@ -1,23 +1,20 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::super::{
-    Assembler, ExceptionExclusion, ExceptionRegion, Instruction, Item, JUMP_BACKWARD,
-    JUMP_BACKWARD_NO_INTERRUPT, JUMP_FORWARD, Label, Operand, SourceLocation,
+    ExceptionExclusion, ExceptionRegion, Instruction, Item, JUMP_BACKWARD,
+    JUMP_BACKWARD_NO_INTERRUPT, JUMP_FORWARD, Label, Operand, OptimizationPipeline, SourceLocation,
     block_has_fallthrough, block_jump_target, cleanup_block_creation_order, ends_scope,
 };
 use crate::target::opcodes::{
     CLEANUP_THROW, END_ASYNC_FOR, END_SEND, LOAD_GLOBAL, NOP, RAISE_VARARGS,
 };
 
-impl Assembler {
+impl OptimizationPipeline {
     pub(in crate::assembler) fn push_cold_blocks_to_end(&mut self) {
         if self.exception_regions.is_empty() {
             return;
         }
-        let graph = self
-            .graph
-            .as_mut()
-            .expect("assembler pass requires the block graph");
+        let graph = &mut self.graph;
         if graph.len() < 2 {
             return;
         }
@@ -332,10 +329,7 @@ impl Assembler {
     }
 
     pub(in crate::assembler) fn duplicate_exit_blocks(&mut self) {
-        let graph = self
-            .graph
-            .as_mut()
-            .expect("assembler pass requires the block graph");
+        let graph = &mut self.graph;
         if graph.is_normalized_jump_free_single_block(&self.preserved_block_boundaries) {
             return;
         }

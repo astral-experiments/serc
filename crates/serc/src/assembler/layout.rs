@@ -6,9 +6,11 @@ use super::{
     is_conditional_jump,
 };
 use crate::CompileError;
-use crate::assembler::{Assembler, Instruction, Label, NormalizedExceptionOwner, SourceLocation};
+use crate::assembler::{
+    Instruction, Label, LayoutAssembler, NormalizedExceptionOwner, SourceLocation,
+};
 
-impl Assembler {
+impl LayoutAssembler {
     pub(in crate::assembler) fn exception_table(
         &self,
         extended_args: &[u8],

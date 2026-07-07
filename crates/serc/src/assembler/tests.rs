@@ -1,6 +1,6 @@
 use super::ir::{
     BorrowFallthrough, ExceptionPolicy, FusionPolicy, JumpPolicy, LoadPolicy, NoLocationPolicy,
-    RetainedJumpNop,
+    RetainedJumpNop, UnoptimizedCode,
 };
 use super::{
     Assembler, AssemblerStage, ExceptionExclusion, Instruction, Item, NormalizedExceptionOwner,
@@ -160,9 +160,12 @@ fn borrow_fallthrough_barrier_stays_on_predecessor_across_labels_and_emission() 
         Item::Instruction(predecessor),
         Item::Label(actual_boundary),
         Item::Instruction(next),
-    ] = assembler.items.as_slice()
+    ] = assembler.linear_items()
     else {
-        panic!("unexpected instruction stream: {:?}", assembler.items);
+        panic!(
+            "unexpected instruction stream: {:?}",
+            assembler.linear_items()
+        );
     };
     assert_eq!(*actual_boundary, boundary);
     assert_eq!(predecessor.borrow_fallthrough, BorrowFallthrough::Barrier);
@@ -196,7 +199,7 @@ fn value_emission_attaches_exception_policy_across_intervening_labels() {
         Item::Instruction(excluded),
         Item::Label(actual_second_boundary),
         Item::Instruction(default),
-    ] = assembler.items.as_slice()
+    ] = assembler.linear_items()
     else {
         panic!("expected three instructions separated by labels");
     };
@@ -225,7 +228,7 @@ fn jump_emission_attaches_exception_policy_after_an_intervening_label() {
         Item::Instruction(default),
         Item::Label(actual_boundary),
         Item::Instruction(excluded),
-    ] = assembler.items.as_slice()
+    ] = assembler.linear_items()
     else {
         panic!("expected two instructions separated by one label");
     };
@@ -349,7 +352,7 @@ fn fusion_preserves_each_typed_instruction_policy() {
 fn owned_fast_loads_use_real_opcodes_with_provenance() {
     let mut assembler = Assembler::default();
     assembler.emit_owned_fast_with_depth(3, 1);
-    let Some(Item::Instruction(instruction)) = assembler.items.last() else {
+    let Some(Item::Instruction(instruction)) = assembler.linear_items().last() else {
         panic!("owned load was not emitted");
     };
     assert_eq!(instruction.opcode, LOAD_FAST);
@@ -477,7 +480,7 @@ fn assembler_with_preserved_constant_boundary() -> Assembler {
     let preserved = super::Label(1);
     let target = super::Label(2);
     Assembler {
-        items: vec![
+        code: UnoptimizedCode::Linear(vec![
             Item::Label(entry),
             Item::Label(preserved),
             pass_instruction(LOAD_CONST, 0, 1),
@@ -491,7 +494,7 @@ fn assembler_with_preserved_constant_boundary() -> Assembler {
             Item::Label(target),
             pass_instruction(LOAD_CONST, 2, 2),
             pass_instruction(RETURN_VALUE, 0, 2),
-        ],
+        ]),
         next_label: 3,
         preserved_block_boundaries: rustc_hash::FxHashSet::from_iter([preserved]),
         ..Assembler::default()
@@ -499,7 +502,7 @@ fn assembler_with_preserved_constant_boundary() -> Assembler {
 }
 
 #[test]
-fn reuses_constant_reachability_graph_with_finish_partitioning() {
+fn constant_reachability_prepares_the_optimization_graph() {
     let expected = assembler_with_preserved_constant_boundary()
         .finish()
         .unwrap();
@@ -509,8 +512,7 @@ fn reuses_constant_reachability_graph_with_finish_partitioning() {
         assembler.used_constant_indices(LOAD_CONST),
         rustc_hash::FxHashSet::from_iter([0, 2])
     );
-    assert!(assembler.items.is_empty());
-    assert!(assembler.graph.is_some());
+    assert!(matches!(assembler.code, UnoptimizedCode::Prepared(_)));
     assembler.remap_constant_indices(LOAD_CONST, &[Some(0), Some(1), Some(2)]);
 
     assert_eq!(assembler.finish().unwrap(), expected);
@@ -525,21 +527,30 @@ fn pass_instruction(opcode: crate::target::Opcode, argument: u32, line: i32) -> 
     ))
 }
 
-fn assembler_with_graph(items: Vec<Item>) -> Assembler {
+fn optimization_pipeline(items: Vec<Item>) -> super::OptimizationPipeline {
+    let next_label = items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Label(label)
+            | Item::Instruction(Instruction {
+                operand: Operand::Forward(label) | Operand::Backward(label),
+                ..
+            }) => Some(label.0 + 1),
+            Item::Instruction(_) => None,
+        })
+        .max()
+        .unwrap_or(0);
     Assembler {
-        graph: Some(super::block_graph::BlockGraph::from_items(
-            items,
-            &rustc_hash::FxHashSet::default(),
-        )),
+        code: UnoptimizedCode::Linear(items),
+        next_label,
         ..Assembler::default()
     }
+    .into_optimization_pipeline()
 }
 
-fn graph_opcodes(assembler: &Assembler) -> Vec<crate::target::Opcode> {
+fn graph_opcodes(assembler: &super::OptimizationPipeline) -> Vec<crate::target::Opcode> {
     assembler
         .graph
-        .as_ref()
-        .unwrap()
         .iter_items()
         .filter_map(|item| {
             let Item::Instruction(instruction) = item else {
@@ -552,9 +563,8 @@ fn graph_opcodes(assembler: &Assembler) -> Vec<crate::target::Opcode> {
 
 #[test]
 fn uninitialized_load_analysis_follows_single_block_backedges() {
-    let mut assembler = Assembler::default();
-    let label = assembler.label();
-    assembler.graph = assembler_with_graph(vec![
+    let label = super::Label(0);
+    let mut assembler = optimization_pipeline(vec![
         Item::Label(label),
         pass_instruction(LOAD_FAST, 0, 1),
         pass_instruction(DELETE_FAST, 0, 1),
@@ -564,8 +574,7 @@ fn uninitialized_load_analysis_follows_single_block_backedges() {
             SourceLocation::new(1, 1, 0, 0),
             None,
         )),
-    ])
-    .graph;
+    ]);
 
     assembler.add_checks_for_uninitialized_loads(1, 1);
 
@@ -577,7 +586,7 @@ fn uninitialized_load_analysis_follows_single_block_backedges() {
 
 #[test]
 fn redundant_swap_removal_preserves_forward_scan_semantics() {
-    let mut assembler = assembler_with_graph(vec![
+    let mut assembler = optimization_pipeline(vec![
         pass_instruction(SWAP, 2, 1),
         Item::Label(super::Label(0)),
         pass_instruction(SWAP, 2, 1),
@@ -599,7 +608,7 @@ fn redundant_nop_removal_preserves_forward_scan_semantics() {
         Item::Label(_) => unreachable!(),
     };
     converted.converted_pop_block = true;
-    let mut assembler = assembler_with_graph(vec![
+    let mut assembler = optimization_pipeline(vec![
         pass_instruction(NOP, 0, 1),
         Item::Label(super::Label(0)),
         pass_instruction(NOP, 0, -1),
