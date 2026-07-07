@@ -178,15 +178,20 @@ Marshal encoding is deliberately split into three responsibilities:
 
 - `marshal/key.rs` defines when values compare equal and when CPython preserves object identity. It
     also defines deterministic sort keys for unordered constants such as frozen sets.
-- `marshal/graph.rs` walks the complete code-object graph first. It counts repeated objects and
-    records strings that CPython will intern.
-- `marshal/writer.rs` uses that graph to assign reference indices and encode code objects,
-    constants, strings, tuples, local-kind bytes, line tables, and exception tables in CPython's
-    order.
+- `marshal/plan.rs` owns the pruned preorder traversal of code fields and constant children. Each
+    entry records its object ID and forced-reference policy; repeated containers remain as leaf
+    entries, so their children are never traversed twice.
+- `marshal/graph.rs` assigns object IDs while the plan is built, counts repeated objects, and records
+    strings that CPython will intern.
+- `marshal/writer.rs` assigns reference indices and linearly consumes the completed plan to encode
+    code objects, constants, strings, tuples, local-kind bytes, line tables, and exception tables
+    in CPython's order.
 
-The graph pass must precede writing because whether an object's first occurrence receives
-`FLAG_REF` depends on later occurrences. Replacing the two-pass design with opportunistic
-single-pass serialization changes bytes even when decoded values are equal.
+Planning and graph analysis must precede writing because whether an object's first occurrence
+receives `FLAG_REF` depends on later occurrences. Replacing that analysis with opportunistic
+single-pass serialization changes bytes even when decoded values are equal. The completed plan is
+already pruned and ordered, so the writer does not reconstruct a recursive object walk or maintain
+a parallel occurrence cursor.
 
 `CompiledModule::to_timestamp_pyc` prefixes the marshalled code object with the generated magic
 number, timestamp-invalidation flags, source modification time, and source size. The runtime is
