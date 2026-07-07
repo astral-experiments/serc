@@ -16,10 +16,11 @@ impl Compiler {
         }
     }
 
-    pub(crate) fn module(filename: &str, source: &str) -> Self {
+    pub(crate) fn module(filename: &str, source: &str, tokens: Tokens) -> Self {
         let context = Arc::new(CompilationContext {
             filename: filename.to_string(),
             source: Arc::from(source),
+            tokens,
             line_index: LineIndex::from_source_text(source),
             scopes: OnceLock::new(),
         });
