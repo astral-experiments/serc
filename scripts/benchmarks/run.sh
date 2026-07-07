@@ -52,16 +52,19 @@ if [[ -d "$default_corpus" ]]; then
     fi
 fi
 
+clean_caches() {
+    find "$corpus" -type d -name __pycache__ -prune -exec rm -rf {} +
+}
+
 if [[ "$using_pinned_numpy" == true ]]; then
+    clean_caches
     actual_revision="$(git -C "$numpy_checkout" rev-parse HEAD)"
-    tracked_changes="$(git -C "$numpy_checkout" status --short --untracked-files=no)"
-    untracked_python="$(git -C "$numpy_checkout" ls-files --others -- ':(glob)**/*.py')"
     if [[ "$actual_revision" != "$numpy_revision" ]]; then
         echo "error: expected NumPy $numpy_revision, found $actual_revision" >&2
         exit 1
     fi
-    if [[ -n "$tracked_changes" || -n "$untracked_python" ]]; then
-        echo "error: the pinned NumPy corpus contains source changes; rerun setup or clean it" >&2
+    if ! bash "$repo_root/scripts/benchmarks/validate-corpus.sh" "$numpy_checkout" numpy; then
+        echo "hint: rerun setup or clean the pinned NumPy corpus" >&2
         exit 1
     fi
 fi
@@ -124,10 +127,6 @@ if executable is None:
 print(executable)
 '
 )"
-
-clean_caches() {
-    find "$corpus" -type d -name __pycache__ -prune -exec rm -rf {} +
-}
 
 source_count="$("$python" -I -c '
 import pathlib

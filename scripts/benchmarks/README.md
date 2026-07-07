@@ -35,8 +35,8 @@ Set up the corpus once:
 
 The setup script shallow-clones NumPy `v2.4.6` at commit
 `b832a09cf2a169c833dd2371e7c07aa00b293242` under `target/benchmarks/numpy`. Corpus setup is
-never part of a measured command. Both setup and the default runner reject tracked changes or
-untracked Python sources in this checkout.
+never part of a measured command. The default runner rejects tracked changes or untracked
+filesystem artifacts in the measured NumPy package tree.
 
 Run the benchmark:
 
