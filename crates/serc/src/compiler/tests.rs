@@ -63,7 +63,7 @@ fn name_ids_deduplicate_private_name_mangling_collisions() {
         return self.__value
 ";
     let parsed = parse_module(source).unwrap();
-    let module = Compiler::module("example.py", source)
+    let module = Compiler::module("example.py", source, parsed.tokens().clone())
         .compile_module(parsed.suite())
         .unwrap();
     let class = module
@@ -96,7 +96,7 @@ fn single_pass_local_collection_preserves_source_order() {
     annotation_only: int
 ";
     let parsed = parse_module(source).unwrap();
-    let module = Compiler::module("example.py", source)
+    let module = Compiler::module("example.py", source, parsed.tokens().clone())
         .compile_module(parsed.suite())
         .unwrap();
     let function = module
@@ -183,8 +183,9 @@ fn scope_body_facts_preserve_named_scope_and_annotation_boundaries() {
 
 #[test]
 fn compiles_a_simple_module() {
-    let parsed = parse_module("answer = 6 * 7\nprint(answer)\n").unwrap();
-    let code = Compiler::module("example.py", "answer = 6 * 7\nprint(answer)\n")
+    let source = "answer = 6 * 7\nprint(answer)\n";
+    let parsed = parse_module(source).unwrap();
+    let code = Compiler::module("example.py", source, parsed.tokens().clone())
         .compile_module(parsed.suite())
         .unwrap();
     assert_eq!(code.name, "<module>");
@@ -196,14 +197,26 @@ fn compiles_a_simple_module() {
 fn compiles_type_alias() {
     let source = "type Alias = int\n";
     let parsed = parse_module(source).unwrap();
-    Compiler::module("example.py", source)
+    Compiler::module("example.py", source, parsed.tokens().clone())
         .compile_module(parsed.suite())
         .unwrap();
 }
 
 #[test]
+fn retains_parser_tokens_in_the_shared_compilation_context() {
+    let source = "value = (\n    1  # comment\n)\n";
+    let parsed = parse_module(source).unwrap();
+    let expected = parsed.tokens().clone();
+    let compiler = Compiler::module("example.py", source, parsed.tokens().clone());
+
+    assert_eq!(compiler.context.tokens, expected);
+}
+
+#[test]
 fn source_positions_use_utf8_byte_columns() {
-    let compiler = Compiler::module("example.py", "α = 1\nβγ = 2\n");
+    let source = "α = 1\nβγ = 2\n";
+    let parsed = parse_module(source).unwrap();
+    let compiler = Compiler::module("example.py", source, parsed.tokens().clone());
 
     assert_eq!(compiler.source_position(0), (1, 0));
     assert_eq!(compiler.source_position(2), (1, 2));
@@ -216,7 +229,8 @@ fn source_positions_use_utf8_byte_columns() {
 #[test]
 fn source_positions_clamp_to_eof() {
     let source = "first\né\n";
-    let compiler = Compiler::module("example.py", source);
+    let parsed = parse_module(source).unwrap();
+    let compiler = Compiler::module("example.py", source, parsed.tokens().clone());
     let eof = u32::try_from(source.len()).unwrap();
 
     assert_eq!(compiler.source_position(eof), (3, 0));
@@ -227,7 +241,8 @@ fn source_positions_clamp_to_eof() {
 #[test]
 fn source_positions_preserve_crlf_boundaries_and_eof() {
     let source = "one\r\ntwo";
-    let compiler = Compiler::module("example.py", source);
+    let parsed = parse_module(source).unwrap();
+    let compiler = Compiler::module("example.py", source, parsed.tokens().clone());
 
     assert_eq!(compiler.source_position(2), (1, 2));
     assert_eq!(compiler.source_position(5), (2, 0));
@@ -236,7 +251,8 @@ fn source_positions_preserve_crlf_boundaries_and_eof() {
     assert_eq!(compiler.source_position(u32::MAX), (2, 3));
 
     let source = "one\r\ntwo\r\n";
-    let compiler = Compiler::module("example.py", source);
+    let parsed = parse_module(source).unwrap();
+    let compiler = Compiler::module("example.py", source, parsed.tokens().clone());
 
     assert_eq!(compiler.source_position(8), (2, 3));
     assert_eq!(compiler.source_position(9), (2, 4));

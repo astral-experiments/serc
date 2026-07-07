@@ -11,15 +11,18 @@ use super::*;
 pub(super) struct CompilationContext {
     pub(super) filename: String,
     pub(super) source: Arc<str>,
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub(super) tokens: Tokens,
     pub(super) line_index: LineIndex,
     pub(super) scopes: OnceLock<ScopeArena>,
 }
 
 impl CompilationContext {
-    pub(super) fn new(filename: &str, source: &str) -> Self {
+    pub(super) fn new(filename: &str, source: &str, tokens: Tokens) -> Self {
         Self {
             filename: filename.to_string(),
             source: Arc::from(source),
+            tokens,
             line_index: LineIndex::from_source_text(source),
             scopes: OnceLock::new(),
         }
