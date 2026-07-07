@@ -86,6 +86,38 @@ fn name_ids_deduplicate_private_name_mangling_collisions() {
 }
 
 #[test]
+fn single_pass_local_collection_preserves_source_order() {
+    let source = r"def ordering():
+    target = external + target
+    print(later)
+    earlier = 1
+    later = 2
+    annotation_only
+    annotation_only: int
+";
+    let parsed = parse_module(source).unwrap();
+    let module = Compiler::module("example.py", source)
+        .compile_module(parsed.suite())
+        .unwrap();
+    let function = module
+        .constants
+        .iter()
+        .find_map(|constant| match constant {
+            Constant::Code(code) if code.name == "ordering" => Some(code),
+            _ => None,
+        })
+        .expect("module should contain the function body");
+
+    // A self-referencing assignment target precedes every load in its value, while a local that
+    // is loaded before its eventual store keeps the position of that first load. A referenced
+    // annotation-only local follows the same rule.
+    assert_eq!(
+        function.locals,
+        ["target", "later", "earlier", "annotation_only"]
+    );
+}
+
+#[test]
 fn scope_body_facts_preserve_named_scope_and_annotation_boundaries() {
     let source = r"def outer():
     global module_name
