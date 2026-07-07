@@ -273,10 +273,7 @@ fn decode_source(bytes: &[u8]) -> Result<String, String> {
 }
 
 fn declared_encoding(bytes: &[u8]) -> Option<&str> {
-    let first_end = bytes
-        .iter()
-        .position(|byte| *byte == b'\n')
-        .map_or(bytes.len(), |index| index + 1);
+    let first_end = physical_line_end(bytes);
     let first = &bytes[..first_end];
     if let Some(cookie) = encoding_cookie(first) {
         return Some(cookie);
@@ -286,11 +283,20 @@ fn declared_encoding(bytes: &[u8]) -> Option<&str> {
     }
 
     let remaining = &bytes[first_end..];
-    let second_end = remaining
-        .iter()
-        .position(|byte| *byte == b'\n')
-        .map_or(remaining.len(), |index| index + 1);
+    let second_end = physical_line_end(remaining);
     encoding_cookie(&remaining[..second_end])
+}
+
+fn physical_line_end(bytes: &[u8]) -> usize {
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        match byte {
+            b'\n' => return index + 1,
+            b'\r' if bytes.get(index + 1) == Some(&b'\n') => return index + 2,
+            b'\r' => return index + 1,
+            _ => {}
+        }
+    }
+    bytes.len()
 }
 
 fn encoding_cookie(line: &[u8]) -> Option<&str> {
@@ -578,8 +584,8 @@ fn write_error(message: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        cache_path, cache_tag, compile_path_with_metadata, decode_source, discover, encode_mtime,
-        has_python_suffix,
+        cache_path, cache_tag, compile_path_with_metadata, declared_encoding, decode_source,
+        discover, encode_mtime, has_python_suffix,
     };
     use std::path::{Path, PathBuf};
     use std::time::{Duration, UNIX_EPOCH};
@@ -629,6 +635,21 @@ mod tests {
         assert_eq!(
             decode_source(b"# coding: ascii\nvalue = '\x80'\n").unwrap_err(),
             "source is not valid ASCII"
+        );
+    }
+
+    #[test]
+    fn limits_encoding_cookies_to_two_cr_terminated_lines() {
+        assert_eq!(
+            declared_encoding(b"# first\r# coding: latin-1\rvalue = '\xe9'\r"),
+            Some("latin-1")
+        );
+        let third_line_cookie = b"# first\r# second\r# coding: latin-1\rvalue = '\xe9'\r";
+        assert_eq!(declared_encoding(third_line_cookie), None);
+        assert!(decode_source(third_line_cookie).is_err());
+        assert_eq!(
+            declared_encoding(b"# first\r\n# coding: latin-1\r\nvalue = '\xe9'\r\n"),
+            Some("latin-1")
         );
     }
 
