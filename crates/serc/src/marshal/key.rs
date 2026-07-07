@@ -249,6 +249,18 @@ pub(super) fn constant_sort_key(value: &Constant) -> Vec<u8> {
                         .expect("sort-key frozenset length fits in u32")
                         .to_le_bytes(),
                 );
+                let mut members = values
+                    .iter()
+                    .map(|value| {
+                        let mut member = Vec::new();
+                        append(&mut member, value, true);
+                        member
+                    })
+                    .collect::<Vec<_>>();
+                members.sort_unstable();
+                for member in members {
+                    output.extend_from_slice(&member);
+                }
             }
             Constant::Slice { lower, upper, step } => {
                 output.push(TYPE_SLICE | flag);
