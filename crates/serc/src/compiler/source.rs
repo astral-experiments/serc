@@ -280,14 +280,15 @@ impl Compiler {
         &self,
         call: &'a ruff_python_ast::ExprCall,
     ) -> Option<&'a ruff_python_ast::ExprAttribute> {
+        let positional_count = call.arguments.args.len();
+        let keyword_count = call.arguments.keywords.len();
         if call.arguments.args.iter().any(Expr::is_starred_expr)
             || call
                 .arguments
                 .keywords
                 .iter()
                 .any(|keyword| keyword.arg.is_none())
-            || call.arguments.keywords.len() > 15
-            || call.arguments.args.len() + call.arguments.keywords.len() >= 30
+            || positional_count + keyword_count + usize::from(keyword_count > 0) >= 30
         {
             return None;
         }

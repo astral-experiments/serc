@@ -688,6 +688,71 @@ class Child(Base):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_large_call_thresholds() {
+        let keywords = |count| {
+            (0..count)
+                .map(|index| format!("k{index}={index}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let positional = |count| {
+            (0..count)
+                .map(|index| index.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let keywords_15 = keywords(15);
+        let keywords_16 = keywords(16);
+        let keywords_28 = keywords(28);
+        let keywords_29 = keywords(29);
+        let positional_27 = positional(27);
+        let positional_28 = positional(28);
+        let positional_31 = positional(31);
+        let source = format!(
+            r"import imported
+
+def method_sixteen(obj):
+    return obj.method({keywords_16})
+
+def global_sixteen():
+    return target({keywords_16})
+
+def global_one_and_fifteen():
+    return target(0, {keywords_15})
+
+def global_thirty_one():
+    return target({positional_31})
+
+def imported_one_and_fifteen():
+    return imported.target(0, {keywords_15})
+
+class Base:
+    def method(self):
+        pass
+
+class Child(Base):
+    def super_sixteen(self):
+        return super().method({keywords_16})
+
+    def super_twenty_eight_and_one(self):
+        return super().method({positional_28}, option=0)
+
+def method_twenty_eight(obj):
+    return obj.method({keywords_28})
+
+def method_twenty_nine(obj):
+    return obj.method({keywords_29})
+
+def method_twenty_seven_and_one(obj):
+    return obj.method({positional_27}, option=0)
+
+def method_twenty_eight_and_one(obj):
+    return obj.method({positional_28}, option=0)
+"
+        );
+        assert_matches_cpython_marshal(&source, "large_call_thresholds.py");
+    }
+    #[test]
     fn matches_cpython_marshal_for_optimized_generator_calls() {
         let source = "module_any = any(value for value in values)\nmodule_all = all(value for value in values)\nmodule_tuple = tuple(value for value in values)\nany(value for value in values)\nall(value for value in values)\ntuple(value for value in values)\nafter = None\n\n\ndef optimized(values):\n    return (\n        any(value for value in values),\n        all(value for value in values),\n        tuple(value for value in values),\n    )\n\n\ndef rebound(values, any):\n    return any(value for value in values)\n\n\ndef terminal_discard(values):\n    all(value for value in values)\n";
         assert_matches_cpython_marshal(source, "optimized_generator_calls.py");

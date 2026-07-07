@@ -1639,38 +1639,11 @@ impl Compiler {
         self.assembler
             .set_location(self.source_location(self.call_opcode_range(call)));
 
-        if !has_starred && !has_keyword_unpack {
-            if call.arguments.keywords.len() > 15 {
-                let keyword_names = call
-                    .arguments
-                    .keywords
-                    .iter()
-                    .map(|keyword| {
-                        self.add_constant(Constant::String(
-                            keyword.arg.as_ref().unwrap().as_str().to_string(),
-                        ))
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                if call.arguments.args.is_empty() {
-                    self.add_constant(Constant::None)?;
-                    self.emit_deferred_constant(Constant::Tuple(Vec::new()))?;
-                } else {
-                    self.compile_collection(&call.arguments.args, CollectionKind::Tuple)?;
-                }
-                self.emit(BUILD_MAP, 0, 1)?;
-                for (keyword, name) in call.arguments.keywords.iter().zip(keyword_names) {
-                    self.assembler
-                        .set_location(self.source_location(self.call_opcode_range(call)));
-                    self.emit(LOAD_CONST, name, 1)?;
-                    self.compile_expression(&keyword.value)?;
-                    self.assembler
-                        .set_location(self.source_location(keyword.value.range()));
-                    self.emit(MAP_ADD, 1, -2)?;
-                }
-                self.assembler
-                    .set_location(self.source_location(self.call_opcode_range(call)));
-                return self.emit(CALL_FUNCTION_EX, 0, -3);
-            }
+        if !has_starred
+            && !has_keyword_unpack
+            && (direct_method
+                || call.arguments.args.len() + call.arguments.keywords.len() * 2 <= 30)
+        {
             for argument in &call.arguments.args {
                 self.compile_expression(argument)?;
             }
@@ -1756,6 +1729,10 @@ impl Compiler {
                     self.emit(DICT_MERGE, 1, -1)?;
                 }
             }
+        }
+        if !has_starred && !has_keyword_unpack {
+            self.assembler
+                .set_location(self.source_location(self.call_opcode_range(call)));
         }
         self.emit(CALL_FUNCTION_EX, 0, -3)
     }
