@@ -6,9 +6,9 @@ use ruff_text_size::Ranged;
 use crate::assembler::SourceLocation;
 
 use super::{
-    Compiler, Constant, FunctionPlan, NameId, NameInterner, ScopeBodyFacts, clean_doc,
-    debug_text_range, interpolated_string_content_range, strip_expression_comments,
-    unparse_annotation,
+    CO_FUTURE_ANNOTATIONS, CO_FUTURE_BARRY_AS_BDFL, Compiler, Constant, FunctionPlan, NameId,
+    NameInterner, SHADOWED_SUPER_SENTINEL, ScopeBodyFacts, clean_doc, debug_text_range,
+    interpolated_string_content_range, strip_expression_comments, unparse_annotation,
 };
 
 fn module_compiler(source: &str, parsed: &Parsed<ModModule>) -> Compiler {
@@ -132,6 +132,59 @@ fn single_pass_local_collection_preserves_source_order() {
         function.locals,
         ["target", "later", "earlier", "annotation_only"]
     );
+}
+
+#[test]
+fn module_plan_preserves_ordered_bindings_and_scope_facts() {
+    let source = r"from __future__ import annotations, barry_as_FLUFL
+import package.module as imported
+from package import member as alias
+
+def child():
+    global nested_global
+
+super = object()
+result = [
+    (captured := item, lambda: item, nested)
+    for item in values
+    for nested in others
+]
+if condition:
+    annotated: int
+";
+    let parsed = parse_module(source).unwrap();
+    let compiler = module_compiler(source, &parsed);
+    let plan = &compiler.context.module_plan;
+    let names = &compiler.context.scopes.names;
+    let name_id = |name| {
+        names
+            .get(name)
+            .unwrap_or_else(|| panic!("module analysis did not intern `{name}`"))
+    };
+
+    assert_eq!(
+        plan.future_flags,
+        CO_FUTURE_ANNOTATIONS | CO_FUTURE_BARRY_AS_BDFL
+    );
+    assert_eq!(
+        plan.comprehension_targets
+            .iter()
+            .map(|name| names.resolve(*name))
+            .collect::<Vec<_>>(),
+        ["item", "nested", "captured"]
+    );
+    assert!(plan.module_globals.contains(name_id("nested_global")));
+    assert!(plan.module_globals.contains(name_id("captured")));
+    assert!(plan.imported_scope_names.contains(name_id("imported")));
+    assert!(plan.imported_scope_names.contains(name_id("alias")));
+    assert!(
+        plan.imported_scope_names
+            .contains(name_id(SHADOWED_SUPER_SENTINEL))
+    );
+    assert!(!plan.imported_scope_names.contains(name_id("annotations")));
+    assert!(plan.comprehension_cell_names.contains(name_id("item")));
+    assert!(plan.has_annotations);
+    assert!(plan.has_simple_annotations);
 }
 
 #[test]

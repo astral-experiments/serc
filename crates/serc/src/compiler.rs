@@ -197,6 +197,7 @@ struct CompilationContext {
     source: Arc<str>,
     tokens: Tokens,
     line_index: LineIndex,
+    module_plan: ModulePlan,
     scopes: ScopeArena,
 }
 
