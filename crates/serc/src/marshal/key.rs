@@ -1,11 +1,7 @@
 use crate::compiler::{CodeObject, Constant};
 
-use super::v5::{
-    FLAG_REF, TYPE_ASCII, TYPE_ASCII_INTERNED, TYPE_BINARY_COMPLEX, TYPE_BINARY_FLOAT, TYPE_CODE,
-    TYPE_ELLIPSIS, TYPE_FALSE, TYPE_FROZENSET, TYPE_INT, TYPE_INTERNED, TYPE_LONG, TYPE_NONE,
-    TYPE_SHORT_ASCII, TYPE_SHORT_ASCII_INTERNED, TYPE_SLICE, TYPE_SMALL_TUPLE, TYPE_STRING,
-    TYPE_TRUE, TYPE_TUPLE, TYPE_UNICODE,
-};
+use super::scalar::{Scalar, write_scalar};
+use super::v5::{FLAG_REF, TYPE_CODE, TYPE_FROZENSET, TYPE_SLICE, TYPE_SMALL_TUPLE, TYPE_TUPLE};
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(super) enum ObjectKey<'a> {
@@ -105,120 +101,40 @@ pub(super) fn constant_sort_key(value: &Constant) -> Vec<u8> {
     fn append(output: &mut Vec<u8>, value: &Constant, force_reference: bool) {
         let flag = if force_reference { FLAG_REF } else { 0 };
         match value {
-            Constant::None => output.push(TYPE_NONE),
-            Constant::Bool(false) => output.push(TYPE_FALSE),
-            Constant::Bool(true) => output.push(TYPE_TRUE),
-            Constant::Ellipsis => output.push(TYPE_ELLIPSIS),
-            Constant::Int(value) => {
-                if let Ok(value) = i32::try_from(*value) {
-                    output.push(TYPE_INT | flag);
-                    output.extend_from_slice(&value.to_le_bytes());
-                } else {
-                    output.push(TYPE_LONG | flag);
-                    let digit_count = (64 - value.leading_zeros()).div_ceil(15).max(1);
-                    output.extend_from_slice(&digit_count.to_le_bytes());
-                    let mut remaining = *value;
-                    for _ in 0..digit_count {
-                        output.extend_from_slice(&((remaining & 0x7fff) as u16).to_le_bytes());
-                        remaining >>= 15;
-                    }
-                }
-            }
-            Constant::SignedInt(value) => {
-                if let Ok(value) = i32::try_from(*value) {
-                    output.push(TYPE_INT | flag);
-                    output.extend_from_slice(&value.to_le_bytes());
-                } else {
-                    output.push(TYPE_LONG | flag);
-                    let magnitude = value.unsigned_abs();
-                    let digit_count = (64 - magnitude.leading_zeros()).div_ceil(15).max(1);
-                    output.extend_from_slice(&0_u32.wrapping_sub(digit_count).to_le_bytes());
-                    let mut remaining = magnitude;
-                    for _ in 0..digit_count {
-                        output.extend_from_slice(&((remaining & 0x7fff) as u16).to_le_bytes());
-                        remaining >>= 15;
-                    }
-                }
-            }
-            Constant::BigInt { negative, digits } => {
-                output.push(TYPE_LONG | flag);
-                let digit_count =
-                    u32::try_from(digits.len()).expect("sort-key integer length fits in u32");
-                output.extend_from_slice(
-                    &if *negative {
-                        0_u32.wrapping_sub(digit_count)
-                    } else {
-                        digit_count
-                    }
-                    .to_le_bytes(),
-                );
-                for digit in digits {
-                    output.extend_from_slice(&digit.to_le_bytes());
-                }
-            }
-            Constant::Float(value) => {
-                output.push(TYPE_BINARY_FLOAT | flag);
-                output.extend_from_slice(&value.to_le_bytes());
-            }
-            Constant::Complex { real, imag } => {
-                output.push(TYPE_BINARY_COMPLEX | flag);
-                output.extend_from_slice(&real.to_le_bytes());
-                output.extend_from_slice(&imag.to_le_bytes());
-            }
-            Constant::String(value) => {
-                let bytes = value.as_bytes();
-                let interned = should_intern(value);
-                if value.is_ascii() && bytes.len() < 256 {
-                    output.push(
-                        (if interned {
-                            TYPE_SHORT_ASCII_INTERNED
-                        } else {
-                            TYPE_SHORT_ASCII
-                        }) | flag,
-                    );
-                    output.push(
-                        u8::try_from(bytes.len()).expect("short ASCII sort-key length fits in u8"),
-                    );
-                } else {
-                    output.push(
-                        (if value.is_ascii() {
-                            if interned {
-                                TYPE_ASCII_INTERNED
-                            } else {
-                                TYPE_ASCII
-                            }
-                        } else if interned {
-                            TYPE_INTERNED
-                        } else {
-                            TYPE_UNICODE
-                        }) | flag,
-                    );
-                    output.extend_from_slice(
-                        &u32::try_from(bytes.len())
-                            .expect("sort-key string length fits in u32")
-                            .to_le_bytes(),
-                    );
-                }
-                output.extend_from_slice(bytes);
-            }
+            Constant::None => write_scalar(output, Scalar::None, flag),
+            Constant::Bool(value) => write_scalar(output, Scalar::Bool(*value), flag),
+            Constant::Ellipsis => write_scalar(output, Scalar::Ellipsis, flag),
+            Constant::Int(value) => write_scalar(output, Scalar::Int(*value), flag),
+            Constant::SignedInt(value) => write_scalar(output, Scalar::SignedInt(*value), flag),
+            Constant::BigInt { negative, digits } => write_scalar(
+                output,
+                Scalar::BigInt {
+                    negative: *negative,
+                    digits,
+                },
+                flag,
+            ),
+            Constant::Float(value) => write_scalar(output, Scalar::Float(*value), flag),
+            Constant::Complex { real, imag } => write_scalar(
+                output,
+                Scalar::Complex {
+                    real: *real,
+                    imag: *imag,
+                },
+                flag,
+            ),
+            Constant::String(value) => write_scalar(
+                output,
+                Scalar::String {
+                    value,
+                    interned: should_intern(value),
+                },
+                flag,
+            ),
             Constant::SurrogateString(value) => {
-                output.push(TYPE_UNICODE | flag);
-                output.extend_from_slice(
-                    &u32::try_from(value.len())
-                        .expect("sort-key string length fits in u32")
-                        .to_le_bytes(),
-                );
-                output.extend_from_slice(value);
+                write_scalar(output, Scalar::SurrogateString(value), flag);
             }
-            Constant::Bytes(value) => {
-                output.push(TYPE_STRING | flag);
-                output.extend_from_slice(
-                    &u32::try_from(value.len())
-                        .expect("sort-key bytes length fits in u32")
-                        .to_le_bytes(),
-                );
-                output.extend_from_slice(value);
-            }
+            Constant::Bytes(value) => write_scalar(output, Scalar::Bytes(value), flag),
             Constant::Tuple(values) => {
                 output.push(
                     (if values.len() < 256 {

@@ -9,6 +9,7 @@ use super::key::{
     locals_tuple_key, slice_member_uses_identity,
 };
 use super::plan::PlannedValue;
+use super::v5::FLAG_REF;
 
 fn code_object(constants: Vec<Constant>) -> CodeObject {
     CodeObject {
@@ -312,4 +313,56 @@ fn nested_frozen_set_wire_order_uses_recursive_member_keys() {
     let second = code_object(vec![Constant::FrozenSet(vec![second_nested, first_nested])]);
 
     assert_eq!(encode_code(&first), encode_code(&second));
+}
+
+#[test]
+fn scalar_wire_encoding_matches_sort_normal_and_slice_paths() {
+    let values = [
+        Constant::Int(257),
+        Constant::Int(u64::MAX),
+        Constant::SignedInt(-6),
+        Constant::SignedInt(i64::MAX),
+        Constant::SignedInt(i64::MIN),
+        Constant::BigInt {
+            negative: true,
+            digits: vec![0x7fff, 0x1234, 1],
+        },
+        Constant::Float(-3.25),
+        Constant::Complex {
+            real: 1.5,
+            imag: -2.75,
+        },
+        Constant::String("not interned".to_string()),
+        Constant::String(format!("{} ", "a".repeat(255))),
+        Constant::String("snowman: ☃".to_string()),
+        Constant::SurrogateString(vec![0xed, 0xa0, 0x80]),
+        Constant::Bytes((0..=u8::MAX).chain([0]).collect()),
+    ];
+
+    for value in values {
+        assert!(slice_member_uses_identity(&value), "scalar {value:?}");
+        let sort_key = constant_sort_key(&value);
+
+        let normal = encode_code(&code_object(vec![Constant::FrozenSet(vec![value.clone()])]));
+        assert!(
+            normal
+                .windows(sort_key.len())
+                .any(|bytes| bytes == sort_key),
+            "normal scalar encoding for {value:?}"
+        );
+
+        let slice = encode_code(&code_object(vec![Constant::Slice {
+            lower: Box::new(value.clone()),
+            upper: Box::new(Constant::None),
+            step: Box::new(Constant::None),
+        }]));
+        let mut unreferenced = sort_key;
+        unreferenced[0] &= !FLAG_REF;
+        assert!(
+            slice
+                .windows(unreferenced.len())
+                .any(|bytes| bytes == unreferenced),
+            "slice scalar encoding for {value:?}"
+        );
+    }
 }
