@@ -1,3 +1,4 @@
+/// A named Python source workload.
 #[derive(Clone, Copy, Debug)]
 pub struct Workload {
     pub id: &'static str,

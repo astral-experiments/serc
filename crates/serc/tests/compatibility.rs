@@ -1,20 +1,15 @@
 mod common;
 
-#[allow(dead_code, unreachable_pub)]
-mod benchmark_workloads {
-    include!("../../serc_benchmark/src/workloads.rs");
-}
-
 #[cfg(test)]
 mod tests {
     use std::fmt::Write as _;
 
     use super::common::{assert_executes, assert_matches_cpython_marshal};
-    use crate::benchmark_workloads;
     use serc::{
         CPYTHON_TARGET, CompileError, SourceDecodeError, compile, compile_bytes,
         compile_bytes_to_pyc, compile_to_pyc, decode_source,
     };
+    use serc_workloads as benchmark_workloads;
 
     #[test]
     fn exposes_the_pinned_cpython_source_identity() {

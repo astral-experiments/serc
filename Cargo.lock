@@ -850,6 +850,7 @@ dependencies = [
  "clap",
  "cpu-time",
  "fs-err",
+ "serc_workloads",
  "rayon",
  "ruff_python_ast",
  "ruff_python_codegen",
@@ -868,7 +869,12 @@ dependencies = [
  "codspeed-criterion-compat",
  "criterion",
  "serc",
+ "serc_workloads",
 ]
+
+[[package]]
+name = "serc_workloads"
+version = "0.0.0"
 
 [[package]]
 name = "phf"
