@@ -49,7 +49,23 @@ pub(super) struct ObjectGraph<'a> {
 
 impl<'a> ObjectGraph<'a> {
     pub(super) fn for_code(code: &'a CodeObject) -> Self {
+        let root_items = code
+            .constants
+            .len()
+            .saturating_add(code.names.len())
+            .saturating_add(code.locals.len())
+            .max(1);
+        let object_capacity = root_items.saturating_mul(6);
+        let occurrence_capacity = root_items.saturating_mul(15);
         let mut graph = Self::default();
+        graph.objects.reserve(object_capacity);
+        graph.objects_by_id.reserve(object_capacity);
+        graph.occurrences.reserve(occurrence_capacity);
+        #[cfg(debug_assertions)]
+        graph.occurrence_locations.reserve(occurrence_capacity);
+        graph
+            .explicitly_interned
+            .reserve(code.interned_constant_strings.len());
         graph.visit_code(code);
         graph.mark_explicitly_interned();
         graph

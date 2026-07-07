@@ -17,6 +17,9 @@ pub(crate) fn encode_code(code: &CodeObject) -> Vec<u8> {
 
 pub(crate) fn encode_code_into(code: &CodeObject, output: &mut Vec<u8>) {
     let graph = ObjectGraph::for_code(code);
+    // Object occurrences provide a cheap proxy for the encoded size and avoid repeatedly
+    // growing the output for ordinary code objects without another graph traversal.
+    output.reserve(graph.occurrence_count().saturating_mul(32));
     let mut writer = Writer {
         graph: &graph,
         output,
