@@ -1,23 +1,20 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::super::{
-    Assembler, ExceptionExclusion, ExceptionRegion, Instruction, InstructionFlags, Item,
-    JUMP_BACKWARD, JUMP_BACKWARD_NO_INTERRUPT, JUMP_FORWARD, Label, Operand, SourceLocation,
+    ExceptionExclusion, ExceptionRegion, Instruction, Item, JUMP_BACKWARD,
+    JUMP_BACKWARD_NO_INTERRUPT, JUMP_FORWARD, Label, Operand, OptimizationPipeline, SourceLocation,
     block_has_fallthrough, block_jump_target, cleanup_block_creation_order, ends_scope,
 };
 use crate::target::opcodes::{
     CLEANUP_THROW, END_ASYNC_FOR, END_SEND, LOAD_GLOBAL, NOP, RAISE_VARARGS,
 };
 
-impl Assembler {
+impl OptimizationPipeline {
     pub(in crate::assembler) fn push_cold_blocks_to_end(&mut self) {
         if self.exception_regions.is_empty() {
             return;
         }
-        let graph = self
-            .graph
-            .as_mut()
-            .expect("assembler pass requires the block graph");
+        let graph = &mut self.graph;
         if graph.len() < 2 {
             return;
         }
@@ -312,12 +309,12 @@ impl Assembler {
                 continue;
             };
             if target_position < index {
-                instruction.operand = Operand::Backward(target);
+                instruction.retarget(Operand::Backward(target));
                 if instruction.opcode == JUMP_FORWARD {
                     instruction.opcode = JUMP_BACKWARD_NO_INTERRUPT;
                 }
             } else {
-                instruction.operand = Operand::Forward(target);
+                instruction.retarget(Operand::Forward(target));
                 if matches!(
                     instruction.opcode,
                     JUMP_BACKWARD | JUMP_BACKWARD_NO_INTERRUPT
@@ -332,10 +329,7 @@ impl Assembler {
     }
 
     pub(in crate::assembler) fn duplicate_exit_blocks(&mut self) {
-        let graph = self
-            .graph
-            .as_mut()
-            .expect("assembler pass requires the block graph");
+        let graph = &mut self.graph;
         if graph.is_normalized_jump_free_single_block(&self.preserved_block_boundaries) {
             return;
         }
@@ -496,10 +490,9 @@ impl Assembler {
                         // the final region labels, so keep their existing block boundary.
                         && (target_chain_end == target_position || opcode == RAISE_VARARGS)
                 });
-            let source_allows_small_exit_inlining =
-                graph[source].last_instruction().is_some_and(|instruction| {
-                    instruction.has_flag(InstructionFlags::INLINE_SMALL_EXIT)
-                });
+            let source_allows_small_exit_inlining = graph[source]
+                .last_instruction()
+                .is_some_and(|instruction| instruction.jump_policy.inline_small_exit());
             let target_contains_end_send = target_blocks.iter().any(|block| {
                 graph[*block].items().iter().any(|item| {
                     matches!(item, Item::Instruction(instruction) if instruction.opcode == END_SEND)
@@ -510,10 +503,9 @@ impl Assembler {
                     !matches!(item, Item::Instruction(instruction) if instruction.location.line >= 0)
                 })
             });
-            let target_allows_no_location_block_inlining =
-                graph[target].last_instruction().is_some_and(|instruction| {
-                    instruction.has_flag(InstructionFlags::ALLOW_NO_LOCATION_BLOCK_INLINING)
-                });
+            let target_allows_no_location_block_inlining = graph[target]
+                .last_instruction()
+                .is_some_and(|instruction| instruction.no_location_policy.allow_block_inlining);
             let target_is_no_location_no_fallthrough = target_has_no_location
                 && target_allows_no_location_block_inlining
                 && !block_has_fallthrough(graph[target].items());
@@ -557,14 +549,7 @@ impl Assembler {
             let preserve_inlined_jump_nop = inline_small_exit
                 && source_location.line >= 0
                 && graph[source].last_instruction().is_some_and(|instruction| {
-                    instruction.has_flag(InstructionFlags::PRESERVE_INLINED_JUMP_NOP)
-                        || matches!(
-                            (
-                                instruction.preserve_direct_inlined_jump_nop,
-                                instruction.operand,
-                            ),
-                            (Some(expected), Operand::Forward(actual)) if expected == actual
-                        )
+                    instruction.jump_policy.retains_nop_for(instruction.operand)
                 });
             let copied_label = Label(self.next_label);
             self.next_label += 1;
@@ -632,7 +617,7 @@ impl Assembler {
                 if let Some(Item::Instruction(instruction)) = copied
                     .iter_mut()
                     .find(|item| matches!(item, Item::Instruction(_)))
-                    && !instruction.has_flag(InstructionFlags::PRESERVE_NO_LOCATION)
+                    && !instruction.no_location_policy.preserve
                 {
                     instruction.location = source_location;
                 }
@@ -687,7 +672,7 @@ impl Assembler {
                 .rev()
                 .find(|item| matches!(item, Item::Instruction(_)))
             {
-                instruction.operand = Operand::Forward(copied_label);
+                instruction.retarget(Operand::Forward(copied_label));
             }
             if inline_no_location_block {
                 graph.append_to_block(source, copied);
@@ -752,9 +737,9 @@ impl Assembler {
                     .iter()
                     .find(|item| matches!(item, Item::Instruction(_)))
                 && first.opcode == NOP
-                && first.has_flag(InstructionFlags::CONVERTED_POP_BLOCK)
+                && first.converted_pop_block
                 && first.location.line < 0
-                && !first.has_flag(InstructionFlags::PRESERVE_NO_LOCATION)
+                && !first.no_location_policy.preserve
                 && let Some(location) = order.iter().find_map(|source| {
                     block_jump_target(graph[*source].items())
                         .and_then(|label| graph.label_block(label))
@@ -803,7 +788,7 @@ impl Assembler {
                 .items_mut()
                 .iter_mut()
                 .find(|item| matches!(item, Item::Instruction(_)))
-                && !instruction.has_flag(InstructionFlags::PRESERVE_NO_LOCATION)
+                && !instruction.no_location_policy.preserve
             {
                 instruction.location = location;
             }

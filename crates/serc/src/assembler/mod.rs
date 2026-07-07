@@ -31,11 +31,50 @@ pub(crate) use ir::{
     AssembledCode, Assembler, ExceptionPolicy, InstructionId, Label, SourceLocation,
 };
 use ir::{
-    BorrowFallthrough, ExceptionExclusion, ExceptionRegion, Instruction, InstructionFlags, Item,
-    NormalizedExceptionOwner, Operand,
+    BorrowFallthrough, ExceptionExclusion, ExceptionRegion, Instruction, Item, LayoutAssembler,
+    LoadPolicy, NormalizedExceptionOwner, Operand, OptimizationPipeline, UnoptimizedCode,
 };
 
+fn reachable_constant_indices(
+    graph: &block_graph::BlockGraph,
+    exception_regions: &[ExceptionRegion],
+    load_const: Opcode,
+) -> FxHashSet<u32> {
+    let reachable = graph.item_reachability(exception_regions);
+    graph
+        .iter_items()
+        .enumerate()
+        .filter_map(|(position, item)| {
+            let Item::Instruction(instruction) = item else {
+                return None;
+            };
+            if reachable[position]
+                && instruction.opcode == load_const
+                && let Operand::Value(index) = instruction.operand
+            {
+                Some(index)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 impl Assembler {
+    fn linear_items(&self) -> &[Item] {
+        let UnoptimizedCode::Linear(items) = &self.code else {
+            panic!("linear instructions are unavailable after constant reachability analysis");
+        };
+        items
+    }
+
+    fn linear_items_mut(&mut self) -> &mut Vec<Item> {
+        let UnoptimizedCode::Linear(items) = &mut self.code else {
+            panic!("linear instructions are unavailable after constant reachability analysis");
+        };
+        items
+    }
+
     pub(crate) fn disable_load_fast_borrowing(&mut self) {
         self.load_fast_borrowing_enabled = false;
     }
@@ -54,28 +93,51 @@ impl Assembler {
     }
 
     pub(crate) fn last_instruction_location(&self) -> Option<SourceLocation> {
-        self.items.iter().rev().find_map(|item| match item {
-            Item::Instruction(instruction) => Some(instruction.location),
-            Item::Label(_) => None,
-        })
+        self.linear_items()
+            .iter()
+            .rev()
+            .find_map(|item| match item {
+                Item::Instruction(instruction) => Some(instruction.location),
+                Item::Label(_) => None,
+            })
     }
 
     fn last_instruction_mut(&mut self) -> Option<&mut Instruction> {
-        self.items.iter_mut().rev().find_map(|item| match item {
-            Item::Instruction(instruction) => Some(instruction),
-            Item::Label(_) => None,
-        })
+        self.linear_items_mut()
+            .iter_mut()
+            .rev()
+            .find_map(|item| match item {
+                Item::Instruction(instruction) => Some(instruction),
+                Item::Label(_) => None,
+            })
+    }
+
+    fn required_last_instruction_mut(&mut self, operation: &str) -> &mut Instruction {
+        self.last_instruction_mut()
+            .unwrap_or_else(|| panic!("{operation} requires a preceding instruction"))
+    }
+
+    fn last_jump_instruction_mut(&mut self, operation: &str) -> &mut Instruction {
+        let instruction = self.required_last_instruction_mut(operation);
+        assert!(
+            matches!(
+                instruction.operand,
+                Operand::Forward(_) | Operand::Backward(_)
+            ),
+            "{operation} requires a jump instruction"
+        );
+        instruction
     }
 
     pub(crate) fn instruction_count(&self) -> usize {
-        self.items
+        self.linear_items()
             .iter()
             .filter(|item| matches!(item, Item::Instruction(_)))
             .count()
     }
 
     pub(crate) fn contains_opcode(&self, opcode: Opcode) -> bool {
-        self.items.iter().any(
+        self.linear_items().iter().any(
             |item| matches!(item, Item::Instruction(instruction) if instruction.opcode == opcode),
         )
     }
@@ -87,7 +149,7 @@ impl Assembler {
     }
 
     pub(crate) fn mark(&mut self, label: Label) {
-        self.items.push(Item::Label(label));
+        self.linear_items_mut().push(Item::Label(label));
     }
 
     /// Keep a source CFG boundary after jump threading removes its last incoming edge.
@@ -108,36 +170,32 @@ impl Assembler {
     }
 
     pub(crate) fn mark_before_trailing_instructions(&mut self, label: Label, count: usize) {
-        let index = self
-            .items
+        let items = self.linear_items_mut();
+        let index = items
             .iter()
             .enumerate()
             .rev()
             .filter(|(_, item)| matches!(item, Item::Instruction(_)))
             .nth(count.saturating_sub(1))
-            .map_or(self.items.len(), |(index, _)| index);
-        self.items.insert(index, Item::Label(label));
+            .map_or(items.len(), |(index, _)| index);
+        items.insert(index, Item::Label(label));
     }
 
     pub(crate) fn mark_before_trailing_converted_pop_block(&mut self, label: Label) -> bool {
-        let mut instructions = self
-            .items
-            .iter()
-            .enumerate()
-            .rev()
-            .filter_map(|(index, item)| {
-                let Item::Instruction(instruction) = item else {
-                    return None;
-                };
-                Some((index, instruction))
-            });
+        let items = self.linear_items_mut();
+        let mut instructions = items.iter().enumerate().rev().filter_map(|(index, item)| {
+            let Item::Instruction(instruction) = item else {
+                return None;
+            };
+            Some((index, instruction))
+        });
         let Some((_, _)) = instructions.next() else {
             return false;
         };
         let Some((mut index, instruction)) = instructions.next() else {
             return false;
         };
-        if !instruction.has_flag(InstructionFlags::CONVERTED_POP_BLOCK) {
+        if !instruction.converted_pop_block {
             return false;
         }
         if let Some((previous_index, previous)) = instructions.next()
@@ -145,7 +203,7 @@ impl Assembler {
         {
             index = previous_index;
         }
-        self.items.insert(index, Item::Label(label));
+        items.insert(index, Item::Label(label));
         true
     }
 
@@ -156,108 +214,108 @@ impl Assembler {
 
     /// Prevents fusion with the next instruction without introducing a CFG boundary.
     pub(crate) fn prevent_last_instruction_fusion(&mut self) {
-        if let Some(instruction) = self.last_instruction_mut() {
-            instruction.insert_flag(InstructionFlags::PREVENT_FUSION_WITH_NEXT);
-        }
+        self.required_last_instruction_mut("preventing fusion with the next instruction")
+            .fusion_policy
+            .prevent_with_next = true;
     }
 
     /// Prevents fusion with the previous instruction without introducing a CFG boundary.
     pub(crate) fn prevent_last_instruction_fusion_with_previous(&mut self) {
-        if let Some(instruction) = self.last_instruction_mut() {
-            instruction.insert_flag(InstructionFlags::PREVENT_FUSION_WITH_PREVIOUS);
-        }
+        self.required_last_instruction_mut("preventing fusion with the previous instruction")
+            .fusion_policy
+            .prevent_with_previous = true;
     }
 
     /// Defers a redundant jump until the pass after exit-block duplication.
     pub(crate) fn defer_last_jump_removal(&mut self) {
-        if let Some(instruction) = self.last_instruction_mut() {
-            instruction.insert_flag(InstructionFlags::DEFER_REDUNDANT_JUMP_REMOVAL);
-        }
+        self.last_jump_instruction_mut("deferring redundant jump removal")
+            .jump_policy
+            .defer_removal();
     }
 
     /// Allows incoming jumps to thread through the last jump before retaining it as a NOP.
     pub(crate) fn preserve_last_redundant_jump_nop_after_threading(&mut self) {
-        if let Some(instruction) = self.last_instruction_mut() {
-            instruction.insert_flag(InstructionFlags::DEFER_REDUNDANT_JUMP_REMOVAL);
-            instruction.insert_flag(InstructionFlags::PRESERVE_NOP_AFTER_JUMP_THREADING);
-        }
+        let policy = &mut self
+            .last_jump_instruction_mut("retaining a redundant jump NOP after threading")
+            .jump_policy;
+        policy.retain_redundant_nop_after_threading();
     }
 
     pub(crate) fn prevent_last_jump_inlining(&mut self) {
-        if let Some(instruction) = self.last_instruction_mut() {
-            instruction.remove_flag(InstructionFlags::INLINE_SMALL_EXIT);
-        }
+        self.last_jump_instruction_mut("preventing jump inlining")
+            .jump_policy
+            .prevent_small_exit_inlining();
     }
 
     pub(crate) fn preserve_last_inlined_jump_nop(&mut self) {
-        if let Some(instruction) = self.last_instruction_mut() {
-            instruction.insert_flag(InstructionFlags::PRESERVE_INLINED_JUMP_NOP);
-        }
+        self.last_jump_instruction_mut("retaining an inlined jump NOP")
+            .jump_policy
+            .retain_nop();
     }
 
     pub(crate) fn preserve_last_direct_inlined_jump_nop(&mut self) {
-        if let Some(instruction) = self.last_instruction_mut()
-            && let Operand::Forward(target) = instruction.operand
-        {
-            instruction.preserve_direct_inlined_jump_nop = Some(target);
-        }
+        let instruction = self.last_jump_instruction_mut("retaining a directly inlined jump NOP");
+        let Operand::Forward(_) = instruction.operand else {
+            panic!("retaining a directly inlined jump NOP requires a forward jump");
+        };
+        instruction.jump_policy.retain_nop_for_direct_target();
     }
 
     pub(crate) fn prevent_last_jump_threading_target(&mut self) {
-        if let Some(instruction) = self.last_instruction_mut() {
-            instruction.remove_flag(InstructionFlags::ALLOW_JUMP_THREADING_TARGET);
-        }
+        self.last_jump_instruction_mut("preventing jump threading through a target")
+            .jump_policy
+            .prevent_threading_target();
     }
 
     pub(crate) fn prepare_last_no_location_block_for_inlining(&mut self) {
-        if let Some(instruction) = self.last_instruction_mut() {
-            instruction.location = SourceLocation::NONE;
-            instruction.remove_flag(InstructionFlags::ALLOW_JUMP_THREADING_TARGET);
-            instruction.insert_flag(InstructionFlags::ALLOW_NO_LOCATION_BLOCK_INLINING);
-        }
+        let instruction =
+            self.last_jump_instruction_mut("preparing a no-location block for inlining");
+        instruction.location = SourceLocation::NONE;
+        instruction.jump_policy.prevent_threading_target();
+        instruction.no_location_policy.allow_block_inlining = true;
     }
 
     pub(crate) fn preserve_last_no_location(&mut self) {
-        if let Some(instruction) = self.last_instruction_mut() {
-            instruction.insert_flag(InstructionFlags::PRESERVE_NO_LOCATION);
-        }
+        self.required_last_instruction_mut("preserving a no-location instruction")
+            .no_location_policy
+            .preserve = true;
     }
 
     pub(crate) fn mark_last_as_converted_pop_block(&mut self) {
-        if let Some(instruction) = self.last_instruction_mut() {
-            instruction.insert_flag(InstructionFlags::CONVERTED_POP_BLOCK);
-        }
+        self.required_last_instruction_mut("marking a converted POP_BLOCK")
+            .converted_pop_block = true;
     }
 
     /// Removes a trailing NOP and returns its location and immediate exclusion labels, if any.
     pub(crate) fn take_trailing_nop_location(
         &mut self,
     ) -> Option<(SourceLocation, Option<(Label, Label)>)> {
-        let index = self
-            .items
+        let current_location = self.location;
+        let items = self.linear_items_mut();
+        let index = items
             .iter()
             .rposition(|item| matches!(item, Item::Instruction(_)))?;
-        let Item::Instruction(instruction) = self.items[index] else {
+        let Item::Instruction(instruction) = items[index] else {
             unreachable!();
         };
         if instruction.opcode != NOP {
             return None;
         }
         if instruction.location.line >= 0
-            && self.location.line >= 0
-            && instruction.location.line != self.location.line
+            && current_location.line >= 0
+            && instruction.location.line != current_location.line
         {
             return None;
         }
         let exclusion = if index > 0 {
-            match (self.items[index - 1], self.items.get(index + 1).copied()) {
+            match (items[index - 1], items.get(index + 1).copied()) {
                 (Item::Label(start), Some(Item::Label(end))) => Some((start, end)),
                 _ => None,
             }
         } else {
             None
         };
-        self.items.remove(index);
+        items.remove(index);
         Some((instruction.location, exclusion))
     }
 
@@ -312,23 +370,27 @@ impl Assembler {
         opcode: Opcode,
         depth_after: u32,
     ) -> InstructionId {
-        let id = InstructionId(self.items.len());
+        let id = InstructionId(self.linear_items().len());
         self.emit_operand_with_depth(opcode, Operand::Value(0), Some(depth_after));
         id
     }
 
     pub(crate) fn patch_argument(&mut self, id: InstructionId, argument: u32) {
-        let Item::Instruction(instruction) = &mut self.items[id.0] else {
+        let Item::Instruction(instruction) = &mut self.linear_items_mut()[id.0] else {
             unreachable!("instruction handle points to a label");
         };
         instruction.operand = Operand::Value(argument);
     }
 
     pub(crate) fn used_constant_indices(&mut self, load_const: Opcode) -> FxHashSet<u32> {
+        if let UnoptimizedCode::Prepared(graph) = &self.code {
+            return reachable_constant_indices(graph, &self.exception_regions, load_const);
+        }
+
         let mut used = FxHashSet::default();
         let mut ended_scope = false;
         let mut straight_line = true;
-        for item in &self.items {
+        for item in self.linear_items() {
             let Item::Instruction(instruction) = item else {
                 continue;
             };
@@ -347,31 +409,19 @@ impl Assembler {
             return used;
         }
 
-        debug_assert!(self.graph.is_none());
-        self.graph = Some(block_graph::BlockGraph::from_items(
-            std::mem::take(&mut self.items),
+        let UnoptimizedCode::Linear(items) =
+            std::mem::replace(&mut self.code, UnoptimizedCode::Linear(Vec::new()))
+        else {
+            unreachable!();
+        };
+        self.code = UnoptimizedCode::Prepared(block_graph::BlockGraph::from_items(
+            items,
             &self.preserved_block_boundaries,
         ));
-        let mut used = FxHashSet::default();
-        let reachable = self.reachable_items();
-        for (index, item) in self
-            .graph
-            .as_ref()
-            .expect("constant reachability scan has a block graph")
-            .iter_items()
-            .enumerate()
-        {
-            let Item::Instruction(instruction) = item else {
-                continue;
-            };
-            if reachable[index]
-                && instruction.opcode == load_const
-                && let Operand::Value(index) = instruction.operand
-            {
-                used.insert(index);
-            }
-        }
-        used
+        let UnoptimizedCode::Prepared(graph) = &self.code else {
+            unreachable!();
+        };
+        reachable_constant_indices(graph, &self.exception_regions, load_const)
     }
 
     pub(crate) fn remap_constant_indices(&mut self, load_const: Opcode, index_map: &[Option<u32>]) {
@@ -389,12 +439,13 @@ impl Assembler {
                 *index = new_index;
             }
         };
-        if let Some(graph) = &mut self.graph {
-            graph.for_each_item_mut(remap);
-        } else {
-            for item in &mut self.items {
-                remap(item);
+        match &mut self.code {
+            UnoptimizedCode::Linear(items) => {
+                for item in items {
+                    remap(item);
+                }
             }
+            UnoptimizedCode::Prepared(graph) => graph.for_each_item_mut(remap),
         }
     }
 
@@ -402,10 +453,10 @@ impl Assembler {
     pub(crate) fn optimize_constant_pops(&mut self) {
         let is_constant_load =
             |opcode| matches!(opcode, LOAD_CONST | LOAD_COMMON_CONSTANT | LOAD_SMALL_INT);
+        let items = self.linear_items_mut();
 
-        for index in 0..self.items.len().saturating_sub(1) {
-            let [Item::Instruction(load), Item::Instruction(pop)] =
-                &mut self.items[index..index + 2]
+        for index in 0..items.len().saturating_sub(1) {
+            let [Item::Instruction(load), Item::Instruction(pop)] = &mut items[index..index + 2]
             else {
                 continue;
             };
@@ -419,15 +470,14 @@ impl Assembler {
         }
 
         let mut label_positions = FxHashMap::default();
-        for (index, item) in self.items.iter().enumerate() {
+        for (index, item) in items.iter().enumerate() {
             if let Item::Label(label) = item {
                 label_positions.insert(*label, index);
             }
         }
         let mut replacements = Vec::new();
-        for index in 0..self.items.len().saturating_sub(1) {
-            let [Item::Instruction(load), Item::Instruction(jump)] = self.items[index..index + 2]
-            else {
+        for index in 0..items.len().saturating_sub(1) {
+            let [Item::Instruction(load), Item::Instruction(jump)] = items[index..index + 2] else {
                 continue;
             };
             let Operand::Forward(target) = jump.operand else {
@@ -439,7 +489,7 @@ impl Assembler {
             let Some(target_position) = label_positions.get(&target).copied() else {
                 continue;
             };
-            let target = self.items[target_position + 1..]
+            let target = items[target_position + 1..]
                 .iter()
                 .filter_map(|item| {
                     if let Item::Instruction(instruction) = item {
@@ -461,8 +511,8 @@ impl Assembler {
             }
         }
         for (index, return_load, return_value) in replacements {
-            self.items[index] = Item::Instruction(return_load);
-            self.items[index + 1] = Item::Instruction(return_value);
+            items[index] = Item::Instruction(return_load);
+            items[index + 1] = Item::Instruction(return_value);
         }
     }
 
@@ -542,9 +592,11 @@ impl Assembler {
             || (opcode == LOAD_FAST && !self.load_fast_borrowing_enabled);
         let mut instruction = Instruction::new(opcode, operand, self.location, depth_after);
         instruction.exception_policy = exception_policy;
-        instruction.set_flag(InstructionFlags::FORCE_OWNED_LOAD, force_owned_load);
-        instruction.set_flag(InstructionFlags::STRICT_OWNED_LOAD, strict_owned_load);
-        self.items.push(Item::Instruction(instruction));
+        instruction.load_policy = LoadPolicy {
+            force_owned: force_owned_load,
+            strict_owned: strict_owned_load,
+        };
+        self.linear_items_mut().push(Item::Instruction(instruction));
     }
 }
 

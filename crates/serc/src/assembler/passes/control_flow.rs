@@ -1,25 +1,21 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::super::{
-    COMPARE_OP, CONTAINS_OP, COPY, ExceptionExclusion, IS_OP, Instruction, InstructionFlags, Item,
-    JUMP_BACKWARD, JUMP_BACKWARD_NO_INTERRUPT, JUMP_FORWARD, NOP, NOT_TAKEN, Operand,
-    POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE, POP_TOP, STORE_FAST, TO_BOOL, UNARY_NOT, ends_scope,
-    is_unconditional_jump,
+    COMPARE_OP, CONTAINS_OP, COPY, ExceptionExclusion, IS_OP, Instruction, Item, JUMP_BACKWARD,
+    JUMP_BACKWARD_NO_INTERRUPT, JUMP_FORWARD, NOP, NOT_TAKEN, Operand, POP_JUMP_IF_FALSE,
+    POP_JUMP_IF_TRUE, POP_TOP, STORE_FAST, TO_BOOL, UNARY_NOT, ends_scope, is_unconditional_jump,
 };
-use crate::assembler::Assembler;
+use crate::assembler::OptimizationPipeline;
 use crate::target::Opcode;
 use crate::target::operands::ComparisonOperation;
 
-impl Assembler {
+impl OptimizationPipeline {
     /// Replaces an overwritten local store with a stack pop.
     ///
     /// CPython applies this peephole before superinstruction fusion when two
     /// adjacent stores target the same local on the same traced line.
     pub(in crate::assembler) fn optimize_redundant_store_fast(&mut self) {
-        let graph = self
-            .graph
-            .as_mut()
-            .expect("assembler pass requires the block graph");
+        let graph = &mut self.graph;
         let order = graph.order().to_vec();
         for block in order {
             let items = graph[block].items_mut();
@@ -45,10 +41,7 @@ impl Assembler {
     }
 
     pub(in crate::assembler) fn remove_unreachable_instructions(&mut self) -> Option<u32> {
-        let graph = self
-            .graph
-            .as_mut()
-            .expect("assembler pass requires the block graph");
+        let graph = &mut self.graph;
         let reachable = graph.reachable_blocks(&self.exception_regions);
         let mut removed_max_depth = None;
         let order = graph.order().to_vec();
@@ -77,23 +70,13 @@ impl Assembler {
         removed_max_depth
     }
 
+    #[cfg(any(test, debug_assertions))]
     pub(in crate::assembler) fn reachable_items(&self) -> Vec<bool> {
-        if let Some(graph) = &self.graph {
-            graph.item_reachability(&self.exception_regions)
-        } else {
-            super::super::block_graph::BlockGraph::from_items(
-                self.items.clone(),
-                &self.preserved_block_boundaries,
-            )
-            .item_reachability(&self.exception_regions)
-        }
+        self.graph.item_reachability(&self.exception_regions)
     }
 
     pub(in crate::assembler) fn optimize_boolean_conversions(&mut self) {
-        let graph = self
-            .graph
-            .as_mut()
-            .expect("assembler pass requires the block graph");
+        let graph = &mut self.graph;
         let order = graph.order().to_vec();
         for block in order {
             let items = graph[block].items_mut();
@@ -198,10 +181,7 @@ impl Assembler {
         // the same truth value, they share the final target. Otherwise the
         // inner jump skips the redundant outer test and enters its POP_TOP
         // fallthrough path directly.
-        let graph = self
-            .graph
-            .as_ref()
-            .expect("assembler pass requires the block graph");
+        let graph = &self.graph;
         let mut positions = graph.item_positions();
         let mut items = positions
             .iter()
@@ -277,19 +257,13 @@ impl Assembler {
             .map(|index| (*index, self.label()))
             .collect::<FxHashMap<_, _>>();
         {
-            let graph = self
-                .graph
-                .as_mut()
-                .expect("assembler pass requires the block graph");
+            let graph = &mut self.graph;
             for index in fallthrough_indices.into_iter().rev() {
                 graph.insert_item(positions[index], Item::Label(fallthrough_labels[&index]));
             }
         }
 
-        let graph = self
-            .graph
-            .as_ref()
-            .expect("assembler pass requires the block graph");
+        let graph = &self.graph;
         positions = graph.item_positions();
         items = positions
             .iter()
@@ -298,10 +272,7 @@ impl Assembler {
         let value_preserving_jumps = (0..items.len())
             .filter(|index| is_value_preserving_jump(&items, *index))
             .collect::<FxHashSet<_>>();
-        let graph = self
-            .graph
-            .as_mut()
-            .expect("assembler pass requires the block graph");
+        let graph = &mut self.graph;
         for (index, position) in positions.iter().copied().enumerate() {
             let Item::Instruction(instruction) = graph.item_mut(position) else {
                 continue;
@@ -320,7 +291,7 @@ impl Assembler {
                     break;
                 };
                 if instruction.opcode == next.opcode {
-                    instruction.operand = next.operand;
+                    instruction.retarget(next.operand);
                     let Operand::Forward(next_target) = next.operand else {
                         break;
                     };
@@ -332,16 +303,13 @@ impl Assembler {
                     let Some(fallthrough) = fallthrough_labels.get(&next.fallthrough_index) else {
                         break;
                     };
-                    instruction.operand = Operand::Forward(*fallthrough);
+                    instruction.retarget(Operand::Forward(*fallthrough));
                     break;
                 }
             }
         }
 
-        let graph = self
-            .graph
-            .as_ref()
-            .expect("assembler pass requires the block graph");
+        let graph = &self.graph;
         items = graph.iter_items().copied().collect();
         let mut jump_targets = FxHashMap::default();
         for (index, item) in items.iter().enumerate() {
@@ -355,8 +323,8 @@ impl Assembler {
                 continue;
             };
             // A jump retained as a source-position NOP remains a CFG boundary.
-            if instruction.has_flag(InstructionFlags::ALLOW_JUMP_THREADING_TARGET)
-                && !instruction.has_flag(InstructionFlags::PRESERVE_INLINED_JUMP_NOP)
+            if instruction.jump_policy.allows_threading_target()
+                && !instruction.jump_policy.always_retains_nop()
                 && is_unconditional_jump(instruction.opcode)
                 && let operand @ (Operand::Forward(_) | Operand::Backward(_)) = instruction.operand
             {
@@ -364,10 +332,7 @@ impl Assembler {
             }
         }
 
-        let graph = self
-            .graph
-            .as_mut()
-            .expect("assembler pass requires the block graph");
+        let graph = &mut self.graph;
         let order = graph.order().to_vec();
         for block in order {
             for item in graph[block].items_mut() {
@@ -375,7 +340,7 @@ impl Assembler {
                     continue;
                 };
                 if instruction.opcode != JUMP_FORWARD
-                    || instruction.has_flag(InstructionFlags::PRESERVE_INLINED_JUMP_NOP)
+                    || instruction.jump_policy.always_retains_nop()
                 {
                     continue;
                 }
@@ -404,17 +369,14 @@ impl Assembler {
                     }
                     target = next;
                 }
-                instruction.operand = operand;
+                instruction.retarget(operand);
                 instruction.opcode = opcode;
             }
         }
     }
 
     pub(in crate::assembler) fn remove_redundant_forward_jumps(&mut self) {
-        let graph = self
-            .graph
-            .as_mut()
-            .expect("assembler pass requires the block graph");
+        let graph = &mut self.graph;
         if !graph.iter_items().any(|item| {
             matches!(
                 item,
@@ -449,15 +411,11 @@ impl Assembler {
                 index += 1;
                 continue;
             }
-            if instruction.has_flag(InstructionFlags::DEFER_REDUNDANT_JUMP_REMOVAL) {
+            if instruction.jump_policy.defers_redundant_removal() {
                 let Item::Instruction(instruction) = &mut items[index].1 else {
                     unreachable!();
                 };
-                instruction.remove_flag(InstructionFlags::DEFER_REDUNDANT_JUMP_REMOVAL);
-                if instruction.has_flag(InstructionFlags::PRESERVE_NOP_AFTER_JUMP_THREADING) {
-                    instruction.remove_flag(InstructionFlags::PRESERVE_NOP_AFTER_JUMP_THREADING);
-                    instruction.insert_flag(InstructionFlags::PRESERVE_INLINED_JUMP_NOP);
-                }
+                instruction.jump_policy.resolve_deferred_removal();
                 index += 1;
                 continue;
             }
@@ -489,7 +447,7 @@ impl Assembler {
                 };
                 instruction.location.line
             });
-            if !instruction.has_flag(InstructionFlags::PRESERVE_INLINED_JUMP_NOP)
+            if !instruction.jump_policy.always_retains_nop()
                 && (instruction.location.line < 0
                     || previous_line == Some(instruction.location.line)
                     || next_line == Some(instruction.location.line))
@@ -509,8 +467,8 @@ impl Assembler {
                     && let Some(next) = next.map(|next| next - 1)
                     && let Item::Instruction(next) = &mut items[next].1
                     && next.location.line < 0
-                    && !next.has_flag(InstructionFlags::PRESERVE_NO_LOCATION)
-                    && !next.has_flag(InstructionFlags::ALLOW_NO_LOCATION_BLOCK_INLINING)
+                    && !next.no_location_policy.preserve
+                    && !next.no_location_policy.allow_block_inlining
                 {
                     next.location = instruction.location;
                 }
@@ -534,10 +492,7 @@ impl Assembler {
     }
 
     pub(in crate::assembler) fn propagate_locations_within_blocks(&mut self) {
-        let graph = self
-            .graph
-            .as_mut()
-            .expect("assembler pass requires the block graph");
+        let graph = &mut self.graph;
         let order = graph.order().to_vec();
         for block in order {
             let mut previous = None;
@@ -551,8 +506,7 @@ impl Assembler {
                     Item::Label(_) => {}
                     Item::Instruction(instruction) => {
                         block_has_instruction = true;
-                        if instruction.location.line < 0
-                            && !instruction.has_flag(InstructionFlags::PRESERVE_NO_LOCATION)
+                        if instruction.location.line < 0 && !instruction.no_location_policy.preserve
                         {
                             if let Some(location) = previous {
                                 instruction.location = location;
@@ -573,10 +527,7 @@ impl Assembler {
     }
 
     pub(in crate::assembler) fn remove_redundant_nops(&mut self) {
-        let graph = self
-            .graph
-            .as_ref()
-            .expect("assembler pass requires the block graph");
+        let graph = &self.graph;
         let instructions = graph
             .item_positions()
             .into_iter()
@@ -592,7 +543,7 @@ impl Assembler {
         for (index, (position, instruction)) in instructions.iter().copied().enumerate() {
             let remove = instruction.opcode == NOP
                 && (instruction.location.line < 0
-                    || (instruction.has_flag(InstructionFlags::CONVERTED_POP_BLOCK)
+                    || (instruction.converted_pop_block
                         && previous.is_some_and(|previous: Instruction| {
                             previous.location.line == instruction.location.line
                                 && !(ends_scope(previous.opcode)
@@ -608,10 +559,7 @@ impl Assembler {
             }
         }
 
-        let graph = self
-            .graph
-            .as_mut()
-            .expect("assembler pass requires the block graph");
+        let graph = &mut self.graph;
         for position in redundant.into_iter().rev() {
             graph.remove_item(position);
         }

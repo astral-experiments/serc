@@ -81,49 +81,57 @@ pub(crate) struct Label(pub(super) u32);
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct InstructionId(pub(super) usize);
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Operand {
     Value(u32),
     Forward(Label),
     Backward(Label),
 }
 
-bitflags::bitflags! {
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub(super) struct InstructionFlags: u16 {
-        const FORCE_OWNED_LOAD = 1 << 0;
-        const STRICT_OWNED_LOAD = 1 << 1;
-        const INLINE_SMALL_EXIT = 1 << 2;
-        const PRESERVE_INLINED_JUMP_NOP = 1 << 3;
-        // Whether an incoming jump may be threaded through this instruction.
-        const ALLOW_JUMP_THREADING_TARGET = 1 << 4;
-        // Whether an unlocated block ending here may be inlined into predecessors.
-        const ALLOW_NO_LOCATION_BLOCK_INLINING = 1 << 5;
-        const PRESERVE_NO_LOCATION = 1 << 6;
-        const PREVENT_FUSION_WITH_NEXT = 1 << 7;
-        const PREVENT_FUSION_WITH_PREVIOUS = 1 << 8;
-        const DEFER_REDUNDANT_JUMP_REMOVAL = 1 << 9;
-        const PRESERVE_NOP_AFTER_JUMP_THREADING = 1 << 10;
-        const CONVERTED_POP_BLOCK = 1 << 11;
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct LoadPolicy {
+    pub(super) force_owned: bool,
+    pub(super) strict_owned: bool,
+}
+
+impl LoadPolicy {
+    const fn fused(first: Self, second: Self) -> Self {
+        Self {
+            force_owned: first.force_owned || second.force_owned,
+            strict_owned: first.strict_owned || second.strict_owned,
+        }
     }
 }
 
-impl InstructionFlags {
-    pub(super) const DEFAULT: Self =
-        Self::INLINE_SMALL_EXIT.union(Self::ALLOW_JUMP_THREADING_TARGET);
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct NoLocationPolicy {
+    /// Whether an unlocated block ending at this instruction may be inlined.
+    pub(super) allow_block_inlining: bool,
+    pub(super) preserve: bool,
+}
 
-    pub(super) const FUSE_OR: Self = Self::FORCE_OWNED_LOAD
-        .union(Self::STRICT_OWNED_LOAD)
-        .union(Self::ALLOW_NO_LOCATION_BLOCK_INLINING)
-        .union(Self::PRESERVE_NO_LOCATION)
-        .union(Self::DEFER_REDUNDANT_JUMP_REMOVAL)
-        .union(Self::PRESERVE_NOP_AFTER_JUMP_THREADING)
-        .union(Self::CONVERTED_POP_BLOCK);
-    pub(super) const FUSE_AND: Self =
-        Self::INLINE_SMALL_EXIT.union(Self::ALLOW_JUMP_THREADING_TARGET);
-    pub(super) const FUSE_FROM_FIRST: Self = Self::PREVENT_FUSION_WITH_PREVIOUS;
-    pub(super) const FUSE_FROM_SECOND: Self = Self::PREVENT_FUSION_WITH_NEXT;
-    pub(super) const FUSE_CLEARED: Self = Self::PRESERVE_INLINED_JUMP_NOP;
+impl NoLocationPolicy {
+    const fn fused(first: Self, second: Self) -> Self {
+        Self {
+            allow_block_inlining: first.allow_block_inlining || second.allow_block_inlining,
+            preserve: first.preserve || second.preserve,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct FusionPolicy {
+    pub(super) prevent_with_previous: bool,
+    pub(super) prevent_with_next: bool,
+}
+
+impl FusionPolicy {
+    const fn fused(first: Self, second: Self) -> Self {
+        Self {
+            prevent_with_previous: first.prevent_with_previous,
+            prevent_with_next: second.prevent_with_next,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -131,6 +139,153 @@ pub(super) enum BorrowFallthrough {
     #[default]
     Reachable,
     Barrier,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) enum RetainedJumpNop {
+    #[default]
+    None,
+    // Retain the jump's line event only while it still points at its original direct target.
+    DirectTarget,
+    Always,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) struct JumpPolicy(u8);
+
+impl JumpPolicy {
+    const RETAINED_NOP_MASK: u8 = 0b11;
+    const RETAINED_NOP_ALWAYS: u8 = 0b01;
+    const RETAINED_NOP_DIRECT_TARGET: u8 = 0b10;
+    const PREVENT_SMALL_EXIT_INLINING: u8 = 1 << 2;
+    const PREVENT_THREADING_TARGET: u8 = 1 << 3;
+    const DEFER_REDUNDANT_REMOVAL: u8 = 1 << 4;
+    const PRESERVE_NOP_AFTER_THREADING: u8 = 1 << 5;
+
+    const SYNTHETIC: Self = Self(Self::PREVENT_SMALL_EXIT_INLINING);
+    const DEFAULT: Self = Self(0);
+
+    pub(super) const fn fused(first: Self, second: Self) -> Self {
+        let mut policy = Self::DEFAULT;
+        if !first.inline_small_exit() || !second.inline_small_exit() {
+            policy.0 |= Self::PREVENT_SMALL_EXIT_INLINING;
+        }
+        if !first.allows_threading_target() || !second.allows_threading_target() {
+            policy.0 |= Self::PREVENT_THREADING_TARGET;
+        }
+        if first.defers_redundant_removal() || second.defers_redundant_removal() {
+            policy.0 |= Self::DEFER_REDUNDANT_REMOVAL;
+        }
+        if first.preserves_nop_after_threading() || second.preserves_nop_after_threading() {
+            policy.0 |= Self::PRESERVE_NOP_AFTER_THREADING;
+        }
+        policy
+    }
+
+    pub(super) const fn inline_small_exit(self) -> bool {
+        self.0 & Self::PREVENT_SMALL_EXIT_INLINING == 0
+    }
+
+    pub(super) const fn allows_threading_target(self) -> bool {
+        self.0 & Self::PREVENT_THREADING_TARGET == 0
+    }
+
+    pub(super) const fn defers_redundant_removal(self) -> bool {
+        self.0 & Self::DEFER_REDUNDANT_REMOVAL != 0
+    }
+
+    pub(super) const fn preserves_nop_after_threading(self) -> bool {
+        self.0 & Self::PRESERVE_NOP_AFTER_THREADING != 0
+    }
+
+    pub(super) const fn retained_nop(self) -> RetainedJumpNop {
+        match self.0 & Self::RETAINED_NOP_MASK {
+            0 => RetainedJumpNop::None,
+            Self::RETAINED_NOP_ALWAYS => RetainedJumpNop::Always,
+            Self::RETAINED_NOP_DIRECT_TARGET => RetainedJumpNop::DirectTarget,
+            _ => unreachable!(),
+        }
+    }
+
+    pub(super) const fn always_retains_nop(self) -> bool {
+        matches!(self.retained_nop(), RetainedJumpNop::Always)
+    }
+
+    pub(super) fn retains_nop_for(self, operand: Operand) -> bool {
+        match (self.retained_nop(), operand) {
+            (RetainedJumpNop::Always, _) => true,
+            (RetainedJumpNop::DirectTarget, Operand::Forward(_)) => true,
+            (RetainedJumpNop::None | RetainedJumpNop::DirectTarget, _) => false,
+        }
+    }
+
+    pub(super) fn retain_nop(&mut self) {
+        self.0 = (self.0 & !Self::RETAINED_NOP_MASK) | Self::RETAINED_NOP_ALWAYS;
+    }
+
+    pub(super) fn retain_nop_for_direct_target(&mut self) {
+        if !self.always_retains_nop() {
+            self.0 = (self.0 & !Self::RETAINED_NOP_MASK) | Self::RETAINED_NOP_DIRECT_TARGET;
+        }
+    }
+
+    fn clear_direct_target_retention(&mut self) {
+        if matches!(self.retained_nop(), RetainedJumpNop::DirectTarget) {
+            self.0 &= !Self::RETAINED_NOP_MASK;
+        }
+    }
+
+    pub(super) fn defer_removal(&mut self) {
+        self.0 |= Self::DEFER_REDUNDANT_REMOVAL;
+    }
+
+    pub(super) fn retain_redundant_nop_after_threading(&mut self) {
+        self.0 |= Self::DEFER_REDUNDANT_REMOVAL | Self::PRESERVE_NOP_AFTER_THREADING;
+    }
+
+    #[cfg(test)]
+    pub(super) fn preserve_nop_after_threading_for_test(&mut self) {
+        self.0 |= Self::PRESERVE_NOP_AFTER_THREADING;
+    }
+
+    pub(super) fn prevent_small_exit_inlining(&mut self) {
+        self.0 |= Self::PREVENT_SMALL_EXIT_INLINING;
+    }
+
+    pub(super) fn prevent_threading_target(&mut self) {
+        self.0 |= Self::PREVENT_THREADING_TARGET;
+    }
+
+    pub(super) fn resolve_deferred_removal(&mut self) {
+        debug_assert!(self.defers_redundant_removal());
+        self.0 &= !Self::DEFER_REDUNDANT_REMOVAL;
+        if self.preserves_nop_after_threading() {
+            self.0 &= !Self::PRESERVE_NOP_AFTER_THREADING;
+            self.retain_nop();
+        }
+    }
+}
+
+impl std::fmt::Debug for JumpPolicy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("JumpPolicy")
+            .field("inline_small_exit", &self.inline_small_exit())
+            .field("retained_nop", &self.retained_nop())
+            .field("allow_threading_target", &self.allows_threading_target())
+            .field("defer_redundant_removal", &self.defers_redundant_removal())
+            .field(
+                "preserve_nop_after_threading",
+                &self.preserves_nop_after_threading(),
+            )
+            .finish()
+    }
+}
+
+impl Default for JumpPolicy {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -223,9 +378,11 @@ pub(super) struct Instruction {
     pub(super) operand: Operand,
     pub(super) location: SourceLocation,
     pub(super) depth_after: Option<u32>,
-    pub(super) flags: InstructionFlags,
-    // Retain the jump's line event only if its original target is copied directly.
-    pub(super) preserve_direct_inlined_jump_nop: Option<Label>,
+    pub(super) load_policy: LoadPolicy,
+    pub(super) no_location_policy: NoLocationPolicy,
+    pub(super) fusion_policy: FusionPolicy,
+    pub(super) converted_pop_block: bool,
+    pub(super) jump_policy: JumpPolicy,
     // `NOT_TAKEN` is added after CPython labels exception handlers. The new instruction keeps
     // whatever exception target remains in its reused CFG slot, if there is one.
     pub(super) exception_policy: ExceptionPolicy,
@@ -246,10 +403,25 @@ impl Instruction {
             operand,
             location,
             depth_after,
-            flags: InstructionFlags::DEFAULT,
-            preserve_direct_inlined_jump_nop: None,
+            load_policy: LoadPolicy::default(),
+            no_location_policy: NoLocationPolicy::default(),
+            fusion_policy: FusionPolicy::default(),
+            converted_pop_block: false,
+            jump_policy: JumpPolicy::default(),
             exception_policy: ExceptionPolicy::default(),
             borrow_fallthrough: BorrowFallthrough::default(),
+        }
+    }
+
+    /// Retargets a jump while keeping direct-target line-event provenance honest.
+    pub(super) fn retarget(&mut self, operand: Operand) {
+        debug_assert!(matches!(
+            operand,
+            Operand::Forward(_) | Operand::Backward(_)
+        ));
+        if self.operand != operand {
+            self.jump_policy.clear_direct_target_retention();
+            self.operand = operand;
         }
     }
 
@@ -261,41 +433,25 @@ impl Instruction {
         depth_after: Option<u32>,
     ) -> Self {
         let mut instruction = Self::new(opcode, operand, location, depth_after);
-        instruction.remove_flag(InstructionFlags::INLINE_SMALL_EXIT);
+        instruction.jump_policy = JumpPolicy::SYNTHETIC;
         instruction
-    }
-
-    pub(super) const fn has_flag(&self, flag: InstructionFlags) -> bool {
-        self.flags.contains(flag)
-    }
-
-    pub(super) fn insert_flag(&mut self, flag: InstructionFlags) {
-        self.flags.insert(flag);
-    }
-
-    pub(super) fn remove_flag(&mut self, flag: InstructionFlags) {
-        self.flags.remove(flag);
-    }
-
-    pub(super) fn set_flag(&mut self, flag: InstructionFlags, enabled: bool) {
-        self.flags.set(flag, enabled);
     }
 
     /// Combines the provenance of two instructions replaced by one superinstruction.
     pub(super) fn fused(opcode: Opcode, operand: Operand, first: Self, second: Self) -> Self {
-        let mut flags = ((first.flags | second.flags) & InstructionFlags::FUSE_OR)
-            | ((first.flags & second.flags) & InstructionFlags::FUSE_AND)
-            | (first.flags & InstructionFlags::FUSE_FROM_FIRST)
-            | (second.flags & InstructionFlags::FUSE_FROM_SECOND);
-        flags.remove(InstructionFlags::FUSE_CLEARED);
-
         Self {
             opcode,
             operand,
             location: first.location,
             depth_after: second.depth_after,
-            flags,
-            preserve_direct_inlined_jump_nop: None,
+            load_policy: LoadPolicy::fused(first.load_policy, second.load_policy),
+            no_location_policy: NoLocationPolicy::fused(
+                first.no_location_policy,
+                second.no_location_policy,
+            ),
+            fusion_policy: FusionPolicy::fused(first.fusion_policy, second.fusion_policy),
+            converted_pop_block: first.converted_pop_block || second.converted_pop_block,
+            jump_policy: JumpPolicy::fused(first.jump_policy, second.jump_policy),
             exception_policy: first.exception_policy.merged(second.exception_policy),
             borrow_fallthrough: second.borrow_fallthrough,
         }
@@ -309,10 +465,16 @@ pub(super) enum Item {
 }
 
 #[derive(Debug)]
+pub(super) enum UnoptimizedCode {
+    /// Instructions are still being emitted and patched by the compiler.
+    Linear(Vec<Item>),
+    /// Constant reachability has prepared the graph that the CFG pipeline will consume.
+    Prepared(BlockGraph),
+}
+
+#[derive(Debug)]
 pub(crate) struct Assembler {
-    pub(super) items: Vec<Item>,
-    /// The block IR exists only while the assembler pass pipeline is running.
-    pub(super) graph: Option<BlockGraph>,
+    pub(super) code: UnoptimizedCode,
     pub(super) next_label: u32,
     pub(super) location: SourceLocation,
     pub(super) exception_regions: Vec<ExceptionRegion>,
@@ -320,6 +482,28 @@ pub(crate) struct Assembler {
     pub(super) borrow_unreachable_blocks: FxHashSet<Label>,
     pub(super) load_fast_borrowing_enabled: bool,
     pub(super) strict_owned_loads: bool,
+}
+
+/// The block-aware assembler state used by CFG optimization passes.
+///
+/// Keeping this separate from [`Assembler`] makes it impossible to run a CFG
+/// pass before instruction emission is complete.
+#[derive(Debug)]
+pub(super) struct OptimizationPipeline {
+    pub(super) graph: BlockGraph,
+    pub(super) next_label: u32,
+    pub(super) exception_regions: Vec<ExceptionRegion>,
+    pub(super) preserved_block_boundaries: FxHashSet<Label>,
+    pub(super) borrow_unreachable_blocks: FxHashSet<Label>,
+}
+
+/// The linear assembler state used after CFG optimization is complete.
+#[derive(Debug)]
+pub(super) struct LayoutAssembler {
+    pub(super) items: Vec<Item>,
+    pub(super) exception_regions: Vec<ExceptionRegion>,
+    pub(super) preserved_block_boundaries: FxHashSet<Label>,
+    pub(super) removed_max_depth: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -360,8 +544,7 @@ impl SourceLocation {
 impl Default for Assembler {
     fn default() -> Self {
         Self {
-            items: Vec::new(),
-            graph: None,
+            code: UnoptimizedCode::Linear(Vec::new()),
             next_label: 0,
             location: SourceLocation::NONE,
             exception_regions: Vec::new(),

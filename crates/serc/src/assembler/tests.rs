@@ -1,27 +1,180 @@
-use super::ir::{BorrowFallthrough, ExceptionPolicy};
+use super::ir::{
+    BorrowFallthrough, ExceptionPolicy, FusionPolicy, JumpPolicy, LoadPolicy, NoLocationPolicy,
+    RetainedJumpNop, UnoptimizedCode,
+};
 use super::{
-    Assembler, AssemblerStage, ExceptionExclusion, Instruction, InstructionFlags, Item,
-    NormalizedExceptionOwner, Operand, SourceLocation,
+    Assembler, AssemblerStage, ExceptionExclusion, Instruction, Item, NormalizedExceptionOwner,
+    Operand, SourceLocation,
 };
 use crate::target::opcodes::*;
 
 #[test]
+#[cfg(target_pointer_width = "64")]
+fn instruction_items_remain_cache_compact() {
+    assert_eq!(std::mem::size_of::<Instruction>(), 48);
+    assert_eq!(std::mem::size_of::<Item>(), 48);
+}
+
+#[test]
 fn instruction_constructors_set_audited_defaults() {
     let regular = Instruction::new(LOAD_CONST, Operand::Value(0), SourceLocation::NONE, None);
-    assert_eq!(regular.flags, InstructionFlags::DEFAULT);
-    assert!(regular.has_flag(InstructionFlags::INLINE_SMALL_EXIT));
-    assert!(regular.has_flag(InstructionFlags::ALLOW_JUMP_THREADING_TARGET));
+    assert_eq!(regular.load_policy, LoadPolicy::default());
+    assert_eq!(regular.no_location_policy, NoLocationPolicy::default());
+    assert_eq!(regular.fusion_policy, FusionPolicy::default());
+    assert!(!regular.converted_pop_block);
+    assert_eq!(regular.jump_policy, JumpPolicy::default());
 
     let synthetic = Instruction::synthetic(NOP, Operand::Value(0), SourceLocation::NONE, None);
-    assert!(!synthetic.has_flag(InstructionFlags::INLINE_SMALL_EXIT));
-    assert!(synthetic.has_flag(InstructionFlags::ALLOW_JUMP_THREADING_TARGET));
-    assert_eq!(
-        synthetic.preserve_direct_inlined_jump_nop, None,
-        "synthetic instructions do not inherit jump provenance"
-    );
+    assert!(!synthetic.jump_policy.inline_small_exit());
+    let mut expected_synthetic_policy = JumpPolicy::default();
+    expected_synthetic_policy.prevent_small_exit_inlining();
+    assert_eq!(synthetic.jump_policy, expected_synthetic_policy);
     assert_eq!(synthetic.exception_policy, ExceptionPolicy::default());
     assert_eq!(regular.borrow_fallthrough, BorrowFallthrough::Reachable);
     assert_eq!(synthetic.borrow_fallthrough, BorrowFallthrough::Reachable);
+}
+
+#[test]
+fn jump_policy_defaults_are_explicit() {
+    let policy = JumpPolicy::default();
+    assert!(policy.inline_small_exit());
+    assert_eq!(policy.retained_nop(), RetainedJumpNop::None);
+    assert!(policy.allows_threading_target());
+    assert!(!policy.defers_redundant_removal());
+    assert!(!policy.preserves_nop_after_threading());
+}
+
+#[test]
+fn jump_policy_fusion_is_exhaustive() {
+    fn policy(bits: u8, retained_nop: RetainedJumpNop) -> JumpPolicy {
+        let mut policy = JumpPolicy::default();
+        if bits & 1 == 0 {
+            policy.prevent_small_exit_inlining();
+        }
+        match retained_nop {
+            RetainedJumpNop::None => {}
+            RetainedJumpNop::DirectTarget => policy.retain_nop_for_direct_target(),
+            RetainedJumpNop::Always => policy.retain_nop(),
+        }
+        if bits & 2 == 0 {
+            policy.prevent_threading_target();
+        }
+        if bits & 4 != 0 {
+            policy.defer_removal();
+        }
+        if bits & 8 != 0 {
+            policy.preserve_nop_after_threading_for_test();
+        }
+        policy
+    }
+
+    let retained_nops = [
+        RetainedJumpNop::None,
+        RetainedJumpNop::DirectTarget,
+        RetainedJumpNop::Always,
+    ];
+    for first_bits in 0..16 {
+        for second_bits in 0..16 {
+            for first_retained in retained_nops {
+                for second_retained in retained_nops {
+                    let first = policy(first_bits, first_retained);
+                    let second = policy(second_bits, second_retained);
+                    let expected_bits =
+                        u8::from(first.inline_small_exit() && second.inline_small_exit())
+                            | (u8::from(
+                                first.allows_threading_target() && second.allows_threading_target(),
+                            ) << 1)
+                            | (u8::from(
+                                first.defers_redundant_removal()
+                                    || second.defers_redundant_removal(),
+                            ) << 2)
+                            | (u8::from(
+                                first.preserves_nop_after_threading()
+                                    || second.preserves_nop_after_threading(),
+                            ) << 3);
+                    assert_eq!(
+                        JumpPolicy::fused(first, second),
+                        policy(expected_bits, RetainedJumpNop::None)
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn retained_jump_nop_distinguishes_direct_target_provenance() {
+    let expected = super::Label(1);
+    let mut instruction = Instruction::new(
+        JUMP_FORWARD,
+        Operand::Forward(expected),
+        SourceLocation::NONE,
+        None,
+    );
+    instruction.jump_policy.retain_nop_for_direct_target();
+    assert!(instruction.jump_policy.retains_nop_for(instruction.operand));
+
+    instruction.retarget(Operand::Forward(expected));
+    assert_eq!(
+        instruction.jump_policy.retained_nop(),
+        RetainedJumpNop::DirectTarget
+    );
+    instruction.retarget(Operand::Forward(super::Label(2)));
+    assert_eq!(
+        instruction.jump_policy.retained_nop(),
+        RetainedJumpNop::None
+    );
+    instruction.retarget(Operand::Forward(expected));
+    assert!(!instruction.jump_policy.retains_nop_for(instruction.operand));
+
+    instruction.jump_policy.retain_nop();
+    instruction.retarget(Operand::Backward(expected));
+    assert!(instruction.jump_policy.always_retains_nop());
+    assert!(instruction.jump_policy.retains_nop_for(instruction.operand));
+}
+
+#[test]
+fn deferred_jump_removal_promotes_post_threading_nop_retention() {
+    let mut policy = JumpPolicy::default();
+    policy.retain_redundant_nop_after_threading();
+    assert!(policy.defers_redundant_removal());
+    assert!(policy.preserves_nop_after_threading());
+
+    policy.resolve_deferred_removal();
+    assert!(!policy.defers_redundant_removal());
+    assert!(!policy.preserves_nop_after_threading());
+    assert_eq!(policy.retained_nop(), RetainedJumpNop::Always);
+}
+
+#[test]
+#[should_panic(expected = "deferring redundant jump removal requires a preceding instruction")]
+fn jump_policy_mutation_requires_a_preceding_instruction() {
+    Assembler::default().defer_last_jump_removal();
+}
+
+#[test]
+#[should_panic(
+    expected = "preventing fusion with the next instruction requires a preceding instruction"
+)]
+fn instruction_policy_mutation_requires_a_preceding_instruction() {
+    Assembler::default().prevent_last_instruction_fusion();
+}
+
+#[test]
+#[should_panic(expected = "preventing jump inlining requires a jump instruction")]
+fn jump_policy_mutation_requires_a_jump() {
+    let mut assembler = Assembler::default();
+    assembler.emit(NOP, 0);
+    assembler.prevent_last_jump_inlining();
+}
+
+#[test]
+#[should_panic(expected = "retaining a directly inlined jump NOP requires a forward jump")]
+fn direct_jump_nop_provenance_requires_a_forward_jump() {
+    let mut assembler = Assembler::default();
+    let target = assembler.label();
+    assembler.emit_backward(JUMP_BACKWARD, target);
+    assembler.preserve_last_direct_inlined_jump_nop();
 }
 
 #[test]
@@ -37,9 +190,12 @@ fn borrow_fallthrough_barrier_stays_on_predecessor_across_labels_and_emission() 
         Item::Instruction(predecessor),
         Item::Label(actual_boundary),
         Item::Instruction(next),
-    ] = assembler.items.as_slice()
+    ] = assembler.linear_items()
     else {
-        panic!("unexpected instruction stream: {:?}", assembler.items);
+        panic!(
+            "unexpected instruction stream: {:?}",
+            assembler.linear_items()
+        );
     };
     assert_eq!(*actual_boundary, boundary);
     assert_eq!(predecessor.borrow_fallthrough, BorrowFallthrough::Barrier);
@@ -73,7 +229,7 @@ fn value_emission_attaches_exception_policy_across_intervening_labels() {
         Item::Instruction(excluded),
         Item::Label(actual_second_boundary),
         Item::Instruction(default),
-    ] = assembler.items.as_slice()
+    ] = assembler.linear_items()
     else {
         panic!("expected three instructions separated by labels");
     };
@@ -102,7 +258,7 @@ fn jump_emission_attaches_exception_policy_after_an_intervening_label() {
         Item::Instruction(default),
         Item::Label(actual_boundary),
         Item::Instruction(excluded),
-    ] = assembler.items.as_slice()
+    ] = assembler.linear_items()
     else {
         panic!("expected two instructions separated by one label");
     };
@@ -115,25 +271,6 @@ fn jump_emission_attaches_exception_policy_after_an_intervening_label() {
 }
 
 #[test]
-fn fusion_classifies_every_instruction_flag() {
-    let mut classified = InstructionFlags::empty();
-    for policy in [
-        InstructionFlags::FUSE_OR,
-        InstructionFlags::FUSE_AND,
-        InstructionFlags::FUSE_FROM_FIRST,
-        InstructionFlags::FUSE_FROM_SECOND,
-        InstructionFlags::FUSE_CLEARED,
-    ] {
-        assert!(
-            (classified & policy).is_empty(),
-            "fusion policies overlap at {policy:?}"
-        );
-        classified.insert(policy);
-    }
-    assert_eq!(classified, InstructionFlags::all());
-}
-
-#[test]
 fn exception_exclusion_names_layout_policy() {
     assert!(!ExceptionExclusion::None.applies(1));
     assert!(!ExceptionExclusion::IfExtended.applies(0));
@@ -142,25 +279,20 @@ fn exception_exclusion_names_layout_policy() {
 }
 
 #[test]
-fn fusion_uses_each_flags_propagation_policy() {
+fn fusion_preserves_each_typed_instruction_policy() {
     let mut first = Instruction::new(
         LOAD_FAST,
         Operand::Value(1),
         SourceLocation::new(2, 2, 0, 1),
         Some(1),
     );
-    for flag in [
-        InstructionFlags::FORCE_OWNED_LOAD,
-        InstructionFlags::ALLOW_NO_LOCATION_BLOCK_INLINING,
-        InstructionFlags::DEFER_REDUNDANT_JUMP_REMOVAL,
-        InstructionFlags::CONVERTED_POP_BLOCK,
-        InstructionFlags::PREVENT_FUSION_WITH_NEXT,
-        InstructionFlags::PRESERVE_INLINED_JUMP_NOP,
-    ] {
-        first.insert_flag(flag);
-    }
-    first.remove_flag(InstructionFlags::ALLOW_JUMP_THREADING_TARGET);
-    first.preserve_direct_inlined_jump_nop = Some(super::Label(1));
+    first.load_policy.force_owned = true;
+    first.no_location_policy.allow_block_inlining = true;
+    first.converted_pop_block = true;
+    first.fusion_policy.prevent_with_next = true;
+    first.jump_policy.prevent_threading_target();
+    first.jump_policy.defer_removal();
+    first.jump_policy.retain_nop();
     first
         .exception_policy
         .exclude(ExceptionExclusion::IfExtended);
@@ -172,46 +304,41 @@ fn fusion_uses_each_flags_propagation_policy() {
         SourceLocation::new(2, 2, 2, 3),
         Some(2),
     );
-    for flag in [
-        InstructionFlags::STRICT_OWNED_LOAD,
-        InstructionFlags::PRESERVE_NO_LOCATION,
-        InstructionFlags::PRESERVE_NOP_AFTER_JUMP_THREADING,
-        InstructionFlags::PREVENT_FUSION_WITH_PREVIOUS,
-        InstructionFlags::PRESERVE_INLINED_JUMP_NOP,
-    ] {
-        second.insert_flag(flag);
-    }
-    second.remove_flag(InstructionFlags::INLINE_SMALL_EXIT);
-    second.preserve_direct_inlined_jump_nop = Some(super::Label(2));
+    second.load_policy.strict_owned = true;
+    second.no_location_policy.preserve = true;
+    second.fusion_policy.prevent_with_previous = true;
+    second.jump_policy.prevent_small_exit_inlining();
+    second.jump_policy.retain_redundant_nop_after_threading();
+    second.jump_policy.retain_nop_for_direct_target();
     second.exception_policy.exclude(ExceptionExclusion::Always);
     second.exception_policy.normalized_owner = NormalizedExceptionOwner::Present;
     second.borrow_fallthrough = BorrowFallthrough::Barrier;
 
     let fused = Instruction::fused(LOAD_FAST_LOAD_FAST, Operand::Value(0x12), first, second);
 
-    for flag in [
-        InstructionFlags::FORCE_OWNED_LOAD,
-        InstructionFlags::STRICT_OWNED_LOAD,
-        InstructionFlags::ALLOW_NO_LOCATION_BLOCK_INLINING,
-        InstructionFlags::PRESERVE_NO_LOCATION,
-        InstructionFlags::DEFER_REDUNDANT_JUMP_REMOVAL,
-        InstructionFlags::PRESERVE_NOP_AFTER_JUMP_THREADING,
-        InstructionFlags::CONVERTED_POP_BLOCK,
-    ] {
-        assert!(fused.has_flag(flag), "missing merged flag {flag:?}");
-    }
-    for flag in [
-        InstructionFlags::INLINE_SMALL_EXIT,
-        InstructionFlags::PRESERVE_INLINED_JUMP_NOP,
-        InstructionFlags::ALLOW_JUMP_THREADING_TARGET,
-        InstructionFlags::PREVENT_FUSION_WITH_NEXT,
-        InstructionFlags::PREVENT_FUSION_WITH_PREVIOUS,
-    ] {
-        assert!(!fused.has_flag(flag), "unexpected merged flag {flag:?}");
-    }
+    assert_eq!(
+        fused.load_policy,
+        LoadPolicy {
+            force_owned: true,
+            strict_owned: true,
+        }
+    );
+    assert_eq!(
+        fused.no_location_policy,
+        NoLocationPolicy {
+            allow_block_inlining: true,
+            preserve: true,
+        }
+    );
+    assert_eq!(fused.fusion_policy, FusionPolicy::default());
+    assert!(fused.converted_pop_block);
     assert_eq!(fused.location, first.location);
     assert_eq!(fused.depth_after, second.depth_after);
-    assert_eq!(fused.preserve_direct_inlined_jump_nop, None);
+    let mut expected_jump_policy = JumpPolicy::default();
+    expected_jump_policy.prevent_small_exit_inlining();
+    expected_jump_policy.prevent_threading_target();
+    expected_jump_policy.retain_redundant_nop_after_threading();
+    assert_eq!(fused.jump_policy, expected_jump_policy);
     assert_eq!(fused.borrow_fallthrough, BorrowFallthrough::Barrier);
     assert_eq!(
         fused.exception_policy,
@@ -222,28 +349,25 @@ fn fusion_uses_each_flags_propagation_policy() {
     );
 
     let mut first_edge = Instruction::new(LOAD_FAST, Operand::Value(1), SourceLocation::NONE, None);
-    first_edge.insert_flag(InstructionFlags::PREVENT_FUSION_WITH_PREVIOUS);
+    first_edge.fusion_policy.prevent_with_previous = true;
     first_edge.borrow_fallthrough = BorrowFallthrough::Barrier;
     let mut second_edge =
         Instruction::new(LOAD_FAST, Operand::Value(2), SourceLocation::NONE, None);
-    second_edge.insert_flag(InstructionFlags::PREVENT_FUSION_WITH_NEXT);
+    second_edge.fusion_policy.prevent_with_next = true;
     let fused_edges = Instruction::fused(
         LOAD_FAST_LOAD_FAST,
         Operand::Value(0x12),
         first_edge,
         second_edge,
     );
-    for flag in [
-        InstructionFlags::INLINE_SMALL_EXIT,
-        InstructionFlags::ALLOW_JUMP_THREADING_TARGET,
-        InstructionFlags::PREVENT_FUSION_WITH_NEXT,
-        InstructionFlags::PREVENT_FUSION_WITH_PREVIOUS,
-    ] {
-        assert!(
-            fused_edges.has_flag(flag),
-            "missing edge-selected flag {flag:?}"
-        );
-    }
+    assert_eq!(
+        fused_edges.fusion_policy,
+        FusionPolicy {
+            prevent_with_previous: true,
+            prevent_with_next: true,
+        }
+    );
+    assert_eq!(fused_edges.jump_policy, JumpPolicy::default());
     assert_eq!(fused_edges.borrow_fallthrough, BorrowFallthrough::Reachable);
 }
 
@@ -251,12 +375,12 @@ fn fusion_uses_each_flags_propagation_policy() {
 fn owned_fast_loads_use_real_opcodes_with_provenance() {
     let mut assembler = Assembler::default();
     assembler.emit_owned_fast_with_depth(3, 1);
-    let Some(Item::Instruction(instruction)) = assembler.items.last() else {
+    let Some(Item::Instruction(instruction)) = assembler.linear_items().last() else {
         panic!("owned load was not emitted");
     };
     assert_eq!(instruction.opcode, LOAD_FAST);
-    assert!(instruction.has_flag(InstructionFlags::FORCE_OWNED_LOAD));
-    assert!(!instruction.has_flag(InstructionFlags::STRICT_OWNED_LOAD));
+    assert!(instruction.load_policy.force_owned);
+    assert!(!instruction.load_policy.strict_owned);
 }
 
 #[test]
@@ -379,7 +503,7 @@ fn assembler_with_preserved_constant_boundary() -> Assembler {
     let preserved = super::Label(1);
     let target = super::Label(2);
     Assembler {
-        items: vec![
+        code: UnoptimizedCode::Linear(vec![
             Item::Label(entry),
             Item::Label(preserved),
             pass_instruction(LOAD_CONST, 0, 1),
@@ -393,7 +517,7 @@ fn assembler_with_preserved_constant_boundary() -> Assembler {
             Item::Label(target),
             pass_instruction(LOAD_CONST, 2, 2),
             pass_instruction(RETURN_VALUE, 0, 2),
-        ],
+        ]),
         next_label: 3,
         preserved_block_boundaries: rustc_hash::FxHashSet::from_iter([preserved]),
         ..Assembler::default()
@@ -401,7 +525,7 @@ fn assembler_with_preserved_constant_boundary() -> Assembler {
 }
 
 #[test]
-fn reuses_constant_reachability_graph_with_finish_partitioning() {
+fn constant_reachability_prepares_the_optimization_graph() {
     let expected = assembler_with_preserved_constant_boundary()
         .finish()
         .unwrap();
@@ -411,8 +535,7 @@ fn reuses_constant_reachability_graph_with_finish_partitioning() {
         assembler.used_constant_indices(LOAD_CONST),
         rustc_hash::FxHashSet::from_iter([0, 2])
     );
-    assert!(assembler.items.is_empty());
-    assert!(assembler.graph.is_some());
+    assert!(matches!(assembler.code, UnoptimizedCode::Prepared(_)));
     assembler.remap_constant_indices(LOAD_CONST, &[Some(0), Some(1), Some(2)]);
 
     assert_eq!(assembler.finish().unwrap(), expected);
@@ -427,21 +550,30 @@ fn pass_instruction(opcode: crate::target::Opcode, argument: u32, line: i32) -> 
     ))
 }
 
-fn assembler_with_graph(items: Vec<Item>) -> Assembler {
+fn optimization_pipeline(items: Vec<Item>) -> super::OptimizationPipeline {
+    let next_label = items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Label(label)
+            | Item::Instruction(Instruction {
+                operand: Operand::Forward(label) | Operand::Backward(label),
+                ..
+            }) => Some(label.0 + 1),
+            Item::Instruction(_) => None,
+        })
+        .max()
+        .unwrap_or(0);
     Assembler {
-        graph: Some(super::block_graph::BlockGraph::from_items(
-            items,
-            &rustc_hash::FxHashSet::default(),
-        )),
+        code: UnoptimizedCode::Linear(items),
+        next_label,
         ..Assembler::default()
     }
+    .into_optimization_pipeline()
 }
 
-fn graph_opcodes(assembler: &Assembler) -> Vec<crate::target::Opcode> {
+fn graph_opcodes(assembler: &super::OptimizationPipeline) -> Vec<crate::target::Opcode> {
     assembler
         .graph
-        .as_ref()
-        .unwrap()
         .iter_items()
         .filter_map(|item| {
             let Item::Instruction(instruction) = item else {
@@ -454,9 +586,8 @@ fn graph_opcodes(assembler: &Assembler) -> Vec<crate::target::Opcode> {
 
 #[test]
 fn uninitialized_load_analysis_follows_single_block_backedges() {
-    let mut assembler = Assembler::default();
-    let label = assembler.label();
-    assembler.graph = assembler_with_graph(vec![
+    let label = super::Label(0);
+    let mut assembler = optimization_pipeline(vec![
         Item::Label(label),
         pass_instruction(LOAD_FAST, 0, 1),
         pass_instruction(DELETE_FAST, 0, 1),
@@ -466,8 +597,7 @@ fn uninitialized_load_analysis_follows_single_block_backedges() {
             SourceLocation::new(1, 1, 0, 0),
             None,
         )),
-    ])
-    .graph;
+    ]);
 
     assembler.add_checks_for_uninitialized_loads(1, 1);
 
@@ -479,7 +609,7 @@ fn uninitialized_load_analysis_follows_single_block_backedges() {
 
 #[test]
 fn redundant_swap_removal_preserves_forward_scan_semantics() {
-    let mut assembler = assembler_with_graph(vec![
+    let mut assembler = optimization_pipeline(vec![
         pass_instruction(SWAP, 2, 1),
         Item::Label(super::Label(0)),
         pass_instruction(SWAP, 2, 1),
@@ -500,8 +630,8 @@ fn redundant_nop_removal_preserves_forward_scan_semantics() {
         Item::Instruction(instruction) => instruction,
         Item::Label(_) => unreachable!(),
     };
-    converted.insert_flag(InstructionFlags::CONVERTED_POP_BLOCK);
-    let mut assembler = assembler_with_graph(vec![
+    converted.converted_pop_block = true;
+    let mut assembler = optimization_pipeline(vec![
         pass_instruction(NOP, 0, 1),
         Item::Label(super::Label(0)),
         pass_instruction(NOP, 0, -1),

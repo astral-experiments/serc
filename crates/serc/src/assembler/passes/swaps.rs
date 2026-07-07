@@ -1,15 +1,12 @@
 use rustc_hash::FxHashSet;
 
 use super::super::{Instruction, Item, NOP, Operand, POP_TOP, STORE_FAST, SWAP, ends_scope};
-use crate::assembler::Assembler;
+use crate::assembler::OptimizationPipeline;
 use crate::assembler::block_graph::{BlockGraph, ItemPosition};
 
-impl Assembler {
+impl OptimizationPipeline {
     pub(in crate::assembler) fn remove_redundant_swaps_before_pops(&mut self) {
-        let graph = self
-            .graph
-            .as_ref()
-            .expect("assembler pass requires the block graph");
+        let graph = &self.graph;
         if !graph.iter_items().any(
             |item| matches!(item, Item::Instruction(instruction) if instruction.opcode == SWAP),
         ) {
@@ -50,10 +47,7 @@ impl Assembler {
             }
         }
 
-        let graph = self
-            .graph
-            .as_mut()
-            .expect("assembler pass requires the block graph");
+        let graph = &mut self.graph;
         for position in redundant.into_iter().rev() {
             graph.remove_item(position);
         }
@@ -67,10 +61,7 @@ impl Assembler {
     pub(in crate::assembler) fn optimize_swap_runs(&mut self) {
         const VISITED: usize = usize::MAX;
 
-        let graph = self
-            .graph
-            .as_ref()
-            .expect("assembler pass requires the block graph");
+        let graph = &self.graph;
         if !graph.iter_items().any(
             |item| matches!(item, Item::Instruction(instruction) if instruction.opcode == SWAP),
         ) {
@@ -93,10 +84,7 @@ impl Assembler {
         let blocks = graph.partition_positions(&block_labels, |instruction| {
             !matches!(instruction.operand, Operand::Value(_)) || ends_scope(instruction.opcode)
         });
-        let graph = self
-            .graph
-            .as_mut()
-            .expect("assembler pass requires the block graph");
+        let graph = &mut self.graph;
         for block in blocks {
             let instruction_positions = block
                 .into_iter()
@@ -235,10 +223,7 @@ impl Assembler {
             None
         }
 
-        let graph = self
-            .graph
-            .as_ref()
-            .expect("assembler pass requires the block graph");
+        let graph = &self.graph;
         if !graph.iter_items().any(
             |item| matches!(item, Item::Instruction(instruction) if instruction.opcode == SWAP),
         ) {
@@ -261,10 +246,7 @@ impl Assembler {
         let blocks = graph.partition_positions(&block_labels, |instruction| {
             !matches!(instruction.operand, Operand::Value(_)) || ends_scope(instruction.opcode)
         });
-        let graph = self
-            .graph
-            .as_mut()
-            .expect("assembler pass requires the block graph");
+        let graph = &mut self.graph;
         for positions in blocks {
             let mut index = positions.len();
             while index > 0 {
