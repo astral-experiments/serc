@@ -3278,6 +3278,11 @@ impl Compiler {
                     if statement.orelse.is_empty()
                         && suite_contains_loop_break(&statement.body)
             );
+        let handlers_terminate = statement.handlers.iter().all(|handler| {
+            handler
+                .as_except_handler()
+                .is_some_and(|handler| suite_terminates(&handler.body))
+        });
 
         if emit_statement_nop {
             let statement_nop_start = self.assembler.label();
@@ -3447,6 +3452,12 @@ impl Compiler {
                 ExceptionPolicy::default()
             };
             self.emit_jump_forward_with_exception_policy(JUMP_FORWARD, end, 0, exception_policy)?;
+            if handlers_terminate {
+                // CPython removes this normal-exit edge before borrowed-load traversal. Keep
+                // the barrier on the source edge so a shared target can still be reached from
+                // an enclosing branch or loop.
+                self.assembler.mark_last_borrow_fallthrough_barrier();
+            }
             if !statement.orelse.is_empty()
                 && suite_ends_in_retained_try_exit_join(&statement.orelse)
             {
@@ -3887,15 +3898,6 @@ impl Compiler {
         self.emit(POP_EXCEPT, 0, -1)?;
         self.emit_reraise(ReraiseStackState::HandlerCleanup)?;
 
-        // CPython's final borrowed-load traversal leaves the normal continuation unvisited
-        // when every exception handler terminates, so its local loads remain owned.
-        if statement.handlers.iter().all(|handler| {
-            handler
-                .as_except_handler()
-                .is_some_and(|handler| suite_terminates(&handler.body))
-        }) {
-            self.assembler.prevent_borrow_reachability(end);
-        }
         self.assembler.mark(end);
         self.set_depth(base_depth);
         Ok(())
