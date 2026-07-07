@@ -3,6 +3,22 @@
 
 use super::*;
 
+#[derive(Debug, Default)]
+pub(super) struct SymbolState {
+    pub(super) locals: Vec<String>,
+    pub(super) fast_local_count: usize,
+    pub(super) cell_names: NameSet,
+    pub(super) free_names: Vec<String>,
+    pub(super) temporary_indices: FxHashMap<NameId, u32>,
+    pub(super) hidden_names: NameSet,
+    pub(super) active_temporaries: NameSet,
+    pub(super) initialized_locals: NameSet,
+    pub(super) owned_load_locals: NameSet,
+    pub(super) imported_scope_names: NameSet,
+    pub(super) type_parameter_names: NameSet,
+    pub(super) module_globals: NameSet,
+}
+
 impl Compiler {
     fn name_id(&self, name: &str) -> Option<NameId> {
         self.context.scopes.get()?.names.get(name)

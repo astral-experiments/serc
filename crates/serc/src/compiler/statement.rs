@@ -3,6 +3,43 @@
 
 use super::*;
 
+#[derive(Debug, Default)]
+pub(super) struct ControlFlowState {
+    pub(super) defer_async_comprehension_restore: bool,
+    pub(super) reorder_async_comprehension_cleanup_throw: bool,
+    pub(super) pending_comprehension_restores: Vec<(Vec<u32>, SourceLocation)>,
+    pub(super) active_comprehension_cleanups: Vec<(Label, u32)>,
+    pub(super) active_comprehension_region_exclusions: Vec<Vec<(Label, Label)>>,
+    pub(super) active_with_exits: Vec<WithExitContext>,
+    pub(super) active_with_region_exclusions: Vec<Vec<(Label, Label)>>,
+    pub(super) active_terminal_withs: usize,
+    // CPython retains the empty end block when an async for ends a protected suite.
+    pub(super) emit_protected_async_for_end_nop: bool,
+    pub(super) active_exception_region_exclusions: Vec<Vec<(Label, Label)>>,
+    pub(super) active_exception_handlers: Vec<ExceptionHandlerContext>,
+    pub(super) active_return_finally_contexts: Vec<ReturnFinallyContext>,
+    // CPython's normalized `NOT_TAKEN` can reuse a normal-finally CFG slot that still owns the
+    // coroutine stop-iteration handler.
+    pub(super) active_normal_finally_bodies: usize,
+    pub(super) active_finally_end_blocks: usize,
+    pub(super) active_finally_try_bodies: usize,
+    pub(super) active_pass_finally_locations: Vec<SourceLocation>,
+    pub(super) active_overriding_finally_returns: usize,
+    pub(super) preserve_finally_break_exit_loop_range: Option<ruff_text_size::TextRange>,
+    pub(super) exclude_terminal_if_not_taken: bool,
+    pub(super) exclude_condition_not_taken_from_exception: bool,
+    pub(super) exclude_condition_not_taken_from_all_exception_regions: bool,
+    pub(super) exclude_loop_tail_not_taken_from_control_flow_regions: bool,
+    pub(super) unwind_exception_handlers_for_implicit_return: bool,
+    pub(super) prevent_try_exit_inlining: bool,
+    pub(super) generator_region_start: Option<Label>,
+    pub(super) generator_region_exclusions: Vec<(Label, Label)>,
+    pub(super) emitted_fallthrough_return: bool,
+    pub(super) loops: Vec<LoopContext>,
+    pub(super) depth: i32,
+    pub(super) max_depth: u32,
+}
+
 impl Compiler {
     fn loop_context(
         &self,
