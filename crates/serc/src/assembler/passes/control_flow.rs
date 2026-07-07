@@ -6,7 +6,7 @@ use super::super::{
     POP_JUMP_IF_TRUE, POP_TOP, STORE_FAST, TO_BOOL, UNARY_NOT, ends_scope, is_unconditional_jump,
 };
 use crate::assembler::OptimizationPipeline;
-use crate::assembler::block_graph::ItemMut;
+use crate::assembler::block_graph::{BlockGraph, ItemMut, ItemPosition};
 use crate::target::Opcode;
 use crate::target::operands::ComparisonOperation;
 
@@ -142,8 +142,12 @@ impl OptimizationPipeline {
             fallthrough_index: usize,
         }
 
-        fn is_value_preserving_jump(items: &[Item], index: usize) -> bool {
-            let Item::Instruction(instruction) = items[index] else {
+        fn is_value_preserving_jump(
+            graph: &BlockGraph,
+            positions: &[ItemPosition],
+            index: usize,
+        ) -> bool {
+            let Item::Instruction(instruction) = *graph.item(positions[index]) else {
                 return false;
             };
             if !matches!(instruction.opcode, POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE)
@@ -151,8 +155,8 @@ impl OptimizationPipeline {
             {
                 return false;
             }
-            let mut previous = items[..index].iter().rev().filter_map(|item| {
-                let Item::Instruction(instruction) = item else {
+            let mut previous = positions[..index].iter().rev().filter_map(|position| {
+                let Item::Instruction(instruction) = *graph.item(*position) else {
                     return None;
                 };
                 (instruction.opcode != NOP).then_some(instruction)
@@ -188,34 +192,34 @@ impl OptimizationPipeline {
             return;
         }
         let mut positions = graph.item_positions();
-        let mut items = positions
-            .iter()
-            .map(|position| *graph.item(*position))
-            .collect::<Vec<_>>();
         let mut conditional_targets = FxHashMap::default();
-        for (index, item) in items.iter().enumerate() {
-            let Item::Label(label) = item else {
+        for (index, position) in positions.iter().copied().enumerate() {
+            let Item::Label(label) = *graph.item(position) else {
                 continue;
             };
-            let following = items[index + 1..]
+            let mut following = positions[index + 1..]
                 .iter()
+                .copied()
                 .enumerate()
-                .filter_map(|(offset, item)| {
-                    let Item::Instruction(instruction) = item else {
+                .filter_map(|(offset, position)| {
+                    let Item::Instruction(instruction) = *graph.item(position) else {
                         return None;
                     };
-                    (instruction.opcode != NOP).then_some((index + 1 + offset, *instruction))
-                })
-                .take(5)
-                .collect::<Vec<_>>();
-            let [
-                (_, copy),
-                (_, to_bool),
-                (_, jump),
-                (_, not_taken),
-                (fallthrough_index, pop),
-            ] = following.as_slice()
-            else {
+                    (instruction.opcode != NOP).then_some((index + 1 + offset, instruction))
+                });
+            let Some((_, copy)) = following.next() else {
+                continue;
+            };
+            let Some((_, to_bool)) = following.next() else {
+                continue;
+            };
+            let Some((_, jump)) = following.next() else {
+                continue;
+            };
+            let Some((_, not_taken)) = following.next() else {
+                continue;
+            };
+            let Some((fallthrough_index, pop)) = following.next() else {
                 continue;
             };
             if copy.opcode != COPY
@@ -229,23 +233,24 @@ impl OptimizationPipeline {
                 continue;
             }
             conditional_targets.insert(
-                *label,
+                label,
                 ConditionalTarget {
                     opcode: jump.opcode,
                     operand: jump.operand,
-                    fallthrough_index: *fallthrough_index,
+                    fallthrough_index,
                 },
             );
         }
 
-        let mut fallthrough_indices = items
+        let mut fallthrough_indices = positions
             .iter()
+            .copied()
             .enumerate()
-            .filter_map(|(index, item)| {
-                let Item::Instruction(instruction) = item else {
+            .filter_map(|(index, position)| {
+                let Item::Instruction(instruction) = *graph.item(position) else {
                     return None;
                 };
-                if !is_value_preserving_jump(&items, index) {
+                if !is_value_preserving_jump(graph, &positions, index) {
                     return None;
                 }
                 let Operand::Forward(target) = instruction.operand else {
@@ -261,30 +266,21 @@ impl OptimizationPipeline {
             .iter()
             .map(|index| (*index, self.label()))
             .collect::<FxHashMap<_, _>>();
-        {
+        if !fallthrough_indices.is_empty() {
             let graph = &mut self.graph;
-            for index in fallthrough_indices.into_iter().rev() {
+            for index in fallthrough_indices.iter().rev().copied() {
                 graph.insert_item(positions[index], Item::Label(fallthrough_labels[&index]));
             }
+            positions = graph.item_positions();
         }
 
-        let graph = &self.graph;
-        positions = graph.item_positions();
-        items = positions
-            .iter()
-            .map(|position| *graph.item(*position))
-            .collect();
-        let value_preserving_jumps = (0..items.len())
-            .filter(|index| is_value_preserving_jump(&items, *index))
-            .collect::<FxHashSet<_>>();
-        let graph = &mut self.graph;
         for (index, position) in positions.iter().copied().enumerate() {
-            let Some(instruction) = graph.instruction_mut(position) else {
-                continue;
-            };
-            if !value_preserving_jumps.contains(&index) {
+            if !is_value_preserving_jump(&self.graph, &positions, index) {
                 continue;
             }
+            let Some(instruction) = self.graph.instruction_mut(position) else {
+                continue;
+            };
             if !matches!(instruction.opcode, POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE) {
                 continue;
             }
@@ -315,25 +311,27 @@ impl OptimizationPipeline {
         }
 
         let graph = &self.graph;
-        items = graph.iter_items().copied().collect();
         let mut jump_targets = FxHashMap::default();
-        for (index, item) in items.iter().enumerate() {
-            let Item::Label(label) = item else {
-                continue;
-            };
-            let Some(Item::Instruction(instruction)) = items[index + 1..]
-                .iter()
-                .find(|item| matches!(item, Item::Instruction(_)))
-            else {
-                continue;
-            };
-            // A jump retained as a source-position NOP remains a CFG boundary.
-            if instruction.jump_policy.allows_threading_target()
-                && !instruction.jump_policy.always_retains_nop()
-                && is_unconditional_jump(instruction.opcode)
-                && let operand @ (Operand::Forward(_) | Operand::Backward(_)) = instruction.operand
-            {
-                jump_targets.insert(*label, (operand, instruction.opcode));
+        let mut next_instruction = None;
+        for block in graph.order().iter().rev().copied() {
+            for item in graph[block].items().iter().rev() {
+                match item {
+                    Item::Instruction(instruction) => next_instruction = Some(*instruction),
+                    Item::Label(label) => {
+                        let Some(instruction) = next_instruction else {
+                            continue;
+                        };
+                        // A jump retained as a source-position NOP remains a CFG boundary.
+                        if instruction.jump_policy.allows_threading_target()
+                            && !instruction.jump_policy.always_retains_nop()
+                            && is_unconditional_jump(instruction.opcode)
+                            && let operand @ (Operand::Forward(_) | Operand::Backward(_)) =
+                                instruction.operand
+                        {
+                            jump_targets.insert(*label, (operand, instruction.opcode));
+                        }
+                    }
+                }
             }
         }
 
