@@ -763,7 +763,7 @@ impl Compiler {
             stack_size,
             flags: self.unit.flags,
             bytecode,
-            constants: self.output.constants,
+            constants: self.output.constants.into_values(),
             names: self.output.names,
             locals: output_locals,
             local_kinds,
