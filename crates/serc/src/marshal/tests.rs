@@ -151,7 +151,7 @@ fn frozen_set_keys_and_reference_order_ignore_input_order() {
 }
 
 #[test]
-fn marshal_plan_is_preorder_with_nested_subtree_boundaries() {
+fn marshal_plan_is_preorder() {
     let nested = code_object(vec![Constant::Tuple(vec![Constant::Int(7)])]);
     let code = code_object(vec![
         Constant::Code(Box::new(nested)),
@@ -163,7 +163,6 @@ fn marshal_plan_is_preorder_with_nested_subtree_boundaries() {
     assert!(
         matches!(entries[0].value, PlannedValue::Code(value) if std::ptr::eq(value, std::ptr::from_ref(&code)))
     );
-    assert_eq!(entries[0].subtree_end, entries.len());
     let root_constants = entries
         .iter()
         .position(|entry| {
@@ -188,7 +187,6 @@ fn marshal_plan_is_preorder_with_nested_subtree_boundaries() {
 
     assert!(root_constants < nested_code);
     assert!(nested_code < nested_constants);
-    assert!(entries[nested_code].subtree_end <= entries[root_constants].subtree_end);
 }
 
 #[test]
@@ -203,9 +201,8 @@ fn marshal_plan_reuses_ids_and_prunes_repeated_container_subtrees() {
         let containers = indices.map(|constant_index| {
             entries
                 .iter()
-                .enumerate()
                 .find(
-                    |(_, entry)| match (&code.constants[constant_index], entry.value) {
+                    |entry| match (&code.constants[constant_index], entry.value) {
                         (Constant::Tuple(values), PlannedValue::Constants(candidate)) => {
                             std::ptr::eq(values.as_slice(), candidate)
                         }
@@ -220,10 +217,27 @@ fn marshal_plan_reuses_ids_and_prunes_repeated_container_subtrees() {
                 )
                 .unwrap()
         });
-        assert_eq!(containers[0].1.object, containers[1].1.object);
-        assert!(containers[0].1.subtree_end > containers[0].0 + 1);
-        assert_eq!(containers[1].1.subtree_end, containers[1].0 + 1);
+        assert_eq!(containers[0].object, containers[1].object);
     }
+
+    let planned_constant = |value: &Constant| {
+        entries.iter().any(|entry| {
+            matches!(entry.value, PlannedValue::Constant(candidate) if std::ptr::eq(candidate, value))
+        })
+    };
+    let [
+        Constant::Tuple(first_tuple),
+        Constant::Tuple(second_tuple),
+        Constant::FrozenSet(first_frozen),
+        Constant::FrozenSet(second_frozen),
+    ] = code.constants.as_slice()
+    else {
+        unreachable!();
+    };
+    assert!(planned_constant(&first_tuple[0]));
+    assert!(!planned_constant(&second_tuple[0]));
+    assert!(first_frozen.iter().all(planned_constant));
+    assert!(second_frozen.iter().all(|value| !planned_constant(value)));
 }
 
 #[test]

@@ -68,11 +68,10 @@ pub(super) struct PlanEntry<'a> {
     pub(super) value: PlannedValue<'a>,
     pub(super) object: Option<ObjectId>,
     pub(super) force_reference: bool,
-    pub(super) subtree_end: usize,
 }
 
-// The plan is a flat preorder tree. Graph construction makes repeated objects leaf entries, and
-// `subtree_end` is the writer's sole authority for walking or skipping children.
+// The plan is a flat preorder traversal. Graph construction makes repeated objects leaf entries,
+// so the writer can consume it linearly without reconstructing the tree.
 #[derive(Debug, Default)]
 pub(super) struct MarshalPlan<'a> {
     entries: Vec<PlanEntry<'a>>,
@@ -95,16 +94,6 @@ impl<'a> MarshalPlan<'a> {
         }
     }
 
-    pub(super) fn entry(&self, index: usize) -> &PlanEntry<'a> {
-        &self.entries[index]
-    }
-
-    pub(super) fn root(&self) -> usize {
-        debug_assert!(!self.entries.is_empty());
-        0
-    }
-
-    #[cfg(test)]
     pub(super) fn entries(&self) -> impl Iterator<Item = &PlanEntry<'a>> {
         self.entries.iter()
     }
@@ -119,8 +108,7 @@ impl<'a, F> PlanBuilder<'a, F>
 where
     F: FnMut(PlannedValue<'a>, PlannedObject<'a>) -> (ObjectId, bool),
 {
-    fn begin(&mut self, value: PlannedValue<'a>, force_reference: bool) -> (usize, bool) {
-        let index = self.entries.len();
+    fn begin(&mut self, value: PlannedValue<'a>, force_reference: bool) -> bool {
         let (object, descend) = value.object().map_or((None, true), |object| {
             let (object, descend) = (self.enter)(value, object);
             (Some(object), descend)
@@ -129,18 +117,12 @@ where
             value,
             object,
             force_reference,
-            subtree_end: index + 1,
         });
-        (index, descend)
-    }
-
-    fn finish(&mut self, index: usize) {
-        self.entries[index].subtree_end = self.entries.len();
+        descend
     }
 
     fn push_code(&mut self, code: &'a CodeObject, force_reference: bool) {
-        let (index, descend) = self.begin(PlannedValue::Code(code), force_reference);
-        if descend {
+        if self.begin(PlannedValue::Code(code), force_reference) {
             self.push_leaf(PlannedValue::CodeBytes(code), true);
             self.push_constants(&code.constants, false);
             self.push_strings(&code.names, false);
@@ -153,37 +135,30 @@ where
             self.push_leaf(PlannedValue::Bytes(&code.line_table), false);
             self.push_leaf(PlannedValue::Bytes(&code.exception_table), false);
         }
-        self.finish(index);
     }
 
     fn push_constants(&mut self, values: &'a [Constant], force_reference: bool) {
-        let (index, descend) = self.begin(PlannedValue::Constants(values), force_reference);
-        if descend {
+        if self.begin(PlannedValue::Constants(values), force_reference) {
             for value in values {
                 self.push_constant(value, false);
             }
         }
-        self.finish(index);
     }
 
     fn push_strings(&mut self, values: &'a [String], force_reference: bool) {
-        let (index, descend) = self.begin(PlannedValue::Strings(values), force_reference);
-        if descend {
+        if self.begin(PlannedValue::Strings(values), force_reference) {
             for value in values {
                 self.push_leaf(PlannedValue::MetadataString(value), false);
             }
         }
-        self.finish(index);
     }
 
     fn push_locals(&mut self, code: &'a CodeObject) {
-        let (index, descend) = self.begin(PlannedValue::Locals(code), false);
-        if descend {
+        if self.begin(PlannedValue::Locals(code), false) {
             for value in &code.locals {
                 self.push_leaf(PlannedValue::MetadataString(value), false);
             }
         }
-        self.finish(index);
     }
 
     fn push_constant(&mut self, value: &'a Constant, force_reference: bool) {
@@ -191,24 +166,20 @@ where
             Constant::Tuple(values) => self.push_constants(values, force_reference),
             Constant::Code(code) => self.push_code(code, false),
             Constant::FrozenSet(values) => {
-                let (index, descend) = self.begin(PlannedValue::Constant(value), force_reference);
-                if descend {
+                if self.begin(PlannedValue::Constant(value), force_reference) {
                     let mut values: Vec<_> = values.iter().collect();
                     values.sort_by_key(|value| constant_sort_key(value));
                     for value in values {
                         self.push_constant(value, true);
                     }
                 }
-                self.finish(index);
             }
             Constant::Slice { lower, upper, step } => {
-                let (index, descend) = self.begin(PlannedValue::Constant(value), force_reference);
-                if descend {
+                if self.begin(PlannedValue::Constant(value), force_reference) {
                     self.push_slice_member(lower);
                     self.push_slice_member(upper);
                     self.push_slice_member(step);
                 }
-                self.finish(index);
             }
             _ => self.push_leaf(PlannedValue::Constant(value), force_reference),
         }

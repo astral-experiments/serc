@@ -23,7 +23,7 @@ pub(crate) fn encode_code_into(code: &CodeObject, output: &mut Vec<u8>) {
         references: vec![None; graph.object_count()],
         reference_count: 0,
     };
-    writer.write_entry(graph.plan().root());
+    writer.write_plan();
 }
 
 struct Writer<'output, 'graph, 'code> {
@@ -34,22 +34,11 @@ struct Writer<'output, 'graph, 'code> {
 }
 
 impl Writer<'_, '_, '_> {
-    fn write_entry(&mut self, index: usize) -> usize {
-        let (value, object, force_reference, subtree_end) = {
-            let entry = self.graph.plan().entry(index);
-            (
-                entry.value,
-                entry.object,
-                entry.force_reference,
-                entry.subtree_end,
-            )
-        };
-        self.write_value(value, object, force_reference);
-        let mut child = index + 1;
-        while child < subtree_end {
-            child = self.write_entry(child);
+    fn write_plan(&mut self) {
+        let graph = self.graph;
+        for entry in graph.plan().entries() {
+            self.write_value(entry.value, entry.object, entry.force_reference);
         }
-        subtree_end
     }
 
     fn write_value(
