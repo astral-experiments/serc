@@ -145,10 +145,13 @@ fn has_python_suffix(path: &Path) -> bool {
 }
 
 fn compile_path(path: &Path, check: bool) -> Result<(), String> {
+    // Keep the cache header and permissions tied to the source snapshot that
+    // precedes the bytes being compiled, matching CPython's read ordering.
+    let metadata = fs_err::metadata(path)
+        .map_err(|error| format!("failed to inspect {}: {error}", path.display()))?;
+    let source_size = metadata.len();
     let source_bytes = fs_err::read(path)
         .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
-    let source_size = u64::try_from(source_bytes.len())
-        .map_err(|error| format!("failed to encode the size for {}: {error}", path.display()))?;
     let source = decode_source(&source_bytes)
         .map_err(|error| format!("failed to decode {}: {error}", path.display()))?;
     let filename = path
@@ -162,8 +165,6 @@ fn compile_path(path: &Path, check: bool) -> Result<(), String> {
         return Ok(());
     }
 
-    let metadata = fs_err::metadata(path)
-        .map_err(|error| format!("failed to inspect {}: {error}", path.display()))?;
     let modified = metadata
         .modified()
         .map_err(|error| format!("failed to read the mtime for {}: {error}", path.display()))?;
