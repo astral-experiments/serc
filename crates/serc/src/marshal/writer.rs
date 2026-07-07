@@ -1,7 +1,7 @@
 use crate::compiler::{CodeObject, Constant};
 
-use super::graph::{ObjectGraph, ObjectId, ObjectLocation, OccurrenceCursor};
-use super::key::{constant_sort_key, slice_member_uses_identity};
+use super::graph::ObjectGraph;
+use super::plan::{ObjectId, PlannedValue};
 use super::v5::{
     FLAG_REF, TYPE_ASCII, TYPE_ASCII_INTERNED, TYPE_BINARY_COMPLEX, TYPE_BINARY_FLOAT, TYPE_CODE,
     TYPE_ELLIPSIS, TYPE_FALSE, TYPE_FROZENSET, TYPE_INT, TYPE_INTERNED, TYPE_LONG, TYPE_NONE,
@@ -22,10 +22,8 @@ pub(crate) fn encode_code_into(code: &CodeObject, output: &mut Vec<u8>) {
         output,
         references: vec![None; graph.object_count()],
         reference_count: 0,
-        occurrences: graph.occurrence_cursor(),
     };
-    writer.write_code(code, true);
-    writer.finish();
+    writer.write_entry(graph.plan().root());
 }
 
 struct Writer<'output, 'graph, 'code> {
@@ -33,20 +31,85 @@ struct Writer<'output, 'graph, 'code> {
     output: &'output mut Vec<u8>,
     references: Vec<Option<u32>>,
     reference_count: usize,
-    occurrences: OccurrenceCursor<'graph>,
 }
 
 impl Writer<'_, '_, '_> {
-    fn finish(self) {
-        self.occurrences.finish();
+    fn write_entry(&mut self, index: usize) -> usize {
+        let (value, object, force_reference, subtree_end) = {
+            let entry = self.graph.plan().entry(index);
+            (
+                entry.value,
+                entry.object,
+                entry.force_reference,
+                entry.subtree_end,
+            )
+        };
+        self.write_value(value, object, force_reference);
+        let mut child = index + 1;
+        while child < subtree_end {
+            child = self.write_entry(child);
+        }
+        subtree_end
     }
 
-    fn next_object(&mut self, location: ObjectLocation) -> ObjectId {
-        self.occurrences.consume(location)
-    }
-
-    fn constant_object(&mut self, value: &Constant) -> ObjectId {
-        self.next_object(ObjectLocation::Constant(std::ptr::from_ref(value).addr()))
+    fn write_value(
+        &mut self,
+        value: PlannedValue<'_>,
+        object: Option<ObjectId>,
+        force_reference: bool,
+    ) {
+        match value {
+            PlannedValue::Code(code) => {
+                let object = object.expect("code has an object");
+                let Some(flag) = self.begin_object(object, force_reference) else {
+                    return;
+                };
+                self.byte(TYPE_CODE | flag);
+                self.long(code.arg_count);
+                self.long(code.positional_only_arg_count);
+                self.long(code.keyword_only_arg_count);
+                self.long(code.stack_size);
+                self.long(code.flags);
+            }
+            PlannedValue::CodeBytes(code) => {
+                let object = object.expect("code bytes have an object");
+                self.bytes_with_object(object, &code.bytecode, force_reference);
+            }
+            PlannedValue::Constants(values) => {
+                let object = object.expect("constants have an object");
+                self.tuple_header(object, values.len(), force_reference);
+            }
+            PlannedValue::Strings(values) => {
+                let object = object.expect("names have an object");
+                self.tuple_header(object, values.len(), force_reference);
+            }
+            PlannedValue::Locals(code) => {
+                let object = object.expect("locals have an object");
+                self.tuple_header(object, code.locals.len(), force_reference);
+            }
+            PlannedValue::LocalKinds(code) => {
+                let object = object.expect("local kinds have an object");
+                self.bytes_with_object(object, &code.local_kinds, force_reference);
+            }
+            PlannedValue::MetadataString(string) => {
+                let object = object.expect("metadata has an object");
+                self.string_with_object(object, string, force_reference);
+            }
+            PlannedValue::FirstLine(first_line_number) => {
+                self.long(first_line_number);
+            }
+            PlannedValue::Bytes(bytes) => {
+                let object = object.expect("bytes have an object");
+                self.bytes_with_object(object, bytes, force_reference);
+            }
+            PlannedValue::Constant(constant) => {
+                self.write_constant_value(object, constant, force_reference);
+            }
+            PlannedValue::SliceMember(constant) => {
+                let object = object.expect("slice member has an object");
+                self.write_slice_member(object, constant);
+            }
+        }
     }
 
     fn byte(&mut self, value: u8) {
@@ -72,11 +135,6 @@ impl Writer<'_, '_, '_> {
         Some(FLAG_REF)
     }
 
-    fn bytes(&mut self, value: &[u8], force_reference: bool) {
-        let object = self.next_object(ObjectLocation::Bytes(value.as_ptr().addr()));
-        self.bytes_with_object(object, value, force_reference);
-    }
-
     fn bytes_with_object(&mut self, object: ObjectId, value: &[u8], force_reference: bool) {
         let Some(flag) = self.begin_object(object, force_reference) else {
             return;
@@ -84,11 +142,6 @@ impl Writer<'_, '_, '_> {
         self.byte(TYPE_STRING | flag);
         self.long(value.len().try_into().expect("marshal value exceeds 4 GiB"));
         self.output.extend_from_slice(value);
-    }
-
-    fn string(&mut self, value: &str) {
-        let object = self.next_object(ObjectLocation::MetadataString(value.as_ptr().addr()));
-        self.string_with_object(object, value, false);
     }
 
     fn string_with_object(&mut self, object: ObjectId, value: &str, force_reference: bool) {
@@ -149,9 +202,9 @@ impl Writer<'_, '_, '_> {
         self.output.extend_from_slice(value);
     }
 
-    fn tuple_header(&mut self, object: ObjectId, length: usize, force_reference: bool) -> bool {
+    fn tuple_header(&mut self, object: ObjectId, length: usize, force_reference: bool) {
         let Some(flag) = self.begin_object(object, force_reference) else {
-            return false;
+            return;
         };
         if let Ok(length) = u8::try_from(length) {
             self.byte(TYPE_SMALL_TUPLE | flag);
@@ -160,60 +213,33 @@ impl Writer<'_, '_, '_> {
             self.byte(TYPE_TUPLE | flag);
             self.long(length.try_into().expect("marshal tuple exceeds 4 GiB"));
         }
-        true
     }
 
-    fn strings(&mut self, values: &[String], force_reference: bool) {
-        let object = self.next_object(ObjectLocation::StringsTuple(values.as_ptr().addr()));
-        if self.tuple_header(object, values.len(), force_reference) {
-            for value in values {
-                self.string(value);
-            }
-        }
-    }
-
-    fn locals(&mut self, code: &CodeObject) {
-        let object = self.next_object(ObjectLocation::LocalsTuple(std::ptr::from_ref(code).addr()));
-        if self.tuple_header(object, code.locals.len(), false) {
-            for value in &code.locals {
-                self.string(value);
-            }
-        }
-    }
-
-    fn constants(&mut self, values: &[Constant], force_reference: bool) {
-        let object = self.next_object(ObjectLocation::ConstantsTuple(values.as_ptr().addr()));
-        if self.tuple_header(object, values.len(), force_reference) {
-            for value in values {
-                self.constant(value);
-            }
-        }
-    }
-
-    fn constant(&mut self, value: &Constant) {
-        self.constant_with_force(value, false);
-    }
-
-    fn constant_with_force(&mut self, value: &Constant, force_reference: bool) {
+    fn write_constant_value(
+        &mut self,
+        object: Option<ObjectId>,
+        value: &Constant,
+        force_reference: bool,
+    ) {
         match value {
             Constant::None => self.byte(TYPE_NONE),
             Constant::Bool(false) => self.byte(TYPE_FALSE),
             Constant::Bool(true) => self.byte(TYPE_TRUE),
             Constant::Ellipsis => self.byte(TYPE_ELLIPSIS),
             Constant::Int(integer) => {
-                let object = self.constant_object(value);
+                let object = object.expect("integer has an object");
                 self.integer(object, *integer, force_reference);
             }
             Constant::SignedInt(integer) => {
-                let object = self.constant_object(value);
+                let object = object.expect("signed integer has an object");
                 self.signed_integer(object, *integer, force_reference);
             }
             Constant::BigInt { negative, digits } => {
-                let object = self.constant_object(value);
+                let object = object.expect("big integer has an object");
                 self.big_integer(object, digits, *negative, force_reference);
             }
             Constant::Float(float) => {
-                let object = self.constant_object(value);
+                let object = object.expect("float has an object");
                 let Some(flag) = self.begin_object(object, force_reference) else {
                     return;
                 };
@@ -221,7 +247,7 @@ impl Writer<'_, '_, '_> {
                 self.output.extend_from_slice(&float.to_le_bytes());
             }
             Constant::Complex { real, imag } => {
-                let object = self.constant_object(value);
+                let object = object.expect("complex has an object");
                 let Some(flag) = self.begin_object(object, force_reference) else {
                     return;
                 };
@@ -230,20 +256,22 @@ impl Writer<'_, '_, '_> {
                 self.output.extend_from_slice(&imag.to_le_bytes());
             }
             Constant::String(string) => {
-                let object = self.constant_object(value);
+                let object = object.expect("string has an object");
                 self.string_with_object(object, string, force_reference);
             }
             Constant::SurrogateString(string) => {
-                let object = self.constant_object(value);
+                let object = object.expect("surrogate string has an object");
                 self.surrogate_string_with_object(object, string, force_reference);
             }
             Constant::Bytes(bytes) => {
-                let object = self.constant_object(value);
+                let object = object.expect("bytes have an object");
                 self.bytes_with_object(object, bytes, force_reference);
             }
-            Constant::Tuple(values) => self.constants(values, force_reference),
+            Constant::Tuple(_) | Constant::Code(_) => {
+                unreachable!("tuple and code constants have dedicated plan entries")
+            }
             Constant::FrozenSet(values) => {
-                let object = self.constant_object(value);
+                let object = object.expect("frozen set has an object");
                 let Some(flag) = self.begin_object(object, force_reference) else {
                     return;
                 };
@@ -254,34 +282,18 @@ impl Writer<'_, '_, '_> {
                         .try_into()
                         .expect("marshal frozenset exceeds 4 GiB"),
                 );
-                let mut values: Vec<_> = values.iter().collect();
-                values.sort_by_key(|value| constant_sort_key(value));
-                for value in values {
-                    self.constant_with_force(value, true);
-                }
             }
-            Constant::Slice { lower, upper, step } => {
-                let object = self.constant_object(value);
+            Constant::Slice { .. } => {
+                let object = object.expect("slice has an object");
                 let Some(flag) = self.begin_object(object, force_reference) else {
                     return;
                 };
                 self.byte(TYPE_SLICE | flag);
-                self.slice_member(lower);
-                self.slice_member(upper);
-                self.slice_member(step);
             }
-            Constant::Code(code) => self.write_code(code, false),
         }
     }
 
-    fn slice_member(&mut self, value: &Constant) {
-        if !slice_member_uses_identity(value) {
-            self.constant(value);
-            return;
-        }
-        let object = self.next_object(ObjectLocation::SliceMember(
-            std::ptr::from_ref(value).addr(),
-        ));
+    fn write_slice_member(&mut self, object: ObjectId, value: &Constant) {
         let Some(flag) = self.begin_object(object, false) else {
             return;
         };
@@ -445,32 +457,5 @@ impl Writer<'_, '_, '_> {
         for digit in value {
             self.output.extend_from_slice(&digit.to_le_bytes());
         }
-    }
-
-    fn write_code(&mut self, code: &CodeObject, force_reference: bool) {
-        let object = self.next_object(ObjectLocation::Code(std::ptr::from_ref(code).addr()));
-        let Some(flag) = self.begin_object(object, force_reference) else {
-            return;
-        };
-        self.byte(TYPE_CODE | flag);
-        self.long(code.arg_count);
-        self.long(code.positional_only_arg_count);
-        self.long(code.keyword_only_arg_count);
-        self.long(code.stack_size);
-        self.long(code.flags);
-        let bytecode = self.next_object(ObjectLocation::CodeBytes(std::ptr::from_ref(code).addr()));
-        self.bytes_with_object(bytecode, &code.bytecode, true);
-        self.constants(&code.constants, false);
-        self.strings(&code.names, false);
-        self.locals(code);
-        let local_kinds =
-            self.next_object(ObjectLocation::LocalKinds(std::ptr::from_ref(code).addr()));
-        self.bytes_with_object(local_kinds, &code.local_kinds, false);
-        self.string(&code.filename);
-        self.string(&code.name);
-        self.string(&code.qualified_name);
-        self.long(code.first_line_number);
-        self.bytes(&code.line_table, false);
-        self.bytes(&code.exception_table, false);
     }
 }

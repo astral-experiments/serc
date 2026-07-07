@@ -1,5 +1,6 @@
 mod graph;
 mod key;
+mod plan;
 mod v5;
 mod writer;
 

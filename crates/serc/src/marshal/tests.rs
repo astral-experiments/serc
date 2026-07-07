@@ -3,11 +3,12 @@ use std::collections::HashSet;
 use crate::compiler::{CodeObject, Constant};
 
 use super::encode_code;
-use super::graph::{ObjectGraph, ObjectLocation};
+use super::graph::ObjectGraph;
 use super::key::{
     ObjectKey, code_bytes_key, code_key, constant_key, local_kinds_key, locals_tuple_key,
     slice_member_uses_identity,
 };
+use super::plan::PlannedValue;
 
 fn code_object(constants: Vec<Constant>) -> CodeObject {
     CodeObject {
@@ -30,34 +31,6 @@ fn code_object(constants: Vec<Constant>) -> CodeObject {
         annotation_thunk: false,
         interned_constant_strings: HashSet::default(),
     }
-}
-
-#[test]
-#[should_panic(expected = "marshal occurrence 0 mismatch")]
-fn occurrence_cursor_rejects_a_mismatched_location() {
-    let code = code_object(Vec::new());
-    let graph = ObjectGraph::for_code(&code);
-    let mut occurrences = graph.occurrence_cursor();
-
-    occurrences.consume(ObjectLocation::Bytes(0));
-}
-
-#[test]
-#[should_panic(expected = "marshal writer requested occurrence 0")]
-fn occurrence_cursor_rejects_over_consumption() {
-    let graph = ObjectGraph::default();
-    let mut occurrences = graph.occurrence_cursor();
-
-    occurrences.consume(ObjectLocation::Bytes(0));
-}
-
-#[test]
-#[should_panic(expected = "marshal writer consumed 0 of")]
-fn occurrence_cursor_rejects_under_consumption() {
-    let code = code_object(Vec::new());
-    let graph = ObjectGraph::for_code(&code);
-
-    graph.occurrence_cursor().finish();
 }
 
 #[test]
@@ -175,4 +148,132 @@ fn frozen_set_keys_and_reference_order_ignore_input_order() {
     let first = code_object(vec![Constant::FrozenSet(values)]);
     let second = code_object(vec![Constant::FrozenSet(reversed)]);
     assert_eq!(encode_code(&first), encode_code(&second));
+}
+
+#[test]
+fn marshal_plan_is_preorder_with_nested_subtree_boundaries() {
+    let nested = code_object(vec![Constant::Tuple(vec![Constant::Int(7)])]);
+    let code = code_object(vec![
+        Constant::Code(Box::new(nested)),
+        Constant::Tuple(vec![Constant::String("outer".to_string())]),
+    ]);
+    let graph = ObjectGraph::for_code(&code);
+    let entries = graph.plan().entries().collect::<Vec<_>>();
+
+    assert!(
+        matches!(entries[0].value, PlannedValue::Code(value) if std::ptr::eq(value, std::ptr::from_ref(&code)))
+    );
+    assert_eq!(entries[0].subtree_end, entries.len());
+    let root_constants = entries
+        .iter()
+        .position(|entry| {
+            matches!(entry.value, PlannedValue::Constants(values) if std::ptr::eq(values, code.constants.as_slice()))
+        })
+        .unwrap();
+    let Constant::Code(nested) = &code.constants[0] else {
+        unreachable!();
+    };
+    let nested_code = entries
+        .iter()
+        .position(|entry| {
+            matches!(entry.value, PlannedValue::Code(value) if std::ptr::eq(value, nested.as_ref()))
+        })
+        .unwrap();
+    let nested_constants = entries
+        .iter()
+        .position(|entry| {
+            matches!(entry.value, PlannedValue::Constants(values) if std::ptr::eq(values, nested.constants.as_slice()))
+        })
+        .unwrap();
+
+    assert!(root_constants < nested_code);
+    assert!(nested_code < nested_constants);
+    assert!(entries[nested_code].subtree_end <= entries[root_constants].subtree_end);
+}
+
+#[test]
+fn marshal_plan_reuses_ids_and_prunes_repeated_container_subtrees() {
+    let tuple = Constant::Tuple(vec![Constant::String("shared".to_string())]);
+    let frozen = Constant::FrozenSet(vec![Constant::Int(1), Constant::Int(2)]);
+    let code = code_object(vec![tuple.clone(), tuple, frozen.clone(), frozen]);
+    let graph = ObjectGraph::for_code(&code);
+    let entries = graph.plan().entries().collect::<Vec<_>>();
+
+    for indices in [[0, 1], [2, 3]] {
+        let containers = indices.map(|constant_index| {
+            entries
+                .iter()
+                .enumerate()
+                .find(
+                    |(_, entry)| match (&code.constants[constant_index], entry.value) {
+                        (Constant::Tuple(values), PlannedValue::Constants(candidate)) => {
+                            std::ptr::eq(values.as_slice(), candidate)
+                        }
+                        (Constant::FrozenSet(_), PlannedValue::Constant(candidate)) => {
+                            std::ptr::eq(
+                                std::ptr::from_ref(&code.constants[constant_index]),
+                                candidate,
+                            )
+                        }
+                        _ => false,
+                    },
+                )
+                .unwrap()
+        });
+        assert_eq!(containers[0].1.object, containers[1].1.object);
+        assert!(containers[0].1.subtree_end > containers[0].0 + 1);
+        assert_eq!(containers[1].1.subtree_end, containers[1].0 + 1);
+    }
+}
+
+#[test]
+fn marshal_plan_preserves_force_mode_and_slice_member_identity() {
+    let code = code_object(vec![
+        Constant::FrozenSet(vec![Constant::String("forced".to_string())]),
+        Constant::Slice {
+            lower: Box::new(Constant::Float(2.5)),
+            upper: Box::new(Constant::Int(256)),
+            step: Box::new(Constant::None),
+        },
+        Constant::Slice {
+            lower: Box::new(Constant::Float(2.5)),
+            upper: Box::new(Constant::Int(256)),
+            step: Box::new(Constant::Bool(false)),
+        },
+    ]);
+    let graph = ObjectGraph::for_code(&code);
+
+    let Constant::FrozenSet(values) = &code.constants[0] else {
+        unreachable!();
+    };
+    let forced = graph
+        .plan()
+        .entries()
+        .find(|entry| {
+            matches!(entry.value, PlannedValue::Constant(value) if std::ptr::eq(value, std::ptr::from_ref(&values[0])))
+        })
+        .unwrap();
+    assert!(forced.force_reference);
+
+    let slices = [1, 2].map(|index| {
+        let Constant::Slice { lower, upper, .. } = &code.constants[index] else {
+            unreachable!();
+        };
+        (lower.as_ref(), upper.as_ref())
+    });
+    let entry_for = |value: &Constant| {
+        graph
+            .plan()
+            .entries()
+            .find(|entry| match entry.value {
+                PlannedValue::Constant(candidate) | PlannedValue::SliceMember(candidate) => {
+                    std::ptr::eq(candidate, value)
+                }
+                _ => false,
+            })
+            .unwrap()
+    };
+    assert!(!entry_for(slices[0].0).force_reference);
+    assert_ne!(entry_for(slices[0].0).object, entry_for(slices[1].0).object);
+    assert_eq!(entry_for(slices[0].1).object, entry_for(slices[1].1).object);
 }
