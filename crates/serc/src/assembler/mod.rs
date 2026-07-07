@@ -322,10 +322,43 @@ impl Assembler {
         instruction.operand = Operand::Value(argument);
     }
 
-    pub(crate) fn used_constant_indices(&self, load_const: Opcode) -> FxHashSet<u32> {
+    pub(crate) fn used_constant_indices(&mut self, load_const: Opcode) -> FxHashSet<u32> {
+        let mut used = FxHashSet::default();
+        let mut ended_scope = false;
+        let mut straight_line = true;
+        for item in &self.items {
+            let Item::Instruction(instruction) = item else {
+                continue;
+            };
+            if ended_scope || !matches!(instruction.operand, Operand::Value(_)) {
+                straight_line = false;
+                break;
+            }
+            if instruction.opcode == load_const
+                && let Operand::Value(index) = instruction.operand
+            {
+                used.insert(index);
+            }
+            ended_scope = ends_scope(instruction.opcode);
+        }
+        if straight_line {
+            return used;
+        }
+
+        debug_assert!(self.graph.is_none());
+        self.graph = Some(block_graph::BlockGraph::from_items(
+            std::mem::take(&mut self.items),
+            &self.preserved_block_boundaries,
+        ));
         let mut used = FxHashSet::default();
         let reachable = self.reachable_items();
-        for (index, item) in self.items.iter().enumerate() {
+        for (index, item) in self
+            .graph
+            .as_ref()
+            .expect("constant reachability scan has a block graph")
+            .iter_items()
+            .enumerate()
+        {
             let Item::Instruction(instruction) = item else {
                 continue;
             };
@@ -340,18 +373,25 @@ impl Assembler {
     }
 
     pub(crate) fn remap_constant_indices(&mut self, load_const: Opcode, index_map: &[Option<u32>]) {
-        for item in &mut self.items {
+        let remap = |item: &mut Item| {
             let Item::Instruction(instruction) = item else {
-                continue;
+                return;
             };
             if instruction.opcode != load_const {
-                continue;
+                return;
             }
             let Operand::Value(index) = &mut instruction.operand else {
                 unreachable!("LOAD_CONST has a jump operand");
             };
             if let Some(new_index) = index_map[usize::try_from(*index).unwrap()] {
                 *index = new_index;
+            }
+        };
+        if let Some(graph) = &mut self.graph {
+            graph.for_each_item_mut(remap);
+        } else {
+            for item in &mut self.items {
+                remap(item);
             }
         }
     }

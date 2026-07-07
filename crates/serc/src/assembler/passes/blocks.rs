@@ -332,6 +332,10 @@ impl Assembler {
             .graph
             .as_mut()
             .expect("assembler pass requires the block graph");
+        if graph.is_normalized_jump_free_single_block(&self.preserved_block_boundaries) {
+            return;
+        }
+
         graph.normalize_blocks(&self.preserved_block_boundaries);
         if graph.len() < 2 {
             return;

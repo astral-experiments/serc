@@ -700,71 +700,65 @@ impl Assembler {
     }
 
     pub(in crate::assembler) fn fuse_superinstructions(&mut self) {
+        fn fuse_pair(first: Item, second: Item) -> Option<Item> {
+            let (Item::Instruction(first), Item::Instruction(second)) = (first, second) else {
+                return None;
+            };
+            if first.has_flag(InstructionFlags::PREVENT_FUSION_WITH_NEXT)
+                || second.has_flag(InstructionFlags::PREVENT_FUSION_WITH_PREVIOUS)
+                || second.has_flag(InstructionFlags::BORROW_UNREACHABLE_ENTRY)
+            {
+                return None;
+            }
+            let (Operand::Value(first_argument), Operand::Value(second_argument)) =
+                (first.operand, second.operand)
+            else {
+                return None;
+            };
+            if first_argument >= 16
+                || second_argument >= 16
+                || first.location.line != second.location.line
+            {
+                return None;
+            }
+            let opcode = match (first.opcode, second.opcode) {
+                (LOAD_FAST_BORROW, LOAD_FAST_BORROW) => LOAD_FAST_BORROW_LOAD_FAST_BORROW,
+                (LOAD_FAST, LOAD_FAST) => LOAD_FAST_LOAD_FAST,
+                (STORE_FAST, LOAD_FAST | LOAD_FAST_BORROW) => STORE_FAST_LOAD_FAST,
+                (STORE_FAST, STORE_FAST) => STORE_FAST_STORE_FAST,
+                _ => return None,
+            };
+            Some(Item::Instruction(Instruction::fused(
+                opcode,
+                Operand::Value((first_argument << 4) | second_argument),
+                first,
+                second,
+            )))
+        }
+
         let graph = self
             .graph
             .as_mut()
             .expect("assembler pass requires the block graph");
         let order = graph.order().to_vec();
         for block in order {
-            let items = std::mem::take(graph[block].items_mut());
-            let mut fused = Vec::with_capacity(items.len());
-            let mut index = 0;
-            while index < items.len() {
-                let Some(Item::Instruction(first)) = items.get(index).copied() else {
-                    fused.push(items[index]);
-                    index += 1;
-                    continue;
-                };
-                let Some(Item::Instruction(second)) = items.get(index + 1).copied() else {
-                    fused.push(items[index]);
-                    index += 1;
-                    continue;
-                };
-                if first.has_flag(InstructionFlags::PREVENT_FUSION_WITH_NEXT)
-                    || second.has_flag(InstructionFlags::PREVENT_FUSION_WITH_PREVIOUS)
-                    || second.has_flag(InstructionFlags::BORROW_UNREACHABLE_ENTRY)
+            let items = graph[block].items_mut();
+            let original_len = items.len();
+            let mut read = 0;
+            let mut write = 0;
+            while read < original_len {
+                if let Some(second) = read.checked_add(1).filter(|index| *index < original_len)
+                    && let Some(fused) = fuse_pair(items[read], items[second])
                 {
-                    fused.push(items[index]);
-                    index += 1;
-                    continue;
+                    items[write] = fused;
+                    read += 2;
+                } else {
+                    items[write] = items[read];
+                    read += 1;
                 }
-                let (Operand::Value(first_argument), Operand::Value(second_argument)) =
-                    (first.operand, second.operand)
-                else {
-                    fused.push(items[index]);
-                    index += 1;
-                    continue;
-                };
-                if first_argument >= 16 || second_argument >= 16 {
-                    fused.push(items[index]);
-                    index += 1;
-                    continue;
-                }
-                if first.location.line != second.location.line {
-                    fused.push(items[index]);
-                    index += 1;
-                    continue;
-                }
-                let opcode = match (first.opcode, second.opcode) {
-                    (LOAD_FAST_BORROW, LOAD_FAST_BORROW) => LOAD_FAST_BORROW_LOAD_FAST_BORROW,
-                    (LOAD_FAST, LOAD_FAST) => LOAD_FAST_LOAD_FAST,
-                    (STORE_FAST, LOAD_FAST | LOAD_FAST_BORROW) => STORE_FAST_LOAD_FAST,
-                    (STORE_FAST, STORE_FAST) => STORE_FAST_STORE_FAST,
-                    _ => {
-                        fused.push(items[index]);
-                        index += 1;
-                        continue;
-                    }
-                };
-                fused.push(Item::Instruction(Instruction::fused(
-                    opcode,
-                    Operand::Value((first_argument << 4) | second_argument),
-                    first,
-                    second,
-                )));
-                index += 2;
+                write += 1;
             }
-            *graph[block].items_mut() = fused;
+            items.truncate(write);
         }
     }
 }

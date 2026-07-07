@@ -13,6 +13,10 @@ impl Assembler {
         &self,
         extended_args: &[u8],
     ) -> Result<Vec<u8>, CompileError> {
+        if self.exception_regions.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let (positions, labels) = self.positions(extended_args);
         let regions = self
             .exception_regions
