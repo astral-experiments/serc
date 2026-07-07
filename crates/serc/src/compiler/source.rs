@@ -1,18 +1,25 @@
-// Compiler submodules intentionally share the parent-owned state and lowering vocabulary.
-#![allow(clippy::wildcard_imports)]
+use std::sync::{Arc, OnceLock};
 
-use std::sync::OnceLock;
-
+use ruff_python_ast::token::{TokenKind, Tokens};
+use ruff_python_ast::{Expr, FStringPart, InterpolatedStringElement, Stmt};
+use ruff_python_codegen::{Generator, Indentation, Mode as CodegenMode};
 use ruff_source_file::{LineEnding, LineIndex};
+use ruff_text_size::{Ranged, TextSize};
+use rustc_hash::FxHashSet;
 
-use super::*;
+use crate::assembler::SourceLocation;
+use crate::code_object::Constant;
+
+use super::constant::{explicit_surrogate_string, fold_constant};
+use super::scope::ScopeArena;
+use super::{CachedSourceLine, Compiler};
 
 #[derive(Debug)]
 pub(super) struct CompilationContext {
     pub(super) filename: String,
     pub(super) source: Arc<str>,
     pub(super) tokens: Tokens,
-    pub(super) line_index: LineIndex,
+    line_index: LineIndex,
     pub(super) scopes: OnceLock<ScopeArena>,
 }
 

@@ -1,9 +1,23 @@
-// Compiler submodules intentionally share the parent-owned state and lowering vocabulary.
-#![allow(clippy::wildcard_imports)]
+use std::borrow::Cow;
 
+use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
+use ruff_python_ast::{
+    BoolOp, Expr, ExprBinOp, ExprContext, FStringPart, InterpolatedStringElement, Number, Operator,
+    Stmt, UnaryOp,
+};
+use ruff_text_size::Ranged;
+use rustc_hash::{FxHashMap, FxHashSet};
+
+use super::{LOAD_CONST, LOAD_SMALL_INT, NOP, STORE_NAME};
+use crate::CompileError;
 use crate::assembler::InstructionId;
+use crate::target::operands::Conversion;
 
-use super::*;
+use super::Compiler;
+use super::expression::literal_truthiness;
+use super::scope::NameId;
+use super::symbol::{mangle_name, to_u32};
+use crate::code_object::{CodeObject, Constant};
 
 #[derive(Debug, Default)]
 pub(super) struct ConstantPool {
@@ -30,7 +44,7 @@ impl ConstantPool {
 
     pub(super) fn retain_used(
         &mut self,
-        used: &HashSet<u32>,
+        used: &FxHashSet<u32>,
     ) -> Result<Vec<Option<u32>>, CompileError> {
         let mut index_map = vec![None; self.values.len()];
         let mut retained = Vec::with_capacity(self.values.len());
@@ -58,8 +72,8 @@ pub(super) struct OutputState {
     pub(super) deferred_constants: Vec<(Option<InstructionId>, Constant)>,
     pub(super) deferred_names: Vec<(InstructionId, String)>,
     pub(super) names: Vec<String>,
-    pub(super) name_indices: FxHashMap<NameId, u32>,
-    pub(super) interned_constant_strings: HashSet<String>,
+    name_indices: FxHashMap<NameId, u32>,
+    pub(super) interned_constant_strings: FxHashSet<String>,
 }
 
 impl Compiler {

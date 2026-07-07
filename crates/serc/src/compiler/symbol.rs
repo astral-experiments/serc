@@ -1,7 +1,31 @@
-// Compiler submodules intentionally share the parent-owned state and lowering vocabulary.
-#![allow(clippy::wildcard_imports)]
+use std::borrow::Cow;
+use std::sync::Arc;
 
-use super::*;
+use ruff_python_ast::visitor::{Visitor, walk_expr, walk_pattern, walk_stmt};
+use ruff_python_ast::{Expr, Pattern, Stmt};
+use rustc_hash::{FxHashMap, FxHashSet};
+
+use super::{
+    BINARY_OP, BUILD_TUPLE, CALL_INTRINSIC_1, CALL_INTRINSIC_2, COMPARE_OP, CONVERT_VALUE,
+    DELETE_DEREF, DELETE_FAST, DELETE_GLOBAL, DELETE_NAME, LOAD_COMMON_CONSTANT, LOAD_DEREF,
+    LOAD_FAST, LOAD_FAST_CHECK, LOAD_FROM_DICT_OR_DEREF, LOAD_FROM_DICT_OR_GLOBALS, LOAD_GLOBAL,
+    LOAD_LOCALS, LOAD_NAME, LOAD_SPECIAL, RERAISE, RESUME, RETURN_VALUE, SET_FUNCTION_ATTRIBUTE,
+    STORE_DEREF, STORE_FAST, STORE_GLOBAL, STORE_NAME,
+};
+use crate::CompileError;
+use crate::assembler::{ExceptionPolicy, Label, SourceLocation};
+use crate::code_object::Constant;
+use crate::target::operands::{
+    BinaryIntrinsic, BinaryOperation, CommonConstant, ComparisonOperation, Conversion,
+    FunctionAttribute, ResumeLocation, SpecialMethod, UnaryIntrinsic,
+};
+use crate::target::{
+    Opcode, is_unconditional_jump, num_popped as opcode_num_popped, num_pushed as opcode_num_pushed,
+};
+
+use super::constant::literal_constant;
+use super::scope::{NameId, NameSet, definitely_evaluated_references};
+use super::{Compiler, Scope};
 
 #[derive(Debug, Default)]
 pub(super) struct SymbolState {
@@ -17,6 +41,12 @@ pub(super) struct SymbolState {
     pub(super) imported_scope_names: NameSet,
     pub(super) type_parameter_names: NameSet,
     pub(super) module_globals: NameSet,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) enum ComparisonMode {
+    Value,
+    Boolean,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -78,7 +108,7 @@ impl Compiler {
             .collect()
     }
 
-    pub(super) fn name_strings(&self, names: impl IntoIterator<Item = NameId>) -> Vec<String> {
+    fn name_strings(&self, names: impl IntoIterator<Item = NameId>) -> Vec<String> {
         let interner = &self
             .context
             .scopes
@@ -272,6 +302,21 @@ impl Compiler {
 
     pub(super) fn store_name(&mut self, name: &str) -> Result<(), CompileError> {
         let name_id = self.required_name_id(name);
+        self.store_name_with_id(name, name_id)
+    }
+
+    pub(super) fn store_name_id(&mut self, name_id: NameId) -> Result<(), CompileError> {
+        let context = Arc::clone(&self.context);
+        let name = context
+            .scopes
+            .get()
+            .expect("scope arena should be initialized before lowering")
+            .names
+            .resolve(name_id);
+        self.store_name_with_id(name, name_id)
+    }
+
+    fn store_name_with_id(&mut self, name: &str, name_id: NameId) -> Result<(), CompileError> {
         if self.symbols.active_temporaries.contains(name_id) {
             let index = self
                 .symbols
@@ -347,6 +392,21 @@ impl Compiler {
 
     pub(super) fn delete_name(&mut self, name: &str) -> Result<(), CompileError> {
         let name_id = self.required_name_id(name);
+        self.delete_name_with_id(name, name_id)
+    }
+
+    pub(super) fn delete_name_id(&mut self, name_id: NameId) -> Result<(), CompileError> {
+        let context = Arc::clone(&self.context);
+        let name = context
+            .scopes
+            .get()
+            .expect("scope arena should be initialized before lowering")
+            .names
+            .resolve(name_id);
+        self.delete_name_with_id(name, name_id)
+    }
+
+    fn delete_name_with_id(&mut self, name: &str, name_id: NameId) -> Result<(), CompileError> {
         if self.symbols.active_temporaries.contains(name_id) {
             let index = self
                 .symbols
