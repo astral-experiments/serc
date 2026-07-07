@@ -3951,13 +3951,18 @@ impl Compiler {
         &mut self,
         policy: ConditionMarkerPolicy,
     ) -> Result<(), CompileError> {
+        let terminal_try_depth = self
+            .control
+            .terminal_try_condition_exception_exclusion_depth;
         if !self.control.exclude_terminal_if_not_taken
             && !self.control.exclude_condition_not_taken_from_exception
+            && terminal_try_depth.is_none()
         {
             return self.emit_with_exception_policy(NOT_TAKEN, 0, 0, policy.ordinary);
         }
 
-        let exclude_from_generator = self.control.exclude_condition_not_taken_from_exception
+        let exclude_from_generator = (self.control.exclude_condition_not_taken_from_exception
+            || terminal_try_depth.is_some())
             && self.control.generator_region_start.is_some();
         let exclude_from_exception = self.control.exclude_condition_not_taken_from_exception
             || (self.control.exclude_terminal_if_not_taken
@@ -3978,21 +3983,47 @@ impl Compiler {
         for exclusions in &mut self.control.active_with_region_exclusions {
             exclusions.push((exclusion_start, exclusion_end));
         }
-        if exclude_from_exception {
-            if self
+        if exclude_from_exception
+            && self
                 .control
                 .exclude_condition_not_taken_from_all_exception_regions
-            {
-                for exclusions in &mut self.control.active_exception_region_exclusions {
+        {
+            for exclusions in &mut self.control.active_exception_region_exclusions {
+                exclusions.push((exclusion_start, exclusion_end));
+            }
+        } else {
+            if let Some(depth) = terminal_try_depth {
+                for exclusions in self
+                    .control
+                    .active_exception_region_exclusions
+                    .iter_mut()
+                    .take(depth)
+                {
                     exclusions.push((exclusion_start, exclusion_end));
                 }
-            } else if let Some(exclusions) =
-                self.control.active_exception_region_exclusions.last_mut()
+            }
+            let terminal_try_includes_innermost = terminal_try_depth.is_some_and(|depth| {
+                depth >= self.control.active_exception_region_exclusions.len()
+            });
+            if exclude_from_exception
+                && !terminal_try_includes_innermost
+                && let Some(exclusions) = self.control.active_exception_region_exclusions.last_mut()
             {
                 exclusions.push((exclusion_start, exclusion_end));
             }
         }
         Ok(())
+    }
+
+    fn emit_condition_not_taken_preserving_terminal_try_owner(
+        &mut self,
+        policy: ConditionMarkerPolicy,
+    ) -> Result<(), CompileError> {
+        self.with_control_override(
+            |control| &mut control.terminal_try_condition_exception_exclusion_depth,
+            None,
+            |compiler| compiler.emit_condition_not_taken(policy),
+        )
     }
 
     pub(super) fn compile_jump_if(
@@ -4084,7 +4115,19 @@ impl Compiler {
             self.assembler.set_location(SourceLocation::NONE);
             self.emit_jump_forward(JUMP_FORWARD, end, 0)?;
             self.assembler.mark(otherwise);
-            self.compile_jump_if(&conditional.orelse, jump_on, label)?;
+            if self
+                .control
+                .terminal_try_condition_exception_exclusion_depth
+                .is_some()
+            {
+                self.with_control_override(
+                    |control| &mut control.terminal_try_condition_exception_exclusion_depth,
+                    None,
+                    |compiler| compiler.compile_jump_if(&conditional.orelse, jump_on, label),
+                )?;
+            } else {
+                self.compile_jump_if(&conditional.orelse, jump_on, label)?;
+            }
             self.assembler.preserve_block_boundary(end);
             self.assembler.mark(end);
             return Ok(());
@@ -4169,12 +4212,14 @@ impl Compiler {
                 label,
                 -1,
             )?;
-            return self.emit_condition_not_taken(ConditionMarkerPolicy {
-                excluded: ExceptionPolicy::default(),
-                ordinary: ExceptionPolicy::normalized_owner(
-                    self.control.active_normal_finally_bodies > 0,
-                ),
-            });
+            return self.emit_condition_not_taken_preserving_terminal_try_owner(
+                ConditionMarkerPolicy {
+                    excluded: ExceptionPolicy::default(),
+                    ordinary: ExceptionPolicy::normalized_owner(
+                        self.control.active_normal_finally_bodies > 0,
+                    ),
+                },
+            );
         }
         let comparison_is_boolean = if let Expr::Compare(comparison) = expression
             && comparison.ops.len() == 1
@@ -4204,12 +4249,17 @@ impl Compiler {
             label,
             -1,
         )?;
-        self.emit_condition_not_taken(ConditionMarkerPolicy {
+        let policy = ConditionMarkerPolicy {
             excluded: ExceptionPolicy::normalized_owner(comparison_is_boolean),
             ordinary: ExceptionPolicy::normalized_owner(
                 comparison_is_boolean || self.control.active_normal_finally_bodies > 0,
             ),
-        })
+        };
+        if comparison_is_boolean || matches!(expression, Expr::Call(_) | Expr::BinOp(_)) {
+            self.emit_condition_not_taken_preserving_terminal_try_owner(policy)
+        } else {
+            self.emit_condition_not_taken(policy)
+        }
     }
 
     pub(super) fn compile_store_target(&mut self, expression: &Expr) -> Result<(), CompileError> {

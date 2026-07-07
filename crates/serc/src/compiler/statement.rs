@@ -171,6 +171,8 @@ pub(super) struct ControlFlowState {
     pub(super) exclude_condition_not_taken_from_exception: bool,
     pub(super) exclude_condition_not_taken_from_all_exception_regions: bool,
     exclude_loop_tail_not_taken_from_control_flow_regions: bool,
+    implicit_return_exception_exclusion_depth: Option<usize>,
+    pub(super) terminal_try_condition_exception_exclusion_depth: Option<usize>,
     unwind_exception_handlers_for_implicit_return: bool,
     prevent_try_exit_inlining: bool,
     pub(super) generator_region_start: Option<Label>,
@@ -635,9 +637,12 @@ impl Compiler {
             // Terminal nested suites return while the enclosing handler is still active.
             return self.emit_deferred_implicit_return();
         }
+        let exclusion_start = self.begin_implicit_return_exception_exclusion(false);
         let none = self.add_constant(Constant::None)?;
         self.emit(LOAD_CONST, none, 1)?;
-        self.emit(RETURN_VALUE, 0, -1)
+        self.emit(RETURN_VALUE, 0, -1)?;
+        self.finish_implicit_return_exception_exclusion(exclusion_start, false);
+        Ok(())
     }
 
     pub(super) fn emit_deferred_implicit_return(&mut self) -> Result<(), CompileError> {
@@ -645,13 +650,10 @@ impl Compiler {
             .control
             .unwind_exception_handlers_for_implicit_return
             .then(|| self.symbols.initialized_locals.clone());
-        let exclusion_start = (self.control.unwind_exception_handlers_for_implicit_return
-            && !self.control.active_exception_region_exclusions.is_empty())
-        .then(|| {
-            let start = self.assembler.label();
-            self.assembler.mark(start);
-            start
-        });
+        let exclude_from_all_exception_regions =
+            self.control.unwind_exception_handlers_for_implicit_return;
+        let exclusion_start =
+            self.begin_implicit_return_exception_exclusion(exclude_from_all_exception_regions);
         if self.control.unwind_exception_handlers_for_implicit_return {
             for index in (0..self.control.active_exception_handlers.len()).rev() {
                 let name = self.control.active_exception_handlers[index].name;
@@ -665,17 +667,109 @@ impl Compiler {
         }
         self.emit_deferred_constant_before_return(Constant::None)?;
         self.emit(RETURN_VALUE, 0, -1)?;
-        if let Some(exclusion_start) = exclusion_start {
-            let exclusion_end = self.assembler.label();
-            self.assembler.mark(exclusion_end);
-            for exclusions in &mut self.control.active_exception_region_exclusions {
-                exclusions.push((exclusion_start, exclusion_end));
-            }
-        }
+        self.finish_implicit_return_exception_exclusion(
+            exclusion_start,
+            exclude_from_all_exception_regions,
+        );
         if let Some(initialized_locals) = initialized_locals {
             // The cleanup edge returned, so its deletes do not affect subsequently emitted cold
             // handler blocks.
             self.symbols.initialized_locals = initialized_locals;
+        }
+        Ok(())
+    }
+
+    fn begin_implicit_return_exception_exclusion(
+        &mut self,
+        exclude_from_all_exception_regions: bool,
+    ) -> Option<Label> {
+        (!self.control.active_exception_region_exclusions.is_empty()
+            && (exclude_from_all_exception_regions
+                || self
+                    .control
+                    .implicit_return_exception_exclusion_depth
+                    .is_some()))
+        .then(|| {
+            let start = self.assembler.label();
+            self.assembler.mark(start);
+            start
+        })
+    }
+
+    fn finish_implicit_return_exception_exclusion(
+        &mut self,
+        exclusion_start: Option<Label>,
+        exclude_from_all_exception_regions: bool,
+    ) {
+        let Some(exclusion_start) = exclusion_start else {
+            return;
+        };
+        let exclusion_end = self.assembler.label();
+        self.assembler.mark(exclusion_end);
+        if exclude_from_all_exception_regions {
+            for exclusions in &mut self.control.active_exception_region_exclusions {
+                exclusions.push((exclusion_start, exclusion_end));
+            }
+        } else if let Some(depth) = self.control.implicit_return_exception_exclusion_depth {
+            for exclusions in self
+                .control
+                .active_exception_region_exclusions
+                .iter_mut()
+                .take(depth)
+            {
+                exclusions.push((exclusion_start, exclusion_end));
+            }
+        }
+    }
+
+    fn terminal_try_condition_exception_exclusion_depth(&self) -> Option<usize> {
+        self.control
+            .implicit_return_exception_exclusion_depth
+            .filter(|depth| self.control.generator_region_start.is_none() || *depth > 1)
+    }
+
+    fn with_terminal_try_condition_exception_exclusion<R>(
+        &mut self,
+        include_generator: bool,
+        compile: impl FnOnce(&mut Self) -> Result<R, CompileError>,
+    ) -> Result<R, CompileError> {
+        let depth = if include_generator {
+            self.control.implicit_return_exception_exclusion_depth
+        } else {
+            self.terminal_try_condition_exception_exclusion_depth()
+        };
+        self.with_control_override(
+            |control| &mut control.terminal_try_condition_exception_exclusion_depth,
+            depth,
+            compile,
+        )
+    }
+
+    fn emit_terminal_try_condition_not_taken(&mut self) -> Result<(), CompileError> {
+        let exclusion = self
+            .terminal_try_condition_exception_exclusion_depth()
+            .map(|depth| {
+                let start = self.assembler.label();
+                self.assembler.mark(start);
+                (start, depth)
+            });
+        self.emit(NOT_TAKEN, 0, 0)?;
+        if let Some((exclusion_start, depth)) = exclusion {
+            let exclusion_end = self.assembler.label();
+            self.assembler.mark(exclusion_end);
+            if self.control.generator_region_start.is_some() {
+                self.control
+                    .generator_region_exclusions
+                    .push((exclusion_start, exclusion_end));
+            }
+            for exclusions in self
+                .control
+                .active_exception_region_exclusions
+                .iter_mut()
+                .take(depth)
+            {
+                exclusions.push((exclusion_start, exclusion_end));
+            }
         }
         Ok(())
     }
@@ -698,7 +792,9 @@ impl Compiler {
                 .set_location(self.source_location(statement.test.range()));
             self.emit(NOP, 0, 0)?;
         } else {
-            self.compile_jump_if(&statement.test, false, condition_false)?;
+            self.with_terminal_try_condition_exception_exclusion(false, |compiler| {
+                compiler.compile_jump_if(&statement.test, false, condition_false)
+            })?;
         }
         if self.output.constants.is_empty()
             && let Some(constant) = first_suite_literal_constant(&statement.body)
@@ -898,7 +994,15 @@ impl Compiler {
                         compiler.with_control_override(
                             |control| &mut control.exclude_condition_not_taken_from_exception,
                             exclude_from_generator,
-                            |compiler| compiler.compile_jump_if(test, false, next),
+                            |compiler| {
+                                compiler.with_terminal_try_condition_exception_exclusion(
+                                    compiler.unit.flags & CO_COROUTINE != 0
+                                        && compiler.control.generator_region_start.is_some()
+                                        && compiler.assembler.contains_opcode(YIELD_VALUE)
+                                        && matches!(body.last(), Some(Stmt::Try(_))),
+                                    |compiler| compiler.compile_jump_if(test, false, next),
+                                )
+                            },
                         )
                     },
                 )?;
@@ -1032,7 +1136,9 @@ impl Compiler {
     ) -> Result<(), CompileError> {
         let base_depth = self.control.depth;
         let otherwise = self.assembler.label();
-        self.compile_jump_if(&expression.test, false, otherwise)?;
+        self.with_terminal_try_condition_exception_exclusion(false, |compiler| {
+            compiler.compile_jump_if(&expression.test, false, otherwise)
+        })?;
         self.compile_expression(&expression.body)?;
         self.assembler
             .set_location(self.source_location(expression.body.range()));
@@ -1189,7 +1295,7 @@ impl Compiler {
             let exclusion_end = self.assembler.label();
             self.assembler.mark(exclusion_end);
             self.emit_jump_forward(jump, short_circuit, -1)?;
-            self.emit(NOT_TAKEN, 0, 0)?;
+            self.emit_terminal_try_condition_not_taken()?;
             self.assembler.mark(continue_outer);
             self.emit(POP_TOP, 0, -1)?;
         }
@@ -1240,7 +1346,7 @@ impl Compiler {
             self.emit(COPY, 1, 1)?;
             self.emit(TO_BOOL, 0, 0)?;
             self.emit_jump_forward(jump, short_circuit, -1)?;
-            self.emit(NOT_TAKEN, 0, 0)?;
+            self.emit_terminal_try_condition_not_taken()?;
             self.emit(POP_TOP, 0, -1)?;
         }
         self.compile_expression(last)
@@ -1983,7 +2089,15 @@ impl Compiler {
                 self.with_control_override(
                     |control| &mut control.exclude_terminal_if_not_taken,
                     exclude_not_taken,
-                    |compiler| compiler.compile_jump_if(test, false, next),
+                    |compiler| {
+                        compiler.with_terminal_try_condition_exception_exclusion(
+                            compiler.unit.flags & CO_COROUTINE != 0
+                                && compiler.control.generator_region_start.is_some()
+                                && compiler.assembler.contains_opcode(YIELD_VALUE)
+                                && matches!(body.last(), Some(Stmt::Try(_))),
+                            |compiler| compiler.compile_jump_if(test, false, next),
+                        )
+                    },
                 )?;
                 if retain_folded_test_in_protected_region {
                     // CPython keeps the first folded branch marker inside the surrounding
@@ -3310,6 +3424,7 @@ impl Compiler {
             .push(Vec::new());
         let direct_continue =
             statement.orelse.is_empty() && matches!(statement.body.as_slice(), [Stmt::Continue(_)]);
+        let mut normal_return_emitted = false;
         let body_noop_location = if direct_continue {
             self.assembler.mark(try_end);
             self.compile_statement(&statement.body[0])?;
@@ -3338,6 +3453,24 @@ impl Compiler {
                         )
                     },
                 )?;
+            } else if terminal
+                && statement.orelse.is_empty()
+                && statement
+                    .body
+                    .last()
+                    .is_some_and(terminal_try_distributes_implicit_return)
+            {
+                let exception_region_depth = self.control.active_exception_region_exclusions.len();
+                let ((), emitted) = self.with_control_override(
+                    |control| &mut control.implicit_return_exception_exclusion_depth,
+                    Some(exception_region_depth),
+                    |compiler| {
+                        compiler.with_fallthrough_tracking(|compiler| {
+                            compiler.compile_suite_inner(&statement.body, true)
+                        })
+                    },
+                )?;
+                normal_return_emitted = emitted;
             } else {
                 self.compile_suite(&statement.body)?;
             }
@@ -3379,7 +3512,19 @@ impl Compiler {
             .pop()
             .expect("active try region has exclusion collector");
         let orelse_instruction_count = self.assembler.instruction_count();
-        self.compile_suite(&statement.orelse)?;
+        if terminal
+            && statement
+                .orelse
+                .last()
+                .is_some_and(terminal_try_distributes_implicit_return)
+        {
+            let ((), emitted) = self.with_fallthrough_tracking(|compiler| {
+                compiler.compile_suite_inner(&statement.orelse, true)
+            })?;
+            normal_return_emitted = emitted;
+        } else {
+            self.compile_suite(&statement.orelse)?;
+        }
         let orelse_noop_location = (self.assembler.instruction_count() == orelse_instruction_count)
             .then(|| {
                 statement
@@ -3401,7 +3546,9 @@ impl Compiler {
             } else if let Some(location) = self.assembler.last_instruction_location() {
                 self.assembler.set_location(location);
             }
-            self.emit_deferred_implicit_return()?;
+            if !normal_return_emitted {
+                self.emit_deferred_implicit_return()?;
+            }
         } else {
             if let Some(location) = orelse_noop_location {
                 self.assembler.set_location(location);
@@ -5619,6 +5766,33 @@ fn terminal_exception_handler_if_supported(statement: &ruff_python_ast::StmtIf) 
             !suite_terminates(body)
                 || matches!(body, [Stmt::Return(statement)] if statement.value.is_none())
         })
+}
+
+fn terminal_try_distributes_implicit_return(statement: &Stmt) -> bool {
+    match statement {
+        Stmt::If(_) | Stmt::Match(_) | Stmt::While(_) => true,
+        Stmt::Expr(statement) => match statement.value.as_ref() {
+            Expr::If(_) => true,
+            Expr::BoolOp(boolean) => terminal_try_bool_expression_supported(boolean),
+            Expr::Compare(comparison) => comparison.ops.len() > 1,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+fn terminal_try_bool_expression_supported(expression: &ruff_python_ast::ExprBoolOp) -> bool {
+    if expression.values.last().is_some_and(|value| match value {
+        Expr::If(_) => true,
+        Expr::Compare(comparison) => comparison.ops.len() > 1,
+        _ => false,
+    }) {
+        return false;
+    }
+    expression.values.iter().all(|value| match value {
+        Expr::BoolOp(nested) => terminal_try_bool_expression_supported(nested),
+        _ => jump_constant_truthiness(value).is_none(),
+    })
 }
 
 pub(super) fn statement_uses_implicit_return_location(statement: &Stmt) -> bool {
