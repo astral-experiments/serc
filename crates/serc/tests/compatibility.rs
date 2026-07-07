@@ -291,6 +291,82 @@ def shadowed_class_decorator(decorator, local):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_plain_class_header_closures() {
+        let source = r"def function_headers(base, metaclass, bases, options, captured):
+    def parent():
+        class Direct(base, metaclass=metaclass):
+            pass
+
+        class Expanded(*bases, **options):
+            pass
+
+        class Nested((lambda: captured)()):
+            pass
+
+        return Direct, Expanded, Nested
+
+    return parent
+
+
+def class_headers(base, metaclass, bases, options):
+    class Container:
+        class Direct(base, metaclass=metaclass):
+            pass
+
+        class Expanded(*bases, **options):
+            pass
+
+    return Container
+
+
+def local_headers(base, metaclass):
+    def parent(base, metaclass):
+        class Child(base, metaclass=metaclass):
+            pass
+
+        return Child
+
+    return parent
+
+
+def shadowed_class_headers(base, metaclass, local_base, local_meta):
+    class Container:
+        base = local_base
+        metaclass = local_meta
+
+        class Child(base, metaclass=metaclass):
+            pass
+
+    return Container
+
+
+def generic_headers(base, metaclass, bound, default):
+    def parent():
+        class Child[T: bound = default](base, metaclass=metaclass):
+            value: T
+
+        return Child
+
+    return parent
+
+
+def generic_type_parameter_shadow(T):
+    def parent():
+        class Child[T](T):
+            pass
+
+        return Child
+
+    return parent
+
+
+class Global(global_base, metaclass=global_meta):
+    pass
+";
+        assert_matches_cpython_marshal(source, "class_header_closures.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_closure_load_fusion_boundaries() {
         let source = "def tuple_value(label, url):\n    return label, lambda: url\n\ndef keyword_call(label, url):\n    return register(label=label, command=lambda: open(url))\n";
         assert_matches_cpython_marshal(source, "closure_fusion.py");

@@ -1689,6 +1689,16 @@ impl ScopeBodyFactsCollector {
 
     fn collect_class_header(&mut self, definition: &StmtClassDef) {
         let Some(type_params) = definition.type_params.as_deref() else {
+            // Plain class arguments execute directly in the current scope. Generic class
+            // arguments instead execute in the synthetic type-parameter scope handled below.
+            if let Some(arguments) = definition.arguments.as_deref() {
+                for argument in &arguments.args {
+                    self.visit_expr(argument);
+                }
+                for keyword in &arguments.keywords {
+                    self.visit_expr(&keyword.value);
+                }
+            }
             return;
         };
         self.facts.has_generic_definition = true;
