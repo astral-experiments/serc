@@ -511,6 +511,29 @@ except Error:
     }
 
     #[test]
+    fn matches_cpython_marshal_for_applied_comprehension_cleanup_swaps() {
+        let source = r"def applied(manager, condition, items):
+    with manager:
+        result = [item for item in items]
+        if condition:
+            return result
+
+def discarded(manager, condition, items):
+    with manager:
+        {item for item in items}
+        if condition:
+            return
+
+def retained(manager, condition, items):
+    with manager:
+        result = consume([item for item in items])
+        if condition:
+            return result
+";
+        assert_matches_cpython_marshal(source, "comprehension_cleanup_swap.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_inlined_comprehension_cells() {
         let source = r"module_result = [lambda: x for x in range(2)]
 
@@ -729,6 +752,12 @@ def render(value):
     fn matches_cpython_marshal_for_with_passes_and_folded_iterables() {
         let source = "def pass_before_loop(manager, values):\n    with manager as target:\n        pass\n        for value in values:\n            target.write(value)\n\ndef pass_in_loop_and_else(manager, values):\n    with manager as target:\n        for value in values:\n            pass\n            target.write(value)\n        else:\n            pass\n\ndef folded_iterable(manager):\n    with manager as target:\n        for value in (1,) if True else (2,):\n            target.write(value)\n\nwith (\n    manager\n) as target: pass\n";
         assert_matches_cpython_marshal(source, "with_passes.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_try_exits_after_if_joins() {
+        let source = "def retained(flag):\n    try:\n        action()\n    except Exception:\n        failed()\n    else:\n        if flag:\n            good()\n        else:\n            other()\n    after()\n\ndef ordinary(flag):\n    try:\n        action()\n    except Exception:\n        failed()\n    else:\n        if flag:\n            good()\n    after()\n";
+        assert_matches_cpython_marshal(source, "try_if_join.py");
     }
 
     #[test]

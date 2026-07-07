@@ -3408,6 +3408,12 @@ impl Compiler {
                 ExceptionPolicy::default()
             };
             self.emit_jump_forward_with_exception_policy(JUMP_FORWARD, end, 0, exception_policy)?;
+            if !statement.orelse.is_empty()
+                && suite_ends_in_retained_try_exit_join(&statement.orelse)
+            {
+                self.assembler
+                    .preserve_last_redundant_jump_nop_after_threading();
+            }
             if body_ends_with_break_loop {
                 // CPython's `POP_BLOCK` initially prevents the loop break from threading
                 // through this normal try exit. Once `POP_BLOCK` disappears, the exit jump
@@ -5340,6 +5346,30 @@ fn condition_jump_target_count(expression: &Expr, jump_on: bool) -> usize {
 
 pub(super) fn suite_terminates(body: &[Stmt]) -> bool {
     body.iter().any(statement_terminates)
+}
+
+fn suite_ends_in_retained_try_exit_join(body: &[Stmt]) -> bool {
+    let Some(Stmt::If(statement)) = body.last() else {
+        return false;
+    };
+    if let Some(truthiness) = early_condition_truthiness(&statement.test)
+        && statement.elif_else_clauses.len() <= 1
+        && statement
+            .elif_else_clauses
+            .first()
+            .is_none_or(|clause| clause.test.is_none())
+    {
+        let selected = if truthiness {
+            statement.body.as_slice()
+        } else {
+            statement
+                .elif_else_clauses
+                .first()
+                .map_or(&[] as &[Stmt], |clause| clause.body.as_slice())
+        };
+        return suite_ends_in_retained_try_exit_join(selected);
+    }
+    !statement.elif_else_clauses.is_empty() || terminating_if_fallthrough_test(statement).is_some()
 }
 
 fn try_requires_loop_tail_inlining(statement: &ruff_python_ast::StmtTry) -> bool {
