@@ -96,6 +96,19 @@ fn uses_cpython_reference_cache_boundaries() {
 }
 
 #[test]
+fn bypasses_value_lookup_for_common_cpython_cached_objects() {
+    let mut graph = ObjectGraph::default();
+    for key in [ObjectKey::Bytes(&[]), ObjectKey::EmptyTuple] {
+        assert!(graph.record(key.clone()));
+        assert!(!graph.record(key));
+    }
+
+    assert_eq!(graph.object_count(), 2);
+    assert_eq!(graph.keyed_object_count(), 2);
+    assert_eq!(graph.hashed_object_count(), 0);
+}
+
+#[test]
 fn tracks_interned_strings_from_constants_and_metadata() {
     let mut code = code_object(vec![
         Constant::String("identifier".to_string()),
