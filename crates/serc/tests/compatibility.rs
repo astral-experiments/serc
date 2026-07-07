@@ -462,6 +462,12 @@ except Error:
     }
 
     #[test]
+    fn matches_cpython_marshal_for_folded_negative_true_division() {
+        let source = "fraction = -5 / 7\ntenth = -1 / 10\nlarge_denominator = -1 / 9_000_000_000_000_000_000\ndivision_by_zero = -1 / 0\n";
+        assert_matches_cpython_marshal(source, "negative_true_division.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_folded_branches_in_a_with_statement() {
         let source = "from contextlib import suppress\n\ndef f():\n    with suppress(Exception):\n        if 1:\n            pass\n        elif 1:\n            pass\n        elif 1:\n            pass\n        try:\n            pass\n        except Exception:\n            pass\n        finally:\n            pass\n        if 2:\n            pass\n        while True:\n            pass\n";
         assert_matches_cpython_marshal(source, "protected_branches.py");

@@ -933,6 +933,9 @@ pub(super) fn fold_constant(expression: &Expr) -> Option<Constant> {
                 (Constant::Int(left), Operator::Div, Constant::Int(right)) if right != 0 => {
                     Some(Constant::Float(left as f64 / right as f64))
                 }
+                (Constant::SignedInt(left), Operator::Div, Constant::Int(right)) if right != 0 => {
+                    Some(Constant::Float(left as f64 / right as f64))
+                }
                 (Constant::Int(left), Operator::FloorDiv, Constant::Int(right)) if right != 0 => {
                     Some(Constant::Int(left / right))
                 }
