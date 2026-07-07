@@ -119,7 +119,11 @@ fn discover(roots: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
             ));
         }
 
-        for entry in WalkDir::new(root).follow_links(false) {
+        for entry in WalkDir::new(root)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|entry| entry.depth() == 0 || entry.file_name() != "__pycache__")
+        {
             let entry =
                 entry.map_err(|error| format!("failed to walk {}: {error}", root.display()))?;
             if (entry.file_type().is_file()
@@ -481,6 +485,21 @@ mod tests {
         assert_eq!(
             paths,
             vec![directory.path().join("b.py"), nested.join("a.py")]
+        );
+    }
+
+    #[test]
+    fn discovery_prunes_python_cache_directories() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = directory.path().join("__pycache__");
+        let source = directory.path().join("module.py");
+        fs_err::create_dir(&cache).unwrap();
+        fs_err::write(&source, "pass\n").unwrap();
+        fs_err::write(cache.join("stray.py"), "pass\n").unwrap();
+
+        assert_eq!(
+            discover(&[directory.path().to_path_buf()]).unwrap(),
+            [source]
         );
     }
 
