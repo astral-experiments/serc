@@ -78,7 +78,7 @@ impl ReraiseStackState {
 
 impl Compiler {
     fn name_id(&self, name: &str) -> Option<NameId> {
-        self.context.scopes.get()?.names.get(name)
+        self.context.scopes.names.get(name)
     }
 
     pub(super) fn required_name_id(&self, name: &str) -> NameId {
@@ -109,12 +109,7 @@ impl Compiler {
     }
 
     fn name_strings(&self, names: impl IntoIterator<Item = NameId>) -> Vec<String> {
-        let interner = &self
-            .context
-            .scopes
-            .get()
-            .expect("scope arena should be initialized before lowering")
-            .names;
+        let interner = &self.context.scopes.names;
         names
             .into_iter()
             .map(|name| interner.resolve(name).to_string())
@@ -122,12 +117,7 @@ impl Compiler {
     }
 
     pub(super) fn insert_lexical_name(&self, names: &mut Vec<NameId>, name: NameId) {
-        self.context
-            .scopes
-            .get()
-            .expect("scope arena should be initialized before lowering")
-            .names
-            .insert_lexical(names, name);
+        self.context.scopes.names.insert_lexical(names, name);
     }
 
     pub(super) fn contains_name(&self, names: &NameSet, name: &str) -> bool {
@@ -135,12 +125,7 @@ impl Compiler {
     }
 
     pub(super) fn resolve_name(&self, name: NameId) -> &str {
-        self.context
-            .scopes
-            .get()
-            .expect("scope arena should be initialized before lowering")
-            .names
-            .resolve(name)
+        self.context.scopes.names.resolve(name)
     }
 
     pub(super) fn scope_index(&self, indices: &FxHashMap<NameId, u32>, name: &str) -> Option<u32> {
@@ -307,12 +292,7 @@ impl Compiler {
 
     pub(super) fn store_name_id(&mut self, name_id: NameId) -> Result<(), CompileError> {
         let context = Arc::clone(&self.context);
-        let name = context
-            .scopes
-            .get()
-            .expect("scope arena should be initialized before lowering")
-            .names
-            .resolve(name_id);
+        let name = context.scopes.names.resolve(name_id);
         self.store_name_with_id(name, name_id)
     }
 
@@ -397,12 +377,7 @@ impl Compiler {
 
     pub(super) fn delete_name_id(&mut self, name_id: NameId) -> Result<(), CompileError> {
         let context = Arc::clone(&self.context);
-        let name = context
-            .scopes
-            .get()
-            .expect("scope arena should be initialized before lowering")
-            .names
-            .resolve(name_id);
+        let name = context.scopes.names.resolve(name_id);
         self.delete_name_with_id(name, name_id)
     }
 

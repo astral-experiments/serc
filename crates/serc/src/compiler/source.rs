@@ -1,7 +1,7 @@
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use ruff_python_ast::token::{TokenKind, Tokens};
-use ruff_python_ast::{Expr, FStringPart, InterpolatedStringElement, Stmt};
+use ruff_python_ast::{Expr, FStringPart, InterpolatedStringElement, Stmt, Suite};
 use ruff_python_codegen::{Generator, Indentation, Mode as CodegenMode};
 use ruff_source_file::{LineEnding, LineIndex};
 use ruff_text_size::{Ranged, TextLen, TextSize};
@@ -11,7 +11,7 @@ use crate::assembler::SourceLocation;
 use crate::code_object::Constant;
 
 use super::constant::{explicit_surrogate_string, fold_constant};
-use super::scope::ScopeArena;
+use super::scope::{ModulePlan, ScopeArena};
 use super::{CachedSourceLine, Compiler};
 
 #[derive(Debug)]
@@ -20,17 +20,20 @@ pub(super) struct CompilationContext {
     pub(super) source: Arc<str>,
     pub(super) tokens: Tokens,
     line_index: LineIndex,
-    pub(super) scopes: OnceLock<ScopeArena>,
+    pub(super) module_plan: ModulePlan,
+    pub(super) scopes: ScopeArena,
 }
 
 impl CompilationContext {
-    pub(super) fn new(filename: &str, source: &str, tokens: Tokens) -> Self {
+    pub(super) fn new(filename: &str, source: &str, tokens: Tokens, body: &Suite) -> Self {
+        let (scopes, module_plan) = ScopeArena::analyze(body);
         Self {
             filename: filename.to_string(),
             source: Arc::from(source),
             tokens,
             line_index: LineIndex::from_source_text(source),
-            scopes: OnceLock::new(),
+            module_plan,
+            scopes,
         }
     }
 }
@@ -542,32 +545,8 @@ pub(super) fn unparse_annotation(expression: &Expr) -> String {
 }
 
 fn python_string_repr(value: &str) -> String {
-    let quote = if value.contains('\'') && !value.contains('"') {
-        '"'
-    } else {
-        '\''
-    };
-    let mut repr = String::with_capacity(value.len() + 2);
-    repr.push(quote);
-    for character in value.chars() {
-        match character {
-            '\\' => repr.push_str("\\\\"),
-            '\n' => repr.push_str("\\n"),
-            '\r' => repr.push_str("\\r"),
-            '\t' => repr.push_str("\\t"),
-            '\x08' => repr.push_str("\\b"),
-            '\x0c' => repr.push_str("\\f"),
-            character if character == quote => {
-                repr.push('\\');
-                repr.push(character);
-            }
-            character if character.is_control() => {
-                use std::fmt::Write;
-                write!(repr, "\\x{:02x}", u32::from(character)).unwrap();
-            }
-            character => repr.push(character),
-        }
-    }
-    repr.push(quote);
-    repr
+    ruff_python_literal::escape::UnicodeEscape::new_repr(value)
+        .str_repr(ruff_python_ast::str::TripleQuotes::No)
+        .to_string()
+        .expect("Python string representation length fits in usize")
 }

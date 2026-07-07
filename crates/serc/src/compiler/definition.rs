@@ -218,7 +218,7 @@ impl Compiler {
             .map(|parameter| self.required_name_id(parameter.name().as_str()))
             .collect();
         let child_scope_id = self.function_scope_id(definition)?;
-        let arena = self.scope_arena()?;
+        let arena = self.scope_arena();
         let mut child_plan = arena
             .function(child_scope_id)
             .ok_or_else(|| CompileError::Internal("function scope has no plan".to_string()))?

@@ -180,7 +180,7 @@ fn compile_normalized(source: &str, filename: &str) -> Result<CompiledModule, Co
         .map_err(CompileError::Parse)?
         .try_into_module()
         .ok_or_else(|| CompileError::Internal("parser did not return a module".to_string()))?;
-    let code = Compiler::module(filename, source, parsed.tokens().clone())
+    let code = Compiler::module(filename, source, parsed.tokens().clone(), parsed.suite())
         .compile_module(parsed.suite())?;
     Ok(CompiledModule { code })
 }
