@@ -7,7 +7,7 @@ use crate::assembler::SourceLocation;
 
 use super::{
     Compiler, Constant, FunctionPlan, NameId, NameInterner, ScopeBodyFacts, clean_doc,
-    debug_text_range, interpolated_string_content_range,
+    debug_text_range, interpolated_string_content_range, strip_expression_comments,
 };
 
 #[test]
@@ -431,6 +431,38 @@ fn debug_text_ranges_follow_ast_text_and_marker_tokens() {
             &source[usize::from(expression_range.start())..usize::from(expression_range.end())],
             expected_expression,
         );
+    }
+}
+
+#[test]
+fn expression_comment_stripping_uses_ruff_comment_tokens() {
+    for (source, expected) in [
+        (
+            "(r'# raw', R\"# raw double\", b'# bytes', rb'# raw bytes', u'# unicode', '# single', \"# double\", '''# triple''', \"\"\"# triple double\"\"\")  # remove\r\nnext",
+            "(r'# raw', R\"# raw double\", b'# bytes', rb'# raw bytes', u'# unicode', '# single', \"# double\", '''# triple''', \"\"\"# triple double\"\"\")  \r\nnext",
+        ),
+        (
+            "\"escaped \\\" # string\" + '\\\\ # string'  # remove\nvalue",
+            "\"escaped \\\" # string\" + '\\\\ # string'  \nvalue",
+        ),
+        (
+            "f\"\"\"outer # {\n    f'inner # {value}'  # nested comment\n} tail #\"\"\"  # remove\n",
+            "f\"\"\"outer # {\n    f'inner # {value}'  # nested comment\n} tail #\"\"\"  \n",
+        ),
+        (
+            "rf\"literal # {value}\" + tr'''template # {value}'''  # remove\n",
+            "rf\"literal # {value}\" + tr'''template # {value}'''  \n",
+        ),
+        (
+            "  call('#')  # generated comment\r\n =   # trailing debug comment\r\n",
+            "  call('#')  \r\n =   \r\n",
+        ),
+        (
+            "value  # first\n    # own line\nother  # last",
+            "value  \n    \nother  ",
+        ),
+    ] {
+        assert_eq!(strip_expression_comments(source), expected, "{source:?}");
     }
 }
 

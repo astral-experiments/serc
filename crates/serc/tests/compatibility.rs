@@ -516,6 +516,29 @@ def render(item, mapping, width):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_comment_trivia_in_interpolations() {
+        let source = r##"
+def render(value):
+    f"""{(
+        '# single',
+        "# double",
+        r'# raw',
+        '''# triple''',
+        """# triple double""",
+    ) =  # debug comment
+    }"""
+    t"""{"escaped \\\" # still string" = }"""
+    t"""{f"nested # {value}" = !r:^20}"""
+    t"""{(
+        '# literal',
+        f"nested # {value}",
+    )  # expression comment
+    !r:^20}"""
+"##;
+        assert_matches_cpython_marshal(source, "comment_trivia_interpolations.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_an_irrefutable_constant_match_guard() {
         let source = "match subject:\n    case value if True:\n        pass\n    case _:\n        unreachable()\nafter()\n";
         assert_matches_cpython_marshal(source, "match.py");
