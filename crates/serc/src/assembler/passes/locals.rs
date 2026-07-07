@@ -386,16 +386,6 @@ impl OptimizationPipeline {
                 borrow_unreachable_blocks[block.index()] = true;
             }
         }
-        for blocks in blocks.windows(2) {
-            if graph[blocks[0]]
-                .last_instruction()
-                .is_some_and(|instruction| {
-                    instruction.borrow_fallthrough == BorrowFallthrough::Barrier
-                })
-            {
-                borrow_unreachable_blocks[blocks[1].index()] = true;
-            }
-        }
         let mut block_positions = vec![usize::MAX; block_slot_count];
         for (position, block) in blocks.iter().copied().enumerate() {
             block_positions[block.index()] = position;
@@ -412,15 +402,18 @@ impl OptimizationPipeline {
             let Some(last) = graph[block].last_instruction() else {
                 continue;
             };
+            let borrow_traversal_stops = last.borrow_fallthrough == BorrowFallthrough::Barrier;
             let folded_jump_has_no_fallthrough =
                 last.opcode == NOP && last.jump_policy.always_retains_nop();
-            if !folded_jump_has_no_fallthrough
+            if !borrow_traversal_stops
+                && !folded_jump_has_no_fallthrough
                 && block_has_fallthrough(&[Item::Instruction(*last)])
                 && let Some(next) = blocks.get(block_positions[block.index()] + 1)
             {
                 pending.push(*next);
             }
-            if let Operand::Forward(label) | Operand::Backward(label) = last.operand
+            if !borrow_traversal_stops
+                && let Operand::Forward(label) | Operand::Backward(label) = last.operand
                 && let Some(target) = graph.label_block(label)
             {
                 pending.push(target);

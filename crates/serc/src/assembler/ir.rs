@@ -394,7 +394,7 @@ pub(super) struct Instruction {
     // whatever exception target remains in its reused CFG slot, if there is one.
     pub(super) exception_policy: ExceptionPolicy,
     // A boundary used only by the final borrowed-load analysis. Earlier CFG passes must continue
-    // to see ordinary fallthrough across this edge.
+    // to see ordinary control-flow reachability across this edge.
     pub(super) borrow_fallthrough: BorrowFallthrough,
 }
 

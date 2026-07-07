@@ -1,9 +1,10 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::super::{
-    COMPARE_OP, CONTAINS_OP, COPY, ExceptionExclusion, IS_OP, Instruction, Item, JUMP_BACKWARD,
-    JUMP_BACKWARD_NO_INTERRUPT, JUMP_FORWARD, NOP, NOT_TAKEN, Operand, POP_JUMP_IF_FALSE,
-    POP_JUMP_IF_TRUE, POP_TOP, STORE_FAST, TO_BOOL, UNARY_NOT, ends_scope, is_unconditional_jump,
+    BorrowFallthrough, COMPARE_OP, CONTAINS_OP, COPY, ExceptionExclusion, IS_OP, Instruction, Item,
+    JUMP_BACKWARD, JUMP_BACKWARD_NO_INTERRUPT, JUMP_FORWARD, NOP, NOT_TAKEN, Operand,
+    POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE, POP_TOP, STORE_FAST, TO_BOOL, UNARY_NOT, ends_scope,
+    is_unconditional_jump,
 };
 use crate::assembler::OptimizationPipeline;
 use crate::assembler::block_graph::{BlockGraph, ItemMut, ItemPosition};
@@ -462,6 +463,14 @@ impl OptimizationPipeline {
                     previous
                         .exception_policy
                         .exclude(ExceptionExclusion::IfExtended);
+                }
+                if instruction.borrow_fallthrough == BorrowFallthrough::Barrier
+                    && let Some(previous) = previous
+                {
+                    let Item::Instruction(previous) = &mut items[previous].1 else {
+                        unreachable!();
+                    };
+                    previous.borrow_fallthrough = BorrowFallthrough::Barrier;
                 }
                 if instruction.location.line >= 0
                     && let Some(next) = next.map(|next| next - 1)

@@ -1170,6 +1170,12 @@ def render(value):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_shared_terminal_handler_borrow_edges() {
+        let source = "def branch_raise(flag):\n    if flag:\n        try:\n            action()\n        except Exception:\n            raise\n    else:\n        consume(flag)\n    after(flag)\n\ndef branch_return(flag):\n    if flag:\n        try:\n            action()\n        except Exception:\n            return\n    else:\n        consume(flag)\n    after(flag)\n\ndef nested_loop(values):\n    result = None\n    for item in values:\n        try:\n            result = load(item)\n        except KeyError:\n            raise ValueError(item)\n    return result\n";
+        assert_matches_cpython_marshal(source, "shared_terminal_handler_edges.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_with_passes_and_folded_iterables() {
         let source = "def pass_before_loop(manager, values):\n    with manager as target:\n        pass\n        for value in values:\n            target.write(value)\n\ndef pass_in_loop_and_else(manager, values):\n    with manager as target:\n        for value in values:\n            pass\n            target.write(value)\n        else:\n            pass\n\ndef folded_iterable(manager):\n    with manager as target:\n        for value in (1,) if True else (2,):\n            target.write(value)\n\nwith (\n    manager\n) as target: pass\n";
         assert_matches_cpython_marshal(source, "with_passes.py");
