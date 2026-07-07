@@ -238,7 +238,7 @@ fn decode_source(bytes: &[u8]) -> Result<String, String> {
         SourceEncoding::Utf8
     };
 
-    match encoding {
+    let source = match encoding {
         SourceEncoding::Utf8 => std::str::from_utf8(bytes)
             .map(str::to_owned)
             .map_err(|error| format!("source is not valid UTF-8: {error}")),
@@ -269,7 +269,11 @@ fn decode_source(bytes: &[u8]) -> Result<String, String> {
         SourceEncoding::Windows1252 => decode_windows_1252(bytes),
         SourceEncoding::ShiftJis => decode_shift_jis(bytes, true),
         SourceEncoding::Cp932 => decode_shift_jis(bytes, false),
+    }?;
+    if source.contains('\0') {
+        return Err("source code string cannot contain null bytes".to_string());
     }
+    Ok(source)
 }
 
 fn declared_encoding(bytes: &[u8]) -> Option<&str> {

@@ -108,6 +108,24 @@ fn compile_failure_has_a_nonzero_status() {
 }
 
 #[test]
+fn compile_rejects_null_bytes() {
+    let directory = tempfile::tempdir().unwrap();
+    let source_path = directory.path().join("null.py");
+    fs_err::write(&source_path, b"value = 'before\0after'\n").unwrap();
+
+    let output = serc()
+        .args(["compile", "--quiet"])
+        .arg(&source_path)
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("source code string cannot contain null bytes"));
+    assert!(!directory.path().join("__pycache__").exists());
+}
+
+#[test]
 fn compile_matches_cpython_pyc() {
     let Some(python) = common::python_3145() else {
         return;
