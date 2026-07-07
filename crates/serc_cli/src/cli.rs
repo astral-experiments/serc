@@ -161,6 +161,14 @@ fn compile_path_with_metadata(
     check: bool,
     load_metadata: impl FnOnce(&Path) -> io::Result<std::fs::Metadata>,
 ) -> Result<(), String> {
+    // Snapshot timestamp-cache metadata before reading. If the path changes during compilation,
+    // the resulting header describes the old state and cannot validate the new source as fresh.
+    let metadata = (!check)
+        .then(|| {
+            load_metadata(path)
+                .map_err(|error| format!("failed to inspect {}: {error}", path.display()))
+        })
+        .transpose()?;
     let source_bytes = fs_err::read(path)
         .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
     let filename = path
@@ -178,8 +186,7 @@ fn compile_path_with_metadata(
         return Ok(());
     }
 
-    let metadata = load_metadata(path)
-        .map_err(|error| format!("failed to inspect {}: {error}", path.display()))?;
+    let metadata = metadata.expect("source metadata is loaded when writing bytecode");
     let source_size = metadata.len();
     let modified = metadata
         .modified()
@@ -309,7 +316,7 @@ mod tests {
     }
 
     #[test]
-    fn samples_source_metadata_after_compilation() {
+    fn samples_source_metadata_before_reading() {
         let directory = tempfile::tempdir().unwrap();
         let source_path = directory.path().join("module.py");
         let source = "value = 1\n";
@@ -325,9 +332,10 @@ mod tests {
         })
         .unwrap();
 
-        let expected = serc::compile_bytes(source.as_bytes(), source_path.to_str().unwrap())
-            .unwrap()
-            .to_timestamp_pyc(1_700_000_000, u32::try_from(replacement.len()).unwrap());
+        let expected =
+            serc::compile_bytes(replacement.as_bytes(), source_path.to_str().unwrap())
+                .unwrap()
+                .to_timestamp_pyc(1_700_000_000, u32::try_from(replacement.len()).unwrap());
         assert_eq!(
             fs_err::read(cache_path(&source_path).unwrap()).unwrap(),
             expected
