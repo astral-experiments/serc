@@ -2,9 +2,12 @@
 use rustc_hash::FxHashMap;
 
 use super::block_graph::BlockGraph;
-use super::{AssembledCode, Assembler, Item, Operand, extended_arg_count};
+use super::{
+    AssembledCode, Assembler, Item, Label, LayoutAssembler, Operand, OptimizationPipeline,
+    UnoptimizedCode, extended_arg_count,
+};
 #[cfg(any(test, debug_assertions))]
-use super::{AssemblerStage, Label};
+use super::{AssemblerStage, ExceptionRegion};
 use crate::CompileError;
 
 mod blocks;
@@ -12,109 +15,147 @@ mod control_flow;
 mod locals;
 mod swaps;
 
+#[cfg(any(test, debug_assertions))]
+fn validate_structure(
+    items: &[Item],
+    exception_regions: &[ExceptionRegion],
+    reachable: Option<&[bool]>,
+    stage: AssemblerStage,
+) -> Result<(), CompileError> {
+    let invariant_error = |message: String| {
+        CompileError::Internal(format!(
+            "assembler invariant failed after {}: {message}",
+            stage.name()
+        ))
+    };
+
+    let mut label_positions = FxHashMap::default();
+    for (index, item) in items.iter().enumerate() {
+        let Item::Label(label) = item else {
+            continue;
+        };
+        if label_positions.insert(*label, index).is_some() {
+            return Err(invariant_error(format!(
+                "label {} is bound more than once",
+                label.0
+            )));
+        }
+    }
+
+    for (index, item) in items.iter().enumerate() {
+        let Item::Instruction(instruction) = item else {
+            continue;
+        };
+        let (target, is_forward) = match instruction.operand {
+            Operand::Value(_) => continue,
+            Operand::Forward(target) => (target, true),
+            Operand::Backward(target) => (target, false),
+        };
+        if !instruction.opcode.has_jump() {
+            return Err(invariant_error(format!(
+                "instruction {index} uses a label operand with non-jump opcode {}",
+                instruction.opcode.code()
+            )));
+        }
+        let Some(target_index) = label_positions.get(&target).copied() else {
+            return Err(invariant_error(format!(
+                "instruction {index} targets unbound label {}",
+                target.0
+            )));
+        };
+        if is_forward && target_index <= index {
+            return Err(invariant_error(format!(
+                "instruction {index} has a forward operand to label {} at {target_index}",
+                target.0
+            )));
+        }
+        if !is_forward && target_index >= index {
+            return Err(invariant_error(format!(
+                "instruction {index} has a backward operand to label {} at {target_index}",
+                target.0
+            )));
+        }
+    }
+
+    for (index, region) in exception_regions.iter().enumerate() {
+        let position = |label: Label, role: &str| {
+            label_positions.get(&label).copied().ok_or_else(|| {
+                invariant_error(format!(
+                    "exception region {index} has an unbound {role} label {}",
+                    label.0
+                ))
+            })
+        };
+        let start = position(region.start, "start")?;
+        let end = position(region.end, "end")?;
+        position(region.target, "target")?;
+        if stage.requires_ordered_exception_regions() && start > end {
+            return Err(invariant_error(format!(
+                "exception region {index} starts at {start} after it ends at {end}"
+            )));
+        }
+    }
+
+    if let Some(reachable) = reachable {
+        if let Some(index) = items.iter().enumerate().find_map(|(index, item)| {
+            matches!(item, Item::Instruction(_))
+                .then_some(index)
+                .filter(|index| !reachable[*index])
+        }) {
+            return Err(invariant_error(format!(
+                "instruction {index} remains unreachable"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(any(test, debug_assertions))]
+fn invariant_error(stage: AssemblerStage, message: &str) -> CompileError {
+    CompileError::Internal(format!(
+        "assembler invariant failed after {}: {message}",
+        stage.name()
+    ))
+}
+
+#[cfg(test)]
 impl Assembler {
-    #[cfg(any(test, debug_assertions))]
     pub(in crate::assembler) fn validate_structure(
         &self,
         stage: AssemblerStage,
     ) -> Result<(), CompileError> {
-        let invariant_error = |message: String| {
-            CompileError::Internal(format!(
-                "assembler invariant failed after {}: {message}",
-                stage.name()
-            ))
-        };
-
-        let items = if let Some(graph) = &self.graph {
-            graph.validate().map_err(&invariant_error)?;
-            graph.iter_items().copied().collect::<Vec<_>>()
-        } else {
-            self.items.clone()
-        };
-
-        let mut label_positions = FxHashMap::default();
-        for (index, item) in items.iter().enumerate() {
-            let Item::Label(label) = item else {
-                continue;
-            };
-            if label_positions.insert(*label, index).is_some() {
-                return Err(invariant_error(format!(
-                    "label {} is bound more than once",
-                    label.0
-                )));
-            }
-        }
-
-        for (index, item) in items.iter().enumerate() {
-            let Item::Instruction(instruction) = item else {
-                continue;
-            };
-            let (target, is_forward) = match instruction.operand {
-                Operand::Value(_) => continue,
-                Operand::Forward(target) => (target, true),
-                Operand::Backward(target) => (target, false),
-            };
-            if !instruction.opcode.has_jump() {
-                return Err(invariant_error(format!(
-                    "instruction {index} uses a label operand with non-jump opcode {}",
-                    instruction.opcode.code()
-                )));
-            }
-            let Some(target_index) = label_positions.get(&target).copied() else {
-                return Err(invariant_error(format!(
-                    "instruction {index} targets unbound label {}",
-                    target.0
-                )));
-            };
-            if is_forward && target_index <= index {
-                return Err(invariant_error(format!(
-                    "instruction {index} has a forward operand to label {} at {target_index}",
-                    target.0
-                )));
-            }
-            if !is_forward && target_index >= index {
-                return Err(invariant_error(format!(
-                    "instruction {index} has a backward operand to label {} at {target_index}",
-                    target.0
-                )));
-            }
-        }
-
-        for (index, region) in self.exception_regions.iter().enumerate() {
-            let position = |label: Label, role: &str| {
-                label_positions.get(&label).copied().ok_or_else(|| {
-                    invariant_error(format!(
-                        "exception region {index} has an unbound {role} label {}",
-                        label.0
-                    ))
-                })
-            };
-            let start = position(region.start, "start")?;
-            let end = position(region.end, "end")?;
-            position(region.target, "target")?;
-            if stage.requires_ordered_exception_regions() && start > end {
-                return Err(invariant_error(format!(
-                    "exception region {index} starts at {start} after it ends at {end}"
-                )));
-            }
-        }
-
-        if stage.requires_full_reachability() {
-            let reachable = self.reachable_items();
-            if let Some(index) = items.iter().enumerate().find_map(|(index, item)| {
-                matches!(item, Item::Instruction(_))
-                    .then_some(index)
-                    .filter(|index| !reachable[*index])
-            }) {
-                return Err(invariant_error(format!(
-                    "instruction {index} remains unreachable"
-                )));
-            }
-        }
-
-        Ok(())
+        let items = self.linear_items();
+        let reachable = stage.requires_full_reachability().then(|| {
+            BlockGraph::from_items(items.to_vec(), &self.preserved_block_boundaries)
+                .item_reachability(&self.exception_regions)
+        });
+        validate_structure(items, &self.exception_regions, reachable.as_deref(), stage)
     }
+}
 
+#[cfg(any(test, debug_assertions))]
+impl OptimizationPipeline {
+    fn validate_structure(&self, stage: AssemblerStage) -> Result<(), CompileError> {
+        self.graph
+            .validate()
+            .map_err(|message| invariant_error(stage, &message))?;
+        let items = self.graph.iter_items().copied().collect::<Vec<_>>();
+        let reachable = stage
+            .requires_full_reachability()
+            .then(|| self.reachable_items());
+        validate_structure(&items, &self.exception_regions, reachable.as_deref(), stage)
+    }
+}
+
+#[cfg(any(test, debug_assertions))]
+impl LayoutAssembler {
+    fn validate_structure(&self, stage: AssemblerStage) -> Result<(), CompileError> {
+        validate_structure(&self.items, &self.exception_regions, None, stage)
+    }
+}
+
+impl Assembler {
     #[cfg(test)]
     pub(crate) fn finish(self) -> Result<Vec<u8>, CompileError> {
         self.finish_code(1, 0, 0)
@@ -122,20 +163,48 @@ impl Assembler {
     }
 
     pub(crate) fn finish_code(
-        mut self,
+        self,
         first_line_number: u32,
         local_count: usize,
         parameter_count: usize,
     ) -> Result<AssembledCode, CompileError> {
-        if let Some(graph) = &mut self.graph {
-            debug_assert!(self.items.is_empty());
-            graph.remove_initial_preserved_boundaries();
-        } else {
-            self.graph = Some(BlockGraph::from_items(
-                std::mem::take(&mut self.items),
-                &rustc_hash::FxHashSet::default(),
-            ));
+        self.into_optimization_pipeline()
+            .optimize(local_count, parameter_count)?
+            .finish(first_line_number)
+    }
+
+    pub(in crate::assembler) fn into_optimization_pipeline(self) -> OptimizationPipeline {
+        let graph = match self.code {
+            UnoptimizedCode::Linear(items) => {
+                BlockGraph::from_items(items, &rustc_hash::FxHashSet::default())
+            }
+            UnoptimizedCode::Prepared(mut graph) => {
+                graph.remove_initial_preserved_boundaries();
+                graph
+            }
+        };
+        OptimizationPipeline {
+            graph,
+            next_label: self.next_label,
+            exception_regions: self.exception_regions,
+            preserved_block_boundaries: self.preserved_block_boundaries,
+            borrow_unreachable_blocks: self.borrow_unreachable_blocks,
         }
+    }
+}
+
+impl OptimizationPipeline {
+    fn label(&mut self) -> Label {
+        let label = Label(self.next_label);
+        self.next_label += 1;
+        label
+    }
+
+    fn optimize(
+        mut self,
+        local_count: usize,
+        parameter_count: usize,
+    ) -> Result<LayoutAssembler, CompileError> {
         let mut removed_max_depth = self.remove_unreachable_instructions();
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::RemoveUnreachableInitial)?;
@@ -192,12 +261,22 @@ impl Assembler {
         self.optimize_load_fast();
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::OptimizeLoadFast)?;
-        self.items = self
-            .graph
-            .take()
-            .expect("assembler pass pipeline has a block graph")
-            .into_items();
-        let instruction_count = self.instruction_count();
+        Ok(LayoutAssembler {
+            items: self.graph.into_items(),
+            exception_regions: self.exception_regions,
+            preserved_block_boundaries: self.preserved_block_boundaries,
+            removed_max_depth,
+        })
+    }
+}
+
+impl LayoutAssembler {
+    fn finish(self, first_line_number: u32) -> Result<AssembledCode, CompileError> {
+        let instruction_count = self
+            .items
+            .iter()
+            .filter(|item| matches!(item, Item::Instruction(_)))
+            .count();
         let mut extended_args = vec![0_u8; instruction_count];
         let mut resolved_arguments = vec![0_u32; instruction_count];
 
@@ -261,7 +340,7 @@ impl Assembler {
                     line_table,
                     exception_table,
                     max_depth,
-                    removed_max_depth,
+                    removed_max_depth: self.removed_max_depth,
                 });
             }
         }
