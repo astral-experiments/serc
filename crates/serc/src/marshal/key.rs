@@ -302,10 +302,9 @@ pub(super) fn locals_tuple_key(code: &CodeObject) -> ObjectKey<'_> {
 
 pub(super) fn should_intern(value: &str) -> bool {
     is_cached_character(value)
-        || value.is_ascii()
-            && value
-                .bytes()
-                .all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
+        || value
+            .bytes()
+            .all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
 }
 
 fn is_cached_character(value: &str) -> bool {
