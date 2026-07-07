@@ -34,46 +34,106 @@ impl Assembler {
             .graph
             .as_ref()
             .expect("assembler pass requires the block graph");
+        if !graph.iter_items().any(|item| {
+            matches!(
+                item,
+                Item::Instruction(instruction)
+                    if matches!(instruction.opcode, LOAD_FAST | LOAD_FAST_CHECK)
+            )
+        }) {
+            return;
+        }
         let order = graph.order().to_vec();
         if order.is_empty() {
             return;
         }
-        let block_indices = order
+        if self.exception_regions.is_empty()
+            && order.len() == 1
+            && block_jump_target(graph[order[0]].items()).is_none()
+        {
+            let graph = self
+                .graph
+                .as_mut()
+                .expect("assembler pass requires the block graph");
+            let mut unsafe_locals = vec![true; local_count];
+            unsafe_locals[..parameter_count.min(local_count).min(64)].fill(false);
+            for item in graph[order[0]].items_mut() {
+                let Item::Instruction(instruction) = item else {
+                    continue;
+                };
+                let Operand::Value(argument) = instruction.operand else {
+                    continue;
+                };
+                let Ok(local) = usize::try_from(argument) else {
+                    continue;
+                };
+                if local >= local_count {
+                    continue;
+                }
+                match instruction.opcode {
+                    DELETE_FAST | LOAD_FAST_AND_CLEAR => unsafe_locals[local] = true,
+                    STORE_FAST => unsafe_locals[local] = false,
+                    LOAD_FAST_CHECK => {
+                        if !unsafe_locals[local] {
+                            instruction.opcode = LOAD_FAST;
+                        }
+                        unsafe_locals[local] = false;
+                    }
+                    LOAD_FAST => {
+                        if unsafe_locals[local] {
+                            instruction.opcode = LOAD_FAST_CHECK;
+                        }
+                        unsafe_locals[local] = false;
+                    }
+                    _ => {}
+                }
+            }
+            return;
+        }
+        let block_slot_count = order
             .iter()
-            .copied()
-            .enumerate()
-            .map(|(index, block)| (block, index))
-            .collect::<FxHashMap<_, _>>();
+            .map(|block| block.index())
+            .max()
+            .map_or(0, |index| index + 1);
+        let mut block_indices = vec![usize::MAX; block_slot_count];
+        let mut block_starts = vec![0; block_slot_count];
+        let mut item_count = 0;
+        for (index, block) in order.iter().copied().enumerate() {
+            block_indices[block.index()] = index;
+            block_starts[block.index()] = item_count;
+            item_count += graph[block].items().len();
+        }
         let positions = graph.item_positions();
-        let linear_indices = positions
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(index, position)| (position, index))
-            .collect::<FxHashMap<_, _>>();
-        let label_positions = positions
-            .iter()
-            .enumerate()
-            .filter_map(|(index, position)| match graph.item(*position) {
-                Item::Label(label) => Some((*label, index)),
-                Item::Instruction(_) => None,
-            })
-            .collect::<FxHashMap<_, _>>();
+        debug_assert_eq!(positions.len(), item_count);
+        let mut label_positions = vec![None; usize::try_from(self.next_label).unwrap()];
+        for (index, position) in positions.iter().enumerate() {
+            if let Item::Label(label) = graph.item(*position) {
+                label_positions[usize::try_from(label.0).unwrap()] = Some(index);
+            }
+        }
 
-        let mut exception_successors = FxHashMap::default();
-        for position in positions.iter().copied() {
+        let mut exception_successors = vec![None; positions.len()];
+        for (index, position) in positions.iter().copied().enumerate() {
             if !matches!(graph.item(position), Item::Instruction(_)) {
                 continue;
             }
-            let index = linear_indices[&position];
             let mut innermost = None::<(usize, usize, usize)>;
             for region in &self.exception_regions {
-                let (Some(&start), Some(&end), Some(target)) = (
-                    label_positions.get(&region.start),
-                    label_positions.get(&region.end),
-                    graph
-                        .label_block(region.target)
-                        .and_then(|block| block_indices.get(&block).copied()),
+                let (Some(start), Some(end), Some(target)) = (
+                    label_positions
+                        .get(usize::try_from(region.start.0).unwrap())
+                        .copied()
+                        .flatten(),
+                    label_positions
+                        .get(usize::try_from(region.end.0).unwrap())
+                        .copied()
+                        .flatten(),
+                    graph.label_block(region.target).and_then(|block| {
+                        block_indices
+                            .get(block.index())
+                            .copied()
+                            .filter(|index| *index != usize::MAX)
+                    }),
                 ) else {
                     continue;
                 };
@@ -87,7 +147,7 @@ impl Assembler {
                 }
             }
             if let Some((_, _, target)) = innermost {
-                exception_successors.insert(position, target);
+                exception_successors[index] = Some(target);
             }
         }
 
@@ -126,11 +186,11 @@ impl Assembler {
             };
 
             let block = order[block_index];
-            for position in graph.block_item_positions(block) {
+            for (offset, position) in graph.block_item_positions(block).into_iter().enumerate() {
                 let Item::Instruction(instruction) = graph.item(position) else {
                     continue;
                 };
-                if let Some(target) = exception_successors.get(&position).copied() {
+                if let Some(target) = exception_successors[block_starts[block.index()] + offset] {
                     propagate(target, &unsafe_locals);
                 }
                 let Operand::Value(argument) = instruction.operand else {
@@ -165,11 +225,15 @@ impl Assembler {
                 propagate(block_index + 1, &unsafe_locals);
             }
             if let Some(target) = block_jump_target(graph[block].items())
-                && let Some(target) = graph
-                    .label_block(target)
-                    .and_then(|block| block_indices.get(&block).copied())
+                && let Some(target) = graph.label_block(target)
             {
-                propagate(target, &unsafe_locals);
+                if let Some(target) = block_indices
+                    .get(target.index())
+                    .copied()
+                    .filter(|target| *target != usize::MAX)
+                {
+                    propagate(target, &unsafe_locals);
+                }
             }
         }
 
@@ -206,6 +270,11 @@ impl Assembler {
             .graph
             .as_mut()
             .expect("assembler pass requires the block graph");
+        if !graph.iter_items().any(|item| {
+            matches!(item, Item::Instruction(instruction) if instruction.opcode == LOAD_FAST_CHECK)
+        }) {
+            return;
+        }
         let order = graph.order().to_vec();
         for block in order {
             let mut initialized = FxHashSet::default();

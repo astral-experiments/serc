@@ -10,6 +10,11 @@ impl Assembler {
             .graph
             .as_ref()
             .expect("assembler pass requires the block graph");
+        if !graph.iter_items().any(
+            |item| matches!(item, Item::Instruction(instruction) if instruction.opcode == SWAP),
+        ) {
+            return;
+        }
         let instructions = graph
             .item_positions()
             .into_iter()
@@ -66,6 +71,11 @@ impl Assembler {
             .graph
             .as_ref()
             .expect("assembler pass requires the block graph");
+        if !graph.iter_items().any(
+            |item| matches!(item, Item::Instruction(instruction) if instruction.opcode == SWAP),
+        ) {
+            return;
+        }
         let mut block_labels = FxHashSet::default();
         for item in graph.iter_items() {
             if let Item::Instruction(Instruction {
@@ -229,6 +239,11 @@ impl Assembler {
             .graph
             .as_ref()
             .expect("assembler pass requires the block graph");
+        if !graph.iter_items().any(
+            |item| matches!(item, Item::Instruction(instruction) if instruction.opcode == SWAP),
+        ) {
+            return;
+        }
         let mut block_labels = FxHashSet::default();
         for item in graph.iter_items() {
             if let Item::Instruction(Instruction {

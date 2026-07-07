@@ -111,14 +111,16 @@ impl BlockGraph {
         items: Vec<Item>,
         preserved_block_boundaries: &FxHashSet<Label>,
     ) -> Self {
+        let blocks = Self::partition_items(items, preserved_block_boundaries)
+            .into_iter()
+            .map(BasicBlock::new)
+            .collect::<Vec<_>>();
+        let order = (0..blocks.len()).map(BasicBlockId).collect();
         let mut graph = Self {
-            blocks: Vec::new(),
-            order: Vec::new(),
+            blocks,
+            order,
             label_blocks: FxHashMap::default(),
         };
-        for block in Self::partition_items(items, preserved_block_boundaries) {
-            graph.push_block(block);
-        }
         graph.rebuild_label_index();
         graph
     }
@@ -335,11 +337,16 @@ impl BlockGraph {
     }
 
     pub(super) fn item_positions(&self) -> Vec<ItemPosition> {
-        self.iter()
-            .flat_map(|(block, contents)| {
-                (0..contents.items().len()).map(move |offset| ItemPosition { block, offset })
-            })
-            .collect()
+        let mut positions = Vec::with_capacity(
+            self.iter()
+                .map(|(_, contents)| contents.items().len())
+                .sum(),
+        );
+        for (block, contents) in self.iter() {
+            positions
+                .extend((0..contents.items().len()).map(|offset| ItemPosition { block, offset }));
+        }
+        positions
     }
 
     pub(super) fn block_item_positions(&self, block: BasicBlockId) -> Vec<ItemPosition> {
@@ -471,15 +478,27 @@ impl BlockGraph {
 
     pub(super) fn into_items(self) -> Vec<Item> {
         let mut blocks = self.blocks.into_iter().map(Some).collect::<Vec<_>>();
-        self.order
-            .into_iter()
-            .flat_map(|block| {
+        let item_count = self
+            .order
+            .iter()
+            .map(|block| {
                 blocks[block.index()]
-                    .take()
+                    .as_ref()
                     .expect("block appears more than once in emission order")
                     .items
+                    .len()
             })
-            .collect()
+            .sum();
+        let mut items = Vec::with_capacity(item_count);
+        for block in self.order {
+            items.append(
+                &mut blocks[block.index()]
+                    .take()
+                    .expect("block appears more than once in emission order")
+                    .items,
+            );
+        }
+        items
     }
 
     #[cfg(any(test, debug_assertions))]
