@@ -1,5 +1,6 @@
+use std::io::Write;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 fn git(checkout: &Path, arguments: &[&str]) {
     let output = Command::new("git")
@@ -51,4 +52,43 @@ fn pinned_corpus_validation_rejects_ignored_non_python_artifacts() {
         String::from_utf8_lossy(&dirty.stderr).contains("numpy/artifact.txt"),
         "{dirty:?}"
     );
+}
+
+#[test]
+fn cargo_artifact_parser_ignores_python_site_configuration() {
+    let site = tempfile::tempdir().unwrap();
+    fs_err::write(
+        site.path().join("sitecustomize.py"),
+        "print('polluted by sitecustomize')\n",
+    )
+    .unwrap();
+    fs_err::write(
+        site.path().join("json.py"),
+        "raise RuntimeError('shadowed json')\n",
+    )
+    .unwrap();
+
+    let resolver = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../scripts/benchmarks/resolve-cargo-artifact.sh");
+    let python = std::env::var("SERC_TEST_PYTHON").unwrap_or_else(|_| "python3".to_string());
+    let mut child = Command::new("bash")
+        .arg(resolver)
+        .arg(python)
+        .env("PYTHONPATH", site.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"{\"reason\":\"compiler-artifact\",\"target\":{\"name\":\"serc\",\"kind\":[\"bin\"]},\"executable\":\"/tmp/target/release/serc\"}\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout, b"/tmp/target/release/serc\n");
+    assert!(output.stderr.is_empty(), "{output:?}");
 }
