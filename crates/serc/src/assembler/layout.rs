@@ -2,8 +2,8 @@ use rustc_hash::FxHashSet;
 
 use super::{
     EXTENDED_ARG, Item, LOAD_FAST_BORROW_LOAD_FAST_BORROW, LOAD_FAST_LOAD_FAST, LOAD_GLOBAL,
-    NOT_TAKEN, Operand, STORE_FAST_LOAD_FAST, STORE_FAST_STORE_FAST, ends_scope,
-    is_conditional_jump,
+    NOT_TAKEN, Operand, POP_TOP, STORE_FAST, STORE_FAST_LOAD_FAST, STORE_FAST_STORE_FAST,
+    ends_scope, is_conditional_jump,
 };
 use crate::CompileError;
 use crate::assembler::{
@@ -20,7 +20,7 @@ impl LayoutAssembler {
             return Ok(Vec::new());
         }
 
-        let regions = self
+        let mut regions = self
             .exception_regions
             .iter()
             .enumerate()
@@ -64,18 +64,35 @@ impl LayoutAssembler {
         let mut instruction_index = 0;
         let mut block_has_instruction = false;
         let mut block_has_stale_exception_owner = false;
+        let mut block_has_applied_comprehension_swap = false;
+        let mut late_exception_inclusions = Vec::new();
+        let mut previous_instruction = None;
         for item in &self.items {
             match item {
                 Item::Label(label) => {
                     if block_has_instruction && block_labels.contains(label) {
                         block_has_instruction = false;
                         block_has_stale_exception_owner = false;
+                        block_has_applied_comprehension_swap = false;
+                        previous_instruction = None;
                     }
                     if setup_labels.contains(label) {
                         block_has_stale_exception_owner = true;
                     }
                 }
                 Item::Instruction(instruction) => {
+                    // CPython's static swap optimization removes the instruction before the
+                    // first comprehension restore, leaving that CFG slot's exception owner for
+                    // a later normalized marker.
+                    let is_comprehension_restore = instruction.opcode == STORE_FAST
+                        && instruction.fusion_policy.prevent_with_previous;
+                    let applied_comprehension_swap = is_comprehension_restore
+                        && previous_instruction.is_some_and(|previous: Instruction| {
+                            matches!(previous.opcode, POP_TOP | STORE_FAST)
+                                && !(previous.opcode == STORE_FAST
+                                    && previous.fusion_policy.prevent_with_previous)
+                        });
+
                     let end = position
                         + u32::from(extended_args[instruction_index])
                         + 1
@@ -89,9 +106,13 @@ impl LayoutAssembler {
                     }
                     if instruction.exception_policy.normalized_owner
                         == NormalizedExceptionOwner::Absent
-                        && !block_has_stale_exception_owner
                     {
-                        late_exception_exclusions.push((position, end));
+                        if block_has_applied_comprehension_swap {
+                            late_exception_inclusions.push((position, end));
+                        }
+                        if !block_has_stale_exception_owner {
+                            late_exception_exclusions.push((position, end));
+                        }
                     }
                     if matches!(
                         instruction.opcode,
@@ -102,8 +123,12 @@ impl LayoutAssembler {
                     ) || matches!(
                         (instruction.opcode, instruction.operand),
                         (LOAD_GLOBAL, Operand::Value(argument)) if argument & 1 != 0
-                    ) {
+                    ) || applied_comprehension_swap
+                    {
                         block_has_stale_exception_owner = true;
+                    }
+                    if applied_comprehension_swap {
+                        block_has_applied_comprehension_swap = true;
                     }
                     position = end;
                     instruction_index += 1;
@@ -115,9 +140,39 @@ impl LayoutAssembler {
                     {
                         block_has_instruction = false;
                         block_has_stale_exception_owner = false;
+                        block_has_applied_comprehension_swap = false;
+                        previous_instruction = None;
+                    } else {
+                        previous_instruction = Some(*instruction);
                     }
                 }
             }
+        }
+        // Compiler-side region exclusions can leave a stale-owner marker structurally
+        // uncovered. Recreate only the applied-comprehension case from the innermost owner of
+        // the immediately preceding instruction.
+        for (start, end) in late_exception_inclusions {
+            if regions
+                .iter()
+                .any(|(region_start, region_end, _, _, _, _)| {
+                    *region_start <= start && *region_end >= end
+                })
+            {
+                continue;
+            }
+            let Some((_, _, target, depth, preserve_lasti, index)) = regions
+                .iter()
+                .filter(|(region_start, region_end, _, _, _, _)| {
+                    *region_start < start && *region_end >= start
+                })
+                .min_by_key(|(region_start, region_end, _, _, _, index)| {
+                    (region_end - region_start, *index)
+                })
+                .copied()
+            else {
+                continue;
+            };
+            regions.push((start, end, target, depth, preserve_lasti, index));
         }
         let mut boundaries = regions
             .iter()

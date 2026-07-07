@@ -242,6 +242,12 @@ class ____PrivateContainer:
     }
 
     #[test]
+    fn matches_cpython_marshal_for_closure_load_fusion_boundaries() {
+        let source = "def tuple_value(label, url):\n    return label, lambda: url\n\ndef keyword_call(label, url):\n    return register(label=label, command=lambda: open(url))\n";
+        assert_matches_cpython_marshal(source, "closure_fusion.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_annotation_scope_closures() {
         let source = include_str!("fixtures/benchmark/annotation_scopes.py");
         assert_matches_cpython_marshal(source, "annotation_scopes.py");
@@ -313,6 +319,12 @@ except Exception:
     }
 
     #[test]
+    fn matches_cpython_marshal_for_terminal_assertions_in_with_bodies() {
+        let source = "def simple(manager, condition):\n    with manager:\n        assert condition\n\ndef message(manager, condition):\n    with manager:\n        use()\n        assert condition, make_message()\n\ndef boolean(manager, first, second):\n    with manager:\n        assert first or second\n\ndef conjunction(manager, first, second):\n    with manager:\n        assert first and second\n\ndef conditional(manager, first, second, condition):\n    with manager:\n        assert first if condition else second\n\ndef constant_true():\n    with manager:\n        assert True\n\ndef constant_false():\n    with manager:\n        assert False\n\ndef followed(manager, condition):\n    with manager:\n        assert condition\n    use()\n\ndef same_line(manager, condition):\n    with manager: assert condition\n\ndef nested(outer, inner, condition):\n    try:\n        with outer:\n            with inner:\n                assert condition\n    finally:\n        cleanup()\n\nasync def asynchronous(manager, condition):\n    async with manager:\n        assert condition\n";
+        assert_matches_cpython_marshal(source, "with_assert.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_async_with_returns() {
         let source = "async def value(manager):\n    async with manager as result:\n        return result.value\n\nasync def constant(manager):\n    async with manager:\n        return 1\n\nasync def nested(outer, inner):\n    async with outer:\n        with inner:\n            return value\n";
         assert_matches_cpython_marshal(source, "async_with_return.py");
@@ -322,6 +334,68 @@ except Exception:
     fn matches_cpython_marshal_for_loop_control_unwinding() {
         let source = "def sync_context(manager, items):\n    for item in items:\n        with manager:\n            if item > 0:\n                continue\n            break\n\ndef exception_handler(items):\n    for item in items:\n        try:\n            consume(item)\n        except Exception:\n            handle(item)\n            continue\n        use(item)\n\ntry:\n    for item in items:\n        consume(item)\n        break\nexcept TypeError:\n    handle()\nafter()\n";
         assert_matches_cpython_marshal(source, "loop_control_unwind.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_inlined_break_line_nops() {
+        let source = r"def conditional(flag):
+    while True:
+        if flag:
+            break
+        step()
+    return value
+
+def direct():
+    while True:
+        break
+    return value
+
+def same_line():
+    while True: break
+    return value
+
+def same_line_after_expression():
+    while True: step(); break
+    return value
+
+def loop_else(flag):
+    while flag:
+        if done():
+            break
+        step()
+    else:
+        fallback()
+    return value
+
+def large_exit(flag):
+    while True:
+        if flag:
+            break
+        step()
+    first(); second(); third(); fourth(); fifth()
+    return value
+
+def implicit_return(flag):
+    while True:
+        if flag:
+            break
+        step()
+
+def managed(manager, flag):
+    while True:
+        with manager:
+            if flag:
+                break
+            step()
+    return value
+
+def iteration(items, flag):
+    for item in items:
+        if flag:
+            break
+    return value
+";
+        assert_matches_cpython_marshal(source, "inlined_break_nop.py");
     }
 
     #[test]
@@ -444,6 +518,18 @@ except Error:
     }
 
     #[test]
+    fn matches_cpython_marshal_for_negative_large_integer_literals() {
+        let source = "minimum_i64 = -9223372036854775808\nbelow_minimum_i64 = -9223372036854775809\nnegative_u64_max = -18446744073709551615\nnegative_u64_overflow = -18446744073709551616\n";
+        assert_matches_cpython_marshal(source, "negative_large_integers.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_folded_negative_true_division() {
+        let source = "fraction = -5 / 7\ntenth = -1 / 10\nlarge_denominator = -1 / 9_000_000_000_000_000_000\ndivision_by_zero = -1 / 0\n";
+        assert_matches_cpython_marshal(source, "negative_true_division.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_folded_branches_in_a_with_statement() {
         let source = "from contextlib import suppress\n\ndef f():\n    with suppress(Exception):\n        if 1:\n            pass\n        elif 1:\n            pass\n        elif 1:\n            pass\n        try:\n            pass\n        except Exception:\n            pass\n        finally:\n            pass\n        if 2:\n            pass\n        while True:\n            pass\n";
         assert_matches_cpython_marshal(source, "protected_branches.py");
@@ -492,6 +578,36 @@ except Error:
     }
 
     #[test]
+    fn matches_cpython_marshal_for_negated_generator_filters() {
+        let source =
+            "def filtered(items):\n    return (item for item in items if not predicate(item))\n";
+        assert_matches_cpython_marshal(source, "negated_generator_filter.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_applied_comprehension_cleanup_swaps() {
+        let source = r"def applied(manager, condition, items):
+    with manager:
+        result = [item for item in items]
+        if condition:
+            return result
+
+def discarded(manager, condition, items):
+    with manager:
+        {item for item in items}
+        if condition:
+            return
+
+def retained(manager, condition, items):
+    with manager:
+        result = consume([item for item in items])
+        if condition:
+            return result
+";
+        assert_matches_cpython_marshal(source, "comprehension_cleanup_swap.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_inlined_comprehension_cells() {
         let source = r"module_result = [lambda: x for x in range(2)]
 
@@ -536,9 +652,116 @@ class Shadowed:
     }
 
     #[test]
+    fn matches_cpython_marshal_for_captured_implicit_super_receivers() {
+        let source = r"class Base:
+    def method(self):
+        pass
+
+
+class Child(Base):
+    def captured_self(self):
+        def capture():
+            return self
+        return super().method()
+
+    @classmethod
+    def captured_cls(cls):
+        def capture():
+            return cls
+        return super().method()
+
+    def ordinary(self):
+        return super().method()
+
+    def explicit(self):
+        def capture():
+            return self
+        return super(Child, self).method()
+";
+        assert_matches_cpython_marshal(source, "captured_super.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_multiline_super_method_arguments() {
+        let source = "class Base:\n    pass\n\nclass Child(Base):\n    def implicit(self, value):\n        return super().method(\n            value\n        )\n\n    def explicit(self, value):\n        return super(Child, self).method(\n            value\n        )\n\n    def keyword(self, value):\n        return super().method(\n            option=value,\n        )\n\n    def split_super(self, value):\n        return super(\n        ).method(\n            value,\n        )\n\n    def multiline_attribute(self):\n        return super().\\\n            value\n";
+        assert_matches_cpython_marshal(source, "super_method_lines.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_large_call_thresholds() {
+        let keywords = |count| {
+            (0..count)
+                .map(|index| format!("k{index}={index}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let positional = |count| {
+            (0..count)
+                .map(|index| index.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let keywords_15 = keywords(15);
+        let keywords_16 = keywords(16);
+        let keywords_28 = keywords(28);
+        let keywords_29 = keywords(29);
+        let positional_27 = positional(27);
+        let positional_28 = positional(28);
+        let positional_31 = positional(31);
+        let source = format!(
+            r"import imported
+
+def method_sixteen(obj):
+    return obj.method({keywords_16})
+
+def global_sixteen():
+    return target({keywords_16})
+
+def global_one_and_fifteen():
+    return target(0, {keywords_15})
+
+def global_thirty_one():
+    return target({positional_31})
+
+def imported_one_and_fifteen():
+    return imported.target(0, {keywords_15})
+
+class Base:
+    def method(self):
+        pass
+
+class Child(Base):
+    def super_sixteen(self):
+        return super().method({keywords_16})
+
+    def super_twenty_eight_and_one(self):
+        return super().method({positional_28}, option=0)
+
+def method_twenty_eight(obj):
+    return obj.method({keywords_28})
+
+def method_twenty_nine(obj):
+    return obj.method({keywords_29})
+
+def method_twenty_seven_and_one(obj):
+    return obj.method({positional_27}, option=0)
+
+def method_twenty_eight_and_one(obj):
+    return obj.method({positional_28}, option=0)
+"
+        );
+        assert_matches_cpython_marshal(&source, "large_call_thresholds.py");
+    }
+    #[test]
     fn matches_cpython_marshal_for_optimized_generator_calls() {
         let source = "module_any = any(value for value in values)\nmodule_all = all(value for value in values)\nmodule_tuple = tuple(value for value in values)\nany(value for value in values)\nall(value for value in values)\ntuple(value for value in values)\nafter = None\n\n\ndef optimized(values):\n    return (\n        any(value for value in values),\n        all(value for value in values),\n        tuple(value for value in values),\n    )\n\n\ndef rebound(values, any):\n    return any(value for value in values)\n\n\ndef terminal_discard(values):\n    all(value for value in values)\n";
         assert_matches_cpython_marshal(source, "optimized_generator_calls.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_boolean_optimized_generator_calls() {
+        let source = "def disjunction(prefix, values):\n    return prefix or any(value for value in values)\n\ndef conjunction(prefix, values):\n    return prefix and all(value for value in values)\n\ndef nested(first, second, values):\n    return first or second or any(value for value in values)\n\nwrapped = lambda first, second, values: first and second and all(value for value in values)\n";
+        assert_matches_cpython_marshal(source, "boolean_generator_calls.py");
     }
 
     #[test]
@@ -581,6 +804,67 @@ class Shadowed:
     fn matches_cpython_marshal_for_a_nested_if_branch_exit() {
         let source = "seed = 0\nif True:\n    body()\ndef between():\n    pass\nreused = True\n\nif a:\n    if b:\n        body()\nelif c:\n    other()\nafter1(); after2(); after3(); after4(); after5(); after6()\n\nif x:\n    if True:\n        body()\nelif y:\n    other()\n\nif False if True else False:\n    body()\nelif True:\n    other()\nelse:\n    unreachable()\n\ndef conditional_in_loop(src, dst):\n    for k, v in src:\n        if True if True else False:\n            dst[k] = v\n\ndef terminating_nested_if(x, y):\n    if x:\n        if y:\n            raise Exception()\n        else:\n            body()\n    else:\n        other()\n    after()\n\ndef nested_if_before_implicit_return(x, y):\n    if x:\n        if y:\n            return\n        else:\n            value = 2\n    else:\n        value = 3\n    return\n\ndef nested_if_with_fallthrough_return(x, y):\n    if x:\n        if y:\n            return y\n    else:\n        return x\n    return None\n\ndef nested_if_before_loop_control(items, condition):\n    for item in items:\n        if item:\n            if condition:\n                value = 1\n            else:\n                value = 2\n            continue\n        else:\n            value = 3\n        continue\n\ndef protected_loop_control(items):\n    for item in items:\n        try:\n            body()\n            if item:\n                break\n        except Exception:\n            recover()\n    for item in items:\n        try:\n            body()\n            continue\n        except Exception:\n            recover()\n\ndef nested_break_then_return(items, condition):\n    for item in items:\n        if item:\n            if condition:\n                break\n        else:\n            return condition\n        return None\n\nif True:\n    if first:\n        one()\n    elif second:\n        two()\n";
         assert_matches_cpython_marshal(source, "nested_if.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_nested_if_final_clause_exits() {
+        let source = r"def final_else(outer, inner):
+    if outer:
+        if inner:
+            first()
+        else:
+            second()
+    else:
+        other()
+    after()
+
+def terminal_final_elif(outer, inner, last):
+    if outer:
+        if inner:
+            first()
+        elif last:
+            raise Error()
+    else:
+        other()
+    after()
+
+def nonterminal_final_elif(outer, inner, last):
+    if outer:
+        if inner:
+            raise Error()
+        elif last:
+            body()
+    else:
+        other()
+    after()
+
+def terminal_final_else(outer, inner):
+    if outer:
+        if inner:
+            first()
+        else:
+            raise Error()
+    else:
+        other()
+    after()
+
+def no_else_nonterminal(outer, inner):
+    if outer:
+        if inner:
+            body()
+    else:
+        other()
+    after()
+
+def folded_nested(outer):
+    if outer:
+        if True:
+            body()
+    else:
+        other()
+    after()
+";
+        assert_matches_cpython_marshal(source, "nested_if_final_clause.py");
     }
 
     #[test]
@@ -689,9 +973,21 @@ def render(value):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_borrowing_after_terminal_exception_handlers() {
+        let source = "def returning(dependencies):\n    try:\n        before = load()\n        after = load()\n    except Exception:\n        return\n    for dependency in dependencies:\n        if dependency in after:\n            consume(dependency, before)\n\ndef reraising(dependencies):\n    try:\n        before = load()\n        after = load()\n    except Exception:\n        raise\n    for dependency in dependencies:\n        if dependency in after:\n            consume(dependency, before)\n";
+        assert_matches_cpython_marshal(source, "terminal_handlers.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_with_passes_and_folded_iterables() {
         let source = "def pass_before_loop(manager, values):\n    with manager as target:\n        pass\n        for value in values:\n            target.write(value)\n\ndef pass_in_loop_and_else(manager, values):\n    with manager as target:\n        for value in values:\n            pass\n            target.write(value)\n        else:\n            pass\n\ndef folded_iterable(manager):\n    with manager as target:\n        for value in (1,) if True else (2,):\n            target.write(value)\n\nwith (\n    manager\n) as target: pass\n";
         assert_matches_cpython_marshal(source, "with_passes.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_try_exits_after_if_joins() {
+        let source = "def retained(flag):\n    try:\n        action()\n    except Exception:\n        failed()\n    else:\n        if flag:\n            good()\n        else:\n            other()\n    after()\n\ndef ordinary(flag):\n    try:\n        action()\n    except Exception:\n        failed()\n    else:\n        if flag:\n            good()\n    after()\n";
+        assert_matches_cpython_marshal(source, "try_if_join.py");
     }
 
     #[test]

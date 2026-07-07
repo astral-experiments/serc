@@ -159,6 +159,16 @@ impl Assembler {
         self.preserved_block_boundaries.insert(label);
     }
 
+    /// Keep a source CFG boundary unless the instruction stream already ends at one.
+    ///
+    /// Coalescing consecutive join labels avoids creating an artificial empty block between
+    /// nested expressions while retaining the boundary after ordinary instruction sequences.
+    pub(crate) fn preserve_block_boundary_if_new(&mut self, label: Label) {
+        if !matches!(self.linear_items().last(), Some(Item::Label(_))) {
+            self.preserve_block_boundary(label);
+        }
+    }
+
     /// Keeps CPython's block-local borrowed-load optimizer from visiting this block.
     pub(crate) fn prevent_borrow_reachability(&mut self, label: Label) {
         self.borrow_unreachable_blocks.insert(label);

@@ -1639,38 +1639,11 @@ impl Compiler {
         self.assembler
             .set_location(self.source_location(self.call_opcode_range(call)));
 
-        if !has_starred && !has_keyword_unpack {
-            if call.arguments.keywords.len() > 15 {
-                let keyword_names = call
-                    .arguments
-                    .keywords
-                    .iter()
-                    .map(|keyword| {
-                        self.add_constant(Constant::String(
-                            keyword.arg.as_ref().unwrap().as_str().to_string(),
-                        ))
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                if call.arguments.args.is_empty() {
-                    self.add_constant(Constant::None)?;
-                    self.emit_deferred_constant(Constant::Tuple(Vec::new()))?;
-                } else {
-                    self.compile_collection(&call.arguments.args, CollectionKind::Tuple)?;
-                }
-                self.emit(BUILD_MAP, 0, 1)?;
-                for (keyword, name) in call.arguments.keywords.iter().zip(keyword_names) {
-                    self.assembler
-                        .set_location(self.source_location(self.call_opcode_range(call)));
-                    self.emit(LOAD_CONST, name, 1)?;
-                    self.compile_expression(&keyword.value)?;
-                    self.assembler
-                        .set_location(self.source_location(keyword.value.range()));
-                    self.emit(MAP_ADD, 1, -2)?;
-                }
-                self.assembler
-                    .set_location(self.source_location(self.call_opcode_range(call)));
-                return self.emit(CALL_FUNCTION_EX, 0, -3);
-            }
+        if !has_starred
+            && !has_keyword_unpack
+            && (direct_method
+                || call.arguments.args.len() + call.arguments.keywords.len() * 2 <= 30)
+        {
             for argument in &call.arguments.args {
                 self.compile_expression(argument)?;
             }
@@ -1756,6 +1729,10 @@ impl Compiler {
                     self.emit(DICT_MERGE, 1, -1)?;
                 }
             }
+        }
+        if !has_starred && !has_keyword_unpack {
+            self.assembler
+                .set_location(self.source_location(self.call_opcode_range(call)));
         }
         self.emit(CALL_FUNCTION_EX, 0, -3)
     }
@@ -1957,34 +1934,38 @@ impl Compiler {
                 (attribute_index << 2) | 2 | kind.method_flag(),
                 kind.stack_effect(),
             )?;
-            self.assembler
-                .set_location(self.source_location(self.attribute_opcode_range(attribute)));
-            self.emit(NOP, 0, 0)?;
+            let attribute_location = self.source_location(attribute.range);
+            if attribute_location.line != attribute_location.end_line {
+                self.assembler
+                    .set_location(self.source_location(self.attribute_opcode_range(attribute)));
+                self.emit(NOP, 0, 0)?;
+            }
             return Ok(SpecializedLowering::Applied);
         }
 
         if self.unit.arg_count == 0 {
             return Ok(SpecializedLowering::NotApplicable);
         }
-        let (class_index, first_parameter) = match &self.unit.scope {
+        let (class_index, first_parameter, first_parameter_is_cell) = match &self.unit.scope {
             Scope::Function {
                 indices,
                 free_indices,
+                cells,
                 globals,
-                ..
             } if self.contains_name(globals, "super")
                 && self.scope_index(indices, "super").is_none() =>
             {
                 let Some(class_index) = self.scope_index(free_indices, "__class__") else {
                     return Ok(SpecializedLowering::NotApplicable);
                 };
-                let Some(first_parameter) = self.symbols.locals.first().copied() else {
+                let Some(first_parameter_name) = self.symbols.locals.first().copied() else {
                     return Ok(SpecializedLowering::NotApplicable);
                 };
-                let Some(first_parameter) = indices.get(&first_parameter).copied() else {
+                let first_parameter_is_cell = cells.contains(first_parameter_name);
+                let Some(first_parameter) = indices.get(&first_parameter_name).copied() else {
                     return Ok(SpecializedLowering::NotApplicable);
                 };
-                (class_index, first_parameter)
+                (class_index, first_parameter, first_parameter_is_cell)
             }
             _ => return Ok(SpecializedLowering::NotApplicable),
         };
@@ -1996,7 +1977,12 @@ impl Compiler {
         self.assembler
             .set_location(self.source_location(call.range));
         self.emit(LOAD_DEREF, class_index, 1)?;
-        self.emit(LOAD_FAST, first_parameter, 1)?;
+        let receiver_opcode = if first_parameter_is_cell {
+            LOAD_DEREF
+        } else {
+            LOAD_FAST
+        };
+        self.emit(receiver_opcode, first_parameter, 1)?;
         self.assembler
             .set_location(self.source_location(attribute.range));
         let attribute_index = self.name_index(attribute.attr.as_str())?;
@@ -2005,9 +1991,12 @@ impl Compiler {
             (attribute_index << 2) | kind.method_flag(),
             kind.stack_effect(),
         )?;
-        self.assembler
-            .set_location(self.source_location(self.attribute_opcode_range(attribute)));
-        self.emit(NOP, 0, 0)?;
+        let attribute_location = self.source_location(attribute.range);
+        if attribute_location.line != attribute_location.end_line {
+            self.assembler
+                .set_location(self.source_location(self.attribute_opcode_range(attribute)));
+            self.emit(NOP, 0, 0)?;
+        }
         Ok(SpecializedLowering::Applied)
     }
 
@@ -2782,6 +2771,27 @@ impl Compiler {
                 self.assembler.mark(next);
             }
             return self.compile_generator_filter(last, element, accepted, restart);
+        }
+        if let Expr::UnaryOp(unary) = condition
+            && unary.op == UnaryOp::Not
+        {
+            self.compile_expression(&unary.operand)?;
+            self.assembler
+                .set_location(self.source_location(unary.operand.range()));
+            self.emit(TO_BOOL, 0, 0)?;
+            let exclusion_start = self.assembler.label();
+            self.assembler.mark(exclusion_start);
+            self.assembler
+                .set_location(self.source_location(element.range()));
+            self.emit_jump_forward(POP_JUMP_IF_FALSE, accepted, -1)?;
+            self.emit(NOT_TAKEN, 0, 0)?;
+            self.emit_jump_backward(JUMP_BACKWARD, restart, 0)?;
+            let exclusion_end = self.assembler.label();
+            self.assembler.mark(exclusion_end);
+            self.control
+                .generator_region_exclusions
+                .push((exclusion_start, exclusion_end));
+            return Ok(());
         }
         if let Expr::Compare(comparison) = condition
             && comparison.ops.len() == 1
@@ -3776,7 +3786,7 @@ impl Compiler {
         } else {
             self.compile_expression(last)?;
         }
-        self.assembler.preserve_block_boundary(end);
+        self.assembler.preserve_block_boundary_if_new(end);
         self.assembler.mark(end);
         self.set_depth(base_depth + 1);
         Ok(())

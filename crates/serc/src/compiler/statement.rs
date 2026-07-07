@@ -1,6 +1,6 @@
 use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
 use ruff_python_ast::{BoolOp, Expr, Pattern, Stmt, UnaryOp};
-use ruff_text_size::Ranged;
+use ruff_text_size::{Ranged, TextRange};
 
 use super::{
     BINARY_SLICE, BUILD_LIST, BUILD_MAP, BUILD_SET, BUILD_TUPLE, CALL, CHECK_EG_MATCH,
@@ -35,6 +35,7 @@ use super::{Compiler, Scope};
 
 #[derive(Clone, Copy, Debug)]
 struct LoopContext {
+    body_start: usize,
     continue_label: Label,
     break_label: Label,
     iterator_cleanup: IteratorCleanup,
@@ -83,6 +84,12 @@ struct WithExitContext {
     is_async: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum WithBodyExitNoop {
+    Located(TextRange),
+    ConvertedPopBlock,
+}
+
 type RegionExclusions = Vec<(Label, Label)>;
 type RegionExclusionStack = Vec<RegionExclusions>;
 
@@ -97,6 +104,12 @@ enum IteratorCleanup {
 enum LoopBackedge {
     Emitted,
     Required,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum NestedIfExitLocation<'a> {
+    Located(&'a Expr),
+    Unlocated,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -173,6 +186,7 @@ impl Compiler {
         break_policy: LoopBreakPolicy,
     ) -> LoopContext {
         LoopContext {
+            body_start: self.assembler.instruction_count(),
             continue_label,
             break_label,
             iterator_cleanup,
@@ -1445,7 +1459,10 @@ impl Compiler {
                     .last()
                     .copied()
                     .ok_or_else(|| CompileError::Internal("break outside loop".to_string()))?;
+                let is_first_emitted_body_instruction =
+                    self.assembler.instruction_count() == context.body_start;
                 self.emit(NOP, 0, 0)?;
+                let marker_end = self.assembler.instruction_count();
                 let finally_end_unwind_start =
                     self.emit_finally_end_unwind(context.finally_end_depth, false)?;
                 let exclusion_start = if self.control.active_exception_region_exclusions.len()
@@ -1480,6 +1497,7 @@ impl Compiler {
                             self.assembler.mark(start);
                             start
                         });
+                    let has_no_emitted_cleanup = self.assembler.instruction_count() == marker_end;
                     self.emit_jump_forward(JUMP_FORWARD, context.break_label, 0)?;
                     if context.break_policy.preserves_jump_exit() {
                         // CPython inlines small exit blocks before removing a jump to the next
@@ -1487,6 +1505,16 @@ impl Compiler {
                         // the following finally return is copied onto the edge.
                         self.assembler.defer_last_jump_removal();
                         self.assembler.preserve_last_inlined_jump_nop();
+                    } else if has_no_emitted_cleanup {
+                        // CPython keeps the break marker when it replaces a jump with a small
+                        // inlined exit block. A break that is the first emitted body instruction
+                        // also owns the line event after early direct-jump removal; later
+                        // same-line body instructions do not. Cleanup edges retain neither NOP.
+                        if is_first_emitted_body_instruction {
+                            self.assembler.preserve_last_inlined_jump_nop();
+                        } else {
+                            self.assembler.preserve_last_direct_inlined_jump_nop();
+                        }
                     }
                     if let Some(jump_exclusion_start) = jump_exclusion_start {
                         let jump_exclusion_end = self.assembler.label();
@@ -1971,12 +1999,10 @@ impl Compiler {
                     first_branch_max_depth = Some(self.control.max_depth);
                 }
                 if !suite_terminates(body) && branch_index + 1 < branch_count {
-                    let nested_if_body_falls_through = matches!(
-                        body.last(),
-                        Some(Stmt::If(statement))
-                            if early_condition_truthiness(&statement.test).is_none()
-                                && !suite_terminates(&statement.body)
-                    );
+                    let nested_if_exit = body.last().and_then(|statement| match statement {
+                        Stmt::If(statement) => nested_if_exit_location(statement),
+                        _ => None,
+                    });
                     let nested_if_ends_in_break = matches!(
                         body.last(),
                         Some(Stmt::If(statement))
@@ -1988,7 +2014,10 @@ impl Compiler {
                         };
                         self.assembler
                             .set_location(self.source_location(statement.test.range()));
-                    } else if nested_if_body_falls_through {
+                    } else if let Some(NestedIfExitLocation::Located(test)) = nested_if_exit {
+                        self.assembler
+                            .set_location(self.source_location(test.range()));
+                    } else if matches!(nested_if_exit, Some(NestedIfExitLocation::Unlocated)) {
                         self.assembler.set_location(SourceLocation::NONE);
                     } else {
                         self.set_branch_end_location(body, body_start);
@@ -1996,7 +2025,7 @@ impl Compiler {
                     self.emit_jump_forward(JUMP_FORWARD, end, 0)?;
                     if nested_if_ends_in_break && has_terminating_else {
                         self.assembler.preserve_last_inlined_jump_nop();
-                    } else if nested_if_body_falls_through {
+                    } else if matches!(nested_if_exit, Some(NestedIfExitLocation::Unlocated)) {
                         self.assembler.preserve_last_no_location();
                     } else if pass_only_body {
                         self.assembler.preserve_last_direct_inlined_jump_nop();
@@ -3154,12 +3183,7 @@ impl Compiler {
         }
         let base_depth = self.control.depth;
         let end = self.assembler.label();
-        let exclude_not_taken = !self.control.active_with_region_exclusions.is_empty();
-        self.with_control_override(
-            |control| &mut control.exclude_terminal_if_not_taken,
-            exclude_not_taken,
-            |compiler| compiler.compile_jump_if(&statement.test, true, end),
-        )?;
+        self.compile_jump_if(&statement.test, true, end)?;
         self.assembler
             .set_location(self.source_location(statement.range));
         self.emit_common_constant(CommonConstant::ASSERTIONERROR)?;
@@ -3407,6 +3431,12 @@ impl Compiler {
                 ExceptionPolicy::default()
             };
             self.emit_jump_forward_with_exception_policy(JUMP_FORWARD, end, 0, exception_policy)?;
+            if !statement.orelse.is_empty()
+                && suite_ends_in_retained_try_exit_join(&statement.orelse)
+            {
+                self.assembler
+                    .preserve_last_redundant_jump_nop_after_threading();
+            }
             if body_ends_with_break_loop {
                 // CPython's `POP_BLOCK` initially prevents the loop break from threading
                 // through this normal try exit. Once `POP_BLOCK` disappears, the exit jump
@@ -3841,13 +3871,12 @@ impl Compiler {
         self.emit(POP_EXCEPT, 0, -1)?;
         self.emit_reraise(ReraiseStackState::HandlerCleanup)?;
 
+        // CPython's final borrowed-load traversal leaves the normal continuation unvisited
+        // when every exception handler terminates, so its local loads remain owned.
         if statement.handlers.iter().all(|handler| {
-            handler.as_except_handler().is_some_and(|handler| {
-                matches!(
-                    handler.body.last(),
-                    Some(Stmt::Break(_) | Stmt::Continue(_))
-                )
-            })
+            handler
+                .as_except_handler()
+                .is_some_and(|handler| suite_terminates(&handler.body))
         }) {
             self.assembler.prevent_borrow_reachability(end);
         }
@@ -4781,7 +4810,7 @@ impl Compiler {
         &mut self,
         remaining: &[ruff_python_ast::WithItem],
         body: &[Stmt],
-    ) -> Result<Option<ruff_text_size::TextRange>, CompileError> {
+    ) -> Result<Option<WithBodyExitNoop>, CompileError> {
         let mut body_noop = None;
         if remaining.is_empty() {
             let body_start = self.assembler.instruction_count();
@@ -4829,9 +4858,15 @@ impl Compiler {
                     previous.line != self.source_location(statement.range()).line
                 })
             {
-                body_noop = Some(statement.range());
+                body_noop = Some(WithBodyExitNoop::Located(statement.range()));
             } else if terminal_if && let Some(Stmt::If(statement)) = body.last() {
-                body_noop = Some(statement.test.range());
+                body_noop = Some(WithBodyExitNoop::Located(statement.test.range()));
+            } else if let Some(Stmt::Assert(statement)) = body.last() {
+                if condition_jump_target_count(&statement.test, true) == 1 {
+                    // CPython converts the with block's trailing `POP_BLOCK` to an unlocated
+                    // NOP. Its sole successful assert predecessor supplies the visible line.
+                    body_noop = Some(WithBodyExitNoop::ConvertedPopBlock);
+                }
             }
         } else {
             self.compile_with_items(remaining, body, false)?;
@@ -4902,11 +4937,18 @@ impl Compiler {
                 .set_location(self.source_location(remaining[0].context_expr.range()));
             self.emit(NOP, 0, 0)?;
         }
-        if let Some(range) = body_noop {
+        if let Some(body_noop) = body_noop {
             let noop_start = self.assembler.label();
             self.assembler.mark(noop_start);
-            self.assembler.set_location(self.source_location(range));
+            let (location, converted_pop_block) = match body_noop {
+                WithBodyExitNoop::Located(range) => (self.source_location(range), false),
+                WithBodyExitNoop::ConvertedPopBlock => (SourceLocation::NONE, true),
+            };
+            self.assembler.set_location(location);
             self.emit(NOP, 0, 0)?;
+            if converted_pop_block {
+                self.assembler.mark_last_as_converted_pop_block();
+            }
             let noop_end = self.assembler.label();
             self.assembler.mark(noop_end);
             self.control
@@ -5275,8 +5317,82 @@ impl Compiler {
     }
 }
 
+// Mirrors the edges that `compile_jump_if` emits directly to its caller-provided target. The
+// converted with-body `POP_BLOCK` only retains a location when that target has one predecessor.
+fn condition_jump_target_count(expression: &Expr, jump_on: bool) -> usize {
+    if let Expr::UnaryOp(unary) = expression
+        && unary.op == UnaryOp::Not
+    {
+        return condition_jump_target_count(&unary.operand, !jump_on);
+    }
+    if let Expr::If(conditional) = expression
+        && let Some(truthiness) = early_condition_truthiness(&conditional.test)
+    {
+        return condition_jump_target_count(
+            if truthiness {
+                &conditional.body
+            } else {
+                &conditional.orelse
+            },
+            jump_on,
+        );
+    }
+    if let Some(truthiness) = jump_constant_truthiness(expression) {
+        return usize::from(truthiness == jump_on);
+    }
+    if let Expr::BoolOp(boolean) = expression {
+        let Some((last, leading)) = boolean.values.split_last() else {
+            return 0;
+        };
+        let short_circuit_jumps_to_target = matches!(boolean.op, BoolOp::Or) == jump_on;
+        if short_circuit_jumps_to_target {
+            return leading
+                .iter()
+                .chain(std::iter::once(last))
+                .map(|value| condition_jump_target_count(value, jump_on))
+                .sum();
+        }
+        return condition_jump_target_count(last, jump_on);
+    }
+    if let Expr::If(conditional) = expression {
+        return condition_jump_target_count(&conditional.body, jump_on)
+            + condition_jump_target_count(&conditional.orelse, jump_on);
+    }
+    if let Expr::Compare(comparison) = expression
+        && comparison.ops.len() > 1
+        && !jump_on
+    {
+        return 2;
+    }
+    1
+}
+
 pub(super) fn suite_terminates(body: &[Stmt]) -> bool {
     body.iter().any(statement_terminates)
+}
+
+fn suite_ends_in_retained_try_exit_join(body: &[Stmt]) -> bool {
+    let Some(Stmt::If(statement)) = body.last() else {
+        return false;
+    };
+    if let Some(truthiness) = early_condition_truthiness(&statement.test)
+        && statement.elif_else_clauses.len() <= 1
+        && statement
+            .elif_else_clauses
+            .first()
+            .is_none_or(|clause| clause.test.is_none())
+    {
+        let selected = if truthiness {
+            statement.body.as_slice()
+        } else {
+            statement
+                .elif_else_clauses
+                .first()
+                .map_or(&[] as &[Stmt], |clause| clause.body.as_slice())
+        };
+        return suite_ends_in_retained_try_exit_join(selected);
+    }
+    !statement.elif_else_clauses.is_empty() || terminating_if_fallthrough_test(statement).is_some()
 }
 
 fn try_requires_loop_tail_inlining(statement: &ruff_python_ast::StmtTry) -> bool {
@@ -5363,6 +5479,27 @@ fn statement_terminates(statement: &Stmt) -> bool {
         Stmt::Try(statement) => suite_terminates(&statement.finalbody),
         _ => false,
     }
+}
+
+fn nested_if_exit_location(
+    statement: &ruff_python_ast::StmtIf,
+) -> Option<NestedIfExitLocation<'_>> {
+    if early_condition_truthiness(&statement.test).is_some() {
+        return None;
+    }
+    let (test, body) = if let Some(clause) = statement.elif_else_clauses.last() {
+        (clause.test.as_ref()?, clause.body.as_slice())
+    } else {
+        (statement.test.as_ref(), statement.body.as_slice())
+    };
+    if early_condition_truthiness(test).is_some() {
+        return None;
+    }
+    Some(if suite_terminates(body) {
+        NestedIfExitLocation::Located(test)
+    } else {
+        NestedIfExitLocation::Unlocated
+    })
 }
 
 fn terminating_if_fallthrough_test(statement: &ruff_python_ast::StmtIf) -> Option<&Expr> {
