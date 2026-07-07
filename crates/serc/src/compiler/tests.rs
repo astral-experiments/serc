@@ -45,7 +45,7 @@ fn name_ids_do_not_define_observable_name_order() {
         freevars: lexical_order,
         ..FunctionPlan::default()
     }
-    .lowering_plan();
+    .into_lowering_plan();
     assert_eq!(
         plan.locals
             .iter()
