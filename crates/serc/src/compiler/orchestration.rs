@@ -756,7 +756,7 @@ impl Compiler {
         } else {
             max_depth.max(1)
         };
-        Ok(CodeObject {
+        let code = CodeObject {
             arg_count: self.unit.arg_count,
             positional_only_arg_count: self.unit.positional_only_arg_count,
             keyword_only_arg_count: self.unit.keyword_only_arg_count,
@@ -781,7 +781,9 @@ impl Compiler {
                 },
                 explicitly_interned_strings: self.output.interned_constant_strings,
             },
-        })
+        };
+        code.validate()?;
+        Ok(code)
     }
 
     pub(super) fn emit_function_prologue(&mut self) -> Result<(), CompileError> {
