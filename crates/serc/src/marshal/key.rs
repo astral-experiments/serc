@@ -1,4 +1,4 @@
-use crate::compiler::{CodeObject, Constant};
+use crate::code_object::{CodeObject, Constant};
 
 use super::v5::{
     FLAG_REF, TYPE_ASCII, TYPE_ASCII_INTERNED, TYPE_BINARY_COMPLEX, TYPE_BINARY_FLOAT, TYPE_CODE,

@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use crate::compiler::{CodeObject, Constant};
+use crate::code_object::{CodeObject, Constant};
 
 use super::encode_code;
 use super::graph::ObjectGraph;

@@ -1,4 +1,4 @@
-use crate::compiler::{CodeObject, Constant};
+use crate::code_object::{CodeObject, Constant};
 
 use super::graph::{ObjectGraph, ObjectId, ObjectLocation};
 use super::key::{constant_sort_key, slice_member_uses_identity};

@@ -5,6 +5,7 @@
 //! Python releases, so future targets should be implemented as separate backends.
 
 mod assembler;
+mod code_object;
 mod compiler;
 mod marshal;
 mod source;
@@ -13,7 +14,8 @@ mod target;
 use std::error::Error;
 use std::fmt;
 
-use compiler::{CodeObject, Compiler};
+use code_object::CodeObject;
+use compiler::Compiler;
 pub use source::{SourceDecodeError, decode_source};
 
 /// The exact CPython implementation targeted by this compiler backend.
