@@ -105,9 +105,6 @@ bitflags::bitflags! {
         const DEFER_REDUNDANT_JUMP_REMOVAL = 1 << 9;
         const PRESERVE_NOP_AFTER_JUMP_THREADING = 1 << 10;
         const CONVERTED_POP_BLOCK = 1 << 11;
-        // Stop borrowed-load traversal at an optimized-away empty CFG block without exposing a
-        // label to the other assembler passes.
-        const BORROW_UNREACHABLE_ENTRY = 1 << 12;
     }
 }
 
@@ -124,10 +121,16 @@ impl InstructionFlags {
         .union(Self::CONVERTED_POP_BLOCK);
     pub(super) const FUSE_AND: Self =
         Self::INLINE_SMALL_EXIT.union(Self::ALLOW_JUMP_THREADING_TARGET);
-    pub(super) const FUSE_FROM_FIRST: Self =
-        Self::PREVENT_FUSION_WITH_PREVIOUS.union(Self::BORROW_UNREACHABLE_ENTRY);
+    pub(super) const FUSE_FROM_FIRST: Self = Self::PREVENT_FUSION_WITH_PREVIOUS;
     pub(super) const FUSE_FROM_SECOND: Self = Self::PREVENT_FUSION_WITH_NEXT;
     pub(super) const FUSE_CLEARED: Self = Self::PRESERVE_INLINED_JUMP_NOP;
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) enum BorrowFallthrough {
+    #[default]
+    Reachable,
+    Barrier,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -175,12 +178,33 @@ impl NormalizedExceptionOwner {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(super) struct ExceptionPolicy {
+pub(crate) struct ExceptionPolicy {
     pub(super) exclusion: ExceptionExclusion,
     pub(super) normalized_owner: NormalizedExceptionOwner,
 }
 
 impl ExceptionPolicy {
+    pub(crate) const EXCLUDE_IF_EXTENDED: Self = Self {
+        exclusion: ExceptionExclusion::IfExtended,
+        normalized_owner: NormalizedExceptionOwner::Unchanged,
+    };
+
+    pub(crate) const EXCLUDE_ALWAYS: Self = Self {
+        exclusion: ExceptionExclusion::Always,
+        normalized_owner: NormalizedExceptionOwner::Unchanged,
+    };
+
+    pub(crate) const fn normalized_owner(has_owner: bool) -> Self {
+        Self {
+            exclusion: ExceptionExclusion::None,
+            normalized_owner: if has_owner {
+                NormalizedExceptionOwner::Present
+            } else {
+                NormalizedExceptionOwner::Absent
+            },
+        }
+    }
+
     const fn merged(self, other: Self) -> Self {
         Self {
             exclusion: self.exclusion.merged(other.exclusion),
@@ -205,6 +229,9 @@ pub(super) struct Instruction {
     // `NOT_TAKEN` is added after CPython labels exception handlers. The new instruction keeps
     // whatever exception target remains in its reused CFG slot, if there is one.
     pub(super) exception_policy: ExceptionPolicy,
+    // A boundary used only by the final borrowed-load analysis. Earlier CFG passes must continue
+    // to see ordinary fallthrough across this edge.
+    pub(super) borrow_fallthrough: BorrowFallthrough,
 }
 
 impl Instruction {
@@ -222,6 +249,7 @@ impl Instruction {
             flags: InstructionFlags::DEFAULT,
             preserve_direct_inlined_jump_nop: None,
             exception_policy: ExceptionPolicy::default(),
+            borrow_fallthrough: BorrowFallthrough::default(),
         }
     }
 
@@ -269,6 +297,7 @@ impl Instruction {
             flags,
             preserve_direct_inlined_jump_nop: None,
             exception_policy: first.exception_policy.merged(second.exception_policy),
+            borrow_fallthrough: second.borrow_fallthrough,
         }
     }
 }
@@ -291,7 +320,6 @@ pub(crate) struct Assembler {
     pub(super) borrow_unreachable_blocks: FxHashSet<Label>,
     pub(super) load_fast_borrowing_enabled: bool,
     pub(super) strict_owned_loads: bool,
-    pub(super) next_instruction_borrow_unreachable: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -341,7 +369,6 @@ impl Default for Assembler {
             borrow_unreachable_blocks: FxHashSet::default(),
             load_fast_borrowing_enabled: true,
             strict_owned_loads: false,
-            next_instruction_borrow_unreachable: false,
         }
     }
 }
