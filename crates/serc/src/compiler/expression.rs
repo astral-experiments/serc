@@ -7,6 +7,7 @@ use ruff_python_ast::{
     InterpolatedStringElement, Keyword, Number, Operator, Pattern, Singleton, Stmt, UnaryOp,
 };
 use ruff_text_size::Ranged;
+use rustc_hash::FxHashSet;
 
 use super::{
     BINARY_SLICE, BUILD_INTERPOLATION, BUILD_LIST, BUILD_MAP, BUILD_SET, BUILD_SLICE, BUILD_STRING,
@@ -47,7 +48,7 @@ use super::scope::{
 use super::source::{debug_text_range, statement_execution_range, strip_expression_comments};
 use super::statement::{is_wildcard_pattern, suite_terminates};
 use super::symbol::{expression_name, to_u32, unsupported};
-use super::{Compiler, Constant, HashSet, SHADOWED_SUPER_SENTINEL, SUPPORTED_FUTURE_FLAGS, Scope};
+use super::{Compiler, Constant, SHADOWED_SUPER_SENTINEL, SUPPORTED_FUTURE_FLAGS, Scope};
 
 #[derive(Debug)]
 struct MatchContext {
@@ -2226,7 +2227,7 @@ impl Compiler {
                 }
             }
         }
-        let mut seen_temporaries = HashSet::default();
+        let mut seen_temporaries = FxHashSet::default();
         temporary_names.retain(|name| seen_temporaries.insert(name.clone()));
         let mut temporary_indices = Vec::with_capacity(temporary_names.len());
         for name in &temporary_names {
@@ -2415,11 +2416,11 @@ impl Compiler {
         for comprehension in &generator.generators {
             collect_target_names(&comprehension.target, &mut locals);
         }
-        let mut seen = HashSet::default();
+        let mut seen = FxHashSet::default();
         locals.retain(|name| seen.insert(name.clone()));
         let required_names = generator_required_names(generator);
         let generator_cellvars = generator_cellvars(generator);
-        let mut globals = HashSet::default();
+        let mut globals = FxHashSet::default();
         let mut freevars = BTreeSet::new();
         for name in required_names {
             if self.can_provide_closure(&name) {

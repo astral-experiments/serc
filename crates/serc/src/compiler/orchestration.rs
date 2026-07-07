@@ -45,29 +45,29 @@ pub(super) struct CodeUnit {
     pub(super) class_scope_is_nested: bool,
     pub(super) module_annotation_index: u32,
     pub(super) annotation_classdict_index: Option<u32>,
-    pub(super) name: String,
+    name: String,
     pub(super) qualified_name: String,
     pub(super) private_name: Option<String>,
     pub(super) arg_count: u32,
-    pub(super) positional_only_arg_count: u32,
-    pub(super) keyword_only_arg_count: u32,
+    positional_only_arg_count: u32,
+    keyword_only_arg_count: u32,
     pub(super) flags: u32,
     pub(super) first_line_number: u32,
     pub(super) annotation_thunk: bool,
 }
 
 #[derive(Debug)]
-pub(super) struct CodeUnitSpec {
-    pub(super) scope: Scope,
-    pub(super) scope_id: ScopeId,
-    pub(super) name: String,
-    pub(super) qualified_name: String,
-    pub(super) private_name: Option<String>,
-    pub(super) arg_count: u32,
-    pub(super) positional_only_arg_count: u32,
-    pub(super) keyword_only_arg_count: u32,
-    pub(super) flags: u32,
-    pub(super) first_line_number: u32,
+struct CodeUnitSpec {
+    scope: Scope,
+    scope_id: ScopeId,
+    name: String,
+    qualified_name: String,
+    private_name: Option<String>,
+    arg_count: u32,
+    positional_only_arg_count: u32,
+    keyword_only_arg_count: u32,
+    flags: u32,
+    first_line_number: u32,
 }
 
 impl Compiler {

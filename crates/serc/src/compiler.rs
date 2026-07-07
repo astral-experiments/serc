@@ -4,9 +4,6 @@ use std::sync::Arc;
 use ruff_text_size::TextSize;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-type HashMap<K, V> = FxHashMap<K, V>;
-type HashSet<T> = FxHashSet<T>;
-
 use crate::assembler::Assembler;
 use crate::target::code_flags::{CO_FUTURE_ANNOTATIONS, CO_FUTURE_BARRY_AS_BDFL};
 // The generated opcode module is the compiler lowering vocabulary; spelling out this nearly
@@ -88,7 +85,7 @@ pub(crate) struct CodeObject {
     pub(crate) line_table: Vec<u8>,
     pub(crate) exception_table: Vec<u8>,
     pub(crate) annotation_thunk: bool,
-    pub(crate) interned_constant_strings: HashSet<String>,
+    pub(crate) interned_constant_strings: FxHashSet<String>,
 }
 
 #[derive(Debug)]
