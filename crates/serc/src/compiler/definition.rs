@@ -189,7 +189,7 @@ impl Compiler {
                 child_plan.mark_global(name);
             }
         }
-        let child_plan = child_plan.lowering_plan();
+        let child_plan = child_plan.into_lowering_plan();
 
         let mut locals = vec![self.required_name_id(".defaults")];
         if defaults.keyword {
