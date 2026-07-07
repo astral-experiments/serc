@@ -389,8 +389,7 @@ impl Assembler {
             |instruction| {
                 !matches!(instruction.operand, Operand::Value(_))
                     || ends_scope(instruction.opcode)
-                    || (instruction.opcode == NOP
-                        && instruction.has_flag(InstructionFlags::PRESERVE_INLINED_JUMP_NOP))
+                    || (instruction.opcode == NOP && instruction.jump_policy.always_retains_nop())
                     || instruction.borrow_fallthrough == BorrowFallthrough::Barrier
             },
         );
@@ -438,7 +437,7 @@ impl Assembler {
                 continue;
             };
             let folded_jump_has_no_fallthrough =
-                last.opcode == NOP && last.has_flag(InstructionFlags::PRESERVE_INLINED_JUMP_NOP);
+                last.opcode == NOP && last.jump_policy.always_retains_nop();
             if !folded_jump_has_no_fallthrough
                 && block_has_fallthrough(&[Item::Instruction(*last)])
                 && let Some(next) = blocks.get(block_positions[block.index()] + 1)

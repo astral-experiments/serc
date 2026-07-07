@@ -355,8 +355,8 @@ impl Assembler {
                 continue;
             };
             // A jump retained as a source-position NOP remains a CFG boundary.
-            if instruction.has_flag(InstructionFlags::ALLOW_JUMP_THREADING_TARGET)
-                && !instruction.has_flag(InstructionFlags::PRESERVE_INLINED_JUMP_NOP)
+            if instruction.jump_policy.allow_threading_target
+                && !instruction.jump_policy.always_retains_nop()
                 && is_unconditional_jump(instruction.opcode)
                 && let operand @ (Operand::Forward(_) | Operand::Backward(_)) = instruction.operand
             {
@@ -375,7 +375,7 @@ impl Assembler {
                     continue;
                 };
                 if instruction.opcode != JUMP_FORWARD
-                    || instruction.has_flag(InstructionFlags::PRESERVE_INLINED_JUMP_NOP)
+                    || instruction.jump_policy.always_retains_nop()
                 {
                     continue;
                 }
@@ -449,15 +449,11 @@ impl Assembler {
                 index += 1;
                 continue;
             }
-            if instruction.has_flag(InstructionFlags::DEFER_REDUNDANT_JUMP_REMOVAL) {
+            if instruction.jump_policy.defer_redundant_removal {
                 let Item::Instruction(instruction) = &mut items[index].1 else {
                     unreachable!();
                 };
-                instruction.remove_flag(InstructionFlags::DEFER_REDUNDANT_JUMP_REMOVAL);
-                if instruction.has_flag(InstructionFlags::PRESERVE_NOP_AFTER_JUMP_THREADING) {
-                    instruction.remove_flag(InstructionFlags::PRESERVE_NOP_AFTER_JUMP_THREADING);
-                    instruction.insert_flag(InstructionFlags::PRESERVE_INLINED_JUMP_NOP);
-                }
+                instruction.jump_policy.resolve_deferred_removal();
                 index += 1;
                 continue;
             }
@@ -489,7 +485,7 @@ impl Assembler {
                 };
                 instruction.location.line
             });
-            if !instruction.has_flag(InstructionFlags::PRESERVE_INLINED_JUMP_NOP)
+            if !instruction.jump_policy.always_retains_nop()
                 && (instruction.location.line < 0
                     || previous_line == Some(instruction.location.line)
                     || next_line == Some(instruction.location.line))

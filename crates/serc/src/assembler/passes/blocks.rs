@@ -496,10 +496,9 @@ impl Assembler {
                         // the final region labels, so keep their existing block boundary.
                         && (target_chain_end == target_position || opcode == RAISE_VARARGS)
                 });
-            let source_allows_small_exit_inlining =
-                graph[source].last_instruction().is_some_and(|instruction| {
-                    instruction.has_flag(InstructionFlags::INLINE_SMALL_EXIT)
-                });
+            let source_allows_small_exit_inlining = graph[source]
+                .last_instruction()
+                .is_some_and(|instruction| instruction.jump_policy.inline_small_exit);
             let target_contains_end_send = target_blocks.iter().any(|block| {
                 graph[*block].items().iter().any(|item| {
                     matches!(item, Item::Instruction(instruction) if instruction.opcode == END_SEND)
@@ -557,14 +556,7 @@ impl Assembler {
             let preserve_inlined_jump_nop = inline_small_exit
                 && source_location.line >= 0
                 && graph[source].last_instruction().is_some_and(|instruction| {
-                    instruction.has_flag(InstructionFlags::PRESERVE_INLINED_JUMP_NOP)
-                        || matches!(
-                            (
-                                instruction.preserve_direct_inlined_jump_nop,
-                                instruction.operand,
-                            ),
-                            (Some(expected), Operand::Forward(actual)) if expected == actual
-                        )
+                    instruction.jump_policy.retains_nop_for(instruction.operand)
                 });
             let copied_label = Label(self.next_label);
             self.next_label += 1;
