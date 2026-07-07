@@ -1,8 +1,8 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::super::{
-    Assembler, ExceptionExclusion, ExceptionRegion, Instruction, InstructionFlags, Item,
-    JUMP_BACKWARD, JUMP_BACKWARD_NO_INTERRUPT, JUMP_FORWARD, Label, Operand, SourceLocation,
+    Assembler, ExceptionExclusion, ExceptionRegion, Instruction, Item, JUMP_BACKWARD,
+    JUMP_BACKWARD_NO_INTERRUPT, JUMP_FORWARD, Label, Operand, SourceLocation,
     block_has_fallthrough, block_jump_target, cleanup_block_creation_order, ends_scope,
 };
 use crate::target::opcodes::{
@@ -508,10 +508,9 @@ impl Assembler {
                     !matches!(item, Item::Instruction(instruction) if instruction.location.line >= 0)
                 })
             });
-            let target_allows_no_location_block_inlining =
-                graph[target].last_instruction().is_some_and(|instruction| {
-                    instruction.has_flag(InstructionFlags::ALLOW_NO_LOCATION_BLOCK_INLINING)
-                });
+            let target_allows_no_location_block_inlining = graph[target]
+                .last_instruction()
+                .is_some_and(|instruction| instruction.no_location_policy.allow_block_inlining);
             let target_is_no_location_no_fallthrough = target_has_no_location
                 && target_allows_no_location_block_inlining
                 && !block_has_fallthrough(graph[target].items());
@@ -623,7 +622,7 @@ impl Assembler {
                 if let Some(Item::Instruction(instruction)) = copied
                     .iter_mut()
                     .find(|item| matches!(item, Item::Instruction(_)))
-                    && !instruction.has_flag(InstructionFlags::PRESERVE_NO_LOCATION)
+                    && !instruction.no_location_policy.preserve
                 {
                     instruction.location = source_location;
                 }
@@ -743,9 +742,9 @@ impl Assembler {
                     .iter()
                     .find(|item| matches!(item, Item::Instruction(_)))
                 && first.opcode == NOP
-                && first.has_flag(InstructionFlags::CONVERTED_POP_BLOCK)
+                && first.converted_pop_block
                 && first.location.line < 0
-                && !first.has_flag(InstructionFlags::PRESERVE_NO_LOCATION)
+                && !first.no_location_policy.preserve
                 && let Some(location) = order.iter().find_map(|source| {
                     block_jump_target(graph[*source].items())
                         .and_then(|label| graph.label_block(label))
@@ -794,7 +793,7 @@ impl Assembler {
                 .items_mut()
                 .iter_mut()
                 .find(|item| matches!(item, Item::Instruction(_)))
-                && !instruction.has_flag(InstructionFlags::PRESERVE_NO_LOCATION)
+                && !instruction.no_location_policy.preserve
             {
                 instruction.location = location;
             }

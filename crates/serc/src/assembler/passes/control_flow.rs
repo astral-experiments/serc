@@ -1,10 +1,9 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::super::{
-    COMPARE_OP, CONTAINS_OP, COPY, ExceptionExclusion, IS_OP, Instruction, InstructionFlags, Item,
-    JUMP_BACKWARD, JUMP_BACKWARD_NO_INTERRUPT, JUMP_FORWARD, NOP, NOT_TAKEN, Operand,
-    POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE, POP_TOP, STORE_FAST, TO_BOOL, UNARY_NOT, ends_scope,
-    is_unconditional_jump,
+    COMPARE_OP, CONTAINS_OP, COPY, ExceptionExclusion, IS_OP, Instruction, Item, JUMP_BACKWARD,
+    JUMP_BACKWARD_NO_INTERRUPT, JUMP_FORWARD, NOP, NOT_TAKEN, Operand, POP_JUMP_IF_FALSE,
+    POP_JUMP_IF_TRUE, POP_TOP, STORE_FAST, TO_BOOL, UNARY_NOT, ends_scope, is_unconditional_jump,
 };
 use crate::assembler::Assembler;
 use crate::target::Opcode;
@@ -495,8 +494,8 @@ impl Assembler {
                     && let Some(next) = next.map(|next| next - 1)
                     && let Item::Instruction(next) = &mut items[next].1
                     && next.location.line < 0
-                    && !next.has_flag(InstructionFlags::PRESERVE_NO_LOCATION)
-                    && !next.has_flag(InstructionFlags::ALLOW_NO_LOCATION_BLOCK_INLINING)
+                    && !next.no_location_policy.preserve
+                    && !next.no_location_policy.allow_block_inlining
                 {
                     next.location = instruction.location;
                 }
@@ -537,8 +536,7 @@ impl Assembler {
                     Item::Label(_) => {}
                     Item::Instruction(instruction) => {
                         block_has_instruction = true;
-                        if instruction.location.line < 0
-                            && !instruction.has_flag(InstructionFlags::PRESERVE_NO_LOCATION)
+                        if instruction.location.line < 0 && !instruction.no_location_policy.preserve
                         {
                             if let Some(location) = previous {
                                 instruction.location = location;
@@ -578,7 +576,7 @@ impl Assembler {
         for (index, (position, instruction)) in instructions.iter().copied().enumerate() {
             let remove = instruction.opcode == NOP
                 && (instruction.location.line < 0
-                    || (instruction.has_flag(InstructionFlags::CONVERTED_POP_BLOCK)
+                    || (instruction.converted_pop_block
                         && previous.is_some_and(|previous: Instruction| {
                             previous.location.line == instruction.location.line
                                 && !(ends_scope(previous.opcode)
