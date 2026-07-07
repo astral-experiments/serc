@@ -548,6 +548,12 @@ class Shadowed:
     }
 
     #[test]
+    fn matches_cpython_marshal_for_multiline_super_method_arguments() {
+        let source = "class Base:\n    pass\n\nclass Child(Base):\n    def implicit(self, value):\n        return super().method(\n            value\n        )\n\n    def explicit(self, value):\n        return super(Child, self).method(\n            value\n        )\n\n    def keyword(self, value):\n        return super().method(\n            option=value,\n        )\n\n    def multiline_attribute(self):\n        return super().\\\n            value\n";
+        assert_matches_cpython_marshal(source, "super_method_lines.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_optimized_generator_calls() {
         let source = "module_any = any(value for value in values)\nmodule_all = all(value for value in values)\nmodule_tuple = tuple(value for value in values)\nany(value for value in values)\nall(value for value in values)\ntuple(value for value in values)\nafter = None\n\n\ndef optimized(values):\n    return (\n        any(value for value in values),\n        all(value for value in values),\n        tuple(value for value in values),\n    )\n\n\ndef rebound(values, any):\n    return any(value for value in values)\n\n\ndef terminal_discard(values):\n    all(value for value in values)\n";
         assert_matches_cpython_marshal(source, "optimized_generator_calls.py");

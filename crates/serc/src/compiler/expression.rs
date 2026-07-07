@@ -1957,9 +1957,11 @@ impl Compiler {
                 (attribute_index << 2) | 2 | kind.method_flag(),
                 kind.stack_effect(),
             )?;
-            self.assembler
-                .set_location(self.source_location(self.attribute_opcode_range(attribute)));
-            self.emit(NOP, 0, 0)?;
+            if matches!(kind, SuperAttributeKind::Attribute) {
+                self.assembler
+                    .set_location(self.source_location(self.attribute_opcode_range(attribute)));
+                self.emit(NOP, 0, 0)?;
+            }
             return Ok(SpecializedLowering::Applied);
         }
 
@@ -2005,9 +2007,11 @@ impl Compiler {
             (attribute_index << 2) | kind.method_flag(),
             kind.stack_effect(),
         )?;
-        self.assembler
-            .set_location(self.source_location(self.attribute_opcode_range(attribute)));
-        self.emit(NOP, 0, 0)?;
+        if matches!(kind, SuperAttributeKind::Attribute) {
+            self.assembler
+                .set_location(self.source_location(self.attribute_opcode_range(attribute)));
+            self.emit(NOP, 0, 0)?;
+        }
         Ok(SpecializedLowering::Applied)
     }
 
