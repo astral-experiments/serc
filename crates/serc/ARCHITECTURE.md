@@ -64,8 +64,10 @@ rewrites do not belong in the AST lowering code.
 ### Parsing
 
 `compile` in `src/lib.rs` normalizes CRLF and bare CR newlines, removes one leading UTF-8 BOM, and
-parses a module with Ruff's `PY314` grammar. Ruff returns syntax and source ranges; it does not
-provide CPython's symbol table, compiler, runtime, or marshal implementation.
+parses a module with Ruff's `PY314` grammar. The shared `CompilationContext` retains Ruff's tokens
+alongside the normalized source for source-boundary and reconstruction queries. Ruff returns
+syntax and source ranges; it does not provide CPython's symbol table, compiler, runtime, or marshal
+implementation.
 
 ### Scope planning and lowering
 
@@ -84,10 +86,18 @@ In particular, `src/compiler/scope.rs` performs the CPython-specific analysis th
 
 - `LocalCollector` and `ReferenceCollector` collect bindings, explicit globals/nonlocals, and
     references.
+- `ModulePlan` records future flags, globals, imports, annotation facts, ordered comprehension
+    targets, and comprehension cells while the module name/scope walk is already in progress.
 - `FunctionPlan` recursively resolves function locals, cells, free variables, annotation free
     variables, and nested-function requirements before a function body is lowered.
 - Module, class, lambda, comprehension, generator, and annotation-scope helpers handle the
     additional name-resolution rules for those scopes.
+
+Module analysis produces the complete `ScopeArena` and `ModulePlan` before the root `Compiler` is
+constructed. `CompilationContext` owns both for the lifetime of root and child compilation, so no
+lowering path can observe an uninitialized scope arena. The module lowering consumes the plan's
+interned `NameId` facts instead of repeating whole-module visitors; the separate local collector is
+retained only where CPython source order is observable.
 
 `Compiler` then lowers the Ruff AST into symbolic `Instruction` values. At this point jumps still
 refer to `Label`s rather than byte offsets. The compiler also owns constant and name tables, local

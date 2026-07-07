@@ -1,7 +1,7 @@
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use ruff_python_ast::token::{TokenKind, Tokens};
-use ruff_python_ast::{Expr, FStringPart, InterpolatedStringElement, Stmt};
+use ruff_python_ast::{Expr, FStringPart, InterpolatedStringElement, Stmt, Suite};
 use ruff_python_codegen::{Generator, Indentation, Mode as CodegenMode};
 use ruff_source_file::{LineEnding, LineIndex};
 use ruff_text_size::{Ranged, TextLen, TextSize};
@@ -11,7 +11,7 @@ use crate::assembler::SourceLocation;
 use crate::code_object::Constant;
 
 use super::constant::{explicit_surrogate_string, fold_constant};
-use super::scope::ScopeArena;
+use super::scope::{ModulePlan, ScopeArena};
 use super::{CachedSourceLine, Compiler};
 
 #[derive(Debug)]
@@ -20,17 +20,20 @@ pub(super) struct CompilationContext {
     pub(super) source: Arc<str>,
     pub(super) tokens: Tokens,
     line_index: LineIndex,
-    pub(super) scopes: OnceLock<ScopeArena>,
+    pub(super) module_plan: ModulePlan,
+    pub(super) scopes: ScopeArena,
 }
 
 impl CompilationContext {
-    pub(super) fn new(filename: &str, source: &str, tokens: Tokens) -> Self {
+    pub(super) fn new(filename: &str, source: &str, tokens: Tokens, body: &Suite) -> Self {
+        let (scopes, module_plan) = ScopeArena::analyze(body);
         Self {
             filename: filename.to_string(),
             source: Arc::from(source),
             tokens,
             line_index: LineIndex::from_source_text(source),
-            scopes: OnceLock::new(),
+            module_plan,
+            scopes,
         }
     }
 }
@@ -483,59 +486,38 @@ pub(super) fn unparse_annotation(expression: &Expr) -> String {
     let mut annotation = Generator::new(&indentation, LineEnding::Lf)
         .with_mode(CodegenMode::AstUnparse)
         .expr(expression);
-    let bytes = annotation.as_bytes();
-    let mut stack = Vec::<(u8, usize)>::new();
+    let parsed = ruff_python_parser::parse_unchecked(
+        &annotation,
+        ruff_python_parser::ParseOptions::from(ruff_python_parser::Mode::ParenthesizedExpression),
+    );
+    let mut stack = Vec::<(TokenKind, usize)>::new();
     let mut parenthesis_pairs = FxHashSet::default();
     let mut bracket_pairs = Vec::new();
-    let mut quote = None::<(u8, bool)>;
-    let mut index = 0_usize;
-    while index < bytes.len() {
-        if let Some((delimiter, triple)) = quote {
-            if bytes[index] == b'\\' {
-                index = (index + 2).min(bytes.len());
-                continue;
+    for token in parsed.tokens() {
+        match token.kind() {
+            opening @ (TokenKind::Lpar | TokenKind::Lsqb | TokenKind::Lbrace) => {
+                stack.push((opening, usize::from(token.start())));
             }
-            if bytes[index] == delimiter
-                && (!triple
-                    || bytes.get(index + 1) == Some(&delimiter)
-                        && bytes.get(index + 2) == Some(&delimiter))
-            {
-                index += if triple { 3 } else { 1 };
-                quote = None;
-                continue;
-            }
-            index += 1;
-            continue;
-        }
-        match bytes[index] {
-            delimiter @ (b'\'' | b'"') => {
-                let triple = bytes.get(index + 1) == Some(&delimiter)
-                    && bytes.get(index + 2) == Some(&delimiter);
-                quote = Some((delimiter, triple));
-                index += if triple { 3 } else { 1 };
-                continue;
-            }
-            delimiter @ (b'(' | b'[' | b'{') => stack.push((delimiter, index)),
-            b')' | b']' | b'}' => {
-                let closing = bytes[index];
+            closing @ (TokenKind::Rpar | TokenKind::Rsqb | TokenKind::Rbrace) => {
                 let expected = match closing {
-                    b')' => b'(',
-                    b']' => b'[',
-                    _ => b'{',
+                    TokenKind::Rpar => TokenKind::Lpar,
+                    TokenKind::Rsqb => TokenKind::Lsqb,
+                    TokenKind::Rbrace => TokenKind::Lbrace,
+                    _ => unreachable!(),
                 };
                 if let Some((opening, opening_index)) = stack.pop()
                     && opening == expected
                 {
-                    if opening == b'(' {
-                        parenthesis_pairs.insert((opening_index, index));
-                    } else if opening == b'[' {
-                        bracket_pairs.push((opening_index, index));
+                    let closing_index = usize::from(token.start());
+                    if opening == TokenKind::Lpar {
+                        parenthesis_pairs.insert((opening_index, closing_index));
+                    } else if opening == TokenKind::Lsqb {
+                        bracket_pairs.push((opening_index, closing_index));
                     }
                 }
             }
             _ => {}
         }
-        index += 1;
     }
     let mut removals = bracket_pairs
         .into_iter()
@@ -563,32 +545,8 @@ pub(super) fn unparse_annotation(expression: &Expr) -> String {
 }
 
 fn python_string_repr(value: &str) -> String {
-    let quote = if value.contains('\'') && !value.contains('"') {
-        '"'
-    } else {
-        '\''
-    };
-    let mut repr = String::with_capacity(value.len() + 2);
-    repr.push(quote);
-    for character in value.chars() {
-        match character {
-            '\\' => repr.push_str("\\\\"),
-            '\n' => repr.push_str("\\n"),
-            '\r' => repr.push_str("\\r"),
-            '\t' => repr.push_str("\\t"),
-            '\x08' => repr.push_str("\\b"),
-            '\x0c' => repr.push_str("\\f"),
-            character if character == quote => {
-                repr.push('\\');
-                repr.push(character);
-            }
-            character if character.is_control() => {
-                use std::fmt::Write;
-                write!(repr, "\\x{:02x}", u32::from(character)).unwrap();
-            }
-            character => repr.push(character),
-        }
-    }
-    repr.push(quote);
-    repr
+    ruff_python_literal::escape::UnicodeEscape::new_repr(value)
+        .str_repr(ruff_python_ast::str::TripleQuotes::No)
+        .to_string()
+        .expect("Python string representation length fits in usize")
 }

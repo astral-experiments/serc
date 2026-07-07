@@ -26,16 +26,14 @@ use crate::target::operands::{FunctionAttribute, ResumeLocation, UnaryIntrinsic}
 use super::constant::{OutputState, fold_constant};
 use super::definition::clean_doc;
 use super::scope::{
-    LocalCollector, LoweringFunctionPlan, NameId, NameSet, ScopeArena, ScopeId,
-    class_static_attributes, future_feature_flags, has_annotations, has_simple_annotations,
-    inlined_comprehension_cell_names_in_suite, module_global_names, module_imported_names,
+    LoweringFunctionPlan, NameId, NameSet, ScopeId, class_static_attributes, has_simple_annotations,
 };
 use super::source::{CompilationContext, implicit_return_range};
 use super::statement::{
     ControlFlowState, statement_uses_implicit_return_location, suite_terminates,
 };
 use super::symbol::{ReraiseStackState, SymbolState, to_u32};
-use super::{Compiler, SHADOWED_SUPER_SENTINEL, Scope};
+use super::{Compiler, Scope};
 
 #[derive(Debug)]
 pub(super) struct CodeUnit {
@@ -84,8 +82,9 @@ impl Compiler {
         }
     }
 
-    pub(crate) fn module(filename: &str, source: &str, tokens: Tokens) -> Self {
-        let context = Arc::new(CompilationContext::new(filename, source, tokens));
+    pub(crate) fn module(filename: &str, source: &str, tokens: Tokens, body: &Suite) -> Self {
+        let context = Arc::new(CompilationContext::new(filename, source, tokens, body));
+        let future_flags = context.module_plan.future_flags;
         let unit = CodeUnit::from_spec(CodeUnitSpec {
             scope: Scope::Module,
             scope_id: ScopeId::MODULE,
@@ -95,7 +94,7 @@ impl Compiler {
             arg_count: 0,
             positional_only_arg_count: 0,
             keyword_only_arg_count: 0,
-            flags: 0,
+            flags: future_flags,
             first_line_number: 1,
         });
         Self::new(context, unit, SymbolState::default())
@@ -120,11 +119,7 @@ impl Compiler {
                 + u32::from(parameter_flags & CO_VARKEYWORDS != 0),
         )
         .unwrap_or(usize::MAX);
-        let names = &context
-            .scopes
-            .get()
-            .expect("scope arena should be initialized before child compilation")
-            .names;
+        let names = &context.scopes.names;
         let mut locals: Vec<_> = plan
             .locals
             .iter()
@@ -213,11 +208,7 @@ impl Compiler {
     ) -> Self {
         let mut locals = Vec::new();
         let mut cell_names = NameSet::default();
-        let names = &context
-            .scopes
-            .get()
-            .expect("scope arena should be initialized before child compilation")
-            .names;
+        let names = &context.scopes.names;
         if needs_class_closure {
             let name = names
                 .get("__class__")
@@ -270,35 +261,24 @@ impl Compiler {
     }
 
     pub(crate) fn compile_module(mut self, body: &Suite) -> Result<CodeObject, CompileError> {
-        let future_flags = future_feature_flags(body);
-        let arena = ScopeArena::analyze(body, future_flags & CO_FUTURE_ANNOTATIONS != 0);
-        if self.context.scopes.set(arena).is_err() {
-            return Err(CompileError::Internal(
-                "scope arena was initialized more than once".to_string(),
-            ));
-        }
-        self.symbols.module_globals = module_global_names(body)
-            .into_iter()
-            .map(|name| self.required_name_id(&name))
-            .collect();
-        self.symbols.imported_scope_names = module_imported_names(body)
-            .into_iter()
-            .map(|name| self.required_name_id(&name))
-            .collect();
-        let mut module_bindings = LocalCollector::default();
-        module_bindings.collect_suite(body);
-        for name in &module_bindings.comprehension_targets {
+        self.symbols
+            .module_globals
+            .clone_from(&self.context.module_plan.module_globals);
+        self.symbols
+            .imported_scope_names
+            .clone_from(&self.context.module_plan.imported_scope_names);
+        for &name in &self.context.module_plan.comprehension_targets {
             let index = to_u32(self.symbols.locals.len(), "module local count")?;
-            let name = self.required_name_id(name);
             self.symbols.locals.push(name);
             self.symbols.temporary_indices.insert(name, index);
             self.symbols.hidden_names.insert(name);
         }
-        let comprehension_cell_names = inlined_comprehension_cell_names_in_suite(body)
-            .into_iter()
-            .map(|name| self.required_name_id(&name))
-            .collect::<Vec<_>>();
-        self.symbols.cell_names.extend(comprehension_cell_names);
+        self.symbols.cell_names.extend(
+            self.context
+                .module_plan
+                .comprehension_cell_names
+                .iter_unordered(),
+        );
         self.symbols.fast_local_count = self.symbols.locals.len();
         self.assembler.set_location(SourceLocation::NONE);
         let comprehension_cells = self
@@ -312,16 +292,8 @@ impl Compiler {
         for index in comprehension_cells {
             self.emit(MAKE_CELL, to_u32(index, "module cell index")?, 0)?;
         }
-        if module_bindings.seen.contains("super") {
-            // This set is propagated to every child compiler. An impossible
-            // Python identifier keeps the module-shadowing fact alongside the
-            // imported-name facts used by the same optimization checks.
-            let sentinel = self.required_name_id(SHADOWED_SUPER_SENTINEL);
-            self.symbols.imported_scope_names.insert(sentinel);
-        }
-        self.unit.flags |= future_flags;
-        let simple_module_annotations = has_simple_annotations(body);
-        let module_annotations = has_annotations(body);
+        let simple_module_annotations = self.context.module_plan.has_simple_annotations;
+        let module_annotations = self.context.module_plan.has_annotations;
         let future_module_annotations =
             self.unit.flags & CO_FUTURE_ANNOTATIONS != 0 && module_annotations;
         if module_annotations {
