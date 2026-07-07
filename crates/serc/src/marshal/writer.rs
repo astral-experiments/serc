@@ -24,8 +24,14 @@ pub(crate) fn encode_code_into(code: &CodeObject, output: &mut Vec<u8>) {
         reference_count: 0,
         next_occurrence: 0,
     };
-    writer.write_code(code, true);
+    writer.write_code(code, ReferenceMode::Forced);
     debug_assert_eq!(writer.next_occurrence, graph.occurrence_count());
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReferenceMode {
+    IfShared,
+    Forced,
 }
 
 struct Writer<'output, 'graph, 'code> {
@@ -55,8 +61,8 @@ impl Writer<'_, '_, '_> {
         self.output.extend_from_slice(&value.to_le_bytes());
     }
 
-    fn begin_object(&mut self, object: ObjectId, force_reference: bool) -> Option<u8> {
-        if !self.graph.is_shared_object(object, force_reference) {
+    fn begin_object(&mut self, object: ObjectId, reference_mode: ReferenceMode) -> Option<u8> {
+        if reference_mode == ReferenceMode::IfShared && !self.graph.is_shared_object(object) {
             return Some(0);
         }
         if let Some(index) = self.references[object.0] {
@@ -70,13 +76,13 @@ impl Writer<'_, '_, '_> {
         Some(FLAG_REF)
     }
 
-    fn bytes(&mut self, value: &[u8], force_reference: bool) {
+    fn bytes(&mut self, value: &[u8], reference_mode: ReferenceMode) {
         let object = self.next_object(ObjectLocation::Bytes(value.as_ptr().addr()));
-        self.bytes_with_object(object, value, force_reference);
+        self.bytes_with_object(object, value, reference_mode);
     }
 
-    fn bytes_with_object(&mut self, object: ObjectId, value: &[u8], force_reference: bool) {
-        let Some(flag) = self.begin_object(object, force_reference) else {
+    fn bytes_with_object(&mut self, object: ObjectId, value: &[u8], reference_mode: ReferenceMode) {
+        let Some(flag) = self.begin_object(object, reference_mode) else {
             return;
         };
         self.byte(TYPE_STRING | flag);
@@ -86,12 +92,17 @@ impl Writer<'_, '_, '_> {
 
     fn string(&mut self, value: &str) {
         let object = self.next_object(ObjectLocation::MetadataString(value.as_ptr().addr()));
-        self.string_with_object(object, value, false);
+        self.string_with_object(object, value, ReferenceMode::IfShared);
     }
 
-    fn string_with_object(&mut self, object: ObjectId, value: &str, force_reference: bool) {
+    fn string_with_object(&mut self, object: ObjectId, value: &str, reference_mode: ReferenceMode) {
         let interned = self.graph.is_interned_object(object);
-        let Some(flag) = self.begin_object(object, force_reference || interned) else {
+        let reference_mode = if interned {
+            ReferenceMode::Forced
+        } else {
+            reference_mode
+        };
+        let Some(flag) = self.begin_object(object, reference_mode) else {
             return;
         };
         let bytes = value.as_bytes();
@@ -132,9 +143,9 @@ impl Writer<'_, '_, '_> {
         &mut self,
         object: ObjectId,
         value: &[u8],
-        force_reference: bool,
+        reference_mode: ReferenceMode,
     ) {
-        let Some(flag) = self.begin_object(object, force_reference) else {
+        let Some(flag) = self.begin_object(object, reference_mode) else {
             return;
         };
         self.byte(TYPE_UNICODE | flag);
@@ -147,8 +158,13 @@ impl Writer<'_, '_, '_> {
         self.output.extend_from_slice(value);
     }
 
-    fn tuple_header(&mut self, object: ObjectId, length: usize, force_reference: bool) -> bool {
-        let Some(flag) = self.begin_object(object, force_reference) else {
+    fn tuple_header(
+        &mut self,
+        object: ObjectId,
+        length: usize,
+        reference_mode: ReferenceMode,
+    ) -> bool {
+        let Some(flag) = self.begin_object(object, reference_mode) else {
             return false;
         };
         if let Ok(length) = u8::try_from(length) {
@@ -161,9 +177,9 @@ impl Writer<'_, '_, '_> {
         true
     }
 
-    fn strings(&mut self, values: &[String], force_reference: bool) {
+    fn strings(&mut self, values: &[String], reference_mode: ReferenceMode) {
         let object = self.next_object(ObjectLocation::StringsTuple(values.as_ptr().addr()));
-        if self.tuple_header(object, values.len(), force_reference) {
+        if self.tuple_header(object, values.len(), reference_mode) {
             for value in values {
                 self.string(value);
             }
@@ -172,16 +188,16 @@ impl Writer<'_, '_, '_> {
 
     fn locals(&mut self, code: &CodeObject) {
         let object = self.next_object(ObjectLocation::LocalsTuple(std::ptr::from_ref(code).addr()));
-        if self.tuple_header(object, code.locals.len(), false) {
+        if self.tuple_header(object, code.locals.len(), ReferenceMode::IfShared) {
             for value in &code.locals {
                 self.string(value);
             }
         }
     }
 
-    fn constants(&mut self, values: &[Constant], force_reference: bool) {
+    fn constants(&mut self, values: &[Constant], reference_mode: ReferenceMode) {
         let object = self.next_object(ObjectLocation::ConstantsTuple(values.as_ptr().addr()));
-        if self.tuple_header(object, values.len(), force_reference) {
+        if self.tuple_header(object, values.len(), reference_mode) {
             for value in values {
                 self.constant(value);
             }
@@ -189,10 +205,10 @@ impl Writer<'_, '_, '_> {
     }
 
     fn constant(&mut self, value: &Constant) {
-        self.constant_with_force(value, false);
+        self.constant_with_reference_mode(value, ReferenceMode::IfShared);
     }
 
-    fn constant_with_force(&mut self, value: &Constant, force_reference: bool) {
+    fn constant_with_reference_mode(&mut self, value: &Constant, reference_mode: ReferenceMode) {
         match value {
             Constant::None => self.byte(TYPE_NONE),
             Constant::Bool(false) => self.byte(TYPE_FALSE),
@@ -200,19 +216,19 @@ impl Writer<'_, '_, '_> {
             Constant::Ellipsis => self.byte(TYPE_ELLIPSIS),
             Constant::Int(integer) => {
                 let object = self.constant_object(value);
-                self.integer(object, *integer, force_reference);
+                self.integer(object, *integer, reference_mode);
             }
             Constant::SignedInt(integer) => {
                 let object = self.constant_object(value);
-                self.signed_integer(object, *integer, force_reference);
+                self.signed_integer(object, *integer, reference_mode);
             }
             Constant::BigInt { negative, digits } => {
                 let object = self.constant_object(value);
-                self.big_integer(object, digits, *negative, force_reference);
+                self.big_integer(object, digits, *negative, reference_mode);
             }
             Constant::Float(float) => {
                 let object = self.constant_object(value);
-                let Some(flag) = self.begin_object(object, force_reference) else {
+                let Some(flag) = self.begin_object(object, reference_mode) else {
                     return;
                 };
                 self.byte(TYPE_BINARY_FLOAT | flag);
@@ -220,7 +236,7 @@ impl Writer<'_, '_, '_> {
             }
             Constant::Complex { real, imag } => {
                 let object = self.constant_object(value);
-                let Some(flag) = self.begin_object(object, force_reference) else {
+                let Some(flag) = self.begin_object(object, reference_mode) else {
                     return;
                 };
                 self.byte(TYPE_BINARY_COMPLEX | flag);
@@ -229,20 +245,20 @@ impl Writer<'_, '_, '_> {
             }
             Constant::String(string) => {
                 let object = self.constant_object(value);
-                self.string_with_object(object, string, force_reference);
+                self.string_with_object(object, string, reference_mode);
             }
             Constant::SurrogateString(string) => {
                 let object = self.constant_object(value);
-                self.surrogate_string_with_object(object, string, force_reference);
+                self.surrogate_string_with_object(object, string, reference_mode);
             }
             Constant::Bytes(bytes) => {
                 let object = self.constant_object(value);
-                self.bytes_with_object(object, bytes, force_reference);
+                self.bytes_with_object(object, bytes, reference_mode);
             }
-            Constant::Tuple(values) => self.constants(values, force_reference),
+            Constant::Tuple(values) => self.constants(values, reference_mode),
             Constant::FrozenSet(values) => {
                 let object = self.constant_object(value);
-                let Some(flag) = self.begin_object(object, force_reference) else {
+                let Some(flag) = self.begin_object(object, reference_mode) else {
                     return;
                 };
                 self.byte(TYPE_FROZENSET | flag);
@@ -253,12 +269,12 @@ impl Writer<'_, '_, '_> {
                         .expect("marshal frozenset exceeds 4 GiB"),
                 );
                 for (_, value) in frozen_set_members_in_wire_order(values) {
-                    self.constant_with_force(value, true);
+                    self.constant_with_reference_mode(value, ReferenceMode::Forced);
                 }
             }
             Constant::Slice { lower, upper, step } => {
                 let object = self.constant_object(value);
-                let Some(flag) = self.begin_object(object, force_reference) else {
+                let Some(flag) = self.begin_object(object, reference_mode) else {
                     return;
                 };
                 self.byte(TYPE_SLICE | flag);
@@ -266,7 +282,7 @@ impl Writer<'_, '_, '_> {
                 self.slice_member(upper);
                 self.slice_member(step);
             }
-            Constant::Code(code) => self.write_code(code, false),
+            Constant::Code(code) => self.write_code(code, ReferenceMode::IfShared),
         }
     }
 
@@ -278,7 +294,7 @@ impl Writer<'_, '_, '_> {
         let object = self.next_object(ObjectLocation::SliceMember(
             std::ptr::from_ref(value).addr(),
         ));
-        let Some(flag) = self.begin_object(object, false) else {
+        let Some(flag) = self.begin_object(object, ReferenceMode::IfShared) else {
             return;
         };
         match value {
@@ -378,8 +394,8 @@ impl Writer<'_, '_, '_> {
         }
     }
 
-    fn integer(&mut self, object: ObjectId, value: u64, force_reference: bool) {
-        let Some(flag) = self.begin_object(object, force_reference) else {
+    fn integer(&mut self, object: ObjectId, value: u64, reference_mode: ReferenceMode) {
+        let Some(flag) = self.begin_object(object, reference_mode) else {
             return;
         };
         if let Ok(value) = i32::try_from(value) {
@@ -399,8 +415,8 @@ impl Writer<'_, '_, '_> {
         }
     }
 
-    fn signed_integer(&mut self, object: ObjectId, value: i64, force_reference: bool) {
-        let Some(flag) = self.begin_object(object, force_reference) else {
+    fn signed_integer(&mut self, object: ObjectId, value: i64, reference_mode: ReferenceMode) {
+        let Some(flag) = self.begin_object(object, reference_mode) else {
             return;
         };
         if let Ok(value) = i32::try_from(value) {
@@ -426,9 +442,9 @@ impl Writer<'_, '_, '_> {
         object: ObjectId,
         value: &[u16],
         negative: bool,
-        force_reference: bool,
+        reference_mode: ReferenceMode,
     ) {
-        let Some(flag) = self.begin_object(object, force_reference) else {
+        let Some(flag) = self.begin_object(object, reference_mode) else {
             return;
         };
         self.byte(TYPE_LONG | flag);
@@ -443,9 +459,9 @@ impl Writer<'_, '_, '_> {
         }
     }
 
-    fn write_code(&mut self, code: &CodeObject, force_reference: bool) {
+    fn write_code(&mut self, code: &CodeObject, reference_mode: ReferenceMode) {
         let object = self.next_object(ObjectLocation::Code(std::ptr::from_ref(code).addr()));
-        let Some(flag) = self.begin_object(object, force_reference) else {
+        let Some(flag) = self.begin_object(object, reference_mode) else {
             return;
         };
         self.byte(TYPE_CODE | flag);
@@ -455,18 +471,18 @@ impl Writer<'_, '_, '_> {
         self.long(code.stack_size);
         self.long(code.flags);
         let bytecode = self.next_object(ObjectLocation::CodeBytes(std::ptr::from_ref(code).addr()));
-        self.bytes_with_object(bytecode, &code.bytecode, true);
-        self.constants(&code.constants, false);
-        self.strings(&code.names, false);
+        self.bytes_with_object(bytecode, &code.bytecode, ReferenceMode::Forced);
+        self.constants(&code.constants, ReferenceMode::IfShared);
+        self.strings(&code.names, ReferenceMode::IfShared);
         self.locals(code);
         let local_kinds =
             self.next_object(ObjectLocation::LocalKinds(std::ptr::from_ref(code).addr()));
-        self.bytes_with_object(local_kinds, &code.local_kinds, false);
+        self.bytes_with_object(local_kinds, &code.local_kinds, ReferenceMode::IfShared);
         self.string(&code.filename);
         self.string(&code.name);
         self.string(&code.qualified_name);
         self.long(code.first_line_number);
-        self.bytes(&code.line_table, false);
-        self.bytes(&code.exception_table, false);
+        self.bytes(&code.line_table, ReferenceMode::IfShared);
+        self.bytes(&code.exception_table, ReferenceMode::IfShared);
     }
 }
