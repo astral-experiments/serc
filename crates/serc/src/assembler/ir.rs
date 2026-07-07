@@ -88,28 +88,50 @@ pub(super) enum Operand {
     Backward(Label),
 }
 
-bitflags::bitflags! {
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub(super) struct InstructionFlags: u16 {
-        const FORCE_OWNED_LOAD = 1 << 0;
-        const STRICT_OWNED_LOAD = 1 << 1;
-        // Whether an unlocated block ending here may be inlined into predecessors.
-        const ALLOW_NO_LOCATION_BLOCK_INLINING = 1 << 5;
-        const PRESERVE_NO_LOCATION = 1 << 6;
-        const PREVENT_FUSION_WITH_NEXT = 1 << 7;
-        const PREVENT_FUSION_WITH_PREVIOUS = 1 << 8;
-        const CONVERTED_POP_BLOCK = 1 << 11;
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct LoadPolicy {
+    pub(super) force_owned: bool,
+    pub(super) strict_owned: bool,
+}
+
+impl LoadPolicy {
+    const fn fused(first: Self, second: Self) -> Self {
+        Self {
+            force_owned: first.force_owned || second.force_owned,
+            strict_owned: first.strict_owned || second.strict_owned,
+        }
     }
 }
 
-impl InstructionFlags {
-    pub(super) const FUSE_OR: Self = Self::FORCE_OWNED_LOAD
-        .union(Self::STRICT_OWNED_LOAD)
-        .union(Self::ALLOW_NO_LOCATION_BLOCK_INLINING)
-        .union(Self::PRESERVE_NO_LOCATION)
-        .union(Self::CONVERTED_POP_BLOCK);
-    pub(super) const FUSE_FROM_FIRST: Self = Self::PREVENT_FUSION_WITH_PREVIOUS;
-    pub(super) const FUSE_FROM_SECOND: Self = Self::PREVENT_FUSION_WITH_NEXT;
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct NoLocationPolicy {
+    /// Whether an unlocated block ending at this instruction may be inlined.
+    pub(super) allow_block_inlining: bool,
+    pub(super) preserve: bool,
+}
+
+impl NoLocationPolicy {
+    const fn fused(first: Self, second: Self) -> Self {
+        Self {
+            allow_block_inlining: first.allow_block_inlining || second.allow_block_inlining,
+            preserve: first.preserve || second.preserve,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct FusionPolicy {
+    pub(super) prevent_with_previous: bool,
+    pub(super) prevent_with_next: bool,
+}
+
+impl FusionPolicy {
+    const fn fused(first: Self, second: Self) -> Self {
+        Self {
+            prevent_with_previous: first.prevent_with_previous,
+            prevent_with_next: second.prevent_with_next,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -309,7 +331,10 @@ pub(super) struct Instruction {
     pub(super) operand: Operand,
     pub(super) location: SourceLocation,
     pub(super) depth_after: Option<u32>,
-    pub(super) flags: InstructionFlags,
+    pub(super) load_policy: LoadPolicy,
+    pub(super) no_location_policy: NoLocationPolicy,
+    pub(super) fusion_policy: FusionPolicy,
+    pub(super) converted_pop_block: bool,
     pub(super) jump_policy: JumpPolicy,
     // `NOT_TAKEN` is added after CPython labels exception handlers. The new instruction keeps
     // whatever exception target remains in its reused CFG slot, if there is one.
@@ -331,7 +356,10 @@ impl Instruction {
             operand,
             location,
             depth_after,
-            flags: InstructionFlags::empty(),
+            load_policy: LoadPolicy::default(),
+            no_location_policy: NoLocationPolicy::default(),
+            fusion_policy: FusionPolicy::default(),
+            converted_pop_block: false,
             jump_policy: JumpPolicy::default(),
             exception_policy: ExceptionPolicy::default(),
             borrow_fallthrough: BorrowFallthrough::default(),
@@ -350,30 +378,20 @@ impl Instruction {
         instruction
     }
 
-    pub(super) const fn has_flag(&self, flag: InstructionFlags) -> bool {
-        self.flags.contains(flag)
-    }
-
-    pub(super) fn insert_flag(&mut self, flag: InstructionFlags) {
-        self.flags.insert(flag);
-    }
-
-    pub(super) fn set_flag(&mut self, flag: InstructionFlags, enabled: bool) {
-        self.flags.set(flag, enabled);
-    }
-
     /// Combines the provenance of two instructions replaced by one superinstruction.
     pub(super) fn fused(opcode: Opcode, operand: Operand, first: Self, second: Self) -> Self {
-        let flags = ((first.flags | second.flags) & InstructionFlags::FUSE_OR)
-            | (first.flags & InstructionFlags::FUSE_FROM_FIRST)
-            | (second.flags & InstructionFlags::FUSE_FROM_SECOND);
-
         Self {
             opcode,
             operand,
             location: first.location,
             depth_after: second.depth_after,
-            flags,
+            load_policy: LoadPolicy::fused(first.load_policy, second.load_policy),
+            no_location_policy: NoLocationPolicy::fused(
+                first.no_location_policy,
+                second.no_location_policy,
+            ),
+            fusion_policy: FusionPolicy::fused(first.fusion_policy, second.fusion_policy),
+            converted_pop_block: first.converted_pop_block || second.converted_pop_block,
             jump_policy: JumpPolicy::fused(first.jump_policy, second.jump_policy),
             exception_policy: first.exception_policy.merged(second.exception_policy),
             borrow_fallthrough: second.borrow_fallthrough,

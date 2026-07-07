@@ -1,14 +1,20 @@
-use super::ir::{BorrowFallthrough, ExceptionPolicy, JumpPolicy, RetainedJumpNop};
+use super::ir::{
+    BorrowFallthrough, ExceptionPolicy, FusionPolicy, JumpPolicy, LoadPolicy, NoLocationPolicy,
+    RetainedJumpNop,
+};
 use super::{
-    Assembler, AssemblerStage, ExceptionExclusion, Instruction, InstructionFlags, Item,
-    NormalizedExceptionOwner, Operand, SourceLocation,
+    Assembler, AssemblerStage, ExceptionExclusion, Instruction, Item, NormalizedExceptionOwner,
+    Operand, SourceLocation,
 };
 use crate::target::opcodes::*;
 
 #[test]
 fn instruction_constructors_set_audited_defaults() {
     let regular = Instruction::new(LOAD_CONST, Operand::Value(0), SourceLocation::NONE, None);
-    assert_eq!(regular.flags, InstructionFlags::empty());
+    assert_eq!(regular.load_policy, LoadPolicy::default());
+    assert_eq!(regular.no_location_policy, NoLocationPolicy::default());
+    assert_eq!(regular.fusion_policy, FusionPolicy::default());
+    assert!(!regular.converted_pop_block);
     assert_eq!(regular.jump_policy, JumpPolicy::default());
 
     let synthetic = Instruction::synthetic(NOP, Operand::Value(0), SourceLocation::NONE, None);
@@ -114,6 +120,14 @@ fn deferred_jump_removal_promotes_post_threading_nop_retention() {
 #[should_panic(expected = "deferring redundant jump removal requires a preceding instruction")]
 fn jump_policy_mutation_requires_a_preceding_instruction() {
     Assembler::default().defer_last_jump_removal();
+}
+
+#[test]
+#[should_panic(
+    expected = "preventing fusion with the next instruction requires a preceding instruction"
+)]
+fn instruction_policy_mutation_requires_a_preceding_instruction() {
+    Assembler::default().prevent_last_instruction_fusion();
 }
 
 #[test]
@@ -224,23 +238,6 @@ fn jump_emission_attaches_exception_policy_after_an_intervening_label() {
 }
 
 #[test]
-fn fusion_classifies_every_instruction_flag() {
-    let mut classified = InstructionFlags::empty();
-    for policy in [
-        InstructionFlags::FUSE_OR,
-        InstructionFlags::FUSE_FROM_FIRST,
-        InstructionFlags::FUSE_FROM_SECOND,
-    ] {
-        assert!(
-            (classified & policy).is_empty(),
-            "fusion policies overlap at {policy:?}"
-        );
-        classified.insert(policy);
-    }
-    assert_eq!(classified, InstructionFlags::all());
-}
-
-#[test]
 fn exception_exclusion_names_layout_policy() {
     assert!(!ExceptionExclusion::None.applies(1));
     assert!(!ExceptionExclusion::IfExtended.applies(0));
@@ -249,21 +246,17 @@ fn exception_exclusion_names_layout_policy() {
 }
 
 #[test]
-fn fusion_uses_each_flags_propagation_policy() {
+fn fusion_preserves_each_typed_instruction_policy() {
     let mut first = Instruction::new(
         LOAD_FAST,
         Operand::Value(1),
         SourceLocation::new(2, 2, 0, 1),
         Some(1),
     );
-    for flag in [
-        InstructionFlags::FORCE_OWNED_LOAD,
-        InstructionFlags::ALLOW_NO_LOCATION_BLOCK_INLINING,
-        InstructionFlags::CONVERTED_POP_BLOCK,
-        InstructionFlags::PREVENT_FUSION_WITH_NEXT,
-    ] {
-        first.insert_flag(flag);
-    }
+    first.load_policy.force_owned = true;
+    first.no_location_policy.allow_block_inlining = true;
+    first.converted_pop_block = true;
+    first.fusion_policy.prevent_with_next = true;
     first.jump_policy.allow_threading_target = false;
     first.jump_policy.defer_redundant_removal = true;
     first.jump_policy.retain_nop();
@@ -278,13 +271,9 @@ fn fusion_uses_each_flags_propagation_policy() {
         SourceLocation::new(2, 2, 2, 3),
         Some(2),
     );
-    for flag in [
-        InstructionFlags::STRICT_OWNED_LOAD,
-        InstructionFlags::PRESERVE_NO_LOCATION,
-        InstructionFlags::PREVENT_FUSION_WITH_PREVIOUS,
-    ] {
-        second.insert_flag(flag);
-    }
+    second.load_policy.strict_owned = true;
+    second.no_location_policy.preserve = true;
+    second.fusion_policy.prevent_with_previous = true;
     second.jump_policy.inline_small_exit = false;
     second.jump_policy.preserve_nop_after_threading = true;
     second
@@ -296,21 +285,22 @@ fn fusion_uses_each_flags_propagation_policy() {
 
     let fused = Instruction::fused(LOAD_FAST_LOAD_FAST, Operand::Value(0x12), first, second);
 
-    for flag in [
-        InstructionFlags::FORCE_OWNED_LOAD,
-        InstructionFlags::STRICT_OWNED_LOAD,
-        InstructionFlags::ALLOW_NO_LOCATION_BLOCK_INLINING,
-        InstructionFlags::PRESERVE_NO_LOCATION,
-        InstructionFlags::CONVERTED_POP_BLOCK,
-    ] {
-        assert!(fused.has_flag(flag), "missing merged flag {flag:?}");
-    }
-    for flag in [
-        InstructionFlags::PREVENT_FUSION_WITH_NEXT,
-        InstructionFlags::PREVENT_FUSION_WITH_PREVIOUS,
-    ] {
-        assert!(!fused.has_flag(flag), "unexpected merged flag {flag:?}");
-    }
+    assert_eq!(
+        fused.load_policy,
+        LoadPolicy {
+            force_owned: true,
+            strict_owned: true,
+        }
+    );
+    assert_eq!(
+        fused.no_location_policy,
+        NoLocationPolicy {
+            allow_block_inlining: true,
+            preserve: true,
+        }
+    );
+    assert_eq!(fused.fusion_policy, FusionPolicy::default());
+    assert!(fused.converted_pop_block);
     assert_eq!(fused.location, first.location);
     assert_eq!(fused.depth_after, second.depth_after);
     assert_eq!(
@@ -333,26 +323,24 @@ fn fusion_uses_each_flags_propagation_policy() {
     );
 
     let mut first_edge = Instruction::new(LOAD_FAST, Operand::Value(1), SourceLocation::NONE, None);
-    first_edge.insert_flag(InstructionFlags::PREVENT_FUSION_WITH_PREVIOUS);
+    first_edge.fusion_policy.prevent_with_previous = true;
     first_edge.borrow_fallthrough = BorrowFallthrough::Barrier;
     let mut second_edge =
         Instruction::new(LOAD_FAST, Operand::Value(2), SourceLocation::NONE, None);
-    second_edge.insert_flag(InstructionFlags::PREVENT_FUSION_WITH_NEXT);
+    second_edge.fusion_policy.prevent_with_next = true;
     let fused_edges = Instruction::fused(
         LOAD_FAST_LOAD_FAST,
         Operand::Value(0x12),
         first_edge,
         second_edge,
     );
-    for flag in [
-        InstructionFlags::PREVENT_FUSION_WITH_NEXT,
-        InstructionFlags::PREVENT_FUSION_WITH_PREVIOUS,
-    ] {
-        assert!(
-            fused_edges.has_flag(flag),
-            "missing edge-selected flag {flag:?}"
-        );
-    }
+    assert_eq!(
+        fused_edges.fusion_policy,
+        FusionPolicy {
+            prevent_with_previous: true,
+            prevent_with_next: true,
+        }
+    );
     assert_eq!(fused_edges.jump_policy, JumpPolicy::default());
     assert_eq!(fused_edges.borrow_fallthrough, BorrowFallthrough::Reachable);
 }
@@ -365,8 +353,8 @@ fn owned_fast_loads_use_real_opcodes_with_provenance() {
         panic!("owned load was not emitted");
     };
     assert_eq!(instruction.opcode, LOAD_FAST);
-    assert!(instruction.has_flag(InstructionFlags::FORCE_OWNED_LOAD));
-    assert!(!instruction.has_flag(InstructionFlags::STRICT_OWNED_LOAD));
+    assert!(instruction.load_policy.force_owned);
+    assert!(!instruction.load_policy.strict_owned);
 }
 
 #[test]
@@ -610,7 +598,7 @@ fn redundant_nop_removal_preserves_forward_scan_semantics() {
         Item::Instruction(instruction) => instruction,
         Item::Label(_) => unreachable!(),
     };
-    converted.insert_flag(InstructionFlags::CONVERTED_POP_BLOCK);
+    converted.converted_pop_block = true;
     let mut assembler = assembler_with_graph(vec![
         pass_instruction(NOP, 0, 1),
         Item::Label(super::Label(0)),

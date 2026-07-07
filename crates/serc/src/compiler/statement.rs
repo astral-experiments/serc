@@ -30,7 +30,7 @@ use super::expression::{
 };
 use super::scope::{NameId, ReferenceCollector, collect_target_names};
 use super::source::{implicit_return_range, unparse_annotation};
-use super::symbol::{ReraiseStackState, statement_name, to_u32, unsupported};
+use super::symbol::{ReraiseStackState, ResumeDepth, statement_name, to_u32, unsupported};
 use super::{Compiler, Scope};
 
 #[derive(Clone, Copy, Debug)]
@@ -41,8 +41,24 @@ struct LoopContext {
     with_depth: usize,
     finally_end_depth: usize,
     exception_region_depth: usize,
-    break_returns: bool,
-    preserve_break_exit: bool,
+    break_policy: LoopBreakPolicy,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LoopBreakPolicy {
+    Return,
+    Jump,
+    PreserveJumpExit,
+}
+
+impl LoopBreakPolicy {
+    const fn returns(self) -> bool {
+        matches!(self, Self::Return)
+    }
+
+    const fn preserves_jump_exit(self) -> bool {
+        matches!(self, Self::PreserveJumpExit)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -154,8 +170,7 @@ impl Compiler {
         continue_label: Label,
         break_label: Label,
         iterator_cleanup: IteratorCleanup,
-        break_returns: bool,
-        preserve_break_exit: bool,
+        break_policy: LoopBreakPolicy,
     ) -> LoopContext {
         LoopContext {
             continue_label,
@@ -164,8 +179,7 @@ impl Compiler {
             with_depth: self.control.active_with_exits.len(),
             finally_end_depth: self.control.active_finally_end_blocks,
             exception_region_depth: self.control.active_exception_region_exclusions.len(),
-            break_returns,
-            preserve_break_exit,
+            break_policy,
         }
     }
 
@@ -183,6 +197,14 @@ impl Compiler {
         );
         self.control.loops.truncate(previous_depth);
         result
+    }
+
+    fn loop_break_policy(&self, range: ruff_text_size::TextRange) -> LoopBreakPolicy {
+        if self.control.preserve_finally_break_exit_loop_range == Some(range) {
+            LoopBreakPolicy::PreserveJumpExit
+        } else {
+            LoopBreakPolicy::Jump
+        }
     }
 
     fn with_exception_handler<T>(
@@ -653,7 +675,12 @@ impl Compiler {
         {
             self.add_constant(constant)?;
         }
-        let context = self.loop_context(start, condition_false, IteratorCleanup::None, true, false);
+        let context = self.loop_context(
+            start,
+            condition_false,
+            IteratorCleanup::None,
+            LoopBreakPolicy::Return,
+        );
         self.with_loop_context(context, |compiler| compiler.compile_suite(&statement.body))?;
         if !suite_terminates(&statement.body) {
             if let Some(location) = self.assembler.last_instruction_location() {
@@ -691,7 +718,12 @@ impl Compiler {
             })
             .collect::<Result<Vec<_>, CompileError>>()?;
 
-        let context = self.loop_context(start, exits[0].1, IteratorCleanup::None, true, false);
+        let context = self.loop_context(
+            start,
+            exits[0].1,
+            IteratorCleanup::None,
+            LoopBreakPolicy::Return,
+        );
         let body_start = self.assembler.instruction_count();
         self.with_loop_context(context, |compiler| compiler.compile_suite(&statement.body))?;
         if !suite_terminates(&statement.body) {
@@ -1434,7 +1466,7 @@ impl Compiler {
                     IteratorCleanup::Sync => self.emit(POP_TOP, 0, -1)?,
                     IteratorCleanup::Async => self.emit(POP_TOP, 0, -1)?,
                 }
-                if context.break_returns {
+                if context.break_policy.returns() {
                     self.emit_implicit_return()?;
                 } else {
                     let jump_exclusion_start =
@@ -1449,7 +1481,7 @@ impl Compiler {
                             start
                         });
                     self.emit_jump_forward(JUMP_FORWARD, context.break_label, 0)?;
-                    if context.preserve_break_exit {
+                    if context.break_policy.preserves_jump_exit() {
                         // CPython inlines small exit blocks before removing a jump to the next
                         // block. Keep this terminal protected-loop break through that pass so
                         // the following finally return is copied onto the edge.
@@ -2218,7 +2250,8 @@ impl Compiler {
 
         self.assembler.mark(body_label);
         self.set_depth(base_depth);
-        let context = self.loop_context(start, restart, IteratorCleanup::None, false, false);
+        let context =
+            self.loop_context(start, restart, IteratorCleanup::None, LoopBreakPolicy::Jump);
         let body_start = self.assembler.instruction_count();
         let tail_jumps = self.with_loop_context(context, |compiler| {
             compiler.with_control_override(
@@ -2613,8 +2646,7 @@ impl Compiler {
                 start,
                 end,
                 IteratorCleanup::None,
-                false,
-                self.control.preserve_finally_break_exit_loop_range == Some(statement.range),
+                self.loop_break_policy(statement.range),
             );
             let body_start = self.assembler.instruction_count();
             let tail_jumps = self.with_loop_context(context, |compiler| {
@@ -2655,8 +2687,7 @@ impl Compiler {
             start,
             end,
             IteratorCleanup::None,
-            false,
-            self.control.preserve_finally_break_exit_loop_range == Some(statement.range),
+            self.loop_break_policy(statement.range),
         );
         let body_start = self.assembler.instruction_count();
         let tail_jumps = self.with_loop_context(context, |compiler| {
@@ -2720,8 +2751,7 @@ impl Compiler {
             start,
             end,
             IteratorCleanup::Sync,
-            false,
-            self.control.preserve_finally_break_exit_loop_range == Some(statement.range),
+            self.loop_break_policy(statement.range),
         );
         let body_start = self.assembler.instruction_count();
         let tail_jumps = self.with_loop_context(context, |compiler| {
@@ -2814,7 +2844,7 @@ impl Compiler {
         self.assembler.mark(yielded);
         self.emit(YIELD_VALUE, 1, 0)?;
         self.assembler.mark(yielded_end);
-        self.emit_resume(ResumeLocation::AFTER_AWAIT, false)?;
+        self.emit_resume(ResumeLocation::AFTER_AWAIT, ResumeDepth::Zero)?;
         self.emit_jump_backward(JUMP_BACKWARD_NO_INTERRUPT, send, 0)?;
         self.assembler.mark(send_end);
         self.set_depth(base_depth + 3);
@@ -2827,8 +2857,7 @@ impl Compiler {
             start,
             end,
             IteratorCleanup::Async,
-            false,
-            self.control.preserve_finally_break_exit_loop_range == Some(statement.range),
+            self.loop_break_policy(statement.range),
         );
         let body_start = self.assembler.instruction_count();
         let tail_jumps = self.with_loop_context(context, |compiler| {
@@ -3549,7 +3578,7 @@ impl Compiler {
                         self.emit(POP_TOP, 0, -1)?;
                     }
                 }
-                if context.break_returns {
+                if context.break_policy.returns() {
                     self.emit_implicit_return()?;
                 } else {
                     self.emit_jump_forward(JUMP_BACKWARD, context.break_label, 0)?;
@@ -4632,7 +4661,7 @@ impl Compiler {
             IteratorCleanup::None => {}
             IteratorCleanup::Sync | IteratorCleanup::Async => self.emit(POP_TOP, 0, -1)?,
         }
-        if context.break_returns {
+        if context.break_policy.returns() {
             self.emit_implicit_return()?;
         } else {
             self.emit_jump_forward(JUMP_FORWARD, context.break_label, 0)?;
@@ -4651,7 +4680,7 @@ impl Compiler {
             IteratorCleanup::None => {}
             IteratorCleanup::Sync | IteratorCleanup::Async => self.emit(POP_TOP, 0, -1)?,
         }
-        if context.break_returns {
+        if context.break_policy.returns() {
             self.emit_implicit_return()?;
         } else {
             self.emit_jump_forward(JUMP_FORWARD, context.break_label, 0)?;

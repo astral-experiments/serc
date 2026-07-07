@@ -3,8 +3,8 @@ use rustc_hash::FxHashSet;
 use super::super::{
     BorrowFallthrough, CHECK_EXC_MATCH, COMPARE_OP, COPY, DELETE_DEREF, DELETE_FAST, DICT_MERGE,
     DICT_UPDATE, END_SEND, FOR_ITER, FORMAT_SIMPLE, GET_ANEXT, GET_LEN, GET_YIELD_FROM_ITER,
-    IMPORT_FROM, Instruction, InstructionFlags, Item, LIST_APPEND, LIST_EXTEND, LOAD_ATTR,
-    LOAD_COMMON_CONSTANT, LOAD_CONST, LOAD_FAST, LOAD_FAST_AND_CLEAR, LOAD_FAST_BORROW,
+    IMPORT_FROM, Instruction, Item, LIST_APPEND, LIST_EXTEND, LOAD_ATTR, LOAD_COMMON_CONSTANT,
+    LOAD_CONST, LOAD_FAST, LOAD_FAST_AND_CLEAR, LOAD_FAST_BORROW,
     LOAD_FAST_BORROW_LOAD_FAST_BORROW, LOAD_FAST_CHECK, LOAD_FAST_LOAD_FAST, LOAD_SMALL_INT,
     LOAD_SPECIAL, LOAD_SUPER_ATTR, MAP_ADD, MATCH_KEYS, MATCH_MAPPING, MATCH_SEQUENCE, NOP,
     Operand, POP_EXCEPT, POP_TOP, PUSH_EXC_INFO, RERAISE, RETURN_VALUE, SEND, SET_ADD,
@@ -657,17 +657,14 @@ impl Assembler {
                 if unsafe_loads.contains(&position) {
                     continue;
                 }
-                let (force_owned_load, strict_owned_load) = match *graph.item(position) {
-                    Item::Instruction(instruction) => (
-                        instruction.has_flag(InstructionFlags::FORCE_OWNED_LOAD),
-                        instruction.has_flag(InstructionFlags::STRICT_OWNED_LOAD),
-                    ),
+                let load_policy = match *graph.item(position) {
+                    Item::Instruction(instruction) => instruction.load_policy,
                     Item::Label(_) => unreachable!(),
                 };
-                if strict_owned_load {
+                if load_policy.strict_owned {
                     continue;
                 }
-                if force_owned_load {
+                if load_policy.force_owned {
                     let following = instruction_positions[index + 1..]
                         .iter()
                         .filter_map(|position| match *graph.item(*position) {
@@ -713,9 +710,9 @@ impl Assembler {
             let (Item::Instruction(first), Item::Instruction(second)) = (first, second) else {
                 return None;
             };
-            if first.has_flag(InstructionFlags::PREVENT_FUSION_WITH_NEXT)
+            if first.fusion_policy.prevent_with_next
                 || first.borrow_fallthrough == BorrowFallthrough::Barrier
-                || second.has_flag(InstructionFlags::PREVENT_FUSION_WITH_PREVIOUS)
+                || second.fusion_policy.prevent_with_previous
             {
                 return None;
             }

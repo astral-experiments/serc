@@ -34,7 +34,7 @@ use super::source::{CompilationContext, implicit_return_range};
 use super::statement::{
     ControlFlowState, statement_uses_implicit_return_location, suite_terminates,
 };
-use super::symbol::{ReraiseStackState, SymbolState, to_u32};
+use super::symbol::{ReraiseStackState, ResumeDepth, SymbolState, to_u32};
 use super::{Compiler, SHADOWED_SUPER_SENTINEL, Scope};
 
 #[derive(Debug)]
@@ -334,7 +334,7 @@ impl Compiler {
             self.emit(MAKE_CELL, annotation_cell, 0)?;
         }
         self.assembler.set_location(SourceLocation::new(0, 1, 0, 0));
-        self.emit_resume(ResumeLocation::AT_FUNC_START, false)?;
+        self.emit_resume(ResumeLocation::AT_FUNC_START, ResumeDepth::Zero)?;
         if module_annotations {
             self.name_index("__conditional_annotations__")?;
             if let Some(statement) = body.first() {
@@ -465,7 +465,7 @@ impl Compiler {
         let line = i32::try_from(self.unit.first_line_number).unwrap_or(i32::MAX);
         self.assembler
             .set_location(SourceLocation::new(line, line, 0, 0));
-        self.emit_resume(ResumeLocation::AT_FUNC_START, false)?;
+        self.emit_resume(ResumeLocation::AT_FUNC_START, ResumeDepth::Zero)?;
         self.load_name("__name__")?;
         self.store_name("__module__")?;
         let qualified_name =
@@ -822,7 +822,7 @@ impl Compiler {
         let line = i32::try_from(self.unit.first_line_number).unwrap_or(i32::MAX);
         self.assembler
             .set_location(SourceLocation::new(line, line, 0, 0));
-        self.emit_resume(ResumeLocation::AT_FUNC_START, false)
+        self.emit_resume(ResumeLocation::AT_FUNC_START, ResumeDepth::Zero)
     }
 }
 
