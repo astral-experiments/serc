@@ -38,6 +38,17 @@ impl<'a> ObjectGraph<'a> {
     ) -> (ObjectId, bool) {
         let (id, first) = self.record_object(object.key, object.interned);
         if first && let PlannedValue::Code(code) = value {
+            // Every code object contributes ten object-bearing structural children, plus at most
+            // one object for each direct constant, name, and local.
+            const STRUCTURAL_CHILDREN: usize = 10;
+            let direct_children = code
+                .constants
+                .len()
+                .saturating_add(code.names.len())
+                .saturating_add(code.locals.len())
+                .saturating_add(STRUCTURAL_CHILDREN);
+            self.objects.reserve(direct_children);
+            self.objects_by_id.reserve(direct_children);
             self.explicitly_interned
                 .extend(code.interned_constant_strings.iter().map(String::as_str));
         }
