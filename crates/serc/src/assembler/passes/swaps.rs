@@ -149,8 +149,8 @@ impl OptimizationPipeline {
                     loop {
                         if stack_index != 0 {
                             current -= 1;
-                            let Item::Instruction(instruction) =
-                                graph.item_mut(instruction_positions[current])
+                            let Some(instruction) =
+                                graph.instruction_mut(instruction_positions[current])
                             else {
                                 unreachable!();
                             };
@@ -169,8 +169,7 @@ impl OptimizationPipeline {
                 }
                 while current > position {
                     current -= 1;
-                    let Item::Instruction(instruction) =
-                        graph.item_mut(instruction_positions[current])
+                    let Some(instruction) = graph.instruction_mut(instruction_positions[current])
                     else {
                         unreachable!();
                     };
@@ -312,15 +311,17 @@ impl OptimizationPipeline {
                     }
                 }
 
-                let Item::Instruction(swap) = graph.item_mut(positions[index]) else {
+                let Some(swap) = graph.instruction_mut(positions[index]) else {
                     unreachable!();
                 };
                 swap.opcode = NOP;
                 swap.operand = Operand::Value(0);
-                let first_item = *graph.item(positions[first]);
-                let last_item = *graph.item(positions[last]);
-                *graph.item_mut(positions[first]) = last_item;
-                *graph.item_mut(positions[last]) = first_item;
+                *graph
+                    .instruction_mut(positions[first])
+                    .expect("swappable item is an instruction") = last_instruction;
+                *graph
+                    .instruction_mut(positions[last])
+                    .expect("swappable item is an instruction") = first_instruction;
             }
         }
     }

@@ -298,7 +298,7 @@ impl OptimizationPipeline {
             })
             .collect::<FxHashMap<_, _>>();
         for (index, position) in item_positions.into_iter().enumerate() {
-            let Item::Instruction(instruction) = graph.item_mut(position) else {
+            let Some(instruction) = graph.instruction_mut(position) else {
                 continue;
             };
             let target = match instruction.operand {
@@ -664,14 +664,9 @@ impl OptimizationPipeline {
                     .iter()
                     .rposition(|item| matches!(item, Item::Instruction(_)))
                 {
-                    graph[source].items_mut().remove(position);
+                    graph.remove_item_at(source, position);
                 }
-            } else if let Some(Item::Instruction(instruction)) = graph[source]
-                .items_mut()
-                .iter_mut()
-                .rev()
-                .find(|item| matches!(item, Item::Instruction(_)))
-            {
+            } else if let Some(instruction) = graph.instructions_mut(source).next_back() {
                 instruction.retarget(Operand::Forward(copied_label));
             }
             if inline_no_location_block {
@@ -750,10 +745,7 @@ impl OptimizationPipeline {
                                 .map(|instruction| instruction.location)
                         })
                 })
-                && let Some(Item::Instruction(first)) = graph[target]
-                    .items_mut()
-                    .iter_mut()
-                    .find(|item| matches!(item, Item::Instruction(_)))
+                && let Some(first) = graph.instructions_mut(target).next()
             {
                 // A converted `POP_BLOCK` inherits the line of its sole jump predecessor.
                 // This remains observable when another predecessor copied the small exit.
@@ -784,10 +776,7 @@ impl OptimizationPipeline {
             }) else {
                 continue;
             };
-            if let Some(Item::Instruction(instruction)) = graph[target]
-                .items_mut()
-                .iter_mut()
-                .find(|item| matches!(item, Item::Instruction(_)))
+            if let Some(instruction) = graph.instructions_mut(target).next()
                 && !instruction.no_location_policy.preserve
             {
                 instruction.location = location;
@@ -799,9 +788,7 @@ impl OptimizationPipeline {
             if !drop_blocks.contains(&block) {
                 final_order.push(block);
             } else if exception_boundary_blocks.contains(&block) {
-                graph[block]
-                    .items_mut()
-                    .retain(|item| matches!(item, Item::Label(_)));
+                graph.retain_items(block, |item| matches!(item, Item::Label(_)));
                 final_order.push(block);
             }
             for copied in inline_copies.remove(&block).unwrap_or_default() {

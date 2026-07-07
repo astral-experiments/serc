@@ -51,10 +51,7 @@ impl OptimizationPipeline {
             let graph = &mut self.graph;
             let mut unsafe_locals = vec![true; local_count];
             unsafe_locals[..parameter_count.min(local_count).min(64)].fill(false);
-            for item in graph[order[0]].items_mut() {
-                let Item::Instruction(instruction) = item else {
-                    continue;
-                };
+            for instruction in graph.instructions_mut(order[0]) {
                 let Operand::Value(argument) = instruction.operand else {
                     continue;
                 };
@@ -233,7 +230,7 @@ impl OptimizationPipeline {
 
         let graph = &mut self.graph;
         for position in positions {
-            let Item::Instruction(instruction) = graph.item_mut(position) else {
+            let Some(instruction) = graph.instruction_mut(position) else {
                 continue;
             };
             match instruction.opcode {
@@ -262,10 +259,7 @@ impl OptimizationPipeline {
         let order = graph.order().to_vec();
         for block in order {
             let mut initialized = FxHashSet::default();
-            for item in graph[block].items_mut() {
-                let Item::Instruction(instruction) = item else {
-                    continue;
-                };
+            for instruction in graph.instructions_mut(block) {
                 let Operand::Value(argument) = instruction.operand else {
                     break;
                 };
@@ -671,7 +665,7 @@ impl OptimizationPipeline {
                         continue;
                     }
                 }
-                let Item::Instruction(instruction) = graph.item_mut(position) else {
+                let Some(instruction) = graph.instruction_mut(position) else {
                     unreachable!();
                 };
                 match instruction.opcode {
@@ -727,23 +721,22 @@ impl OptimizationPipeline {
         let graph = &mut self.graph;
         let order = graph.order().to_vec();
         for block in order {
-            let items = graph[block].items_mut();
+            let items = graph[block].items();
             let original_len = items.len();
+            let mut fused_items = Vec::with_capacity(original_len);
             let mut read = 0;
-            let mut write = 0;
             while read < original_len {
                 if let Some(second) = read.checked_add(1).filter(|index| *index < original_len)
                     && let Some(fused) = fuse_pair(items[read], items[second])
                 {
-                    items[write] = fused;
+                    fused_items.push(fused);
                     read += 2;
                 } else {
-                    items[write] = items[read];
+                    fused_items.push(items[read]);
                     read += 1;
                 }
-                write += 1;
             }
-            items.truncate(write);
+            graph.replace_items(block, fused_items);
         }
     }
 }

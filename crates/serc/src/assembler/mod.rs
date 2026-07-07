@@ -425,10 +425,7 @@ impl Assembler {
     }
 
     pub(crate) fn remap_constant_indices(&mut self, load_const: Opcode, index_map: &[Option<u32>]) {
-        let remap = |item: &mut Item| {
-            let Item::Instruction(instruction) = item else {
-                return;
-            };
+        let remap = |instruction: &mut Instruction| {
             if instruction.opcode != load_const {
                 return;
             }
@@ -442,10 +439,12 @@ impl Assembler {
         match &mut self.code {
             UnoptimizedCode::Linear(items) => {
                 for item in items {
-                    remap(item);
+                    if let Item::Instruction(instruction) = item {
+                        remap(instruction);
+                    }
                 }
             }
-            UnoptimizedCode::Prepared(graph) => graph.for_each_item_mut(remap),
+            UnoptimizedCode::Prepared(graph) => graph.for_each_instruction_mut(remap),
         }
     }
 

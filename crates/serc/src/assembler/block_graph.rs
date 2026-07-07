@@ -1,4 +1,4 @@
-use std::ops::{Index, IndexMut};
+use std::ops::{Index, Range};
 
 use rustc_hash::FxHashSet;
 
@@ -46,10 +46,6 @@ impl BasicBlock {
 
     pub(super) fn items(&self) -> &[Item] {
         &self.items
-    }
-
-    pub(super) fn items_mut(&mut self) -> &mut Vec<Item> {
-        &mut self.items
     }
 
     pub(super) fn first_label(&self) -> Option<Label> {
@@ -331,14 +327,14 @@ impl BlockGraph {
         let items = original_order
             .iter()
             .copied()
-            .flat_map(|block| std::mem::take(&mut self[block].items));
+            .flat_map(|block| std::mem::take(&mut self.blocks[block.index()].items));
         let segments = collect_segments(items, segment_lengths);
 
         let mut reusable = original_order.into_iter();
         let mut order = Vec::with_capacity(segments.len());
         for items in segments {
             if let Some(block) = reusable.next() {
-                self[block].items = items;
+                self.blocks[block.index()].items = items;
                 order.push(block);
             } else {
                 order.push(self.allocate_block(items));
@@ -420,14 +416,14 @@ impl BlockGraph {
         let items = original_order
             .iter()
             .copied()
-            .flat_map(|block| std::mem::take(&mut self[block].items));
+            .flat_map(|block| std::mem::take(&mut self.blocks[block.index()].items));
         let segments = collect_segments(items, segment_lengths);
 
         let mut reusable = original_order.into_iter();
         let mut order = Vec::with_capacity(segments.len());
         for items in segments {
             if let Some(block) = reusable.next() {
-                self[block].items = items;
+                self.blocks[block.index()].items = items;
                 order.push(block);
             } else {
                 order.push(self.allocate_block(items));
@@ -442,23 +438,50 @@ impl BlockGraph {
         block: BasicBlockId,
         items: impl IntoIterator<Item = Item>,
     ) {
-        let start = self[block].items.len();
-        self[block].items.extend(items);
-        let labels = self[block].items[start..]
-            .iter()
-            .filter_map(|item| match item {
-                Item::Label(label) => Some(*label),
-                Item::Instruction(_) => None,
-            })
-            .collect::<Vec<_>>();
-        for label in labels {
-            self.bind_label(label, block);
-        }
+        let end = self[block].items.len();
+        self.splice_items(block, end..end, items);
     }
 
     pub(super) fn insert_label(&mut self, block: BasicBlockId, position: usize, label: Label) {
-        self[block].items.insert(position, Item::Label(label));
-        self.bind_label(label, block);
+        self.splice_items(block, position..position, [Item::Label(label)]);
+    }
+
+    /// Removes one item while keeping label lookup synchronized.
+    pub(super) fn remove_item_at(&mut self, block: BasicBlockId, position: usize) -> Item {
+        let old_labels = self.block_labels(block);
+        let item = self.blocks[block.index()].items.remove(position);
+        self.refresh_block_labels(block, old_labels);
+        item
+    }
+
+    /// Retains items that satisfy `keep` while keeping label lookup synchronized.
+    pub(super) fn retain_items(
+        &mut self,
+        block: BasicBlockId,
+        mut keep: impl FnMut(&Item) -> bool,
+    ) {
+        let old_labels = self.block_labels(block);
+        self.blocks[block.index()].items.retain(|item| keep(item));
+        self.refresh_block_labels(block, old_labels);
+    }
+
+    /// Replaces all items in a block while preserving its stable identity.
+    pub(super) fn replace_items(&mut self, block: BasicBlockId, items: Vec<Item>) {
+        let old_labels = self.block_labels(block);
+        self.blocks[block.index()].items = items;
+        self.refresh_block_labels(block, old_labels);
+    }
+
+    /// Splices a block's items while keeping label lookup synchronized.
+    pub(super) fn splice_items(
+        &mut self,
+        block: BasicBlockId,
+        range: Range<usize>,
+        replace_with: impl IntoIterator<Item = Item>,
+    ) {
+        let old_labels = self.block_labels(block);
+        drop(self.blocks[block.index()].items.splice(range, replace_with));
+        self.refresh_block_labels(block, old_labels);
     }
 
     fn rebuild_label_index(&mut self) {
@@ -477,6 +500,31 @@ impl BlockGraph {
             }
         }
         self.label_blocks = label_blocks;
+    }
+
+    fn block_labels(&self, block: BasicBlockId) -> Vec<Label> {
+        self[block]
+            .items()
+            .iter()
+            .filter_map(|item| match item {
+                Item::Label(label) => Some(*label),
+                Item::Instruction(_) => None,
+            })
+            .collect()
+    }
+
+    fn refresh_block_labels(&mut self, block: BasicBlockId, old_labels: Vec<Label>) {
+        for label in old_labels {
+            if self.label_block(label) == Some(block) {
+                self.unbind_label(label);
+            }
+        }
+        if !self.order.contains(&block) {
+            return;
+        }
+        for label in self.block_labels(block) {
+            self.bind_label(label, block);
+        }
     }
 
     fn validate_order(&self, order: &[BasicBlockId]) -> Result<(), String> {
@@ -535,11 +583,42 @@ impl BlockGraph {
         self.iter().flat_map(|(_, block)| block.items())
     }
 
-    pub(super) fn for_each_item_mut(&mut self, mut visit: impl FnMut(&mut Item)) {
+    pub(super) fn for_each_instruction_mut(&mut self, mut visit: impl FnMut(&mut Instruction)) {
         let blocks = &mut self.blocks;
         for block in self.order.iter().copied() {
             for item in &mut blocks[block.index()].items {
-                visit(item);
+                if let Item::Instruction(instruction) = item {
+                    visit(instruction);
+                }
+            }
+        }
+    }
+
+    pub(super) fn instructions_mut(
+        &mut self,
+        block: BasicBlockId,
+    ) -> impl DoubleEndedIterator<Item = &mut Instruction> {
+        self.blocks[block.index()]
+            .items
+            .iter_mut()
+            .filter_map(|item| match item {
+                Item::Instruction(instruction) => Some(instruction),
+                Item::Label(_) => None,
+            })
+    }
+
+    pub(super) fn for_each_adjacent_instruction_pair_mut(
+        &mut self,
+        block: BasicBlockId,
+        mut visit: impl FnMut(&mut Instruction, &mut Instruction),
+    ) {
+        let items = &mut self.blocks[block.index()].items;
+        for index in 0..items.len().saturating_sub(1) {
+            let (before, after) = items.split_at_mut(index + 1);
+            if let (Item::Instruction(first), Item::Instruction(second)) =
+                (&mut before[index], &mut after[0])
+            {
+                visit(first, second);
             }
         }
     }
@@ -599,23 +678,19 @@ impl BlockGraph {
         &self[position.block].items[position.offset]
     }
 
-    pub(super) fn item_mut(&mut self, position: ItemPosition) -> &mut Item {
-        &mut self[position.block].items[position.offset]
+    pub(super) fn instruction_mut(&mut self, position: ItemPosition) -> Option<&mut Instruction> {
+        match &mut self.blocks[position.block.index()].items[position.offset] {
+            Item::Instruction(instruction) => Some(instruction),
+            Item::Label(_) => None,
+        }
     }
 
     pub(super) fn insert_item(&mut self, position: ItemPosition, item: Item) {
-        if let Item::Label(label) = item {
-            self.bind_label(label, position.block);
-        }
-        self[position.block].items.insert(position.offset, item);
+        self.splice_items(position.block, position.offset..position.offset, [item]);
     }
 
     pub(super) fn remove_item(&mut self, position: ItemPosition) -> Item {
-        let item = self[position.block].items.remove(position.offset);
-        if let Item::Label(label) = item {
-            self.unbind_label(label);
-        }
-        item
+        self.remove_item_at(position.block, position.offset)
     }
 
     pub(super) fn reachable_blocks(&self, exception_regions: &[ExceptionRegion]) -> Vec<bool> {
@@ -750,12 +825,6 @@ impl Index<BasicBlockId> for BlockGraph {
     }
 }
 
-impl IndexMut<BasicBlockId> for BlockGraph {
-    fn index_mut(&mut self, index: BasicBlockId) -> &mut Self::Output {
-        &mut self.blocks[index.index()]
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -839,6 +908,7 @@ mod tests {
         let dropped_label = Label(0);
         let retained_label = Label(1);
         let inserted_label = Label(2);
+        let omitted_label = Label(3);
         let mut graph = BlockGraph::from_items(
             vec![
                 Item::Label(dropped_label),
@@ -863,6 +933,110 @@ mod tests {
         assert_eq!(graph.label_block(inserted_label), Some(inserted));
         assert_eq!(inserted.index(), 2);
         assert!(!graph[dropped].items().is_empty());
+
+        graph.replace_items(
+            dropped,
+            vec![
+                Item::Label(omitted_label),
+                instruction(RETURN_VALUE, Operand::Value(0)),
+            ],
+        );
+
+        assert_eq!(graph.label_block(dropped_label), None);
+        assert_eq!(graph.label_block(omitted_label), None);
+        assert!(matches!(graph[dropped].items()[0], Item::Label(label) if label == omitted_label));
+        graph.validate().unwrap();
+    }
+
+    #[test]
+    fn removing_an_item_removes_its_label_from_lookup() {
+        let removed_label = Label(0);
+        let retained_label = Label(1);
+        let mut graph = BlockGraph::from_items(
+            vec![
+                Item::Label(removed_label),
+                Item::Label(retained_label),
+                instruction(RETURN_VALUE, Operand::Value(0)),
+            ],
+            &FxHashSet::default(),
+        );
+        let block = graph.block_at(0);
+
+        let removed = graph.remove_item_at(block, 0);
+
+        assert!(matches!(removed, Item::Label(label) if label == removed_label));
+        assert_eq!(graph.label_block(removed_label), None);
+        assert_eq!(graph.label_block(retained_label), Some(block));
+        graph.validate().unwrap();
+    }
+
+    #[test]
+    fn retaining_items_removes_discarded_labels_from_lookup() {
+        let removed_label = Label(0);
+        let retained_label = Label(1);
+        let mut graph = BlockGraph::from_items(
+            vec![
+                Item::Label(removed_label),
+                Item::Label(retained_label),
+                instruction(RETURN_VALUE, Operand::Value(0)),
+            ],
+            &FxHashSet::default(),
+        );
+        let block = graph.block_at(0);
+
+        graph.retain_items(
+            block,
+            |item| !matches!(item, Item::Label(label) if *label == removed_label),
+        );
+
+        assert_eq!(graph.label_block(removed_label), None);
+        assert_eq!(graph.label_block(retained_label), Some(block));
+        graph.validate().unwrap();
+    }
+
+    #[test]
+    fn replacing_items_replaces_labels_in_lookup() {
+        let old_label = Label(0);
+        let new_label = Label(1);
+        let mut graph = BlockGraph::from_items(
+            vec![
+                Item::Label(old_label),
+                instruction(RETURN_VALUE, Operand::Value(0)),
+            ],
+            &FxHashSet::default(),
+        );
+        let block = graph.block_at(0);
+
+        graph.replace_items(
+            block,
+            vec![
+                Item::Label(new_label),
+                instruction(RETURN_VALUE, Operand::Value(0)),
+            ],
+        );
+
+        assert_eq!(graph.label_block(old_label), None);
+        assert_eq!(graph.label_block(new_label), Some(block));
+        graph.validate().unwrap();
+    }
+
+    #[test]
+    fn splicing_items_replaces_labels_in_lookup() {
+        let old_label = Label(0);
+        let new_label = Label(1);
+        let mut graph = BlockGraph::from_items(
+            vec![
+                Item::Label(old_label),
+                instruction(RETURN_VALUE, Operand::Value(0)),
+            ],
+            &FxHashSet::default(),
+        );
+        let block = graph.block_at(0);
+
+        graph.splice_items(block, 0..1, [Item::Label(new_label)]);
+
+        assert_eq!(graph.label_block(old_label), None);
+        assert_eq!(graph.label_block(new_label), Some(block));
         graph.validate().unwrap();
     }
 
