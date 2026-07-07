@@ -6,9 +6,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::Instant;
 
-use serc::{CPYTHON_TARGET, CompileError, compile};
+use serc::{CPYTHON_TARGET, CompileError, compile, compile_bytes};
 use rayon::prelude::*;
 use walkdir::WalkDir;
+
+const WORKER_STACK_SIZE: usize = 32 * 1024 * 1024;
 
 const ORACLE: &str = r#"
 import marshal
@@ -42,7 +44,7 @@ impl OutcomeKind {
             Self::Exact => "exact",
             Self::ByteMismatch => "byte mismatch",
             Self::Unsupported => "unsupported",
-            Self::ParseMismatch => "Ruff parse mismatch",
+            Self::ParseMismatch => "parse/decode mismatch",
             Self::CompilerPanic => "compiler panic",
             Self::CpythonRejected => "CPython rejected",
             Self::NonUtf8 => "non-UTF-8",
@@ -62,10 +64,16 @@ struct Outcome {
     detail: String,
 }
 
+enum CompilerInput {
+    Bytes(Vec<u8>),
+    Text(String),
+}
+
 #[derive(Debug)]
 struct Options {
     python: String,
     roots: Vec<PathBuf>,
+    extensions: Vec<String>,
     limit: Option<usize>,
     expected_files: Option<usize>,
     expected_exact: Option<usize>,
@@ -73,6 +81,7 @@ struct Options {
     require_all: bool,
     examples: usize,
     dump_mismatches: Option<PathBuf>,
+    source_bytes: bool,
 }
 
 fn main() -> ExitCode {
@@ -87,7 +96,7 @@ fn main() -> ExitCode {
         eprintln!("{message}");
         return ExitCode::from(2);
     }
-    let mut paths = match discover(&options.roots) {
+    let mut paths = match discover(&options.roots, &options.extensions) {
         Ok(paths) => paths,
         Err(message) => {
             eprintln!("{message}");
@@ -111,11 +120,24 @@ fn main() -> ExitCode {
         paths.truncate(limit);
     }
 
+    let pool = match rayon::ThreadPoolBuilder::new()
+        .stack_size(WORKER_STACK_SIZE)
+        .build()
+    {
+        Ok(pool) => pool,
+        Err(error) => {
+            eprintln!("failed to create the comparison worker pool: {error}");
+            return ExitCode::from(2);
+        }
+    };
+
     let started = Instant::now();
-    let outcomes: Vec<_> = paths
-        .par_iter()
-        .map(|path| compare(path, &options.python))
-        .collect();
+    let outcomes: Vec<_> = pool.install(|| {
+        paths
+            .par_iter()
+            .map(|path| compare(path, &options.python, options.source_bytes))
+            .collect()
+    });
 
     let mut counts = BTreeMap::<OutcomeKind, usize>::new();
     for outcome in &outcomes {
@@ -163,7 +185,9 @@ fn main() -> ExitCode {
     }
 
     if let Some(directory) = &options.dump_mismatches {
-        if let Err(error) = dump_mismatches(&outcomes, &options.python, directory) {
+        if let Err(error) =
+            dump_mismatches(&outcomes, &options.python, directory, options.source_bytes)
+        {
             eprintln!("failed to dump mismatches: {error}");
             return ExitCode::FAILURE;
         }
@@ -272,6 +296,7 @@ fn verify_python(python: &str) -> Result<(), String> {
 fn parse_options() -> Result<Options, String> {
     let mut python = "python3".to_string();
     let mut roots = Vec::new();
+    let mut extensions = vec!["py".to_string()];
     let mut limit = None;
     let mut expected_files = None;
     let mut expected_exact = None;
@@ -279,6 +304,7 @@ fn parse_options() -> Result<Options, String> {
     let mut require_all = false;
     let mut examples = 10;
     let mut dump_mismatches = None;
+    let mut source_bytes = false;
     let mut arguments = env::args().skip(1);
 
     while let Some(argument) = arguments.next() {
@@ -303,6 +329,22 @@ fn parse_options() -> Result<Options, String> {
                     .ok_or_else(|| "--examples requires a number".to_string())?
                     .parse()
                     .map_err(|_| "--examples requires a number".to_string())?;
+            }
+            "--extension" => {
+                let extension = arguments
+                    .next()
+                    .ok_or_else(|| "--extension requires a value".to_string())?;
+                if extension.is_empty()
+                    || extension.starts_with('.')
+                    || extension.contains(std::path::is_separator)
+                {
+                    return Err(
+                        "--extension requires a non-empty bare extension such as `pyi`".to_string(),
+                    );
+                }
+                if !extensions.contains(&extension) {
+                    extensions.push(extension);
+                }
             }
             "--expected-files" => {
                 expected_files = Some(
@@ -338,9 +380,10 @@ fn parse_options() -> Result<Options, String> {
                     })?));
             }
             "--require-all" => require_all = true,
+            "--source-bytes" => source_bytes = true,
             "--help" | "-h" => {
                 return Err(
-                    "usage: compare_cpython_corpus [--python PATH] [--limit N] [--expected-files N] [--expected-exact N] [--expected-cpython-rejected N] [--examples N] [--require-all] [--dump-mismatches DIR] [ROOT ...]"
+                    "usage: compare_cpython_corpus [--python PATH] [--extension EXT] [--source-bytes] [--limit N] [--expected-files N] [--expected-exact N] [--expected-cpython-rejected N] [--examples N] [--require-all] [--dump-mismatches DIR] [ROOT ...]"
                         .to_string(),
                 );
             }
@@ -368,6 +411,7 @@ fn parse_options() -> Result<Options, String> {
     Ok(Options {
         python,
         roots,
+        extensions,
         limit,
         expected_files,
         expected_exact,
@@ -375,6 +419,7 @@ fn parse_options() -> Result<Options, String> {
         require_all,
         examples,
         dump_mismatches,
+        source_bytes,
     })
 }
 
@@ -382,6 +427,7 @@ fn dump_mismatches(
     outcomes: &[Outcome],
     python: &str,
     directory: &Path,
+    source_bytes: bool,
 ) -> Result<(), std::io::Error> {
     fs_err::create_dir_all(directory)?;
     outcomes
@@ -389,11 +435,18 @@ fn dump_mismatches(
         .filter(|outcome| outcome.kind == OutcomeKind::ByteMismatch)
         .enumerate()
         .try_for_each(|(index, outcome)| {
-            let source = fs_err::read_to_string(&outcome.path)?;
+            let source = if source_bytes {
+                CompilerInput::Bytes(fs_err::read(&outcome.path)?)
+            } else {
+                CompilerInput::Text(fs_err::read_to_string(&outcome.path)?)
+            };
             let filename = outcome.path.to_string_lossy();
-            let ours = compile(&source, &filename)
-                .expect("a mismatch compiled successfully in the first pass")
-                .marshal();
+            let ours = match &source {
+                CompilerInput::Bytes(source) => compile_bytes(source, &filename),
+                CompilerInput::Text(source) => compile(source, &filename),
+            }
+            .expect("a mismatch compiled successfully in the first pass")
+            .marshal();
             let oracle = Command::new(python)
                 .args(["-I", "-S", "-c", ORACLE])
                 .arg(&outcome.path)
@@ -406,7 +459,7 @@ fn dump_mismatches(
         })
 }
 
-fn discover(roots: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
+fn discover(roots: &[PathBuf], extensions: &[String]) -> Result<Vec<PathBuf>, String> {
     let mut paths = Vec::new();
     for root in roots {
         for entry in WalkDir::new(root).follow_links(false) {
@@ -414,10 +467,11 @@ fn discover(roots: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
                 format!("failed to walk corpus root {}: {error}", root.display())
             })?;
             if entry.file_type().is_file()
-                && entry
-                    .path()
-                    .extension()
-                    .is_some_and(|extension| extension == "py")
+                && entry.path().extension().is_some_and(|extension| {
+                    extensions
+                        .iter()
+                        .any(|expected| extension == expected.as_str())
+                })
             {
                 paths.push(entry.into_path());
             }
@@ -428,7 +482,7 @@ fn discover(roots: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
     Ok(paths)
 }
 
-fn compare(path: &Path, python: &str) -> Outcome {
+fn compare(path: &Path, python: &str, source_bytes: bool) -> Outcome {
     let oracle = match Command::new(python)
         .args(["-I", "-S", "-c", ORACLE])
         .arg(path)
@@ -462,7 +516,12 @@ fn compare(path: &Path, python: &str) -> Outcome {
         }
     };
 
-    let source = match fs_err::read_to_string(path) {
+    let source = if source_bytes {
+        fs_err::read(path).map(CompilerInput::Bytes)
+    } else {
+        fs_err::read_to_string(path).map(CompilerInput::Text)
+    };
+    let source = match source {
         Ok(source) => source,
         Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
             return Outcome {
@@ -481,7 +540,10 @@ fn compare(path: &Path, python: &str) -> Outcome {
     };
 
     let filename = path.to_string_lossy();
-    let compiled = std::panic::catch_unwind(|| compile(&source, &filename));
+    let compiled = std::panic::catch_unwind(|| match &source {
+        CompilerInput::Bytes(source) => compile_bytes(source, &filename),
+        CompilerInput::Text(source) => compile(source, &filename),
+    });
     let ours = match compiled {
         Ok(Ok(module)) => module.marshal(),
         Ok(Err(CompileError::Unsupported(message))) => {
@@ -573,8 +635,9 @@ fn one_line(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{OutcomeKind, validate_outcome_counts};
+    use super::{OutcomeKind, discover, validate_outcome_counts};
     use std::collections::BTreeMap;
+    use std::fs;
 
     #[test]
     fn require_all_rejects_a_corpus_without_exact_matches() {
@@ -586,6 +649,31 @@ mod tests {
             failures
                 .iter()
                 .any(|failure| failure == "no files matched CPython exactly")
+        );
+    }
+
+    #[test]
+    fn pyi_discovery_is_opt_in() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("module.py"), "pass\n").unwrap();
+        fs::write(
+            directory.path().join("module.pyi"),
+            "def function() -> None: ...\n",
+        )
+        .unwrap();
+        fs::write(directory.path().join("notes.txt"), "not Python\n").unwrap();
+        let roots = [directory.path().to_path_buf()];
+
+        let default = discover(&roots, &["py".to_string()]).unwrap();
+        assert_eq!(default, vec![directory.path().join("module.py")]);
+
+        let with_stubs = discover(&roots, &["py".to_string(), "pyi".to_string()]).unwrap();
+        assert_eq!(
+            with_stubs,
+            vec![
+                directory.path().join("module.py"),
+                directory.path().join("module.pyi")
+            ]
         );
     }
 
