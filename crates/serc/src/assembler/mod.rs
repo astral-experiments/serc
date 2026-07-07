@@ -67,6 +67,20 @@ impl Assembler {
         })
     }
 
+    fn last_jump_instruction_mut(&mut self, operation: &str) -> &mut Instruction {
+        let instruction = self
+            .last_instruction_mut()
+            .unwrap_or_else(|| panic!("{operation} requires a preceding instruction"));
+        assert!(
+            matches!(
+                instruction.operand,
+                Operand::Forward(_) | Operand::Backward(_)
+            ),
+            "{operation} requires a jump instruction"
+        );
+        instruction
+    }
+
     pub(crate) fn instruction_count(&self) -> usize {
         self.items
             .iter()
@@ -170,51 +184,51 @@ impl Assembler {
 
     /// Defers a redundant jump until the pass after exit-block duplication.
     pub(crate) fn defer_last_jump_removal(&mut self) {
-        if let Some(instruction) = self.last_instruction_mut() {
-            instruction.insert_flag(InstructionFlags::DEFER_REDUNDANT_JUMP_REMOVAL);
-        }
+        self.last_jump_instruction_mut("deferring redundant jump removal")
+            .jump_policy
+            .defer_removal();
     }
 
     /// Allows incoming jumps to thread through the last jump before retaining it as a NOP.
     pub(crate) fn preserve_last_redundant_jump_nop_after_threading(&mut self) {
-        if let Some(instruction) = self.last_instruction_mut() {
-            instruction.insert_flag(InstructionFlags::DEFER_REDUNDANT_JUMP_REMOVAL);
-            instruction.insert_flag(InstructionFlags::PRESERVE_NOP_AFTER_JUMP_THREADING);
-        }
+        let policy = &mut self
+            .last_jump_instruction_mut("retaining a redundant jump NOP after threading")
+            .jump_policy;
+        policy.retain_redundant_nop_after_threading();
     }
 
     pub(crate) fn prevent_last_jump_inlining(&mut self) {
-        if let Some(instruction) = self.last_instruction_mut() {
-            instruction.remove_flag(InstructionFlags::INLINE_SMALL_EXIT);
-        }
+        self.last_jump_instruction_mut("preventing jump inlining")
+            .jump_policy
+            .prevent_small_exit_inlining();
     }
 
     pub(crate) fn preserve_last_inlined_jump_nop(&mut self) {
-        if let Some(instruction) = self.last_instruction_mut() {
-            instruction.insert_flag(InstructionFlags::PRESERVE_INLINED_JUMP_NOP);
-        }
+        self.last_jump_instruction_mut("retaining an inlined jump NOP")
+            .jump_policy
+            .retain_nop();
     }
 
     pub(crate) fn preserve_last_direct_inlined_jump_nop(&mut self) {
-        if let Some(instruction) = self.last_instruction_mut()
-            && let Operand::Forward(target) = instruction.operand
-        {
-            instruction.preserve_direct_inlined_jump_nop = Some(target);
-        }
+        let instruction = self.last_jump_instruction_mut("retaining a directly inlined jump NOP");
+        let Operand::Forward(target) = instruction.operand else {
+            panic!("retaining a directly inlined jump NOP requires a forward jump");
+        };
+        instruction.jump_policy.retain_nop_for_direct_target(target);
     }
 
     pub(crate) fn prevent_last_jump_threading_target(&mut self) {
-        if let Some(instruction) = self.last_instruction_mut() {
-            instruction.remove_flag(InstructionFlags::ALLOW_JUMP_THREADING_TARGET);
-        }
+        self.last_jump_instruction_mut("preventing jump threading through a target")
+            .jump_policy
+            .prevent_threading_target();
     }
 
     pub(crate) fn prepare_last_no_location_block_for_inlining(&mut self) {
-        if let Some(instruction) = self.last_instruction_mut() {
-            instruction.location = SourceLocation::NONE;
-            instruction.remove_flag(InstructionFlags::ALLOW_JUMP_THREADING_TARGET);
-            instruction.insert_flag(InstructionFlags::ALLOW_NO_LOCATION_BLOCK_INLINING);
-        }
+        let instruction =
+            self.last_jump_instruction_mut("preparing a no-location block for inlining");
+        instruction.location = SourceLocation::NONE;
+        instruction.jump_policy.prevent_threading_target();
+        instruction.insert_flag(InstructionFlags::ALLOW_NO_LOCATION_BLOCK_INLINING);
     }
 
     pub(crate) fn preserve_last_no_location(&mut self) {

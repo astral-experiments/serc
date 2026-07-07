@@ -93,37 +93,23 @@ bitflags::bitflags! {
     pub(super) struct InstructionFlags: u16 {
         const FORCE_OWNED_LOAD = 1 << 0;
         const STRICT_OWNED_LOAD = 1 << 1;
-        const INLINE_SMALL_EXIT = 1 << 2;
-        const PRESERVE_INLINED_JUMP_NOP = 1 << 3;
-        // Whether an incoming jump may be threaded through this instruction.
-        const ALLOW_JUMP_THREADING_TARGET = 1 << 4;
         // Whether an unlocated block ending here may be inlined into predecessors.
         const ALLOW_NO_LOCATION_BLOCK_INLINING = 1 << 5;
         const PRESERVE_NO_LOCATION = 1 << 6;
         const PREVENT_FUSION_WITH_NEXT = 1 << 7;
         const PREVENT_FUSION_WITH_PREVIOUS = 1 << 8;
-        const DEFER_REDUNDANT_JUMP_REMOVAL = 1 << 9;
-        const PRESERVE_NOP_AFTER_JUMP_THREADING = 1 << 10;
         const CONVERTED_POP_BLOCK = 1 << 11;
     }
 }
 
 impl InstructionFlags {
-    pub(super) const DEFAULT: Self =
-        Self::INLINE_SMALL_EXIT.union(Self::ALLOW_JUMP_THREADING_TARGET);
-
     pub(super) const FUSE_OR: Self = Self::FORCE_OWNED_LOAD
         .union(Self::STRICT_OWNED_LOAD)
         .union(Self::ALLOW_NO_LOCATION_BLOCK_INLINING)
         .union(Self::PRESERVE_NO_LOCATION)
-        .union(Self::DEFER_REDUNDANT_JUMP_REMOVAL)
-        .union(Self::PRESERVE_NOP_AFTER_JUMP_THREADING)
         .union(Self::CONVERTED_POP_BLOCK);
-    pub(super) const FUSE_AND: Self =
-        Self::INLINE_SMALL_EXIT.union(Self::ALLOW_JUMP_THREADING_TARGET);
     pub(super) const FUSE_FROM_FIRST: Self = Self::PREVENT_FUSION_WITH_PREVIOUS;
     pub(super) const FUSE_FROM_SECOND: Self = Self::PREVENT_FUSION_WITH_NEXT;
-    pub(super) const FUSE_CLEARED: Self = Self::PRESERVE_INLINED_JUMP_NOP;
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -131,6 +117,106 @@ pub(super) enum BorrowFallthrough {
     #[default]
     Reachable,
     Barrier,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) enum RetainedJumpNop {
+    #[default]
+    None,
+    // Retain the jump's line event only if its original target is copied directly.
+    DirectTarget(Label),
+    Always,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct JumpPolicy {
+    pub(super) inline_small_exit: bool,
+    pub(super) retained_nop: RetainedJumpNop,
+    pub(super) allow_threading_target: bool,
+    pub(super) defer_redundant_removal: bool,
+    pub(super) preserve_nop_after_threading: bool,
+}
+
+impl JumpPolicy {
+    const SYNTHETIC: Self = Self {
+        inline_small_exit: false,
+        ..Self::DEFAULT
+    };
+
+    const DEFAULT: Self = Self {
+        inline_small_exit: true,
+        retained_nop: RetainedJumpNop::None,
+        allow_threading_target: true,
+        defer_redundant_removal: false,
+        preserve_nop_after_threading: false,
+    };
+
+    pub(super) const fn fused(first: Self, second: Self) -> Self {
+        Self {
+            inline_small_exit: first.inline_small_exit && second.inline_small_exit,
+            retained_nop: RetainedJumpNop::None,
+            allow_threading_target: first.allow_threading_target && second.allow_threading_target,
+            defer_redundant_removal: first.defer_redundant_removal
+                || second.defer_redundant_removal,
+            preserve_nop_after_threading: first.preserve_nop_after_threading
+                || second.preserve_nop_after_threading,
+        }
+    }
+
+    pub(super) const fn always_retains_nop(self) -> bool {
+        matches!(self.retained_nop, RetainedJumpNop::Always)
+    }
+
+    pub(super) fn retains_nop_for(self, operand: Operand) -> bool {
+        match (self.retained_nop, operand) {
+            (RetainedJumpNop::Always, _) => true,
+            (RetainedJumpNop::DirectTarget(expected), Operand::Forward(actual)) => {
+                expected == actual
+            }
+            (RetainedJumpNop::None | RetainedJumpNop::DirectTarget(_), _) => false,
+        }
+    }
+
+    pub(super) fn retain_nop(&mut self) {
+        self.retained_nop = RetainedJumpNop::Always;
+    }
+
+    pub(super) fn retain_nop_for_direct_target(&mut self, target: Label) {
+        if !self.always_retains_nop() {
+            self.retained_nop = RetainedJumpNop::DirectTarget(target);
+        }
+    }
+
+    pub(super) fn defer_removal(&mut self) {
+        self.defer_redundant_removal = true;
+    }
+
+    pub(super) fn retain_redundant_nop_after_threading(&mut self) {
+        self.defer_redundant_removal = true;
+        self.preserve_nop_after_threading = true;
+    }
+
+    pub(super) fn prevent_small_exit_inlining(&mut self) {
+        self.inline_small_exit = false;
+    }
+
+    pub(super) fn prevent_threading_target(&mut self) {
+        self.allow_threading_target = false;
+    }
+
+    pub(super) fn resolve_deferred_removal(&mut self) {
+        debug_assert!(self.defer_redundant_removal);
+        self.defer_redundant_removal = false;
+        if std::mem::take(&mut self.preserve_nop_after_threading) {
+            self.retain_nop();
+        }
+    }
+}
+
+impl Default for JumpPolicy {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -224,8 +310,7 @@ pub(super) struct Instruction {
     pub(super) location: SourceLocation,
     pub(super) depth_after: Option<u32>,
     pub(super) flags: InstructionFlags,
-    // Retain the jump's line event only if its original target is copied directly.
-    pub(super) preserve_direct_inlined_jump_nop: Option<Label>,
+    pub(super) jump_policy: JumpPolicy,
     // `NOT_TAKEN` is added after CPython labels exception handlers. The new instruction keeps
     // whatever exception target remains in its reused CFG slot, if there is one.
     pub(super) exception_policy: ExceptionPolicy,
@@ -246,8 +331,8 @@ impl Instruction {
             operand,
             location,
             depth_after,
-            flags: InstructionFlags::DEFAULT,
-            preserve_direct_inlined_jump_nop: None,
+            flags: InstructionFlags::empty(),
+            jump_policy: JumpPolicy::default(),
             exception_policy: ExceptionPolicy::default(),
             borrow_fallthrough: BorrowFallthrough::default(),
         }
@@ -261,7 +346,7 @@ impl Instruction {
         depth_after: Option<u32>,
     ) -> Self {
         let mut instruction = Self::new(opcode, operand, location, depth_after);
-        instruction.remove_flag(InstructionFlags::INLINE_SMALL_EXIT);
+        instruction.jump_policy = JumpPolicy::SYNTHETIC;
         instruction
     }
 
@@ -273,21 +358,15 @@ impl Instruction {
         self.flags.insert(flag);
     }
 
-    pub(super) fn remove_flag(&mut self, flag: InstructionFlags) {
-        self.flags.remove(flag);
-    }
-
     pub(super) fn set_flag(&mut self, flag: InstructionFlags, enabled: bool) {
         self.flags.set(flag, enabled);
     }
 
     /// Combines the provenance of two instructions replaced by one superinstruction.
     pub(super) fn fused(opcode: Opcode, operand: Operand, first: Self, second: Self) -> Self {
-        let mut flags = ((first.flags | second.flags) & InstructionFlags::FUSE_OR)
-            | ((first.flags & second.flags) & InstructionFlags::FUSE_AND)
+        let flags = ((first.flags | second.flags) & InstructionFlags::FUSE_OR)
             | (first.flags & InstructionFlags::FUSE_FROM_FIRST)
             | (second.flags & InstructionFlags::FUSE_FROM_SECOND);
-        flags.remove(InstructionFlags::FUSE_CLEARED);
 
         Self {
             opcode,
@@ -295,7 +374,7 @@ impl Instruction {
             location: first.location,
             depth_after: second.depth_after,
             flags,
-            preserve_direct_inlined_jump_nop: None,
+            jump_policy: JumpPolicy::fused(first.jump_policy, second.jump_policy),
             exception_policy: first.exception_policy.merged(second.exception_policy),
             borrow_fallthrough: second.borrow_fallthrough,
         }
