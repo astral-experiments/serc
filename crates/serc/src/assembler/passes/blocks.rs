@@ -5,9 +5,253 @@ use super::super::{
     JUMP_BACKWARD_NO_INTERRUPT, JUMP_FORWARD, Label, Operand, OptimizationPipeline, SourceLocation,
     block_has_fallthrough, block_jump_target, cleanup_block_creation_order, ends_scope,
 };
+use crate::assembler::block_graph::{BasicBlockId, BlockGraph};
 use crate::target::opcodes::{
     CLEANUP_THROW, END_ASYNC_FOR, END_SEND, LOAD_GLOBAL, NOP, RAISE_VARARGS,
 };
+
+struct NoExitCopyAnalysis {
+    positions: Vec<usize>,
+    predecessors: Vec<usize>,
+    jump_predecessors: Vec<Option<BasicBlockId>>,
+    exception_handler_blocks: FxHashSet<BasicBlockId>,
+}
+
+// Most multi-block code objects reach this pass without an eligible exit copy. Returning an
+// analysis proves that the copy-producing loop below cannot run while retaining the location
+// propagation performed at the end of the full pass.
+fn no_exit_copy_analysis(
+    graph: &BlockGraph,
+    order: &[BasicBlockId],
+    exception_regions: &[ExceptionRegion],
+) -> Option<NoExitCopyAnalysis> {
+    let vector_len = order
+        .iter()
+        .map(|block| block.index())
+        .max()
+        .expect("exit-block analysis requires at least one block")
+        + 1;
+    let mut positions = vec![usize::MAX; vector_len];
+    for (position, block) in order.iter().copied().enumerate() {
+        positions[block.index()] = position;
+    }
+
+    let exception_handler_blocks = exception_regions
+        .iter()
+        .filter_map(|region| graph.label_block(region.target))
+        .collect::<FxHashSet<_>>();
+    let mut predecessors = vec![0_usize; vector_len];
+    let mut jump_predecessors = vec![None; vector_len];
+    predecessors[order[0].index()] = 1;
+    for (position, block) in order.iter().copied().enumerate() {
+        if block_has_fallthrough(graph[block].items())
+            && let Some(next) = order.get(position + 1)
+        {
+            predecessors[next.index()] += 1;
+        }
+        if let Some(target) =
+            block_jump_target(graph[block].items()).and_then(|label| graph.label_block(label))
+        {
+            predecessors[target.index()] += 1;
+            if jump_predecessors[target.index()].is_none() {
+                jump_predecessors[target.index()] = Some(block);
+            }
+        }
+    }
+
+    // This cheap scan is a superset of the exact copy conditions. A false result is sufficient
+    // to skip the exception-boundary and target-chain analysis.
+    let possible_copy = order.iter().copied().any(|source| {
+        let Some(target) =
+            block_jump_target(graph[source].items()).and_then(|label| graph.label_block(label))
+        else {
+            return false;
+        };
+        let Some(target_last) = graph[target].last_instruction() else {
+            return false;
+        };
+        let target_has_no_location = graph[target].items().iter().all(|item| {
+            !matches!(item, Item::Instruction(instruction) if instruction.location.line >= 0)
+        });
+        let source_has_fallthrough = block_has_fallthrough(graph[source].items());
+        let shared_exit = predecessors[target.index()] > 1
+            && target_has_no_location
+            && ends_scope(target_last.opcode);
+        let no_location_exit = target_has_no_location
+            && !block_has_fallthrough(graph[target].items())
+            && target_last.no_location_policy.allow_block_inlining
+            && (!source_has_fallthrough || predecessors[target.index()] > 1);
+        let small_exit_source = !source_has_fallthrough
+            && graph[source]
+                .last_instruction()
+                .is_some_and(|instruction| instruction.jump_policy.inline_small_exit());
+        shared_exit || no_location_exit || small_exit_source
+    });
+    if !possible_copy {
+        return Some(NoExitCopyAnalysis {
+            positions,
+            predecessors,
+            jump_predecessors,
+            exception_handler_blocks,
+        });
+    }
+
+    // Prove that the remaining candidates are false positives. These predicates must remain a
+    // conservative mirror of every copy-producing condition in `duplicate_exit_blocks`; adding a
+    // new copy path there requires extending this proof before it is safe to retain the early
+    // return.
+    let exception_split_labels = exception_regions
+        .iter()
+        .flat_map(|region| [region.start, region.end])
+        .collect::<FxHashSet<_>>();
+
+    for source in order.iter().copied() {
+        let Some(target) =
+            block_jump_target(graph[source].items()).and_then(|label| graph.label_block(label))
+        else {
+            continue;
+        };
+        let Some(target_last) = graph[target].last_instruction() else {
+            continue;
+        };
+        let target_position = positions[target.index()];
+        let mut target_chain_end = target_position;
+        while target_chain_end + 1 < order.len()
+            && block_has_fallthrough(graph[order[target_chain_end]].items())
+            && predecessors[order[target_chain_end + 1].index()] == 1
+            && graph[order[target_chain_end + 1]].items().iter().any(
+                |item| matches!(item, Item::Label(label) if exception_split_labels.contains(label)),
+            )
+        {
+            target_chain_end += 1;
+        }
+        let target_blocks = &order[target_position..=target_chain_end];
+        let target_pre_fusion_size = target_blocks
+            .iter()
+            .flat_map(|block| graph[*block].items())
+            .map(|item| match item {
+                Item::Instruction(instruction) => {
+                    let fused_push_null = instruction.opcode == LOAD_GLOBAL
+                        && matches!(instruction.operand, Operand::Value(argument) if argument & 1 != 0);
+                    1 + usize::from(fused_push_null)
+                }
+                Item::Label(label) => usize::from(
+                    target_chain_end > target_position
+                        && exception_split_labels.contains(label),
+                ),
+            })
+            .sum::<usize>();
+        let target_terminal_opcode = target_blocks
+            .iter()
+            .rev()
+            .flat_map(|block| graph[*block].items().iter().rev())
+            .find_map(|item| match item {
+                Item::Instruction(instruction) => Some(instruction.opcode),
+                Item::Label(_) => None,
+            });
+        let target_is_small_exit = target_pre_fusion_size <= 4
+            && target_terminal_opcode.is_some_and(|opcode| {
+                ends_scope(opcode)
+                    && (target_chain_end == target_position || opcode == RAISE_VARARGS)
+            });
+        let source_has_fallthrough = block_has_fallthrough(graph[source].items());
+        let inline_small_exit = !source_has_fallthrough
+            && target_is_small_exit
+            && graph[source]
+                .last_instruction()
+                .is_some_and(|instruction| instruction.jump_policy.inline_small_exit())
+            && !target_blocks.iter().any(|block| {
+                graph[*block].items().iter().any(|item| {
+                    matches!(item, Item::Instruction(instruction) if instruction.opcode == END_SEND)
+                })
+            })
+            && !exception_handler_blocks.contains(&target);
+        let target_has_no_location = target_blocks.iter().all(|block| {
+            graph[*block].items().iter().all(|item| {
+                !matches!(item, Item::Instruction(instruction) if instruction.location.line >= 0)
+            })
+        });
+        let no_location_exit = target_has_no_location
+            && !block_has_fallthrough(graph[target].items())
+            && target_last.no_location_policy.allow_block_inlining;
+        let shared_exit = predecessors[target.index()] > 1
+            && graph[target].items().iter().all(|item| {
+                !matches!(item, Item::Instruction(instruction) if instruction.location.line >= 0)
+            })
+            && ends_scope(target_last.opcode);
+        if inline_small_exit
+            || (!source_has_fallthrough && no_location_exit)
+            || (predecessors[target.index()] > 1 && (shared_exit || no_location_exit))
+        {
+            return None;
+        }
+    }
+
+    Some(NoExitCopyAnalysis {
+        positions,
+        predecessors,
+        jump_predecessors,
+        exception_handler_blocks,
+    })
+}
+
+// The original pass performs these location repairs even when it creates no copies, so the fast
+// path must preserve them before returning.
+fn propagate_exit_block_locations(
+    graph: &mut BlockGraph,
+    order: &[BasicBlockId],
+    analysis: &NoExitCopyAnalysis,
+) {
+    for target in order.iter().copied() {
+        if analysis.exception_handler_blocks.contains(&target) {
+            continue;
+        }
+        if analysis.predecessors[target.index()] == 1
+            && let Some(Item::Instruction(first)) = graph[target]
+                .items()
+                .iter()
+                .find(|item| matches!(item, Item::Instruction(_)))
+            && first.opcode == NOP
+            && first.converted_pop_block
+            && first.location.line < 0
+            && !first.no_location_policy.preserve
+            && let Some(location) = analysis.jump_predecessors[target.index()].and_then(|source| {
+                graph[source]
+                    .last_instruction()
+                    .map(|instruction| instruction.location)
+            })
+            && let Some(first) = graph.instructions_mut(target).next()
+        {
+            first.location = location;
+            continue;
+        }
+        if !graph[target].items().iter().all(|item| {
+            !matches!(item, Item::Instruction(instruction) if instruction.location.line >= 0)
+        }) {
+            continue;
+        }
+        let target_position = analysis.positions[target.index()];
+        let predecessor = if target_position > 0
+            && block_has_fallthrough(graph[order[target_position - 1]].items())
+        {
+            Some(order[target_position - 1])
+        } else {
+            analysis.jump_predecessors[target.index()]
+        };
+        let Some(location) = predecessor.and_then(|source| {
+            graph[source]
+                .last_instruction()
+                .map(|instruction| instruction.location)
+        }) else {
+            continue;
+        };
+        if let Some(instruction) = graph.instructions_mut(target).next()
+            && !instruction.no_location_policy.preserve
+        {
+            instruction.location = location;
+        }
+    }
+}
 
 impl OptimizationPipeline {
     pub(in crate::assembler) fn push_cold_blocks_to_end(&mut self) {
@@ -345,6 +589,10 @@ impl OptimizationPipeline {
         }
 
         let order = graph.order().to_vec();
+        if let Some(analysis) = no_exit_copy_analysis(graph, &order, &self.exception_regions) {
+            propagate_exit_block_locations(graph, &order, &analysis);
+            return;
+        }
         for block in order.iter().copied() {
             if graph[block].first_label().is_none() {
                 let label = Label(self.next_label);
