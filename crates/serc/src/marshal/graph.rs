@@ -91,9 +91,28 @@ fn mismatched_occurrence(index: usize, expected: OccurrenceKind, recorded: Occur
 
 const CODE_OBJECT_CHILDREN: usize = 10;
 
+#[derive(Clone, Copy, Debug)]
+enum CachedObject {
+    EmptyBytes,
+    EmptyTuple,
+}
+
+impl CachedObject {
+    #[cfg(test)]
+    fn for_key(key: &ObjectKey<'_>) -> Option<Self> {
+        match key {
+            ObjectKey::Bytes([]) => Some(Self::EmptyBytes),
+            ObjectKey::EmptyTuple => Some(Self::EmptyTuple),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub(super) struct ObjectGraph<'a> {
     objects: FxHashMap<HashedObjectKey<'a>, ObjectId>,
+    cached_empty_bytes: Option<ObjectId>,
+    cached_empty_tuple: Option<ObjectId>,
     objects_by_id: Vec<Object>,
     occurrences: Vec<Occurrence>,
     #[cfg(debug_assertions)]
@@ -134,6 +153,12 @@ impl<'a> ObjectGraph<'a> {
         first
     }
 
+    fn record_cached_value(&mut self, kind: OccurrenceKind, cached: CachedObject) -> bool {
+        let (id, first) = self.record_cached(cached);
+        self.occurrences.push(Occurrence { object: id, kind });
+        first
+    }
+
     fn record_unique_value(&mut self, kind: OccurrenceKind, key: ObjectKey<'a>) -> bool {
         let id = self.record_unique(key);
         self.occurrences.push(Occurrence { object: id, kind });
@@ -157,7 +182,11 @@ impl<'a> ObjectGraph<'a> {
 
     #[cfg(test)]
     pub(super) fn record(&mut self, key: ObjectKey<'a>) -> bool {
-        self.record_object(key.into(), false).1
+        if let Some(cached) = CachedObject::for_key(&key) {
+            self.record_cached(cached).1
+        } else {
+            self.record_object(key.into(), false).1
+        }
     }
 
     /// Records an identity-bearing object that is structurally owned by a unique parent.
@@ -175,6 +204,28 @@ impl<'a> ObjectGraph<'a> {
             interned: false,
         });
         id
+    }
+
+    fn record_cached(&mut self, cached: CachedObject) -> (ObjectId, bool) {
+        let slot = match cached {
+            CachedObject::EmptyBytes => &mut self.cached_empty_bytes,
+            CachedObject::EmptyTuple => &mut self.cached_empty_tuple,
+        };
+        if let Some(id) = *slot {
+            let object = &mut self.objects_by_id[id.index()];
+            object.count += 1;
+            return (id, false);
+        }
+
+        let id = ObjectId::from_index(self.objects_by_id.len());
+        self.objects_by_id.push(Object {
+            count: 1,
+            cached: true,
+            interned: false,
+        });
+        debug_assert!(slot.is_none());
+        *slot = Some(id);
+        (id, true)
     }
 
     fn record_object(&mut self, key: HashedObjectKey<'a>, interned: bool) -> (ObjectId, bool) {
@@ -237,6 +288,13 @@ impl<'a> ObjectGraph<'a> {
     #[cfg(test)]
     pub(super) fn keyed_object_count(&self) -> usize {
         self.objects.len()
+            + usize::from(self.cached_empty_bytes.is_some())
+            + usize::from(self.cached_empty_tuple.is_some())
+    }
+
+    #[cfg(test)]
+    pub(super) fn hashed_object_count(&self) -> usize {
+        self.objects.len()
     }
 
     pub(super) fn occurrence_cursor(&self) -> OccurrenceCursor<'_> {
@@ -288,6 +346,11 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
 
     #[inline]
     fn constants(&mut self, values: &'code [Constant], _reference_mode: ReferenceMode) -> bool {
+        if values.is_empty() {
+            return self
+                .graph
+                .record_cached_value(OccurrenceKind::Constants, CachedObject::EmptyTuple);
+        }
         let key = constants_tuple_key(values);
         if values
             .iter()
@@ -303,12 +366,22 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
 
     #[inline]
     fn strings(&mut self, values: &'code [String]) -> bool {
+        if values.is_empty() {
+            return self
+                .graph
+                .record_cached_value(OccurrenceKind::Strings, CachedObject::EmptyTuple);
+        }
         self.graph
             .record_keyed(OccurrenceKind::Strings, strings_tuple_key(values), false)
     }
 
     #[inline]
     fn locals(&mut self, code: &'code CodeObject) -> bool {
+        if code.locals.is_empty() {
+            return self
+                .graph
+                .record_cached_value(OccurrenceKind::Locals, CachedObject::EmptyTuple);
+        }
         let key = locals_tuple_key(code);
         if matches!(&key, ObjectKey::AnnotationLocals(_)) {
             self.graph.record_unique_value(OccurrenceKind::Locals, key)
@@ -319,13 +392,12 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
 
     #[inline]
     fn local_kinds(&mut self, code: &'code CodeObject) {
-        let key = local_kinds_key(code);
-        if matches!(&key, ObjectKey::LocalKinds(_)) {
+        if code.local_kinds.is_empty() {
             self.graph
-                .record_unique_value(OccurrenceKind::LocalKinds, key);
+                .record_cached_value(OccurrenceKind::LocalKinds, CachedObject::EmptyBytes);
         } else {
             self.graph
-                .record_keyed(OccurrenceKind::LocalKinds, key, false);
+                .record_unique_value(OccurrenceKind::LocalKinds, local_kinds_key(code));
         }
     }
 
@@ -343,8 +415,13 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
 
     #[inline]
     fn bytes(&mut self, value: &'code [u8]) {
-        self.graph
-            .record_keyed(OccurrenceKind::Bytes, ObjectKey::Bytes(value), false);
+        if value.is_empty() {
+            self.graph
+                .record_cached_value(OccurrenceKind::Bytes, CachedObject::EmptyBytes);
+        } else {
+            self.graph
+                .record_keyed(OccurrenceKind::Bytes, ObjectKey::Bytes(value), false);
+        }
     }
 
     #[inline]
@@ -359,6 +436,9 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
                 ObjectKey::String(value),
                 should_intern(value),
             ),
+            Constant::Bytes(value) if value.is_empty() => self
+                .graph
+                .record_cached_value(OccurrenceKind::Constant, CachedObject::EmptyBytes),
             _ => self
                 .graph
                 .record_keyed(OccurrenceKind::Constant, constant_key(value), false),
