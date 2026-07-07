@@ -146,7 +146,7 @@ fn compile_matches_cpython_pyc() {
 }
 
 #[test]
-fn compile_matches_cpython_for_latin1_encoding_cookies() {
+fn compile_matches_cpython_for_encoding_cookies() {
     let Some(python) = common::python_3145() else {
         return;
     };
@@ -161,6 +161,11 @@ fn compile_matches_cpython_for_latin1_encoding_cookies() {
             "utf8_bytes",
             b"# coding: latin-1\nvalue = '\xc3\xa9'\n".as_slice(),
         ),
+        (
+            "windows_1252",
+            b"# coding: cp1252\nvalue = '\x80'\n".as_slice(),
+        ),
+        ("ascii", b"# coding: ascii\nvalue = 'ascii'\n".as_slice()),
     ] {
         let source_path = directory.path().join(format!("{name}.py"));
         let pyc_path = directory

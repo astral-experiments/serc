@@ -19,6 +19,7 @@ workspace = true
 
 [dependencies]
 clap = { workspace = true }
+encoding_rs = { workspace = true }
 fs-err = { workspace = true }
 ruff_python_ast = { workspace = true }
 ruff_python_codegen = { workspace = true }

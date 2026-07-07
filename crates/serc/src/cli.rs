@@ -191,10 +191,11 @@ fn compile_path(path: &Path, check: bool) -> Result<(), String> {
         .map_err(|error| format!("failed to replace {}: {error}", output.display()))
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum SourceEncoding {
     Utf8,
     Latin1,
+    Ascii,
+    Standard(&'static encoding_rs::Encoding),
 }
 
 fn decode_source(bytes: &[u8]) -> Result<String, String> {
@@ -223,6 +224,18 @@ fn decode_source(bytes: &[u8]) -> Result<String, String> {
             .map(str::to_owned)
             .map_err(|error| format!("source is not valid UTF-8: {error}")),
         SourceEncoding::Latin1 => Ok(bytes.iter().copied().map(char::from).collect()),
+        SourceEncoding::Ascii => {
+            if !bytes.is_ascii() {
+                return Err("source is not valid ASCII".to_string());
+            }
+            std::str::from_utf8(bytes)
+                .map(str::to_owned)
+                .map_err(|error| format!("source is not valid ASCII: {error}"))
+        }
+        SourceEncoding::Standard(encoding) => encoding
+            .decode_without_bom_handling_and_without_replacement(bytes)
+            .map(std::borrow::Cow::into_owned)
+            .ok_or_else(|| format!("source is not valid {}", encoding.name())),
     }
 }
 
@@ -307,7 +320,36 @@ fn classify_encoding(name: &str) -> Option<(SourceEncoding, bool)> {
         return Some((SourceEncoding::Latin1, false));
     }
 
-    None
+    let codec_name = normalize_codec_name(name);
+    let encoding = match codec_name.as_str() {
+        "utf" | "u8" | "utf8" | "utf8_ucs2" | "utf8_ucs4" | "cp65001" => SourceEncoding::Utf8,
+        "latin" | "latin1" | "l1" | "8859" | "cp819" | "ibm819" | "csisolatin1" | "iso8859"
+        | "iso8859_1" | "iso_8859_1_1987" | "iso_ir_100" => SourceEncoding::Latin1,
+        "ascii" | "646" | "cp367" | "ibm367" | "csascii" | "us" | "us_ascii" | "iso646_us"
+        | "iso_646.irv_1991" | "iso_ir_6" | "ansi_x3.4_1968" | "ansi_x3_4_1968"
+        | "ansi_x3.4_1986" => SourceEncoding::Ascii,
+        _ => SourceEncoding::Standard(encoding_rs::Encoding::for_label_no_replacement(
+            name.as_bytes(),
+        )?),
+    };
+    Some((encoding, false))
+}
+
+fn normalize_codec_name(name: &str) -> String {
+    let mut normalized = String::with_capacity(name.len());
+    let mut separator = false;
+    for byte in name.bytes() {
+        if byte.is_ascii_alphanumeric() || byte == b'.' {
+            if separator && !normalized.is_empty() {
+                normalized.push('_');
+            }
+            normalized.push(char::from(byte.to_ascii_lowercase()));
+            separator = false;
+        } else {
+            separator = true;
+        }
+    }
+    normalized
 }
 
 fn encode_mtime(modified: SystemTime) -> u32 {
@@ -415,8 +457,13 @@ mod tests {
             "# comment\n# coding: latin-1\nvalue = '\u{e9}'\n"
         );
         assert_eq!(
-            decode_source(b"# coding: cp1252\nvalue = 1\n").unwrap_err(),
-            "unsupported source encoding `cp1252`"
+            decode_source(b"# coding: cp1252\nvalue = '\x80'\n").unwrap(),
+            "# coding: cp1252\nvalue = '\u{20ac}'\n"
+        );
+        assert!(decode_source(b"# coding: ascii\nvalue = 1\n").is_ok());
+        assert_eq!(
+            decode_source(b"# coding: ascii\nvalue = '\x80'\n").unwrap_err(),
+            "source is not valid ASCII"
         );
     }
 
