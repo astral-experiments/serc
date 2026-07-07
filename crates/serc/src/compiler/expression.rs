@@ -906,10 +906,12 @@ impl Compiler {
                     self.control.generator_region_start.is_some()
                         && self.control.active_exception_region_exclusions.is_empty()
                         && self.control.active_with_region_exclusions.is_empty();
-                self.emit_resume(
-                    ResumeLocation::AFTER_YIELD,
-                    wrapper_is_only_exception_region,
-                )?;
+                let resume_depth = if wrapper_is_only_exception_region {
+                    ResumeDepth::One
+                } else {
+                    ResumeDepth::Zero
+                };
+                self.emit_resume(ResumeLocation::AFTER_YIELD, resume_depth)?;
             }
             Expr::YieldFrom(expression) => {
                 if self.unit.flags & CO_GENERATOR == 0 {
@@ -929,10 +931,12 @@ impl Compiler {
                 self.assembler.mark(yielded);
                 self.emit(YIELD_VALUE, 1, 0)?;
                 self.assembler.mark(yielded_end);
-                self.emit_resume(
-                    ResumeLocation::AFTER_YIELD_FROM,
-                    self.control.generator_region_start.is_none(),
-                )?;
+                let resume_depth = if self.control.generator_region_start.is_none() {
+                    ResumeDepth::One
+                } else {
+                    ResumeDepth::Zero
+                };
+                self.emit_resume(ResumeLocation::AFTER_YIELD_FROM, resume_depth)?;
                 self.emit_jump_backward(JUMP_BACKWARD_NO_INTERRUPT, send, 0)?;
                 self.assembler.mark(cleanup);
                 self.assembler.add_exception_region(
@@ -1460,7 +1464,7 @@ impl Compiler {
         self.assembler.mark(yielded);
         self.emit(YIELD_VALUE, 1, 0)?;
         self.assembler.mark(yielded_end);
-        self.emit_resume(ResumeLocation::AFTER_AWAIT, false)?;
+        self.emit_resume(ResumeLocation::AFTER_AWAIT, ResumeDepth::Zero)?;
         self.emit_jump_backward(JUMP_BACKWARD_NO_INTERRUPT, send, 0)?;
 
         self.assembler.mark(cleanup);
@@ -2512,7 +2516,7 @@ impl Compiler {
                 self.emit_unary_intrinsic(UnaryIntrinsic::ASYNC_GEN_WRAP)?;
             }
             self.emit(YIELD_VALUE, 0, 0)?;
-            self.emit_resume(ResumeLocation::AFTER_YIELD, true)?;
+            self.emit_resume(ResumeLocation::AFTER_YIELD, ResumeDepth::One)?;
             self.emit(POP_TOP, 0, -1)?;
         }
         self.emit_jump_backward(JUMP_BACKWARD, start, 0)?;
@@ -2556,7 +2560,7 @@ impl Compiler {
         self.assembler.mark(yielded);
         self.emit(YIELD_VALUE, 1, 0)?;
         self.assembler.mark(yielded_end);
-        self.emit_resume(ResumeLocation::AFTER_AWAIT, false)?;
+        self.emit_resume(ResumeLocation::AFTER_AWAIT, ResumeDepth::Zero)?;
         self.emit_jump_backward(JUMP_BACKWARD_NO_INTERRUPT, send, 0)?;
         self.assembler.mark(send_end);
         self.set_depth(loop_depth + 2);
@@ -2600,7 +2604,7 @@ impl Compiler {
                 .set_location(self.source_location(element.range()));
             self.emit_unary_intrinsic(UnaryIntrinsic::ASYNC_GEN_WRAP)?;
             self.emit(YIELD_VALUE, 0, 0)?;
-            self.emit_resume(ResumeLocation::AFTER_YIELD, true)?;
+            self.emit_resume(ResumeLocation::AFTER_YIELD, ResumeDepth::One)?;
             self.emit(POP_TOP, 0, -1)?;
         }
         self.emit_jump_backward(JUMP_BACKWARD, start, 0)?;
@@ -3071,7 +3075,7 @@ impl Compiler {
         self.assembler.mark(yielded);
         self.emit(YIELD_VALUE, 1, 0)?;
         self.assembler.mark(yielded_end);
-        self.emit_resume(ResumeLocation::AFTER_AWAIT, false)?;
+        self.emit_resume(ResumeLocation::AFTER_AWAIT, ResumeDepth::Zero)?;
         self.emit_jump_backward(JUMP_BACKWARD_NO_INTERRUPT, send, 0)?;
         if reorder_cleanup {
             self.assembler.mark(protected_before_cleanup_end);
