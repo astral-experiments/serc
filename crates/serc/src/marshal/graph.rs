@@ -5,7 +5,7 @@ use rustc_hash::FxHashMap;
 use crate::code_object::{CodeObject, Constant};
 
 use super::key::{
-    ObjectKey, code_bytes_key, code_key, constant_key, constants_tuple_key,
+    HashedObjectKey, ObjectKey, code_bytes_key, code_key, constant_key, constants_tuple_key,
     frozen_set_members_in_wire_order, local_kinds_key, locals_tuple_key, should_intern,
     slice_member_uses_identity, strings_tuple_key,
 };
@@ -39,7 +39,7 @@ struct Object {
 
 #[derive(Debug, Default)]
 pub(super) struct ObjectGraph<'a> {
-    objects: FxHashMap<ObjectKey<'a>, ObjectId>,
+    objects: FxHashMap<HashedObjectKey<'a>, ObjectId>,
     objects_by_id: Vec<Object>,
     occurrences: Vec<ObjectId>,
     #[cfg(debug_assertions)]
@@ -57,7 +57,11 @@ impl<'a> ObjectGraph<'a> {
 
     fn mark_explicitly_interned(&mut self) {
         for value in std::mem::take(&mut self.explicitly_interned) {
-            let Some(id) = self.objects.get(&ObjectKey::String(value)).copied() else {
+            let Some(id) = self
+                .objects
+                .get(&HashedObjectKey::from(ObjectKey::String(value)))
+                .copied()
+            else {
                 continue;
             };
             let object = &mut self.objects_by_id[id.0];
@@ -68,22 +72,22 @@ impl<'a> ObjectGraph<'a> {
 
     #[cfg(test)]
     pub(super) fn record(&mut self, key: ObjectKey<'a>) -> bool {
-        self.record_object(key, false).1
+        self.record_object(key.into(), false).1
     }
 
     fn record_at(&mut self, _location: ObjectLocation, key: ObjectKey<'a>, interned: bool) -> bool {
-        let (id, first) = self.record_object(key, interned);
+        let (id, first) = self.record_object(key.into(), interned);
         self.occurrences.push(id);
         #[cfg(debug_assertions)]
         self.occurrence_locations.push(_location);
         first
     }
 
-    fn record_object(&mut self, key: ObjectKey<'a>, interned: bool) -> (ObjectId, bool) {
+    fn record_object(&mut self, key: HashedObjectKey<'a>, interned: bool) -> (ObjectId, bool) {
         let next_id = ObjectId(self.objects_by_id.len());
         match self.objects.entry(key) {
             Entry::Occupied(entry) => {
-                let cached = interned || Self::is_cached(entry.key());
+                let cached = interned || Self::is_cached(entry.key().key());
                 let id = *entry.get();
                 let object = &mut self.objects_by_id[id.0];
                 object.count += 1;
@@ -92,7 +96,7 @@ impl<'a> ObjectGraph<'a> {
                 (id, false)
             }
             Entry::Vacant(entry) => {
-                let cached = interned || Self::is_cached(entry.key());
+                let cached = interned || Self::is_cached(entry.key().key());
                 entry.insert(next_id);
                 self.objects_by_id.push(Object {
                     count: 1,
@@ -264,7 +268,7 @@ impl<'a> ObjectGraph<'a> {
         if force_reference
             || self
                 .objects
-                .get(key)
+                .get(&HashedObjectKey::from(key.clone()))
                 .is_some_and(|id| self.objects_by_id[id.0].count > 1)
         {
             return true;
@@ -309,7 +313,7 @@ impl<'a> ObjectGraph<'a> {
     pub(super) fn is_interned(&self, value: &str) -> bool {
         self.objects
             .iter()
-            .find_map(|(key, id)| match key {
+            .find_map(|(key, id)| match key.key() {
                 ObjectKey::String(string) if *string == value => Some(*id),
                 _ => None,
             })
