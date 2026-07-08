@@ -1655,6 +1655,47 @@ async def bare_fallback_control():
     }
 
     #[test]
+    fn matches_cpython_marshal_for_final_elif_short_circuit_loop_tails() {
+        let source = r"def direct_and(items, first, second):
+    for item in items:
+        if item == 0:
+            first()
+        elif item and second:
+            second()
+
+
+def direct_not_or(items, first, second):
+    while items:
+        item = items.pop()
+        if item == 0:
+            first()
+        elif not (item or second):
+            second()
+
+
+async def direct_async(items, first, second):
+    async for item in items:
+        if item == 0:
+            first()
+        elif item and second:
+            second()
+
+
+def nested_loop(items, first, second):
+    for item in items:
+        if item:
+            for nested in item:
+                if first:
+                    first()
+                elif nested and second:
+                    second()
+        elif second:
+            second()
+";
+        assert_matches_cpython_marshal(source, "final_elif_short_circuit.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_loop_and_async_iteration_edges() {
         let source = include_str!("fixtures/benchmark/loop_async_edges.py");
         assert_matches_cpython_marshal(source, "loop_tail.py");
