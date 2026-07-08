@@ -538,6 +538,7 @@ struct ClassPlan {
     required: FxHashSet<NameId>,
     needs_class_closure: bool,
     needs_classdict: bool,
+    has_conditional_annotations: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -549,6 +550,7 @@ pub(super) struct LoweringClassPlan {
     pub(super) required: FxHashSet<NameId>,
     pub(super) needs_class_closure: bool,
     pub(super) needs_classdict: bool,
+    pub(super) has_conditional_annotations: bool,
 }
 
 impl ClassPlan {
@@ -562,6 +564,13 @@ impl ClassPlan {
         nested_class_requirements: &FxHashSet<NameId>,
         child_needs_class_closure: bool,
     ) -> Self {
+        let has_conditional_annotations = if future_annotations {
+            false
+        } else {
+            let mut annotations = Vec::new();
+            collect_conditional_simple_annotations(&definition.body, &mut annotations);
+            !annotations.is_empty()
+        };
         let ScopeBodyFacts {
             globals,
             nonlocals,
@@ -644,6 +653,7 @@ impl ClassPlan {
             required: names.intern_set(required),
             needs_class_closure,
             needs_classdict,
+            has_conditional_annotations,
         }
     }
 
@@ -656,6 +666,7 @@ impl ClassPlan {
             required: self.required.clone(),
             needs_class_closure: self.needs_class_closure,
             needs_classdict: self.needs_classdict,
+            has_conditional_annotations: self.has_conditional_annotations,
         }
     }
 }
@@ -2454,6 +2465,50 @@ pub(super) fn has_simple_annotations(body: &[Stmt]) -> bool {
     let mut annotations = Vec::new();
     collect_simple_annotations(body, &mut annotations);
     !annotations.is_empty()
+}
+
+pub(super) fn collect_conditional_simple_annotations<'a>(
+    body: &'a [Stmt],
+    annotations: &mut Vec<&'a ruff_python_ast::StmtAnnAssign>,
+) {
+    for statement in body {
+        match statement {
+            Stmt::If(statement) => {
+                collect_simple_annotations(&statement.body, annotations);
+                for clause in &statement.elif_else_clauses {
+                    collect_simple_annotations(&clause.body, annotations);
+                }
+            }
+            Stmt::For(statement) => {
+                collect_simple_annotations(&statement.body, annotations);
+                collect_simple_annotations(&statement.orelse, annotations);
+            }
+            Stmt::While(statement) => {
+                collect_simple_annotations(&statement.body, annotations);
+                collect_simple_annotations(&statement.orelse, annotations);
+            }
+            Stmt::Try(statement) => {
+                collect_simple_annotations(&statement.body, annotations);
+                collect_simple_annotations(&statement.orelse, annotations);
+                for handler in &statement.handlers {
+                    if let Some(handler) = handler.as_except_handler() {
+                        collect_simple_annotations(&handler.body, annotations);
+                    }
+                }
+                collect_simple_annotations(&statement.finalbody, annotations);
+                // Try/finally lowers the final body once for the normal path and once for the
+                // exceptional path, so both copies conditionally register their annotations.
+                collect_simple_annotations(&statement.finalbody, annotations);
+            }
+            Stmt::With(statement) => collect_simple_annotations(&statement.body, annotations),
+            Stmt::Match(statement) => {
+                for case in &statement.cases {
+                    collect_simple_annotations(&case.body, annotations);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 pub(super) fn collect_simple_annotations<'a>(

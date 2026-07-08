@@ -6,8 +6,8 @@ use super::{
     BINARY_SLICE, BUILD_LIST, BUILD_MAP, BUILD_SET, BUILD_TUPLE, CALL, CHECK_EG_MATCH,
     CHECK_EXC_MATCH, CLEANUP_THROW, COPY, END_ASYNC_FOR, END_FOR, END_SEND, FOR_ITER, GET_AITER,
     GET_ANEXT, GET_ITER, IMPORT_FROM, IMPORT_NAME, JUMP_BACKWARD, JUMP_BACKWARD_NO_INTERRUPT,
-    JUMP_FORWARD, LIST_APPEND, LOAD_ATTR, LOAD_CONST, LOAD_SMALL_INT, MAP_ADD, NOP, NOT_TAKEN,
-    POP_EXCEPT, POP_ITER, POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE,
+    JUMP_FORWARD, LIST_APPEND, LOAD_ATTR, LOAD_CONST, LOAD_DEREF, LOAD_SMALL_INT, MAP_ADD, NOP,
+    NOT_TAKEN, POP_EXCEPT, POP_ITER, POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE,
     POP_JUMP_IF_TRUE, POP_TOP, PUSH_EXC_INFO, RAISE_VARARGS, RETURN_VALUE, SEND, SET_ADD,
     STORE_ATTR, STORE_SLICE, STORE_SUBSCR, SWAP, TO_BOOL, WITH_EXCEPT_START, YIELD_VALUE,
 };
@@ -3263,6 +3263,33 @@ impl Compiler {
         &mut self,
         assignment: &ruff_python_ast::StmtAnnAssign,
     ) -> Result<(), CompileError> {
+        if assignment.simple
+            && matches!(self.unit.scope, Scope::Class { .. })
+            && self.unit.flags & CO_FUTURE_ANNOTATIONS == 0
+        {
+            if let Some(value) = &assignment.value {
+                self.compile_expression(value)?;
+                self.compile_store_target(&assignment.target)?;
+            }
+            if self
+                .unit
+                .class_conditional_annotations
+                .front()
+                .is_some_and(|range| *range == assignment.range)
+            {
+                self.unit.class_conditional_annotations.pop_front();
+                let index = self.unit.module_annotation_index;
+                self.unit.module_annotation_index += 1;
+                self.assembler
+                    .set_location(self.source_location(assignment.range));
+                let cell = self.closure_index("__conditional_annotations__")?;
+                self.emit(LOAD_DEREF, cell, 1)?;
+                self.emit(LOAD_SMALL_INT, index, 1)?;
+                self.emit(SET_ADD, 1, -1)?;
+                self.emit(POP_TOP, 0, -1)?;
+            }
+            return Ok(());
+        }
         if assignment.simple
             && (matches!(self.unit.scope, Scope::Module)
                 || matches!(self.unit.scope, Scope::Class { .. })

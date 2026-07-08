@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use ruff_python_ast::token::TokenKind;
@@ -8,9 +9,9 @@ use rustc_hash::FxHashSet;
 
 use super::{
     BUILD_LIST, BUILD_MAP, BUILD_TUPLE, CALL, CALL_FUNCTION_EX, CALL_KW, CONTAINS_OP, COPY,
-    DICT_MERGE, LIST_APPEND, LIST_EXTEND, LOAD_BUILD_CLASS, LOAD_CONST, LOAD_FAST, LOAD_SMALL_INT,
-    MAKE_FUNCTION, NOT_TAKEN, POP_JUMP_IF_FALSE, PUSH_NULL, RAISE_VARARGS, RETURN_VALUE,
-    STORE_SUBSCR, SWAP, UNPACK_SEQUENCE,
+    DICT_MERGE, LIST_APPEND, LIST_EXTEND, LOAD_BUILD_CLASS, LOAD_CONST, LOAD_DEREF, LOAD_FAST,
+    LOAD_SMALL_INT, MAKE_FUNCTION, NOT_TAKEN, POP_JUMP_IF_FALSE, PUSH_NULL, RAISE_VARARGS,
+    RETURN_VALUE, STORE_SUBSCR, SWAP, UNPACK_SEQUENCE,
 };
 use crate::CompileError;
 use crate::assembler::SourceLocation;
@@ -25,8 +26,9 @@ use crate::target::operands::{
 
 use super::constant::fold_constant;
 use super::scope::{
-    LoweringFunctionPlan, NameId, ReferenceCollector, collect_simple_annotations,
-    expression_required_names, nested_expression_required_names, type_parameter_required_names,
+    LoweringFunctionPlan, NameId, ReferenceCollector, collect_conditional_simple_annotations,
+    collect_simple_annotations, expression_required_names, nested_expression_required_names,
+    type_parameter_required_names,
 };
 use super::source::unparse_annotation;
 use super::statement::suite_contains_yield;
@@ -818,6 +820,7 @@ impl Compiler {
             class_plan.bound_names,
             class_plan.needs_class_closure,
             class_plan.needs_classdict,
+            class_plan.has_conditional_annotations,
             self.unit.flags & SUPPORTED_FUTURE_FLAGS,
         );
         child.unit.class_scope_is_nested = class_scope_is_nested;
@@ -1335,6 +1338,9 @@ impl Compiler {
         if annotations.is_empty() {
             return Ok(None);
         }
+        let mut conditional_annotations = Vec::new();
+        collect_conditional_simple_annotations(body, &mut conditional_annotations);
+        let mut conditional_annotations = VecDeque::from(conditional_annotations);
 
         let mut references = ReferenceCollector::default();
         for annotation in &annotations {
@@ -1350,8 +1356,16 @@ impl Compiler {
         {
             self.insert_lexical_name(&mut freevars, name);
         }
+        let dunder_class = self.required_name_id("__class__");
+        if reference_ids.contains(&dunder_class) && self.is_cell_id(dunder_class) {
+            self.insert_lexical_name(&mut freevars, dunder_class);
+        }
         let classdict = self.required_name_id("__classdict__");
         self.insert_lexical_name(&mut freevars, classdict);
+        if !conditional_annotations.is_empty() {
+            let conditional = self.required_name_id("__conditional_annotations__");
+            freevars.push(conditional);
+        }
         let freevar_set: FxHashSet<_> = freevars.iter().copied().collect();
         let globals = reference_ids
             .into_iter()
@@ -1396,7 +1410,47 @@ impl Compiler {
         child.emit_annotation_format_guard("format")?;
         child.emit(BUILD_MAP, 0, 1)?;
 
+        let mut conditional_index = 0_u32;
         for annotation in annotations {
+            let annotation_conditional = conditional_annotations
+                .front()
+                .is_some_and(|candidate| std::ptr::eq(*candidate, annotation));
+            if annotation_conditional {
+                conditional_annotations.pop_front();
+                child
+                    .assembler
+                    .set_location(child.source_location(annotation.range));
+                child.emit(LOAD_SMALL_INT, conditional_index, 1)?;
+                conditional_index += 1;
+                let conditional = child.closure_index("__conditional_annotations__")?;
+                child.emit(LOAD_DEREF, conditional, 1)?;
+                child.emit(CONTAINS_OP, 0, -1)?;
+                let skip = child.assembler.label();
+                child.emit_jump_forward(POP_JUMP_IF_FALSE, skip, -1)?;
+                child.emit(NOT_TAKEN, 0, 0)?;
+                child
+                    .assembler
+                    .set_location(child.source_location(annotation.annotation.range()));
+                child.compile_expression(&annotation.annotation)?;
+                child
+                    .assembler
+                    .set_location(child.source_location(annotation.range));
+                child.emit(COPY, 2, 1)?;
+                let target = child.mangled_name(
+                    annotation
+                        .target
+                        .as_name_expr()
+                        .ok_or_else(|| unsupported("simple annotation target"))?
+                        .id
+                        .as_str(),
+                );
+                child.load_string_constant(&target)?;
+                child.assembler.set_location(setup_location);
+                child.emit(STORE_SUBSCR, 0, -3)?;
+                child.assembler.mark(skip);
+                child.set_depth(1);
+                continue;
+            }
             let Expr::Name(target) = annotation.target.as_ref() else {
                 return Err(unsupported("simple annotation target"));
             };
@@ -1413,6 +1467,7 @@ impl Compiler {
             child.assembler.set_location(setup_location);
             child.emit(STORE_SUBSCR, 0, -3)?;
         }
+        debug_assert!(conditional_annotations.is_empty());
         child.assembler.set_location(setup_location);
         child.emit(RETURN_VALUE, 0, -1)?;
         let child = child.finish_inner(false)?;

@@ -1,9 +1,11 @@
 use std::cell::Cell;
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use ruff_python_ast::token::Tokens;
 use ruff_python_ast::{Expr, Stmt, Suite};
 use ruff_text_size::Ranged;
+use ruff_text_size::TextRange;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{
@@ -26,7 +28,8 @@ use crate::target::operands::{FunctionAttribute, ResumeLocation, UnaryIntrinsic}
 use super::constant::{OutputState, fold_constant};
 use super::definition::clean_doc;
 use super::scope::{
-    LoweringFunctionPlan, NameId, NameSet, ScopeId, class_static_attributes, has_simple_annotations,
+    LoweringFunctionPlan, NameId, NameSet, ScopeId, class_static_attributes,
+    collect_conditional_simple_annotations, has_simple_annotations,
 };
 use super::source::{CompilationContext, implicit_return_range};
 use super::statement::{
@@ -43,6 +46,7 @@ pub(super) struct CodeUnit {
     pub(super) child_qualified_name_parent: Option<String>,
     pub(super) class_scope_is_nested: bool,
     pub(super) module_annotation_index: u32,
+    pub(super) class_conditional_annotations: VecDeque<TextRange>,
     pub(super) annotation_classdict_index: Option<u32>,
     name: String,
     pub(super) qualified_name: String,
@@ -205,6 +209,7 @@ impl Compiler {
         bound_names: FxHashSet<NameId>,
         needs_class_closure: bool,
         has_methods: bool,
+        has_conditional_annotations: bool,
         future_flags: u32,
     ) -> Self {
         let mut locals = comprehension_targets.to_vec();
@@ -231,6 +236,15 @@ impl Compiler {
             let name = names
                 .get("__classdict__")
                 .expect("module analysis should intern `__classdict__`");
+            if !locals.contains(&name) {
+                locals.push(name);
+            }
+            cell_names.insert(name);
+        }
+        if has_conditional_annotations {
+            let name = names
+                .get("__conditional_annotations__")
+                .expect("module analysis should intern `__conditional_annotations__`");
             if !locals.contains(&name) {
                 locals.push(name);
             }
@@ -430,6 +444,15 @@ impl Compiler {
     pub(super) fn compile_class_body(mut self, body: &Suite) -> Result<CodeObject, CompileError> {
         let has_classdict_cell = self.is_cell("__classdict__");
         let has_class_cell = self.is_cell("__class__");
+        let has_conditional_annotations = self.is_cell("__conditional_annotations__");
+        if has_conditional_annotations {
+            let mut annotations = Vec::new();
+            collect_conditional_simple_annotations(body, &mut annotations);
+            self.unit.class_conditional_annotations = annotations
+                .into_iter()
+                .map(|annotation| annotation.range)
+                .collect();
+        }
         self.assembler.set_location(SourceLocation::NONE);
         if !self.symbols.free_names.is_empty() {
             self.emit(
@@ -487,6 +510,11 @@ impl Compiler {
                 .expect("classdict cell is present");
             self.emit(STORE_DEREF, to_u32(index, "classdict cell index")?, -1)?;
         }
+        if has_conditional_annotations {
+            self.emit(BUILD_SET, 0, 1)?;
+            let index = self.closure_index("__conditional_annotations__")?;
+            self.emit(STORE_DEREF, index, -1)?;
+        }
         if self.unit.flags & CO_FUTURE_ANNOTATIONS != 0 && has_simple_annotations(body) {
             self.emit(SETUP_ANNOTATIONS, 0, 0)?;
         }
@@ -509,6 +537,7 @@ impl Compiler {
         let body_start = self.assembler.instruction_count();
         let mut footer_location = SourceLocation::NONE;
         self.compile_suite(body)?;
+        debug_assert!(self.unit.class_conditional_annotations.is_empty());
         if let Some(Stmt::Expr(expression)) = body.last()
             && fold_constant(&expression.value).is_some()
         {
@@ -824,6 +853,7 @@ impl CodeUnit {
             child_qualified_name_parent: None,
             class_scope_is_nested: false,
             module_annotation_index: 0,
+            class_conditional_annotations: VecDeque::new(),
             annotation_classdict_index: None,
             name: spec.name,
             qualified_name: spec.qualified_name,
