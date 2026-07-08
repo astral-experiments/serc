@@ -587,6 +587,128 @@ async def await_before_nested_finally(a):
 ";
         assert_matches_cpython_marshal(source, "terminal_try_condition_ownership.py");
     }
+    #[test]
+    fn matches_cpython_marshal_for_terminal_try_dynamic_condition_owners() {
+        let source = r"def call_then_local():
+    try:
+        flag = source()
+        if flag:
+            action()
+    except Exception:
+        recover()
+
+def unpack_then_local(values):
+    try:
+        first, second = values
+        if first:
+            action()
+    except Exception:
+        recover()
+
+def fast_pair(left, right):
+    try:
+        if left + right:
+            action()
+    except Exception:
+        recover()
+
+def fast_const(left):
+    try:
+        if left + 1:
+            action()
+    except Exception:
+        recover()
+
+def global_call():
+    try:
+        if predicate():
+            action()
+    except Exception:
+        recover()
+
+def local_call(predicate):
+    try:
+        if predicate():
+            action()
+    except Exception:
+        recover()
+
+def method_call(obj):
+    try:
+        if obj.predicate():
+            action()
+    except Exception:
+        recover()
+
+def fast_dict(key, value):
+    try:
+        if {key: value}:
+            action()
+    except Exception:
+        recover()
+
+def constant_dict(value):
+    try:
+        if {'key': value}:
+            action()
+    except Exception:
+        recover()
+
+def unpack_dict(mapping):
+    try:
+        if {**mapping}:
+            action()
+    except Exception:
+        recover()
+
+def prior_call_then_while(flag):
+    try:
+        seed()
+        while flag:
+            action()
+            break
+    except Exception:
+        recover()
+";
+        assert_matches_cpython_marshal(source, "terminal_try_dynamic_owners.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_generator_like_terminal_elif_owners() {
+        let source = r"def generator_elif(first, second):
+    yield 1
+    try:
+        if first:
+            one()
+        elif second:
+            two()
+    except Exception:
+        recover()
+
+async def async_generator_elif(first, second):
+    yield 1
+    try:
+        if first:
+            one()
+        elif second:
+            two()
+    except Exception:
+        recover()
+
+async def coroutine_after_await(first, second, final):
+    await before()
+    try:
+        if first:
+            one()
+        elif second:
+            two()
+        if final:
+            three()
+    except Exception:
+        recover()
+";
+        assert_matches_cpython_marshal(source, "terminal_try_generator_elif.py");
+    }
 
     #[test]
     fn matches_cpython_marshal_for_try_exits_across_exception_boundaries() {

@@ -144,6 +144,75 @@ impl Assembler {
         )
     }
 
+    /// Returns whether optimization can leave a dynamic exception owner in the current block.
+    ///
+    /// Stop at every emitted label so future backedges cannot leak ownership across a block
+    /// boundary that has not become a jump target yet.
+    pub(crate) fn current_block_has_dynamic_exception_owner(&self) -> bool {
+        fn will_fuse(first: Instruction, second: Instruction) -> bool {
+            if first.fusion_policy.prevent_with_next
+                || first.borrow_fallthrough == BorrowFallthrough::Barrier
+                || second.fusion_policy.prevent_with_previous
+            {
+                return false;
+            }
+            let (Operand::Value(first_argument), Operand::Value(second_argument)) =
+                (first.operand, second.operand)
+            else {
+                return false;
+            };
+            first_argument < 16
+                && second_argument < 16
+                && first.location.line == second.location.line
+                && matches!(
+                    (first.opcode, second.opcode),
+                    (LOAD_FAST_BORROW, LOAD_FAST_BORROW)
+                        | (LOAD_FAST, LOAD_FAST)
+                        | (STORE_FAST, LOAD_FAST | LOAD_FAST_BORROW | STORE_FAST)
+                )
+        }
+
+        let mut following_instruction = None;
+        for item in self.linear_items().iter().rev() {
+            let Item::Instruction(instruction) = item else {
+                break;
+            };
+            if instruction.opcode == NOT_TAKEN
+                || (!is_conditional_jump(instruction.opcode)
+                    && (!matches!(instruction.operand, Operand::Value(_))
+                        || ends_scope(instruction.opcode)))
+            {
+                break;
+            }
+
+            let applied_comprehension_swap =
+                following_instruction.is_some_and(|following: Instruction| {
+                    following.opcode == STORE_FAST
+                        && following.fusion_policy.prevent_with_previous
+                        && matches!(instruction.opcode, POP_TOP | STORE_FAST)
+                        && !(instruction.opcode == STORE_FAST
+                            && instruction.fusion_policy.prevent_with_previous)
+                });
+            if matches!(
+                instruction.opcode,
+                LOAD_FAST_BORROW_LOAD_FAST_BORROW
+                    | LOAD_FAST_LOAD_FAST
+                    | STORE_FAST_LOAD_FAST
+                    | STORE_FAST_STORE_FAST
+            ) || matches!(
+                (instruction.opcode, instruction.operand),
+                (LOAD_GLOBAL, Operand::Value(argument)) if argument & 1 != 0
+            ) || following_instruction
+                .is_some_and(|following| will_fuse(*instruction, following))
+                || applied_comprehension_swap
+            {
+                return true;
+            }
+            following_instruction = Some(*instruction);
+        }
+        false
+    }
+
     pub(crate) fn label(&mut self) -> Label {
         let label = Label(self.next_label);
         self.next_label += 1;

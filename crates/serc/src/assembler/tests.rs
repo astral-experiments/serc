@@ -279,6 +279,56 @@ fn exception_exclusion_names_layout_policy() {
 }
 
 #[test]
+fn dynamic_exception_owner_tracks_fusible_loads_and_null_globals() {
+    let location = SourceLocation::new(1, 1, 0, 1);
+
+    let mut fusible = Assembler::default();
+    fusible.set_location(location);
+    fusible.emit(LOAD_FAST, 1);
+    fusible.emit(LOAD_FAST, 2);
+    assert!(fusible.current_block_has_dynamic_exception_owner());
+
+    let mut mixed = Assembler::default();
+    mixed.set_location(location);
+    mixed.emit(LOAD_FAST, 1);
+    mixed.emit(LOAD_CONST, 0);
+    assert!(!mixed.current_block_has_dynamic_exception_owner());
+
+    let mut blocked = Assembler::default();
+    blocked.set_location(location);
+    blocked.emit(LOAD_FAST, 1);
+    blocked.prevent_last_instruction_fusion();
+    blocked.emit(LOAD_FAST, 2);
+    assert!(!blocked.current_block_has_dynamic_exception_owner());
+
+    let mut null_global = Assembler::default();
+    null_global.emit(LOAD_GLOBAL, 1);
+    assert!(null_global.current_block_has_dynamic_exception_owner());
+
+    let mut regular_global = Assembler::default();
+    regular_global.emit(LOAD_GLOBAL, 0);
+    assert!(!regular_global.current_block_has_dynamic_exception_owner());
+}
+
+#[test]
+fn dynamic_exception_owner_stops_at_emitted_boundaries() {
+    let mut assembler = Assembler::default();
+    assembler.set_location(SourceLocation::new(1, 1, 0, 1));
+    assembler.emit(LOAD_FAST, 1);
+    assembler.emit(LOAD_FAST, 2);
+    assert!(assembler.current_block_has_dynamic_exception_owner());
+
+    let boundary = assembler.label();
+    assembler.mark(boundary);
+    assert!(!assembler.current_block_has_dynamic_exception_owner());
+
+    assembler.emit(LOAD_GLOBAL, 1);
+    assert!(assembler.current_block_has_dynamic_exception_owner());
+    assembler.emit(NOT_TAKEN, 0);
+    assert!(!assembler.current_block_has_dynamic_exception_owner());
+}
+
+#[test]
 fn fusion_preserves_each_typed_instruction_policy() {
     let mut first = Instruction::new(
         LOAD_FAST,

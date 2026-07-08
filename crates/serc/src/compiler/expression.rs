@@ -4255,7 +4255,13 @@ impl Compiler {
                 comparison_is_boolean || self.control.active_normal_finally_bodies > 0,
             ),
         };
-        if comparison_is_boolean || matches!(expression, Expr::Call(_) | Expr::BinOp(_)) {
+        if comparison_is_boolean
+            || (self
+                .control
+                .terminal_try_condition_exception_exclusion_depth
+                .is_some()
+                && self.assembler.current_block_has_dynamic_exception_owner())
+        {
             self.emit_condition_not_taken_preserving_terminal_try_owner(policy)
         } else {
             self.emit_condition_not_taken(policy)
