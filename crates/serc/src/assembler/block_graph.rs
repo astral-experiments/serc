@@ -572,6 +572,21 @@ impl BlockGraph {
                     (Item::Label(_), _) | (_, Item::Label(_)) => None,
                 });
             if let Some(instruction) = fused {
+                let Item::Instruction(second) = items[read + 1] else {
+                    unreachable!("a fused pair must contain two instructions");
+                };
+                // CPython resolves missing locations before replacing the second half of a
+                // superinstruction with a removable NOP. For a forward source-order pair,
+                // preserve that location on an immediately following instruction before
+                // compacting the pair. Reversed assignment stores retain the first location.
+                if let Some(Item::Instruction(following)) = items.get_mut(read + 2)
+                    && following.location.line < 0
+                    && !following.no_location_policy.preserve
+                    && second.location.line == instruction.location.line
+                    && second.location.column > instruction.location.column
+                {
+                    following.location = second.location;
+                }
                 items[write] = Item::Instruction(instruction);
                 read += 2;
             } else {

@@ -2430,6 +2430,21 @@ def tail_break(flag, result):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_superinstruction_location_propagation() {
+        let source = r#"def load_pair(first, second, item):
+    consume(first, second, message=("Expected %s" % item))
+
+def store_pair(items):
+    return ["pair %s/%s" % (first, second) for first, second in items]
+
+def reversed_store_pair(first, second):
+    left, right = convert(first), convert(second)
+    return "pair %s/%s" % (left, right)
+"#;
+        assert_matches_cpython_marshal(source, "superinstruction_locations.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_borrowing_after_terminal_exception_handlers() {
         let source = "def returning(dependencies):\n    try:\n        before = load()\n        after = load()\n    except Exception:\n        return\n    for dependency in dependencies:\n        if dependency in after:\n            consume(dependency, before)\n\ndef reraising(dependencies):\n    try:\n        before = load()\n        after = load()\n    except Exception:\n        raise\n    for dependency in dependencies:\n        if dependency in after:\n            consume(dependency, before)\n";
         assert_matches_cpython_marshal(source, "terminal_handlers.py");
