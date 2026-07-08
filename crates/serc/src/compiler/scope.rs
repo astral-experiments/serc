@@ -1378,8 +1378,23 @@ impl LocalCollector {
                         }
                     }
                 }
-                Stmt::FunctionDef(definition) => self.insert(definition.name.as_str()),
-                Stmt::ClassDef(definition) => self.insert(definition.name.as_str()),
+                Stmt::FunctionDef(definition) => {
+                    for decorator in &definition.decorator_list {
+                        self.collect_expression(&decorator.expression);
+                    }
+                    self.insert(definition.name.as_str());
+                }
+                Stmt::ClassDef(definition) => {
+                    for decorator in &definition.decorator_list {
+                        self.collect_expression(&decorator.expression);
+                    }
+                    self.insert(definition.name.as_str());
+                }
+                Stmt::Delete(statement) => {
+                    for target in &statement.targets {
+                        self.collect_target(target);
+                    }
+                }
                 Stmt::TypeAlias(statement) => {
                     if let Expr::Name(name) = statement.name.as_ref() {
                         self.insert(name.id.as_str());

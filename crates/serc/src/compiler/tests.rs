@@ -208,6 +208,39 @@ fn single_pass_local_collection_preserves_source_order() {
 }
 
 #[test]
+fn local_collection_includes_decorator_bindings_and_delete_targets() {
+    let source = r"def bindings():
+    @decorator
+    def function():
+        pass
+
+    @(assigned := decorator)
+    class Class:
+        pass
+
+    del deleted
+    decorator = identity
+";
+    let parsed = parse_module(source).unwrap();
+    let module = module_compiler(source, &parsed)
+        .compile_module(parsed.suite())
+        .unwrap();
+    let function = module
+        .constants
+        .iter()
+        .find_map(|constant| match constant {
+            Constant::Code(code) if code.name == "bindings" => Some(code),
+            _ => None,
+        })
+        .expect("module should contain the function body");
+
+    assert_eq!(
+        function.locals,
+        ["decorator", "function", "assigned", "Class", "deleted"]
+    );
+}
+
+#[test]
 fn symbol_name_ids_preserve_mangled_cell_and_freevar_order() {
     let source = r"class ____Container:
     def outer(self):
