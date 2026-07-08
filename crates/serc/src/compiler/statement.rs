@@ -29,7 +29,7 @@ use super::expression::{
     optimized_generator_callable,
 };
 use super::scope::{NameId, NameSet, ReferenceCollector, collect_target_names};
-use super::source::{implicit_return_range, unparse_annotation};
+use super::source::{condition_exit_range, implicit_return_range, unparse_annotation};
 use super::symbol::{ReraiseStackState, ResumeDepth, statement_name, to_u32, unsupported};
 use super::{Compiler, Scope};
 
@@ -876,7 +876,7 @@ impl Compiler {
         self.assembler.mark(condition_false);
         self.set_depth(base_depth);
         self.assembler
-            .set_location(self.source_location(statement.test.range()));
+            .set_location(self.source_location(condition_exit_range(&statement.test)));
         self.emit_implicit_return()?;
         self.set_depth(base_depth);
         Ok(())
@@ -917,11 +917,8 @@ impl Compiler {
         for (value, exit) in exits.into_iter().rev() {
             self.assembler.mark(exit);
             self.set_depth(base_depth);
-            let range = match value {
-                Expr::UnaryOp(unary) if unary.op == UnaryOp::Not => unary.operand.range(),
-                _ => value.range(),
-            };
-            self.assembler.set_location(self.source_location(range));
+            self.assembler
+                .set_location(self.source_location(condition_exit_range(value)));
             self.emit_implicit_return()?;
         }
         self.set_depth(base_depth);
@@ -2885,7 +2882,7 @@ impl Compiler {
             let exclusion_start = self.assembler.label();
             self.assembler.mark(exclusion_start);
             self.assembler
-                .set_location(self.source_location(statement.test.range()));
+                .set_location(self.source_location(condition_exit_range(&statement.test)));
             self.emit(NOP, 0, 0)?;
             let exclusion_end = self.assembler.label();
             self.assembler.mark(exclusion_end);
@@ -2906,7 +2903,7 @@ impl Compiler {
         self.set_depth(base_depth);
         if statement.orelse.is_empty() {
             self.assembler
-                .set_location(self.source_location(statement.test.range()));
+                .set_location(self.source_location(condition_exit_range(&statement.test)));
         }
         Ok(())
     }
