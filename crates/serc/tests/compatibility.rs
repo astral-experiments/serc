@@ -2235,6 +2235,19 @@ def decorated():
     }
 
     #[test]
+    fn matches_cpython_marshal_for_an_assertion_branch_exit() {
+        let source = r#"def select(result, states, failed):
+    if failed:
+        assert states == {"disabled"}
+    else:
+        assert states == {"normal"}
+
+    return result
+"#;
+        assert_matches_cpython_marshal(source, "assert_branch_exit.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_nested_if_final_clause_exits() {
         let source = r"def final_else(outer, inner):
     if outer:

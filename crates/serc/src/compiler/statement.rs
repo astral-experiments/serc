@@ -2244,11 +2244,17 @@ impl Compiler {
                         self.set_branch_end_location(body, body_start);
                     }
                     self.emit_jump_forward(JUMP_FORWARD, end, 0)?;
+                    // CPython retains the first assertion branch's source jump when it copies a
+                    // nonterminal join onto that edge. Later clauses and terminating `else`
+                    // blocks take different CFG paths and drop the jump instead.
+                    let retain_assertion_exit = branch_index == 0
+                        && !has_terminating_else
+                        && matches!(body.last(), Some(Stmt::Assert(_)));
                     if nested_if_ends_in_break && has_terminating_else {
                         self.assembler.preserve_last_inlined_jump_nop();
                     } else if matches!(nested_if_exit, Some(NestedIfExitLocation::Unlocated)) {
                         self.assembler.preserve_last_no_location();
-                    } else if pass_only_body {
+                    } else if pass_only_body || retain_assertion_exit {
                         self.assembler.preserve_last_direct_inlined_jump_nop();
                     } else if matches!(body.last(), Some(Stmt::If(_))) {
                         // CPython emits this jump in the nested if's empty join block. When
