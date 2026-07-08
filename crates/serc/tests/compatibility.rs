@@ -2574,6 +2574,34 @@ def reversed_store_pair(first, second):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_terminal_handler_condition_exits() {
+        let source = r"def unnamed(action, reraises):
+    try:
+        action()
+    except Exception:
+        if reraises:
+            raise
+
+def named(action, reraises):
+    try:
+        action()
+    except Exception as error:
+        if reraises(error):
+            raise
+
+def final_elif(action, first, second):
+    try:
+        action()
+    except Exception:
+        if first:
+            raise
+        elif second:
+            raise
+";
+        assert_matches_cpython_marshal(source, "terminal_handler_condition_exits.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_shared_terminal_handler_borrow_edges() {
         let source = "def branch_raise(flag):\n    if flag:\n        try:\n            action()\n        except Exception:\n            raise\n    else:\n        consume(flag)\n    after(flag)\n\ndef branch_return(flag):\n    if flag:\n        try:\n            action()\n        except Exception:\n            return\n    else:\n        consume(flag)\n    after(flag)\n\ndef nested_loop(values):\n    result = None\n    for item in values:\n        try:\n            result = load(item)\n        except KeyError:\n            raise ValueError(item)\n    return result\n";
         assert_matches_cpython_marshal(source, "shared_terminal_handler_edges.py");
