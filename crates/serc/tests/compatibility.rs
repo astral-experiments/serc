@@ -187,6 +187,18 @@ mod tests {
     }
 
     #[test]
+    fn matches_cpython_marshal_for_a_match_case_starting_with_if() {
+        let source = r"match subject:
+    case 1:
+        if first or second:
+            consume(subject)
+    case 2:
+        consume(subject)
+";
+        assert_matches_cpython_marshal(source, "match_leading_if.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_class_footer_control_flow() {
         let source = "class WithFooter:\n    with manager:\n        def method(self): ...\n\nclass WildcardFooter:\n    match value:\n        case int(): ...\n        case _:\n            def method(self): ...\n\nclass FoldedBranchFooter:\n    if ...:\n        ...\n    else:\n        with manager:\n            for value in values:\n                def method(self): ...\n";
         assert_matches_cpython_marshal(source, "class_footer.py");
