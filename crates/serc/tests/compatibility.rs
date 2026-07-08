@@ -5,10 +5,11 @@ mod tests {
     use std::error::Error as _;
     use std::fmt::Write as _;
 
-    use super::common::{assert_executes, assert_matches_cpython_marshal};
+    use super::common::{
+        assert_executes, assert_matches_cpython_marshal, assert_matches_cpython_marshal_bytes,
+    };
     use serc::{
-        CPYTHON_TARGET, CompileError, SourceDecodeError, compile, compile_bytes,
-        compile_bytes_to_pyc, compile_to_pyc, decode_source,
+        CPYTHON_TARGET, CompileError, compile, compile_bytes_to_pyc, compile_to_pyc, decode_source,
     };
     use serc_workloads as benchmark_workloads;
 
@@ -54,12 +55,31 @@ mod tests {
             decode_source(b"\xef\xbb\xbf# coding: utf-8\r\nvalue = '\xc3\xa9'\r").unwrap(),
             "# coding: utf-8\nvalue = '\u{e9}'\n"
         );
-        assert!(matches!(
-            compile_bytes(b"# coding: latin-1\nvalue = 'ascii'\n", "value.py"),
-            Err(CompileError::Decode(SourceDecodeError::UnsupportedEncoding(encoding)))
-                if encoding == "latin-1"
-        ));
+        assert_eq!(
+            decode_source(b"# coding: latin-1\nvalue = '\xe9'\n").unwrap(),
+            "# coding: latin-1\nvalue = '\u{e9}'\n"
+        );
         assert!(compile("# coding: latin-1\nvalue = 'already decoded'\n", "value.py").is_ok());
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_supported_source_encodings() {
+        let cases: [(&str, &[u8]); 8] = [
+            ("latin_1.py", b"# coding: latin-1\nvalue = '\xe9'\n"),
+            ("euc_jp.py", b"# coding: euc-jp\nvalue = '\xa1\xc1'\n"),
+            ("koi8_r.py", b"# coding: koi8-r\nvalue = '\xe1'\n"),
+            ("cp1251.py", b"# coding: cp1251\nvalue = '\xc0'\n"),
+            ("iso_8859_1.py", b"# coding: iso.8859.1\nvalue = '\xe9'\n"),
+            ("iso_ir_100.py", b"# coding: iso.ir.100\nvalue = '\xe9'\n"),
+            ("u_jis.py", b"# coding: u.jis\nvalue = '\xa1\xc1'\n"),
+            (
+                "windows_1251.py",
+                b"# coding: windows.1251\nvalue = '\xc0'\n",
+            ),
+        ];
+        for (filename, source) in cases {
+            assert_matches_cpython_marshal_bytes(source, filename);
+        }
     }
 
     #[test]

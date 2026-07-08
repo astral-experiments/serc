@@ -3,6 +3,8 @@ use std::error::Error;
 use std::fmt;
 use std::str::Utf8Error;
 
+use encoding_rs::{EUC_JP, KOI8_R, WINDOWS_1251};
+
 const UTF8_BOM: &[u8] = b"\xef\xbb\xbf";
 
 /// An error while decoding Python source bytes.
@@ -15,6 +17,8 @@ pub enum SourceDecodeError {
     UnsupportedEncoding(String),
     /// A UTF-8 byte-order mark conflicts with the declared encoding.
     Utf8BomConflict(String),
+    /// The source is not valid in its declared encoding.
+    InvalidEncoding(String),
     /// The source is not valid UTF-8.
     InvalidUtf8(Utf8Error),
     /// The source contains a null byte.
@@ -34,6 +38,9 @@ impl fmt::Display for SourceDecodeError {
                     "encoding problem: UTF-8 BOM conflicts with `{encoding}`"
                 )
             }
+            Self::InvalidEncoding(encoding) => {
+                write!(formatter, "source is not valid `{encoding}`")
+            }
             Self::InvalidUtf8(error) => write!(formatter, "source is not valid UTF-8: {error}"),
             Self::NullByte => formatter.write_str("source code string cannot contain null bytes"),
         }
@@ -50,6 +57,15 @@ impl Error for SourceDecodeError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceEncoding {
+    Utf8(Utf8Encoding),
+    Latin1,
+    EucJp,
+    Koi8R,
+    Windows1251,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Utf8Encoding {
     BomCompatible,
     Alias,
@@ -58,29 +74,198 @@ enum Utf8Encoding {
 /// Decode Python source bytes and normalize them for parsing.
 ///
 /// Serc accepts UTF-8 source, including a single UTF-8 BOM and CPython-compatible UTF-8
-/// encoding cookies on the first or second physical line. Newlines are normalized to `\n`. The
-/// returned value borrows `bytes` when no newline normalization is required.
+/// encoding cookies on the first or second physical line. Latin-1, EUC-JP, KOI8-R, and Windows
+/// 1251 cookies are also decoded with CPython-compatible aliases and strict mappings. Newlines are
+/// normalized to `\n`. The returned value borrows `bytes` for unchanged UTF-8 source.
 pub fn decode_source(bytes: &[u8]) -> Result<Cow<'_, str>, SourceDecodeError> {
+    if bytes.contains(&0) {
+        return Err(SourceDecodeError::NullByte);
+    }
     let (bytes, has_bom) = bytes
         .strip_prefix(UTF8_BOM)
         .map_or((bytes, false), |bytes| (bytes, true));
     if has_bom && bytes.starts_with(UTF8_BOM) {
         return Err(SourceDecodeError::MultipleUtf8Boms);
     }
-    if let Some(cookie) = declared_encoding(bytes) {
-        let Some(encoding) = classify_utf8_encoding(cookie) else {
-            return Err(SourceDecodeError::UnsupportedEncoding(cookie.to_string()));
-        };
-        if has_bom && encoding == Utf8Encoding::Alias {
-            return Err(SourceDecodeError::Utf8BomConflict(cookie.to_string()));
+    let declared = declared_encoding(bytes);
+    let encoding = match declared {
+        Some(cookie) => {
+            let Some(encoding) = classify_source_encoding(cookie) else {
+                return Err(SourceDecodeError::UnsupportedEncoding(cookie.to_string()));
+            };
+            if has_bom && encoding != SourceEncoding::Utf8(Utf8Encoding::BomCompatible) {
+                return Err(SourceDecodeError::Utf8BomConflict(cookie.to_string()));
+            }
+            encoding
         }
+        None => SourceEncoding::Utf8(Utf8Encoding::BomCompatible),
+    };
+
+    let source = match encoding {
+        SourceEncoding::Utf8(_) => {
+            Cow::Borrowed(std::str::from_utf8(bytes).map_err(SourceDecodeError::InvalidUtf8)?)
+        }
+        SourceEncoding::Latin1 => Cow::Owned(bytes.iter().copied().map(char::from).collect()),
+        SourceEncoding::EucJp | SourceEncoding::Koi8R | SourceEncoding::Windows1251 => {
+            let encoding_name = declared.expect("legacy source encoding has a cookie");
+            decode_legacy(encoding, bytes)
+                .ok_or_else(|| SourceDecodeError::InvalidEncoding(encoding_name.to_string()))?
+        }
+    };
+    Ok(normalize_decoded_source(source))
+}
+
+fn decode_legacy(encoding: SourceEncoding, bytes: &[u8]) -> Option<Cow<'_, str>> {
+    match encoding {
+        SourceEncoding::EucJp => decode_euc_jp(bytes),
+        SourceEncoding::Koi8R => KOI8_R.decode_without_bom_handling_and_without_replacement(bytes),
+        SourceEncoding::Windows1251 if !bytes.contains(&0x98) => {
+            WINDOWS_1251.decode_without_bom_handling_and_without_replacement(bytes)
+        }
+        SourceEncoding::Windows1251 => None,
+        SourceEncoding::Utf8(_) | SourceEncoding::Latin1 => unreachable!(),
+    }
+}
+
+fn decode_euc_jp(bytes: &[u8]) -> Option<Cow<'_, str>> {
+    let decoded = EUC_JP.decode_without_bom_handling_and_without_replacement(bytes)?;
+    let mut has_override = false;
+    let mut index = 0;
+    while index < bytes.len() {
+        let length = euc_jp_character_len(bytes, index)?;
+        let sequence = &bytes[index..index + length];
+        if length == 2 && euc_jp_web_extension(sequence[0], sequence[1]) {
+            return None;
+        }
+        has_override |= euc_jp_override(sequence).is_some();
+        index += length;
+    }
+    if !has_override {
+        return Some(decoded);
     }
 
-    let source = std::str::from_utf8(bytes).map_err(SourceDecodeError::InvalidUtf8)?;
-    if source.contains('\0') {
-        return Err(SourceDecodeError::NullByte);
+    let mut output = String::with_capacity(decoded.len());
+    let mut segment_start = 0;
+    index = 0;
+    while index < bytes.len() {
+        let length = euc_jp_character_len(bytes, index)?;
+        let sequence = &bytes[index..index + length];
+        if let Some(character) = euc_jp_override(sequence) {
+            let segment = EUC_JP.decode_without_bom_handling_and_without_replacement(
+                &bytes[segment_start..index],
+            )?;
+            output.push_str(&segment);
+            output.push(character);
+            segment_start = index + length;
+        }
+        index += length;
     }
-    Ok(normalize_newlines(source))
+    let segment =
+        EUC_JP.decode_without_bom_handling_and_without_replacement(&bytes[segment_start..])?;
+    output.push_str(&segment);
+    Some(Cow::Owned(output))
+}
+
+fn euc_jp_character_len(bytes: &[u8], index: usize) -> Option<usize> {
+    match bytes[index] {
+        0x00..=0x7f => Some(1),
+        0x8e if matches!(bytes.get(index + 1), Some(0xa1..=0xdf)) => Some(2),
+        0x8f if matches!(bytes.get(index + 1), Some(0xa1..=0xfe))
+            && matches!(bytes.get(index + 2), Some(0xa1..=0xfe)) =>
+        {
+            Some(3)
+        }
+        0xa1..=0xfe if matches!(bytes.get(index + 1), Some(0xa1..=0xfe)) => Some(2),
+        _ => None,
+    }
+}
+
+fn euc_jp_web_extension(lead: u8, trail: u8) -> bool {
+    match lead {
+        0xad => matches!(trail, 0xa1..=0xbe | 0xc0..=0xd6 | 0xdf..=0xfc),
+        0xf9..=0xfb => matches!(trail, 0xa1..=0xfe),
+        0xfc => matches!(trail, 0xa1..=0xee | 0xf1..=0xfe),
+        _ => false,
+    }
+}
+
+fn euc_jp_override(sequence: &[u8]) -> Option<char> {
+    match sequence {
+        [0xa1, 0xc1] => Some('\u{301c}'),
+        [0xa1, 0xc2] => Some('\u{2016}'),
+        [0xa1, 0xdd] => Some('\u{2212}'),
+        [0xa1, 0xf1] => Some('\u{00a2}'),
+        [0xa1, 0xf2] => Some('\u{00a3}'),
+        [0xa2, 0xcc] => Some('\u{00ac}'),
+        [0x8f, 0xa2, 0xb7] => Some('~'),
+        _ => None,
+    }
+}
+
+fn normalize_decoded_source(source: Cow<'_, str>) -> Cow<'_, str> {
+    match source {
+        Cow::Borrowed(source) => normalize_newlines(source),
+        Cow::Owned(source) => {
+            if source.as_bytes().contains(&b'\r') {
+                Cow::Owned(normalize_newlines(&source).into_owned())
+            } else {
+                Cow::Owned(source)
+            }
+        }
+    }
+}
+
+fn classify_source_encoding(name: &str) -> Option<SourceEncoding> {
+    if let Some(encoding) = classify_utf8_encoding(name) {
+        return Some(SourceEncoding::Utf8(encoding));
+    }
+    if classify_latin1_encoding(name) {
+        return Some(SourceEncoding::Latin1);
+    }
+    let normalized = normalize_codec_name(name);
+    let encoding = match normalized.as_str() {
+        "8859" | "cp819" | "csisolatin1" | "ibm819" | "iso8859" | "iso8859_1" | "iso_8859_1"
+        | "iso_8859_1_1987" | "iso_ir_100" | "l1" | "latin" | "latin1" | "latin_1" => {
+            Some(SourceEncoding::Latin1)
+        }
+        "euc_jp" | "eucjp" | "ujis" | "u_jis" => Some(SourceEncoding::EucJp),
+        "koi8_r" | "cskoi8r" => Some(SourceEncoding::Koi8R),
+        "windows_1251" | "cp1251" | "1251" => Some(SourceEncoding::Windows1251),
+        _ => None,
+    };
+    encoding.or_else(|| classify_dotted_codec_alias(&normalized))
+}
+
+fn classify_dotted_codec_alias(name: &str) -> Option<SourceEncoding> {
+    let alias = name.contains('.').then(|| name.replace('.', "_"))?;
+    match alias.as_str() {
+        "iso8859_1" | "iso_8859_1" | "iso_8859_1_1987" | "iso_ir_100" => {
+            Some(SourceEncoding::Latin1)
+        }
+        "u_jis" => Some(SourceEncoding::EucJp),
+        "windows_1251" => Some(SourceEncoding::Windows1251),
+        _ => None,
+    }
+}
+
+fn classify_latin1_encoding(name: &str) -> bool {
+    let normalized_prefix: String = name
+        .bytes()
+        .take(12)
+        .map(|byte| match byte {
+            b'A'..=b'Z' => char::from(byte.to_ascii_lowercase()),
+            b'_' => '-',
+            _ => char::from(byte),
+        })
+        .collect();
+    ["latin-1", "iso-8859-1", "iso-latin-1"]
+        .iter()
+        .any(|prefix| {
+            normalized_prefix == *prefix
+                || normalized_prefix
+                    .strip_prefix(prefix)
+                    .is_some_and(|suffix| suffix.starts_with('-'))
+        })
 }
 
 pub(crate) fn normalize_source(source: &str) -> Cow<'_, str> {
@@ -191,11 +376,18 @@ fn classify_utf8_encoding(name: &str) -> Option<Utf8Encoding> {
         return Some(Utf8Encoding::BomCompatible);
     }
 
-    matches!(
-        normalize_codec_name(name).as_str(),
-        "utf" | "u8" | "utf8" | "utf8_ucs2" | "utf8_ucs4" | "cp65001"
-    )
-    .then_some(Utf8Encoding::Alias)
+    let normalized = normalize_codec_name(name);
+    if matches!(
+        normalized.as_str(),
+        "utf" | "u8" | "utf8" | "utf_8" | "utf8_ucs2" | "utf8_ucs4" | "cp65001"
+    ) {
+        return Some(Utf8Encoding::Alias);
+    }
+    normalized
+        .contains('.')
+        .then(|| normalized.replace('.', "_"))
+        .is_some_and(|alias| matches!(alias.as_str(), "utf8_ucs2" | "utf8_ucs4"))
+        .then_some(Utf8Encoding::Alias)
 }
 
 fn normalize_codec_name(name: &str) -> String {
@@ -219,7 +411,10 @@ fn normalize_codec_name(name: &str) -> String {
 mod tests {
     use std::borrow::Cow;
 
-    use super::{SourceDecodeError, declared_encoding, decode_source, normalize_source};
+    use super::{
+        SourceDecodeError, SourceEncoding, classify_source_encoding, declared_encoding,
+        decode_euc_jp, decode_source, normalize_source,
+    };
 
     #[test]
     fn borrows_source_without_normalization() {
@@ -254,6 +449,30 @@ mod tests {
     }
 
     #[test]
+    fn decodes_supported_legacy_encodings_and_normalizes_newlines() {
+        assert_eq!(
+            decode_source(b"# coding: latin-1\r\nvalue = '\xe9'\r").unwrap(),
+            "# coding: latin-1\nvalue = '\u{e9}'\n"
+        );
+        assert_eq!(
+            decode_source(b"# coding: euc-jp\nvalue = '\xa4\xa2'\n").unwrap(),
+            "# coding: euc-jp\nvalue = '\u{3042}'\n"
+        );
+        assert_eq!(
+            decode_source(b"# coding: koi8-r\nvalue = '\xe1'\n").unwrap(),
+            "# coding: koi8-r\nvalue = '\u{410}'\n"
+        );
+        assert_eq!(
+            decode_source(b"# coding: cp1251\nvalue = '\xc0'\n").unwrap(),
+            "# coding: cp1251\nvalue = '\u{410}'\n"
+        );
+        assert_eq!(
+            decode_source(b"# coding: latin-1\nvalue = '\0'\n"),
+            Err(SourceDecodeError::NullByte)
+        );
+    }
+
+    #[test]
     fn rejects_invalid_source_bytes() {
         assert_eq!(
             decode_source(b"\xef\xbb\xbf\xef\xbb\xbfpass\n"),
@@ -271,6 +490,66 @@ mod tests {
             decode_source(b"\xef\xbb\xbf# coding: utf8\npass\n"),
             Err(SourceDecodeError::Utf8BomConflict("utf8".to_string()))
         );
+        assert_eq!(
+            decode_source(b"\xef\xbb\xbf# coding: latin-1\npass\n"),
+            Err(SourceDecodeError::Utf8BomConflict("latin-1".to_string()))
+        );
+        assert_eq!(
+            decode_source(b"# coding: cp1251\nvalue = '\x98'\n"),
+            Err(SourceDecodeError::InvalidEncoding("cp1251".to_string()))
+        );
+        assert_eq!(
+            decode_source(b"# coding: euc-jp\nvalue = '\xa4'\n"),
+            Err(SourceDecodeError::InvalidEncoding("euc-jp".to_string()))
+        );
+        assert_eq!(
+            decode_source(b"# coding: euc-jp\nvalue = '\xad\xa1'\n"),
+            Err(SourceDecodeError::InvalidEncoding("euc-jp".to_string()))
+        );
+        assert_eq!(
+            decode_source(b"# coding: big5\npass\n"),
+            Err(SourceDecodeError::UnsupportedEncoding("big5".to_string()))
+        );
+        for source in [
+            b"\xff\0".as_slice(),
+            b"# coding: cp1251\n\x98\0",
+            b"# coding: big5\n\0",
+            b"\xef\xbb\xbf\xef\xbb\xbf\0",
+        ] {
+            assert_eq!(decode_source(source), Err(SourceDecodeError::NullByte));
+        }
+    }
+
+    #[test]
+    fn applies_cpython_euc_jp_mapping_overrides() {
+        for (encoded, expected) in [
+            (b"\xa1\xc1".as_slice(), '\u{301c}'),
+            (b"\xa1\xc2".as_slice(), '\u{2016}'),
+            (b"\xa1\xdd".as_slice(), '\u{2212}'),
+            (b"\xa1\xf1".as_slice(), '\u{00a2}'),
+            (b"\xa1\xf2".as_slice(), '\u{00a3}'),
+            (b"\xa2\xcc".as_slice(), '\u{00ac}'),
+            (b"\x8f\xa2\xb7".as_slice(), '~'),
+        ] {
+            assert_eq!(decode_euc_jp(encoded).unwrap(), expected.to_string());
+        }
+    }
+
+    #[test]
+    fn rejects_euc_jp_web_extension_ranges() {
+        for (lead, ranges) in [
+            (0xad, &[(0xa1, 0xbe), (0xc0, 0xd6), (0xdf, 0xfc)][..]),
+            (0xf9, &[(0xa1, 0xfe)][..]),
+            (0xfa, &[(0xa1, 0xfe)][..]),
+            (0xfb, &[(0xa1, 0xfe)][..]),
+            (0xfc, &[(0xa1, 0xee), (0xf1, 0xfe)][..]),
+        ] {
+            for &(start, end) in ranges {
+                for trail in start..=end {
+                    assert!(decode_euc_jp(&[lead, trail]).is_none());
+                }
+            }
+        }
     }
 
     #[test]
@@ -282,12 +561,82 @@ mod tests {
             "utf",
             "u8",
             "utf8",
+            "utf--8",
+            "utf__8",
             "utf8_ucs2",
             "utf8_ucs4",
+            "utf8.ucs2",
+            "utf8.ucs4",
             "cp65001",
         ] {
             let source = format!("# coding: {encoding}\npass\n");
             assert!(decode_source(source.as_bytes()).is_ok(), "{encoding}");
+        }
+        assert!(matches!(
+            decode_source(b"# coding: utf.8\npass\n"),
+            Err(SourceDecodeError::UnsupportedEncoding(encoding)) if encoding == "utf.8"
+        ));
+    }
+
+    #[test]
+    fn accepts_cpython_legacy_encoding_aliases() {
+        for encoding in [
+            "8859",
+            "cp819",
+            "csisolatin1",
+            "ibm819",
+            "iso8859",
+            "iso8859_1",
+            "iso_8859_1",
+            "iso_8859_1_1987",
+            "iso_ir_100",
+            "l1",
+            "latin",
+            "latin1",
+            "latin_1",
+            "iso_latin_1",
+            "iso.8859.1",
+            "iso.ir.100",
+            "latin-1-unix",
+            "iso-8859-1-unix",
+            "iso-latin-1-unix",
+        ] {
+            assert_eq!(
+                classify_source_encoding(encoding),
+                Some(SourceEncoding::Latin1),
+                "{encoding}"
+            );
+        }
+        for encoding in ["euc_jp", "eucjp", "u_jis", "ujis", "u.jis"] {
+            assert_eq!(
+                classify_source_encoding(encoding),
+                Some(SourceEncoding::EucJp),
+                "{encoding}"
+            );
+        }
+        for encoding in ["cskoi8r", "koi8_r"] {
+            assert_eq!(
+                classify_source_encoding(encoding),
+                Some(SourceEncoding::Koi8R),
+                "{encoding}"
+            );
+        }
+        for encoding in ["1251", "cp1251", "windows_1251", "windows.1251"] {
+            assert_eq!(
+                classify_source_encoding(encoding),
+                Some(SourceEncoding::Windows1251),
+                "{encoding}"
+            );
+        }
+        for encoding in [
+            "latin.1",
+            "iso-latin--1",
+            "iso__latin_1",
+            "euc.jp",
+            "koi8.r",
+            "cp.1251",
+        ] {
+            assert_eq!(classify_source_encoding(encoding), None, "{encoding}");
         }
     }
 
@@ -297,12 +646,13 @@ mod tests {
             let supported = format!("# first{newline}# coding: utf8{newline}pass{newline}");
             assert!(decode_source(supported.as_bytes()).is_ok(), "{newline:?}");
 
-            let unsupported = format!("# first{newline}# coding: latin-1{newline}pass{newline}");
+            let legacy = format!("# first{newline}# coding: latin-1{newline}pass{newline}");
+            assert!(decode_source(legacy.as_bytes()).is_ok(), "{newline:?}");
+
+            let unsupported = format!("# first{newline}# coding: big5{newline}pass{newline}");
             assert_eq!(
                 decode_source(unsupported.as_bytes()),
-                Err(SourceDecodeError::UnsupportedEncoding(
-                    "latin-1".to_string()
-                )),
+                Err(SourceDecodeError::UnsupportedEncoding("big5".to_string())),
                 "{newline:?}",
             );
         }

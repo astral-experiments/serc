@@ -14,6 +14,7 @@ license = "MIT OR Apache-2.0"
 clap = { version = "4.6.1", features = ["derive"] }
 codspeed-criterion-compat = { version = "=4.4.1", default-features = false }
 criterion = { version = "=0.8.0", default-features = false }
+encoding_rs = "0.8.35"
 ruff_python_ast = { git = "https://github.com/astral-sh/ruff", rev = "e4a063a136ae0e3d6801bd0dad47d09a0f419530" }
 ruff_python_codegen = { git = "https://github.com/astral-sh/ruff", rev = "e4a063a136ae0e3d6801bd0dad47d09a0f419530" }
 ruff_python_literal = { git = "https://github.com/astral-sh/ruff", rev = "e4a063a136ae0e3d6801bd0dad47d09a0f419530" }

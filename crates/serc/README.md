@@ -32,17 +32,18 @@ cargo run --release -p serc-cli -- compile path/to/package
 
 Paths default to the current directory. Pass `--check` to compile without writing cache files and
 `--quiet` to suppress the success summary. Compilation is sequential so the command can be
-compared directly with single-worker CPython `compileall`. Source files must use UTF-8, either by
-default or with a UTF-8 encoding cookie; other source encodings are unsupported.
+compared directly with single-worker CPython `compileall`. Source files may use UTF-8 or a
+CPython-compatible encoding cookie for Latin-1, EUC-JP, KOI8-R, or Windows-1251; other source
+encodings are unsupported.
 
 ## Library source API
 
 `compile_bytes` is the reusable file-input boundary for callers that already own source bytes. It
-performs no filesystem I/O: it validates a UTF-8 BOM and encoding cookie, rejects null bytes, and
-normalizes CRLF and CR newlines in one pass before compiling. Sources that need no normalization
-remain borrowed internally. For callers that already have source metadata,
-`compile_bytes_to_pyc` constructs a timestamp-invalidated cache file and records the original raw
-byte length:
+performs no filesystem I/O: it validates a UTF-8 BOM and encoding cookie, strictly decodes the
+supported legacy encodings, rejects null bytes, and normalizes CRLF and CR newlines before
+compiling. UTF-8 sources that need no normalization remain borrowed internally. For callers that
+already have source metadata, `compile_bytes_to_pyc` constructs a timestamp-invalidated cache
+file and records the original raw byte length:
 
 ```rust
 let source = b"# coding: utf-8\r\nanswer = 42\r\n";
