@@ -389,6 +389,9 @@ pub(super) struct Instruction {
     pub(super) no_location_policy: NoLocationPolicy,
     pub(super) fusion_policy: FusionPolicy,
     pub(super) converted_pop_block: bool,
+    // Instruction slots removed by compiler-side constant folding. The count is capped at the
+    // three slots that a normalized boolean value marker can reuse.
+    pub(super) hidden_exception_owner_slots: u8,
     pub(super) jump_policy: JumpPolicy,
     // `NOT_TAKEN` is added after CPython labels exception handlers. The new instruction keeps
     // whatever exception target remains in its reused CFG slot, if there is one.
@@ -414,6 +417,7 @@ impl Instruction {
             no_location_policy: NoLocationPolicy::default(),
             fusion_policy: FusionPolicy::default(),
             converted_pop_block: false,
+            hidden_exception_owner_slots: 0,
             jump_policy: JumpPolicy::default(),
             exception_policy: ExceptionPolicy::default(),
             borrow_fallthrough: BorrowFallthrough::default(),
@@ -458,6 +462,10 @@ impl Instruction {
             ),
             fusion_policy: FusionPolicy::fused(first.fusion_policy, second.fusion_policy),
             converted_pop_block: first.converted_pop_block || second.converted_pop_block,
+            hidden_exception_owner_slots: first
+                .hidden_exception_owner_slots
+                .saturating_add(second.hidden_exception_owner_slots)
+                .min(3),
             jump_policy: JumpPolicy::fused(first.jump_policy, second.jump_policy),
             exception_policy: first.exception_policy.merged(second.exception_policy),
             borrow_fallthrough: second.borrow_fallthrough,
