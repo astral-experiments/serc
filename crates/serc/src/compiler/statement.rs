@@ -2882,10 +2882,16 @@ impl Compiler {
             }
             self.pre_register_suite_names(&statement.orelse)?;
             self.assembler.mark(end);
-            if suite_contains_loop_break(&statement.body) {
+            if suite_contains_loop_break(&statement.body)
+                && (!self.control.active_exception_region_exclusions.is_empty()
+                    || !self.control.active_with_region_exclusions.is_empty()
+                    || !suite_contains_unprotected_nontail_conditional_loop_break(&statement.body))
+            {
                 // A constant-true loop can reach its exit only through `break`. CPython removes
-                // a redundant break jump before borrowed-load analysis but does not reconnect
-                // the large exit block; a copied small exit remains independently reachable.
+                // an unconditional break jump before borrowed-load analysis but does not
+                // reconnect the large exit block. An unprotected non-tail conditional break
+                // retains an explicit exit edge unless a surrounding control-flow region
+                // rewrites that edge during cleanup.
                 self.assembler.prevent_borrow_reachability(end);
             }
             self.set_depth(base_depth);
@@ -6218,4 +6224,45 @@ fn suite_contains_loop_break(body: &[Stmt]) -> bool {
         Stmt::FunctionDef(_) | Stmt::ClassDef(_) => false,
         _ => false,
     })
+}
+
+fn suite_contains_unprotected_nontail_conditional_loop_break(body: &[Stmt]) -> bool {
+    fn contains(body: &[Stmt], conditional: bool) -> bool {
+        for statement in body {
+            let found = match statement {
+                Stmt::Break(_) => conditional,
+                Stmt::If(statement) => {
+                    let conditional =
+                        conditional || early_condition_truthiness(&statement.test).is_none();
+                    contains(&statement.body, conditional)
+                        || statement.elif_else_clauses.iter().any(|clause| {
+                            let conditional = conditional
+                                || clause
+                                    .test
+                                    .as_ref()
+                                    .is_some_and(|test| early_condition_truthiness(test).is_none());
+                            contains(&clause.body, conditional)
+                        })
+                }
+                // CPython's borrowed-load traversal can stop at the normal exit of these
+                // regions, so a later break does not prove that the loop exit is visited.
+                Stmt::Try(_) | Stmt::With(_) => return false,
+                Stmt::Match(_) | Stmt::For(_) | Stmt::While(_) => false,
+                Stmt::FunctionDef(_) | Stmt::ClassDef(_) => false,
+                _ => false,
+            };
+            if found {
+                return true;
+            }
+        }
+        false
+    }
+
+    let Some((last, leading)) = body.split_last() else {
+        return false;
+    };
+    if suite_contains_loop_break(std::slice::from_ref(last)) {
+        return false;
+    }
+    contains(leading, false)
 }
