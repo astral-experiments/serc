@@ -42,9 +42,9 @@ use super::constant::{
     two_element_slice_optimization,
 };
 use super::scope::{
-    LoweringFunctionPlan, NameId, analyze_lambda_scope, collect_named_expression_target_names,
-    collect_nested_comprehension_target_names, collect_target_names, comprehension_cell_names,
-    generator_cellvars, generator_required_names,
+    LoweringFunctionPlan, NameId, NameSet, analyze_lambda_scope,
+    collect_named_expression_target_names, collect_nested_comprehension_target_names,
+    collect_target_names, comprehension_cell_names, generator_cellvars, generator_required_names,
 };
 use super::source::{debug_text_range, statement_execution_range, strip_expression_comments};
 use super::statement::{is_wildcard_pattern, suite_terminates};
@@ -71,6 +71,92 @@ enum CollectionKind {
 enum SpecializedLowering {
     Applied,
     NotApplicable,
+}
+
+#[derive(Default)]
+struct ComprehensionScopeFacts {
+    names: BTreeSet<String>,
+    walrus_targets: BTreeSet<String>,
+}
+
+impl ComprehensionScopeFacts {
+    fn visit_nested_comprehension(&mut self, generators: &[ruff_python_ast::Comprehension]) {
+        // The first iterable is evaluated in the containing scope; the remaining
+        // expressions enter the nested comprehension's own inlined scope.
+        if let Some(generator) = generators.first() {
+            self.visit_expr(&generator.iter);
+        }
+    }
+}
+
+impl<'ast> Visitor<'ast> for ComprehensionScopeFacts {
+    fn visit_expr(&mut self, expression: &'ast Expr) {
+        match expression {
+            Expr::Name(name) => {
+                self.names.insert(name.id.as_str().to_string());
+            }
+            Expr::Named(named) => {
+                if let Expr::Name(name) = named.target.as_ref() {
+                    self.walrus_targets.insert(name.id.as_str().to_string());
+                }
+            }
+            Expr::Generator(generator) => {
+                self.visit_nested_comprehension(&generator.generators);
+                return;
+            }
+            Expr::ListComp(comprehension) => {
+                self.visit_nested_comprehension(&comprehension.generators);
+                return;
+            }
+            Expr::SetComp(comprehension) => {
+                self.visit_nested_comprehension(&comprehension.generators);
+                return;
+            }
+            Expr::DictComp(comprehension) => {
+                self.visit_nested_comprehension(&comprehension.generators);
+                return;
+            }
+            Expr::Lambda(lambda) => {
+                if let Some(parameters) = lambda.parameters.as_deref() {
+                    for parameter in parameters
+                        .posonlyargs
+                        .iter()
+                        .chain(&parameters.args)
+                        .chain(&parameters.kwonlyargs)
+                    {
+                        if let Some(default) = parameter.default.as_deref() {
+                            self.visit_expr(default);
+                        }
+                    }
+                }
+                return;
+            }
+            _ => {}
+        }
+        walk_expr(self, expression);
+    }
+}
+
+fn comprehension_scope_facts(
+    generators: &[ruff_python_ast::Comprehension],
+    key: Option<&Expr>,
+    value: &Expr,
+) -> ComprehensionScopeFacts {
+    let mut facts = ComprehensionScopeFacts::default();
+    for generator in generators {
+        facts.visit_expr(&generator.target);
+        for condition in &generator.ifs {
+            facts.visit_expr(condition);
+        }
+    }
+    for generator in generators.iter().skip(1) {
+        facts.visit_expr(&generator.iter);
+    }
+    if let Some(key) = key {
+        facts.visit_expr(key);
+    }
+    facts.visit_expr(value);
+    facts
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2233,8 +2319,10 @@ impl Compiler {
         self.assembler.set_location(comprehension_location);
 
         let mut temporary_names = Vec::new();
+        let mut local_names = Vec::new();
         for (index, generator) in generators.iter().enumerate() {
             collect_target_names(&generator.target, &mut temporary_names);
+            collect_target_names(&generator.target, &mut local_names);
             // The first iterable runs before entering the inlined comprehension scope.
             if index > 0 {
                 collect_nested_comprehension_target_names(&generator.iter, &mut temporary_names);
@@ -2280,6 +2368,10 @@ impl Compiler {
                 0,
             )?;
         }
+        let local_names: NameSet = local_names
+            .iter()
+            .map(|name| self.required_name_id(name))
+            .collect();
         let active_temporary_ids: Vec<_> = active_temporary_names
             .iter()
             .map(|name| self.required_name_id(name))
@@ -2298,8 +2390,42 @@ impl Compiler {
         self.emit(SWAP, 2, 0)?;
         let cleanup_depth =
             (base_depth + i32::try_from(temporary_names.len()).unwrap() + 1).cast_unsigned();
-        let ((), region_exclusions) =
-            self.with_comprehension_context((cleanup, cleanup_depth), |compiler| {
+        // CPython's method-call optimization reads `DEF_IMPORT` from the mutable module
+        // symbol table. An inlined module comprehension temporarily replaces the symbols
+        // whose scopes differ after compiling its first iterable. Mirror that effective
+        // import state here so nested lambdas and generator expressions inherit it, then
+        // restore the exact removed names when this comprehension ends.
+        let mut removed_imports = Vec::new();
+        if matches!(self.unit.scope, Scope::Module) {
+            let facts = comprehension_scope_facts(generators, key, value);
+            for name in facts.names {
+                let name_id = self.required_name_id(&name);
+                if !self.symbols.imported_scope_names.contains(name_id)
+                    || facts.walrus_targets.contains(&name)
+                {
+                    continue;
+                }
+                let is_local = local_names.contains(name_id);
+                let is_free = !is_local
+                    && self
+                        .control
+                        .active_comprehension_local_names
+                        .iter()
+                        .any(|locals| locals.contains(name_id));
+                if (is_local
+                    && !comprehension_cell_names.contains(&name)
+                    && !self.symbols.module_globals.contains(name_id))
+                    || is_free
+                {
+                    continue;
+                }
+                if self.symbols.imported_scope_names.remove(name_id) {
+                    removed_imports.push(name_id);
+                }
+            }
+        }
+        let result =
+            self.with_comprehension_context((cleanup, cleanup_depth), local_names, |compiler| {
                 compiler.with_control_override(
                     |control| &mut control.reorder_async_comprehension_cleanup_throw,
                     // CPython 3.14.5's flow graph leaves the throw cleanup immediately before
@@ -2310,7 +2436,9 @@ impl Compiler {
                             .compile_comprehension_generator(generators, 0, key, value, add_opcode)
                     },
                 )
-            })?;
+            });
+        self.symbols.imported_scope_names.extend(removed_imports);
+        let ((), region_exclusions) = result?;
         self.assembler.mark(protected_end);
 
         if temporary_names.is_empty() {
