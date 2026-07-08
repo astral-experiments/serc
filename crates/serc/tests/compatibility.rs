@@ -1696,6 +1696,42 @@ def nested_loop(items, first, second):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_non_final_branch_nested_loop_tails() {
+        let source = r#"def for_loop(items):
+    for item in items:
+        if classify(item) == "first":
+            if item:
+                consume(item)
+        elif classify(item) == "second":
+            if item is not None:
+                consume(item)
+        else:
+            fallback(item)
+
+
+def while_loop(items):
+    while items:
+        item = items.pop()
+        if is_first(item):
+            if item:
+                consume(item)
+        elif is_second(item):
+            consume(item)
+
+
+def recursively_nested(items):
+    for item in items:
+        if is_first(item):
+            if item:
+                if accepted(item):
+                    consume(item)
+        elif is_second(item):
+            consume(item)
+"#;
+        assert_matches_cpython_marshal(source, "non_final_branch_loop_tail.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_loop_and_async_iteration_edges() {
         let source = include_str!("fixtures/benchmark/loop_async_edges.py");
         assert_matches_cpython_marshal(source, "loop_tail.py");
