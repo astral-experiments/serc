@@ -7,6 +7,7 @@ use super::{
     Operand, OperandPatchId, SourceLocation,
 };
 use crate::target::opcodes::*;
+use crate::target::operands::ResumeLocation;
 
 #[test]
 #[cfg(target_pointer_width = "64")]
@@ -398,20 +399,20 @@ fn dynamic_exception_owner_stops_at_emitted_boundaries() {
 #[test]
 fn current_block_resume_after_yield_stops_at_emitted_boundaries() {
     let mut assembler = Assembler::default();
-    assembler.emit(RESUME, 1);
+    assembler.emit(RESUME, ResumeLocation::AFTER_YIELD.argument());
     assert!(assembler.current_block_resumes_after_yield());
 
     let boundary = assembler.label();
     assembler.mark(boundary);
     assert!(!assembler.current_block_resumes_after_yield());
 
-    assembler.emit(RESUME, 2);
+    assembler.emit(RESUME, ResumeLocation::AFTER_YIELD_FROM.argument());
     assert!(!assembler.current_block_resumes_after_yield());
 
-    assembler.emit(RESUME, 3);
+    assembler.emit(RESUME, ResumeLocation::AFTER_AWAIT.argument());
     assert!(!assembler.current_block_resumes_after_yield());
 
-    assembler.emit(RESUME, 1);
+    assembler.emit(RESUME, ResumeLocation::AFTER_YIELD.argument());
     assert!(assembler.current_block_resumes_after_yield());
     assembler.emit(NOT_TAKEN, 0);
     assert!(!assembler.current_block_resumes_after_yield());
