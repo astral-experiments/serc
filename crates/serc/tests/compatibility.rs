@@ -1181,6 +1181,86 @@ except Error:
     }
 
     #[test]
+    fn matches_cpython_marshal_for_ownerless_late_exception_dispatch_markers() {
+        let source = r"async def coroutine_multiple_handlers():
+    await source()
+    try:
+        action()
+    except ValueError:
+        first()
+    except TypeError:
+        second()
+
+
+def generator_multiple_handlers():
+    yield source()
+    try:
+        action()
+    except ValueError:
+        first()
+    except TypeError:
+        second()
+
+
+def with_multiple_handlers(manager):
+    with manager:
+        try:
+            action()
+        except ValueError:
+            first()
+        except TypeError:
+            second()
+
+
+def finally_multiple_handlers():
+    try:
+        try:
+            action()
+        except ValueError:
+            first()
+        except TypeError:
+            second()
+    finally:
+        cleanup()
+
+
+async def conditional_exception_type():
+    await source()
+    try:
+        action()
+    except (FirstError if condition else SecondError):
+        recover()
+
+
+async def single_handler_control():
+    await source()
+    try:
+        action()
+    except ValueError:
+        recover()
+
+
+async def tuple_handler_control():
+    await source()
+    try:
+        action()
+    except (ValueError, TypeError):
+        recover()
+
+
+async def bare_fallback_control():
+    await source()
+    try:
+        action()
+    except ValueError:
+        recover()
+    except:
+        fallback()
+";
+        assert_matches_cpython_marshal(source, "handler_dispatch_owners.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_a_return_from_an_exception_handler() {
         let source = "def f():\n    value = source()\n    try:\n        raise ValueError\n    except ValueError:\n        return value\n\ndef nested():\n    try:\n        body()\n    except ValueError as error:\n        try:\n            pass\n        except TypeError:\n            raise error\n\ndef nested_message():\n    try:\n        body()\n    except ValueError as error:\n        try:\n            finish()\n        except TypeError:\n            log(f\"error: {error}\")\n";
         assert_matches_cpython_marshal(source, "handler_return.py");
