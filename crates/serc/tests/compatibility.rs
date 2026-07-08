@@ -2299,6 +2299,41 @@ float_overflow = 1e308 ** 2
     }
 
     #[test]
+    fn matches_cpython_marshal_for_arbitrary_integer_constant_folding() {
+        let source = r"positive_shift = 1 << 64
+negative_shift = -1 << 64
+maximum_shift = 1 << 127
+maximum_negative_shift = -1 << 127
+unfolded_shift = 1 << 128
+nested_shift = (1 << 64) << 63
+negative_nested_shift = (-1 << 64) << 63
+zero_huge_shift = 0 << 999999999999999999999999999999999999999
+positive_minus_small = 18446744073709551616 - 1
+positive_plus_small = 18446744073709551616 + 1
+unbounded_add = 999999999999999999999999999999999999999999999999999999999999 + 1
+unbounded_subtract = 1000000000000000000000000000000000000000000000000000000000000 - 1
+unbounded_cancel = 999999999999999999999999999999999999999999999999999999999999 + -999999999999999999999999999999999999999999999999999999999999
+unbounded_nested_add = (1 << 127) + (1 << 127)
+small_minus_positive = 1 - 18446744073709551616
+negative_minus_small = -18446744073709551616 - 1
+negative_plus_small = -18446744073709551616 + 1
+below_i64 = -(1 << 63) - 1
+above_i64 = -(1 << 63) + 1
+signed_sum = -9223372036854775808 + -9223372036854775808
+positive_product = (1 << 63) * 2
+negative_product = (1 << 63) * -2
+maximum_product = 18446744073709551615 * 9223372036854775807
+unfolded_product = 18446744073709551616 * 9223372036854775808
+zero_huge_product = 0 * 999999999999999999999999999999999999999
+negative_right_shift = -3 >> 1
+large_negative_right_shift = -18446744073709551617 >> 64
+huge_positive_right_shift = 1 >> 999999999999999999999999999999999999999
+huge_negative_right_shift = -1 >> 999999999999999999999999999999999999999
+";
+        assert_matches_cpython_marshal(source, "folded_arbitrary_integers.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_a_large_constant_list() {
         let source = format!(
             "large = [{}]\n",

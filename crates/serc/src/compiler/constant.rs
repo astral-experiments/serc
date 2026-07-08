@@ -924,42 +924,10 @@ pub(super) fn fold_constant(expression: &Expr) -> Option<Constant> {
             let left = fold_constant(&binary.left)?;
             let right = fold_constant(&binary.right)?;
             match (left, binary.op, right) {
-                (Constant::Bool(left), Operator::Add, Constant::Bool(right)) => {
-                    Some(Constant::Int(u64::from(left) + u64::from(right)))
-                }
-                (Constant::Int(left), Operator::Add, Constant::Int(right)) => {
-                    left.checked_add(right).map(Constant::Int)
-                }
-                (
-                    left @ (Constant::Int(_)
-                    | Constant::BigInt {
-                        negative: false, ..
-                    }),
-                    Operator::Add,
-                    right @ (Constant::Int(_)
-                    | Constant::BigInt {
-                        negative: false, ..
-                    }),
-                ) => fold_positive_integer_add(&left, &right),
-                (Constant::Int(left), Operator::Sub, Constant::Int(right)) => {
-                    if let Some(value) = left.checked_sub(right) {
-                        Some(Constant::Int(value))
-                    } else {
-                        let magnitude = right - left;
-                        if magnitude <= i64::MAX.cast_unsigned() {
-                            Some(Constant::SignedInt(-(magnitude.cast_signed())))
-                        } else if magnitude == i64::MIN.unsigned_abs() {
-                            Some(Constant::SignedInt(i64::MIN))
-                        } else {
-                            Some(Constant::BigInt {
-                                negative: true,
-                                digits: big_integer_digits(&magnitude.to_string()),
-                            })
-                        }
-                    }
-                }
-                (Constant::Int(left), Operator::Mult, Constant::Int(right)) => {
-                    left.checked_mul(right).map(Constant::Int)
+                (left, operator @ (Operator::Add | Operator::Sub | Operator::Mult), right)
+                    if is_integer_constant(&left) && is_integer_constant(&right) =>
+                {
+                    fold_integer_arithmetic(&left, operator, &right)
                 }
                 (Constant::Int(left), Operator::Div, Constant::Int(right)) if right != 0 => {
                     Some(Constant::Float(left as f64 / right as f64))
@@ -993,17 +961,10 @@ pub(super) fn fold_constant(expression: &Expr) -> Option<Constant> {
                         negative: false, ..
                     },
                 ) => Some(Constant::Int(0)),
-                (Constant::Int(left), Operator::LShift, Constant::Int(right)) => {
-                    u32::try_from(right)
-                        .ok()
-                        .and_then(|right| left.checked_shl(right))
-                        .map(Constant::Int)
-                }
-                (Constant::Int(left), Operator::RShift, Constant::Int(right)) => {
-                    u32::try_from(right)
-                        .ok()
-                        .and_then(|right| left.checked_shr(right))
-                        .map(Constant::Int)
+                (left, operator @ (Operator::LShift | Operator::RShift), right)
+                    if is_integer_constant(&left) && is_integer_constant(&right) =>
+                {
+                    fold_integer_shift(&left, operator, &right)
                 }
                 (
                     left @ (Constant::Int(_)
@@ -1178,9 +1139,108 @@ fn fold_positive_integer_bitwise(
     Some(positive_integer_constant(digits))
 }
 
-fn fold_positive_integer_add(left: &Constant, right: &Constant) -> Option<Constant> {
-    let left = positive_integer_digits(left)?;
-    let right = positive_integer_digits(right)?;
+struct FoldedInteger {
+    negative: bool,
+    digits: Vec<u16>,
+}
+
+fn is_integer_constant(value: &Constant) -> bool {
+    matches!(
+        value,
+        Constant::Bool(_) | Constant::Int(_) | Constant::SignedInt(_) | Constant::BigInt { .. }
+    )
+}
+
+fn folded_integer(value: &Constant) -> Option<FoldedInteger> {
+    let (negative, digits) = match value {
+        Constant::Bool(value) => (false, integer_digits(u64::from(*value))),
+        Constant::Int(value) => (false, integer_digits(*value)),
+        Constant::SignedInt(value) => (value.is_negative(), integer_digits(value.unsigned_abs())),
+        Constant::BigInt { negative, digits } => (*negative, normalized_digits(digits.clone())),
+        _ => return None,
+    };
+    Some(FoldedInteger {
+        negative: negative && !digits.is_empty(),
+        digits,
+    })
+}
+
+fn integer_digits(mut value: u64) -> Vec<u16> {
+    let mut digits = Vec::new();
+    while value != 0 {
+        digits.push((value & 0x7fff) as u16);
+        value >>= 15;
+    }
+    digits
+}
+
+fn fold_integer_arithmetic(
+    left: &Constant,
+    operator: Operator,
+    right: &Constant,
+) -> Option<Constant> {
+    const MAX_INT_SIZE: usize = 128;
+
+    let left = folded_integer(left)?;
+    let right = folded_integer(right)?;
+    let result = match operator {
+        Operator::Add => add_folded_integers(&left, &right),
+        Operator::Sub => {
+            let right = FoldedInteger {
+                negative: !right.negative && !right.digits.is_empty(),
+                digits: right.digits,
+            };
+            add_folded_integers(&left, &right)
+        }
+        Operator::Mult => {
+            if !left.digits.is_empty()
+                && !right.digits.is_empty()
+                && magnitude_bit_length(&left.digits) + magnitude_bit_length(&right.digits)
+                    > MAX_INT_SIZE
+            {
+                return None;
+            }
+            FoldedInteger {
+                negative: left.negative != right.negative,
+                digits: multiply_magnitudes(&left.digits, &right.digits),
+            }
+        }
+        _ => unreachable!(),
+    };
+    Some(integer_constant(result.negative, result.digits))
+}
+
+fn add_folded_integers(left: &FoldedInteger, right: &FoldedInteger) -> FoldedInteger {
+    if left.negative == right.negative {
+        FoldedInteger {
+            negative: left.negative,
+            digits: add_magnitudes(&left.digits, &right.digits),
+        }
+    } else {
+        match compare_magnitudes(&left.digits, &right.digits) {
+            std::cmp::Ordering::Less => FoldedInteger {
+                negative: right.negative,
+                digits: subtract_magnitudes(&right.digits, &left.digits),
+            },
+            std::cmp::Ordering::Equal => FoldedInteger {
+                negative: false,
+                digits: Vec::new(),
+            },
+            std::cmp::Ordering::Greater => FoldedInteger {
+                negative: left.negative,
+                digits: subtract_magnitudes(&left.digits, &right.digits),
+            },
+        }
+    }
+}
+
+fn compare_magnitudes(left: &[u16], right: &[u16]) -> std::cmp::Ordering {
+    left.len()
+        .cmp(&right.len())
+        .then_with(|| left.iter().rev().cmp(right.iter().rev()))
+}
+
+fn add_magnitudes(left: &[u16], right: &[u16]) -> Vec<u16> {
     let mut digits = Vec::with_capacity(left.len().max(right.len()) + 1);
     let mut carry = 0_u32;
     for index in 0..left.len().max(right.len()) {
@@ -1193,7 +1253,156 @@ fn fold_positive_integer_add(left: &Constant, right: &Constant) -> Option<Consta
     if carry != 0 {
         digits.push(u16::try_from(carry).expect("base-2^15 carry fits in u16"));
     }
-    Some(positive_integer_constant(digits))
+    digits
+}
+
+fn subtract_magnitudes(left: &[u16], right: &[u16]) -> Vec<u16> {
+    debug_assert!(compare_magnitudes(left, right) != std::cmp::Ordering::Less);
+    let mut digits = Vec::with_capacity(left.len());
+    let mut borrow = 0_i32;
+    for (index, left) in left.iter().copied().enumerate() {
+        let mut value =
+            i32::from(left) - i32::from(right.get(index).copied().unwrap_or(0)) - borrow;
+        if value < 0 {
+            value += 1 << 15;
+            borrow = 1;
+        } else {
+            borrow = 0;
+        }
+        digits.push(u16::try_from(value).expect("base-2^15 subtraction digit fits in u16"));
+    }
+    debug_assert_eq!(borrow, 0);
+    normalized_digits(digits)
+}
+
+fn multiply_magnitudes(left: &[u16], right: &[u16]) -> Vec<u16> {
+    if left.is_empty() || right.is_empty() {
+        return Vec::new();
+    }
+    let mut digits = vec![0_u16; left.len() + right.len()];
+    for (left_index, left) in left.iter().copied().enumerate() {
+        let mut carry = 0_u32;
+        for (right_index, right) in right.iter().copied().enumerate() {
+            let index = left_index + right_index;
+            let value = u32::from(digits[index]) + u32::from(left) * u32::from(right) + carry;
+            digits[index] = (value & 0x7fff) as u16;
+            carry = value >> 15;
+        }
+        let mut index = left_index + right.len();
+        while carry != 0 {
+            if index == digits.len() {
+                digits.push(0);
+            }
+            let value = u32::from(digits[index]) + carry;
+            digits[index] = (value & 0x7fff) as u16;
+            carry = value >> 15;
+            index += 1;
+        }
+    }
+    normalized_digits(digits)
+}
+
+fn magnitude_bit_length(digits: &[u16]) -> usize {
+    digits.last().map_or(0, |last| {
+        (digits.len() - 1) * 15 + (u16::BITS - last.leading_zeros()) as usize
+    })
+}
+
+fn fold_integer_shift(left: &Constant, operator: Operator, right: &Constant) -> Option<Constant> {
+    const MAX_INT_SIZE: usize = 128;
+
+    let left = folded_integer(left)?;
+    let right = folded_integer(right)?;
+    if right.negative {
+        return None;
+    }
+    if left.digits.is_empty() {
+        return Some(Constant::Int(0));
+    }
+
+    let right = magnitude_to_usize(&right.digits);
+    match operator {
+        Operator::LShift => {
+            let right = right?;
+            if right != 0
+                && (right > MAX_INT_SIZE
+                    || magnitude_bit_length(&left.digits) > MAX_INT_SIZE - right)
+            {
+                return None;
+            }
+            Some(integer_constant(
+                left.negative,
+                left_shift_magnitude(&left.digits, right),
+            ))
+        }
+        Operator::RShift => {
+            let Some(right) = right else {
+                return Some(if left.negative {
+                    Constant::SignedInt(-1)
+                } else {
+                    Constant::Int(0)
+                });
+            };
+            let bit_length = magnitude_bit_length(&left.digits);
+            if right >= bit_length {
+                return Some(if left.negative {
+                    Constant::SignedInt(-1)
+                } else {
+                    Constant::Int(0)
+                });
+            }
+            let (mut digits, discarded) = right_shift_magnitude(&left.digits, right);
+            if left.negative && discarded {
+                digits = add_magnitudes(&digits, &[1]);
+            }
+            Some(integer_constant(left.negative, digits))
+        }
+        _ => unreachable!(),
+    }
+}
+
+fn magnitude_to_usize(digits: &[u16]) -> Option<usize> {
+    let mut value = 0_usize;
+    for digit in digits.iter().rev() {
+        value = value
+            .checked_mul(1 << 15)?
+            .checked_add(usize::from(*digit))?;
+    }
+    Some(value)
+}
+
+fn left_shift_magnitude(digits: &[u16], shift: usize) -> Vec<u16> {
+    let digit_shift = shift / 15;
+    let bit_shift = shift % 15;
+    let mut output = vec![0_u16; digit_shift];
+    let mut carry = 0_u32;
+    for digit in digits {
+        let value = (u32::from(*digit) << bit_shift) | carry;
+        output.push((value & 0x7fff) as u16);
+        carry = value >> 15;
+    }
+    if carry != 0 {
+        output.push(u16::try_from(carry).expect("base-2^15 shift carry fits in u16"));
+    }
+    output
+}
+
+fn right_shift_magnitude(digits: &[u16], shift: usize) -> (Vec<u16>, bool) {
+    let digit_shift = shift / 15;
+    let bit_shift = shift % 15;
+    let discarded = digits[..digit_shift].iter().any(|digit| *digit != 0)
+        || bit_shift != 0 && digits[digit_shift] & ((1_u16 << bit_shift) - 1) != 0;
+    let mut output = Vec::with_capacity(digits.len() - digit_shift);
+    for index in digit_shift..digits.len() {
+        let lower = u32::from(digits[index]) >> bit_shift;
+        let upper = if bit_shift == 0 {
+            0
+        } else {
+            u32::from(digits.get(index + 1).copied().unwrap_or(0)) << (15 - bit_shift)
+        };
+        output.push(((lower | upper) & 0x7fff) as u16);
+    }
+    (normalized_digits(output), discarded)
 }
 
 fn positive_integer_digits(value: &Constant) -> Option<Vec<u16>> {
@@ -1228,10 +1437,33 @@ fn positive_integer_constant(digits: Vec<u16>) -> Constant {
             return Constant::Int(value);
         }
     }
-    Constant::BigInt {
-        negative: false,
-        digits,
+    integer_constant(false, digits)
+}
+
+fn integer_constant(negative: bool, digits: Vec<u16>) -> Constant {
+    let digits = normalized_digits(digits);
+    if digits.is_empty() {
+        return Constant::Int(0);
     }
+    if digits.len() <= 5 {
+        let value = digits
+            .iter()
+            .enumerate()
+            .fold(0_u128, |value, (index, digit)| {
+                value | (u128::from(*digit) << (index * 15))
+            });
+        if !negative {
+            if let Ok(value) = u64::try_from(value) {
+                return Constant::Int(value);
+            }
+        } else if value < u128::from(i64::MIN.unsigned_abs()) {
+            let value = i64::try_from(value).expect("magnitude below 2^63 fits in i64");
+            return Constant::SignedInt(-value);
+        } else if value == u128::from(i64::MIN.unsigned_abs()) {
+            return Constant::SignedInt(i64::MIN);
+        }
+    }
+    Constant::BigInt { negative, digits }
 }
 
 fn fold_literal_subscript(value: &Expr, index: &Expr) -> Option<Constant> {
