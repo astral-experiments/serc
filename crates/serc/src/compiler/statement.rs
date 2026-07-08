@@ -79,6 +79,21 @@ struct ReturnFinallyContext {
 }
 
 #[derive(Clone, Copy, Debug)]
+struct ExceptionTypeBoolMarkerState {
+    first_handler: bool,
+    initial_block: usize,
+}
+
+impl ExceptionTypeBoolMarkerState {
+    fn new(first_handler: bool, initial_block: usize) -> Self {
+        Self {
+            first_handler,
+            initial_block,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 struct WithExitContext {
     location: SourceLocation,
     is_async: bool,
@@ -176,6 +191,7 @@ pub(super) struct ControlFlowState {
     pub(super) include_assert_none_condition_owner: bool,
     pub(super) exclude_condition_not_taken_from_all_exception_regions: bool,
     exclude_loop_tail_not_taken_from_control_flow_regions: bool,
+    exception_type_bool_marker_state: Option<ExceptionTypeBoolMarkerState>,
     implicit_return_exception_exclusion_depth: Option<usize>,
     pub(super) terminal_try_condition_exception_exclusion_depth: Option<usize>,
     unwind_exception_handlers_for_implicit_return: bool,
@@ -196,6 +212,20 @@ impl ControlFlowState {
         self.active_exception_handlers
             .last()
             .is_some_and(|handler| handler.name.is_some())
+    }
+
+    /// Returns whether a direct Boolean exception-type marker should retain its owner.
+    ///
+    /// CPython appends normalized markers without initializing the reused CFG instruction slot.
+    /// The first marker in a first handler can therefore inherit the common-cleanup owner. The
+    /// corresponding slot is fresh for later handlers and after another marker or block boundary.
+    pub(super) fn exception_type_bool_marker_preserves_owner(
+        &self,
+        current_block: usize,
+    ) -> Option<bool> {
+        self.exception_type_bool_marker_state
+            .as_ref()
+            .and_then(|state| (state.initial_block == current_block).then_some(state.first_handler))
     }
 }
 
@@ -3705,7 +3735,18 @@ impl Compiler {
                     .into_iter()
                     .filter(|name| self.symbols.owned_load_locals.insert(*name))
                     .collect();
-                self.compile_expression(exception_type)?;
+                let bool_marker_state =
+                    matches!(exception_type.as_ref(), Expr::BoolOp(_)).then(|| {
+                        ExceptionTypeBoolMarkerState::new(
+                            handler_index == 0,
+                            self.assembler.current_block_token(),
+                        )
+                    });
+                self.with_control_override(
+                    |control| &mut control.exception_type_bool_marker_state,
+                    bool_marker_state,
+                    |compiler| compiler.compile_expression(exception_type),
+                )?;
                 for name in newly_owned {
                     self.symbols.owned_load_locals.remove(name);
                 }
@@ -3714,8 +3755,8 @@ impl Compiler {
                 // CPython normalizes these jumps after exception targets are labeled. A later
                 // handler or conditional exception type appends the marker into a fresh CFG
                 // slot, so it cannot inherit an outer generator, with, or finally owner.
-                let ownerless_not_taken =
-                    handler_index > 0 || matches!(exception_type.as_ref(), Expr::If(_));
+                let ownerless_not_taken = handler_index > 0
+                    || matches!(exception_type.as_ref(), Expr::BoolOp(_) | Expr::If(_));
                 self.assembler.set_location(handler_location);
                 self.emit(CHECK_EXC_MATCH, 0, 0)?;
                 self.emit_jump_forward(POP_JUMP_IF_FALSE, next_handler, -1)?;
@@ -4214,18 +4255,38 @@ impl Compiler {
             let exception_type = handler.type_.as_ref().ok_or_else(|| {
                 CompileError::Internal("exception-group handler has no type".to_string())
             })?;
-            self.compile_expression(exception_type)?;
+            let bool_marker_state = matches!(exception_type.as_ref(), Expr::BoolOp(_)).then(|| {
+                ExceptionTypeBoolMarkerState::new(
+                    handler_index == 0,
+                    self.assembler.current_block_token(),
+                )
+            });
+            self.with_control_override(
+                |control| &mut control.exception_type_bool_marker_state,
+                bool_marker_state,
+                |compiler| compiler.compile_expression(exception_type),
+            )?;
             self.assembler.set_location(handler_location);
             self.emit(CHECK_EG_MATCH, 0, 0)?;
             self.emit(COPY, 1, 1)?;
             self.emit_jump_forward(POP_JUMP_IF_NONE, no_match, -1)?;
-            let not_taken_exclusion_start =
-                (handler_index > 0 || matches!(exception_type.as_ref(), Expr::If(_))).then(|| {
-                    let start = self.assembler.label();
-                    self.assembler.mark(start);
-                    start
-                });
-            self.emit(NOT_TAKEN, 0, 0)?;
+            let ownerless_not_taken = handler_index > 0
+                || matches!(exception_type.as_ref(), Expr::BoolOp(_) | Expr::If(_));
+            let not_taken_exclusion_start = ownerless_not_taken.then(|| {
+                let start = self.assembler.label();
+                self.assembler.mark(start);
+                start
+            });
+            self.emit_with_exception_policy(
+                NOT_TAKEN,
+                0,
+                0,
+                if ownerless_not_taken {
+                    ExceptionPolicy::EXCLUDE_ALWAYS
+                } else {
+                    ExceptionPolicy::default()
+                },
+            )?;
             if let Some(start) = not_taken_exclusion_start {
                 let end = self.assembler.label();
                 self.assembler.mark(end);

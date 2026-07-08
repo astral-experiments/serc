@@ -1327,6 +1327,106 @@ async def bare_fallback_control():
     }
 
     #[test]
+    fn matches_cpython_marshal_for_boolean_exception_type_marker_owners() {
+        let cases = [
+            (
+                "handler_boolop_plain.py",
+                r"def f():
+    try:
+        action()
+    except A or B or C:
+        recover()
+",
+            ),
+            (
+                "handler_boolop_generator.py",
+                r"def f():
+    yield source()
+    try:
+        action()
+    except A and B:
+        recover()
+",
+            ),
+            (
+                "handler_boolop_with.py",
+                r"def f(manager):
+    with manager:
+        try:
+            action()
+        except A or B or C:
+            recover()
+",
+            ),
+            (
+                "handler_boolop_finally.py",
+                r"def f():
+    try:
+        try:
+            action()
+        except A and B:
+            recover()
+    finally:
+        cleanup()
+",
+            ),
+            (
+                "handler_boolop_later.py",
+                r"def f():
+    try:
+        action()
+    except X:
+        first()
+    except A or B or C:
+        recover()
+",
+            ),
+            (
+                "handler_boolop_dynamic.py",
+                r"def f():
+    try:
+        action()
+    except X:
+        first()
+    except f(g(h())) or B:
+        recover()
+",
+            ),
+            (
+                "handler_boolop_conditional.py",
+                r"def f():
+    try:
+        action()
+    except (A if C else B) or D:
+        recover()
+",
+            ),
+            (
+                "handler_boolop_comprehension.py",
+                r"def f(values):
+    try:
+        action()
+    except [x or y for x in values] or B:
+        recover()
+",
+            ),
+            (
+                "handler_boolop_exception_group.py",
+                r"def f():
+    try:
+        action()
+    except* A or B:
+        recover()
+",
+            ),
+        ];
+
+        for (filename, source) in cases {
+            assert_matches_cpython_marshal(source, filename);
+        }
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_a_return_from_an_exception_handler() {
         let source = "def f():\n    value = source()\n    try:\n        raise ValueError\n    except ValueError:\n        return value\n\ndef nested():\n    try:\n        body()\n    except ValueError as error:\n        try:\n            pass\n        except TypeError:\n            raise error\n\ndef nested_message():\n    try:\n        body()\n    except ValueError as error:\n        try:\n            finish()\n        except TypeError:\n            log(f\"error: {error}\")\n";
         assert_matches_cpython_marshal(source, "handler_return.py");

@@ -4063,11 +4063,19 @@ impl Compiler {
             // vacated by earlier optimizations in this block.
             let marker_owner_slots = self.assembler.current_block_dynamic_exception_owner_slots();
             let marker_reuses_exception_owner = marker_owner_slots >= 3;
+            let current_block = self.assembler.current_block_token();
+            let exception_type_marker_owner = self
+                .control
+                .exception_type_bool_marker_preserves_owner(current_block);
+            let preserve_exception_type_owner = exception_type_marker_owner == Some(true);
+            let exclude_exception_type_owner =
+                exception_type_marker_owner == Some(false) && !marker_reuses_exception_owner;
             let exclude_inlined_comprehension_owner = !self
                 .control
                 .active_comprehension_region_exclusions
                 .is_empty()
-                && !marker_reuses_exception_owner;
+                && !marker_reuses_exception_owner
+                && exception_type_marker_owner.is_none();
             let exclusion_start = self.assembler.label();
             self.assembler.mark(exclusion_start);
             self.emit(COPY, 1, 1)?;
@@ -4099,7 +4107,8 @@ impl Compiler {
                 && !marker_reuses_exception_owner
                 && !self.control.same_line_try_body
                 && !named_exception_handler
-                && !exception_group_handler;
+                && !exception_group_handler
+                && exception_type_marker_owner.is_none();
             let exclude_from_plain_try = self.control.generator_region_start.is_none()
                 && self.control.active_with_suspension_epochs.is_empty()
                 && self.control.active_normal_finally_bodies == 0
@@ -4108,8 +4117,10 @@ impl Compiler {
                 && !named_exception_handler
                 && !exception_group_handler
                 && !marker_reuses_exception_owner
+                && exception_type_marker_owner.is_none()
                 && !self.control.active_exception_region_exclusions.is_empty();
-            let exclude_from_all_owners = exclude_inlined_comprehension_owner
+            let exclude_from_all_owners = exclude_exception_type_owner
+                || exclude_inlined_comprehension_owner
                 || exclude_after_coroutine_suspension
                 || exclude_from_plain_try;
             let marker_start = (!exclude_inlined_comprehension_owner
@@ -4130,7 +4141,9 @@ impl Compiler {
                     ExceptionPolicy::EXCLUDE_ALWAYS
                 } else {
                     ExceptionPolicy::normalized_owner(
-                        normalized_owner || marker_reuses_exception_owner,
+                        normalized_owner
+                            || preserve_exception_type_owner
+                            || marker_reuses_exception_owner,
                     )
                 },
             )?;

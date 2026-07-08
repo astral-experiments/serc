@@ -132,6 +132,28 @@ impl Assembler {
         instruction
     }
 
+    fn current_block_start(&self) -> usize {
+        self.linear_items()
+            .iter()
+            .rposition(|item| match item {
+                Item::Label(_) => true,
+                Item::Instruction(instruction) => {
+                    instruction.opcode == NOT_TAKEN
+                        || (!is_conditional_jump(instruction.opcode)
+                            && (matches!(
+                                instruction.operand,
+                                Operand::Forward(_) | Operand::Backward(_)
+                            ) || ends_scope(instruction.opcode)))
+                }
+            })
+            .map_or(0, |index| index + 1)
+    }
+
+    /// Returns an opaque token for the current emitted control-flow block.
+    pub(crate) fn current_block_token(&self) -> usize {
+        self.current_block_start()
+    }
+
     pub(crate) fn instruction_count(&self) -> usize {
         self.linear_items()
             .iter()
@@ -182,20 +204,7 @@ impl Assembler {
         }
 
         let items = self.linear_items();
-        let start = items
-            .iter()
-            .rposition(|item| match item {
-                Item::Label(_) => true,
-                Item::Instruction(instruction) => {
-                    instruction.opcode == NOT_TAKEN
-                        || (!is_conditional_jump(instruction.opcode)
-                            && (matches!(
-                                instruction.operand,
-                                Operand::Forward(_) | Operand::Backward(_)
-                            ) || ends_scope(instruction.opcode)))
-                }
-            })
-            .map_or(0, |index| index + 1);
+        let start = self.current_block_start();
         let mut slots = 0;
         let mut index = start;
         while index < items.len() {
