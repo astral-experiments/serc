@@ -1574,6 +1574,12 @@ async def bare_fallback_control():
     }
 
     #[test]
+    fn matches_cpython_marshal_for_async_for_noop_body_backedges() {
+        let source = "async def pass_body(items):\n    async for item in items:\n        pass\n\nasync def two_passes(items):\n    async for item in items:\n        pass\n        pass\n\nasync def docstring_and_pass(items):\n    async for item in items:\n        'docstring'\n        pass\n\nasync def nested(items):\n    async for outer in items:\n        async for inner in outer:\n            pass\n\nasync def with_else(items):\n    async for item in items:\n        pass\n    else:\n        pass\n";
+        assert_matches_cpython_marshal(source, "async_for_noop_body.py");
+    }
+
+    #[test]
     fn matches_cpython_terminal_async_for_nop_ownership() {
         let source = "import dis\n\nasync def sync_with_direct(manager, items):\n    with manager:\n        async for item in items:\n            consume(item)\n\nasync def async_then_sync_with(async_manager, sync_manager, items):\n    async with async_manager:\n        with sync_manager:\n            async for item in items:\n                consume(item)\n\nasync def try_around_async_with(manager, items):\n    try:\n        async with manager:\n            async for item in items:\n                consume(item)\n    finally:\n        cleanup()\n\nasync def async_with_around_try(manager, items):\n    async with manager:\n        try:\n            async for item in items:\n                consume(item)\n        finally:\n            cleanup()\n\ndef has_end_nop(function):\n    instructions = list(dis.get_instructions(function))\n    return any(\n        left.opname == 'END_ASYNC_FOR' and right.opname == 'NOP'\n        for left, right in zip(instructions, instructions[1:])\n    )\n\nfor function in (sync_with_direct, async_then_sync_with, try_around_async_with, async_with_around_try):\n    print(has_end_nop(function))\n";
         assert_executes(source, "True\nTrue\nFalse\nTrue\n");
