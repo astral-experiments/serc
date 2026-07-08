@@ -4218,7 +4218,16 @@ impl Compiler {
                 true,
             );
             if terminal_handler_exclusions.is_none() && !terminal_handler_try_return {
-                if let Some(range) = suite_unary_not_fallthrough_range(&handler.body) {
+                // CPython propagates a terminal handler's unique condition-fallthrough edge
+                // onto the normal cleanup block.
+                if terminal
+                    && let Some(Stmt::If(statement)) = handler.body.last()
+                    && let Some(test) = terminating_if_fallthrough_test(statement)
+                    && let Some(test) = unique_condition_jump_target(test, false)
+                {
+                    self.assembler
+                        .set_location(self.source_location(test.range()));
+                } else if let Some(range) = suite_unary_not_fallthrough_range(&handler.body) {
                     self.assembler.set_location(self.source_location(range));
                 } else if !handler_body_has_instructions
                     && let Some(statement) = handler.body.last()
