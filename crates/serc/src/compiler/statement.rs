@@ -185,6 +185,8 @@ pub(super) struct ControlFlowState {
     // coroutine stop-iteration handler.
     pub(super) active_normal_finally_bodies: usize,
     pub(super) active_finally_end_blocks: usize,
+    // Set while compiling a condition introduced by exceptional-finally lowering.
+    pub(super) exceptional_finally_condition: bool,
     active_finally_try_bodies: usize,
     active_pass_finally_locations: Vec<SourceLocation>,
     active_overriding_finally_returns: usize,
@@ -219,6 +221,16 @@ impl ControlFlowState {
         self.active_exception_handlers
             .last()
             .is_some_and(|handler| handler.name.is_some())
+    }
+
+    pub(super) fn in_exception_handler(&self) -> bool {
+        !self.active_exception_handlers.is_empty()
+    }
+
+    pub(super) fn in_iterator_loop(&self) -> bool {
+        self.loops
+            .last()
+            .is_some_and(|context| context.iterator_cleanup != IteratorCleanup::None)
     }
 
     /// Returns whether a direct Boolean exception-type marker should retain its owner.
@@ -5086,7 +5098,11 @@ impl Compiler {
             && final_if.elif_else_clauses.is_empty()
         {
             let condition_false = self.assembler.label();
-            self.compile_jump_if(&final_if.test, false, condition_false)?;
+            self.with_control_override(
+                |control| &mut control.exceptional_finally_condition,
+                true,
+                |compiler| compiler.compile_jump_if(&final_if.test, false, condition_false),
+            )?;
             self.with_control_counter(
                 |control| &mut control.active_finally_end_blocks,
                 |compiler| compiler.compile_suite(&final_if.body),

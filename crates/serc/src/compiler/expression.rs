@@ -2028,6 +2028,9 @@ impl Compiler {
                 self.assembler
                     .set_location(self.source_location(self.attribute_opcode_range(attribute)));
                 self.emit(NOP, 0, 0)?;
+            } else {
+                // CPython removes the same-line specialized-call NOP before appending markers.
+                self.assembler.add_last_hidden_exception_owner_slots(1);
             }
             return Ok(SpecializedLowering::Applied);
         }
@@ -2085,6 +2088,9 @@ impl Compiler {
             self.assembler
                 .set_location(self.source_location(self.attribute_opcode_range(attribute)));
             self.emit(NOP, 0, 0)?;
+        } else {
+            // CPython removes the same-line specialized-call NOP before appending markers.
+            self.assembler.add_last_hidden_exception_owner_slots(1);
         }
         Ok(SpecializedLowering::Applied)
     }
@@ -2155,12 +2161,19 @@ impl Compiler {
                 .map(|default| fold_constant(default))
                 .collect::<Option<Vec<_>>>()
             {
+                let hidden_owner_slots = positional_defaults
+                    .iter()
+                    .fold(positional_defaults.len(), |slots, default| {
+                        slots.saturating_add(folded_constant_owner_slots(default))
+                    });
                 for default in &positional_defaults {
                     self.record_folded_value(default)?;
                 }
                 self.assembler
                     .set_location(self.source_location(lambda.range));
                 self.emit_deferred_constant(Constant::Tuple(defaults))?;
+                self.assembler
+                    .add_last_hidden_exception_owner_slots(hidden_owner_slots);
             } else {
                 for default in &positional_defaults {
                     self.compile_expression(default)?;
@@ -2537,6 +2550,8 @@ impl Compiler {
                     self.assembler
                         .prevent_last_instruction_fusion_with_previous();
                 }
+                // The SWAP/STORE_FAST_MAYBE_NULL restore contracts by one CFG slot.
+                self.assembler.add_last_hidden_exception_owner_slots(1);
             }
             // CPython converts STORE_FAST_MAYBE_NULL only after inserting superinstructions.
             self.assembler.prevent_last_instruction_fusion();
@@ -4609,13 +4624,37 @@ impl Compiler {
                 comparison_is_boolean || self.control.active_normal_finally_bodies > 0,
             ),
         };
-        if comparison_is_boolean
+        let preserve_terminal_try_owner = comparison_is_boolean
             || (self
                 .control
                 .terminal_try_condition_exception_exclusion_depth
                 .is_some()
-                && self.assembler.current_block_has_dynamic_exception_owner())
-        {
+                && self.assembler.current_block_has_dynamic_exception_owner());
+        let exclude_plain_try_marker = !comparison_is_boolean
+            && !self.assembler.fallthrough_has_dynamic_exception_owner()
+            && self.control.generator_region_start.is_none()
+            && !self.control.in_iterator_loop()
+            && !self.control.exceptional_finally_condition
+            && self
+                .control
+                .active_comprehension_region_exclusions
+                .is_empty()
+            && self.control.active_with_region_exclusions.is_empty()
+            && self.control.active_normal_finally_bodies == 0
+            && self.control.active_finally_end_blocks == 0
+            && self.control.active_exception_group_handlers == 0
+            && !self.control.same_line_try_body
+            && !self.control.current_exception_handler_binds_name()
+            && !self.control.in_exception_handler()
+            && self.control.active_exception_region_exclusions.len() == 1;
+        if exclude_plain_try_marker {
+            // CPython appends normalized markers after exception targets are labeled. Force the
+            // plain try marker ownerless only when no optimized CFG slot can carry an owner.
+            self.emit_condition_not_taken(ConditionMarkerPolicy {
+                excluded: ExceptionPolicy::EXCLUDE_ALWAYS,
+                ordinary: ExceptionPolicy::EXCLUDE_ALWAYS,
+            })
+        } else if preserve_terminal_try_owner {
             self.emit_condition_not_taken_preserving_terminal_try_owner(policy)
         } else {
             self.emit_condition_not_taken(policy)

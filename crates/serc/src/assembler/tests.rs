@@ -397,6 +397,51 @@ fn dynamic_exception_owner_stops_at_emitted_boundaries() {
 }
 
 #[test]
+fn fallthrough_dynamic_exception_owner_crosses_exception_region_labels() {
+    let mut hidden_slot = Assembler::default();
+    hidden_slot.emit(LOAD_CONST, 0);
+    hidden_slot.add_last_hidden_exception_owner_slots(1);
+    let boundary = hidden_slot.label();
+    hidden_slot.mark(boundary);
+    assert!(!hidden_slot.current_block_has_dynamic_exception_owner());
+    assert!(hidden_slot.fallthrough_has_dynamic_exception_owner());
+
+    let mut consumed_by_prologue = Assembler::default();
+    consumed_by_prologue.emit(LOAD_CONST, 0);
+    consumed_by_prologue.add_last_hidden_exception_owner_slots(1);
+    let boundary = consumed_by_prologue.label();
+    consumed_by_prologue.mark(boundary);
+    consumed_by_prologue.emit(COPY_FREE_VARS, 1);
+    assert!(!consumed_by_prologue.fallthrough_has_dynamic_exception_owner());
+
+    let mut hard_boundary = Assembler::default();
+    hard_boundary.emit(LOAD_CONST, 0);
+    hard_boundary.add_last_hidden_exception_owner_slots(1);
+    let boundary = hard_boundary.label();
+    hard_boundary.emit_forward_with_depth(
+        POP_JUMP_IF_FALSE,
+        boundary,
+        0,
+        ExceptionPolicy::default(),
+    );
+    hard_boundary.mark(boundary);
+    assert!(!hard_boundary.fallthrough_has_dynamic_exception_owner());
+}
+
+#[test]
+fn fallthrough_dynamic_exception_owner_preserves_conservative_vacancies() {
+    let location = SourceLocation::new(1, 1, 0, 1);
+
+    let mut protected_nops = Assembler::default();
+    protected_nops.set_location(location);
+    protected_nops.emit(NOP, 0);
+    let boundary = protected_nops.label();
+    protected_nops.mark(boundary);
+    protected_nops.emit(NOP, 0);
+    assert!(protected_nops.fallthrough_has_dynamic_exception_owner());
+}
+
+#[test]
 fn current_block_resume_after_yield_stops_at_emitted_boundaries() {
     let mut assembler = Assembler::default();
     assembler.emit(RESUME, ResumeLocation::AFTER_YIELD.argument());
