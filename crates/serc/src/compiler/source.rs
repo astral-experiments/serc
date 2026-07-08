@@ -408,14 +408,41 @@ pub(super) fn implicit_return_range(
     }
 }
 
-pub(super) fn condition_exit_range(expression: &Expr) -> ruff_text_size::TextRange {
-    let mut expression = expression;
+fn condition_exit_expression(mut expression: &Expr) -> &Expr {
     while let Expr::UnaryOp(unary) = expression
         && unary.op == ruff_python_ast::UnaryOp::Not
     {
         expression = &unary.operand;
     }
-    expression.range()
+    expression
+}
+
+pub(super) fn condition_exit_range(expression: &Expr) -> ruff_text_size::TextRange {
+    condition_exit_expression(expression).range()
+}
+
+pub(super) fn unary_not_condition_exit_range(
+    expression: &Expr,
+) -> Option<ruff_text_size::TextRange> {
+    let Expr::UnaryOp(unary) = expression else {
+        return None;
+    };
+    if unary.op != ruff_python_ast::UnaryOp::Not {
+        return None;
+    }
+
+    let operand = condition_exit_expression(&unary.operand);
+    if matches!(operand, Expr::BoolOp(_) | Expr::If(_)) {
+        return None;
+    }
+    Some(operand.range())
+}
+
+pub(super) fn synthetic_condition_exit_range(expression: &Expr) -> ruff_text_size::TextRange {
+    // `codegen_jump_if` strips `not`, so direct operands own synthetic exits. Boolean and
+    // conditional operands choose an edge-specific child; preserve their previous whole-condition
+    // owner until the caller retains enough jump-polarity information to select that child.
+    unary_not_condition_exit_range(expression).unwrap_or(expression.range())
 }
 
 fn last_store_target_range(compiler: &Compiler, expression: &Expr) -> ruff_text_size::TextRange {

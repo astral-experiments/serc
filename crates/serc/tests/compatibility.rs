@@ -494,6 +494,48 @@ def protected(lock):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_unary_not_synthetic_exit_locations() {
+        let source = r"def branch_join(flag):
+    if flag:
+        if not predicate():
+            return False
+    else:
+        recover()
+    return True
+
+
+def terminal_assert(flag):
+    if flag:
+        assert predicate()
+    else:
+        assert not predicate()
+
+
+def handler_exit():
+    try:
+        action()
+    except Error as error:
+        if not predicate():
+            recover()
+
+
+def finally_exit():
+    try:
+        action()
+    finally:
+        if not predicate():
+            recover()
+
+
+def loop_tail():
+    while outer():
+        if not predicate():
+            work()
+";
+        assert_matches_cpython_marshal(source, "unary_not_synthetic_exits.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_a_try_at_the_end_of_a_loop() {
         let source = "async def show_status():\n    while True:\n        try:\n            if report_host:\n                data = value\n        except Exception as error:\n            pass\n";
         assert_matches_cpython_marshal(source, "loop_try.py");
