@@ -4618,11 +4618,22 @@ impl Compiler {
             label,
             -1,
         )?;
+        let comparison_marker_owner = if self.control.loop_tail_while_condition {
+            ExceptionPolicy::default()
+        } else {
+            ExceptionPolicy::normalized_owner(true)
+        };
         let policy = ConditionMarkerPolicy {
-            excluded: ExceptionPolicy::normalized_owner(comparison_is_boolean),
-            ordinary: ExceptionPolicy::normalized_owner(
-                comparison_is_boolean || self.control.active_normal_finally_bodies > 0,
-            ),
+            excluded: if comparison_is_boolean {
+                comparison_marker_owner
+            } else {
+                ExceptionPolicy::normalized_owner(false)
+            },
+            ordinary: if comparison_is_boolean {
+                comparison_marker_owner
+            } else {
+                ExceptionPolicy::normalized_owner(self.control.active_normal_finally_bodies > 0)
+            },
         };
         let preserve_terminal_try_owner = comparison_is_boolean
             || (self

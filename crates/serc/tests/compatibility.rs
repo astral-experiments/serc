@@ -1778,6 +1778,22 @@ async def bare_fallback_control():
     }
 
     #[test]
+    fn matches_cpython_marshal_for_normalized_comparison_marker_owners() {
+        let source = r"async def coroutine():
+    await source
+    if test == expected:
+        await other
+
+
+def generator(value):
+    while value > 0:
+        yield value
+        value -= 1
+";
+        assert_matches_cpython_marshal(source, "normalized_comparison_owners.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_boolean_value_marker_owners() {
         let source = "def generator_expression(items):\n    return (item or fallback for item in items)\n\ndef generator_value(value):\n    yield value\n    result = value and fallback\n    consume(result)\n\ndef generator_try(value):\n    yield value\n    try:\n        result = value or fallback\n        consume(result)\n    finally:\n        cleanup()\n\ndef ordinary_try(value):\n    try:\n        result = value or fallback\n        consume(result)\n    finally:\n        cleanup()\n\ndef nested_try(value):\n    try:\n        try:\n            result = value and fallback\n            consume(result)\n        finally:\n            inner_cleanup()\n    finally:\n        outer_cleanup()\n\ndef with_only(manager, value):\n    with manager:\n        result = value or fallback\n        consume(result)\n\ndef try_inside_with(manager, value):\n    with manager:\n        try:\n            result = value and fallback\n            consume(result)\n        finally:\n            cleanup()\n\ndef with_inside_try(manager, value):\n    try:\n        with manager:\n            result = value or fallback\n            consume(result)\n    finally:\n        cleanup()\n\ndef comprehension(items):\n    return [item and fallback for item in items]\n\ndef protected_comprehensions(manager, items):\n    try:\n        left = [item or fallback for item in items]\n        with manager:\n            right = {item and fallback for item in items}\n        return left, right\n    finally:\n        cleanup()\n\ndef generator_comprehension(items):\n    yield [item or fallback for item in items]\n\nasync def coroutine_before(value):\n    result = value or fallback\n    await source\n    consume(result)\n\nasync def coroutine_after(value):\n    await source\n    result = value and fallback\n    consume(result)\n\nasync def coroutine_try(value):\n    await source\n    try:\n        result = value or fallback\n        consume(result)\n    finally:\n        cleanup()\n\nasync def coroutine_with(manager, value):\n    await source\n    with manager:\n        result = value and fallback\n        consume(result)\n\nasync def async_generator(value):\n    yield value\n    result = value or fallback\n    consume(result)\n\nasync def async_generator_try(value):\n    yield value\n    try:\n        result = value and fallback\n        consume(result)\n    finally:\n        cleanup()\n";
         assert_matches_cpython_marshal(source, "boolean_value_marker_owners.py");

@@ -114,6 +114,11 @@ impl LayoutAssembler {
                             late_exception_exclusions.push((position, end));
                         }
                     }
+                    if instruction.exception_policy.normalized_owner
+                        == NormalizedExceptionOwner::Present
+                    {
+                        late_exception_inclusions.push((position, end));
+                    }
                     if matches!(
                         instruction.opcode,
                         LOAD_FAST_BORROW_LOAD_FAST_BORROW
@@ -148,9 +153,9 @@ impl LayoutAssembler {
                 }
             }
         }
-        // Compiler-side region exclusions can leave a stale-owner marker structurally
-        // uncovered. Recreate only the applied-comprehension case from the innermost owner of
-        // the immediately preceding instruction.
+        // Compiler-side region exclusions can leave a normalized marker structurally
+        // uncovered. Recreate its requested owner from the innermost owner of the immediately
+        // preceding instruction.
         for (start, end) in late_exception_inclusions {
             if regions
                 .iter()

@@ -195,6 +195,13 @@ pub(super) struct ControlFlowState {
     pub(super) exclude_condition_not_taken_from_exception: bool,
     pub(super) include_assert_none_condition_owner: bool,
     pub(super) exclude_condition_not_taken_from_all_exception_regions: bool,
+    // CPython normalizes a loop-tail while condition through a fresh backward-jump block. Its
+    // `NOT_TAKEN` slot therefore cannot inherit the compacted condition block's stale owner.
+    pub(super) loop_tail_while_condition: bool,
+    // A final nested while can reach an enclosing loop backedge through ordinary fallthrough.
+    // CPython threads that exit before jump normalization, which likewise moves `NOT_TAKEN`
+    // into a fresh backward-jump block instead of reusing the condition block's stale slot.
+    suite_fallthrough_to_loop_backedge: bool,
     exclude_loop_tail_not_taken_from_control_flow_regions: bool,
     exception_type_bool_marker_state: Option<ExceptionTypeBoolMarkerState>,
     implicit_return_exception_exclusion_depth: Option<usize>,
@@ -723,6 +730,15 @@ impl Compiler {
                     && !innermost_async_with
                     && (!self.control.active_with_region_exclusions.is_empty()
                         || !self.control.active_exception_region_exclusions.is_empty());
+                let transparent_loop_tail = matches!(statement, Stmt::While(statement) if statement.orelse.is_empty())
+                    || matches!(statement, Stmt::If(statement)
+                            if statement.elif_else_clauses.is_empty()
+                                || matches!(statement.elif_else_clauses.as_slice(), [clause]
+                                    if clause.test.is_none()));
+                let suite_fallthrough_to_loop_backedge =
+                    self.control.suite_fallthrough_to_loop_backedge
+                        && is_final
+                        && transparent_loop_tail;
                 self.with_control_override(
                     |control| &mut control.emit_protected_async_for_end_nop,
                     emit_protected_async_for_end_nop,
@@ -730,7 +746,13 @@ impl Compiler {
                         compiler.with_control_override(
                             |control| &mut control.current_statement_has_following,
                             !is_final,
-                            |compiler| compiler.compile_statement(statement),
+                            |compiler| {
+                                compiler.with_control_override(
+                                    |control| &mut control.suite_fallthrough_to_loop_backedge,
+                                    suite_fallthrough_to_loop_backedge,
+                                    |compiler| compiler.compile_statement(statement),
+                                )
+                            },
                         )
                     },
                 )?;
@@ -934,7 +956,13 @@ impl Compiler {
             IteratorCleanup::None,
             LoopBreakPolicy::Return,
         );
-        self.with_loop_context(context, |compiler| compiler.compile_suite(&statement.body))?;
+        self.with_loop_context(context, |compiler| {
+            compiler.with_control_override(
+                |control| &mut control.suite_fallthrough_to_loop_backedge,
+                true,
+                |compiler| compiler.compile_suite(&statement.body),
+            )
+        })?;
         if !suite_terminates(&statement.body) {
             if let Some(location) = self.assembler.last_instruction_location() {
                 self.assembler.set_location(location);
@@ -978,7 +1006,13 @@ impl Compiler {
             LoopBreakPolicy::Return,
         );
         let body_start = self.assembler.instruction_count();
-        self.with_loop_context(context, |compiler| compiler.compile_suite(&statement.body))?;
+        self.with_loop_context(context, |compiler| {
+            compiler.with_control_override(
+                |control| &mut control.suite_fallthrough_to_loop_backedge,
+                true,
+                |compiler| compiler.compile_suite(&statement.body),
+            )
+        })?;
         if !suite_terminates(&statement.body) {
             self.emit_while_backedge(&statement.body, body_start, start)?;
         }
@@ -2396,7 +2430,11 @@ impl Compiler {
     ) -> Result<LoopBackedge, CompileError> {
         match body.split_last() {
             Some((Stmt::If(statement), leading)) => {
-                self.compile_suite(leading)?;
+                self.with_control_override(
+                    |control| &mut control.suite_fallthrough_to_loop_backedge,
+                    false,
+                    |compiler| compiler.compile_suite(leading),
+                )?;
                 self.compile_loop_tail_if(
                     statement,
                     restart,
@@ -2414,19 +2452,31 @@ impl Compiler {
                         Some(Stmt::Try(statement)) if try_requires_loop_tail_inlining(statement)
                     ) =>
             {
-                self.compile_suite(leading)?;
+                self.with_control_override(
+                    |control| &mut control.suite_fallthrough_to_loop_backedge,
+                    false,
+                    |compiler| compiler.compile_suite(leading),
+                )?;
                 self.compile_loop_tail_while(statement, restart)?;
                 Ok(LoopBackedge::Emitted)
             }
             Some((Stmt::Assert(statement), leading))
                 if early_condition_truthiness(&statement.test).is_none() =>
             {
-                self.compile_suite(leading)?;
+                self.with_control_override(
+                    |control| &mut control.suite_fallthrough_to_loop_backedge,
+                    false,
+                    |compiler| compiler.compile_suite(leading),
+                )?;
                 self.compile_loop_tail_assert(statement, restart)?;
                 Ok(LoopBackedge::Emitted)
             }
             _ => {
-                self.compile_suite(body)?;
+                self.with_control_override(
+                    |control| &mut control.suite_fallthrough_to_loop_backedge,
+                    true,
+                    |compiler| compiler.compile_suite(body),
+                )?;
                 Ok(LoopBackedge::Required)
             }
         }
@@ -2569,7 +2619,11 @@ impl Compiler {
             .then(|| (self.assembler.label(), self.assembler.label()));
 
         self.assembler.mark(start);
-        self.compile_jump_if(&statement.test, true, body_label)?;
+        self.with_control_override(
+            |control| &mut control.loop_tail_while_condition,
+            true,
+            |compiler| compiler.compile_jump_if(&statement.test, true, body_label),
+        )?;
         if let Some((control_start, _)) = control_region {
             self.assembler
                 .mark_before_trailing_instructions(control_start, 2);
@@ -2608,7 +2662,11 @@ impl Compiler {
         if let Some((Stmt::Try(statement), leading)) = body.split_last()
             && try_requires_loop_tail_inlining(statement)
         {
-            self.compile_suite(leading)?;
+            self.with_control_override(
+                |control| &mut control.suite_fallthrough_to_loop_backedge,
+                false,
+                |compiler| compiler.compile_suite(leading),
+            )?;
             self.compile_try_inner(statement, TryCompileOptions::LOOP_TAIL)?;
             Ok(LoopBackedge::Required)
         } else {
@@ -3025,10 +3083,18 @@ impl Compiler {
         let exclude_not_taken = !self.control.active_exception_region_exclusions.is_empty()
             || self.control.active_terminal_withs > 0
             || self.control.generator_region_start.is_some();
+        let condition_fallthrough_to_loop_backedge =
+            self.control.suite_fallthrough_to_loop_backedge;
         self.with_control_override(
             |control| &mut control.exclude_condition_not_taken_from_exception,
             exclude_not_taken,
-            |compiler| compiler.compile_jump_if(&statement.test, false, else_label),
+            |compiler| {
+                compiler.with_control_override(
+                    |control| &mut control.loop_tail_while_condition,
+                    condition_fallthrough_to_loop_backedge,
+                    |compiler| compiler.compile_jump_if(&statement.test, false, else_label),
+                )
+            },
         )?;
         let context = self.loop_context(
             start,
