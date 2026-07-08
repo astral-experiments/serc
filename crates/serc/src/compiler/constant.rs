@@ -1028,17 +1028,20 @@ pub(super) fn fold_constant(expression: &Expr) -> Option<Constant> {
                 (Constant::Float(left), Operator::Div, Constant::Float(right)) if right != 0.0 => {
                     Some(Constant::Float(left / right))
                 }
-                (left, operator @ (Operator::Add | Operator::Sub | Operator::Div), right)
-                    if matches!(left, Constant::Float(_))
+                (
+                    left,
+                    operator @ (Operator::Add | Operator::Sub | Operator::Mult | Operator::Div),
+                    right,
+                ) if matches!(left, Constant::Float(_))
+                    && matches!(
+                        right,
+                        Constant::Bool(_) | Constant::Int(_) | Constant::SignedInt(_)
+                    )
+                    || matches!(right, Constant::Float(_))
                         && matches!(
-                            right,
+                            left,
                             Constant::Bool(_) | Constant::Int(_) | Constant::SignedInt(_)
-                        )
-                        || matches!(right, Constant::Float(_))
-                            && matches!(
-                                left,
-                                Constant::Bool(_) | Constant::Int(_) | Constant::SignedInt(_)
-                            ) =>
+                        ) =>
                 {
                     let to_float = |constant: Constant| match constant {
                         Constant::Bool(value) => Some(f64::from(value)),
@@ -1052,6 +1055,7 @@ pub(super) fn fold_constant(expression: &Expr) -> Option<Constant> {
                     match operator {
                         Operator::Add => Some(Constant::Float(left + right)),
                         Operator::Sub => Some(Constant::Float(left - right)),
+                        Operator::Mult => Some(Constant::Float(left * right)),
                         Operator::Div if right != 0.0 => Some(Constant::Float(left / right)),
                         Operator::Div => None,
                         _ => unreachable!(),
