@@ -1871,6 +1871,12 @@ def render(value):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_assert_none_condition_owners_in_with_bodies() {
+        let source = include_str!("fixtures/with_assert_none_condition_owners.py");
+        assert_matches_cpython_marshal(source, "with_assert_none_condition_owners.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_try_exits_after_if_joins() {
         let source = "def retained(flag):\n    try:\n        action()\n    except Exception:\n        failed()\n    else:\n        if flag:\n            good()\n        else:\n            other()\n    after()\n\ndef ordinary(flag):\n    try:\n        action()\n    except Exception:\n        failed()\n    else:\n        if flag:\n            good()\n    after()\n";
         assert_matches_cpython_marshal(source, "try_if_join.py");

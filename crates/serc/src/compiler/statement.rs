@@ -173,6 +173,7 @@ pub(super) struct ControlFlowState {
     preserve_finally_break_exit_loop_range: Option<ruff_text_size::TextRange>,
     pub(super) exclude_terminal_if_not_taken: bool,
     pub(super) exclude_condition_not_taken_from_exception: bool,
+    pub(super) include_assert_none_condition_owner: bool,
     pub(super) exclude_condition_not_taken_from_all_exception_regions: bool,
     exclude_loop_tail_not_taken_from_control_flow_regions: bool,
     implicit_return_exception_exclusion_depth: Option<usize>,
@@ -3335,7 +3336,12 @@ impl Compiler {
         }
         let base_depth = self.control.depth;
         let end = self.assembler.label();
-        self.compile_jump_if(&statement.test, true, end)?;
+        let include_none_owner = !self.control.active_with_region_exclusions.is_empty();
+        self.with_control_override(
+            |control| &mut control.include_assert_none_condition_owner,
+            include_none_owner,
+            |compiler| compiler.compile_jump_if(&statement.test, true, end),
+        )?;
         self.assembler
             .set_location(self.source_location(statement.range));
         self.emit_common_constant(CommonConstant::ASSERTIONERROR)?;
