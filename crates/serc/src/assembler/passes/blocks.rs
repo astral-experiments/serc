@@ -488,6 +488,11 @@ impl OptimizationPipeline {
             });
             if let Some((insertion_position, start, end)) = terminal_restore {
                 let terminal_restore = order.drain(start..=end).collect::<Vec<_>>();
+                let insertion_position = if insertion_position > end {
+                    insertion_position - terminal_restore.len()
+                } else {
+                    insertion_position
+                };
                 order.splice(insertion_position..insertion_position, terminal_restore);
             }
         }
@@ -1032,6 +1037,44 @@ impl OptimizationPipeline {
             {
                 instruction.location = location;
             }
+        }
+
+        let jump_target = |item: &Item| match item {
+            Item::Instruction(Instruction {
+                operand: Operand::Forward(target) | Operand::Backward(target),
+                ..
+            }) => graph.label_block(*target),
+            Item::Instruction(_) | Item::Label(_) => None,
+        };
+        let mut retained_jump_targets = order
+            .iter()
+            .copied()
+            .filter(|block| !drop_blocks.contains(block))
+            .flat_map(|block| graph[block].items())
+            .chain(
+                inline_copies
+                    .values()
+                    .chain(target_copies.values())
+                    .flatten()
+                    .flatten(),
+            )
+            .filter_map(jump_target)
+            .collect::<Vec<_>>();
+        // A copied exit can retain an edge to a block outside the copied chain. Keep that
+        // original target even when all of its original predecessors were themselves copied.
+        while let Some(target) = retained_jump_targets.pop() {
+            if !drop_blocks.remove(&target) {
+                continue;
+            }
+            retained_jump_targets.extend(graph[target].items().iter().filter_map(
+                |item| match item {
+                    Item::Instruction(Instruction {
+                        operand: Operand::Forward(target) | Operand::Backward(target),
+                        ..
+                    }) => graph.label_block(*target),
+                    Item::Instruction(_) | Item::Label(_) => None,
+                },
+            ));
         }
 
         let mut final_order = Vec::new();
