@@ -465,6 +465,31 @@ class Global(global_base, metaclass=global_meta):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_generator_targets_shadowing_enclosing_freevars() {
+        let source = r"def lambda_parent(all_elements, element):
+    return lambda owner: all(owner.contains(element) for element in all_elements)
+
+def function_parent(all_elements, element):
+    def child(owner):
+        return all(owner.contains(element) for element in all_elements)
+    return child
+
+def lambda_in_generator_parent(items, predicate):
+    def child():
+        return any((lambda: predicate(item))() for item in items)
+    return child
+
+def comprehension_shadow_parent(items, captured):
+    def child():
+        values = [captured for captured in items]
+        generated = (item for item in items)
+        return captured, values, generated
+    return child
+";
+        assert_matches_cpython_marshal(source, "generator_target_shadow.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_annotation_scope_closures() {
         let source = include_str!("fixtures/benchmark/annotation_scopes.py");
         assert_matches_cpython_marshal(source, "annotation_scopes.py");
