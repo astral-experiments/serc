@@ -2075,10 +2075,8 @@ impl Compiler {
                 };
                 if !preserve_tos && !return_is_overridden {
                     if let Some(value) = &statement.value {
-                        let return_spans_lines = {
-                            let location = self.source_location(statement.range);
-                            location.line != location.end_line
-                        };
+                        let return_location = self.source_location(statement.range);
+                        let return_spans_lines = return_location.line != return_location.end_line;
                         if !with_unwind_starts.is_empty() || finally_unwind_start.is_some() {
                             let constant = fold_constant(value).ok_or_else(|| {
                                 CompileError::Internal(
@@ -2087,8 +2085,18 @@ impl Compiler {
                             })?;
                             self.emit_preprocessed_constant(value, constant)?;
                         } else if return_spans_lines {
-                            self.assembler
-                                .set_location(self.source_location(statement.range));
+                            let value_location = self.source_location(value.range());
+                            // Parentheses outside the literal's line span preserve the return
+                            // statement location on RETURN_VALUE. Otherwise, both the constant
+                            // and return use the literal's range.
+                            let location = if value_location.line == return_location.line
+                                && value_location.end_line == return_location.end_line
+                            {
+                                value_location
+                            } else {
+                                return_location
+                            };
+                            self.assembler.set_location(location);
                             let constant = fold_constant(value).ok_or_else(|| {
                                 CompileError::Internal(
                                     "literal return value did not fold to a constant".to_string(),
