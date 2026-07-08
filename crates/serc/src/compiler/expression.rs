@@ -2593,6 +2593,16 @@ impl Compiler {
         for comprehension in &generator.generators {
             collect_target_names(&comprehension.target, &mut locals);
         }
+        collect_nested_comprehension_target_names(&generator.elt, &mut locals);
+        for (index, comprehension) in generator.generators.iter().enumerate() {
+            collect_nested_comprehension_target_names(&comprehension.target, &mut locals);
+            if index > 0 {
+                collect_nested_comprehension_target_names(&comprehension.iter, &mut locals);
+            }
+            for condition in &comprehension.ifs {
+                collect_nested_comprehension_target_names(condition, &mut locals);
+            }
+        }
         let mut seen = FxHashSet::default();
         locals.retain(|name| seen.insert(name.clone()));
         let required_names = generator_required_names(generator);

@@ -249,6 +249,20 @@ impl Compiler {
                     let index = self.name_index_with_id(name, name_id)?;
                     return self.emit(LOAD_GLOBAL, index << 1, 1);
                 }
+                if indices.contains_key(&name_id)
+                    && let Some(index) = free_indices.get(&name_id).copied()
+                {
+                    // An inlined comprehension can use a temporary fast-local slot with the
+                    // same spelling as a free variable. Outside the comprehension, resolve the
+                    // name through the closure.
+                    if let Some(classdict) = annotation_classdict_index
+                        && name != "__classdict__"
+                    {
+                        self.emit(LOAD_DEREF, classdict, 1)?;
+                        return self.emit(LOAD_FROM_DICT_OR_DEREF, index, 0);
+                    }
+                    return self.emit(LOAD_DEREF, index, 1);
+                }
                 if let Some(index) = indices.get(&name_id).copied() {
                     if cells.contains(name_id) {
                         if let Some(classdict) = annotation_classdict_index
