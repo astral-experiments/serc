@@ -4340,14 +4340,36 @@ impl Compiler {
                 label,
                 -1,
             )?;
-            return self.emit_condition_not_taken_preserving_terminal_try_owner(
-                ConditionMarkerPolicy {
-                    excluded: ExceptionPolicy::default(),
-                    ordinary: ExceptionPolicy::normalized_owner(
-                        self.control.active_normal_finally_bodies > 0,
-                    ),
-                },
-            );
+            // CPython keeps this specialized fallthrough in the surrounding generator's
+            // stop-iteration region. Override the generic condition exclusion only when no
+            // nested control-flow region can own the marker instead.
+            let preserve_generator_stop_iteration_owner =
+                self.control.generator_region_start.is_some()
+                    && self
+                        .control
+                        .active_comprehension_region_exclusions
+                        .is_empty()
+                    && self.control.active_with_region_exclusions.is_empty()
+                    && self.control.active_exception_region_exclusions.is_empty()
+                    && self.control.active_normal_finally_bodies == 0;
+            let policy = ConditionMarkerPolicy {
+                excluded: ExceptionPolicy::default(),
+                ordinary: ExceptionPolicy::normalized_owner(
+                    self.control.generator_region_start.is_some()
+                        || self.control.active_normal_finally_bodies > 0,
+                ),
+            };
+            return if preserve_generator_stop_iteration_owner {
+                self.with_control_override(
+                    |control| &mut control.exclude_condition_not_taken_from_exception,
+                    false,
+                    |compiler| {
+                        compiler.emit_condition_not_taken_preserving_terminal_try_owner(policy)
+                    },
+                )
+            } else {
+                self.emit_condition_not_taken_preserving_terminal_try_owner(policy)
+            };
         }
         let comparison_is_boolean = if let Expr::Compare(comparison) = expression
             && comparison.ops.len() == 1
