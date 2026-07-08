@@ -311,6 +311,23 @@ def shadowed_class_decorator(decorator, local):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_decorator_bindings_and_delete_only_locals() {
+        let source = r"def bindings():
+    @decorator
+    def function():
+        pass
+
+    @(assigned := decorator)
+    class Class:
+        pass
+
+    del deleted
+    decorator = identity
+";
+        assert_matches_cpython_marshal(source, "decorator_bindings.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_plain_class_header_closures() {
         let source = r"def function_headers(base, metaclass, bases, options, captured):
     def parent():
