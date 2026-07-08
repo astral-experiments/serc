@@ -468,6 +468,7 @@ pub(super) fn statement_execution_range(statement: &Stmt) -> ruff_text_size::Tex
             .map_or(statement.range, first_expression_instruction_range),
         Stmt::AugAssign(statement) => first_expression_instruction_range(&statement.target),
         Stmt::Expr(statement) => first_expression_instruction_range(&statement.value),
+        Stmt::If(statement) => first_expression_instruction_range(&statement.test),
         Stmt::Return(statement) => statement
             .value
             .as_deref()
