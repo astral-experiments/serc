@@ -1029,8 +1029,26 @@ pub(super) fn fold_constant(expression: &Expr) -> Option<Constant> {
                     Some(Constant::Float(left / right))
                 }
                 (
+                    left @ (Constant::Bool(_) | Constant::Int(_) | Constant::SignedInt(_)),
+                    Operator::Pow,
+                    Constant::SignedInt(right),
+                ) if right < 0 => {
+                    let left = match left {
+                        Constant::Bool(value) => f64::from(value),
+                        Constant::Int(value) => value as f64,
+                        Constant::SignedInt(value) => value as f64,
+                        _ => unreachable!(),
+                    };
+                    let result = left.powf(right as f64);
+                    result.is_finite().then_some(Constant::Float(result))
+                }
+                (
                     left,
-                    operator @ (Operator::Add | Operator::Sub | Operator::Mult | Operator::Div),
+                    operator @ (Operator::Add
+                    | Operator::Sub
+                    | Operator::Mult
+                    | Operator::Div
+                    | Operator::Pow),
                     right,
                 ) if matches!(left, Constant::Float(_))
                     && matches!(
@@ -1057,6 +1075,10 @@ pub(super) fn fold_constant(expression: &Expr) -> Option<Constant> {
                         Operator::Sub => Some(Constant::Float(left - right)),
                         Operator::Mult => Some(Constant::Float(left * right)),
                         Operator::Div if right != 0.0 => Some(Constant::Float(left / right)),
+                        Operator::Pow => {
+                            let result = left.powf(right);
+                            result.is_finite().then_some(Constant::Float(result))
+                        }
                         Operator::Div => None,
                         _ => unreachable!(),
                     }

@@ -2284,6 +2284,21 @@ underflow = 1e-308 * 1e-308
     }
 
     #[test]
+    fn matches_cpython_marshal_for_folded_mixed_numeric_power() {
+        let source = r"int_float = 7 ** 0.5
+float_int = 2.0 ** 53
+int_negative = 10 ** -10
+signed_base_negative = (-2) ** -3
+float_base_integer = (-2.0) ** 3
+underflow = 10 ** -100000
+true_negative = True ** -1
+zero_negative = 0 ** -1
+float_overflow = 1e308 ** 2
+";
+        assert_matches_cpython_marshal(source, "folded_mixed_power.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_a_large_constant_list() {
         let source = format!(
             "large = [{}]\n",
