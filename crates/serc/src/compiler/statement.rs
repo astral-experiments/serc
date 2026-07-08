@@ -3637,6 +3637,12 @@ impl Compiler {
                 self.assembler
                     .preserve_last_redundant_jump_nop_after_threading();
             }
+            if statement.orelse.is_empty()
+                && suite_ends_in_retained_try_body_exit_join(&statement.body)
+            {
+                self.assembler
+                    .preserve_last_redundant_jump_nop_after_threading();
+            }
             if body_ends_with_break_loop {
                 // CPython's `POP_BLOCK` initially prevents the loop break from threading
                 // through this normal try exit. Once `POP_BLOCK` disappears, the exit jump
@@ -5663,6 +5669,42 @@ fn suite_ends_in_retained_try_exit_join(body: &[Stmt]) -> bool {
         return suite_ends_in_retained_try_exit_join(selected);
     }
     !statement.elif_else_clauses.is_empty() || terminating_if_fallthrough_test(statement).is_some()
+}
+
+// CPython builds a normal try body with different temporary block edges than its `else` suite,
+// so the body's final if join survives redundant-jump removal under narrower conditions. Keep
+// this predicate separate from `suite_ends_in_retained_try_exit_join`.
+fn suite_ends_in_retained_try_body_exit_join(body: &[Stmt]) -> bool {
+    let Some(Stmt::If(statement)) = body.last() else {
+        return false;
+    };
+    if let Some(truthiness) = early_condition_truthiness(&statement.test) {
+        if truthiness {
+            return suite_ends_in_retained_try_body_exit_join(&statement.body);
+        }
+        for clause in &statement.elif_else_clauses {
+            let Some(test) = &clause.test else {
+                return !suite_terminates(&clause.body);
+            };
+            match early_condition_truthiness(test) {
+                Some(false) => {}
+                Some(true) => {
+                    return suite_ends_in_retained_try_body_exit_join(&clause.body);
+                }
+                None => {
+                    return statement
+                        .elif_else_clauses
+                        .last()
+                        .is_some_and(|last| last.test.is_none() && !suite_terminates(&last.body));
+                }
+            }
+        }
+        return false;
+    }
+    statement
+        .elif_else_clauses
+        .last()
+        .is_some_and(|clause| clause.test.is_none() && !suite_terminates(&clause.body))
 }
 
 fn try_requires_loop_tail_inlining(statement: &ruff_python_ast::StmtTry) -> bool {
