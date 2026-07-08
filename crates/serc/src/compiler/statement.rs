@@ -5269,6 +5269,11 @@ impl Compiler {
                 .set_location(self.source_location(remaining[0].context_expr.range()));
             self.emit(NOP, 0, 0)?;
         }
+        let body_noop = body_noop.or_else(|| {
+            (!self.assembler.last_instruction_is_nop()
+                && with_body_ends_in_retained_pop_block(body))
+            .then_some(WithBodyExitNoop::ConvertedPopBlock)
+        });
         if let Some(body_noop) = body_noop {
             let noop_start = self.assembler.label();
             self.assembler.mark(noop_start);
@@ -5726,6 +5731,42 @@ fn condition_jump_target_count(expression: &Expr, jump_on: bool) -> usize {
 
 pub(super) fn suite_terminates(body: &[Stmt]) -> bool {
     body.iter().any(statement_terminates)
+}
+
+fn try_normal_exit_predecessors(statement: &ruff_python_ast::StmtTry) -> usize {
+    let normal_body =
+        usize::from(!suite_terminates(&statement.body) && !suite_terminates(&statement.orelse));
+    normal_body
+        + statement
+            .handlers
+            .iter()
+            .filter(|handler| {
+                handler
+                    .as_except_handler()
+                    .is_some_and(|handler| !suite_terminates(&handler.body))
+            })
+            .count()
+}
+
+// CPython converts the POP_BLOCK after every synchronous with body into an unowned NOP.
+// When a final structured statement leaves one normal predecessor, location propagation makes
+// that NOP observable before the manager's normal exit.
+fn with_body_ends_in_retained_pop_block(body: &[Stmt]) -> bool {
+    match body.last() {
+        Some(Stmt::Try(statement)) => {
+            statement.finalbody.is_empty()
+                && !suite_terminates(&statement.body)
+                && !matches!(statement.body.last(), Some(Stmt::If(_)))
+                && try_normal_exit_predecessors(statement) == 1
+        }
+        Some(Stmt::With(statement)) => {
+            matches!(
+                statement.body.last(),
+                Some(Stmt::Return(_) | Stmt::Raise(_))
+            )
+        }
+        _ => false,
+    }
 }
 
 fn suite_ends_in_retained_try_exit_join(body: &[Stmt]) -> bool {
