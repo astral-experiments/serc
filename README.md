@@ -57,8 +57,8 @@ network, storage, and CPU resources:
 ./scripts/check-mypy-primer-compatibility /path/to/python3.14.5
 ```
 
-The second command freezes the current outcome baseline of 62,017 byte-identical
-files, 11,361 failures, and 159 files rejected by CPython. It exits unsuccessfully
+The second command freezes the current outcome baseline of 62,054 byte-identical
+files, 11,324 failures, and 159 files rejected by CPython. It exits unsuccessfully
 when the outcome counts change so compatibility improvements advance the baseline
 explicitly. CI validates the pinned catalog and the
 corpus-management scripts, but the full comparison does not replace or weaken

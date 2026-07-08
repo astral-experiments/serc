@@ -1687,6 +1687,9 @@ impl<'ast> Visitor<'ast> for NamedExpressionCollector<'_> {
             return;
         }
         if let Expr::Named(named) = expression {
+            // CPython allocates locals referenced by the value before the walrus target.
+            walk_expr(self, expression);
+
             if self.in_inlined_comprehension
                 && let Expr::Name(name) = named.target.as_ref()
             {
@@ -1694,6 +1697,7 @@ impl<'ast> Visitor<'ast> for NamedExpressionCollector<'_> {
                     .insert_comprehension_target(name.id.as_str().to_string());
             }
             self.collector.collect_target(&named.target);
+            return;
         }
         walk_expr(self, expression);
     }
