@@ -397,6 +397,198 @@ class Global(global_base, metaclass=global_meta):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_terminal_try_suite_implicit_returns() {
+        let source = r"def body_if(flag):
+    try:
+        if flag:
+            action()
+    except Exception:
+        pass
+
+def leading_and_terminal_if(first, second):
+    try:
+        if first:
+            before()
+        if second:
+            action()
+    except Exception:
+        pass
+
+def body_if_else(flag):
+    try:
+        if flag:
+            action()
+        else:
+            other()
+    except Exception:
+        pass
+
+def body_while(flag):
+    try:
+        while flag:
+            action()
+            break
+    except Exception:
+        pass
+
+def body_match(value):
+    try:
+        match value:
+            case 1:
+                action()
+    except Exception:
+        pass
+
+def else_if(flag):
+    try:
+        action()
+    except Exception:
+        recover()
+    else:
+        if flag:
+            success()
+
+def conditional_expression(flag):
+    try:
+        action() if flag else other()
+    except Exception:
+        pass
+
+def boolean_expression(flag):
+    try:
+        flag and action()
+    except Exception:
+        pass
+
+def chained_comparison(left, middle, right):
+    try:
+        left < middle < right
+    except Exception:
+        pass
+
+def tuple_conditional_expression(flag):
+    try:
+        (before(), action() if flag else other())
+    except Exception:
+        pass
+
+async def coroutine_if(flag):
+    try:
+        if flag:
+            await action()
+    except Exception:
+        pass
+";
+        assert_matches_cpython_marshal(source, "terminal_try_returns.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_nested_terminal_try_condition_ownership() {
+        let source = r"def nested_try(a, b):
+    try:
+        if a:
+            try:
+                b and action()
+            except ValueError:
+                inner()
+    except Exception:
+        recover()
+
+def complex_condition(a, b, c):
+    try:
+        if a and (b if c else other()):
+            action()
+    except Exception:
+        recover()
+
+def guarded_match(value, flag):
+    try:
+        match value:
+            case 1 if flag and predicate():
+                action()
+    except Exception:
+        recover()
+
+def nested_try_generator(a, b):
+    yield 1
+    try:
+        if a:
+            try:
+                b and action()
+            except ValueError:
+                inner()
+    except Exception:
+        recover()
+
+async def nested_try_coroutine(a, b):
+    await before()
+    try:
+        if a:
+            try:
+                b and await action()
+            except ValueError:
+                inner()
+    except Exception:
+        recover()
+
+async def nested_try_async_generator(a, b):
+    yield 1
+    try:
+        if a:
+            try:
+                b and action()
+            except ValueError:
+                inner()
+    except Exception:
+        recover()
+
+async def coroutine_nested_finally(a):
+    try:
+        if a:
+            try:
+                action()
+            finally:
+                cleanup()
+    except Exception:
+        recover()
+
+async def coroutine_nested_else(a):
+    try:
+        if a:
+            try:
+                action()
+            except ValueError:
+                inner()
+            else:
+                success()
+    except Exception:
+        recover()
+
+async def await_late_in_bool_condition(a):
+    try:
+        if a and await predicate():
+            try:
+                action()
+            except ValueError:
+                inner()
+    except Exception:
+        recover()
+
+async def await_before_nested_finally(a):
+    await before()
+    try:
+        if a:
+            try:
+                action()
+            finally:
+                cleanup()
+    except Exception:
+        recover()
+";
+        assert_matches_cpython_marshal(source, "terminal_try_condition_ownership.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_try_exits_across_exception_boundaries() {
         let source = r"try:
     1 / 0
