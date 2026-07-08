@@ -490,6 +490,21 @@ def comprehension_shadow_parent(items, captured):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_decorated_generic_function_closures() {
+        let source = r"class Container:
+    @decorator
+    def method[T](self, value: T) -> T: ...
+
+def parent():
+    captured = object()
+    @decorator
+    async def function[T: captured](value: T) -> T: ...
+    return function
+";
+        assert_matches_cpython_marshal(source, "decorated_generic_closure.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_annotation_scope_closures() {
         let source = include_str!("fixtures/benchmark/annotation_scopes.py");
         assert_matches_cpython_marshal(source, "annotation_scopes.py");

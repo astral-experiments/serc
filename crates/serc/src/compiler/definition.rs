@@ -341,10 +341,10 @@ impl Compiler {
         wrapper.emit(RETURN_VALUE, 0, -1)?;
         let wrapper = wrapper.finish_inner(false)?;
         let wrapper_closure_names = wrapper_plan.freevars;
+        self.assembler.set_location(definition_location);
         if !wrapper_closure_names.is_empty() {
             self.emit_closure_tuple(&wrapper_closure_names)?;
         }
-        self.assembler.set_location(definition_location);
         let code = self.add_constant(Constant::Code(Box::new(wrapper)))?;
         self.emit(LOAD_CONST, code, 1)?;
         self.emit(MAKE_FUNCTION, 0, 0)?;
