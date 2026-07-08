@@ -46,7 +46,10 @@ use super::scope::{
     collect_named_expression_target_names, collect_nested_comprehension_target_names,
     collect_target_names, comprehension_cell_names, generator_cellvars, generator_required_names,
 };
-use super::source::{debug_text_range, statement_execution_range, strip_expression_comments};
+use super::source::{
+    debug_text_range, statement_execution_range, strip_expression_comments,
+    synthetic_condition_exit_range,
+};
 use super::statement::{is_wildcard_pattern, suite_terminates};
 use super::symbol::{
     ComparisonMode, ReraiseStackState, ResumeDepth, expression_name, to_u32, unsupported,
@@ -429,7 +432,7 @@ impl Compiler {
         self.assembler.mark(false_exit);
         self.set_depth(base_depth);
         self.assembler
-            .set_location(self.source_location(statement.test.range()));
+            .set_location(self.source_location(synthetic_condition_exit_range(&statement.test)));
         self.emit_jump_forward(JUMP_FORWARD, match_end, 0)?;
         // CPython leaves the condition's false edge pointing at this case-exit block, even
         // though the block itself immediately jumps to the match join.

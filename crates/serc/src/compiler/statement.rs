@@ -29,7 +29,10 @@ use super::expression::{
     optimized_generator_callable,
 };
 use super::scope::{NameId, NameSet, ReferenceCollector, collect_target_names};
-use super::source::{condition_exit_range, implicit_return_range, unparse_annotation};
+use super::source::{
+    condition_exit_range, implicit_return_range, synthetic_condition_exit_range,
+    unary_not_condition_exit_range, unparse_annotation,
+};
 use super::symbol::{ReraiseStackState, ResumeDepth, statement_name, to_u32, unsupported};
 use super::{Compiler, Scope};
 
@@ -1096,7 +1099,9 @@ impl Compiler {
                     compiler.compile_suite_inner(body, true)
                 })?;
                 if !suite_terminates(body) && !emitted_fallthrough {
-                    if let Some(statement) = body
+                    if let Some(range) = suite_unary_not_fallthrough_range(body) {
+                        self.assembler.set_location(self.source_location(range));
+                    } else if let Some(statement) = body
                         .last()
                         .filter(|statement| statement_uses_implicit_return_location(statement))
                     {
@@ -1111,22 +1116,25 @@ impl Compiler {
                         self.assembler
                             .set_location(self.source_location(statement.range()));
                     } else {
-                        self.assembler
-                            .set_location(self.source_location(test.range()));
+                        self.assembler.set_location(
+                            self.source_location(synthetic_condition_exit_range(test)),
+                        );
                     }
                     self.emit_deferred_implicit_return()?;
                 }
                 self.assembler.mark(next);
                 self.set_depth(base_depth);
                 self.assembler
-                    .set_location(self.source_location(test.range()));
+                    .set_location(self.source_location(synthetic_condition_exit_range(test)));
             } else {
                 let body_start = self.assembler.instruction_count();
                 let ((), emitted_fallthrough) = self.with_fallthrough_tracking(|compiler| {
                     compiler.compile_suite_inner(body, true)
                 })?;
                 if !suite_terminates(body) && !emitted_fallthrough {
-                    if let Some(statement) = body
+                    if let Some(range) = suite_unary_not_fallthrough_range(body) {
+                        self.assembler.set_location(self.source_location(range));
+                    } else if let Some(statement) = body
                         .last()
                         .filter(|statement| statement_uses_implicit_return_location(statement))
                     {
@@ -2223,11 +2231,13 @@ impl Compiler {
                         let Some(Stmt::If(statement)) = body.last() else {
                             unreachable!();
                         };
-                        self.assembler
-                            .set_location(self.source_location(statement.test.range()));
+                        self.assembler.set_location(
+                            self.source_location(synthetic_condition_exit_range(&statement.test)),
+                        );
                     } else if let Some(NestedIfExitLocation::Located(test)) = nested_if_exit {
-                        self.assembler
-                            .set_location(self.source_location(test.range()));
+                        self.assembler.set_location(
+                            self.source_location(synthetic_condition_exit_range(test)),
+                        );
                     } else if matches!(nested_if_exit, Some(NestedIfExitLocation::Unlocated)) {
                         self.assembler.set_location(SourceLocation::NONE);
                     } else {
@@ -2276,7 +2286,9 @@ impl Compiler {
             && let Some(test) = terminating_if_fallthrough_test(statement)
         {
             self.assembler
-                .set_location(self.source_location(test.range()));
+                .set_location(self.source_location(synthetic_condition_exit_range(test)));
+        } else if let Some(range) = suite_unary_not_fallthrough_range(body) {
+            self.assembler.set_location(self.source_location(range));
         } else if self.assembler.instruction_count() > body_start
             && let Some(location) = self.assembler.last_instruction_location()
         {
@@ -2481,7 +2493,7 @@ impl Compiler {
                 .mark_before_trailing_instructions(control_start, 2);
         }
         self.assembler
-            .set_location(self.source_location(statement.test.range()));
+            .set_location(self.source_location(synthetic_condition_exit_range(&statement.test)));
         self.emit_jump_backward(JUMP_BACKWARD, restart, 0)?;
         if let Some((control_start, control_end)) = control_region {
             self.assembler.mark(control_end);
@@ -2692,8 +2704,9 @@ impl Compiler {
             }
         }
         if !has_else {
-            self.assembler
-                .set_location(self.source_location(statement.test.range()));
+            self.assembler.set_location(
+                self.source_location(synthetic_condition_exit_range(&statement.test)),
+            );
             self.emit_jump_backward(JUMP_BACKWARD, restart, 0)?;
         }
         Ok(())
@@ -3615,11 +3628,15 @@ impl Compiler {
             if let Some(location) = orelse_noop_location {
                 self.assembler.set_location(location);
             } else if statement.orelse.is_empty()
-                && let Some(Stmt::If(statement)) = statement.body.last()
-                && let Some(test) = terminating_if_fallthrough_test(statement)
+                && let Some(Stmt::If(nested)) = statement.body.last()
+                && let Some(test) = terminating_if_fallthrough_test(nested)
             {
                 self.assembler
-                    .set_location(self.source_location(test.range()));
+                    .set_location(self.source_location(synthetic_condition_exit_range(test)));
+            } else if statement.orelse.is_empty()
+                && let Some(range) = suite_unary_not_fallthrough_range(&statement.body)
+            {
+                self.assembler.set_location(self.source_location(range));
             } else if statement.orelse.is_empty()
                 && let Some(location) = body_noop_location
             {
@@ -4042,7 +4059,11 @@ impl Compiler {
                 true,
             );
             if terminal_handler_exclusions.is_none() && !terminal_handler_try_return {
-                if !handler_body_has_instructions && let Some(statement) = handler.body.last() {
+                if let Some(range) = suite_unary_not_fallthrough_range(&handler.body) {
+                    self.assembler.set_location(self.source_location(range));
+                } else if !handler_body_has_instructions
+                    && let Some(statement) = handler.body.last()
+                {
                     self.assembler
                         .set_location(self.source_location(statement.range()));
                 // CPython leaves named cleanup after a nested try unlocated so every incoming
@@ -4515,13 +4536,17 @@ impl Compiler {
             } else {
                 let instruction_count = self.assembler.instruction_count();
                 self.compile_suite(body)?;
-                if self.assembler.instruction_count() > instruction_count {
+                if let Some(range) = suite_unary_not_fallthrough_range(body) {
+                    self.source_location(range)
+                } else if self.assembler.instruction_count() > instruction_count {
                     self.assembler
                         .last_instruction_location()
-                        .unwrap_or_else(|| self.source_location(last_test.range()))
+                        .unwrap_or_else(|| {
+                            self.source_location(synthetic_condition_exit_range(last_test))
+                        })
                 } else {
                     body.last().map_or_else(
-                        || self.source_location(last_test.range()),
+                        || self.source_location(synthetic_condition_exit_range(last_test)),
                         |statement| self.source_location(statement.range()),
                     )
                 }
@@ -4541,7 +4566,7 @@ impl Compiler {
             exclusions.push(self.emit_terminal_exception_handler_action(
                 name,
                 handler_depth,
-                self.source_location(last_test.range()),
+                self.source_location(synthetic_condition_exit_range(last_test)),
             )?);
         }
         Ok(exclusions)
@@ -4807,7 +4832,9 @@ impl Compiler {
             Ok(())
         })?;
         if terminal && !finalbody_emitted_fallthrough && !suite_terminates(&statement.finalbody) {
-            if let Some(statement) = statement
+            if let Some(range) = suite_unary_not_fallthrough_range(&statement.finalbody) {
+                self.assembler.set_location(self.source_location(range));
+            } else if let Some(statement) = statement
                 .finalbody
                 .last()
                 .filter(|statement| statement_uses_implicit_return_location(statement))
@@ -4905,7 +4932,7 @@ impl Compiler {
             self.assembler.mark(condition_false);
             self.set_depth(base_depth + 2);
             self.assembler
-                .set_location(self.source_location(final_if.test.range()));
+                .set_location(self.source_location(synthetic_condition_exit_range(&final_if.test)));
             self.emit_reraise(ReraiseStackState::ActiveExceptionHandler)?;
         } else {
             if let Some(location) = pass_finally_location {
@@ -4918,7 +4945,9 @@ impl Compiler {
                 )?;
             }
             if !suite_terminates(&statement.finalbody) {
-                if let Some(statement) = statement
+                if let Some(range) = suite_unary_not_fallthrough_range(&statement.finalbody) {
+                    self.assembler.set_location(self.source_location(range));
+                } else if let Some(statement) = statement
                     .finalbody
                     .last()
                     .filter(|statement| statement_uses_implicit_return_location(statement))
@@ -5191,7 +5220,9 @@ impl Compiler {
             {
                 body_noop = Some(WithBodyExitNoop::Located(statement.range()));
             } else if terminal_if && let Some(Stmt::If(statement)) = body.last() {
-                body_noop = Some(WithBodyExitNoop::Located(statement.test.range()));
+                body_noop = Some(WithBodyExitNoop::Located(synthetic_condition_exit_range(
+                    &statement.test,
+                )));
             } else if let Some(Stmt::Assert(statement)) = body.last() {
                 if condition_jump_target_count(&statement.test, true) == 1 {
                     // CPython converts the with block's trailing `POP_BLOCK` to an unlocated
@@ -5934,6 +5965,18 @@ fn nested_if_exit_location(
     } else {
         NestedIfExitLocation::Unlocated
     })
+}
+
+fn suite_unary_not_fallthrough_range(body: &[Stmt]) -> Option<TextRange> {
+    match body.last()? {
+        Stmt::Assert(statement) if early_condition_truthiness(&statement.test).is_none() => {
+            unary_not_condition_exit_range(&statement.test)
+        }
+        Stmt::If(statement) => {
+            terminating_if_fallthrough_test(statement).and_then(unary_not_condition_exit_range)
+        }
+        _ => None,
+    }
 }
 
 fn terminating_if_fallthrough_test(statement: &ruff_python_ast::StmtIf) -> Option<&Expr> {
