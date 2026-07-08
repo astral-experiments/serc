@@ -933,3 +933,32 @@ fn redundant_nop_removal_preserves_forward_scan_semantics() {
 
     assert_eq!(graph_opcodes(&assembler), [NOP, LOAD_CONST, RETURN_VALUE]);
 }
+
+#[test]
+fn cold_block_terminal_restore_accounts_for_the_drained_range() {
+    let source = r"async def f(iterator):
+    async for item in iterator:
+        if condition:
+            await call()
+            break
+    assert result
+";
+
+    crate::compile(source, "cold_terminal_restore.py").unwrap();
+}
+
+#[test]
+fn duplicated_exit_blocks_retain_transitively_targeted_blocks() {
+    let source = r"def f():
+    try:
+        result = first()
+    except Error as outer:
+        try:
+            result = second()
+        except Error as inner:
+            pass
+    return result
+";
+
+    crate::compile(source, "nested_exit_copy.py").unwrap();
+}
