@@ -2099,6 +2099,10 @@ impl Compiler {
         let Expr::Name(name) = expression else {
             return Ok(SpecializedLowering::NotApplicable);
         };
+        let name_id = self.required_name_id(name.id.as_str());
+        if self.symbols.active_temporaries.contains(name_id) {
+            return Ok(SpecializedLowering::NotApplicable);
+        }
         let is_global = match &self.unit.scope {
             Scope::Function {
                 indices,
@@ -2109,6 +2113,13 @@ impl Compiler {
                 self.contains_name(globals, name.id.as_str())
                     || (self.scope_index(indices, name.id.as_str()).is_none()
                         && self.scope_index(free_indices, name.id.as_str()).is_none())
+            }
+            Scope::Class {
+                globals,
+                free_indices,
+                ..
+            } if !self.control.active_comprehension_cleanups.is_empty() => {
+                globals.contains(name_id) || !free_indices.contains_key(&name_id)
             }
             Scope::Module | Scope::Class { .. } => false,
         };

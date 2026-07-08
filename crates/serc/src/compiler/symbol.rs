@@ -213,11 +213,22 @@ impl Compiler {
                     let index = self.name_index_with_id(name, name_id)?;
                     self.emit(LOAD_GLOBAL, index << 1, 1)
                 } else if let Some(index) = free_indices.get(&name_id).copied() {
-                    self.emit(LOAD_LOCALS, 0, 1)?;
-                    self.emit(LOAD_FROM_DICT_OR_DEREF, index, 0)
+                    if self.control.active_comprehension_cleanups.is_empty() {
+                        self.emit(LOAD_LOCALS, 0, 1)?;
+                        self.emit(LOAD_FROM_DICT_OR_DEREF, index, 0)
+                    } else {
+                        self.emit(LOAD_DEREF, index, 1)
+                    }
                 } else {
                     let index = self.name_index_with_id(name, name_id)?;
-                    self.emit(LOAD_NAME, index, 1)
+                    if self.control.active_comprehension_cleanups.is_empty() {
+                        self.emit(LOAD_NAME, index, 1)
+                    } else {
+                        // The first iterable runs in the class namespace, but the inlined
+                        // comprehension body retains the globals-only lookup semantics of its
+                        // former implicit function scope.
+                        self.emit(LOAD_GLOBAL, index << 1, 1)
+                    }
                 }
             }
             Scope::Function {
