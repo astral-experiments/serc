@@ -24,7 +24,7 @@ use crate::target::operands::{
     BinaryIntrinsic, CommonConstant, ComparisonOperation, FunctionAttribute, UnaryIntrinsic,
 };
 
-use super::constant::fold_constant;
+use super::constant::{fold_constant, folded_constant_owner_slots};
 use super::scope::{
     LoweringFunctionPlan, NameId, ReferenceCollector, collect_conditional_simple_annotations,
     collect_simple_annotations, expression_required_names, nested_expression_required_names,
@@ -545,11 +545,18 @@ impl Compiler {
                 .map(|default| fold_constant(default))
                 .collect::<Option<Vec<_>>>()
             {
+                let hidden_owner_slots = positional_defaults
+                    .iter()
+                    .fold(positional_defaults.len(), |slots, default| {
+                        slots.saturating_add(folded_constant_owner_slots(default))
+                    });
                 for default in &positional_defaults {
                     self.record_folded_value(default)?;
                 }
                 self.assembler.set_location(definition_location);
                 self.emit_deferred_constant(Constant::Tuple(defaults))?;
+                self.assembler
+                    .add_last_hidden_exception_owner_slots(hidden_owner_slots);
             } else {
                 for default in &positional_defaults {
                     self.compile_expression(default)?;

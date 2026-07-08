@@ -595,6 +595,8 @@ impl Compiler {
                 self.assembler
                     .prevent_last_instruction_fusion_with_previous();
             }
+            // The SWAP/STORE_FAST_MAYBE_NULL restore contracts by one CFG slot.
+            self.assembler.add_last_hidden_exception_owner_slots(1);
             // CPython converts STORE_FAST_MAYBE_NULL only after inserting superinstructions.
             self.assembler.prevent_last_instruction_fusion();
         }

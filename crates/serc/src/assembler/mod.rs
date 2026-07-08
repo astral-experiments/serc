@@ -10,16 +10,17 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::CompileError;
 use crate::target::opcodes::{
-    CHECK_EXC_MATCH, COMPARE_OP, CONTAINS_OP, COPY, DELETE_DEREF, DELETE_FAST, DICT_MERGE,
-    DICT_UPDATE, END_SEND, EXTENDED_ARG, FOR_ITER, FORMAT_SIMPLE, GET_ANEXT, GET_LEN,
+    CHECK_EXC_MATCH, COMPARE_OP, CONTAINS_OP, COPY, COPY_FREE_VARS, DELETE_DEREF, DELETE_FAST,
+    DICT_MERGE, DICT_UPDATE, END_SEND, EXTENDED_ARG, FOR_ITER, FORMAT_SIMPLE, GET_ANEXT, GET_LEN,
     GET_YIELD_FROM_ITER, IMPORT_FROM, IS_OP, JUMP_BACKWARD, JUMP_BACKWARD_NO_INTERRUPT,
     JUMP_FORWARD, LIST_APPEND, LIST_EXTEND, LOAD_ATTR, LOAD_COMMON_CONSTANT, LOAD_CONST, LOAD_FAST,
     LOAD_FAST_AND_CLEAR, LOAD_FAST_BORROW, LOAD_FAST_BORROW_LOAD_FAST_BORROW, LOAD_FAST_CHECK,
-    LOAD_FAST_LOAD_FAST, LOAD_GLOBAL, LOAD_SMALL_INT, LOAD_SPECIAL, LOAD_SUPER_ATTR, MAP_ADD,
-    MATCH_KEYS, MATCH_MAPPING, MATCH_SEQUENCE, NOP, NOT_TAKEN, POP_EXCEPT, POP_JUMP_IF_FALSE,
-    POP_JUMP_IF_TRUE, POP_TOP, PUSH_EXC_INFO, RERAISE, RESUME, RETURN_VALUE, SEND, SET_ADD,
-    SET_FUNCTION_ATTRIBUTE, SET_UPDATE, STORE_DEREF, STORE_FAST, STORE_FAST_LOAD_FAST,
-    STORE_FAST_STORE_FAST, STORE_GLOBAL, SWAP, TO_BOOL, UNARY_NOT, WITH_EXCEPT_START,
+    LOAD_FAST_LOAD_FAST, LOAD_GLOBAL, LOAD_SMALL_INT, LOAD_SPECIAL, LOAD_SUPER_ATTR, MAKE_CELL,
+    MAP_ADD, MATCH_KEYS, MATCH_MAPPING, MATCH_SEQUENCE, NOP, NOT_TAKEN, POP_EXCEPT,
+    POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE, POP_TOP, PUSH_EXC_INFO, RERAISE, RESUME, RETURN_VALUE,
+    SEND, SET_ADD, SET_FUNCTION_ATTRIBUTE, SET_UPDATE, STORE_DEREF, STORE_FAST,
+    STORE_FAST_LOAD_FAST, STORE_FAST_STORE_FAST, STORE_GLOBAL, SWAP, TO_BOOL, UNARY_NOT,
+    WITH_EXCEPT_START,
 };
 use crate::target::operands::ResumeLocation;
 use crate::target::{
@@ -178,13 +179,13 @@ impl Assembler {
         )
     }
 
-    /// Returns how many instruction slots optimization can vacate in the current block.
+    /// Returns how many instruction slots optimization can vacate before a normalized marker.
     ///
     /// CPython compacts instructions without clearing their exception-handler fields. Later
-    /// insertions can reuse those stale slots, so normalized instructions may acquire an owner.
-    /// Stop at every emitted label so future backedges cannot leak slots across a block boundary
-    /// that has not become a jump target yet.
-    pub(crate) fn current_block_dynamic_exception_owner_slots(&self) -> usize {
+    /// insertions can reuse those stale slots, so normalized instructions may acquire an owner. A
+    /// fallthrough scan crosses labels that only delimit exception regions, matching CPython's
+    /// pseudo-instruction representation of those boundaries.
+    fn dynamic_exception_owner_slots(&self, cross_labels: bool) -> usize {
         fn will_fuse(first: Instruction, second: Instruction) -> bool {
             if first.fusion_policy.prevent_with_next
                 || first.borrow_fallthrough == BorrowFallthrough::Barrier
@@ -215,21 +216,87 @@ impl Assembler {
         }
 
         let items = self.linear_items();
-        let start = self.current_block_start();
+        let block_labels = cross_labels.then(|| {
+            let mut block_labels = self.preserved_block_boundaries.clone();
+            for region in &self.exception_regions {
+                block_labels.insert(region.target);
+            }
+            for item in items {
+                if let Item::Instruction(Instruction {
+                    operand: Operand::Forward(label) | Operand::Backward(label),
+                    ..
+                }) = item
+                {
+                    block_labels.insert(*label);
+                }
+            }
+            block_labels
+        });
+        let start = if let Some(block_labels) = &block_labels {
+            items
+                .iter()
+                .rposition(|item| match item {
+                    Item::Label(label) => block_labels.contains(label),
+                    Item::Instruction(instruction) => {
+                        instruction.opcode == NOT_TAKEN
+                            || (!is_conditional_jump(instruction.opcode)
+                                && (matches!(
+                                    instruction.operand,
+                                    Operand::Forward(_) | Operand::Backward(_)
+                                ) || ends_scope(instruction.opcode)))
+                    }
+                })
+                .map_or(0, |index| index + 1)
+        } else {
+            self.current_block_start()
+        };
         let mut slots = 0;
+        let mut late_inserted_slots = 0;
+        let mut nop_count = 0;
         let mut index = start;
         while index < items.len() {
-            let Item::Instruction(instruction) = items[index] else {
-                break;
+            let instruction = match items[index] {
+                Item::Instruction(instruction) => instruction,
+                Item::Label(label)
+                    if block_labels
+                        .as_ref()
+                        .is_some_and(|block_labels| !block_labels.contains(&label)) =>
+                {
+                    index += 1;
+                    continue;
+                }
+                Item::Label(_) => break,
             };
+            if block_labels.is_some() {
+                late_inserted_slots +=
+                    usize::from(matches!(instruction.opcode, COPY_FREE_VARS | MAKE_CELL));
+                nop_count += usize::from(instruction.opcode == NOP);
+            }
             slots += usize::from(instruction.hidden_exception_owner_slots);
             let following = items.get(index + 1).and_then(|item| match item {
                 Item::Instruction(instruction) => Some(*instruction),
                 Item::Label(_) => None,
             });
+            let following_location = if let Some(block_labels) = &block_labels {
+                let mut following = None;
+                for item in &items[index + 1..] {
+                    match item {
+                        Item::Instruction(instruction) => {
+                            following = Some(*instruction);
+                            break;
+                        }
+                        Item::Label(label) if block_labels.contains(label) => break,
+                        Item::Label(_) => {}
+                    }
+                }
+                following
+            } else {
+                following
+            };
+
             let removable_nop = instruction.opcode == NOP
                 && (instruction.location.line < 0
-                    || following.is_some_and(|following| {
+                    || following_location.is_some_and(|following| {
                         following.location.line == instruction.location.line
                     }));
             let applied_comprehension_swap = following.is_some_and(|following| {
@@ -266,12 +333,35 @@ impl Assembler {
             }
             index += 1;
         }
-        slots
+        // Late prologue insertions consume stale slots instead of creating them.
+        // COPY_FREE_VARS and MAKE_CELL are the two such insertions relevant here.
+        let slots = slots.saturating_sub(late_inserted_slots);
+        if cross_labels && nop_count >= 2 {
+            // Consecutive protected regions can leave a stale slot even when their removed pseudo
+            // instructions are absent from our IR.
+            slots.max(1)
+        } else {
+            slots
+        }
+    }
+
+    pub(crate) fn current_block_dynamic_exception_owner_slots(&self) -> usize {
+        self.dynamic_exception_owner_slots(false)
     }
 
     /// Returns whether optimization can leave a dynamic exception owner in the current block.
     pub(crate) fn current_block_has_dynamic_exception_owner(&self) -> bool {
         self.current_block_dynamic_exception_owner_slots() > 0
+    }
+
+    /// Returns whether optimization can leave a dynamic exception owner before a normalized
+    /// condition marker, including across labels that only delimit exception regions.
+    ///
+    /// CPython represents an exception-region start with a pseudo instruction rather than a CFG
+    /// label, so compaction before a try body can shift stale owners into a marker appended
+    /// inside the body.
+    pub(crate) fn fallthrough_has_dynamic_exception_owner(&self) -> bool {
+        self.dynamic_exception_owner_slots(true) > 0
     }
 
     /// Returns whether the current block resumes directly after a plain `yield`.
