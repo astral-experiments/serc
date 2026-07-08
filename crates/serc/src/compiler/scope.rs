@@ -1266,6 +1266,22 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_> {
         walk_pattern(self, pattern);
     }
 }
+
+fn function_default_expressions(definition: &StmtFunctionDef) -> impl Iterator<Item = &Expr> {
+    definition
+        .parameters
+        .posonlyargs
+        .iter()
+        .chain(&definition.parameters.args)
+        .filter_map(|parameter| parameter.default.as_deref())
+        .chain(
+            definition
+                .parameters
+                .kwonlyargs
+                .iter()
+                .filter_map(|parameter| parameter.default.as_deref()),
+        )
+}
 #[derive(Debug, Default)]
 struct LocalCollector {
     names: Vec<String>,
@@ -1380,13 +1396,26 @@ impl LocalCollector {
                 }
                 Stmt::FunctionDef(definition) => {
                     for decorator in &definition.decorator_list {
-                        self.collect_expression(&decorator.expression);
+                        self.collect_definition_header_expression(&decorator.expression);
+                    }
+                    for default in function_default_expressions(definition) {
+                        self.collect_definition_header_expression(default);
                     }
                     self.insert(definition.name.as_str());
                 }
                 Stmt::ClassDef(definition) => {
                     for decorator in &definition.decorator_list {
-                        self.collect_expression(&decorator.expression);
+                        self.collect_definition_header_expression(&decorator.expression);
+                    }
+                    if definition.type_params.is_none()
+                        && let Some(arguments) = definition.arguments.as_deref()
+                    {
+                        for argument in &arguments.args {
+                            self.collect_definition_header_expression(argument);
+                        }
+                        for keyword in &arguments.keywords {
+                            self.collect_definition_header_expression(&keyword.value);
+                        }
                     }
                     self.insert(definition.name.as_str());
                 }
@@ -1525,6 +1554,17 @@ impl LocalCollector {
             collector: self,
             in_inlined_comprehension: false,
             collect_known_loads: true,
+            named_target_after_value: false,
+        }
+        .visit_expr(expression);
+    }
+
+    fn collect_definition_header_expression(&mut self, expression: &Expr) {
+        NamedExpressionCollector {
+            collector: self,
+            in_inlined_comprehension: false,
+            collect_known_loads: true,
+            named_target_after_value: true,
         }
         .visit_expr(expression);
     }
@@ -1584,6 +1624,7 @@ struct NamedExpressionCollector<'a> {
     collector: &'a mut LocalCollector,
     in_inlined_comprehension: bool,
     collect_known_loads: bool,
+    named_target_after_value: bool,
 }
 
 impl<'ast> Visitor<'ast> for NamedExpressionCollector<'_> {
@@ -1597,6 +1638,19 @@ impl<'ast> Visitor<'ast> for NamedExpressionCollector<'_> {
             walk_expr(self, expression);
             self.collect_known_loads = previous_loads;
             self.in_inlined_comprehension = previous;
+            return;
+        }
+        if self.named_target_after_value
+            && let Expr::Named(named) = expression
+        {
+            self.visit_expr(&named.value);
+            if self.in_inlined_comprehension
+                && let Expr::Name(name) = named.target.as_ref()
+            {
+                self.collector
+                    .insert_comprehension_target(name.id.as_str().to_string());
+            }
+            self.collector.collect_target(&named.target);
             return;
         }
         if self.collect_known_loads
@@ -1687,6 +1741,9 @@ impl ScopeBodyFactsCollector {
         for decorator in &definition.decorator_list {
             self.visit_expr(&decorator.expression);
         }
+        for default in function_default_expressions(definition) {
+            self.visit_expr(default);
+        }
         let Some(type_params) = definition.type_params.as_deref() else {
             return;
         };
@@ -1703,6 +1760,9 @@ impl ScopeBodyFactsCollector {
     }
 
     fn collect_class_header(&mut self, definition: &StmtClassDef) {
+        for decorator in &definition.decorator_list {
+            self.visit_expr(&decorator.expression);
+        }
         let Some(type_params) = definition.type_params.as_deref() else {
             // Plain class arguments execute directly in the current scope. Generic class
             // arguments instead execute in the synthetic type-parameter scope handled below.

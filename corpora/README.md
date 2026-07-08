@@ -85,10 +85,10 @@ Then run the frozen CPython 3.14.5 outcome comparison:
 ```
 
 The check first rejects missing files, content-identity drift, tracked
-modifications, and untracked files. The current outcome baseline requires 62,007
-byte-identical files, 11,371 failures, and 159 files rejected by CPython. The
-failures comprise 11,370 byte mismatches and one oracle failure; there are no
-remaining compiler panics.
+modifications, and untracked files. The current outcome baseline requires 62,017
+byte-identical files, 11,361 failures, and 159 files rejected by CPython. The
+failures comprise 11,360 byte mismatches and one oracle failure; there are no
+remaining compiler panics or parse/decode mismatches.
 
 A full run exits unsuccessfully when either exact matches or CPython rejections
 change, so improvements and regressions both require an intentional baseline
