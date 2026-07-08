@@ -2316,11 +2316,12 @@ impl Compiler {
         &mut self,
         body: &[Stmt],
         restart: Label,
+        split_short_circuit: bool,
     ) -> Result<LoopBackedge, CompileError> {
         match body.split_last() {
             Some((Stmt::If(statement), leading)) => {
                 self.compile_suite(leading)?;
-                self.compile_loop_tail_if(statement, restart)?;
+                self.compile_loop_tail_if(statement, restart, split_short_circuit)?;
                 Ok(LoopBackedge::Emitted)
             }
             Some((Stmt::While(statement), leading))
@@ -2530,7 +2531,7 @@ impl Compiler {
             self.compile_try_inner(statement, TryCompileOptions::LOOP_TAIL)?;
             Ok(LoopBackedge::Required)
         } else {
-            self.compile_loop_tail_suite(body, restart)
+            self.compile_loop_tail_suite(body, restart, true)
         }
     }
 
@@ -2584,6 +2585,7 @@ impl Compiler {
         &mut self,
         statement: &ruff_python_ast::StmtIf,
         restart: Label,
+        split_short_circuit: bool,
     ) -> Result<(), CompileError> {
         let base_depth = self.control.depth;
         if statement.elif_else_clauses.is_empty() {
@@ -2591,7 +2593,12 @@ impl Compiler {
                 && let Expr::Compare(comparison) = statement.test.as_ref()
                 && comparison.ops.len() > 1
             {
-                return self.compile_loop_tail_chained_compare(statement, comparison, restart);
+                return self.compile_loop_tail_chained_compare(
+                    statement,
+                    comparison,
+                    restart,
+                    split_short_circuit,
+                );
             }
             let body = statement.body.as_slice();
             let body_label = self.assembler.label();
@@ -2601,7 +2608,7 @@ impl Compiler {
             let body_start = self.assembler.instruction_count();
             let nested_tail = self.compile_with_strict_owned_loads(
                 matches!(statement.test.as_ref(), Expr::If(_)),
-                |compiler| compiler.compile_loop_tail_suite(body, restart),
+                |compiler| compiler.compile_loop_tail_suite(body, restart, split_short_circuit),
             )?;
             if nested_tail == LoopBackedge::Required && !suite_terminates(body) {
                 self.set_branch_end_location(body, body_start);
@@ -2624,37 +2631,20 @@ impl Compiler {
             if !has_else && branch_index + 1 == branch_count {
                 let test = test.expect("last branch without else has a test");
                 let body_label = self.assembler.label();
-                let control_region = (early_condition_truthiness(test).is_none()
-                    && self.has_active_control_flow_region())
-                .then(|| (self.assembler.label(), self.assembler.label()));
-                let generator_exclusion = (control_region.is_none()
-                    && self.control.generator_region_start.is_some())
-                .then(|| self.assembler.label());
-                self.compile_jump_if(test, true, body_label)?;
-                if let Some((control_start, _)) = control_region {
-                    self.assembler
-                        .mark_before_trailing_instructions(control_start, 2);
-                }
-                if let Some(exclusion_start) = generator_exclusion {
-                    self.assembler
-                        .mark_before_trailing_instructions(exclusion_start, 2);
-                }
-                self.emit_jump_backward(JUMP_BACKWARD, restart, 0)?;
-                if let Some((control_start, control_end)) = control_region {
-                    self.assembler.mark(control_end);
-                    self.add_control_flow_region_exclusion(control_start, control_end);
+                // Chained comparisons retain a separate cleanup join before the loop edge.
+                // Keep their generic Boolean join until that loop-tail layout is modeled;
+                // ordinary short-circuit operands normalize directly against the backedge.
+                if split_short_circuit && !expression_contains_chained_comparison(test) {
+                    self.compile_loop_tail_condition(test, true, body_label, restart)?;
+                } else {
+                    self.compile_loop_tail_condition_atom(test, true, body_label, restart)?;
                 }
                 self.assembler.mark(body_label);
-                if let Some(exclusion_start) = generator_exclusion {
-                    self.control
-                        .generator_region_exclusions
-                        .push((exclusion_start, body_label));
-                }
                 self.set_depth(base_depth);
                 let body_start = self.assembler.instruction_count();
                 let nested_tail = self
                     .compile_with_strict_owned_loads(matches!(test, Expr::If(_)), |compiler| {
-                        compiler.compile_loop_tail_suite(body, restart)
+                        compiler.compile_loop_tail_suite(body, restart, split_short_circuit)
                     })?;
                 if nested_tail == LoopBackedge::Required && !suite_terminates(body) {
                     self.set_branch_end_location(body, body_start);
@@ -2685,9 +2675,11 @@ impl Compiler {
                     },
                 )?;
             }
+            // A non-final branch still targets the following `elif`; its nested Boolean joins
+            // therefore remain forward instead of splitting directly around the loop edge.
             let nested_tail = self.compile_with_strict_owned_loads(
                 test.is_some_and(|test| matches!(test, Expr::If(_))),
-                |compiler| compiler.compile_loop_tail_suite(body, restart),
+                |compiler| compiler.compile_loop_tail_suite(body, restart, false),
             )?;
             if nested_tail == LoopBackedge::Required && !suite_terminates(body) {
                 if let Some(location) = self.assembler.last_instruction_location() {
@@ -2744,7 +2736,16 @@ impl Compiler {
             }
             return self.compile_loop_tail_condition(last, jump_on, success, restart);
         }
+        self.compile_loop_tail_condition_atom(expression, jump_on, success, restart)
+    }
 
+    fn compile_loop_tail_condition_atom(
+        &mut self,
+        expression: &Expr,
+        jump_on: bool,
+        success: Label,
+        restart: Label,
+    ) -> Result<(), CompileError> {
         let control_region = (early_condition_truthiness(expression).is_none()
             && self.has_active_control_flow_region())
         .then(|| (self.assembler.label(), self.assembler.label()));
@@ -2778,6 +2779,7 @@ impl Compiler {
         statement: &ruff_python_ast::StmtIf,
         comparison: &ruff_python_ast::ExprCompare,
         restart: Label,
+        split_short_circuit: bool,
     ) -> Result<(), CompileError> {
         let base_depth = self.control.depth;
         let cleanup = self.assembler.label();
@@ -2827,7 +2829,8 @@ impl Compiler {
         self.assembler.mark(body);
         self.set_depth(base_depth);
         let body_start = self.assembler.instruction_count();
-        let nested_tail = self.compile_loop_tail_suite(&statement.body, restart)?;
+        let nested_tail =
+            self.compile_loop_tail_suite(&statement.body, restart, split_short_circuit)?;
         if nested_tail == LoopBackedge::Required && !suite_terminates(&statement.body) {
             self.set_branch_end_location(&statement.body, body_start);
             self.emit_jump_backward(JUMP_BACKWARD, restart, 0)?;
@@ -2977,7 +2980,7 @@ impl Compiler {
         );
         let body_start = self.assembler.instruction_count();
         let tail_jumps = self.with_loop_context(context, |compiler| {
-            compiler.compile_loop_tail_suite(&statement.body, start)
+            compiler.compile_loop_tail_suite(&statement.body, start, true)
         })?;
         if tail_jumps == LoopBackedge::Required && !suite_terminates(&statement.body) {
             if self.assembler.instruction_count() > body_start
@@ -3083,7 +3086,7 @@ impl Compiler {
         );
         let body_start = self.assembler.instruction_count();
         let tail_jumps = self.with_loop_context(context, |compiler| {
-            compiler.compile_loop_tail_suite(&statement.body, start)
+            compiler.compile_loop_tail_suite(&statement.body, start, true)
         })?;
         if tail_jumps == LoopBackedge::Required && !suite_terminates(&statement.body) {
             if self.assembler.instruction_count() > body_start
@@ -5758,6 +5761,27 @@ fn condition_jump_target_count(expression: &Expr, jump_on: bool) -> usize {
         return 2;
     }
     1
+}
+
+fn expression_contains_chained_comparison(expression: &Expr) -> bool {
+    #[derive(Default)]
+    struct Detector {
+        found: bool,
+    }
+
+    impl<'ast> Visitor<'ast> for Detector {
+        fn visit_expr(&mut self, expression: &'ast Expr) {
+            if matches!(expression, Expr::Compare(comparison) if comparison.ops.len() > 1) {
+                self.found = true;
+            } else if !self.found {
+                walk_expr(self, expression);
+            }
+        }
+    }
+
+    let mut detector = Detector::default();
+    detector.visit_expr(expression);
+    detector.found
 }
 
 pub(super) fn suite_terminates(body: &[Stmt]) -> bool {
