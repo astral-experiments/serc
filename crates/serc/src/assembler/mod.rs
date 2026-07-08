@@ -105,6 +105,17 @@ impl Assembler {
             })
     }
 
+    pub(crate) fn last_instruction_is_nop(&self) -> bool {
+        self.linear_items()
+            .iter()
+            .rev()
+            .find_map(|item| match item {
+                Item::Instruction(instruction) => Some(instruction.opcode == NOP),
+                Item::Label(_) => None,
+            })
+            .unwrap_or(false)
+    }
+
     fn last_instruction_mut(&mut self) -> Option<&mut Instruction> {
         self.linear_items_mut()
             .iter_mut()

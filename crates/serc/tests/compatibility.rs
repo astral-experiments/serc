@@ -981,6 +981,60 @@ except Exception:
     }
 
     #[test]
+    fn matches_cpython_marshal_for_converted_pop_blocks_in_synchronous_with_bodies() {
+        let source = r"def terminal_handler(manager):
+    with manager:
+        try:
+            action()
+        except Error:
+            raise
+
+def terminal_else(manager):
+    with manager:
+        try:
+            action()
+        except Error:
+            recover()
+        else:
+            raise Other
+
+def nested_return(outer, inner):
+    with outer:
+        with inner:
+            return value
+
+def nested_raise(outer, inner):
+    with outer:
+        with inner:
+            raise Error
+
+def no_duplicate_after_finally(manager):
+    with manager:
+        try:
+            action()
+        finally:
+            cleanup()
+
+def no_duplicate_after_if(manager, condition):
+    with manager:
+        try:
+            action()
+            if condition:
+                other()
+        except Error:
+            raise
+
+def multiple_normal_predecessors(manager):
+    with manager:
+        try:
+            action()
+        except Error:
+            recover()
+";
+        assert_matches_cpython_marshal(source, "with_converted_pop_block.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_trailing_finally_exits_in_synchronous_with_bodies() {
         let source = r"def direct(manager):
     with manager:
