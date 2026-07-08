@@ -2439,6 +2439,79 @@ def render(value):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_try_with_normal_exits() {
+        let source = r"def pass_body(value, manager):
+    try:
+        with manager:
+            pass
+    except Error:
+        pass
+    consume(value)
+
+def active_body(value, manager):
+    try:
+        with manager:
+            action()
+    except Error:
+        pass
+    consume(value)
+
+def following_try(value, manager):
+    try:
+        with manager:
+            action()
+    except Error:
+        pass
+    try:
+        consume(value)
+    except OtherError:
+        raise
+
+def terminal_handler(value, manager):
+    try:
+        with manager:
+            action()
+    except Error:
+        return
+    consume(value)
+
+def nested_try(value, manager):
+    try:
+        try:
+            with manager:
+                action()
+        except InnerError:
+            recover()
+        consume(value)
+    except OuterError:
+        recover_outer()
+    return value
+
+def finally_guard(value, manager):
+    try:
+        with manager:
+            action()
+    finally:
+        cleanup()
+    try:
+        consume(value)
+    except Error:
+        raise
+
+def ordinary_guard(value):
+    try:
+        action()
+    except Error:
+        pass
+    try:
+        consume(value)
+    except OtherError:
+        raise
+";
+        assert_matches_cpython_marshal(source, "try_with_normal_exits.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_borrowing_after_constant_loop_breaks() {
         let source = r"def unprotected(flag, result):
     while True:

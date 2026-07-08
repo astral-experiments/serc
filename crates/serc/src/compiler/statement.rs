@@ -202,6 +202,10 @@ pub(super) struct ControlFlowState {
     pub(super) coroutine_suspension_epoch: usize,
     pub(super) generator_expression: bool,
     pub(super) same_line_try_body: bool,
+    // Whether the statement currently entered by `compile_suite` has a sibling successor.
+    current_statement_has_following: bool,
+    // The direct final synchronous `with` in an active non-final try body, if any.
+    direct_final_sync_with_try_body: Option<ruff_text_size::TextRange>,
     pub(super) generator_region_start: Option<Label>,
     pub(super) generator_region_exclusions: Vec<(Label, Label)>,
     pub(super) emitted_fallthrough_return: bool,
@@ -262,10 +266,24 @@ impl Compiler {
             .body
             .first()
             .is_some_and(|body| self.source_location(body.range()).line == try_line);
+        let direct_final_sync_with_try_body = (self.control.current_statement_has_following
+            && statement.orelse.is_empty())
+        .then(|| statement.body.last())
+        .flatten()
+        .and_then(|statement| match statement {
+            Stmt::With(statement) if !statement.is_async => Some(statement.range),
+            _ => None,
+        });
         self.with_control_override(
             |control| &mut control.same_line_try_body,
             same_line,
-            compile,
+            |compiler| {
+                compiler.with_control_override(
+                    |control| &mut control.direct_final_sync_with_try_body,
+                    direct_final_sync_with_try_body,
+                    compile,
+                )
+            },
         )
     }
 
@@ -575,7 +593,7 @@ impl Compiler {
                         continue;
                     }
                     Stmt::With(statement) if !statement.is_async => {
-                        self.compile_with_items(&statement.items, &statement.body, true)?;
+                        self.compile_with_statement(statement, true)?;
                         self.control.emitted_fallthrough_return = true;
                         continue;
                     }
@@ -696,7 +714,13 @@ impl Compiler {
                 self.with_control_override(
                     |control| &mut control.emit_protected_async_for_end_nop,
                     emit_protected_async_for_end_nop,
-                    |compiler| compiler.compile_statement(statement),
+                    |compiler| {
+                        compiler.with_control_override(
+                            |control| &mut control.current_statement_has_following,
+                            !is_final,
+                            |compiler| compiler.compile_statement(statement),
+                        )
+                    },
                 )?;
             }
             if statement_terminates(statement) {
@@ -3584,6 +3608,14 @@ impl Compiler {
                 .as_except_handler()
                 .is_some_and(|handler| suite_terminates(&handler.body))
         });
+        // CPython removes the with handler's normal-exit edge before borrowed-load traversal,
+        // so a following suite cannot reach this try join through that edge.
+        if self.control.current_statement_has_following
+            && statement.orelse.is_empty()
+            && matches!(statement.body.last(), Some(Stmt::With(statement)) if !statement.is_async)
+        {
+            self.assembler.prevent_borrow_reachability(end);
+        }
 
         if emit_statement_nop {
             let statement_nop_start = self.assembler.label();
@@ -5270,7 +5302,24 @@ impl Compiler {
     }
 
     fn compile_with(&mut self, statement: &ruff_python_ast::StmtWith) -> Result<(), CompileError> {
-        self.compile_with_items(&statement.items, &statement.body, false)
+        self.compile_with_statement(statement, false)
+    }
+
+    fn compile_with_statement(
+        &mut self,
+        statement: &ruff_python_ast::StmtWith,
+        terminal: bool,
+    ) -> Result<(), CompileError> {
+        // A direct try/except omits its owner from the suppressed handler exit. A synthetic
+        // try/finally protected body keeps that owner instead.
+        let exclude_handler_exit = self.control.active_finally_try_bodies == 0
+            && self.control.direct_final_sync_with_try_body == Some(statement.range);
+        self.compile_with_items(
+            &statement.items,
+            &statement.body,
+            terminal,
+            exclude_handler_exit,
+        )
     }
 
     fn compile_with_body(
@@ -5358,7 +5407,7 @@ impl Compiler {
                 }
             }
         } else {
-            self.compile_with_items(remaining, body, false)?;
+            self.compile_with_items(remaining, body, false, false)?;
         }
         Ok(body_noop)
     }
@@ -5368,6 +5417,7 @@ impl Compiler {
         items: &[ruff_python_ast::WithItem],
         body: &[Stmt],
         terminal: bool,
+        exclude_handler_exit: bool,
     ) -> Result<(), CompileError> {
         let Some((item, remaining)) = items.split_first() else {
             return self.compile_suite(body);
@@ -5522,9 +5572,23 @@ impl Compiler {
         if terminal {
             self.emit_implicit_return()?;
         } else {
+            let outer_exception_exit_start = exclude_handler_exit.then(|| {
+                let start = self.assembler.label();
+                self.assembler.mark(start);
+                start
+            });
             self.emit_jump_forward(JUMP_FORWARD, end, 0)?;
             if self.control.active_finally_try_bodies > 0 {
                 self.assembler.prevent_last_jump_inlining();
+            }
+            if let Some(start) = outer_exception_exit_start {
+                let exclusion_end = self.assembler.label();
+                self.assembler.mark(exclusion_end);
+                // Only the direct try omits this owner; an enclosing try still covers the exit.
+                if let Some(exclusions) = self.control.active_exception_region_exclusions.last_mut()
+                {
+                    exclusions.push((start, exclusion_end));
+                }
             }
         }
 
