@@ -28,7 +28,7 @@ use super::expression::{
     expression_defers_async_comprehension_restore, jump_constant_truthiness,
     optimized_generator_callable,
 };
-use super::scope::{NameId, ReferenceCollector, collect_target_names};
+use super::scope::{NameId, NameSet, ReferenceCollector, collect_target_names};
 use super::source::{implicit_return_range, unparse_annotation};
 use super::symbol::{ReraiseStackState, ResumeDepth, statement_name, to_u32, unsupported};
 use super::{Compiler, Scope};
@@ -147,6 +147,7 @@ pub(super) struct ControlFlowState {
     pub(super) reorder_async_comprehension_cleanup_throw: bool,
     pub(super) pending_comprehension_restores: Vec<(Vec<u32>, SourceLocation)>,
     pub(super) active_comprehension_cleanups: Vec<(Label, u32)>,
+    pub(super) active_comprehension_local_names: Vec<NameSet>,
     pub(super) active_comprehension_region_exclusions: Vec<Vec<(Label, Label)>>,
     active_with_exits: Vec<WithExitContext>,
     pub(super) active_with_region_exclusions: Vec<Vec<(Label, Label)>>,
@@ -249,16 +250,23 @@ impl Compiler {
     pub(super) fn with_comprehension_context<T>(
         &mut self,
         cleanup: (Label, u32),
+        local_names: NameSet,
         compile: impl FnOnce(&mut Self) -> Result<T, CompileError>,
     ) -> Result<(T, Vec<(Label, Label)>), CompileError> {
-        let ((value, exclusions), _cleanup) = self.with_control_stack(
-            |control| &mut control.active_comprehension_cleanups,
-            cleanup,
+        let (((value, exclusions), _cleanup), _local_names) = self.with_control_stack(
+            |control| &mut control.active_comprehension_local_names,
+            local_names,
             |compiler| {
                 compiler.with_control_stack(
-                    |control| &mut control.active_comprehension_region_exclusions,
-                    Vec::new(),
-                    compile,
+                    |control| &mut control.active_comprehension_cleanups,
+                    cleanup,
+                    |compiler| {
+                        compiler.with_control_stack(
+                            |control| &mut control.active_comprehension_region_exclusions,
+                            Vec::new(),
+                            compile,
+                        )
+                    },
                 )
             },
         )?;
