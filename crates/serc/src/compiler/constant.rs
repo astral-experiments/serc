@@ -97,13 +97,17 @@ impl Compiler {
             self.assembler
                 .set_location(self.source_location(expression.range()));
         }
+        let hidden_owner_slots = folded_constant_owner_slots(expression);
         if let Constant::Int(value) = constant
             && let Ok(value) = u8::try_from(value)
         {
-            self.emit(LOAD_SMALL_INT, u32::from(value), 1)
+            self.emit(LOAD_SMALL_INT, u32::from(value), 1)?;
         } else {
-            self.emit_deferred_constant(constant)
+            self.emit_deferred_constant(constant)?;
         }
+        self.assembler
+            .add_last_hidden_exception_owner_slots(hidden_owner_slots);
+        Ok(())
     }
 
     fn record_folded_operands(&mut self, expression: &Expr) -> Result<(), CompileError> {
@@ -303,6 +307,33 @@ impl Compiler {
             .push((instruction, name.to_string()));
         Ok(())
     }
+}
+
+/// Returns instruction slots removed when CPython's flow graph folds `expression`.
+///
+/// The count is attached to the emitted folded result so labels and other control-flow
+/// boundaries naturally constrain which later boolean marker can reuse the stale slots.
+pub(super) fn folded_constant_owner_slots(expression: &Expr) -> usize {
+    fn direct(expression: &Expr) -> Option<usize> {
+        fold_constant(expression)?;
+        let nested = |expression| direct(expression).unwrap_or(0);
+        Some(match expression {
+            Expr::BinOp(binary) => 2_usize
+                .saturating_add(nested(&binary.left))
+                .saturating_add(nested(&binary.right)),
+            Expr::Tuple(tuple) => tuple.elts.iter().fold(tuple.elts.len(), |slots, element| {
+                slots.saturating_add(nested(element))
+            }),
+            Expr::UnaryOp(unary) => 1_usize.saturating_add(nested(&unary.operand)),
+            Expr::Subscript(subscript) => 2_usize
+                .saturating_add(nested(&subscript.value))
+                .saturating_add(nested(&subscript.slice)),
+            Expr::Name(_) => 0,
+            _ => 0,
+        })
+    }
+
+    direct(expression).unwrap_or(0).min(3)
 }
 
 pub(super) fn explicit_surrogate_string(value: &str, source: &str) -> Option<Vec<u8>> {

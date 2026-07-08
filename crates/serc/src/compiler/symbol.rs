@@ -15,6 +15,7 @@ use super::{
 use crate::CompileError;
 use crate::assembler::{ExceptionPolicy, Label, SourceLocation};
 use crate::code_object::Constant;
+use crate::target::code_flags::{CO_ASYNC_GENERATOR, CO_COROUTINE};
 use crate::target::operands::{
     BinaryIntrinsic, BinaryOperation, CommonConstant, ComparisonOperation, Conversion,
     FunctionAttribute, ResumeLocation, SpecialMethod, UnaryIntrinsic,
@@ -941,7 +942,14 @@ impl Compiler {
         location: ResumeLocation,
         depth: ResumeDepth,
     ) -> Result<(), CompileError> {
-        self.emit(RESUME, location.at_depth(depth.is_one()), 0)
+        self.emit(RESUME, location.at_depth(depth.is_one()), 0)?;
+        if location == ResumeLocation::AFTER_AWAIT
+            && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR) != 0
+        {
+            self.control.coroutine_suspension_epoch =
+                self.control.coroutine_suspension_epoch.saturating_add(1);
+        }
+        Ok(())
     }
 
     pub(super) fn emit_binary_operation(

@@ -17,10 +17,11 @@ use crate::target::opcodes::{
     LOAD_FAST_AND_CLEAR, LOAD_FAST_BORROW, LOAD_FAST_BORROW_LOAD_FAST_BORROW, LOAD_FAST_CHECK,
     LOAD_FAST_LOAD_FAST, LOAD_GLOBAL, LOAD_SMALL_INT, LOAD_SPECIAL, LOAD_SUPER_ATTR, MAP_ADD,
     MATCH_KEYS, MATCH_MAPPING, MATCH_SEQUENCE, NOP, NOT_TAKEN, POP_EXCEPT, POP_JUMP_IF_FALSE,
-    POP_JUMP_IF_TRUE, POP_TOP, PUSH_EXC_INFO, RERAISE, RETURN_VALUE, SEND, SET_ADD,
+    POP_JUMP_IF_TRUE, POP_TOP, PUSH_EXC_INFO, RERAISE, RESUME, RETURN_VALUE, SEND, SET_ADD,
     SET_FUNCTION_ATTRIBUTE, SET_UPDATE, STORE_DEREF, STORE_FAST, STORE_FAST_LOAD_FAST,
     STORE_FAST_STORE_FAST, STORE_GLOBAL, SWAP, TO_BOOL, UNARY_NOT, WITH_EXCEPT_START,
 };
+use crate::target::operands::ResumeLocation;
 use crate::target::{
     Opcode, is_conditional_jump, is_scope_exit as ends_scope, is_unconditional_jump,
     num_popped as opcode_num_popped, num_pushed as opcode_num_pushed,
@@ -144,11 +145,13 @@ impl Assembler {
         )
     }
 
-    /// Returns whether optimization can leave a dynamic exception owner in the current block.
+    /// Returns how many instruction slots optimization can vacate in the current block.
     ///
-    /// Stop at every emitted label so future backedges cannot leak ownership across a block
-    /// boundary that has not become a jump target yet.
-    pub(crate) fn current_block_has_dynamic_exception_owner(&self) -> bool {
+    /// CPython compacts instructions without clearing their exception-handler fields. Later
+    /// insertions can reuse those stale slots, so normalized instructions may acquire an owner.
+    /// Stop at every emitted label so future backedges cannot leak slots across a block boundary
+    /// that has not become a jump target yet.
+    pub(crate) fn current_block_dynamic_exception_owner_slots(&self) -> usize {
         fn will_fuse(first: Instruction, second: Instruction) -> bool {
             if first.fusion_policy.prevent_with_next
                 || first.borrow_fallthrough == BorrowFallthrough::Barrier
@@ -164,35 +167,58 @@ impl Assembler {
             first_argument < 16
                 && second_argument < 16
                 && first.location.line == second.location.line
+                && !(first.opcode == STORE_FAST
+                    && second.opcode == STORE_FAST
+                    && first_argument == second_argument)
                 && matches!(
                     (first.opcode, second.opcode),
                     (LOAD_FAST_BORROW, LOAD_FAST_BORROW)
                         | (LOAD_FAST, LOAD_FAST)
-                        | (STORE_FAST, LOAD_FAST | LOAD_FAST_BORROW | STORE_FAST)
+                        | (
+                            STORE_FAST,
+                            LOAD_FAST | LOAD_FAST_BORROW | LOAD_FAST_CHECK | STORE_FAST
+                        )
                 )
         }
 
-        let mut following_instruction = None;
-        for item in self.linear_items().iter().rev() {
-            let Item::Instruction(instruction) = item else {
+        let items = self.linear_items();
+        let start = items
+            .iter()
+            .rposition(|item| match item {
+                Item::Label(_) => true,
+                Item::Instruction(instruction) => {
+                    instruction.opcode == NOT_TAKEN
+                        || (!is_conditional_jump(instruction.opcode)
+                            && (matches!(
+                                instruction.operand,
+                                Operand::Forward(_) | Operand::Backward(_)
+                            ) || ends_scope(instruction.opcode)))
+                }
+            })
+            .map_or(0, |index| index + 1);
+        let mut slots = 0;
+        let mut index = start;
+        while index < items.len() {
+            let Item::Instruction(instruction) = items[index] else {
                 break;
             };
-            if instruction.opcode == NOT_TAKEN
-                || (!is_conditional_jump(instruction.opcode)
-                    && (!matches!(instruction.operand, Operand::Value(_))
-                        || ends_scope(instruction.opcode)))
-            {
-                break;
-            }
-
-            let applied_comprehension_swap =
-                following_instruction.is_some_and(|following: Instruction| {
-                    following.opcode == STORE_FAST
-                        && following.fusion_policy.prevent_with_previous
-                        && matches!(instruction.opcode, POP_TOP | STORE_FAST)
-                        && !(instruction.opcode == STORE_FAST
-                            && instruction.fusion_policy.prevent_with_previous)
-                });
+            slots += usize::from(instruction.hidden_exception_owner_slots);
+            let following = items.get(index + 1).and_then(|item| match item {
+                Item::Instruction(instruction) => Some(*instruction),
+                Item::Label(_) => None,
+            });
+            let removable_nop = instruction.opcode == NOP
+                && (instruction.location.line < 0
+                    || following.is_some_and(|following| {
+                        following.location.line == instruction.location.line
+                    }));
+            let applied_comprehension_swap = following.is_some_and(|following| {
+                following.opcode == STORE_FAST
+                    && following.fusion_policy.prevent_with_previous
+                    && matches!(instruction.opcode, POP_TOP | STORE_FAST)
+                    && !(instruction.opcode == STORE_FAST
+                        && instruction.fusion_policy.prevent_with_previous)
+            });
             if matches!(
                 instruction.opcode,
                 LOAD_FAST_BORROW_LOAD_FAST_BORROW
@@ -202,13 +228,54 @@ impl Assembler {
             ) || matches!(
                 (instruction.opcode, instruction.operand),
                 (LOAD_GLOBAL, Operand::Value(argument)) if argument & 1 != 0
-            ) || following_instruction
-                .is_some_and(|following| will_fuse(*instruction, following))
+            ) || instruction.converted_pop_block
+                || removable_nop
                 || applied_comprehension_swap
             {
-                return true;
+                slots += 1;
+                index += 1;
+                continue;
             }
-            following_instruction = Some(*instruction);
+            if following.is_some_and(|following| will_fuse(instruction, following)) {
+                slots += 1;
+                slots += following.map_or(0, |following| {
+                    usize::from(following.hidden_exception_owner_slots)
+                });
+                index += 2;
+                continue;
+            }
+            index += 1;
+        }
+        slots
+    }
+
+    /// Returns whether optimization can leave a dynamic exception owner in the current block.
+    pub(crate) fn current_block_has_dynamic_exception_owner(&self) -> bool {
+        self.current_block_dynamic_exception_owner_slots() > 0
+    }
+
+    /// Returns whether the current block resumes directly after a plain `yield`.
+    pub(crate) fn current_block_resumes_after_yield(&self) -> bool {
+        for item in self.linear_items().iter().rev() {
+            let Item::Instruction(instruction) = item else {
+                break;
+            };
+            if instruction.opcode == RESUME {
+                return matches!(
+                    instruction.operand,
+                    Operand::Value(argument)
+                        if argument & 3 == ResumeLocation::AFTER_YIELD.argument()
+                );
+            }
+            if instruction.opcode == NOT_TAKEN
+                || (!is_conditional_jump(instruction.opcode)
+                    && (matches!(
+                        instruction.operand,
+                        Operand::Forward(_) | Operand::Backward(_)
+                    ) || ends_scope(instruction.opcode)))
+            {
+                break;
+            }
         }
         false
     }
@@ -304,6 +371,16 @@ impl Assembler {
     pub(crate) fn fusion_barrier(&mut self) {
         let label = self.label();
         self.mark(label);
+    }
+
+    /// Records compiler-side fold vacancies on the instruction that replaced them.
+    pub(crate) fn add_last_hidden_exception_owner_slots(&mut self, slots: usize) {
+        let slots = u8::try_from(slots.min(3)).expect("capped hidden slot count fits in u8");
+        let instruction = self.required_last_instruction_mut("recording hidden owner slots");
+        instruction.hidden_exception_owner_slots = instruction
+            .hidden_exception_owner_slots
+            .saturating_add(slots)
+            .min(3);
     }
 
     /// Prevents fusion with the next instruction without introducing a CFG boundary.

@@ -150,6 +150,7 @@ pub(super) struct ControlFlowState {
     pub(super) active_comprehension_local_names: Vec<NameSet>,
     pub(super) active_comprehension_region_exclusions: Vec<Vec<(Label, Label)>>,
     active_with_exits: Vec<WithExitContext>,
+    pub(super) active_with_suspension_epochs: Vec<usize>,
     pub(super) active_with_region_exclusions: Vec<Vec<(Label, Label)>>,
     active_terminal_withs: usize,
     // CPython retains the empty end block when an async for ends a protected suite.
@@ -159,11 +160,13 @@ pub(super) struct ControlFlowState {
     preserve_next_finally_exit_nop: bool,
     pub(super) active_exception_region_exclusions: Vec<Vec<(Label, Label)>>,
     active_exception_handlers: Vec<ExceptionHandlerContext>,
+    // Exception-group handlers retain their body marker owner after coroutine suspension.
+    pub(super) active_exception_group_handlers: usize,
     active_return_finally_contexts: Vec<ReturnFinallyContext>,
     // CPython's normalized `NOT_TAKEN` can reuse a normal-finally CFG slot that still owns the
     // coroutine stop-iteration handler.
     pub(super) active_normal_finally_bodies: usize,
-    active_finally_end_blocks: usize,
+    pub(super) active_finally_end_blocks: usize,
     active_finally_try_bodies: usize,
     active_pass_finally_locations: Vec<SourceLocation>,
     active_overriding_finally_returns: usize,
@@ -176,12 +179,23 @@ pub(super) struct ControlFlowState {
     pub(super) terminal_try_condition_exception_exclusion_depth: Option<usize>,
     unwind_exception_handlers_for_implicit_return: bool,
     prevent_try_exit_inlining: bool,
+    pub(super) coroutine_suspension_epoch: usize,
+    pub(super) generator_expression: bool,
+    pub(super) same_line_try_body: bool,
     pub(super) generator_region_start: Option<Label>,
     pub(super) generator_region_exclusions: Vec<(Label, Label)>,
     pub(super) emitted_fallthrough_return: bool,
     loops: Vec<LoopContext>,
     pub(super) depth: i32,
     pub(super) max_depth: u32,
+}
+
+impl ControlFlowState {
+    pub(super) fn current_exception_handler_binds_name(&self) -> bool {
+        self.active_exception_handlers
+            .last()
+            .is_some_and(|handler| handler.name.is_some())
+    }
 }
 
 impl Compiler {
@@ -202,6 +216,23 @@ impl Compiler {
             exception_region_depth: self.control.active_exception_region_exclusions.len(),
             break_policy,
         }
+    }
+
+    fn with_try_body_context<T>(
+        &mut self,
+        statement: &ruff_python_ast::StmtTry,
+        compile: impl FnOnce(&mut Self) -> Result<T, CompileError>,
+    ) -> Result<T, CompileError> {
+        let try_line = self.source_location(statement.range).line;
+        let same_line = statement
+            .body
+            .first()
+            .is_some_and(|body| self.source_location(body.range()).line == try_line);
+        self.with_control_override(
+            |control| &mut control.same_line_try_body,
+            same_line,
+            compile,
+        )
     }
 
     fn with_loop_context<T>(
@@ -394,6 +425,9 @@ impl Compiler {
         let previous_depth = self.control.active_with_exits.len();
         let previous_terminal_withs = self.control.active_terminal_withs;
         self.control.active_with_exits.push(context);
+        self.control
+            .active_with_suspension_epochs
+            .push(self.control.coroutine_suspension_epoch);
         self.control.active_terminal_withs += usize::from(terminal);
         let result = compile(self);
         self.control.active_terminal_withs = previous_terminal_withs;
@@ -401,7 +435,15 @@ impl Compiler {
             result.is_err() || self.control.active_with_exits.len() == previous_depth + 1,
             "with contexts should be balanced"
         );
+        debug_assert!(
+            result.is_err()
+                || self.control.active_with_suspension_epochs.len() == previous_depth + 1,
+            "with suspension epochs should be balanced"
+        );
         self.control.active_with_exits.truncate(previous_depth);
+        self.control
+            .active_with_suspension_epochs
+            .truncate(previous_depth);
         result
     }
 
@@ -3441,18 +3483,22 @@ impl Compiler {
                     .is_some_and(terminal_try_distributes_implicit_return)
             {
                 let exception_region_depth = self.control.active_exception_region_exclusions.len();
-                let ((), emitted) = self.with_control_override(
-                    |control| &mut control.implicit_return_exception_exclusion_depth,
-                    Some(exception_region_depth),
-                    |compiler| {
-                        compiler.with_fallthrough_tracking(|compiler| {
-                            compiler.compile_suite_inner(&statement.body, true)
-                        })
-                    },
-                )?;
+                let ((), emitted) = self.with_try_body_context(statement, |compiler| {
+                    compiler.with_control_override(
+                        |control| &mut control.implicit_return_exception_exclusion_depth,
+                        Some(exception_region_depth),
+                        |compiler| {
+                            compiler.with_fallthrough_tracking(|compiler| {
+                                compiler.compile_suite_inner(&statement.body, true)
+                            })
+                        },
+                    )
+                })?;
                 normal_return_emitted = emitted;
             } else {
-                self.compile_suite(&statement.body)?;
+                self.with_try_body_context(statement, |compiler| {
+                    compiler.compile_suite(&statement.body)
+                })?;
             }
             let location = (self.assembler.instruction_count() == body_instruction_count)
                 .then(|| {
@@ -4063,7 +4109,9 @@ impl Compiler {
             .active_exception_region_exclusions
             .push(Vec::new());
         let body_instruction_start = self.assembler.instruction_count();
-        self.compile_suite(&statement.body)?;
+        self.with_try_body_context(statement, |compiler| {
+            compiler.compile_suite(&statement.body)
+        })?;
         let body_noop_location = (self.assembler.instruction_count() == body_instruction_start)
             .then(|| {
                 statement
@@ -4174,7 +4222,10 @@ impl Compiler {
             let body_start = self.assembler.label();
             self.assembler.mark(body_start);
             let body_instruction_start = self.assembler.instruction_count();
-            self.compile_suite(&handler.body)?;
+            self.with_control_counter(
+                |control| &mut control.active_exception_group_handlers,
+                |compiler| compiler.compile_suite(&handler.body),
+            )?;
             let body_has_instructions = self.assembler.instruction_count() > body_instruction_start;
             let body_end = self.assembler.label();
             self.assembler.mark(body_end);
@@ -4553,7 +4604,9 @@ impl Compiler {
                                 .set_location(compiler.source_location(pass.range));
                             compiler.emit(NOP, 0, 0)?;
                         }
-                        compiler.compile_suite(&statement.body)?;
+                        compiler.with_try_body_context(statement, |compiler| {
+                            compiler.compile_suite(&statement.body)
+                        })?;
                         let has_instructions =
                             compiler.assembler.instruction_count() > instruction_count;
                         if !has_instructions {

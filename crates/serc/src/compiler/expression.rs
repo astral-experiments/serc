@@ -38,8 +38,8 @@ use crate::target::operands::{
 
 use super::constant::{
     PercentFormatPart, big_integer_digits, constant_slice, first_literal_constant, fold_constant,
-    folded_bool_operand, optimized_percent_format, python_constant_values_equal,
-    two_element_slice_optimization,
+    folded_bool_operand, folded_constant_owner_slots, optimized_percent_format,
+    python_constant_values_equal, two_element_slice_optimization,
 };
 use super::scope::{
     LoweringFunctionPlan, NameId, NameSet, analyze_lambda_scope,
@@ -2630,6 +2630,7 @@ impl Compiler {
             0,
             flags,
         )?;
+        child.control.generator_expression = true;
         child.unit.private_name.clone_from(&self.unit.private_name);
         child
             .symbols
@@ -3592,6 +3593,7 @@ impl Compiler {
         elements: &[Expr],
         kind: CollectionKind,
     ) -> Result<(), CompileError> {
+        let collection_location = self.assembler.location();
         if !elements.iter().any(Expr::is_starred_expr) {
             if kind == CollectionKind::Tuple
                 && let Some(constants) = elements
@@ -3602,7 +3604,17 @@ impl Compiler {
                 for element in elements {
                     self.record_folded_value(element)?;
                 }
-                return self.emit_deferred_constant(Constant::Tuple(constants));
+                for element in elements {
+                    self.emit_folded_tuple_not_nops(element)?;
+                }
+                self.assembler.set_location(collection_location);
+                self.emit_deferred_constant(Constant::Tuple(constants))?;
+                self.assembler
+                    .add_last_hidden_exception_owner_slots(folded_elements_owner_slots(
+                        elements,
+                        elements.len(),
+                    ));
+                return Ok(());
             }
             if elements.len() > 30 {
                 self.emit(kind.build_opcode_for_unpacking(), 0, 1)?;
@@ -3625,6 +3637,10 @@ impl Compiler {
                 for element in elements {
                     self.record_folded_value(element)?;
                 }
+                for element in elements {
+                    self.emit_folded_tuple_not_nops(element)?;
+                }
+                self.assembler.set_location(collection_location);
                 let constant = if kind == CollectionKind::Set {
                     let mut unique = Vec::with_capacity(constants.len());
                     for constant in constants {
@@ -3650,6 +3666,11 @@ impl Compiler {
                     1,
                     -1,
                 )?;
+                self.assembler
+                    .add_last_hidden_exception_owner_slots(folded_elements_owner_slots(
+                        elements,
+                        elements.len().saturating_sub(2),
+                    ));
                 return Ok(());
             }
             for element in elements {
@@ -3671,6 +3692,10 @@ impl Compiler {
             for element in &elements[..unpacking_start] {
                 self.record_folded_value(element)?;
             }
+            for element in &elements[..unpacking_start] {
+                self.emit_folded_tuple_not_nops(element)?;
+            }
+            self.assembler.set_location(collection_location);
             let constant = if kind == CollectionKind::Set {
                 let mut unique = Vec::with_capacity(constants.len());
                 for constant in constants {
@@ -3688,6 +3713,15 @@ impl Compiler {
             self.emit(kind.build_opcode_for_unpacking(), 0, 1)?;
             self.emit_deferred_constant(constant)?;
             self.emit(kind.extend_opcode(), 1, -1)?;
+            self.assembler
+                .add_last_hidden_exception_owner_slots(folded_elements_owner_slots(
+                    &elements[..unpacking_start],
+                    if elements.len() <= 30 {
+                        unpacking_start.saturating_sub(2)
+                    } else {
+                        0
+                    },
+                ));
         } else {
             for element in &elements[..unpacking_start] {
                 self.compile_expression(element)?;
@@ -3714,8 +3748,8 @@ impl Compiler {
         expression: &Expr,
     ) -> Result<(), CompileError> {
         let previous = self.assembler.location();
-        self.assembler
-            .set_location(self.source_location(expression.range()));
+        let expression_location = self.source_location(expression.range());
+        self.assembler.set_location(expression_location);
         let result = match expression {
             Expr::Tuple(tuple)
                 if tuple.elts.iter().any(Expr::is_starred_expr) || tuple.elts.len() > 30 =>
@@ -3734,7 +3768,22 @@ impl Compiler {
                     for element in &list.elts {
                         self.record_folded_value(element)?;
                     }
-                    self.emit_deferred_constant(Constant::Tuple(constants))
+                    for element in &list.elts {
+                        self.emit_folded_tuple_not_nops(element)?;
+                    }
+                    self.assembler.set_location(expression_location);
+                    self.emit_deferred_constant(Constant::Tuple(constants))?;
+                    self.assembler.add_last_hidden_exception_owner_slots(
+                        folded_elements_owner_slots(
+                            &list.elts,
+                            if list.elts.len() <= 30 {
+                                list.elts.len()
+                            } else {
+                                0
+                            },
+                        ),
+                    );
+                    Ok(())
                 } else {
                     self.compile_collection(&list.elts, CollectionKind::Tuple)
                 }
@@ -3757,7 +3806,21 @@ impl Compiler {
                         unique.push(constant);
                     }
                 }
-                self.emit_deferred_constant(Constant::FrozenSet(unique))
+                for element in &set.elts {
+                    self.emit_folded_tuple_not_nops(element)?;
+                }
+                self.assembler.set_location(expression_location);
+                self.emit_deferred_constant(Constant::FrozenSet(unique))?;
+                self.assembler
+                    .add_last_hidden_exception_owner_slots(folded_elements_owner_slots(
+                        &set.elts,
+                        if set.elts.len() <= 30 {
+                            set.elts.len()
+                        } else {
+                            0
+                        },
+                    ));
+                Ok(())
             }
             _ => self.compile_expression_inner(expression),
         };
@@ -3993,6 +4056,18 @@ impl Compiler {
                 self.compile_expression(value)?;
             }
             self.assembler.set_location(location);
+            let resumes_after_yield = self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) != 0
+                && self.assembler.current_block_resumes_after_yield();
+            // CPython inserts `COPY`, `TO_BOOL`, and `NOT_TAKEN` after compacting the CFG. The
+            // marker can only reuse a stale exception owner when all three inserted slots were
+            // vacated by earlier optimizations in this block.
+            let marker_owner_slots = self.assembler.current_block_dynamic_exception_owner_slots();
+            let marker_reuses_exception_owner = marker_owner_slots >= 3;
+            let exclude_inlined_comprehension_owner = !self
+                .control
+                .active_comprehension_region_exclusions
+                .is_empty()
+                && !marker_reuses_exception_owner;
             let exclusion_start = self.assembler.label();
             self.assembler.mark(exclusion_start);
             self.emit(COPY, 1, 1)?;
@@ -4000,7 +4075,98 @@ impl Compiler {
             let exclusion_end = self.assembler.label();
             self.assembler.mark(exclusion_end);
             self.emit_jump_forward(jump, end, -1)?;
-            self.emit(NOT_TAKEN, 0, 0)?;
+
+            let exception_group_handler = self.control.active_exception_group_handlers > 0;
+            let normalized_owner = self.control.active_normal_finally_bodies > 0
+                || self.control.active_finally_end_blocks > 0
+                || resumes_after_yield
+                || exception_group_handler;
+            let in_generator_expression = self.control.generator_expression;
+            let exclude_generator_expression_owner =
+                in_generator_expression && !marker_reuses_exception_owner;
+            let suspension_epoch = self.control.coroutine_suspension_epoch;
+            let after_coroutine_suspension =
+                self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR) != 0 && suspension_epoch > 0;
+            let has_fresh_with_owner = after_coroutine_suspension
+                && self
+                    .control
+                    .active_with_suspension_epochs
+                    .contains(&suspension_epoch);
+            let named_exception_handler = self.control.current_exception_handler_binds_name();
+            let exclude_after_coroutine_suspension = after_coroutine_suspension
+                && !has_fresh_with_owner
+                && self.control.active_finally_end_blocks == 0
+                && !marker_reuses_exception_owner
+                && !self.control.same_line_try_body
+                && !named_exception_handler
+                && !exception_group_handler;
+            let exclude_from_plain_try = self.control.generator_region_start.is_none()
+                && self.control.active_with_suspension_epochs.is_empty()
+                && self.control.active_normal_finally_bodies == 0
+                && self.control.active_finally_end_blocks == 0
+                && !self.control.same_line_try_body
+                && !named_exception_handler
+                && !exception_group_handler
+                && !marker_reuses_exception_owner
+                && !self.control.active_exception_region_exclusions.is_empty();
+            let exclude_from_all_owners = exclude_inlined_comprehension_owner
+                || exclude_after_coroutine_suspension
+                || exclude_from_plain_try;
+            let marker_start = (!exclude_inlined_comprehension_owner
+                && (exclude_generator_expression_owner
+                    || exclude_after_coroutine_suspension
+                    || exclude_from_plain_try))
+                .then(|| {
+                    let start = self.assembler.label();
+                    self.assembler.mark(start);
+                    start
+                });
+
+            self.emit_with_exception_policy(
+                NOT_TAKEN,
+                0,
+                0,
+                if exclude_from_all_owners {
+                    ExceptionPolicy::EXCLUDE_ALWAYS
+                } else {
+                    ExceptionPolicy::normalized_owner(
+                        normalized_owner || marker_reuses_exception_owner,
+                    )
+                },
+            )?;
+
+            if let Some(marker_start) = marker_start {
+                let marker_end = self.assembler.label();
+                self.assembler.mark(marker_end);
+                if self.control.generator_region_start.is_some()
+                    && (exclude_generator_expression_owner || exclude_after_coroutine_suspension)
+                {
+                    self.control
+                        .generator_region_exclusions
+                        .push((marker_start, marker_end));
+                }
+                if exclude_after_coroutine_suspension
+                    && self.control.active_normal_finally_bodies == 0
+                {
+                    let active_with_count = self.control.active_with_suspension_epochs.len();
+                    for exclusions in self
+                        .control
+                        .active_with_region_exclusions
+                        .iter_mut()
+                        .take(active_with_count)
+                    {
+                        exclusions.push((marker_start, marker_end));
+                    }
+                }
+                if exclude_from_plain_try
+                    || (exclude_after_coroutine_suspension
+                        && self.control.active_normal_finally_bodies == 0)
+                {
+                    for exclusions in &mut self.control.active_exception_region_exclusions {
+                        exclusions.push((marker_start, marker_end));
+                    }
+                }
+            }
             self.assembler
                 .set_location(self.source_location(expression.range));
             self.emit(POP_TOP, 0, -1)?;
@@ -4673,6 +4839,14 @@ pub(super) fn literal_truthiness(expression: &Expr) -> Option<bool> {
         Expr::Tuple(value) => Some(!value.elts.is_empty()),
         _ => None,
     }
+}
+
+fn folded_elements_owner_slots(elements: &[Expr], structural_slots: usize) -> usize {
+    elements.iter().fold(structural_slots, |slots, element| {
+        slots
+            .saturating_add(folded_constant_owner_slots(element))
+            .min(3)
+    })
 }
 
 pub(super) fn jump_constant_truthiness(expression: &Expr) -> Option<bool> {

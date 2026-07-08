@@ -7,6 +7,7 @@ use super::{
     Operand, OperandPatchId, SourceLocation,
 };
 use crate::target::opcodes::*;
+use crate::target::operands::ResumeLocation;
 
 #[test]
 #[cfg(target_pointer_width = "64")]
@@ -22,6 +23,7 @@ fn instruction_constructors_set_audited_defaults() {
     assert_eq!(regular.no_location_policy, NoLocationPolicy::default());
     assert_eq!(regular.fusion_policy, FusionPolicy::default());
     assert!(!regular.converted_pop_block);
+    assert_eq!(regular.hidden_exception_owner_slots, 0);
     assert_eq!(regular.jump_policy, JumpPolicy::default());
 
     let synthetic = Instruction::synthetic(NOP, Operand::Value(0), SourceLocation::NONE, None);
@@ -286,12 +288,14 @@ fn dynamic_exception_owner_tracks_fusible_loads_and_null_globals() {
     fusible.set_location(location);
     fusible.emit(LOAD_FAST, 1);
     fusible.emit(LOAD_FAST, 2);
+    assert_eq!(fusible.current_block_dynamic_exception_owner_slots(), 1);
     assert!(fusible.current_block_has_dynamic_exception_owner());
 
     let mut mixed = Assembler::default();
     mixed.set_location(location);
     mixed.emit(LOAD_FAST, 1);
     mixed.emit(LOAD_CONST, 0);
+    assert_eq!(mixed.current_block_dynamic_exception_owner_slots(), 0);
     assert!(!mixed.current_block_has_dynamic_exception_owner());
 
     let mut blocked = Assembler::default();
@@ -299,15 +303,79 @@ fn dynamic_exception_owner_tracks_fusible_loads_and_null_globals() {
     blocked.emit(LOAD_FAST, 1);
     blocked.prevent_last_instruction_fusion();
     blocked.emit(LOAD_FAST, 2);
+    assert_eq!(blocked.current_block_dynamic_exception_owner_slots(), 0);
     assert!(!blocked.current_block_has_dynamic_exception_owner());
 
     let mut null_global = Assembler::default();
     null_global.emit(LOAD_GLOBAL, 1);
+    assert_eq!(null_global.current_block_dynamic_exception_owner_slots(), 1);
     assert!(null_global.current_block_has_dynamic_exception_owner());
 
     let mut regular_global = Assembler::default();
     regular_global.emit(LOAD_GLOBAL, 0);
+    assert_eq!(
+        regular_global.current_block_dynamic_exception_owner_slots(),
+        0
+    );
     assert!(!regular_global.current_block_has_dynamic_exception_owner());
+
+    let mut three_slots = Assembler::default();
+    three_slots.set_location(location);
+    three_slots.emit(STORE_FAST, 1);
+    three_slots.emit(STORE_FAST, 2);
+    three_slots.emit(LOAD_GLOBAL, 1);
+    three_slots.emit(LOAD_GLOBAL, 3);
+    assert_eq!(three_slots.current_block_dynamic_exception_owner_slots(), 3);
+
+    let mut redundant_store = Assembler::default();
+    redundant_store.set_location(location);
+    redundant_store.emit(STORE_FAST, 1);
+    redundant_store.emit(STORE_FAST, 1);
+    assert_eq!(
+        redundant_store.current_block_dynamic_exception_owner_slots(),
+        0
+    );
+
+    let mut converted_pop_block = Assembler::default();
+    converted_pop_block.emit(NOP, 0);
+    converted_pop_block.mark_last_as_converted_pop_block();
+    assert_eq!(
+        converted_pop_block.current_block_dynamic_exception_owner_slots(),
+        1
+    );
+
+    let mut hidden_slots = Assembler::default();
+    hidden_slots.emit(LOAD_CONST, 0);
+    hidden_slots.add_last_hidden_exception_owner_slots(2);
+    assert_eq!(
+        hidden_slots.current_block_dynamic_exception_owner_slots(),
+        2
+    );
+    let boundary = hidden_slots.label();
+    hidden_slots.mark(boundary);
+    assert_eq!(
+        hidden_slots.current_block_dynamic_exception_owner_slots(),
+        0
+    );
+
+    let mut removable_nop = Assembler::default();
+    removable_nop.set_location(SourceLocation::new(1, 1, 0, 1));
+    removable_nop.emit(NOP, 0);
+    removable_nop.emit(LOAD_CONST, 0);
+    assert_eq!(
+        removable_nop.current_block_dynamic_exception_owner_slots(),
+        1
+    );
+
+    let mut retained_nop = Assembler::default();
+    retained_nop.set_location(SourceLocation::new(1, 1, 0, 1));
+    retained_nop.emit(NOP, 0);
+    retained_nop.set_location(SourceLocation::new(2, 2, 0, 1));
+    retained_nop.emit(LOAD_CONST, 0);
+    assert_eq!(
+        retained_nop.current_block_dynamic_exception_owner_slots(),
+        0
+    );
 }
 
 #[test]
@@ -329,6 +397,28 @@ fn dynamic_exception_owner_stops_at_emitted_boundaries() {
 }
 
 #[test]
+fn current_block_resume_after_yield_stops_at_emitted_boundaries() {
+    let mut assembler = Assembler::default();
+    assembler.emit(RESUME, ResumeLocation::AFTER_YIELD.argument());
+    assert!(assembler.current_block_resumes_after_yield());
+
+    let boundary = assembler.label();
+    assembler.mark(boundary);
+    assert!(!assembler.current_block_resumes_after_yield());
+
+    assembler.emit(RESUME, ResumeLocation::AFTER_YIELD_FROM.argument());
+    assert!(!assembler.current_block_resumes_after_yield());
+
+    assembler.emit(RESUME, ResumeLocation::AFTER_AWAIT.argument());
+    assert!(!assembler.current_block_resumes_after_yield());
+
+    assembler.emit(RESUME, ResumeLocation::AFTER_YIELD.argument());
+    assert!(assembler.current_block_resumes_after_yield());
+    assembler.emit(NOT_TAKEN, 0);
+    assert!(!assembler.current_block_resumes_after_yield());
+}
+
+#[test]
 fn fusion_preserves_each_typed_instruction_policy() {
     let mut first = Instruction::new(
         LOAD_FAST,
@@ -339,6 +429,7 @@ fn fusion_preserves_each_typed_instruction_policy() {
     first.load_policy.force_owned = true;
     first.no_location_policy.allow_block_inlining = true;
     first.converted_pop_block = true;
+    first.hidden_exception_owner_slots = 2;
     first.fusion_policy.prevent_with_next = true;
     first.jump_policy.prevent_threading_target();
     first.jump_policy.defer_removal();
@@ -362,6 +453,7 @@ fn fusion_preserves_each_typed_instruction_policy() {
     second.jump_policy.retain_nop_for_direct_target();
     second.exception_policy.exclude(ExceptionExclusion::Always);
     second.exception_policy.normalized_owner = NormalizedExceptionOwner::Present;
+    second.hidden_exception_owner_slots = 2;
     second.borrow_fallthrough = BorrowFallthrough::Barrier;
 
     let fused = Instruction::fused(LOAD_FAST_LOAD_FAST, Operand::Value(0x12), first, second);
@@ -382,6 +474,7 @@ fn fusion_preserves_each_typed_instruction_policy() {
     );
     assert_eq!(fused.fusion_policy, FusionPolicy::default());
     assert!(fused.converted_pop_block);
+    assert_eq!(fused.hidden_exception_owner_slots, 3);
     assert_eq!(fused.location, first.location);
     assert_eq!(fused.depth_after, second.depth_after);
     let mut expected_jump_policy = JumpPolicy::default();
