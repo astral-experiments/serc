@@ -3712,17 +3712,31 @@ impl Compiler {
                 for name in newly_owned {
                     self.symbols.owned_load_locals.remove(name);
                 }
+                let exclude_not_taken_from_dispatch = handler_index > 0
+                    || matches!(exception_type.as_ref(), Expr::BoolOp(_) | Expr::If(_));
+                // CPython normalizes these jumps after exception targets are labeled. A later
+                // handler or conditional exception type appends the marker into a fresh CFG
+                // slot, so it cannot inherit an outer generator, with, or finally owner.
+                let ownerless_not_taken =
+                    handler_index > 0 || matches!(exception_type.as_ref(), Expr::If(_));
                 self.assembler.set_location(handler_location);
                 self.emit(CHECK_EXC_MATCH, 0, 0)?;
                 self.emit_jump_forward(POP_JUMP_IF_FALSE, next_handler, -1)?;
                 let exclusion_start = self.assembler.label();
                 self.assembler.mark(exclusion_start);
-                self.emit(NOT_TAKEN, 0, 0)?;
+                self.emit_with_exception_policy(
+                    NOT_TAKEN,
+                    0,
+                    0,
+                    if ownerless_not_taken {
+                        ExceptionPolicy::EXCLUDE_ALWAYS
+                    } else {
+                        ExceptionPolicy::default()
+                    },
+                )?;
                 let exclusion_end = self.assembler.label();
                 self.assembler.mark(exclusion_end);
-                if handler_index > 0
-                    || matches!(exception_type.as_ref(), Expr::BoolOp(_) | Expr::If(_))
-                {
+                if exclude_not_taken_from_dispatch {
                     for exclusions in &mut self.control.active_exception_region_exclusions {
                         exclusions.push((exclusion_start, exclusion_end));
                     }
