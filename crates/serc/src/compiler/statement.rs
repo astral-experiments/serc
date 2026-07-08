@@ -728,6 +728,13 @@ impl Compiler {
             .filter(|depth| self.control.generator_region_start.is_none() || *depth > 1)
     }
 
+    fn terminal_try_condition_includes_generator_region(&self, branch_index: usize) -> bool {
+        branch_index > 0
+            || (self.unit.flags & CO_COROUTINE != 0
+                && self.control.generator_region_start.is_some()
+                && self.assembler.contains_opcode(YIELD_VALUE))
+    }
+
     fn with_terminal_try_condition_exception_exclusion<R>(
         &mut self,
         include_generator: bool,
@@ -996,10 +1003,9 @@ impl Compiler {
                             exclude_from_generator,
                             |compiler| {
                                 compiler.with_terminal_try_condition_exception_exclusion(
-                                    compiler.unit.flags & CO_COROUTINE != 0
-                                        && compiler.control.generator_region_start.is_some()
-                                        && compiler.assembler.contains_opcode(YIELD_VALUE)
-                                        && matches!(body.last(), Some(Stmt::Try(_))),
+                                    compiler.terminal_try_condition_includes_generator_region(
+                                        branch_index,
+                                    ),
                                     |compiler| compiler.compile_jump_if(test, false, next),
                                 )
                             },
@@ -2091,10 +2097,7 @@ impl Compiler {
                     exclude_not_taken,
                     |compiler| {
                         compiler.with_terminal_try_condition_exception_exclusion(
-                            compiler.unit.flags & CO_COROUTINE != 0
-                                && compiler.control.generator_region_start.is_some()
-                                && compiler.assembler.contains_opcode(YIELD_VALUE)
-                                && matches!(body.last(), Some(Stmt::Try(_))),
+                            compiler.terminal_try_condition_includes_generator_region(branch_index),
                             |compiler| compiler.compile_jump_if(test, false, next),
                         )
                     },
