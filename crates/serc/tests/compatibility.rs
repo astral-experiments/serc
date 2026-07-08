@@ -2513,6 +2513,20 @@ def reversed_store_pair(first, second):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_multiline_boolean_returns_through_with() {
+        let source = r"def multiline_and(manager, value, expected):
+    with manager:
+        return (
+            value is not None
+            and value.kind == expected.kind
+            and value.name == expected.name
+            and value.flags == expected.flags
+        )
+";
+        assert_matches_cpython_marshal(source, "with_multiline_boolean_return.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_assert_none_condition_owners_in_with_bodies() {
         let source = include_str!("fixtures/with_assert_none_condition_owners.py");
         assert_matches_cpython_marshal(source, "with_assert_none_condition_owners.py");

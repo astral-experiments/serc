@@ -1833,6 +1833,22 @@ impl Compiler {
                     self.emit(NOP, 0, 0)?;
                 } else if let Some(value) = &statement.value {
                     self.compile_expression(value)?;
+                    let location = self.source_location(statement.range);
+                    // CPython converts a synchronous `with` POP_BLOCK following a multiline
+                    // `and` return into a NOP carrying the whole return statement's range.
+                    // Mark it as converted so ordinary redundant markers can still disappear.
+                    if location.line != location.end_line
+                        && matches!(value.as_ref(), Expr::BoolOp(boolean) if boolean.op == BoolOp::And)
+                        && self
+                            .control
+                            .active_with_exits
+                            .last()
+                            .is_some_and(|context| !context.is_async)
+                    {
+                        self.assembler.set_location(location);
+                        self.emit(NOP, 0, 0)?;
+                        self.assembler.mark_last_as_converted_pop_block();
+                    }
                 }
                 let pass_finally_edge_start = unwinds_pass_finally
                     .then(|| {
