@@ -2353,6 +2353,47 @@ def render(value):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_borrowing_after_constant_loop_breaks() {
+        let source = r"def unprotected(flag, result):
+    while True:
+        if flag:
+            break
+        step()
+    first(result)
+    second(result)
+    third(result)
+    fourth(result)
+    fifth(result)
+    return result
+
+def generator(flag, result):
+    while True:
+        if flag:
+            break
+        yield step()
+    first(result)
+    second(result)
+    third(result)
+    fourth(result)
+    fifth(result)
+    return result
+
+def tail_break(flag, result):
+    while True:
+        step()
+        if flag:
+            break
+    first(result)
+    second(result)
+    third(result)
+    fourth(result)
+    fifth(result)
+    return result
+";
+        assert_matches_cpython_marshal(source, "constant_loop_break_borrowing.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_borrowing_after_terminal_exception_handlers() {
         let source = "def returning(dependencies):\n    try:\n        before = load()\n        after = load()\n    except Exception:\n        return\n    for dependency in dependencies:\n        if dependency in after:\n            consume(dependency, before)\n\ndef reraising(dependencies):\n    try:\n        before = load()\n        after = load()\n    except Exception:\n        raise\n    for dependency in dependencies:\n        if dependency in after:\n            consume(dependency, before)\n";
         assert_matches_cpython_marshal(source, "terminal_handlers.py");
