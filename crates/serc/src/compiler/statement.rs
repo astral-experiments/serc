@@ -3077,6 +3077,9 @@ impl Compiler {
                 && let Some(location) = self.assembler.last_instruction_location()
             {
                 self.assembler.set_location(location);
+            } else if let Some(statement) = statement.body.last() {
+                self.assembler
+                    .set_location(self.source_location(statement.range()));
             }
             self.emit_jump_backward(JUMP_BACKWARD, start, 0)?;
         }
