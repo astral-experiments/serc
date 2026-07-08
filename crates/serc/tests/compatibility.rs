@@ -1853,6 +1853,27 @@ class Decorated:
     }
 
     #[test]
+    fn matches_cpython_marshal_for_conditional_class_annotations() {
+        let source = r"flag = True
+
+class Conditional:
+    direct: str
+    if flag:
+        enabled: int
+    else:
+        disabled: bytes
+
+class WithClassCell:
+    if flag:
+        member: __class__
+
+    def method(self):
+        return __class__
+";
+        assert_matches_cpython_marshal(source, "conditional_class_annotations.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_negated_generator_filters() {
         let source =
             "def filtered(items):\n    return (item for item in items if not predicate(item))\n";
