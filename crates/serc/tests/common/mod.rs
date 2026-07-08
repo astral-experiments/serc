@@ -2,10 +2,11 @@ use std::io::Write as _;
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
-use serc::{CPYTHON_TARGET, compile, compile_to_pyc};
+use serc::{CPYTHON_TARGET, compile, compile_bytes, compile_to_pyc};
 use tempfile::tempdir;
 
 const CPYTHON_MARSHAL: &str = "import marshal, sys; code = compile(sys.stdin.read(), sys.argv[1], 'exec', dont_inherit=True, optimize=0); sys.stdout.buffer.write(marshal.dumps(code))";
+const CPYTHON_MARSHAL_BYTES: &str = "import marshal, sys; code = compile(sys.stdin.buffer.read(), sys.argv[1], 'exec', dont_inherit=True, optimize=0); sys.stdout.buffer.write(marshal.dumps(code))";
 
 static PYTHON_3145: OnceLock<Result<String, String>> = OnceLock::new();
 
@@ -78,6 +79,30 @@ pub(crate) fn assert_matches_cpython_marshal(source: &str, filename: &str) {
         compile(source, filename).unwrap().marshal(),
         expected.stdout,
         "marshal mismatch for {filename}",
+    );
+}
+
+pub(crate) fn assert_matches_cpython_marshal_bytes(source: &[u8], filename: &str) {
+    let expected = python_3145_command()
+        .args(["-c", CPYTHON_MARSHAL_BYTES, filename])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            child.stdin.take().unwrap().write_all(source)?;
+            child.wait_with_output()
+        })
+        .unwrap();
+    assert!(
+        expected.status.success(),
+        "CPython byte-source marshal oracle failed for {filename}: {}",
+        String::from_utf8_lossy(&expected.stderr)
+    );
+    assert_eq!(
+        compile_bytes(source, filename).unwrap().marshal(),
+        expected.stdout,
+        "marshal mismatch for byte source {filename}",
     );
 }
 

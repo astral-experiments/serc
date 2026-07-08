@@ -226,10 +226,10 @@ fn compile_matches_cpython_for_utf8_encoding_cookies() {
 }
 
 #[test]
-fn compile_rejects_non_utf8_encoding_cookies() {
+fn compile_rejects_unsupported_encoding_cookies() {
     let directory = tempfile::tempdir().unwrap();
 
-    for encoding in ["ascii", "latin-1", "cp932", "koi8-r", "gbk", "big5"] {
+    for encoding in ["ascii", "cp932", "gbk", "big5"] {
         let source_path = directory.path().join(format!("{encoding}.py"));
         fs_err::write(
             &source_path,
