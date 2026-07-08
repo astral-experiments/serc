@@ -3628,8 +3628,16 @@ impl Compiler {
                 self.emit_deferred_implicit_return()?;
             }
         } else {
+            let direct_exit_location = statement
+                .orelse
+                .is_empty()
+                .then(|| direct_try_body_exit_location(&statement.body))
+                .flatten();
             if let Some(location) = orelse_noop_location {
                 self.assembler.set_location(location);
+            } else if let Some(location) = direct_exit_location {
+                self.assembler
+                    .set_location(self.source_location(location.range()));
             } else if statement.orelse.is_empty()
                 && let Some(Stmt::If(nested)) = statement.body.last()
                 && let Some(test) = terminating_if_fallthrough_test(nested)
@@ -3692,6 +3700,9 @@ impl Compiler {
             {
                 self.assembler
                     .preserve_last_redundant_jump_nop_after_threading();
+            }
+            if direct_exit_location.is_some() {
+                self.assembler.preserve_last_direct_inlined_jump_nop();
             }
             if statement.orelse.is_empty()
                 && suite_ends_in_retained_try_body_exit_join(&statement.body)
@@ -5763,6 +5774,52 @@ fn condition_jump_target_count(expression: &Expr, jump_on: bool) -> usize {
     1
 }
 
+// Returns the expression that contributes the sole edge to a condition's target.
+fn unique_condition_jump_target(expression: &Expr, jump_on: bool) -> Option<&Expr> {
+    if condition_jump_target_count(expression, jump_on) != 1 {
+        return None;
+    }
+
+    if let Expr::UnaryOp(unary) = expression
+        && unary.op == UnaryOp::Not
+    {
+        return unique_condition_jump_target(&unary.operand, !jump_on);
+    }
+    if let Expr::If(conditional) = expression
+        && let Some(truthiness) = early_condition_truthiness(&conditional.test)
+    {
+        return unique_condition_jump_target(
+            if truthiness {
+                &conditional.body
+            } else {
+                &conditional.orelse
+            },
+            jump_on,
+        );
+    }
+    if let Expr::BoolOp(boolean) = expression {
+        let (last, leading) = boolean.values.split_last()?;
+        let short_circuit_jumps_to_target = matches!(boolean.op, BoolOp::Or) == jump_on;
+        if short_circuit_jumps_to_target {
+            return leading
+                .iter()
+                .chain(std::iter::once(last))
+                .find(|value| condition_jump_target_count(value, jump_on) == 1)
+                .and_then(|value| unique_condition_jump_target(value, jump_on));
+        }
+        return unique_condition_jump_target(last, jump_on);
+    }
+    if let Expr::If(conditional) = expression {
+        let branch = if condition_jump_target_count(&conditional.body, jump_on) == 1 {
+            &conditional.body
+        } else {
+            &conditional.orelse
+        };
+        return unique_condition_jump_target(branch, jump_on);
+    }
+    Some(expression)
+}
+
 fn expression_contains_chained_comparison(expression: &Expr) -> bool {
     #[derive(Default)]
     struct Detector {
@@ -5846,6 +5903,26 @@ fn suite_ends_in_retained_try_exit_join(body: &[Stmt]) -> bool {
         return suite_ends_in_retained_try_exit_join(selected);
     }
     !statement.elif_else_clauses.is_empty() || terminating_if_fallthrough_test(statement).is_some()
+}
+
+// A terminal final branch leaves the try body's normal exit with one direct predecessor. If
+// that exit later copies a small return or raise, CPython retains the original jump's location.
+fn direct_try_body_exit_location(body: &[Stmt]) -> Option<&Expr> {
+    let Some(Stmt::If(statement)) = body.last() else {
+        return None;
+    };
+    if suite_contains_loop_break(&statement.body)
+        || statement
+            .elif_else_clauses
+            .iter()
+            .any(|clause| suite_contains_loop_break(&clause.body))
+    {
+        return None;
+    }
+    let test = terminating_if_fallthrough_test(statement)?;
+    (early_condition_truthiness(&statement.test).is_none())
+        .then(|| unique_condition_jump_target(test, false))
+        .flatten()
 }
 
 // CPython builds a normal try body with different temporary block edges than its `else` suite,
