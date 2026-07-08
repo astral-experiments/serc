@@ -201,26 +201,39 @@ impl Compiler {
         globals: FxHashSet<NameId>,
         nonlocals: FxHashSet<NameId>,
         freevars: &[NameId],
+        comprehension_targets: &[NameId],
         bound_names: FxHashSet<NameId>,
         needs_class_closure: bool,
         has_methods: bool,
         future_flags: u32,
     ) -> Self {
-        let mut locals = Vec::new();
+        let mut locals = comprehension_targets.to_vec();
+        let fast_local_count = locals.len();
         let mut cell_names = NameSet::default();
+        let temporary_indices = comprehension_targets
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, name)| (name, u32::try_from(index).unwrap_or(u32::MAX)))
+            .collect();
+        let hidden_names = comprehension_targets.iter().copied().collect();
         let names = &context.scopes.names;
         if needs_class_closure {
             let name = names
                 .get("__class__")
                 .expect("module analysis should intern `__class__`");
-            locals.push(name);
+            if !locals.contains(&name) {
+                locals.push(name);
+            }
             cell_names.insert(name);
         }
         if has_methods {
             let name = names
                 .get("__classdict__")
                 .expect("module analysis should intern `__classdict__`");
-            locals.push(name);
+            if !locals.contains(&name) {
+                locals.push(name);
+            }
             cell_names.insert(name);
         }
         let free_start = locals.len();
@@ -236,8 +249,11 @@ impl Compiler {
         let bound_names = bound_names.into_iter().collect();
         let symbols = SymbolState {
             locals,
+            fast_local_count,
             cell_names,
             free_names,
+            temporary_indices,
+            hidden_names,
             ..SymbolState::default()
         };
         let unit = CodeUnit::from_spec(CodeUnitSpec {

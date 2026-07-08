@@ -814,6 +814,7 @@ impl Compiler {
             class_plan.globals,
             class_plan.nonlocals,
             &freevars,
+            &class_plan.comprehension_targets,
             class_plan.bound_names,
             class_plan.needs_class_closure,
             class_plan.needs_classdict,

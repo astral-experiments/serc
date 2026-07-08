@@ -534,6 +534,7 @@ struct ClassPlan {
     globals: FxHashSet<NameId>,
     nonlocals: FxHashSet<NameId>,
     bound_names: FxHashSet<NameId>,
+    comprehension_targets: Vec<NameId>,
     required: FxHashSet<NameId>,
     needs_class_closure: bool,
     needs_classdict: bool,
@@ -544,6 +545,7 @@ pub(super) struct LoweringClassPlan {
     pub(super) globals: FxHashSet<NameId>,
     pub(super) nonlocals: FxHashSet<NameId>,
     pub(super) bound_names: FxHashSet<NameId>,
+    pub(super) comprehension_targets: Vec<NameId>,
     pub(super) required: FxHashSet<NameId>,
     pub(super) needs_class_closure: bool,
     pub(super) needs_classdict: bool,
@@ -576,6 +578,7 @@ impl ClassPlan {
         let mut locals = LocalCollector {
             globals,
             nonlocals,
+            ignore_generator_body_comprehension_targets: true,
             ..LocalCollector::default()
         };
         locals.collect_suite(&definition.body);
@@ -629,10 +632,15 @@ impl ClassPlan {
         let needs_classdict = has_type_alias
             || has_generic_definition
             || !future_annotations && (has_function_definition || has_simple_annotations);
+        let comprehension_targets = std::mem::take(&mut locals.comprehension_targets)
+            .into_iter()
+            .map(|name| names.intern_owned(name))
+            .collect();
         Self {
             globals: names.intern_set(locals.globals),
             nonlocals: names.intern_set(locals.nonlocals),
             bound_names: names.intern_set(locals.seen),
+            comprehension_targets,
             required: names.intern_set(required),
             needs_class_closure,
             needs_classdict,
@@ -644,6 +652,7 @@ impl ClassPlan {
             globals: self.globals.clone(),
             nonlocals: self.nonlocals.clone(),
             bound_names: self.bound_names.clone(),
+            comprehension_targets: self.comprehension_targets.clone(),
             required: self.required.clone(),
             needs_class_closure: self.needs_class_closure,
             needs_classdict: self.needs_classdict,
@@ -1292,6 +1301,7 @@ struct LocalCollector {
     annotation_only: FxHashSet<String>,
     globals: FxHashSet<String>,
     nonlocals: FxHashSet<String>,
+    ignore_generator_body_comprehension_targets: bool,
 }
 
 impl LocalCollector {
@@ -1635,7 +1645,16 @@ impl<'ast> Visitor<'ast> for NamedExpressionCollector<'_> {
         if matches!(expression, Expr::Generator(_)) {
             let previous = std::mem::replace(&mut self.in_inlined_comprehension, false);
             let previous_loads = std::mem::replace(&mut self.collect_known_loads, false);
-            walk_expr(self, expression);
+            if self.collector.ignore_generator_body_comprehension_targets {
+                let Expr::Generator(generator) = expression else {
+                    unreachable!();
+                };
+                if let Some(first) = generator.generators.first() {
+                    self.visit_expr(&first.iter);
+                }
+            } else {
+                walk_expr(self, expression);
+            }
             self.collect_known_loads = previous_loads;
             self.in_inlined_comprehension = previous;
             return;
