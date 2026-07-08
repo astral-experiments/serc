@@ -428,6 +428,29 @@ class Global(global_base, metaclass=global_meta):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_unary_not_loop_exit_locations() {
+        let source = r"def terminal_call():
+    while not predicate():
+        work()
+
+def terminal_nested_not():
+    while not not predicate():
+        work()
+
+def terminal_and(flag):
+    while flag and not predicate():
+        work()
+
+def protected(lock):
+    with lock:
+        while not lock.done():
+            work()
+    work()
+";
+        assert_matches_cpython_marshal(source, "while_not_exit.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_a_try_at_the_end_of_a_loop() {
         let source = "async def show_status():\n    while True:\n        try:\n            if report_host:\n                data = value\n        except Exception as error:\n            pass\n";
         assert_matches_cpython_marshal(source, "loop_try.py");

@@ -402,10 +402,20 @@ pub(super) fn implicit_return_range(
             };
             last_discarded_annotation_slice_range(&subscript.slice)
         }
-        Stmt::While(statement) => statement.test.range(),
+        Stmt::While(statement) => condition_exit_range(&statement.test),
         Stmt::For(statement) => statement.iter.range(),
         _ => statement.range(),
     }
+}
+
+pub(super) fn condition_exit_range(expression: &Expr) -> ruff_text_size::TextRange {
+    let mut expression = expression;
+    while let Expr::UnaryOp(unary) = expression
+        && unary.op == ruff_python_ast::UnaryOp::Not
+    {
+        expression = &unary.operand;
+    }
+    expression.range()
 }
 
 fn last_store_target_range(compiler: &Compiler, expression: &Expr) -> ruff_text_size::TextRange {
