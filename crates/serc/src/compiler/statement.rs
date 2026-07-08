@@ -2318,10 +2318,33 @@ impl Compiler {
         restart: Label,
         split_short_circuit: bool,
     ) -> Result<LoopBackedge, CompileError> {
+        self.compile_loop_tail_suite_inner(body, restart, split_short_circuit, false)
+    }
+
+    fn compile_non_final_branch_loop_tail_suite(
+        &mut self,
+        body: &[Stmt],
+        restart: Label,
+    ) -> Result<LoopBackedge, CompileError> {
+        self.compile_loop_tail_suite_inner(body, restart, false, true)
+    }
+
+    fn compile_loop_tail_suite_inner(
+        &mut self,
+        body: &[Stmt],
+        restart: Label,
+        split_short_circuit: bool,
+        non_final_branch: bool,
+    ) -> Result<LoopBackedge, CompileError> {
         match body.split_last() {
             Some((Stmt::If(statement), leading)) => {
                 self.compile_suite(leading)?;
-                self.compile_loop_tail_if(statement, restart, split_short_circuit)?;
+                self.compile_loop_tail_if(
+                    statement,
+                    restart,
+                    split_short_circuit,
+                    non_final_branch,
+                )?;
                 Ok(LoopBackedge::Emitted)
             }
             Some((Stmt::While(statement), leading))
@@ -2586,9 +2609,38 @@ impl Compiler {
         statement: &ruff_python_ast::StmtIf,
         restart: Label,
         split_short_circuit: bool,
+        non_final_branch: bool,
     ) -> Result<(), CompileError> {
         let base_depth = self.control.depth;
         if statement.elif_else_clauses.is_empty() {
+            if non_final_branch
+                && !split_short_circuit
+                && !self.has_active_control_flow_region()
+                && condition_jump_target_count(&statement.test, false) == 1
+                && condition_jump_target_count(&statement.test, true) == 1
+                && !suite_terminates(&statement.body)
+            {
+                let body = statement.body.as_slice();
+                let fallback = self.assembler.label();
+                self.compile_jump_if(&statement.test, false, fallback)?;
+                let body_start = self.assembler.instruction_count();
+                let nested_tail = self.compile_with_strict_owned_loads(
+                    matches!(statement.test.as_ref(), Expr::If(_)),
+                    |compiler| compiler.compile_non_final_branch_loop_tail_suite(body, restart),
+                )?;
+                if nested_tail == LoopBackedge::Required {
+                    self.set_branch_end_location(body, body_start);
+                    self.emit_jump_backward(JUMP_BACKWARD, restart, 0)?;
+                }
+
+                self.assembler.mark(fallback);
+                self.set_depth(base_depth);
+                self.assembler.set_location(
+                    self.source_location(synthetic_condition_exit_range(&statement.test)),
+                );
+                self.emit_jump_backward(JUMP_BACKWARD, restart, 0)?;
+                return Ok(());
+            }
             if self.control.generator_region_start.is_none()
                 && let Expr::Compare(comparison) = statement.test.as_ref()
                 && comparison.ops.len() > 1
@@ -2679,7 +2731,13 @@ impl Compiler {
             // therefore remain forward instead of splitting directly around the loop edge.
             let nested_tail = self.compile_with_strict_owned_loads(
                 test.is_some_and(|test| matches!(test, Expr::If(_))),
-                |compiler| compiler.compile_loop_tail_suite(body, restart, false),
+                |compiler| {
+                    if test.is_some() {
+                        compiler.compile_non_final_branch_loop_tail_suite(body, restart)
+                    } else {
+                        compiler.compile_loop_tail_suite(body, restart, false)
+                    }
+                },
             )?;
             if nested_tail == LoopBackedge::Required && !suite_terminates(body) {
                 if let Some(location) = self.assembler.last_instruction_location() {
