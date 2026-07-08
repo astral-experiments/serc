@@ -2479,38 +2479,7 @@ impl Compiler {
     ) -> Result<(), CompileError> {
         let base_depth = self.control.depth;
         let failure = self.assembler.label();
-        let exclude_not_taken = !self.control.active_with_region_exclusions.is_empty();
-        self.with_control_override(
-            |control| &mut control.exclude_terminal_if_not_taken,
-            exclude_not_taken,
-            |compiler| {
-                if let Expr::BoolOp(boolean) = statement.test.as_ref()
-                    && boolean.op == BoolOp::Or
-                    && let Some((last, leading)) = boolean.values.split_last()
-                {
-                    for value in leading {
-                        let next = compiler.assembler.label();
-                        compiler.compile_jump_if(value, false, next)?;
-                        compiler
-                            .assembler
-                            .set_location(compiler.source_location(value.range()));
-                        compiler.emit_jump_backward(JUMP_BACKWARD, restart, 0)?;
-                        compiler.assembler.mark(next);
-                    }
-                    compiler.compile_jump_if(last, false, failure)?;
-                    compiler
-                        .assembler
-                        .set_location(compiler.source_location(last.range()));
-                } else {
-                    compiler.compile_jump_if(&statement.test, false, failure)?;
-                    compiler
-                        .assembler
-                        .set_location(compiler.source_location(statement.test.range()));
-                }
-                Ok(())
-            },
-        )?;
-        self.emit_jump_backward(JUMP_BACKWARD, restart, 0)?;
+        self.compile_loop_tail_condition(&statement.test, false, failure, restart)?;
 
         self.assembler.mark(failure);
         self.set_depth(base_depth);
