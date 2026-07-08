@@ -6,7 +6,9 @@ use ruff_text_size::Ranged;
 use crate::assembler::SourceLocation;
 use crate::code_object::Constant;
 use crate::target::code_flags::{CO_FUTURE_ANNOTATIONS, CO_FUTURE_BARRY_AS_BDFL};
-use crate::target::opcodes::{BUILD_TUPLE, LOAD_CONST, RAISE_VARARGS, RERAISE, RETURN_VALUE};
+use crate::target::opcodes::{
+    BUILD_TUPLE, LOAD_CONST, NOT_TAKEN, RAISE_VARARGS, RERAISE, RETURN_VALUE,
+};
 
 use super::definition::clean_doc;
 use super::scope::{FunctionPlan, NameId, NameInterner, ScopeBodyFacts};
@@ -832,6 +834,73 @@ fn source_positions_preserve_crlf_boundaries_and_eof() {
     assert_eq!(compiler.source_position(10), (3, 0));
     assert_eq!(compiler.source_position(5), (2, 0));
     assert_eq!(compiler.source_position(u32::MAX), (3, 0));
+}
+
+#[test]
+fn comparison_markers_distinguish_forward_and_threaded_loop_fallthroughs() {
+    fn read_exception_varint(table: &[u8], index: &mut usize) -> u32 {
+        let mut byte = table[*index];
+        *index += 1;
+        let mut value = u32::from(byte & 0x3f);
+        while byte & 0x40 != 0 {
+            byte = table[*index];
+            *index += 1;
+            value = (value << 6) | u32::from(byte & 0x3f);
+        }
+        value
+    }
+
+    let source = r"def f(container1, container2):
+    a_idx, b_idx = 0, 0
+    max_a, max_b = len(container1), len(container2)
+    while a_idx < max_a and b_idx < max_b:
+        if container1[a_idx] == container2[b_idx]:
+            yield (container1[a_idx], container2[b_idx])
+            a_idx += 1
+            b_idx += 1
+        else:
+            while container1[a_idx] < container2[b_idx]:
+                a_idx += 1
+            while container1[a_idx] > container2[b_idx]:
+                b_idx += 1
+";
+    let parsed = parse_module(source).unwrap();
+    let module = module_compiler(source, &parsed)
+        .compile_module(parsed.suite())
+        .unwrap();
+    let function = module
+        .constants
+        .iter()
+        .find_map(|constant| match constant {
+            Constant::Code(code) if code.name == "f" => Some(code),
+            _ => None,
+        })
+        .expect("module should contain f");
+
+    let mut ranges = Vec::new();
+    let mut index = 0;
+    while index < function.exception_table.len() {
+        let start = read_exception_varint(&function.exception_table, &mut index);
+        let length = read_exception_varint(&function.exception_table, &mut index);
+        read_exception_varint(&function.exception_table, &mut index);
+        read_exception_varint(&function.exception_table, &mut index);
+        ranges.push(start..start + length);
+    }
+    let marker_owners = function
+        .bytecode
+        .chunks_exact(2)
+        .enumerate()
+        .filter(|(_, instruction)| instruction[0] == NOT_TAKEN.code())
+        .map(|(offset, _)| {
+            let offset = u32::try_from(offset).unwrap();
+            ranges.iter().any(|range| range.contains(&offset))
+        })
+        .collect::<Vec<_>>();
+
+    // CPython appends the first four markers to compacted forward-jump blocks, reusing their
+    // stale generator owner. The final nested while exit threads to the outer backedge first,
+    // so jump normalization creates its marker in a fresh, ownerless block.
+    assert_eq!(marker_owners, [true, true, true, true, false]);
 }
 
 #[test]
