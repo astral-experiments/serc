@@ -241,6 +241,52 @@ fn local_collection_includes_decorator_bindings_and_delete_targets() {
 }
 
 #[test]
+fn local_collection_includes_direct_definition_header_bindings() {
+    let source = r"def bindings():
+    @decorator
+    def function(positional=(function_target := function_source), *, keyword=keyword_source):
+        pass
+
+    @class_decorator
+    class Class((base_target := base_source), metaclass=metaclass_source):
+        pass
+
+    function_source = keyword_source = None
+    base_source = object
+    metaclass_source = type
+    decorator = class_decorator = identity
+";
+    let parsed = parse_module(source).unwrap();
+    let module = module_compiler(source, &parsed)
+        .compile_module(parsed.suite())
+        .unwrap();
+    let function = module
+        .constants
+        .iter()
+        .find_map(|constant| match constant {
+            Constant::Code(code) if code.name == "bindings" => Some(code),
+            _ => None,
+        })
+        .expect("module should contain the function body");
+
+    assert_eq!(
+        function.locals,
+        [
+            "decorator",
+            "function_source",
+            "function_target",
+            "keyword_source",
+            "function",
+            "class_decorator",
+            "base_source",
+            "base_target",
+            "metaclass_source",
+            "Class",
+        ]
+    );
+}
+
+#[test]
 fn symbol_name_ids_preserve_mangled_cell_and_freevar_order() {
     let source = r"class ____Container:
     def outer(self):
