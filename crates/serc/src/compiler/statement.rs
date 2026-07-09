@@ -1420,7 +1420,13 @@ impl Compiler {
 
         self.assembler.mark(otherwise);
         self.set_depth(base_depth);
-        self.compile_expression(&expression.orelse)?;
+        let direct_else_name = matches!(expression.orelse.as_ref(), Expr::Name(_));
+        self.compile_with_strict_owned_loads(direct_else_name, |compiler| {
+            compiler.compile_expression(&expression.orelse)
+        })?;
+        if direct_else_name {
+            self.assembler.prevent_last_instruction_fusion();
+        }
         if preserve_fallthrough_join_nop {
             self.assembler
                 .set_location(self.source_location(expression.orelse.range()));

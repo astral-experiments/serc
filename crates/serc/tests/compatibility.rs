@@ -2619,7 +2619,7 @@ def keyword_unpacking():
 
     #[test]
     fn matches_cpython_marshal_for_branch_result_ownership() {
-        let source = "def ternary(name, suffix):\n    return name[:-len(suffix)] if name.endswith(suffix) else name\n\ndef simple(condition, left, right):\n    return left if condition else right\n\ndef boolean(left, right):\n    return left or right\n\ndef nested(condition, name):\n    return name.upper() if condition else name\n\ndef nested_boolean(left, middle, right):\n    return (left and middle) or right, (left or middle) and right\n\ndef folded_annotation(arg: 2 or None | int):\n    pass\n\nlambda_conditional = lambda condition, left, right: left if condition else right\nlambda_boolean = lambda left, right: left or right\nmodule_boolean = (left and middle) or right\n";
+        let source = "def ternary(name, suffix):\n    return name[:-len(suffix)] if name.endswith(suffix) else name\n\ndef simple(condition, left, right):\n    return left if condition else right\n\ndef terminal_attribute(condition, holder, left, right):\n    holder.value = left.value if condition else right\n\ndef boolean(left, right):\n    return left or right\n\ndef nested(condition, name):\n    return name.upper() if condition else name\n\ndef nested_boolean(left, middle, right):\n    return (left and middle) or right, (left or middle) and right\n\ndef folded_annotation(arg: 2 or None | int):\n    pass\n\nlambda_conditional = lambda condition, left, right: left if condition else right\nlambda_boolean = lambda left, right: left or right\nmodule_boolean = (left and middle) or right\n";
         assert_matches_cpython_marshal(source, "ownership.py");
     }
 
