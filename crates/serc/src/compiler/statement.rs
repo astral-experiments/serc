@@ -3193,11 +3193,12 @@ impl Compiler {
 
         self.assembler.mark(else_label);
         self.set_depth(base_depth);
-        // CPython omits the protected-region exit marker when another statement follows the
-        // while in the same suite.
+        // CPython keeps the converted with-body POP_BLOCK marker only when the while condition
+        // contributes one edge to the normal exit.
         if statement.orelse.is_empty()
             && !self.control.current_statement_has_following
             && !self.control.active_with_region_exclusions.is_empty()
+            && condition_jump_target_count(&statement.test, false) == 1
         {
             let exclusion_start = self.assembler.label();
             self.assembler.mark(exclusion_start);

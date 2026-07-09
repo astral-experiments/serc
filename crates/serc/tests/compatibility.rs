@@ -672,6 +672,38 @@ async def followed_async(manager, flag):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_final_while_exit_markers_in_with_bodies() {
+        let source = r"def single_exit(manager, flag):
+    with manager:
+        while flag:
+            step()
+    outside()
+
+
+def multiple_condition_exits(manager, first, second):
+    with manager:
+        while first and second:
+            step()
+    outside()
+
+
+def chained_comparison(manager, low, value, high):
+    with manager:
+        while low < value < high:
+            step()
+    outside()
+
+
+def conditional_expression(manager, condition, first, second):
+    with manager:
+        while first if condition else second:
+            step()
+    outside()
+";
+        assert_matches_cpython_marshal(source, "final_while_with.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_unary_not_synthetic_exit_locations() {
         let source = r"def branch_join(flag):
     if flag:
