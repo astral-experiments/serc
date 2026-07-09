@@ -280,7 +280,23 @@ impl OptimizationPipeline {
 }
 
 impl LayoutAssembler {
-    fn finish(self, first_line_number: u32) -> Result<AssembledCode, CompileError> {
+    /// Resolves CPython-style `NEXT_LOCATION` markers after CFG optimization.
+    fn resolve_next_locations(&mut self) {
+        let mut next_location = None;
+        for item in self.items.iter_mut().rev() {
+            let Item::Instruction(instruction) = item else {
+                continue;
+            };
+            if instruction.location_from_next {
+                instruction.location = next_location.unwrap_or(super::SourceLocation::NONE);
+                instruction.location_from_next = false;
+            }
+            next_location = Some(instruction.location);
+        }
+    }
+
+    fn finish(mut self, first_line_number: u32) -> Result<AssembledCode, CompileError> {
+        self.resolve_next_locations();
         let instruction_count = self
             .items
             .iter()

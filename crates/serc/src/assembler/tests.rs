@@ -22,6 +22,7 @@ fn instruction_constructors_set_audited_defaults() {
     assert_eq!(regular.load_policy, LoadPolicy::default());
     assert_eq!(regular.no_location_policy, NoLocationPolicy::default());
     assert_eq!(regular.fusion_policy, FusionPolicy::default());
+    assert!(!regular.location_from_next);
     assert!(!regular.converted_pop_block);
     assert_eq!(regular.hidden_exception_owner_slots, 0);
     assert_eq!(regular.jump_policy, JumpPolicy::default());
@@ -535,6 +536,28 @@ fn fusion_preserves_each_typed_instruction_policy() {
             normalized_owner: NormalizedExceptionOwner::Absent,
         }
     );
+
+    let mut next_first = Instruction::new(
+        LOAD_FAST,
+        Operand::Value(1),
+        SourceLocation::new(3, 3, 0, 1),
+        None,
+    );
+    next_first.location_from_next = true;
+    let next_second = Instruction::new(
+        LOAD_FAST,
+        Operand::Value(2),
+        SourceLocation::new(4, 4, 0, 1),
+        None,
+    );
+    let fused_next = Instruction::fused(
+        LOAD_FAST_LOAD_FAST,
+        Operand::Value(0x12),
+        next_first,
+        next_second,
+    );
+    assert_eq!(fused_next.location, next_second.location);
+    assert!(!fused_next.location_from_next);
 
     let mut first_edge = Instruction::new(LOAD_FAST, Operand::Value(1), SourceLocation::NONE, None);
     first_edge.fusion_policy.prevent_with_previous = true;

@@ -289,6 +289,7 @@ impl Compiler {
                         }),
                     );
                     self.emit(POP_TOP, 0, -1)?;
+                    self.assembler.use_next_location_for_last_instruction();
                 }
                 let body_previous_location = self.assembler.last_instruction_location();
                 let body_start = self.assembler.instruction_count();
