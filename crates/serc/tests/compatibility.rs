@@ -199,6 +199,41 @@ mod tests {
     }
 
     #[test]
+    fn matches_cpython_marshal_for_match_success_next_locations() {
+        let source = r"def tuple_result(subject):
+    match subject:
+        case 1:
+            return make_first(), make_second()
+        case 2:
+            raise Failure()
+        case _:
+            return None
+
+async def await_result(subject):
+    match subject:
+        case 1:
+            value = await produce()
+            return value
+        case 2:
+            await consume()
+        case _:
+            return None
+
+def nested_match(subject, nested):
+    match subject:
+        case 1:
+            match nested:
+                case 2:
+                    return [nested]
+                case _:
+                    return []
+        case _:
+            return None
+";
+        assert_matches_cpython_marshal(source, "match_success_next_location.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_class_footer_control_flow() {
         let source = "class WithFooter:\n    with manager:\n        def method(self): ...\n\nclass WildcardFooter:\n    match value:\n        case int(): ...\n        case _:\n            def method(self): ...\n\nclass FoldedBranchFooter:\n    if ...:\n        ...\n    else:\n        with manager:\n            for value in values:\n                def method(self): ...\n";
         assert_matches_cpython_marshal(source, "class_footer.py");

@@ -562,6 +562,13 @@ impl Assembler {
             .preserve = true;
     }
 
+    /// Gives the last instruction its final successor's location after optimization.
+    /// This mirrors CPython's `NEXT_LOCATION` pseudo-location.
+    pub(crate) fn use_next_location_for_last_instruction(&mut self) {
+        self.required_last_instruction_mut("using the next instruction location")
+            .location_from_next = true;
+    }
+
     pub(crate) fn mark_last_as_converted_pop_block(&mut self) {
         self.required_last_instruction_mut("marking a converted POP_BLOCK")
             .converted_pop_block = true;

@@ -384,6 +384,9 @@ pub(super) struct Instruction {
     pub(super) opcode: Opcode,
     pub(super) operand: Operand,
     pub(super) location: SourceLocation,
+    // CPython resolves `NEXT_LOCATION` only after CFG optimization and instruction reordering.
+    // Keep that provenance separate from the provisional source location used by earlier passes.
+    pub(super) location_from_next: bool,
     pub(super) depth_after: Option<u32>,
     pub(super) load_policy: LoadPolicy,
     pub(super) no_location_policy: NoLocationPolicy,
@@ -412,6 +415,7 @@ impl Instruction {
             opcode,
             operand,
             location,
+            location_from_next: false,
             depth_after,
             load_policy: LoadPolicy::default(),
             no_location_policy: NoLocationPolicy::default(),
@@ -450,10 +454,16 @@ impl Instruction {
 
     /// Combines the provenance of two instructions replaced by one superinstruction.
     pub(super) fn fused(opcode: Opcode, operand: Operand, first: Self, second: Self) -> Self {
+        let (location, location_from_next) = if first.location_from_next {
+            (second.location, second.location_from_next)
+        } else {
+            (first.location, false)
+        };
         Self {
             opcode,
             operand,
-            location: first.location,
+            location,
+            location_from_next,
             depth_after: second.depth_after,
             load_policy: LoadPolicy::fused(first.load_policy, second.load_policy),
             no_location_policy: NoLocationPolicy::fused(
