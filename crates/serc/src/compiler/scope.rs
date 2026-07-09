@@ -1517,6 +1517,9 @@ impl LocalCollector {
                 }
                 Stmt::Try(statement) => {
                     self.collect_suite(&statement.body);
+                    // CPython emits the normal else path before moving exception handlers into
+                    // cold blocks, so locals first bound there precede handler-only locals.
+                    self.collect_suite(&statement.orelse);
                     for handler in &statement.handlers {
                         if let Some(handler) = handler.as_except_handler() {
                             if let Some(name) = &handler.name {
@@ -1528,7 +1531,6 @@ impl LocalCollector {
                             self.collect_suite(&handler.body);
                         }
                     }
-                    self.collect_suite(&statement.orelse);
                     self.collect_suite(&statement.finalbody);
                 }
                 Stmt::With(statement) => {

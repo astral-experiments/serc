@@ -2899,6 +2899,29 @@ def decorated():
     }
 
     #[test]
+    fn matches_cpython_marshal_for_try_else_local_order() {
+        let source = r"def ordered():
+    try:
+        initial = produce()
+    except Exception as error:
+        handler_only = fallback()
+        result = handler_only
+    else:
+        result = success(initial)
+    return result
+
+
+def no_else_control():
+    try:
+        initial = produce()
+    except Exception as error:
+        handler_only = fallback()
+    return initial
+";
+        assert_matches_cpython_marshal(source, "try_else_local_order.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_multiline_conditional_expressions() {
         let source = "value = (\n    'body'\n    if True\n    else 'otherwise'\n)\n\ndef nested():\n    target.attribute = (\n        (first if inner else second)\n        if outer\n        else third\n    )\n";
         assert_matches_cpython_marshal(source, "conditional_expression.py");
