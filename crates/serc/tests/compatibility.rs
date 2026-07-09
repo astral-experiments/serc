@@ -2792,6 +2792,164 @@ def ordinary_guard(value):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_empty_try_exit_borrow_boundaries() {
+        let source = r"def fallthrough_if(value, flag):
+    try:
+        if flag:
+            consume()
+    except Exception:
+        pass
+    consume(value)
+    return value
+
+
+def terminal_if(value, flag):
+    try:
+        if flag:
+            return value
+    except Exception:
+        pass
+    consume(value)
+    return value
+
+
+def followed_in_try(value, flag):
+    try:
+        if flag:
+            consume()
+        other()
+    except Exception:
+        pass
+    consume(value)
+    return value
+
+
+def plain_try(value):
+    try:
+        consume()
+    except Exception:
+        pass
+    consume(value)
+    return value
+
+
+def shared_outer_join(value, flag, outer):
+    if outer:
+        try:
+            if flag:
+                consume()
+        except Exception:
+            pass
+    consume(value)
+    return value
+
+
+def unthreaded_nested_if(value, flag, inner):
+    try:
+        if flag:
+            if inner:
+                return value
+            else:
+                consume()
+    except Exception:
+        pass
+    consume(value)
+    return value
+";
+        assert_matches_cpython_marshal(source, "empty_try_exit_borrow.py");
+    }
+
+    #[test]
+    fn uses_cpython_borrow_kinds_for_threaded_empty_try_exits() {
+        let source = r#"import dis
+
+
+def threaded_nested_try(value, flag):
+    try:
+        if flag:
+            try:
+                consume()
+            except ValueError:
+                pass
+    except Exception:
+        pass
+    consume(value)
+
+
+def threaded_nested_with(value, flag, manager):
+    try:
+        if flag:
+            with manager:
+                consume()
+    except Exception:
+        pass
+    consume(value)
+
+
+def threaded_nested_if(value, flag, inner):
+    try:
+        if flag:
+            if inner:
+                consume()
+            else:
+                other()
+    except Exception:
+        pass
+    consume(value)
+
+
+def threaded_loop_break(value, flag, inner, items):
+    try:
+        if flag:
+            for item in items:
+                if inner:
+                    break
+                consume(item)
+    except Exception:
+        pass
+    consume(value)
+
+
+def threaded_match(value, flag, subject):
+    try:
+        if flag:
+            match subject:
+                case True:
+                    consume()
+                case _:
+                    other()
+    except Exception:
+        pass
+    consume(value)
+
+
+def value_load(function):
+    loads = [
+        instruction.opname
+        for instruction in dis.get_instructions(function)
+        if instruction.argval == "value"
+        and instruction.opname.startswith("LOAD_FAST")
+    ]
+    assert len(loads) == 1, loads
+    return loads[0]
+
+
+for function in (
+    threaded_nested_try,
+    threaded_nested_with,
+    threaded_nested_if,
+    threaded_loop_break,
+    threaded_match,
+):
+    print(value_load(function))
+"#;
+        assert_executes(
+            source,
+            "LOAD_FAST_BORROW\nLOAD_FAST_BORROW\nLOAD_FAST_BORROW\nLOAD_FAST_BORROW\nLOAD_FAST_BORROW\n",
+        );
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_borrowing_after_constant_loop_breaks() {
         let source = r"def unprotected(flag, result):
     while True:

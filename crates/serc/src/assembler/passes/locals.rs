@@ -366,6 +366,7 @@ impl OptimizationPipeline {
                 !matches!(instruction.operand, Operand::Value(_))
                     || ends_scope(instruction.opcode)
                     || (instruction.opcode == NOP && instruction.jump_policy.always_retains_nop())
+                    || instruction.jump_policy.borrow_empty_block()
                     || instruction.borrow_fallthrough == BorrowFallthrough::Barrier
             },
         );
@@ -402,7 +403,8 @@ impl OptimizationPipeline {
             let Some(last) = graph[block].last_instruction() else {
                 continue;
             };
-            let borrow_traversal_stops = last.borrow_fallthrough == BorrowFallthrough::Barrier;
+            let borrow_traversal_stops = last.borrow_fallthrough == BorrowFallthrough::Barrier
+                || last.jump_policy.borrow_empty_block();
             let folded_jump_has_no_fallthrough =
                 last.opcode == NOP && last.jump_policy.always_retains_nop();
             if !borrow_traversal_stops
@@ -673,6 +675,24 @@ impl OptimizationPipeline {
                     }
                     _ => {}
                 }
+            }
+        }
+    }
+
+    pub(in crate::assembler) fn remove_borrow_empty_block_markers(&mut self) {
+        let graph = &mut self.graph;
+        let blocks = graph.order().to_vec();
+        for block in blocks {
+            graph.retain_items(block, |item| {
+                !matches!(
+                    item,
+                    Item::Instruction(instruction)
+                        if instruction.opcode == NOP
+                            && instruction.jump_policy.borrow_empty_block()
+                )
+            });
+            for instruction in graph.instructions_mut(block) {
+                instruction.jump_policy.clear_borrow_empty_block();
             }
         }
     }

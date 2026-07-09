@@ -480,6 +480,7 @@ fn fusion_preserves_each_typed_instruction_policy() {
     first.jump_policy.prevent_threading_target();
     first.jump_policy.defer_removal();
     first.jump_policy.retain_nop();
+    first.jump_policy.mark_borrow_empty_block();
     first
         .exception_policy
         .exclude(ExceptionExclusion::IfExtended);
@@ -527,6 +528,7 @@ fn fusion_preserves_each_typed_instruction_policy() {
     expected_jump_policy.prevent_small_exit_inlining();
     expected_jump_policy.prevent_threading_target();
     expected_jump_policy.retain_redundant_nop_after_threading();
+    expected_jump_policy.mark_borrow_empty_block();
     assert_eq!(fused.jump_policy, expected_jump_policy);
     assert_eq!(fused.borrow_fallthrough, BorrowFallthrough::Barrier);
     assert_eq!(
@@ -921,7 +923,7 @@ fn redundant_jump_removal_preserves_borrow_traversal_barrier() {
         pass_instruction(RETURN_VALUE, 0, 1),
     ]);
 
-    assembler.remove_redundant_forward_jumps();
+    assembler.remove_redundant_forward_jumps(true);
 
     let instructions = assembler
         .graph
@@ -938,6 +940,53 @@ fn redundant_jump_removal_preserves_borrow_traversal_barrier() {
         BorrowFallthrough::Barrier
     );
     assert_eq!(instructions[1].opcode, RETURN_VALUE);
+}
+
+#[test]
+fn borrow_empty_block_marker_survives_until_local_analysis() {
+    let target = super::Label(0);
+    let mut jump = Instruction::new(
+        JUMP_FORWARD,
+        Operand::Forward(target),
+        SourceLocation::NONE,
+        None,
+    );
+    jump.jump_policy.mark_borrow_empty_block();
+    let mut assembler = optimization_pipeline(vec![
+        pass_instruction(LOAD_CONST, 0, 1),
+        Item::Instruction(jump),
+        Item::Label(target),
+        pass_instruction(RETURN_VALUE, 0, 1),
+    ]);
+
+    assembler.remove_redundant_forward_jumps(false);
+    let retained = assembler
+        .graph
+        .iter_items()
+        .find_map(|item| match item {
+            Item::Instruction(instruction) if instruction.jump_policy.borrow_empty_block() => {
+                Some(instruction)
+            }
+            Item::Instruction(_) | Item::Label(_) => None,
+        })
+        .unwrap();
+    assert_eq!(retained.opcode, JUMP_FORWARD);
+
+    assembler.remove_redundant_forward_jumps(true);
+    let marker = assembler
+        .graph
+        .iter_items()
+        .find_map(|item| match item {
+            Item::Instruction(instruction) if instruction.jump_policy.borrow_empty_block() => {
+                Some(instruction)
+            }
+            Item::Instruction(_) | Item::Label(_) => None,
+        })
+        .unwrap();
+    assert_eq!(marker.opcode, NOP);
+
+    assembler.remove_borrow_empty_block_markers();
+    assert_eq!(graph_opcodes(&assembler), [LOAD_CONST, RETURN_VALUE]);
 }
 
 #[test]

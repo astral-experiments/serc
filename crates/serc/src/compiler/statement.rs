@@ -3694,6 +3694,9 @@ impl Compiler {
                 .as_except_handler()
                 .is_some_and(|handler| suite_terminates(&handler.body))
         });
+        let normal_exit_starts_in_empty_block = self.control.current_statement_has_following
+            && statement.orelse.is_empty()
+            && suite_ends_in_empty_try_exit_block(&statement.body);
         // CPython removes the with handler's normal-exit edge before borrowed-load traversal,
         // so a following suite cannot reach this try join through that edge.
         if self.control.current_statement_has_following
@@ -3920,6 +3923,9 @@ impl Compiler {
                 ExceptionPolicy::default()
             };
             self.emit_jump_forward_with_exception_policy(JUMP_FORWARD, end, 0, exception_policy)?;
+            if normal_exit_starts_in_empty_block {
+                self.assembler.mark_last_borrow_empty_block();
+            }
             if handlers_terminate {
                 // CPython removes this normal-exit edge before borrowed-load traversal. Keep
                 // the barrier on the source edge so a shared target can still be reached from
@@ -6296,6 +6302,47 @@ pub(super) fn suite_contains_yield(body: &[Stmt]) -> bool {
     }
     collector.found
 }
+// A final fallthrough `if` without an `else` leaves CPython's normal try-exit block empty.
+fn suite_ends_in_empty_try_exit_block(body: &[Stmt]) -> bool {
+    let Some(Stmt::If(statement)) = body.last() else {
+        return false;
+    };
+    statement.elif_else_clauses.is_empty()
+        && !suite_terminates(&statement.body)
+        && !statement
+            .body
+            .last()
+            .is_some_and(statement_threads_through_empty_join)
+}
+
+// CPython threads these nested compound-statement exits through a following empty `if` join.
+// That gives borrowed-load traversal another route to the suite after the enclosing `try`.
+fn statement_threads_through_empty_join(statement: &Stmt) -> bool {
+    match statement {
+        Stmt::Try(_) | Stmt::With(_) => true,
+        Stmt::If(statement) => {
+            !statement.elif_else_clauses.is_empty()
+                && std::iter::once(statement.body.as_slice())
+                    .chain(
+                        statement
+                            .elif_else_clauses
+                            .iter()
+                            .take(statement.elif_else_clauses.len() - 1)
+                            .map(|clause| clause.body.as_slice()),
+                    )
+                    .any(|body| !suite_terminates(body))
+        }
+        Stmt::For(statement) => suite_contains_loop_break(&statement.body),
+        Stmt::While(statement) => suite_contains_loop_break(&statement.body),
+        Stmt::Match(statement) => statement
+            .cases
+            .iter()
+            .take(statement.cases.len().saturating_sub(1))
+            .any(|case| !suite_terminates(&case.body)),
+        _ => false,
+    }
+}
+
 fn statement_terminates(statement: &Stmt) -> bool {
     match statement {
         Stmt::Break(_) | Stmt::Continue(_) | Stmt::Return(_) | Stmt::Raise(_) => true,

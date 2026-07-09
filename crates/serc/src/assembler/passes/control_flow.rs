@@ -376,7 +376,10 @@ impl OptimizationPipeline {
         }
     }
 
-    pub(in crate::assembler) fn remove_redundant_forward_jumps(&mut self) {
+    pub(in crate::assembler) fn remove_redundant_forward_jumps(
+        &mut self,
+        finalize_borrow_empty_blocks: bool,
+    ) {
         let graph = &mut self.graph;
         if !graph.iter_items().any(|item| {
             matches!(
@@ -420,12 +423,25 @@ impl OptimizationPipeline {
                 index += 1;
                 continue;
             }
+            if instruction.jump_policy.borrow_empty_block() && !finalize_borrow_empty_blocks {
+                index += 1;
+                continue;
+            }
             let target_is_next = items[index + 1..]
                 .iter()
                 .map(|(_, item)| item)
                 .take_while(|item| matches!(item, Item::Label(_)))
                 .any(|item| matches!(item, Item::Label(label) if *label == target));
             if !target_is_next {
+                index += 1;
+                continue;
+            }
+            if instruction.jump_policy.borrow_empty_block() {
+                let Item::Instruction(instruction) = &mut items[index].1 else {
+                    unreachable!();
+                };
+                instruction.opcode = NOP;
+                instruction.operand = Operand::Value(0);
                 index += 1;
                 continue;
             }
