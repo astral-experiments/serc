@@ -262,15 +262,7 @@ impl OptimizationPipeline {
     /// location on some intervening jumps, so recover the earlier location from the jump's
     /// preceding instruction or, for a split jump block, its sole predecessor.
     pub(in crate::assembler) fn resolve_synthesized_conditional_target_locations(&mut self) {
-        if !self.graph.order().iter().copied().any(|block| {
-            self.graph[block].items().iter().any(|item| {
-                matches!(
-                    item,
-                    Item::Instruction(instruction)
-                        if instruction.no_location_policy.inherit_conditional_target
-                )
-            })
-        }) {
+        if !self.has_synthesized_percent_target_locations {
             return;
         }
 
@@ -345,7 +337,7 @@ impl OptimizationPipeline {
             let Some(first) = self.graph.instructions_mut(target).next() else {
                 continue;
             };
-            if !first.no_location_policy.inherit_conditional_target {
+            if first.no_location_policy.percent_target_location != u8::MAX {
                 continue;
             }
             if first.location.line < 0 {
@@ -357,6 +349,103 @@ impl OptimizationPipeline {
                     location = *source_predecessor_location;
                 }
                 first.location = location;
+            }
+            first.no_location_policy.percent_target_location = 0;
+        }
+    }
+
+    /// Defers synthesized percent literals that begin a sole fallthrough target.
+    ///
+    /// CPython's early line-number propagation gives the target's leading unlocated
+    /// instruction the last located instruction from its only predecessor. Handler and
+    /// try-else body labels create this shape before later CFG optimization.
+    pub(in crate::assembler) fn defer_synthesized_fallthrough_locations(
+        &mut self,
+    ) -> Vec<SourceLocation> {
+        if !self.has_synthesized_percent_target_locations {
+            return Vec::new();
+        }
+        let order = self.graph.order().to_vec();
+        let Some(maximum_block) = order.iter().map(|block| block.index()).max() else {
+            return Vec::new();
+        };
+        let mut predecessors = vec![0_usize; maximum_block + 1];
+        predecessors[order[0].index()] = 1;
+        for (position, source) in order.iter().copied().enumerate() {
+            if block_has_fallthrough(self.graph[source].items())
+                && let Some(target) = order.get(position + 1)
+            {
+                predecessors[target.index()] += 1;
+            }
+            if let Some(target) = block_jump_target(self.graph[source].items())
+                .and_then(|label| self.graph.label_block(label))
+            {
+                predecessors[target.index()] += 1;
+            }
+        }
+
+        let mut locations = Vec::new();
+        for blocks in order.windows(2) {
+            let [source, target] = blocks else {
+                unreachable!();
+            };
+            if predecessors[target.index()] != 1
+                || !block_has_fallthrough(self.graph[*source].items())
+            {
+                continue;
+            }
+            let Some(location) =
+                self.graph[*source]
+                    .items()
+                    .iter()
+                    .rev()
+                    .find_map(|item| match item {
+                        Item::Instruction(instruction) if instruction.location.line >= 0 => {
+                            Some(instruction.location)
+                        }
+                        Item::Instruction(_) | Item::Label(_) => None,
+                    })
+            else {
+                continue;
+            };
+            let Some(first) = self.graph.instructions_mut(*target).next() else {
+                continue;
+            };
+            if first.location.line >= 0
+                || first.no_location_policy.percent_target_location != u8::MAX
+            {
+                continue;
+            }
+            let Ok(id) = u8::try_from(locations.len() + 1) else {
+                continue;
+            };
+            // Keep the all-ones value as the unresolved marker. If a single code object
+            // contains more candidates than the compact side table can represent, leaving
+            // the remainder unlocated preserves the compiler's existing behavior.
+            if id == u8::MAX {
+                continue;
+            }
+            locations.push(location);
+            first.no_location_policy.percent_target_location = id;
+        }
+        locations
+    }
+
+    /// Applies locations selected before CFG optimization without affecting opcode transforms.
+    pub(in crate::assembler) fn resolve_deferred_fallthrough_locations(
+        &mut self,
+        locations: &[SourceLocation],
+    ) {
+        for block in self.graph.order().to_vec() {
+            for instruction in self.graph.instructions_mut(block) {
+                let id = instruction.no_location_policy.percent_target_location;
+                instruction.no_location_policy.percent_target_location = 0;
+                if id == 0 || id == u8::MAX || instruction.location.line >= 0 {
+                    continue;
+                }
+                if let Some(location) = locations.get(usize::from(id - 1)) {
+                    instruction.location = *location;
+                }
             }
         }
     }

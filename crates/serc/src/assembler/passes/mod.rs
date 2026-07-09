@@ -197,6 +197,7 @@ impl Assembler {
             exception_regions: self.exception_regions,
             preserved_block_boundaries: self.preserved_block_boundaries,
             borrow_unreachable_blocks: self.borrow_unreachable_blocks,
+            has_synthesized_percent_target_locations: self.has_synthesized_percent_target_locations,
         }
     }
 }
@@ -217,6 +218,7 @@ impl OptimizationPipeline {
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::RemoveUnreachableInitial)?;
         self.resolve_synthesized_conditional_target_locations();
+        let synthesized_fallthrough_locations = self.defer_synthesized_fallthrough_locations();
         self.optimize_boolean_conversions();
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::OptimizeBooleanConversions)?;
@@ -271,6 +273,7 @@ impl OptimizationPipeline {
         self.remove_borrow_empty_block_markers();
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::OptimizeLoadFast)?;
+        self.resolve_deferred_fallthrough_locations(&synthesized_fallthrough_locations);
         Ok(LayoutAssembler {
             items: self.graph.into_items(),
             exception_regions: self.exception_regions,
