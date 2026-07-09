@@ -1438,6 +1438,47 @@ def multiple_normal_predecessors(manager):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_handler_fed_pop_blocks_in_synchronous_with_bodies() {
+        let source = r"def named(manager):
+    with manager:
+        try:
+            raise Other
+        except Error as error:
+            recover(error)
+
+def unnamed(manager):
+    with manager:
+        try:
+            raise Error
+        except Error:
+            recover()
+
+def assertion(manager, condition):
+    with manager:
+        try:
+            raise Other
+        except Error:
+            assert condition
+
+def body_falls_through(manager):
+    with manager:
+        try:
+            action()
+        except Error:
+            recover()
+
+def terminal_loop(manager):
+    with manager:
+        try:
+            while True:
+                action()
+        except Error:
+            pass
+";
+        assert_matches_cpython_marshal(source, "with_handler_fed_pop_block.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_trailing_finally_exits_in_synchronous_with_bodies() {
         let source = r"def direct(manager):
     with manager:
