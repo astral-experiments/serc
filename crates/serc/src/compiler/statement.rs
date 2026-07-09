@@ -3123,9 +3123,10 @@ impl Compiler {
     ) -> Result<(), CompileError> {
         let base_depth = self.control.depth;
         if let Some(truthiness) = early_condition_truthiness(&statement.test) {
-            if self.output.constants.is_empty()
-                && let Some(constant) = fold_constant(&statement.test)
-            {
+            // CPython interns a folded loop test before compiling the body, even though the
+            // optimized condition emits no load. Unused nonzero constants are pruned later;
+            // if the value is used in the body, this preserves its source-order slot.
+            if let Some(constant) = fold_constant(&statement.test) {
                 self.add_constant(constant)?;
             }
             if !truthiness {

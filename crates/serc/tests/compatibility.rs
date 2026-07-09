@@ -1645,6 +1645,39 @@ def iteration(items, flag):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_folded_while_constant_order() {
+        let source = r#"async def empty_pool_retained(action, consume):
+    while True:
+        await action()
+        consume(flag=True)
+
+async def prefixed_unused(action):
+    "doc"
+    while True:
+        await action()
+
+async def prefixed_retained(action, consume):
+    "doc"
+    while True:
+        await action()
+        consume(flag=True)
+
+async def prefixed_retained_assignment(action):
+    "doc"
+    while True:
+        await action()
+        marker = True
+
+async def await_before_loop(action, consume):
+    await action()
+    while True:
+        await action()
+        consume(flag=True)
+"#;
+        assert_matches_cpython_marshal(source, "folded_while_constant_order.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_async_comprehension_cleanup_exits() {
         let source = "async def discarded():\n    [item async for item in source]\n\nasync def returned():\n    return [item async for item in source]\n";
         assert_matches_cpython_marshal(source, "async_comprehension.py");
