@@ -1719,6 +1719,61 @@ async def await_before_loop(action, consume):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_loop_tail_condition_orientation() {
+        let source = r"def terminal_while_break():
+    while True:
+        value = step()
+        if stop(value):
+            break
+        if condition(value):
+            consume(value)
+
+def terminal_while_compound_control():
+    while True:
+        value = step()
+        if stop(value):
+            break
+        if condition(value):
+            consume(value)
+        else:
+            reject(value)
+
+def nonfinal_nested_while(items):
+    for item in items:
+        if first(item):
+            while condition(item):
+                consume(item)
+        elif second(item):
+            other(item)
+
+def direct_nested_while_control(items):
+    for item in items:
+        while condition(item):
+            consume(item)
+
+def protected_nested_while_control(items):
+    try:
+        for item in items:
+            while condition(item):
+                consume(item)
+    except Exception:
+        recover()
+
+def nonfinal_assertions(items):
+    for item in items:
+        if first(item):
+            assert condition(item)
+        else:
+            assert other(item)
+
+def direct_assertion_control(items):
+    for item in items:
+        assert condition(item)
+";
+        assert_matches_cpython_marshal(source, "loop_tail_condition_orientation.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_async_comprehension_cleanup_exits() {
         let source = "async def discarded():\n    [item async for item in source]\n\nasync def returned():\n    return [item async for item in source]\n";
         assert_matches_cpython_marshal(source, "async_comprehension.py");

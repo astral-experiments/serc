@@ -987,18 +987,36 @@ impl Compiler {
             IteratorCleanup::None,
             LoopBreakPolicy::Return,
         );
-        self.with_loop_context(context, |compiler| {
-            compiler.with_control_override(
-                |control| &mut control.suite_fallthrough_to_loop_backedge,
-                true,
-                |compiler| compiler.compile_suite(&statement.body),
-            )
-        })?;
-        if !suite_terminates(&statement.body) {
-            if let Some(location) = self.assembler.last_instruction_location() {
-                self.assembler.set_location(location);
+        let normalize_final_condition = matches!(
+            statement.body.last(),
+            Some(Stmt::If(tail))
+                if tail.elif_else_clauses.is_empty()
+                    && !suite_contains_loop_break(&tail.body)
+        );
+        if normalize_final_condition {
+            // CPython normalizes a backward conditional jump by reversing it around an explicit
+            // backedge. The terminal-while path still needs that layout for a simple final `if`.
+            let body_start = self.assembler.instruction_count();
+            let tail_jumps = self.with_loop_context(context, |compiler| {
+                compiler.compile_while_tail_suite(&statement.body, start)
+            })?;
+            if tail_jumps == LoopBackedge::Required && !suite_terminates(&statement.body) {
+                self.emit_while_backedge(&statement.body, body_start, start)?;
             }
-            self.emit_jump_backward(JUMP_BACKWARD, start, 0)?;
+        } else {
+            self.with_loop_context(context, |compiler| {
+                compiler.with_control_override(
+                    |control| &mut control.suite_fallthrough_to_loop_backedge,
+                    true,
+                    |compiler| compiler.compile_suite(&statement.body),
+                )
+            })?;
+            if !suite_terminates(&statement.body) {
+                if let Some(location) = self.assembler.last_instruction_location() {
+                    self.assembler.set_location(location);
+                }
+                self.emit_jump_backward(JUMP_BACKWARD, start, 0)?;
+            }
         }
 
         self.assembler.mark(condition_false);
@@ -2503,7 +2521,7 @@ impl Compiler {
                     false,
                     |compiler| compiler.compile_suite(leading),
                 )?;
-                self.compile_loop_tail_while(statement, restart)?;
+                self.compile_loop_tail_while(statement, restart, non_final_branch)?;
                 Ok(LoopBackedge::Emitted)
             }
             Some((Stmt::Assert(statement), leading))
@@ -2514,7 +2532,7 @@ impl Compiler {
                     false,
                     |compiler| compiler.compile_suite(leading),
                 )?;
-                self.compile_loop_tail_assert(statement, restart)?;
+                self.compile_loop_tail_assert(statement, restart, non_final_branch)?;
                 Ok(LoopBackedge::Emitted)
             }
             Some((Stmt::Try(statement), leading))
@@ -2672,8 +2690,40 @@ impl Compiler {
         &mut self,
         statement: &ruff_python_ast::StmtWhile,
         restart: Label,
+        non_final_branch: bool,
     ) -> Result<(), CompileError> {
         let base_depth = self.control.depth;
+        if non_final_branch && !self.has_active_control_flow_region() {
+            // CPython leaves an unprotected inner loop's body as the fallthrough block and
+            // targets the enclosing backedge when its condition is false.
+            let start = self.assembler.label();
+            let exit = self.assembler.label();
+            self.assembler.mark(start);
+            self.with_control_override(
+                |control| &mut control.loop_tail_while_condition,
+                true,
+                |compiler| compiler.compile_jump_if(&statement.test, false, exit),
+            )?;
+
+            let context =
+                self.loop_context(start, restart, IteratorCleanup::None, LoopBreakPolicy::Jump);
+            let body_start = self.assembler.instruction_count();
+            let tail_jumps = self.with_loop_context(context, |compiler| {
+                compiler.compile_while_tail_suite(&statement.body, start)
+            })?;
+            if tail_jumps == LoopBackedge::Required && !suite_terminates(&statement.body) {
+                self.emit_while_backedge(&statement.body, body_start, start)?;
+            }
+
+            self.assembler.mark(exit);
+            self.set_depth(base_depth);
+            self.assembler.set_location(
+                self.source_location(synthetic_condition_exit_range(&statement.test)),
+            );
+            self.emit_jump_backward(JUMP_BACKWARD, restart, 0)?;
+            return Ok(());
+        }
+
         let start = self.assembler.label();
         let body_label = self.assembler.label();
         let control_region = self
@@ -2764,8 +2814,37 @@ impl Compiler {
         &mut self,
         statement: &ruff_python_ast::StmtAssert,
         restart: Label,
+        non_final_branch: bool,
     ) -> Result<(), CompileError> {
         let base_depth = self.control.depth;
+        if non_final_branch
+            && !self.has_active_control_flow_region()
+            && condition_jump_target_count(&statement.test, false) == 1
+            && condition_jump_target_count(&statement.test, true) == 1
+        {
+            // In a non-final branch, successful assertion evaluation exits the enclosing branch.
+            // CPython jumps over the fallthrough raise block to the loop backedge.
+            let success = self.assembler.label();
+            self.compile_jump_if(&statement.test, true, success)?;
+            self.assembler
+                .set_location(self.source_location(statement.range));
+            self.emit_common_constant(CommonConstant::ASSERTIONERROR)?;
+            if let Some(message) = &statement.msg {
+                self.compile_expression(message)?;
+                self.assembler
+                    .set_location(self.source_location(statement.range));
+                self.emit(CALL, 0, -1)?;
+            }
+            self.assembler
+                .set_location(self.source_location(statement.test.range()));
+            self.emit(RAISE_VARARGS, 1, -1)?;
+
+            self.assembler.mark(success);
+            self.set_depth(base_depth);
+            self.emit_jump_backward(JUMP_BACKWARD, restart, 0)?;
+            return Ok(());
+        }
+
         let failure = self.assembler.label();
         self.compile_loop_tail_condition(&statement.test, false, failure, restart)?;
 
