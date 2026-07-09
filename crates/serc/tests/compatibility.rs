@@ -1917,6 +1917,59 @@ async def bare_fallback_control():
     }
 
     #[test]
+    fn matches_cpython_marshal_for_nonterminal_handler_condition_fallthrough() {
+        let source = r"def named_raise(flag):
+    try:
+        action()
+    except Error as error:
+        if flag:
+            raise error
+    after()
+
+
+def named_return(flag):
+    try:
+        action()
+    except Error as error:
+        if flag:
+            return error
+    after()
+
+
+def bare_raise(flag):
+    try:
+        action()
+    except Error:
+        if flag:
+            raise
+    after()
+
+
+def final_elif(first, second):
+    try:
+        action()
+    except Error as error:
+        if first:
+            raise error
+        elif second:
+            raise error
+    after()
+
+
+def explicit_else(flag):
+    try:
+        action()
+    except Error as error:
+        if flag:
+            raise error
+        else:
+            consume(error)
+    after()
+";
+        assert_matches_cpython_marshal(source, "nonterminal_handler_fallthrough.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_named_handler_nested_finally_cleanup() {
         let source = r"class Container:
     def fallthrough_from_nested_try(self):
