@@ -4461,10 +4461,9 @@ impl Compiler {
                 true,
             );
             if terminal_handler_exclusions.is_none() && !terminal_handler_try_return {
-                // CPython propagates a terminal handler's unique condition-fallthrough edge
-                // onto the normal cleanup block.
-                if terminal
-                    && let Some(Stmt::If(statement)) = handler.body.last()
+                // CPython propagates a handler's sole condition-fallthrough edge onto the
+                // normal cleanup block, even when code follows the enclosing try statement.
+                if let Some(Stmt::If(statement)) = handler.body.last()
                     && let Some(test) = terminating_if_fallthrough_test(statement)
                     && let Some(test) = unique_condition_jump_target(test, false)
                 {
