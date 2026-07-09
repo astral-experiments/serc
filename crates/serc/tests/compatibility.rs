@@ -3241,6 +3241,13 @@ for function in (
     fifth(result)
     return result
 
+def copied_tiny_exit(flag, result):
+    while True:
+        step()
+        if flag:
+            break
+    return result
+
 def generator(flag, result):
     while True:
         if flag:

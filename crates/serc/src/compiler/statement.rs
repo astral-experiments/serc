@@ -225,6 +225,9 @@ pub(super) struct ControlFlowState {
     pub(super) same_line_try_body: bool,
     // Whether the statement currently entered by `compile_suite` has a sibling successor.
     current_statement_has_following: bool,
+    // Whether that successor is a direct return of one local. CPython copies this tiny exit
+    // before removing a constant-loop break edge, so its borrowed-load pass still visits it.
+    current_statement_followed_by_name_return: bool,
     // The direct final synchronous `with` in an active non-final try body, if any.
     direct_final_sync_with_try_body: Option<ruff_text_size::TextRange>,
     pub(super) generator_region_start: Option<Label>,
@@ -751,6 +754,11 @@ impl Compiler {
                     self.control.suite_fallthrough_to_loop_backedge
                         && is_final
                         && transparent_loop_tail;
+                let followed_by_name_return = matches!(
+                    body.get(index + 1),
+                    Some(Stmt::Return(statement))
+                        if matches!(statement.value.as_deref(), Some(Expr::Name(_)))
+                );
                 self.with_control_override(
                     |control| &mut control.emit_protected_async_for_end_nop,
                     emit_protected_async_for_end_nop,
@@ -760,9 +768,19 @@ impl Compiler {
                             !is_final,
                             |compiler| {
                                 compiler.with_control_override(
-                                    |control| &mut control.suite_fallthrough_to_loop_backedge,
-                                    suite_fallthrough_to_loop_backedge,
-                                    |compiler| compiler.compile_statement(statement),
+                                    |control| {
+                                        &mut control.current_statement_followed_by_name_return
+                                    },
+                                    followed_by_name_return,
+                                    |compiler| {
+                                        compiler.with_control_override(
+                                            |control| {
+                                                &mut control.suite_fallthrough_to_loop_backedge
+                                            },
+                                            suite_fallthrough_to_loop_backedge,
+                                            |compiler| compiler.compile_statement(statement),
+                                        )
+                                    },
                                 )
                             },
                         )
@@ -3137,7 +3155,12 @@ impl Compiler {
             }
             self.pre_register_suite_names(&statement.orelse)?;
             self.assembler.mark(end);
+            let copied_direct_return_exit = self.control.current_statement_followed_by_name_return
+                && self.control.active_exception_region_exclusions.is_empty()
+                && self.control.active_with_region_exclusions.is_empty()
+                && suite_ends_in_simple_conditional_break(&statement.body);
             if suite_contains_loop_break(&statement.body)
+                && !copied_direct_return_exit
                 && (!self.control.active_exception_region_exclusions.is_empty()
                     || !self.control.active_with_region_exclusions.is_empty()
                     || !suite_contains_unprotected_nontail_conditional_loop_break(&statement.body))
@@ -6739,4 +6762,13 @@ fn suite_contains_unprotected_nontail_conditional_loop_break(body: &[Stmt]) -> b
         return false;
     }
     contains(leading, false)
+}
+
+fn suite_ends_in_simple_conditional_break(body: &[Stmt]) -> bool {
+    matches!(
+        body.last(),
+        Some(Stmt::If(statement))
+            if statement.elif_else_clauses.is_empty()
+                && matches!(statement.body.as_slice(), [Stmt::Break(_)])
+    )
 }
