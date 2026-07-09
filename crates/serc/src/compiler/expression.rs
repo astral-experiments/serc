@@ -1563,7 +1563,7 @@ impl Compiler {
                     self.assembler.set_location(SourceLocation::NONE);
                     self.load_string_constant(&value)?;
                     self.assembler
-                        .inherit_conditional_target_location_for_last_instruction();
+                        .inherit_percent_target_location_for_last_instruction();
                 }
                 PercentFormatPart::Formatted {
                     expression,

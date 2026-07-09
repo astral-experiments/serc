@@ -569,12 +569,13 @@ impl Assembler {
             .preserve = true;
     }
 
-    pub(crate) fn inherit_conditional_target_location_for_last_instruction(&mut self) {
+    pub(crate) fn inherit_percent_target_location_for_last_instruction(&mut self) {
         self.required_last_instruction_mut(
-            "inheriting a conditional target location for a synthesized instruction",
+            "inheriting a predecessor location for a synthesized percent instruction",
         )
         .no_location_policy
-        .inherit_conditional_target = true;
+        .percent_target_location = u8::MAX;
+        self.has_synthesized_percent_target_locations = true;
     }
 
     /// Gives the last instruction its final successor's location after optimization.

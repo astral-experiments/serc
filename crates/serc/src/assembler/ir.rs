@@ -115,8 +115,8 @@ pub(super) struct NoLocationPolicy {
     /// Whether an unlocated block ending at this instruction may be inlined.
     pub(super) allow_block_inlining: bool,
     pub(super) preserve: bool,
-    /// Whether a synthesized leading constant inherits its sole predecessor's location.
-    pub(super) inherit_conditional_target: bool,
+    /// An unresolved percent target or its deferred-location side-table index.
+    pub(super) percent_target_location: u8,
 }
 
 impl NoLocationPolicy {
@@ -124,8 +124,11 @@ impl NoLocationPolicy {
         Self {
             allow_block_inlining: first.allow_block_inlining || second.allow_block_inlining,
             preserve: first.preserve || second.preserve,
-            inherit_conditional_target: first.inherit_conditional_target
-                || second.inherit_conditional_target,
+            percent_target_location: if matches!(first.percent_target_location, 0 | u8::MAX) {
+                second.percent_target_location
+            } else {
+                first.percent_target_location
+            },
         }
     }
 }
@@ -529,6 +532,7 @@ pub(crate) struct Assembler {
     pub(super) borrow_unreachable_blocks: FxHashSet<Label>,
     pub(super) load_fast_borrowing_enabled: bool,
     pub(super) strict_owned_loads: bool,
+    pub(super) has_synthesized_percent_target_locations: bool,
 }
 
 /// The block-aware assembler state used by CFG optimization passes.
@@ -542,6 +546,7 @@ pub(super) struct OptimizationPipeline {
     pub(super) exception_regions: Vec<ExceptionRegion>,
     pub(super) preserved_block_boundaries: FxHashSet<Label>,
     pub(super) borrow_unreachable_blocks: FxHashSet<Label>,
+    pub(super) has_synthesized_percent_target_locations: bool,
 }
 
 /// The linear assembler state used after CFG optimization is complete.
@@ -601,6 +606,7 @@ impl Default for Assembler {
             borrow_unreachable_blocks: FxHashSet::default(),
             load_fast_borrowing_enabled: true,
             strict_owned_loads: false,
+            has_synthesized_percent_target_locations: false,
         }
     }
 }
