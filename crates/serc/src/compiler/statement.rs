@@ -204,6 +204,7 @@ pub(super) struct ControlFlowState {
     pub(super) exclude_terminal_if_not_taken: bool,
     pub(super) exclude_condition_not_taken_from_exception: bool,
     pub(super) include_assert_none_condition_owner: bool,
+    pub(super) preserve_assert_chained_comparison_exit_nop: bool,
     pub(super) exclude_condition_not_taken_from_all_exception_regions: bool,
     // CPython normalizes a loop-tail while condition through a fresh backward-jump block. Its
     // `NOT_TAKEN` slot therefore cannot inherit the compacted condition block's stale owner.
@@ -3682,10 +3683,17 @@ impl Compiler {
         let base_depth = self.control.depth;
         let end = self.assembler.label();
         let include_none_owner = !self.control.active_with_region_exclusions.is_empty();
+        let preserve_chained_comparison_exit_nop = matches!(statement.test.as_ref(), Expr::Compare(comparison) if comparison.ops.len() > 1);
         self.with_control_override(
             |control| &mut control.include_assert_none_condition_owner,
             include_none_owner,
-            |compiler| compiler.compile_jump_if(&statement.test, true, end),
+            |compiler| {
+                compiler.with_control_override(
+                    |control| &mut control.preserve_assert_chained_comparison_exit_nop,
+                    preserve_chained_comparison_exit_nop,
+                    |compiler| compiler.compile_jump_if(&statement.test, true, end),
+                )
+            },
         )?;
         self.assembler
             .set_location(self.source_location(statement.range));

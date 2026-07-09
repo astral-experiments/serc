@@ -4531,7 +4531,11 @@ impl Compiler {
             )?;
             self.emit(NOT_TAKEN, 0, 0)?;
             self.emit_jump_forward(JUMP_FORWARD, end, 0)?;
-            if !jump_on {
+            if jump_on && self.control.preserve_assert_chained_comparison_exit_nop {
+                // CPython retains an assertion's final comparison fallthrough jump as a NOP
+                // when the successful comparison jumps past the assertion failure block.
+                self.assembler.preserve_last_inlined_jump_nop();
+            } else if !jump_on {
                 self.assembler.prevent_last_jump_inlining();
             }
 
