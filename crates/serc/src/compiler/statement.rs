@@ -101,6 +101,7 @@ struct WithExitContext {
     location: SourceLocation,
     is_async: bool,
     exception_region_depth: usize,
+    loop_depth: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3817,6 +3818,19 @@ impl Compiler {
             .push(Vec::new());
         let direct_continue =
             statement.orelse.is_empty() && matches!(statement.body.as_slice(), [Stmt::Continue(_)]);
+        let direct_with_exit = self
+            .control
+            .active_with_exits
+            .last()
+            .is_some_and(|context| context.loop_depth == self.control.loops.len());
+        let retained_assertion_exit = (self.control.current_statement_has_following
+            || !statement.orelse.is_empty()
+            || direct_with_exit)
+            && matches!(
+                statement.body.last(),
+                Some(Stmt::Assert(assertion))
+                    if condition_jump_target_count(&assertion.test, true) == 1
+            );
         let mut normal_return_emitted = false;
         let body_noop_location = if direct_continue {
             self.assembler.mark(try_end);
@@ -3884,7 +3898,27 @@ impl Compiler {
                         .map(|statement| self.source_location(statement.range()))
                 })
                 .flatten();
-            self.assembler.mark(try_end);
+            if retained_assertion_exit {
+                self.assembler.mark_before_trailing_labels(try_end);
+            } else {
+                self.assembler.mark(try_end);
+            }
+            if let Some(Stmt::Assert(assertion)) = statement.body.last()
+                && retained_assertion_exit
+            {
+                // CPython's POP_BLOCK follows the successful assertion edge. The jump targets
+                // that instruction directly, so it survives conversion as a located NOP.
+                let exit_test = unique_condition_jump_target(&assertion.test, true)
+                    .expect("retained assertion exit has a unique successful edge");
+                self.assembler
+                    .set_location(self.source_location(exit_test.range()));
+                self.emit(NOP, 0, 0)?;
+                self.assembler.mark_last_as_converted_pop_block();
+                self.assembler.preserve_last_nop();
+                if early_condition_truthiness(&assertion.test) == Some(true) {
+                    self.assembler.mark_last_borrow_fallthrough_barrier();
+                }
+            }
             if !statement.orelse.is_empty()
                 && let Some(location) = location
             {
@@ -4030,6 +4064,9 @@ impl Compiler {
             }
             if direct_exit_location.is_some() {
                 self.assembler.preserve_last_direct_inlined_jump_nop();
+            }
+            if statement.orelse.is_empty() && retained_assertion_exit {
+                self.assembler.prevent_last_jump_threading_target();
             }
             if statement.orelse.is_empty()
                 && suite_ends_in_retained_try_body_exit_join(&statement.body)
@@ -5684,6 +5721,7 @@ impl Compiler {
             location: self.source_location(item.context_expr.range()),
             is_async: false,
             exception_region_depth: self.control.active_exception_region_exclusions.len(),
+            loop_depth: self.control.loops.len(),
         };
         let (body_noop, region_exclusions) = self.with_region_exclusion_collector(
             |control| &mut control.active_with_region_exclusions,
@@ -5883,6 +5921,7 @@ impl Compiler {
             location: self.source_location(item.context_expr.range()),
             is_async: true,
             exception_region_depth: self.control.active_exception_region_exclusions.len(),
+            loop_depth: self.control.loops.len(),
         };
         let outer_exception_owns_exit = context.exception_region_depth > 0
         // Without the converted end NOP, CPython gives the async-with exit back to the
