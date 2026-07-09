@@ -4902,15 +4902,44 @@ impl Compiler {
         let finally_handler = self.assembler.label();
         let cleanup = self.assembler.label();
         let end = self.assembler.label();
-        if !statement.handlers.is_empty() {
-            // Removing the inner try's normal exit leaves an empty CPython CFG block before the
-            // normal finally body. Its borrow traversal stops at that empty block.
+        let fallthrough_handlers_reach_simple_finally =
+            statement.handlers.iter().all(|handler| {
+                handler.as_except_handler().is_some_and(|handler| {
+                    handler.type_.is_some()
+                        && handler.body.iter().all(|statement| {
+                            !matches!(
+                                statement,
+                                Stmt::Assert(_)
+                                    | Stmt::Break(_)
+                                    | Stmt::Continue(_)
+                                    | Stmt::For(_)
+                                    | Stmt::If(_)
+                                    | Stmt::Match(_)
+                                    | Stmt::Raise(_)
+                                    | Stmt::Return(_)
+                                    | Stmt::Try(_)
+                                    | Stmt::While(_)
+                                    | Stmt::With(_)
+                            )
+                        })
+                })
+            }) && matches!(statement.finalbody.as_slice(), [Stmt::Expr(_)])
+                && !matches!(
+                    statement.body.last(),
+                    Some(Stmt::If(_) | Stmt::Try(_) | Stmt::While(_) | Stmt::With(_))
+                );
+        if !statement.handlers.is_empty() && !fallthrough_handlers_reach_simple_finally {
+            // A terminating handler leaves an empty CPython CFG block before the normal finally
+            // body. Bare or compound handlers and compound try-body exits can leave the same
+            // boundary. Linear typed handlers keep a single-expression body reachable.
             self.assembler.prevent_borrow_reachability(protected_end);
-            if matches!(statement.finalbody.first(), Some(Stmt::Try(_))) {
-                // Keep handler exits targeting the nested finally body instead of the removed
-                // normal-exit NOP that precedes it.
-                self.assembler.preserve_block_boundary(protected_end);
-            }
+        }
+        if !statement.handlers.is_empty()
+            && matches!(statement.finalbody.first(), Some(Stmt::Try(_)))
+        {
+            // Keep handler exits targeting the nested finally body instead of the removed
+            // normal-exit NOP that precedes it.
+            self.assembler.preserve_block_boundary(protected_end);
         }
 
         let statement_nop_start = self.assembler.label();
