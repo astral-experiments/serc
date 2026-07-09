@@ -227,7 +227,7 @@ impl OptimizationPipeline {
         }
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::RemoveUnreachableAfterThreading)?;
-        self.remove_redundant_forward_jumps();
+        self.remove_redundant_forward_jumps(false);
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::RemoveRedundantForwardJumpsEarly)?;
         self.optimize_redundant_store_fast();
@@ -263,10 +263,11 @@ impl OptimizationPipeline {
         self.remove_redundant_nops();
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::RemoveRedundantNops)?;
-        self.remove_redundant_forward_jumps();
+        self.remove_redundant_forward_jumps(true);
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::RemoveRedundantForwardJumpsLate)?;
         self.optimize_load_fast();
+        self.remove_borrow_empty_block_markers();
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::OptimizeLoadFast)?;
         Ok(LayoutAssembler {

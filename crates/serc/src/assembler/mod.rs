@@ -427,6 +427,13 @@ impl Assembler {
             .borrow_fallthrough = BorrowFallthrough::Barrier;
     }
 
+    /// Retains a redundant jump as an analysis-only marker for CPython's empty CFG block.
+    pub(crate) fn mark_last_borrow_empty_block(&mut self) {
+        self.last_jump_instruction_mut("marking an empty borrowed-load block")
+            .jump_policy
+            .mark_borrow_empty_block();
+    }
+
     pub(crate) fn mark_before_trailing_instructions(&mut self, label: Label, count: usize) {
         let items = self.linear_items();
         let index = items
