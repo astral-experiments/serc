@@ -176,6 +176,7 @@ impl JumpPolicy {
     const DEFER_REDUNDANT_REMOVAL: u8 = 1 << 4;
     const PRESERVE_NOP_AFTER_THREADING: u8 = 1 << 5;
     const BORROW_EMPTY_BLOCK: u8 = 1 << 6;
+    const PRESERVE_EXPLICIT_NOP: u8 = 1 << 7;
 
     const SYNTHETIC: Self = Self(Self::PREVENT_SMALL_EXIT_INLINING);
     const DEFAULT: Self = Self(0);
@@ -196,6 +197,9 @@ impl JumpPolicy {
         }
         if first.borrow_empty_block() || second.borrow_empty_block() {
             policy.0 |= Self::BORROW_EMPTY_BLOCK;
+        }
+        if first.preserves_explicit_nop() || second.preserves_explicit_nop() {
+            policy.0 |= Self::PRESERVE_EXPLICIT_NOP;
         }
         policy
     }
@@ -220,12 +224,20 @@ impl JumpPolicy {
         self.0 & Self::BORROW_EMPTY_BLOCK != 0
     }
 
+    pub(super) const fn preserves_explicit_nop(self) -> bool {
+        self.0 & Self::PRESERVE_EXPLICIT_NOP != 0
+    }
+
     pub(super) fn mark_borrow_empty_block(&mut self) {
         self.0 |= Self::BORROW_EMPTY_BLOCK;
     }
 
     pub(super) fn clear_borrow_empty_block(&mut self) {
         self.0 &= !Self::BORROW_EMPTY_BLOCK;
+    }
+
+    pub(super) fn preserve_explicit_nop(&mut self) {
+        self.0 |= Self::PRESERVE_EXPLICIT_NOP;
     }
 
     pub(super) const fn retained_nop(self) -> RetainedJumpNop {
@@ -309,6 +321,7 @@ impl std::fmt::Debug for JumpPolicy {
                 &self.preserves_nop_after_threading(),
             )
             .field("borrow_empty_block", &self.borrow_empty_block())
+            .field("preserve_explicit_nop", &self.preserves_explicit_nop())
             .finish()
     }
 }

@@ -577,6 +577,7 @@ impl OptimizationPipeline {
         let mut redundant = Vec::new();
         for (index, (position, instruction)) in instructions.iter().copied().enumerate() {
             let remove = instruction.opcode == NOP
+                && !instruction.jump_policy.preserves_explicit_nop()
                 && (instruction.location.line < 0
                     || (instruction.converted_pop_block
                         && previous.is_some_and(|previous: Instruction| {

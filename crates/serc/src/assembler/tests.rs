@@ -482,6 +482,7 @@ fn fusion_preserves_each_typed_instruction_policy() {
     first.jump_policy.defer_removal();
     first.jump_policy.retain_nop();
     first.jump_policy.mark_borrow_empty_block();
+    first.jump_policy.preserve_explicit_nop();
     first
         .exception_policy
         .exclude(ExceptionExclusion::IfExtended);
@@ -523,6 +524,7 @@ fn fusion_preserves_each_typed_instruction_policy() {
     );
     assert_eq!(fused.fusion_policy, FusionPolicy::default());
     assert!(fused.converted_pop_block);
+    assert!(fused.jump_policy.preserves_explicit_nop());
     assert_eq!(fused.hidden_exception_owner_slots, 3);
     assert_eq!(fused.location, first.location);
     assert_eq!(fused.depth_after, second.depth_after);
@@ -531,6 +533,7 @@ fn fusion_preserves_each_typed_instruction_policy() {
     expected_jump_policy.prevent_threading_target();
     expected_jump_policy.retain_redundant_nop_after_threading();
     expected_jump_policy.mark_borrow_empty_block();
+    expected_jump_policy.preserve_explicit_nop();
     assert_eq!(fused.jump_policy, expected_jump_policy);
     assert_eq!(fused.borrow_fallthrough, BorrowFallthrough::Barrier);
     assert_eq!(

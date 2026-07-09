@@ -400,6 +400,16 @@ impl Assembler {
         self.linear_items_mut().push(Item::Label(label));
     }
 
+    /// Inserts a boundary before every join label at the current instruction position.
+    pub(crate) fn mark_before_trailing_labels(&mut self, label: Label) {
+        let index = self
+            .linear_items()
+            .iter()
+            .rposition(|item| matches!(item, Item::Instruction(_)))
+            .map_or(0, |index| index + 1);
+        self.insert_label(index, label);
+    }
+
     /// Keep a source CFG boundary after jump threading removes its last incoming edge.
     pub(crate) fn preserve_block_boundary(&mut self, label: Label) {
         self.preserved_block_boundaries.insert(label);
@@ -590,6 +600,15 @@ impl Assembler {
             .converted_pop_block = true;
     }
 
+    pub(crate) fn preserve_last_nop(&mut self) {
+        let instruction = self.required_last_instruction_mut("preserving an explicit NOP");
+        assert_eq!(
+            instruction.opcode, NOP,
+            "preserving an explicit NOP requires a NOP instruction"
+        );
+        instruction.jump_policy.preserve_explicit_nop();
+    }
+
     /// Removes a trailing NOP and returns its location and immediate exclusion labels, if any.
     pub(crate) fn take_trailing_nop_location(
         &mut self,
@@ -602,7 +621,7 @@ impl Assembler {
         let Item::Instruction(instruction) = items[index] else {
             unreachable!();
         };
-        if instruction.opcode != NOP {
+        if instruction.opcode != NOP || instruction.jump_policy.preserves_explicit_nop() {
             return None;
         }
         if instruction.location.line >= 0
