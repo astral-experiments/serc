@@ -107,6 +107,7 @@ struct WithExitContext {
 #[derive(Clone, Copy, Debug)]
 enum WithBodyExitNoop {
     Located(TextRange),
+    LocatedConvertedPopBlock(TextRange),
     ConvertedPopBlock,
 }
 
@@ -5770,15 +5771,25 @@ impl Compiler {
             self.emit(NOP, 0, 0)?;
         }
         let body_noop = body_noop.or_else(|| {
-            (!self.assembler.last_instruction_is_nop()
-                && with_body_ends_in_retained_pop_block(body))
-            .then_some(WithBodyExitNoop::ConvertedPopBlock)
+            remaining
+                .is_empty()
+                .then(|| with_body_handler_exit_location(body))
+                .flatten()
+                .map(WithBodyExitNoop::LocatedConvertedPopBlock)
+                .or_else(|| {
+                    (!self.assembler.last_instruction_is_nop()
+                        && with_body_ends_in_retained_pop_block(body))
+                    .then_some(WithBodyExitNoop::ConvertedPopBlock)
+                })
         });
         if let Some(body_noop) = body_noop {
             let noop_start = self.assembler.label();
             self.assembler.mark(noop_start);
             let (location, converted_pop_block) = match body_noop {
                 WithBodyExitNoop::Located(range) => (self.source_location(range), false),
+                WithBodyExitNoop::LocatedConvertedPopBlock(range) => {
+                    (self.source_location(range), true)
+                }
                 WithBodyExitNoop::ConvertedPopBlock => (SourceLocation::NONE, true),
             };
             self.assembler.set_location(location);
@@ -6328,6 +6339,45 @@ fn try_normal_exit_predecessors(statement: &ruff_python_ast::StmtTry) -> usize {
                     .is_some_and(|handler| !suite_terminates(&handler.body))
             })
             .count()
+}
+
+// A converted `POP_BLOCK` after a final try normally inherits its location from a sole jump
+// predecessor. If a direct return or raise terminates the try body and the only normal predecessor
+// instead comes from an exception handler, CPython propagates that handler's fallthrough location
+// onto the marker.
+fn with_body_handler_exit_location(body: &[Stmt]) -> Option<TextRange> {
+    let Some(Stmt::Try(statement)) = body.last() else {
+        return None;
+    };
+    if statement.is_star
+        || !statement.finalbody.is_empty()
+        || !suite_terminates(&statement.body)
+        || !statement
+            .body
+            .iter()
+            .any(|statement| matches!(statement, Stmt::Return(_) | Stmt::Raise(_)))
+    {
+        return None;
+    }
+
+    let mut fallthrough_handlers = statement
+        .handlers
+        .iter()
+        .filter_map(ruff_python_ast::ExceptHandler::as_except_handler)
+        .filter(|handler| !suite_terminates(&handler.body));
+    let handler = fallthrough_handlers.next()?;
+    if fallthrough_handlers.next().is_some() {
+        return None;
+    }
+
+    match handler.body.last()? {
+        Stmt::Assert(statement) => Some(statement.test.range()),
+        Stmt::If(statement) => {
+            terminating_if_fallthrough_test(statement).map(synthetic_condition_exit_range)
+        }
+        statement @ (Stmt::Expr(_) | Stmt::Pass(_) | Stmt::Assign(_)) => Some(statement.range()),
+        _ => None,
+    }
 }
 
 // CPython converts the POP_BLOCK after every synchronous with body into an unowned NOP.
