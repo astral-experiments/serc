@@ -3058,6 +3058,158 @@ def reversed_store_pair(first, second):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_fallthrough_handler_finally_borrows() {
+        let source = r"def pass_handler(value):
+    try:
+        work()
+    except Error:
+        pass
+    finally:
+        consume(value)
+
+
+def work_handler(value):
+    try:
+        work()
+    except Error:
+        recover()
+    finally:
+        consume(value)
+
+
+def two_fallthrough_handlers(value):
+    try:
+        work()
+    except ValueError:
+        recover()
+    except Error:
+        other()
+    finally:
+        consume(value)
+
+
+def handler_with_else(value):
+    try:
+        work()
+    except Error:
+        recover()
+    else:
+        success()
+    finally:
+        consume(value)
+
+
+def no_handler(value):
+    try:
+        work()
+    finally:
+        consume(value)
+
+
+def raise_then_fallthrough(value):
+    try:
+        work()
+    except ValueError:
+        raise
+    except Error:
+        recover()
+    finally:
+        consume(value)
+
+
+def fallthrough_then_raise(value):
+    try:
+        work()
+    except ValueError:
+        recover()
+    except Error:
+        raise
+    finally:
+        consume(value)
+
+
+def bare_handler(value):
+    try:
+        work()
+    except:
+        recover()
+    finally:
+        consume(value)
+";
+        assert_matches_cpython_marshal(source, "fallthrough_handler_finally_borrows.py");
+    }
+
+    #[test]
+    fn uses_cpython_finally_load_kinds_at_handler_boundaries() {
+        let source = r#"import dis
+
+
+def fallthrough_handler(value):
+    try:
+        work()
+    except Error:
+        recover()
+    finally:
+        consume(value)
+
+
+def bare_handler(value):
+    try:
+        work()
+    except:
+        recover()
+    finally:
+        consume(value)
+
+
+def loop_break_body(value, flag):
+    try:
+        while True:
+            work()
+            if flag:
+                break
+    except Error:
+        recover()
+    finally:
+        consume(value)
+
+
+def partial_raise_handler(value, flag):
+    try:
+        work()
+    except Error:
+        if flag:
+            recover()
+        else:
+            raise
+    finally:
+        consume(value)
+
+
+def value_loads(function):
+    return " ".join(
+        instruction.opname
+        for instruction in dis.get_instructions(function)
+        if instruction.argval == "value"
+        and instruction.opname.startswith("LOAD_FAST")
+    )
+
+
+for function in (
+    fallthrough_handler,
+    bare_handler,
+    loop_break_body,
+    partial_raise_handler,
+):
+    print(value_loads(function))
+"#;
+        assert_executes(
+            source,
+            "LOAD_FAST_BORROW LOAD_FAST\nLOAD_FAST LOAD_FAST\nLOAD_FAST LOAD_FAST\nLOAD_FAST LOAD_FAST\n",
+        );
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_terminal_handler_condition_exits() {
         let source = r"def unnamed(action, reraises):
     try:
