@@ -6,6 +6,7 @@ use super::super::{
     block_has_fallthrough, block_jump_target, cleanup_block_creation_order, ends_scope,
 };
 use crate::assembler::block_graph::{BasicBlockId, BlockGraph};
+use crate::target::is_conditional_jump;
 use crate::target::opcodes::{
     CLEANUP_THROW, END_ASYNC_FOR, END_SEND, LOAD_GLOBAL, NOP, RAISE_VARARGS,
 };
@@ -254,6 +255,112 @@ fn propagate_exit_block_locations(
 }
 
 impl OptimizationPipeline {
+    /// Resolves synthesized percent-format literals that begin a conditional target block.
+    ///
+    /// CPython's early line-number propagation gives this leading constant the sole
+    /// predecessor's condition location. Serc retains the eventual percent-expression
+    /// location on some intervening jumps, so recover the earlier location from the jump's
+    /// preceding instruction or, for a split jump block, its sole predecessor.
+    pub(in crate::assembler) fn resolve_synthesized_conditional_target_locations(&mut self) {
+        if !self.graph.order().iter().copied().any(|block| {
+            self.graph[block].items().iter().any(|item| {
+                matches!(
+                    item,
+                    Item::Instruction(instruction)
+                        if instruction.no_location_policy.inherit_conditional_target
+                )
+            })
+        }) {
+            return;
+        }
+
+        let order = self.graph.order().to_vec();
+        let mut predecessors = FxHashMap::<BasicBlockId, (usize, SourceLocation)>::default();
+        if let Some(entry) = order.first().copied() {
+            predecessors.insert(entry, (1, SourceLocation::NONE));
+        }
+        for blocks in order.windows(2) {
+            let [source, target] = blocks else {
+                unreachable!();
+            };
+            if block_has_fallthrough(self.graph[*source].items()) {
+                let location = self.graph[*source]
+                    .items()
+                    .iter()
+                    .rev()
+                    .find_map(|item| match item {
+                        Item::Instruction(instruction) if instruction.location.line >= 0 => {
+                            Some(instruction.location)
+                        }
+                        Item::Instruction(_) | Item::Label(_) => None,
+                    })
+                    .unwrap_or(SourceLocation::NONE);
+                let entry = predecessors
+                    .entry(*target)
+                    .or_insert((0, SourceLocation::NONE));
+                entry.0 += 1;
+                entry.1 = location;
+            }
+        }
+        let mut conditional_targets =
+            FxHashMap::<BasicBlockId, (BasicBlockId, SourceLocation, SourceLocation)>::default();
+        for source in order.iter().copied() {
+            let mut previous_location = SourceLocation::NONE;
+            for item in self.graph[source].items() {
+                let Item::Instruction(instruction) = item else {
+                    continue;
+                };
+                let predecessor_location = previous_location;
+                if instruction.location.line >= 0 {
+                    previous_location = instruction.location;
+                }
+                let (Operand::Forward(label) | Operand::Backward(label)) = instruction.operand
+                else {
+                    continue;
+                };
+                let Some(target) = self.graph.label_block(label) else {
+                    continue;
+                };
+                let predecessor = predecessors
+                    .entry(target)
+                    .or_insert((0, SourceLocation::NONE));
+                predecessor.0 += 1;
+                predecessor.1 = instruction.location;
+                if is_conditional_jump(instruction.opcode) {
+                    conditional_targets
+                        .insert(target, (source, instruction.location, predecessor_location));
+                }
+            }
+        }
+
+        for target in order {
+            let Some(&(source, jump_location, predecessor_location)) =
+                conditional_targets.get(&target)
+            else {
+                continue;
+            };
+            if predecessors.get(&target).map(|(count, _)| *count) != Some(1) {
+                continue;
+            }
+            let Some(first) = self.graph.instructions_mut(target).next() else {
+                continue;
+            };
+            if !first.no_location_policy.inherit_conditional_target {
+                continue;
+            }
+            if first.location.line < 0 {
+                let mut location = jump_location;
+                if predecessor_location.line < 0
+                    && let Some((1, source_predecessor_location)) = predecessors.get(&source)
+                    && source_predecessor_location.line >= 0
+                {
+                    location = *source_predecessor_location;
+                }
+                first.location = location;
+            }
+        }
+    }
+
     pub(in crate::assembler) fn push_cold_blocks_to_end(&mut self) {
         if self.exception_regions.is_empty() {
             return;

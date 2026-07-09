@@ -216,6 +216,7 @@ impl OptimizationPipeline {
         let mut removed_max_depth = self.remove_unreachable_instructions();
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::RemoveUnreachableInitial)?;
+        self.resolve_synthesized_conditional_target_locations();
         self.optimize_boolean_conversions();
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::OptimizeBooleanConversions)?;

@@ -115,6 +115,8 @@ pub(super) struct NoLocationPolicy {
     /// Whether an unlocated block ending at this instruction may be inlined.
     pub(super) allow_block_inlining: bool,
     pub(super) preserve: bool,
+    /// Whether a synthesized leading constant inherits its sole predecessor's location.
+    pub(super) inherit_conditional_target: bool,
 }
 
 impl NoLocationPolicy {
@@ -122,6 +124,8 @@ impl NoLocationPolicy {
         Self {
             allow_block_inlining: first.allow_block_inlining || second.allow_block_inlining,
             preserve: first.preserve || second.preserve,
+            inherit_conditional_target: first.inherit_conditional_target
+                || second.inherit_conditional_target,
         }
     }
 }

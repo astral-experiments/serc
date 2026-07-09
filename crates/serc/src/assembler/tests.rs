@@ -474,6 +474,7 @@ fn fusion_preserves_each_typed_instruction_policy() {
     );
     first.load_policy.force_owned = true;
     first.no_location_policy.allow_block_inlining = true;
+    first.no_location_policy.inherit_conditional_target = true;
     first.converted_pop_block = true;
     first.hidden_exception_owner_slots = 2;
     first.fusion_policy.prevent_with_next = true;
@@ -517,6 +518,7 @@ fn fusion_preserves_each_typed_instruction_policy() {
         NoLocationPolicy {
             allow_block_inlining: true,
             preserve: true,
+            inherit_conditional_target: true,
         }
     );
     assert_eq!(fused.fusion_policy, FusionPolicy::default());
