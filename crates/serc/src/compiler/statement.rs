@@ -2497,11 +2497,28 @@ impl Compiler {
                         self.assembler.preserve_last_no_location();
                     } else if pass_only_body || retain_assertion_exit {
                         self.assembler.preserve_last_direct_inlined_jump_nop();
-                    } else if matches!(body.last(), Some(Stmt::If(_))) {
+                    } else if let Some(Stmt::If(nested)) = body.last() {
                         // CPython emits this jump in the nested if's empty join block. When
                         // small-exit inlining replaces it with a NOP, no preceding instruction
                         // in that block can make the NOP redundant.
-                        self.assembler.preserve_last_direct_inlined_jump_nop();
+                        if branch_index == 0
+                            && body.len() == 1
+                            && statement.elif_else_clauses.len() >= 2
+                            && statement
+                                .elif_else_clauses
+                                .last()
+                                .is_some_and(|clause| clause.test.is_none())
+                            && nested.elif_else_clauses.len() >= 2
+                            && nested
+                                .elif_else_clauses
+                                .last()
+                                .is_some_and(|clause| clause.test.is_none())
+                        {
+                            self.assembler
+                                .preserve_last_redundant_jump_nop_after_threading();
+                        } else {
+                            self.assembler.preserve_last_direct_inlined_jump_nop();
+                        }
                     }
                 }
                 self.assembler.mark(next);
@@ -3068,6 +3085,33 @@ impl Compiler {
         for (branch_index, (test, body)) in branches.into_iter().enumerate() {
             if !try_body_normal_exit && !has_else && branch_index + 1 == branch_count {
                 let test = test.expect("last branch without else has a test");
+                if non_final_branch
+                    && !self.has_active_control_flow_region()
+                    && condition_jump_target_count(test, false) == 1
+                    && condition_jump_target_count(test, true) == 1
+                {
+                    // CPython retains source order for a final `elif` nested in a non-final
+                    // loop-tail branch: the body falls through and the false edge reaches the
+                    // enclosing backedge directly.
+                    let fallback = self.assembler.label();
+                    self.compile_jump_if(test, false, fallback)?;
+                    let body_start = self.assembler.instruction_count();
+                    let nested_tail = self.compile_with_strict_owned_loads(
+                        matches!(test, Expr::If(_)),
+                        |compiler| compiler.compile_non_final_branch_loop_tail_suite(body, restart),
+                    )?;
+                    if nested_tail == LoopBackedge::Required && !suite_terminates(body) {
+                        self.set_branch_end_location(body, body_start);
+                        self.emit_jump_backward(JUMP_BACKWARD, restart, 0)?;
+                    }
+
+                    self.assembler.mark(fallback);
+                    self.set_depth(base_depth);
+                    self.assembler
+                        .set_location(self.source_location(synthetic_condition_exit_range(test)));
+                    self.emit_jump_backward(JUMP_BACKWARD, restart, 0)?;
+                    return Ok(());
+                }
                 let body_label = self.assembler.label();
                 // Chained comparisons retain a separate cleanup join before the loop edge.
                 // Keep their generic Boolean join until that loop-tail layout is modeled;
