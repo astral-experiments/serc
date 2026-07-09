@@ -3554,6 +3554,52 @@ match subject:
     }
 
     #[test]
+    fn matches_cpython_marshal_for_synthesized_percent_format_target_locations() {
+        let source = r#"def terminal_false_target(flag, value):
+    if flag:
+        return value
+    return "tail=%s" % value
+
+
+def else_target(flag, value):
+    if flag:
+        result = "left=%s" % value
+    else:
+        result = "right=%s" % value
+    return result
+
+
+def final_elif_target(first, second, value):
+    if first:
+        return first
+    elif second:
+        return second
+    return "tail=%s" % value
+
+
+def entry_block(value):
+    return "entry=%s" % value
+
+
+def true_fallthrough(flag, value):
+    if flag:
+        return "body=%s" % value
+    return value
+
+
+def formatted_first(flag, value):
+    if flag:
+        return flag
+    return "%s=tail" % value
+
+
+def filtered_generator(items):
+    return "".join(" %s=%s" % (key, value) for key, value in items if value)
+"#;
+        assert_matches_cpython_marshal(source, "percent_format_target.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_folded_not_and_terminal_while() {
         let source = "folded = not (\n    True\n)\n\ndef loop():\n    while not check() and left < right:\n        pass\n";
         assert_matches_cpython_marshal(source, "example.py");

@@ -569,6 +569,14 @@ impl Assembler {
             .preserve = true;
     }
 
+    pub(crate) fn inherit_conditional_target_location_for_last_instruction(&mut self) {
+        self.required_last_instruction_mut(
+            "inheriting a conditional target location for a synthesized instruction",
+        )
+        .no_location_policy
+        .inherit_conditional_target = true;
+    }
+
     /// Gives the last instruction its final successor's location after optimization.
     /// This mirrors CPython's `NEXT_LOCATION` pseudo-location.
     pub(crate) fn use_next_location_for_last_instruction(&mut self) {
