@@ -2368,6 +2368,68 @@ def method_twenty_eight_and_one(obj):
         );
         assert_matches_cpython_marshal(&source, "large_call_thresholds.py");
     }
+
+    #[test]
+    fn matches_cpython_marshal_for_starred_global_call_arguments() {
+        let source = r"global module_values, module_callable
+module_explicit_global = consume(*module_values)
+module_load_name = consume(*module_name)
+module_both_global = module_callable(*module_values)
+module_multiline = consume(
+    *module_values
+)
+module_named_keyword = consume(*module_values, option=True)
+
+module_direct_global = module_callable()
+
+class ClassScope:
+    global class_values, class_callable
+    explicit_global = consume(*class_values)
+    load_name = consume(*class_name)
+    both_global = class_callable(*class_values)
+    named_keyword = consume(*class_values, option=True)
+
+    direct_global = class_callable()
+
+
+class AnnotationScope:
+    type Alias = consume(*annotation_values)
+
+
+def global_callable():
+    return consume(*values)
+
+def local_callable(consume):
+    return consume(*values)
+
+def local_argument(values):
+    return consume(*values)
+
+def bound_callable(obj):
+    return obj.consume(*values)
+
+def computed_callable():
+    return make_consumer()(*values)
+
+def comprehension_shadow():
+    global values
+    return [consume(*values) for values in collections]
+
+def called_argument():
+    return consume(*make_values())
+
+def leading_argument():
+    return consume(1, *values)
+
+def multiple_arguments():
+    return consume(*values, *more_values)
+
+def keyword_unpacking():
+    return consume(*values, **options)
+";
+        assert_matches_cpython_marshal(source, "starred_global_argument.py");
+    }
+
     #[test]
     fn matches_cpython_marshal_for_optimized_generator_calls() {
         let source = "module_any = any(value for value in values)\nmodule_all = all(value for value in values)\nmodule_tuple = tuple(value for value in values)\nany(value for value in values)\nall(value for value in values)\ntuple(value for value in values)\nafter = None\n\n\ndef optimized(values):\n    return (\n        any(value for value in values),\n        all(value for value in values),\n        tuple(value for value in values),\n    )\n\n\ndef rebound(values, any):\n    return any(value for value in values)\n\n\ndef terminal_discard(values):\n    all(value for value in values)\n";
