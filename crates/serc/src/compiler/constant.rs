@@ -942,6 +942,14 @@ pub(super) fn fold_constant(expression: &Expr) -> Option<Constant> {
                     Some(Constant::Int(left % right))
                 }
                 (Constant::Int(left), Operator::Pow, Constant::Int(right)) => {
+                    const MAX_INT_SIZE: u64 = 128;
+
+                    if left != 0 && right > 0 {
+                        let left_bits = u64::from(u64::BITS - left.leading_zeros());
+                        if left_bits > MAX_INT_SIZE / right {
+                            return None;
+                        }
+                    }
                     let right = u32::try_from(right).ok()?;
                     if let Some(value) = left.checked_pow(right) {
                         Some(Constant::Int(value))
@@ -1070,6 +1078,18 @@ pub(super) fn fold_constant(expression: &Expr) -> Option<Constant> {
                         _ => unreachable!(),
                     };
                     Some(Constant::Complex { real, imag })
+                }
+                (left, Operator::Div, right)
+                    if matches!(left, Constant::Complex { .. })
+                        || matches!(right, Constant::Complex { .. }) =>
+                {
+                    fold_complex_division(&left, &right)
+                }
+                (left, Operator::Pow, right)
+                    if matches!(left, Constant::Complex { .. })
+                        || matches!(right, Constant::Complex { .. }) =>
+                {
+                    fold_complex_integer_power(&left, &right)
                 }
                 (Constant::String(mut left), Operator::Add, Constant::String(right)) => {
                     left.push_str(&right);
@@ -1600,6 +1620,115 @@ fn constant_complex_parts(constant: &Constant) -> Option<(f64, f64)> {
         Constant::Complex { real, imag } => Some((*real, *imag)),
         _ => None,
     }
+}
+
+fn complex_product(left: (f64, f64), right: (f64, f64)) -> (f64, f64) {
+    (
+        left.0 * right.0 - left.1 * right.1,
+        left.0 * right.1 + left.1 * right.0,
+    )
+}
+
+fn complex_quotient(left: (f64, f64), right: (f64, f64)) -> Option<(f64, f64)> {
+    let abs_real = right.0.abs();
+    let abs_imag = right.1.abs();
+    let result = if abs_real >= abs_imag {
+        if abs_real == 0.0 {
+            return None;
+        }
+        let ratio = right.1 / right.0;
+        let denominator = right.0 + right.1 * ratio;
+        (
+            (left.0 + left.1 * ratio) / denominator,
+            (left.1 - left.0 * ratio) / denominator,
+        )
+    } else if abs_imag >= abs_real {
+        let ratio = right.0 / right.1;
+        let denominator = right.0 * ratio + right.1;
+        (
+            (left.0 * ratio + left.1) / denominator,
+            (left.1 * ratio - left.0) / denominator,
+        )
+    } else {
+        (f64::NAN, f64::NAN)
+    };
+    (result.0.is_finite() && result.1.is_finite()).then_some(result)
+}
+
+fn fold_complex_division(left: &Constant, right: &Constant) -> Option<Constant> {
+    let left_parts = constant_complex_parts(left)?;
+    let right_parts = constant_complex_parts(right)?;
+    let (real, imag) = match (left, right) {
+        (Constant::Complex { .. }, Constant::Complex { .. }) => {
+            complex_quotient(left_parts, right_parts)?
+        }
+        (Constant::Complex { .. }, _) => {
+            if right_parts.0 == 0.0 {
+                return None;
+            }
+            (left_parts.0 / right_parts.0, left_parts.1 / right_parts.0)
+        }
+        (_, Constant::Complex { .. }) => {
+            let abs_real = right_parts.0.abs();
+            let abs_imag = right_parts.1.abs();
+            if abs_real >= abs_imag {
+                if abs_real == 0.0 {
+                    return None;
+                }
+                let ratio = right_parts.1 / right_parts.0;
+                let denominator = right_parts.0 + right_parts.1 * ratio;
+                (
+                    left_parts.0 / denominator,
+                    (-left_parts.0 * ratio) / denominator,
+                )
+            } else {
+                let ratio = right_parts.0 / right_parts.1;
+                let denominator = right_parts.0 * ratio + right_parts.1;
+                (
+                    (left_parts.0 * ratio) / denominator,
+                    (-left_parts.0) / denominator,
+                )
+            }
+        }
+        _ => return None,
+    };
+    (real.is_finite() && imag.is_finite()).then_some(Constant::Complex { real, imag })
+}
+
+#[expect(
+    clippy::float_cmp,
+    reason = "CPython checks complex exponents for exact binary64 integrality"
+)]
+fn fold_complex_integer_power(base: &Constant, exponent: &Constant) -> Option<Constant> {
+    let base = constant_complex_parts(base)?;
+    let (exponent_real, exponent_imag) = constant_complex_parts(exponent)?;
+    if exponent_imag != 0.0 || exponent_real != exponent_real.floor() || exponent_real.abs() > 100.0
+    {
+        return None;
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the exact integral exponent is bounded to CPython's [-100, 100] fast path"
+    )]
+    let exponent = exponent_real as i64;
+    let mut result = (1.0, 0.0);
+    let mut power = base;
+    let magnitude = exponent.unsigned_abs();
+    let mut mask = 1_u64;
+    while mask > 0 && magnitude >= mask {
+        if magnitude & mask != 0 {
+            result = complex_product(result, power);
+        }
+        mask <<= 1;
+        power = complex_product(power, power);
+    }
+    if exponent < 0 {
+        result = complex_quotient((1.0, 0.0), result)?;
+    }
+    (result.0.is_finite() && result.1.is_finite()).then_some(Constant::Complex {
+        real: result.0,
+        imag: result.1,
+    })
 }
 
 pub(super) fn constant_truthiness(constant: &Constant) -> bool {

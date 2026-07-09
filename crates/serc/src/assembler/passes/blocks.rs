@@ -992,8 +992,16 @@ impl OptimizationPipeline {
             }
 
             let source_location = graph[source]
-                .last_instruction()
-                .map_or(SourceLocation::NONE, |instruction| instruction.location);
+                .items()
+                .iter()
+                .rev()
+                .find_map(|item| match item {
+                    Item::Instruction(instruction) if instruction.location.line >= 0 => {
+                        Some(instruction.location)
+                    }
+                    Item::Instruction(_) | Item::Label(_) => None,
+                })
+                .unwrap_or(SourceLocation::NONE);
             let mut copied = target_blocks
                 .iter()
                 .flat_map(|block| graph[*block].items().iter().copied())
@@ -1122,7 +1130,19 @@ impl OptimizationPipeline {
                 instruction.retarget(Operand::Forward(copied_label));
             }
             if inline_no_location_block {
+                let copied_jump_target =
+                    block_jump_target(&copied).and_then(|label| graph.label_block(label));
                 graph.append_to_block(source, copied);
+                if let Some(copied_jump_target) = copied_jump_target {
+                    remaining_predecessors
+                        .entry(copied_jump_target)
+                        .and_modify(|count| *count += 1);
+                    drop_blocks.remove(&copied_jump_target);
+                }
+                // CPython repeats no-line block inlining to a fixed point. The copied block can
+                // itself end in a jump to another synthetic cleanup block, so revisit this source
+                // before considering its earlier jump predecessors.
+                sources.push(source);
                 // The copied jump can turn this source into another eligible unlocated block.
                 // Revisit earlier jump predecessors until the chain reaches a fixed point.
                 for predecessor in order.iter().copied().take(source_position) {

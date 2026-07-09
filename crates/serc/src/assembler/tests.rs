@@ -1084,3 +1084,70 @@ fn duplicated_exit_blocks_retain_transitively_targeted_blocks() {
 
     crate::compile(source, "nested_exit_copy.py").unwrap();
 }
+
+#[test]
+fn no_location_block_inlining_reaches_a_fixed_point() {
+    let restart = super::Label(0);
+    let source = super::Label(1);
+    let first_cleanup = super::Label(2);
+    let second_cleanup = super::Label(3);
+    let mut first_cleanup_jump = Instruction::new(
+        JUMP_FORWARD,
+        Operand::Forward(second_cleanup),
+        SourceLocation::NONE,
+        None,
+    );
+    first_cleanup_jump.jump_policy.prevent_threading_target();
+    first_cleanup_jump.no_location_policy.allow_block_inlining = true;
+    let mut second_cleanup_jump = Instruction::new(
+        JUMP_BACKWARD_NO_INTERRUPT,
+        Operand::Backward(restart),
+        SourceLocation::NONE,
+        None,
+    );
+    second_cleanup_jump.jump_policy.prevent_threading_target();
+    second_cleanup_jump.no_location_policy.allow_block_inlining = true;
+    let mut assembler = optimization_pipeline(vec![
+        Item::Label(restart),
+        pass_instruction(NOP, 0, 0),
+        Item::Label(source),
+        pass_instruction(LOAD_CONST, 0, 1),
+        Item::Instruction(Instruction::new(
+            JUMP_FORWARD,
+            Operand::Forward(first_cleanup),
+            SourceLocation::new(1, 1, 0, 0),
+            None,
+        )),
+        Item::Label(first_cleanup),
+        pass_instruction(POP_EXCEPT, 0, -1),
+        Item::Instruction(first_cleanup_jump),
+        Item::Label(second_cleanup),
+        pass_instruction(POP_TOP, 0, -1),
+        Item::Instruction(second_cleanup_jump),
+    ]);
+
+    assembler.duplicate_exit_blocks();
+    assembler.propagate_locations_within_blocks();
+
+    assert_eq!(
+        graph_opcodes(&assembler),
+        [
+            NOP,
+            LOAD_CONST,
+            POP_EXCEPT,
+            POP_TOP,
+            JUMP_BACKWARD_NO_INTERRUPT
+        ]
+    );
+    assert_eq!(
+        assembler
+            .graph
+            .iter_items()
+            .filter_map(|item| match item {
+                Item::Instruction(instruction) => Some(instruction.location.line),
+                Item::Label(_) => None,
+            })
+            .collect::<Vec<_>>(),
+        [0, 1, 1, 1, 1]
+    );
+}

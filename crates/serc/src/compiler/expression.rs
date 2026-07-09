@@ -3811,11 +3811,12 @@ impl Compiler {
                 self.compile_collection(&tuple.elts, CollectionKind::List)
             }
             Expr::List(list) if !list.elts.iter().any(Expr::is_starred_expr) => {
-                if let Some(constants) = list
-                    .elts
-                    .iter()
-                    .map(fold_constant)
-                    .collect::<Option<Vec<_>>>()
+                if list.elts.len() <= 30
+                    && let Some(constants) = list
+                        .elts
+                        .iter()
+                        .map(fold_constant)
+                        .collect::<Option<Vec<_>>>()
                 {
                     for element in &list.elts {
                         self.record_folded_value(element)?;
@@ -3837,7 +3838,14 @@ impl Compiler {
                     );
                     Ok(())
                 } else {
-                    self.compile_collection(&list.elts, CollectionKind::Tuple)
+                    self.compile_collection(
+                        &list.elts,
+                        if list.elts.len() > 30 {
+                            CollectionKind::List
+                        } else {
+                            CollectionKind::Tuple
+                        },
+                    )
                 }
             }
             Expr::Set(set)
@@ -4239,7 +4247,9 @@ impl Compiler {
         if let Expr::BoolOp(inner) = last
             && inner.op == expression.op
         {
-            self.compile_bool_expression_at(inner, location)?;
+            // CPython preserves the trailing group's own range after recursively lowering it;
+            // leading groups instead share the surrounding expression's short-circuit marker.
+            self.compile_bool_expression_at(inner, self.source_location(inner.range))?;
         } else {
             self.compile_expression(last)?;
         }
@@ -4515,20 +4525,41 @@ impl Compiler {
                 self.emit(NOT_TAKEN, 0, 0)?;
             }
 
-            self.compile_expression(comparison.comparators.last().unwrap())?;
+            let final_comparator = comparison.comparators.last().unwrap();
+            let final_operator = *comparison.ops.last().unwrap();
+            let specialized_none_jump = matches!(final_comparator, Expr::NoneLiteral(_))
+                && matches!(final_operator, CmpOp::Is | CmpOp::IsNot);
+            if specialized_none_jump {
+                self.add_constant(Constant::None)?;
+            } else {
+                self.compile_expression(final_comparator)?;
+            }
             self.assembler
                 .set_location(self.source_location(comparison.range));
-            let (opcode, argument) = comparison_operator_boolean(*comparison.ops.last().unwrap());
-            self.emit(opcode, argument, -1)?;
-            self.emit_jump_forward(
-                if jump_on {
-                    POP_JUMP_IF_TRUE
-                } else {
-                    POP_JUMP_IF_FALSE
-                },
-                label,
-                -1,
-            )?;
+            if specialized_none_jump {
+                let jump_if_none = jump_on == (final_operator == CmpOp::Is);
+                self.emit_jump_forward(
+                    if jump_if_none {
+                        POP_JUMP_IF_NONE
+                    } else {
+                        POP_JUMP_IF_NOT_NONE
+                    },
+                    label,
+                    -1,
+                )?;
+            } else {
+                let (opcode, argument) = comparison_operator_boolean(final_operator);
+                self.emit(opcode, argument, -1)?;
+                self.emit_jump_forward(
+                    if jump_on {
+                        POP_JUMP_IF_TRUE
+                    } else {
+                        POP_JUMP_IF_FALSE
+                    },
+                    label,
+                    -1,
+                )?;
+            }
             self.emit(NOT_TAKEN, 0, 0)?;
             self.emit_jump_forward(JUMP_FORWARD, end, 0)?;
             if jump_on && self.control.preserve_assert_chained_comparison_exit_nop {
