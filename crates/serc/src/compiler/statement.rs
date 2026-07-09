@@ -3120,7 +3120,12 @@ impl Compiler {
 
         self.assembler.mark(else_label);
         self.set_depth(base_depth);
-        if statement.orelse.is_empty() && !self.control.active_with_region_exclusions.is_empty() {
+        // CPython omits the protected-region exit marker when another statement follows the
+        // while in the same suite.
+        if statement.orelse.is_empty()
+            && !self.control.current_statement_has_following
+            && !self.control.active_with_region_exclusions.is_empty()
+        {
             let exclusion_start = self.assembler.label();
             self.assembler.mark(exclusion_start);
             self.assembler

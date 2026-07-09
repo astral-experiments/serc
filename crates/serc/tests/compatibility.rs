@@ -626,6 +626,52 @@ def protected(lock):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_nonfinal_while_exits_in_with_bodies() {
+        let source = r"def final_sync(manager, flag):
+    with manager:
+        while flag:
+            step()
+    outside()
+
+
+def followed_sync(manager, flag):
+    with manager:
+        while flag:
+            step()
+        inside()
+    outside()
+
+
+def nested_followed_sync(manager, flag, outer):
+    with manager:
+        if outer:
+            while flag:
+                step()
+            inside()
+    outside()
+
+
+def loop_else_sync(manager, flag):
+    with manager:
+        while flag:
+            step()
+        else:
+            fallback()
+        inside()
+    outside()
+
+
+async def followed_async(manager, flag):
+    async with manager:
+        while flag:
+            step()
+        inside()
+    outside()
+";
+        assert_matches_cpython_marshal(source, "nonfinal_while_with.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_unary_not_synthetic_exit_locations() {
         let source = r"def branch_join(flag):
     if flag:
