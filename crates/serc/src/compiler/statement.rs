@@ -136,6 +136,7 @@ struct TryCompileOptions {
     terminal: bool,
     emit_statement_nop: bool,
     exclude_terminal_body_not_taken: bool,
+    loop_tail: Option<(Label, bool)>,
 }
 
 impl TryCompileOptions {
@@ -143,12 +144,13 @@ impl TryCompileOptions {
         terminal: false,
         emit_statement_nop: true,
         exclude_terminal_body_not_taken: false,
+        loop_tail: None,
     };
     const TERMINAL: Self = Self {
         terminal: true,
         ..Self::STANDARD
     };
-    const LOOP_TAIL: Self = Self {
+    const LEGACY_LOOP_TAIL: Self = Self {
         exclude_terminal_body_not_taken: true,
         ..Self::STANDARD
     };
@@ -156,7 +158,15 @@ impl TryCompileOptions {
         terminal: false,
         emit_statement_nop: false,
         exclude_terminal_body_not_taken: false,
+        loop_tail: None,
     };
+
+    const fn loop_tail(restart: Label, split_short_circuit: bool) -> Self {
+        Self {
+            loop_tail: Some((restart, split_short_circuit)),
+            ..Self::STANDARD
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -2448,6 +2458,7 @@ impl Compiler {
                     restart,
                     split_short_circuit,
                     non_final_branch,
+                    false,
                 )?;
                 Ok(LoopBackedge::Emitted)
             }
@@ -2478,6 +2489,22 @@ impl Compiler {
                 )?;
                 self.compile_loop_tail_assert(statement, restart)?;
                 Ok(LoopBackedge::Emitted)
+            }
+            Some((Stmt::Try(statement), leading))
+                if !non_final_branch
+                    && self.control.generator_region_start.is_none()
+                    && try_requires_loop_tail_inlining(statement) =>
+            {
+                self.with_control_override(
+                    |control| &mut control.suite_fallthrough_to_loop_backedge,
+                    false,
+                    |compiler| compiler.compile_suite(leading),
+                )?;
+                self.compile_try_inner(
+                    statement,
+                    TryCompileOptions::loop_tail(restart, split_short_circuit),
+                )?;
+                Ok(LoopBackedge::Required)
             }
             _ => {
                 self.with_control_override(
@@ -2667,15 +2694,16 @@ impl Compiler {
         body: &[Stmt],
         restart: Label,
     ) -> Result<LoopBackedge, CompileError> {
-        if let Some((Stmt::Try(statement), leading)) = body.split_last()
-            && try_requires_loop_tail_inlining(statement)
+        if self.control.generator_region_start.is_some()
+            && let Some((Stmt::Try(statement), leading)) = body.split_last()
+            && try_requires_legacy_loop_tail_exclusion(statement)
         {
             self.with_control_override(
                 |control| &mut control.suite_fallthrough_to_loop_backedge,
                 false,
                 |compiler| compiler.compile_suite(leading),
             )?;
-            self.compile_try_inner(statement, TryCompileOptions::LOOP_TAIL)?;
+            self.compile_try_inner(statement, TryCompileOptions::LEGACY_LOOP_TAIL)?;
             Ok(LoopBackedge::Required)
         } else {
             self.compile_loop_tail_suite(body, restart, true)
@@ -2688,10 +2716,13 @@ impl Compiler {
         body_start: usize,
         restart: Label,
     ) -> Result<(), CompileError> {
-        let inline_try_tail = matches!(
-            body.last(),
-            Some(Stmt::Try(statement)) if try_requires_loop_tail_inlining(statement)
-        );
+        let inline_try_tail = body.last().is_some_and(|statement| match statement {
+            Stmt::Try(statement) if self.control.generator_region_start.is_some() => {
+                try_requires_legacy_loop_tail_exclusion(statement)
+            }
+            Stmt::Try(statement) => try_requires_loop_tail_inlining(statement),
+            _ => false,
+        });
         if !inline_try_tail {
             self.set_branch_end_location(body, body_start);
         }
@@ -2728,12 +2759,36 @@ impl Compiler {
         Ok(())
     }
 
+    fn emit_loop_tail_backedge(
+        &mut self,
+        restart: Label,
+        exclude_from_innermost_exception: bool,
+    ) -> Result<(), CompileError> {
+        let exclusion_start = exclude_from_innermost_exception.then(|| {
+            let start = self.assembler.label();
+            self.assembler.mark(start);
+            start
+        });
+        self.emit_jump_backward(JUMP_BACKWARD, restart, 0)?;
+        if let Some(exclusion_start) = exclusion_start {
+            let exclusion_end = self.assembler.label();
+            self.assembler.mark(exclusion_end);
+            self.control
+                .active_exception_region_exclusions
+                .last_mut()
+                .expect("try-body loop tail requires an active exception region")
+                .push((exclusion_start, exclusion_end));
+        }
+        Ok(())
+    }
+
     fn compile_loop_tail_if(
         &mut self,
         statement: &ruff_python_ast::StmtIf,
         restart: Label,
         split_short_circuit: bool,
         non_final_branch: bool,
+        try_body_normal_exit: bool,
     ) -> Result<(), CompileError> {
         let base_depth = self.control.depth;
         if statement.elif_else_clauses.is_empty() {
@@ -2765,32 +2820,34 @@ impl Compiler {
                 self.emit_jump_backward(JUMP_BACKWARD, restart, 0)?;
                 return Ok(());
             }
-            if self.control.generator_region_start.is_none()
-                && let Expr::Compare(comparison) = statement.test.as_ref()
-                && comparison.ops.len() > 1
-            {
-                return self.compile_loop_tail_chained_compare(
-                    statement,
-                    comparison,
-                    restart,
-                    split_short_circuit,
-                );
+            if !try_body_normal_exit {
+                if self.control.generator_region_start.is_none()
+                    && let Expr::Compare(comparison) = statement.test.as_ref()
+                    && comparison.ops.len() > 1
+                {
+                    return self.compile_loop_tail_chained_compare(
+                        statement,
+                        comparison,
+                        restart,
+                        split_short_circuit,
+                    );
+                }
+                let body = statement.body.as_slice();
+                let body_label = self.assembler.label();
+                self.compile_loop_tail_condition(&statement.test, true, body_label, restart)?;
+                self.assembler.mark(body_label);
+                self.set_depth(base_depth);
+                let body_start = self.assembler.instruction_count();
+                let nested_tail = self.compile_with_strict_owned_loads(
+                    matches!(statement.test.as_ref(), Expr::If(_)),
+                    |compiler| compiler.compile_loop_tail_suite(body, restart, split_short_circuit),
+                )?;
+                if nested_tail == LoopBackedge::Required && !suite_terminates(body) {
+                    self.set_branch_end_location(body, body_start);
+                    self.emit_jump_backward(JUMP_BACKWARD, restart, 0)?;
+                }
+                return Ok(());
             }
-            let body = statement.body.as_slice();
-            let body_label = self.assembler.label();
-            self.compile_loop_tail_condition(&statement.test, true, body_label, restart)?;
-            self.assembler.mark(body_label);
-            self.set_depth(base_depth);
-            let body_start = self.assembler.instruction_count();
-            let nested_tail = self.compile_with_strict_owned_loads(
-                matches!(statement.test.as_ref(), Expr::If(_)),
-                |compiler| compiler.compile_loop_tail_suite(body, restart, split_short_circuit),
-            )?;
-            if nested_tail == LoopBackedge::Required && !suite_terminates(body) {
-                self.set_branch_end_location(body, body_start);
-                self.emit_jump_backward(JUMP_BACKWARD, restart, 0)?;
-            }
-            return Ok(());
         }
         let mut branches: Vec<(Option<&Expr>, &[Stmt])> =
             vec![(Some(&statement.test), statement.body.as_slice())];
@@ -2804,7 +2861,7 @@ impl Compiler {
         let has_else = branches.last().is_some_and(|(test, _)| test.is_none());
 
         for (branch_index, (test, body)) in branches.into_iter().enumerate() {
-            if !has_else && branch_index + 1 == branch_count {
+            if !try_body_normal_exit && !has_else && branch_index + 1 == branch_count {
                 let test = test.expect("last branch without else has a test");
                 let body_label = self.assembler.label();
                 // Chained comparisons retain a separate cleanup join before the loop edge.
@@ -2830,13 +2887,17 @@ impl Compiler {
             }
             let next = test.map(|_| self.assembler.label());
             if let (Some(test), Some(next)) = (test, next) {
-                let exclude_from_control_flow_regions =
-                    !self.control.active_exception_region_exclusions.is_empty()
-                        || self
-                            .control
-                            .exclude_loop_tail_not_taken_from_control_flow_regions;
-                let exclude_from_all_exception_regions =
-                    !self.control.active_exception_region_exclusions.is_empty();
+                let has_outer_exception_region = try_body_normal_exit
+                    && self.control.active_exception_region_exclusions.len() > 1;
+                let exclude_from_control_flow_regions = has_outer_exception_region
+                    || (!try_body_normal_exit
+                        && (!self.control.active_exception_region_exclusions.is_empty()
+                            || self
+                                .control
+                                .exclude_loop_tail_not_taken_from_control_flow_regions));
+                let exclude_from_all_exception_regions = has_outer_exception_region
+                    || (!try_body_normal_exit
+                        && !self.control.active_exception_region_exclusions.is_empty());
                 self.with_control_override(
                     |control| &mut control.exclude_condition_not_taken_from_exception,
                     exclude_from_control_flow_regions,
@@ -2870,7 +2931,7 @@ impl Compiler {
                     self.assembler
                         .set_location(self.source_location(statement.range()));
                 }
-                self.emit_jump_backward(JUMP_BACKWARD, restart, 0)?;
+                self.emit_loop_tail_backedge(restart, try_body_normal_exit)?;
             }
             if let Some(next) = next {
                 self.assembler.mark(next);
@@ -2878,10 +2939,20 @@ impl Compiler {
             }
         }
         if !has_else {
+            let fallthrough_test = if try_body_normal_exit {
+                statement
+                    .elif_else_clauses
+                    .iter()
+                    .rev()
+                    .find_map(|clause| clause.test.as_ref())
+                    .unwrap_or(statement.test.as_ref())
+            } else {
+                statement.test.as_ref()
+            };
             self.assembler.set_location(
-                self.source_location(synthetic_condition_exit_range(&statement.test)),
+                self.source_location(synthetic_condition_exit_range(fallthrough_test)),
             );
-            self.emit_jump_backward(JUMP_BACKWARD, restart, 0)?;
+            self.emit_loop_tail_backedge(restart, try_body_normal_exit)?;
         }
         Ok(())
     }
@@ -3673,6 +3744,7 @@ impl Compiler {
             terminal,
             emit_statement_nop,
             exclude_terminal_body_not_taken,
+            loop_tail,
         } = options;
         if statement.is_star {
             return self.compile_try_star_except(statement, terminal, emit_statement_nop);
@@ -3766,6 +3838,11 @@ impl Compiler {
                         )
                     },
                 )?;
+            } else if let Some((restart, split_short_circuit)) = loop_tail
+                && let Some((Stmt::If(statement), leading)) = statement.body.split_last()
+            {
+                self.compile_suite(leading)?;
+                self.compile_loop_tail_if(statement, restart, split_short_circuit, false, true)?;
             } else if terminal
                 && statement.orelse.is_empty()
                 && statement
@@ -6277,7 +6354,22 @@ fn suite_ends_in_retained_try_body_exit_join(body: &[Stmt]) -> bool {
         .is_some_and(|clause| clause.test.is_none() && !suite_terminates(&clause.body))
 }
 
-fn try_requires_loop_tail_inlining(statement: &ruff_python_ast::StmtTry) -> bool {
+fn if_normal_exit_count(statement: &ruff_python_ast::StmtIf) -> usize {
+    usize::from(!suite_terminates(&statement.body))
+        + statement
+            .elif_else_clauses
+            .iter()
+            .filter(|clause| !suite_terminates(&clause.body))
+            .count()
+        + usize::from(
+            statement
+                .elif_else_clauses
+                .last()
+                .is_none_or(|clause| clause.test.is_some()),
+        )
+}
+
+fn try_requires_legacy_loop_tail_exclusion(statement: &ruff_python_ast::StmtTry) -> bool {
     !statement.is_star
         && statement.finalbody.is_empty()
         && statement.orelse.is_empty()
@@ -6286,6 +6378,16 @@ fn try_requires_loop_tail_inlining(statement: &ruff_python_ast::StmtTry) -> bool
             Some(Stmt::If(statement))
                 if statement.elif_else_clauses.is_empty()
                     && !suite_terminates(&statement.body)
+        )
+}
+
+fn try_requires_loop_tail_inlining(statement: &ruff_python_ast::StmtTry) -> bool {
+    !statement.is_star
+        && statement.finalbody.is_empty()
+        && statement.orelse.is_empty()
+        && matches!(
+            statement.body.last(),
+            Some(Stmt::If(statement)) if if_normal_exit_count(statement) > 1
         )
 }
 
