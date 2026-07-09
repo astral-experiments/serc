@@ -2365,6 +2365,18 @@ def recursively_nested(items):
                     consume(item)
         elif is_second(item):
             consume(item)
+
+
+def final_elif_in_non_final_branch(items):
+    for item in items:
+        if is_first(item):
+            if accepted(item):
+                consume(item)
+            elif deferred(item):
+                if ready(item):
+                    consume(item)
+        else:
+            fallback(item)
 "#;
         assert_matches_cpython_marshal(source, "non_final_branch_loop_tail.py");
     }
@@ -2899,6 +2911,29 @@ def decorated():
     }
 
     #[test]
+    fn matches_cpython_marshal_for_try_else_local_order() {
+        let source = r"def ordered():
+    try:
+        initial = produce()
+    except Exception as error:
+        handler_only = fallback()
+        result = handler_only
+    else:
+        result = success(initial)
+    return result
+
+
+def no_else_control():
+    try:
+        initial = produce()
+    except Exception as error:
+        handler_only = fallback()
+    return initial
+";
+        assert_matches_cpython_marshal(source, "try_else_local_order.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_multiline_conditional_expressions() {
         let source = "value = (\n    'body'\n    if True\n    else 'otherwise'\n)\n\ndef nested():\n    target.attribute = (\n        (first if inner else second)\n        if outer\n        else third\n    )\n";
         assert_matches_cpython_marshal(source, "conditional_expression.py");
@@ -3195,6 +3230,45 @@ def folded_nested(outer):
             body()
     else:
         other()
+    after()
+
+def threaded_three_way_cascade(major, minor, bugfix, other_major, other_minor, other_bugfix):
+    if major == other_major:
+        if minor == other_minor:
+            if bugfix == other_bugfix:
+                result = 0
+            elif bugfix > other_bugfix:
+                result = 1
+            else:
+                result = -1
+        elif minor > other_minor:
+            result = 1
+        else:
+            result = -1
+    elif major > other_major:
+        result = 1
+    else:
+        result = -1
+    return result
+
+def cascade_with_leading_statement(outer, middle, inner):
+    if outer:
+        prepare()
+        if middle:
+            if inner:
+                first()
+            elif alternate():
+                second()
+            else:
+                third()
+        elif alternate():
+            fourth()
+        else:
+            fifth()
+    elif alternate():
+        sixth()
+    else:
+        seventh()
     after()
 ";
         assert_matches_cpython_marshal(source, "nested_if_final_clause.py");
