@@ -1,5 +1,5 @@
 use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
-use ruff_python_ast::{BoolOp, Expr, Pattern, Stmt, UnaryOp};
+use ruff_python_ast::{BoolOp, CmpOp, Expr, Pattern, Stmt, UnaryOp};
 use ruff_text_size::{Ranged, TextRange};
 
 use super::{
@@ -1218,7 +1218,9 @@ impl Compiler {
                     compiler.compile_suite_inner(body, true)
                 })?;
                 if !suite_terminates(body) && !emitted_fallthrough {
-                    if let Some(range) = suite_unary_not_fallthrough_range(body) {
+                    if let Some(range) = suite_assert_success_fallthrough_range(body) {
+                        self.assembler.set_location(self.source_location(range));
+                    } else if let Some(range) = suite_unary_not_fallthrough_range(body) {
                         self.assembler.set_location(self.source_location(range));
                     } else if let Some(statement) = body
                         .last()
@@ -1235,23 +1237,29 @@ impl Compiler {
                         self.assembler
                             .set_location(self.source_location(statement.range()));
                     } else {
-                        self.assembler.set_location(
-                            self.source_location(synthetic_condition_exit_range(test)),
-                        );
+                        self.assembler
+                            .set_location(self.source_location(condition_fallthrough_range(test)));
                     }
                     self.emit_deferred_implicit_return()?;
                 }
                 self.assembler.mark(next);
                 self.set_depth(base_depth);
                 self.assembler
-                    .set_location(self.source_location(synthetic_condition_exit_range(test)));
+                    .set_location(self.source_location(condition_fallthrough_range(test)));
             } else {
                 let body_start = self.assembler.instruction_count();
-                let ((), emitted_fallthrough) = self.with_fallthrough_tracking(|compiler| {
-                    compiler.compile_suite_inner(body, true)
-                })?;
+                let ((), emitted_fallthrough) = self.compile_with_strict_owned_loads(
+                    suite_is_constant_false_assertion(body),
+                    |compiler| {
+                        compiler.with_fallthrough_tracking(|compiler| {
+                            compiler.compile_suite_inner(body, true)
+                        })
+                    },
+                )?;
                 if !suite_terminates(body) && !emitted_fallthrough {
-                    if let Some(range) = suite_unary_not_fallthrough_range(body) {
+                    if let Some(range) = suite_assert_success_fallthrough_range(body) {
+                        self.assembler.set_location(self.source_location(range));
+                    } else if let Some(range) = suite_unary_not_fallthrough_range(body) {
                         self.assembler.set_location(self.source_location(range));
                     } else if let Some(statement) = body
                         .last()
@@ -1337,6 +1345,83 @@ impl Compiler {
         self.assembler
             .set_location(self.source_location(comparison.range));
         self.emit_deferred_implicit_return()?;
+        self.set_depth(base_depth);
+        Ok(())
+    }
+
+    fn compile_terminating_if_chained_compare_with_else(
+        &mut self,
+        statement: &ruff_python_ast::StmtIf,
+        comparison: &ruff_python_ast::ExprCompare,
+    ) -> Result<(), CompileError> {
+        let base_depth = self.control.depth;
+        let cleanup = self.assembler.label();
+        let body = self.assembler.label();
+        let otherwise = self.assembler.label();
+        self.compile_expression(&comparison.left)?;
+        for (operator, comparator) in comparison
+            .ops
+            .iter()
+            .zip(&comparison.comparators)
+            .take(comparison.ops.len() - 1)
+        {
+            self.compile_expression(comparator)?;
+            self.assembler
+                .set_location(self.source_location(comparison.range));
+            self.emit(SWAP, 2, 0)?;
+            self.emit(COPY, 2, 1)?;
+            let (opcode, argument) = comparison_operator_boolean(*operator);
+            self.emit(opcode, argument, -1)?;
+            self.emit_jump_forward(POP_JUMP_IF_FALSE, cleanup, -1)?;
+            self.emit(NOT_TAKEN, 0, 0)?;
+        }
+
+        let final_comparator = comparison.comparators.last().unwrap();
+        let final_operator = *comparison.ops.last().unwrap();
+        let specialized_none_jump = matches!(final_comparator, Expr::NoneLiteral(_))
+            && matches!(final_operator, CmpOp::Is | CmpOp::IsNot);
+        if specialized_none_jump {
+            self.add_constant(Constant::None)?;
+        } else {
+            self.compile_expression(final_comparator)?;
+        }
+        self.assembler
+            .set_location(self.source_location(comparison.range));
+        if specialized_none_jump {
+            self.emit_jump_forward(
+                if final_operator == CmpOp::Is {
+                    POP_JUMP_IF_NOT_NONE
+                } else {
+                    POP_JUMP_IF_NONE
+                },
+                otherwise,
+                -1,
+            )?;
+        } else {
+            let (opcode, argument) = comparison_operator_boolean(final_operator);
+            self.emit(opcode, argument, -1)?;
+            self.emit_jump_forward(POP_JUMP_IF_FALSE, otherwise, -1)?;
+        }
+        self.emit(NOT_TAKEN, 0, 0)?;
+        self.emit(NOP, 0, 0)?;
+        self.assembler.preserve_last_nop();
+
+        self.assembler.mark(body);
+        self.set_depth(base_depth);
+        self.compile_suite(&statement.body)?;
+
+        self.assembler.mark(cleanup);
+        self.set_depth(base_depth + 1);
+        self.assembler
+            .set_location(self.source_location(comparison.range));
+        self.emit(POP_TOP, 0, -1)?;
+
+        self.assembler.mark(otherwise);
+        self.set_depth(base_depth);
+        let [clause] = statement.elif_else_clauses.as_slice() else {
+            unreachable!("terminal chained comparison specialization requires one else clause");
+        };
+        self.compile_suite(&clause.body)?;
         self.set_depth(base_depth);
         Ok(())
     }
@@ -2252,6 +2337,14 @@ impl Compiler {
     }
 
     fn compile_if(&mut self, statement: &ruff_python_ast::StmtIf) -> Result<(), CompileError> {
+        if let Expr::Compare(comparison) = statement.test.as_ref()
+            && comparison.ops.len() > 1
+            && suite_terminates(&statement.body)
+            && matches!(statement.elif_else_clauses.as_slice(), [clause]
+                if clause.test.is_none() && suite_terminates(&clause.body))
+        {
+            return self.compile_terminating_if_chained_compare_with_else(statement, comparison);
+        }
         if let Some(truthiness) = early_condition_truthiness(&statement.test)
             && statement.elif_else_clauses.len() <= 1
             && statement
@@ -2384,9 +2477,8 @@ impl Compiler {
                             self.source_location(synthetic_condition_exit_range(&statement.test)),
                         );
                     } else if let Some(NestedIfExitLocation::Located(test)) = nested_if_exit {
-                        self.assembler.set_location(
-                            self.source_location(synthetic_condition_exit_range(test)),
-                        );
+                        self.assembler
+                            .set_location(self.source_location(condition_fallthrough_range(test)));
                     } else if matches!(nested_if_exit, Some(NestedIfExitLocation::Unlocated)) {
                         self.assembler.set_location(SourceLocation::NONE);
                     } else {
@@ -2416,7 +2508,12 @@ impl Compiler {
                 self.set_depth(base_depth);
             } else {
                 let body_start = self.assembler.instruction_count();
-                self.compile_suite(body)?;
+                // CPython emits a constant-false assertion in a final `else` suite in a
+                // separate failure block that its borrowed-load traversal never visits.
+                self.compile_with_strict_owned_loads(
+                    suite_is_constant_false_assertion(body),
+                    |compiler| compiler.compile_suite(body),
+                )?;
                 if branch_index + 1 == branch_count
                     && self.assembler.instruction_count() == body_start
                     && let Some(statement) = body.last()
@@ -2441,7 +2538,9 @@ impl Compiler {
             && let Some(test) = terminating_if_fallthrough_test(statement)
         {
             self.assembler
-                .set_location(self.source_location(synthetic_condition_exit_range(test)));
+                .set_location(self.source_location(condition_fallthrough_range(test)));
+        } else if let Some(range) = suite_assert_success_fallthrough_range(body) {
+            self.assembler.set_location(self.source_location(range));
         } else if let Some(range) = suite_unary_not_fallthrough_range(body) {
             self.assembler.set_location(self.source_location(range));
         } else if self.assembler.instruction_count() > body_start
@@ -2717,9 +2816,8 @@ impl Compiler {
 
             self.assembler.mark(exit);
             self.set_depth(base_depth);
-            self.assembler.set_location(
-                self.source_location(synthetic_condition_exit_range(&statement.test)),
-            );
+            self.assembler
+                .set_location(self.source_location(condition_fallthrough_range(&statement.test)));
             self.emit_jump_backward(JUMP_BACKWARD, restart, 0)?;
             return Ok(());
         }
@@ -2741,7 +2839,7 @@ impl Compiler {
                 .mark_before_trailing_instructions(control_start, 2);
         }
         self.assembler
-            .set_location(self.source_location(synthetic_condition_exit_range(&statement.test)));
+            .set_location(self.source_location(condition_fallthrough_range(&statement.test)));
         self.emit_jump_backward(JUMP_BACKWARD, restart, 0)?;
         if let Some((control_start, control_end)) = control_region {
             self.assembler.mark(control_end);
@@ -2898,12 +2996,13 @@ impl Compiler {
     ) -> Result<(), CompileError> {
         let base_depth = self.control.depth;
         if statement.elif_else_clauses.is_empty() {
+            // CPython keeps a non-final branch's nested condition body before the fallback
+            // backedge even when that body exits the enclosing loop or function.
             if non_final_branch
                 && !split_short_circuit
                 && !self.has_active_control_flow_region()
                 && condition_jump_target_count(&statement.test, false) == 1
                 && condition_jump_target_count(&statement.test, true) == 1
-                && !suite_terminates(&statement.body)
             {
                 let body = statement.body.as_slice();
                 let fallback = self.assembler.label();
@@ -2913,7 +3012,7 @@ impl Compiler {
                     matches!(statement.test.as_ref(), Expr::If(_)),
                     |compiler| compiler.compile_non_final_branch_loop_tail_suite(body, restart),
                 )?;
-                if nested_tail == LoopBackedge::Required {
+                if nested_tail == LoopBackedge::Required && !suite_terminates(body) {
                     self.set_branch_end_location(body, body_start);
                     self.emit_jump_backward(JUMP_BACKWARD, restart, 0)?;
                 }
@@ -3891,9 +3990,30 @@ impl Compiler {
                 .as_except_handler()
                 .is_some_and(|handler| suite_terminates(&handler.body))
         });
+        let normal_exit_suite = if statement.orelse.is_empty() {
+            statement.body.as_slice()
+        } else {
+            statement.orelse.as_slice()
+        };
+        // A direct nested try with a terminating handler leaves the outer try body followed by
+        // an empty normal-exit block after CPython reorders the cold handler blocks.
+        let handler_contains_terminal_nested_try = statement.handlers.iter().any(|handler| {
+            handler.as_except_handler().is_some_and(|handler| {
+                handler.body.iter().any(|statement| {
+                    let Stmt::Try(statement) = statement else {
+                        return false;
+                    };
+                    statement.handlers.iter().any(|handler| {
+                        handler
+                            .as_except_handler()
+                            .is_some_and(|handler| suite_terminates(&handler.body))
+                    })
+                })
+            })
+        });
         let normal_exit_starts_in_empty_block = self.control.current_statement_has_following
-            && statement.orelse.is_empty()
-            && suite_ends_in_empty_try_exit_block(&statement.body);
+            && (suite_ends_in_empty_try_exit_block(normal_exit_suite)
+                || handler_contains_terminal_nested_try);
         // CPython removes the with handler's normal-exit edge before borrowed-load traversal,
         // so a following suite cannot reach this try join through that edge.
         if self.control.current_statement_has_following
@@ -4090,6 +4210,10 @@ impl Compiler {
                 && let Some(location) = body_noop_location
             {
                 self.assembler.set_location(location);
+            } else if statement.orelse.is_empty()
+                && let Some(range) = suite_assert_success_fallthrough_range(&statement.body)
+            {
+                self.assembler.set_location(self.source_location(range));
             } else if let Some(location) = self.assembler.last_instruction_location() {
                 self.assembler.set_location(location);
             }
@@ -4161,10 +4285,11 @@ impl Compiler {
             if normal_exit_starts_in_empty_block {
                 self.assembler.mark_last_borrow_empty_block();
             }
-            if handlers_terminate {
+            if handlers_terminate && !self.control.current_statement_followed_by_name_return {
                 // CPython removes this normal-exit edge before borrowed-load traversal. Keep
                 // the barrier on the source edge so a shared target can still be reached from
-                // an enclosing branch or loop.
+                // an enclosing branch or loop. A direct following name return is copied onto
+                // the normal edge first, so its load remains reachable and borrowed.
                 self.assembler.mark_last_borrow_fallthrough_barrier();
             }
             if !statement.orelse.is_empty()
@@ -5767,7 +5892,7 @@ impl Compiler {
             {
                 body_noop = Some(WithBodyExitNoop::Located(statement.range()));
             } else if terminal_if && let Some(Stmt::If(statement)) = body.last() {
-                body_noop = Some(WithBodyExitNoop::Located(synthetic_condition_exit_range(
+                body_noop = Some(WithBodyExitNoop::Located(condition_fallthrough_range(
                     &statement.test,
                 )));
             } else if let Some(Stmt::Assert(statement)) = body.last() {
@@ -6380,6 +6505,13 @@ fn unique_condition_jump_target(expression: &Expr, jump_on: bool) -> Option<&Exp
     Some(expression)
 }
 
+fn condition_fallthrough_range(expression: &Expr) -> TextRange {
+    // A sole false edge carries its contributing operand's range through CPython's CFG;
+    // multi-edge joins retain the whole synthetic condition range.
+    unique_condition_jump_target(expression, false)
+        .map_or_else(|| synthetic_condition_exit_range(expression), Ranged::range)
+}
+
 fn expression_contains_chained_comparison(expression: &Expr) -> bool {
     #[derive(Default)]
     struct Detector {
@@ -6403,6 +6535,15 @@ fn expression_contains_chained_comparison(expression: &Expr) -> bool {
 
 pub(super) fn suite_terminates(body: &[Stmt]) -> bool {
     body.iter().any(statement_terminates)
+}
+
+fn suite_is_constant_false_assertion(body: &[Stmt]) -> bool {
+    body.len() == 1
+        && matches!(
+            body.first(),
+            Some(Stmt::Assert(assertion))
+                if jump_constant_truthiness(&assertion.test) == Some(false)
+        )
 }
 
 fn try_normal_exit_predecessors(statement: &ruff_python_ast::StmtTry) -> usize {
@@ -6743,6 +6884,14 @@ fn suite_unary_not_fallthrough_range(body: &[Stmt]) -> Option<TextRange> {
         }
         _ => None,
     }
+}
+
+fn suite_assert_success_fallthrough_range(body: &[Stmt]) -> Option<TextRange> {
+    let Some(Stmt::Assert(statement)) = body.last() else {
+        return None;
+    };
+    // Only a unique success edge can supply one stable location to a shared branch exit.
+    unique_condition_jump_target(&statement.test, true).map(Ranged::range)
 }
 
 fn terminating_if_fallthrough_test(statement: &ruff_python_ast::StmtIf) -> Option<&Expr> {

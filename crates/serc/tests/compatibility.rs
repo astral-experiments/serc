@@ -1766,6 +1766,30 @@ def nonfinal_assertions(items):
         else:
             assert other(item)
 
+def nonfinal_break(items):
+    for item in items:
+        if first(item):
+            if stop(item):
+                break
+        else:
+            consume(item)
+
+def nonfinal_raise(items):
+    for item in items:
+        if first(item):
+            if rejected(item):
+                raise ValueError(item)
+        else:
+            consume(item)
+
+def nonfinal_return(items):
+    for item in items:
+        if first(item):
+            if accepted(item):
+                return item
+        else:
+            consume(item)
+
 def direct_assertion_control(items):
     for item in items:
         assert condition(item)
@@ -2153,6 +2177,61 @@ def explicit_else(flag):
     fn matches_cpython_marshal_for_optimized_boolean_operands() {
         let source = "if a and f() and False and g():\n    pass\na or \"\" or True\na or () or True\na and \"value\" and False\na or (b or c) or d\n0 if a or [1] or True or [2] else 1\nif (\n    f()\n    is None\n):\n    pass\nif g() is not None:\n    pass\nx\n\ndef terminal_conditional_expression(wait):\n    call() if wait else None\n\nif first or low <= value < high:\n    pass\n\nmultiline = [\n    (\n        \"value\"\n        and condition\n        and result\n    )\n]\n";
         assert_matches_cpython_marshal(source, "bool.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_trailing_nested_boolean_locations() {
+        let source = r"def conjunction(first, second, third):
+    return first and (second and third)
+
+
+def disjunction(first, second, third):
+    return first or (second or third)
+
+
+strip = lambda value: ((b'x' in value and value.strip()) or
+                       ((b'x' not in value and value.lower()) or None))
+";
+        assert_matches_cpython_marshal(source, "trailing_nested_boolean_locations.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_unique_condition_fallthrough_locations() {
+        let source = r#"def terminal_try(left, right):
+    try:
+        assert left and right
+    except TypeError:
+        pass
+
+
+def terminal_branch(flag, left, right):
+    if flag:
+        assert left and right
+    else:
+        consume()
+
+
+def protected(value):
+    with manager(invalid="ignore"):
+        result = transform(value)
+        if result.real != 0 or result.imag != 0:
+            raise AssertionError(format_result(result.real, result.imag))
+
+
+def nested_join(flag, left, right):
+    if flag:
+        if not (left and right):
+            raise ValueError
+    elif alternate:
+        consume()
+
+
+def nested_loop(items, left, right):
+    for item in items:
+        while left or right:
+            left, right = update(item)
+"#;
+        assert_matches_cpython_marshal(source, "unique_condition_fallthrough_locations.py");
     }
 
     #[test]
@@ -2857,6 +2936,30 @@ def decorated():
     }
 
     #[test]
+    fn matches_cpython_marshal_for_constant_false_assertions_in_final_else_suites() {
+        let source = r#"def direct(condition, value):
+    if condition:
+        return
+    else:
+        assert False, value
+
+
+def chained(kind, value):
+    if kind == "first":
+        first()
+    elif kind == "second":
+        second()
+    else:
+        assert 0, f"unknown: {value}"
+
+
+def control(value):
+    assert False, value
+"#;
+        assert_matches_cpython_marshal(source, "constant_false_assertion_else.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_assertion_chained_comparison_exit_nops() {
         let source = r#"def direct_chain(first, middle, last):
     assert first.value < middle.value < last.value
@@ -2880,6 +2983,30 @@ def non_assertion_chain(first, middle, last):
     after()
 "#;
         assert_matches_cpython_marshal(source, "assert_chained_comparison_exit_nops.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_final_none_chained_comparison_jumps() {
+        let source = r#"class Example:
+    def __init__(self, first, second=None, prefix=None):
+        if second is prefix is None:
+            self.value = first
+            self.first = None
+            self.second = None
+        else:
+            self.value = prefix
+            self.first = first
+            self.second = second
+
+    def render(self):
+        first = self.first
+        second = self.second
+        if first is second is None:
+            return self.value
+        else:
+            return f"{first}: {second}"
+"#;
+        assert_matches_cpython_marshal(source, "final_none_chained_comparison.py");
     }
 
     #[test]
@@ -3252,6 +3379,53 @@ def ordinary_guard(value):
     }
 
     #[test]
+    fn uses_cpython_borrow_kinds_after_terminal_nested_handlers() {
+        let source = r#"import dis
+
+
+def terminal_nested_handler(value):
+    try:
+        result = action()
+    except Error:
+        try:
+            recover()
+        except OtherError:
+            return value
+        result = fallback()
+    consume(value)
+    return result
+
+
+def fallthrough_nested_handler(value):
+    try:
+        result = action()
+    except Error:
+        try:
+            recover()
+        except OtherError:
+            alternate()
+        result = fallback()
+    consume(value)
+    return result
+
+
+def load_after_consume(function):
+    instructions = list(dis.get_instructions(function))
+    consume = next(
+        index
+        for index, instruction in enumerate(instructions)
+        if instruction.opname == "LOAD_GLOBAL" and instruction.argval == "consume"
+    )
+    return instructions[consume + 1].opname
+
+
+print(load_after_consume(terminal_nested_handler))
+print(load_after_consume(fallthrough_nested_handler))
+"#;
+        assert_executes(source, "LOAD_FAST\nLOAD_FAST_BORROW\n");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_empty_try_exit_borrow_boundaries() {
         let source = r"def fallthrough_if(value, flag):
     try:
@@ -3313,6 +3487,32 @@ def unthreaded_nested_if(value, flag, inner):
                 consume()
     except Exception:
         pass
+    consume(value)
+    return value
+
+
+def fallthrough_if_in_else(value, flag):
+    try:
+        consume()
+    except Exception:
+        pass
+    else:
+        if flag:
+            consume()
+    consume(value)
+    return value
+
+
+def complete_if_in_else(value, flag):
+    try:
+        consume()
+    except Exception:
+        pass
+    else:
+        if flag:
+            consume()
+        else:
+            recover()
     consume(value)
     return value
 ";
@@ -3476,6 +3676,29 @@ def reversed_store_pair(first, second):
     fn matches_cpython_marshal_for_borrowing_after_terminal_exception_handlers() {
         let source = "def returning(dependencies):\n    try:\n        before = load()\n        after = load()\n    except Exception:\n        return\n    for dependency in dependencies:\n        if dependency in after:\n            consume(dependency, before)\n\ndef reraising(dependencies):\n    try:\n        before = load()\n        after = load()\n    except Exception:\n        raise\n    for dependency in dependencies:\n        if dependency in after:\n            consume(dependency, before)\n";
         assert_matches_cpython_marshal(source, "terminal_handlers.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_name_returns_after_terminal_exception_handlers() {
+        let source = r"def direct():
+    try:
+        value = produce()
+    except Exception:
+        raise RuntimeError
+    return value
+
+
+def nested():
+    try:
+        try:
+            value = produce()
+        except SyntaxError:
+            raise SyntaxError
+        return value
+    except Exception:
+        raise
+";
+        assert_matches_cpython_marshal(source, "terminal_handler_name_return.py");
     }
 
     #[test]
@@ -3846,6 +4069,16 @@ negative_product = (1 << 63) * -2
 maximum_product = 18446744073709551615 * 9223372036854775807
 unfolded_product = 18446744073709551616 * 9223372036854775808
 zero_huge_product = 0 * 999999999999999999999999999999999999999
+maximum_power = 2 ** 64
+unfolded_power = 2 ** 65
+unfolded_huge_power = 2 ** 100
+zero_huge_power = 0 ** 999999999999999999999999999999999999999
+complex_positive_power = [(1 + 2j) ** 3, (2 + 3j) ** 4]
+complex_negative_power = [(1 + 2j) ** -2, (2 + 3j) ** -3]
+real_divided_by_complex = [1 / (1 + 2j), 1 / (2 + 3j)]
+complex_divided_by_real = [(-11 + 2j) / 125, (-46 - 9j) / 2197]
+unfolded_complex_power = (1e308 + 1j) ** 2
+unfolded_zero_negative_power = 0j ** -1
 negative_right_shift = -3 >> 1
 large_negative_right_shift = -18446744073709551617 >> 64
 huge_positive_right_shift = 1 >> 999999999999999999999999999999999999999
@@ -3864,6 +4097,19 @@ huge_negative_right_shift = -1 >> 999999999999999999999999999999999999999
                 .join(", ")
         );
         assert_matches_cpython_marshal(&source, "large_constant_list.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_large_list_iterables() {
+        let constants = (0..31)
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let dynamic = (0..31).map(|_| "value").collect::<Vec<_>>().join(", ");
+        let source = format!(
+            "def constant_loop():\n    for item in [{constants}]:\n        consume(item)\n\n\ndef dynamic_loop(value):\n    for item in [{dynamic}]:\n        consume(item)\n\n\ndef constant_contains(item):\n    return item in [{constants}]\n\n\ndef dynamic_contains(item, value):\n    return item in [{dynamic}]\n"
+        );
+        assert_matches_cpython_marshal(&source, "large_list_iterables.py");
     }
 
     #[test]
