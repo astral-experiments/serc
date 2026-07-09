@@ -2620,6 +2620,7 @@ impl Compiler {
                     split_short_circuit,
                     non_final_branch,
                     false,
+                    leading,
                 )?;
                 Ok(LoopBackedge::Emitted)
             }
@@ -3010,8 +3011,15 @@ impl Compiler {
         split_short_circuit: bool,
         non_final_branch: bool,
         try_body_normal_exit: bool,
+        leading: &[Stmt],
     ) -> Result<(), CompileError> {
         let base_depth = self.control.depth;
+        let first_branch_reuses_protected_owner = matches!(
+            (leading, statement.test.as_ref()),
+            ([Stmt::Assign(assignment)], Expr::Name(test))
+                if matches!(assignment.targets.as_slice(), [Expr::Name(target)]
+                    if target.id.as_str() == test.id.as_str())
+        );
         if statement.elif_else_clauses.is_empty() {
             // CPython keeps a non-final branch's nested condition body before the fallback
             // backedge even when that body exits the enclosing loop or function.
@@ -3160,6 +3168,26 @@ impl Compiler {
                         )
                     },
                 )?;
+                if branch_index == 0
+                    && !try_body_normal_exit
+                    && !non_final_branch
+                    && first_branch_reuses_protected_owner
+                    && self.control.in_iterator_loop()
+                    && !self.control.active_with_region_exclusions.is_empty()
+                    && self
+                        .control
+                        .active_with_exits
+                        .last()
+                        .is_some_and(|context| {
+                            !context.is_async
+                                && context.loop_depth.checked_add(1)
+                                    == Some(self.control.loops.len())
+                        })
+                {
+                    // CPython reuses the protected owner on the first branch fallthrough of a
+                    // multi-branch loop tail. Later branch markers start in fresh CFG blocks.
+                    self.assembler.preserve_last_not_taken_exception_owner();
+                }
             }
             // A non-final branch still targets the following `elif`; its nested Boolean joins
             // therefore remain forward instead of splitting directly around the loop edge.
@@ -4139,7 +4167,14 @@ impl Compiler {
                 && let Some((Stmt::If(statement), leading)) = statement.body.split_last()
             {
                 self.compile_suite(leading)?;
-                self.compile_loop_tail_if(statement, restart, split_short_circuit, false, true)?;
+                self.compile_loop_tail_if(
+                    statement,
+                    restart,
+                    split_short_circuit,
+                    false,
+                    true,
+                    leading,
+                )?;
             } else if terminal
                 && statement.orelse.is_empty()
                 && statement
