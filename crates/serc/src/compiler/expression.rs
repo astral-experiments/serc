@@ -1775,11 +1775,19 @@ impl Compiler {
             );
         }
 
+        let mut starred_argument_pushed_null = false;
         if call.arguments.args.is_empty() {
             self.emit_deferred_constant(Constant::Tuple(Vec::new()))?;
         } else if call.arguments.args.len() == 1 {
             if let Expr::Starred(starred) = &call.arguments.args[0] {
-                self.compile_expression(&starred.value)?;
+                if call.arguments.keywords.is_empty()
+                    && self.compile_direct_global_callable(&starred.value)?
+                        == SpecializedLowering::Applied
+                {
+                    starred_argument_pushed_null = true;
+                } else {
+                    self.compile_expression(&starred.value)?;
+                }
             } else {
                 self.compile_collection(&call.arguments.args, CollectionKind::Tuple)?;
             }
@@ -1787,7 +1795,7 @@ impl Compiler {
             self.compile_collection(&call.arguments.args, CollectionKind::Tuple)?;
         }
 
-        if call.arguments.keywords.is_empty() {
+        if call.arguments.keywords.is_empty() && !starred_argument_pushed_null {
             self.emit(PUSH_NULL, 0, 1)?;
         } else {
             let mut have_dict = false;
@@ -1820,7 +1828,7 @@ impl Compiler {
                 }
             }
         }
-        if !has_starred && !has_keyword_unpack {
+        if (!has_starred && !has_keyword_unpack) || starred_argument_pushed_null {
             self.assembler
                 .set_location(self.source_location(self.call_opcode_range(call)));
         }
@@ -2111,6 +2119,7 @@ impl Compiler {
             return Ok(SpecializedLowering::NotApplicable);
         }
         let is_global = match &self.unit.scope {
+            Scope::Module => self.symbols.module_globals.contains(name_id),
             Scope::Function {
                 indices,
                 free_indices,
@@ -2125,10 +2134,11 @@ impl Compiler {
                 globals,
                 free_indices,
                 ..
-            } if !self.control.active_comprehension_cleanups.is_empty() => {
-                globals.contains(name_id) || !free_indices.contains_key(&name_id)
+            } => {
+                globals.contains(name_id)
+                    || (!self.control.active_comprehension_cleanups.is_empty()
+                        && !free_indices.contains_key(&name_id))
             }
-            Scope::Module | Scope::Class { .. } => false,
         };
         if !is_global {
             return Ok(SpecializedLowering::NotApplicable);
