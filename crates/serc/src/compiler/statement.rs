@@ -2358,15 +2358,23 @@ impl Compiler {
                     };
                     self.emit_loop_iterator_cleanup(loop_depth, next_loop, preserve_tos)?;
                     if preserve_tos {
-                        let common_cleanup_start = name.is_some().then(|| {
+                        let common_cleanup_start = (name.is_some()
+                            || (handler_count == 1
+                                && self.control.active_exception_region_exclusions.len() > 1
+                                && self
+                                    .control
+                                    .direct_try_body_statements
+                                    .contains(&statement.range)))
+                        .then(|| {
                             let start = self.assembler.label();
                             self.assembler.mark(start);
                             start
                         });
                         self.emit(SWAP, 2, 0)?;
                         if let Some(common_cleanup_start) = common_cleanup_start {
-                            // Named-handler cleanup stops owning the stack before `POP_EXCEPT`,
-                            // while the value-preserving swap belongs to the common cleanup.
+                            // A named-handler return always assigns this swap to the common cleanup.
+                            // A direct value return crossing a nested try in a bare handler needs
+                            // the same short region so the inner try stops owning the stack before `SWAP`.
                             let common_cleanup_end = self.assembler.label();
                             self.assembler.mark(common_cleanup_end);
                             self.assembler.add_exception_region(

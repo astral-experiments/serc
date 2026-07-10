@@ -2476,6 +2476,44 @@ async def bare_fallback_control():
     }
 
     #[test]
+    fn matches_cpython_marshal_for_nested_try_return_swap_owners() {
+        let source = r"def target(var):
+    try:
+        return var['kindselector']['*']
+    except KeyError:
+        try:
+            return var['kindselector']['kind']
+        except KeyError:
+            pass
+
+def direct(var):
+    try:
+        return var['kindselector']['*']
+    except KeyError:
+        return var['kindselector']['kind']
+
+def named(var):
+    try:
+        return var['kindselector']['*']
+    except KeyError as error:
+        try:
+            return var['kindselector']['kind']
+        except KeyError:
+            pass
+
+def literal(var):
+    try:
+        action()
+    except KeyError:
+        try:
+            return False
+        except TypeError:
+            pass
+";
+        assert_matches_cpython_marshal(source, "nested_try_return_swap_owners.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_named_exception_cleanup() {
         let source = r"class Container:
     def nested_handler(self):
