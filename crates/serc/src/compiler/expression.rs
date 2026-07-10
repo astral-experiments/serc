@@ -4783,7 +4783,7 @@ impl Compiler {
             }
             self.emit(NOT_TAKEN, 0, 0)?;
             self.emit_jump_forward(JUMP_FORWARD, end, 0)?;
-            if jump_on && self.control.retained_chained_comparison_exit == Some(comparison.range) {
+            if self.control.retained_chained_comparison_exit == Some(comparison.range) {
                 // CPython retains this final comparison fallthrough jump as a NOP when its
                 // neighboring terminal exit is copied through the optimized CFG.
                 self.assembler.preserve_last_inlined_jump_nop();

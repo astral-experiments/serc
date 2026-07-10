@@ -4749,6 +4749,39 @@ def loop_controls(items, low, value, high):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_positive_chained_comparison_small_exits() {
+        let source = r"def tuple_return(left, right, limit):
+    if left == right == limit:
+        return left, left
+    consume()
+    return fallback()
+
+
+def direct_raise(left, right, limit):
+    if left == right == limit:
+        raise ValueError
+    consume()
+    return fallback()
+
+
+def multi_statement_control(left, right, limit):
+    if left == right == limit:
+        consume(left)
+        return left, left
+    consume()
+    return fallback()
+
+
+def final_none_control(first, second):
+    if first is second is None:
+        return (None,) * 4
+    consume()
+    return fallback()
+";
+        assert_matches_cpython_marshal(source, "positive_chained_comparison_small_exits.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_final_none_chained_comparison_jumps() {
         let source = r#"class Example:
     def __init__(self, first, second=None, prefix=None):

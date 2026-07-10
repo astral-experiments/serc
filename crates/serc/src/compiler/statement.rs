@@ -2906,7 +2906,15 @@ impl Compiler {
                 let retained_chained_comparison_exit =
                     (matches!(body, [Stmt::Return(_) | Stmt::Raise(_)])
                         && stable_terminal_exit_layout)
-                        .then(|| final_chained_comparison_jump(test, false))
+                        .then(|| {
+                            final_chained_comparison_jump(test, false).or_else(|| {
+                                (self.control.current_statement_has_following
+                                    && matches!(test, Expr::Compare(comparison)
+                                        if comparison.ops.len() > 1
+                                            && !matches!(comparison.comparators.last(), Some(Expr::NoneLiteral(_)))))
+                                .then(|| test.range())
+                            })
+                        })
                         .flatten();
                 let include_scoped_none_condition_owner = branch_count == 1
                     && branch_index == 0
