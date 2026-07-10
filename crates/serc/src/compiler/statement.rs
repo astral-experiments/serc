@@ -3027,7 +3027,9 @@ impl Compiler {
                 && !split_short_circuit
                 && !self.has_active_control_flow_region()
                 && condition_jump_target_count(&statement.test, false) == 1
-                && condition_jump_target_count(&statement.test, true) == 1
+                && (condition_jump_target_count(&statement.test, true) == 1
+                    || (statement.body.len() == 1
+                        && matches!(statement.body.first(), Some(Stmt::Assign(_)))))
             {
                 let body = statement.body.as_slice();
                 let fallback = self.assembler.label();
@@ -6946,11 +6948,15 @@ fn nested_if_exit_location(
     if early_condition_truthiness(test).is_some() {
         return None;
     }
-    Some(if suite_terminates(body) {
-        NestedIfExitLocation::Located(test)
-    } else {
-        NestedIfExitLocation::Unlocated
-    })
+    Some(
+        if suite_terminates(body)
+            || matches!(body.last(), Some(Stmt::Try(statement)) if statement.finalbody.is_empty())
+        {
+            NestedIfExitLocation::Located(test)
+        } else {
+            NestedIfExitLocation::Unlocated
+        },
+    )
 }
 
 fn suite_unary_not_fallthrough_range(body: &[Stmt]) -> Option<TextRange> {
