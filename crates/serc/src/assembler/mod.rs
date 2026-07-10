@@ -35,7 +35,7 @@ pub(crate) use ir::{
 };
 use ir::{
     BorrowFallthrough, ExceptionExclusion, ExceptionRegion, Instruction, Item, LayoutAssembler,
-    LoadPolicy, NormalizedExceptionOwner, Operand, OperandPatch, OptimizationPipeline,
+    LocalPolicy, NormalizedExceptionOwner, Operand, OperandPatch, OptimizationPipeline,
     UnoptimizedCode,
 };
 
@@ -533,6 +533,16 @@ impl Assembler {
             .prevent_with_previous = true;
     }
 
+    /// Records that the last `STORE_FAST` restores a value saved by an inlined comprehension.
+    /// The saved stack slot may contain NULL, unlike an ordinary local store.
+    pub(crate) fn mark_last_store_fast_as_maybe_null_comprehension_restore(&mut self) {
+        let instruction = self.required_last_instruction_mut("marking a maybe-null local restore");
+        assert_eq!(instruction.opcode, STORE_FAST);
+        instruction
+            .local_policy
+            .mark_maybe_null_comprehension_restore();
+    }
+
     /// Defers a redundant jump until the pass after exit-block duplication.
     pub(crate) fn defer_last_jump_removal(&mut self) {
         self.last_jump_instruction_mut("deferring redundant jump removal")
@@ -1024,10 +1034,7 @@ impl Assembler {
             || (opcode == LOAD_FAST && !self.load_fast_borrowing_enabled);
         let mut instruction = Instruction::new(opcode, operand, self.location, depth_after);
         instruction.exception_policy = exception_policy;
-        instruction.load_policy = LoadPolicy {
-            force_owned: force_owned_load,
-            strict_owned: strict_owned_load,
-        };
+        instruction.local_policy = LocalPolicy::for_load(force_owned_load, strict_owned_load);
         self.linear_items_mut().push(Item::Instruction(instruction));
     }
 }

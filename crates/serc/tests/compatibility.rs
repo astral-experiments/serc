@@ -796,6 +796,49 @@ def single_exit_break(items):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_protected_non_final_branch_loop_tails() {
+        let source = r"def protected_state_machine(items):
+    for index, item in enumerate(items):
+        try:
+            if state == SCANNING:
+                if item.startswith(tag):
+                    if item.endswith(end):
+                        state = STATE_RETTYPE
+                    else:
+                        state = STATE_DOC
+            elif state == STATE_DOC:
+                if item.startswith(end):
+                    state = STATE_RETTYPE
+                else:
+                    output.append(item)
+            elif state == STATE_RETTYPE:
+                state = STATE_NAME
+            elif state == STATE_NAME:
+                state = STATE_ARGS
+            elif state == STATE_ARGS:
+                if item.startswith(start):
+                    state = SCANNING
+                else:
+                    arguments.append(item)
+        except ParseError:
+            raise
+        except Exception as error:
+            message = 'details'
+            raise ParseError(index, message) from error
+
+
+def single_normal_exit_control(items):
+    for item in items:
+        try:
+            if accepted(item):
+                consume(item)
+        except LookupError:
+            continue
+";
+        assert_matches_cpython_marshal(source, "protected_non_final_branch_loop_tails.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_shared_artificial_loop_backedges() {
         let source = r"def try_else(values, output):
     for value in values:
@@ -2195,6 +2238,70 @@ def explicit_else(flag):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_bare_handler_inlineable_cleanup() {
+        let source = r"def trailing_try(key):
+    try:
+        value = first[key]
+    except KeyError:
+        try:
+            value = second[key]
+        except KeyError:
+            raise NameError(key) from None
+    return value
+
+
+def trailing_if(flag):
+    try:
+        action()
+    except Error:
+        value = None
+        if flag:
+            value = recover()
+        else:
+            value = fallback()
+    return value
+
+
+def trailing_if_with_terminating_arm(first, second):
+    try:
+        action()
+    except Error:
+        if first:
+            raise
+        elif second:
+            value = recover()
+        else:
+            value = fallback()
+    return value
+";
+        assert_matches_cpython_marshal(source, "bare_handler_inlineable_cleanup.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_bare_handler_cleanup_controls() {
+        let source = r"def implicit_fallthrough(flag):
+    try:
+        action()
+    except Error:
+        if flag:
+            raise
+    after()
+
+
+def single_normal_exit(flag):
+    try:
+        action()
+    except Error:
+        if flag:
+            raise
+        else:
+            recover()
+    after()
+";
+        assert_matches_cpython_marshal(source, "bare_handler_cleanup_controls.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_folded_expressions_in_protected_regions() {
         let source = "def try_except():\n    try:\n        'try'\n        body()\n    except:\n        'except'\n        recover()\n\ndef except_only():\n    try:\n        body()\n    except:\n        'except'\n\ndef nested_handlers():\n    try:\n        try:\n            body()\n        except ValueError:\n            recover()\n        except TypeError:\n            recover()\n    finally:\n        cleanup()\n\ndef with_body(manager):\n    with manager:\n        'with'\n        body()\n\ndef with_only(manager):\n    with manager:\n        'with'\n\nasync def protected_condition():\n    await source\n    if test:\n        await other\n\ntry:\n    pass\nexcept (ValueError if True else TypeError):\n    pass\n\ntry:\n    pass\nexcept* (ValueError if True else TypeError):\n    pass\n\ndef protected_conditions(manager, first, second):\n    with manager:\n        if first:\n            body()\n        if second:\n            body()\n\ndef generator_try():\n    yield 1\n    try:\n        pass\n    except Exception:\n        pass\n\nif condition:\n    try:\n        with manager:\n            body()\n    except Error:\n        pass\n";
         assert_matches_cpython_marshal(source, "protected_nop.py");
@@ -2436,6 +2543,43 @@ def final_elif_in_non_final_branch(items):
             fallback(item)
 "#;
         assert_matches_cpython_marshal(source, "non_final_branch_loop_tail.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_inherited_non_final_branch_loop_tails() {
+        let source = r"def append_library(libraries, item):
+    for existing in libraries:
+        if is_sequence(existing):
+            if is_sequence(item):
+                if item[0] == existing[0]:
+                    if item[1] is existing[1]:
+                        return
+                    warn(item[0])
+                    break
+            else:
+                if item == existing[0]:
+                    warn(item[0])
+                    break
+        else:
+            if is_sequence(item):
+                if item[0] == existing:
+                    warn(item[0])
+                    break
+            else:
+                if item == existing:
+                    return
+    libraries.append(item)
+
+
+def final_else_control(items):
+    for item in items:
+        if is_sequence(item):
+            consume(item)
+        else:
+            if accepted(item):
+                consume(item)
+";
+        assert_matches_cpython_marshal(source, "inherited_non_final_branch_loop_tails.py");
     }
 
     #[test]
@@ -2701,6 +2845,63 @@ def retained(manager, condition, items):
             return result
 ";
         assert_matches_cpython_marshal(source, "comprehension_cleanup_swap.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_maybe_null_comprehension_restores() {
+        let source = r#"def assigned(items):
+    target = "outer"
+    [target for target in items]
+    first(target)
+    second(target)
+
+def parameter(target, items):
+    [target for target in items]
+    first(target)
+    second(target)
+
+def with_target(manager, items):
+    with manager as target:
+        [target for target in items]
+        first(target)
+        second(target)
+
+def unrelated(items):
+    value = "outer"
+    [target for target in items]
+    first(value)
+    second(value)
+
+def rebound(items):
+    target = "outer"
+    [target for target in items]
+    target = "new"
+    first(target)
+    second(target)
+
+def discarded(items):
+    target = "outer"
+    {target for target in items}
+    first(target)
+    second(target)
+"#;
+        assert_matches_cpython_marshal(source, "maybe_null_comprehension_restore.py");
+    }
+
+    #[test]
+    fn leaves_comprehension_cell_restores_definitely_initialized() {
+        let source = r#"import dis
+
+def cell_restore(items):
+    target = "outer"
+    [target for target in items]
+    return (target for _ in items)
+
+for instruction in dis.get_instructions(cell_restore):
+    if instruction.argval == "target" and instruction.opname.startswith("LOAD_FAST"):
+        print(instruction.opname)
+"#;
+        assert_executes(source, "LOAD_FAST_AND_CLEAR\nLOAD_FAST_BORROW\n");
     }
 
     #[test]
@@ -3028,6 +3229,25 @@ def no_else_control():
     fn matches_cpython_marshal_for_multiline_conditional_expressions() {
         let source = "value = (\n    'body'\n    if True\n    else 'otherwise'\n)\n\ndef nested():\n    target.attribute = (\n        (first if inner else second)\n        if outer\n        else third\n    )\n";
         assert_matches_cpython_marshal(source, "conditional_expression.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_conditional_expression_join_locations() {
+        let source = r"def split_short_circuit(manager, value):
+    manager.first = (value.items or []) if has_value(
+        value, 'items') else []
+    manager.second = (value.other or []) if has_value(
+        value, 'other') else []
+
+
+def same_block_control(condition, body, otherwise):
+    return body if condition else otherwise
+
+
+def call_control(condition):
+    return body() if condition else otherwise()
+";
+        assert_matches_cpython_marshal(source, "conditional_expression_join_locations.py");
     }
 
     #[test]
@@ -3869,6 +4089,125 @@ def earlier_and_tail_break(first_flag, last_flag, result):
     return result
 ";
         assert_matches_cpython_marshal(source, "constant_loop_break_borrowing.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_terminal_constant_loop_if_alternatives() {
+        let source = r"def simple_final_if(flag, result):
+    while True:
+        step()
+        if flag:
+            break
+    first(result)
+    second(result)
+    third(result)
+    fourth(result)
+    fifth(result)
+    return result
+
+def final_if_with_fallthrough(result):
+    while True:
+        value = read()
+        if value is None:
+            break
+        elif value is ignored:
+            pass
+        else:
+            consume(value)
+    first(result)
+    second(result)
+    third(result)
+    fourth(result)
+    fifth(result)
+    return result
+";
+        assert_matches_cpython_marshal(source, "terminal_constant_loop_if_alternatives.py");
+    }
+
+    #[test]
+    fn matches_cpython_load_ownership_for_constant_loop_exit_shapes() {
+        let source = r"import dis
+
+def break_inside_try(fp, size, result):
+    data = b''
+    while True:
+        try:
+            chunk = fp.read(size - len(data))
+            data += chunk
+            if len(chunk) == 0 or len(data) == size:
+                break
+        except BlockingIOError:
+            pass
+    first(result)
+    second(result)
+    third(result)
+    fourth(result)
+    fifth(result)
+    return result
+
+def break_inside_with(lock, result):
+    while True:
+        with lock:
+            if ready():
+                break
+        wait()
+    first(result)
+    second(result)
+    third(result)
+    fourth(result)
+    fifth(result)
+    return result
+
+def breaking_fallthrough_alternative(first_flag, last_flag, result):
+    while True:
+        if first_flag:
+            break
+        else:
+            step()
+            if last_flag:
+                break
+    first(result)
+    second(result)
+    third(result)
+    fourth(result)
+    fifth(result)
+    return result
+
+def final_else_break(first_flag, second_flag, result):
+    while True:
+        if first_flag:
+            first(result)
+        elif second_flag:
+            second(result)
+        else:
+            break
+    first(result)
+    second(result)
+    third(result)
+    fourth(result)
+    fifth(result)
+    return result
+
+def result_loads(function):
+    return [
+        instruction.opname
+        for instruction in dis.get_instructions(function)
+        if instruction.argval == 'result'
+        and instruction.opname.startswith('LOAD_FAST')
+    ]
+
+for function in (
+    break_inside_try,
+    break_inside_with,
+    breaking_fallthrough_alternative,
+    final_else_break,
+):
+    print(','.join(result_loads(function)))
+";
+        assert_executes(
+            source,
+            "LOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST_BORROW\nLOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST_BORROW\nLOAD_FAST,LOAD_FAST,LOAD_FAST,LOAD_FAST,LOAD_FAST,LOAD_FAST\nLOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST,LOAD_FAST,LOAD_FAST,LOAD_FAST,LOAD_FAST,LOAD_FAST\n",
+        );
     }
 
     #[test]

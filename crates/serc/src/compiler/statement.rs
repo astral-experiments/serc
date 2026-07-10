@@ -33,7 +33,9 @@ use super::source::{
     condition_exit_range, implicit_return_range, synthetic_condition_exit_range,
     unary_not_condition_exit_range, unparse_annotation,
 };
-use super::symbol::{ReraiseStackState, ResumeDepth, statement_name, to_u32, unsupported};
+use super::symbol::{
+    ComprehensionRestore, ReraiseStackState, ResumeDepth, statement_name, to_u32, unsupported,
+};
 use super::{Compiler, Scope};
 
 #[derive(Clone, Copy, Debug)]
@@ -128,6 +130,13 @@ enum LoopBackedge {
     Required,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct LoopTailMode {
+    non_final_branch: bool,
+    try_body_normal_exit: bool,
+    propagate_try_body_normal_exit: bool,
+}
+
 #[derive(Clone, Copy, Debug)]
 enum NestedIfExitLocation<'a> {
     Located(&'a Expr),
@@ -176,7 +185,7 @@ impl TryCompileOptions {
 pub(super) struct ControlFlowState {
     pub(super) defer_async_comprehension_restore: bool,
     pub(super) reorder_async_comprehension_cleanup_throw: bool,
-    pub(super) pending_comprehension_restores: Vec<(Vec<u32>, SourceLocation)>,
+    pub(super) pending_comprehension_restores: Vec<(Vec<ComprehensionRestore>, SourceLocation)>,
     pub(super) active_comprehension_cleanups: Vec<(Label, u32)>,
     pub(super) active_comprehension_local_names: Vec<NameSet>,
     pub(super) active_comprehension_region_exclusions: Vec<Vec<(Label, Label)>>,
@@ -2677,15 +2686,30 @@ impl Compiler {
         restart: Label,
         split_short_circuit: bool,
     ) -> Result<LoopBackedge, CompileError> {
-        self.compile_loop_tail_suite_inner(body, restart, split_short_circuit, false)
+        self.compile_loop_tail_suite_inner(
+            body,
+            restart,
+            split_short_circuit,
+            LoopTailMode::default(),
+        )
     }
 
     fn compile_non_final_branch_loop_tail_suite(
         &mut self,
         body: &[Stmt],
         restart: Label,
+        try_body_normal_exit: bool,
     ) -> Result<LoopBackedge, CompileError> {
-        self.compile_loop_tail_suite_inner(body, restart, false, true)
+        self.compile_loop_tail_suite_inner(
+            body,
+            restart,
+            false,
+            LoopTailMode {
+                non_final_branch: true,
+                try_body_normal_exit,
+                propagate_try_body_normal_exit: try_body_normal_exit,
+            },
+        )
     }
 
     fn compile_loop_tail_suite_inner(
@@ -2693,7 +2717,7 @@ impl Compiler {
         body: &[Stmt],
         restart: Label,
         split_short_circuit: bool,
-        non_final_branch: bool,
+        mode: LoopTailMode,
     ) -> Result<LoopBackedge, CompileError> {
         match body.split_last() {
             Some((Stmt::If(statement), leading)) => {
@@ -2702,14 +2726,7 @@ impl Compiler {
                     false,
                     |compiler| compiler.compile_suite(leading),
                 )?;
-                self.compile_loop_tail_if(
-                    statement,
-                    restart,
-                    split_short_circuit,
-                    non_final_branch,
-                    false,
-                    leading,
-                )?;
+                self.compile_loop_tail_if(statement, restart, split_short_circuit, mode, leading)?;
                 Ok(LoopBackedge::Emitted)
             }
             Some((Stmt::While(statement), leading))
@@ -2726,7 +2743,7 @@ impl Compiler {
                     false,
                     |compiler| compiler.compile_suite(leading),
                 )?;
-                self.compile_loop_tail_while(statement, restart, non_final_branch)?;
+                self.compile_loop_tail_while(statement, restart, mode.non_final_branch)?;
                 Ok(LoopBackedge::Emitted)
             }
             Some((Stmt::Assert(statement), leading))
@@ -2737,11 +2754,11 @@ impl Compiler {
                     false,
                     |compiler| compiler.compile_suite(leading),
                 )?;
-                self.compile_loop_tail_assert(statement, restart, non_final_branch)?;
+                self.compile_loop_tail_assert(statement, restart, mode.non_final_branch)?;
                 Ok(LoopBackedge::Emitted)
             }
             Some((Stmt::Try(statement), leading))
-                if !non_final_branch
+                if !mode.non_final_branch
                     && self.control.generator_region_start.is_none()
                     && try_requires_loop_tail_inlining(statement) =>
             {
@@ -3097,10 +3114,14 @@ impl Compiler {
         statement: &ruff_python_ast::StmtIf,
         restart: Label,
         split_short_circuit: bool,
-        non_final_branch: bool,
-        try_body_normal_exit: bool,
+        mode: LoopTailMode,
         leading: &[Stmt],
     ) -> Result<(), CompileError> {
+        let LoopTailMode {
+            non_final_branch,
+            try_body_normal_exit,
+            propagate_try_body_normal_exit,
+        } = mode;
         let base_depth = self.control.depth;
         let first_branch_reuses_protected_owner = matches!(
             (leading, statement.test.as_ref()),
@@ -3109,11 +3130,15 @@ impl Compiler {
                     if target.id.as_str() == test.id.as_str())
         );
         if statement.elif_else_clauses.is_empty() {
+            let protected_try_normal_exit = try_body_normal_exit
+                && self.control.generator_region_start.is_none()
+                && self.control.active_with_region_exclusions.is_empty()
+                && !self.control.active_exception_region_exclusions.is_empty();
             // CPython keeps a non-final branch's nested condition body before the fallback
             // backedge even when that body exits the enclosing loop or function.
             if non_final_branch
                 && !split_short_circuit
-                && !self.has_active_control_flow_region()
+                && (!self.has_active_control_flow_region() || protected_try_normal_exit)
                 && condition_jump_target_count(&statement.test, false) == 1
                 && (condition_jump_target_count(&statement.test, true) == 1
                     || (statement.body.len() == 1
@@ -3121,15 +3146,25 @@ impl Compiler {
             {
                 let body = statement.body.as_slice();
                 let fallback = self.assembler.label();
-                self.compile_jump_if(&statement.test, false, fallback)?;
+                self.with_control_override(
+                    |control| &mut control.exclude_condition_not_taken_from_exception,
+                    protected_try_normal_exit,
+                    |compiler| compiler.compile_jump_if(&statement.test, false, fallback),
+                )?;
                 let body_start = self.assembler.instruction_count();
                 let nested_tail = self.compile_with_strict_owned_loads(
                     matches!(statement.test.as_ref(), Expr::If(_)),
-                    |compiler| compiler.compile_non_final_branch_loop_tail_suite(body, restart),
+                    |compiler| {
+                        compiler.compile_non_final_branch_loop_tail_suite(
+                            body,
+                            restart,
+                            propagate_try_body_normal_exit,
+                        )
+                    },
                 )?;
                 if nested_tail == LoopBackedge::Required && !suite_terminates(body) {
                     self.set_branch_end_location(body, body_start);
-                    self.emit_jump_backward(JUMP_BACKWARD, restart, 0)?;
+                    self.emit_loop_tail_backedge(restart, protected_try_normal_exit)?;
                 }
 
                 self.assembler.mark(fallback);
@@ -3137,7 +3172,7 @@ impl Compiler {
                 self.assembler.set_location(
                     self.source_location(synthetic_condition_exit_range(&statement.test)),
                 );
-                self.emit_jump_backward(JUMP_BACKWARD, restart, 0)?;
+                self.emit_loop_tail_backedge(restart, protected_try_normal_exit)?;
                 return Ok(());
             }
             if !try_body_normal_exit {
@@ -3196,7 +3231,9 @@ impl Compiler {
                     let body_start = self.assembler.instruction_count();
                     let nested_tail = self.compile_with_strict_owned_loads(
                         matches!(test, Expr::If(_)),
-                        |compiler| compiler.compile_non_final_branch_loop_tail_suite(body, restart),
+                        |compiler| {
+                            compiler.compile_non_final_branch_loop_tail_suite(body, restart, false)
+                        },
                     )?;
                     if nested_tail == LoopBackedge::Required && !suite_terminates(body) {
                         self.set_branch_end_location(body, body_start);
@@ -3236,7 +3273,9 @@ impl Compiler {
             if let (Some(test), Some(next)) = (test, next) {
                 let has_outer_exception_region = try_body_normal_exit
                     && self.control.active_exception_region_exclusions.len() > 1;
+                let protected_nested_branch = try_body_normal_exit && non_final_branch;
                 let exclude_from_control_flow_regions = has_outer_exception_region
+                    || protected_nested_branch
                     || (!try_body_normal_exit
                         && (!self.control.active_exception_region_exclusions.is_empty()
                             || self
@@ -3284,11 +3323,16 @@ impl Compiler {
             let nested_tail = self.compile_with_strict_owned_loads(
                 test.is_some_and(|test| matches!(test, Expr::If(_))),
                 |compiler| {
-                    if test.is_some() {
-                        compiler.compile_non_final_branch_loop_tail_suite(body, restart)
-                    } else {
-                        compiler.compile_loop_tail_suite(body, restart, false)
-                    }
+                    compiler.compile_loop_tail_suite_inner(
+                        body,
+                        restart,
+                        false,
+                        LoopTailMode {
+                            non_final_branch: test.is_some() || non_final_branch,
+                            try_body_normal_exit: propagate_try_body_normal_exit,
+                            propagate_try_body_normal_exit,
+                        },
+                    )
                 },
             )?;
             if nested_tail == LoopBackedge::Required && !suite_terminates(body) {
@@ -3517,14 +3561,16 @@ impl Compiler {
                 && (!self.control.active_exception_region_exclusions.is_empty()
                     || !self.control.active_with_region_exclusions.is_empty()
                     || coroutine_terminal_break_exit
-                    || !suite_contains_unprotected_nontail_conditional_loop_break(&statement.body))
+                    || !suite_contains_borrow_reachable_conditional_loop_break(&statement.body))
             {
                 // A constant-true loop can reach its exit only through `break`. CPython removes
                 // an unconditional break jump before borrowed-load analysis but does not
-                // reconnect the large exit block. An unprotected non-tail conditional break
-                // retains an explicit exit edge unless a surrounding control-flow region
-                // rewrites that edge during cleanup. A coroutine stop handler with a continue
-                // edge also keeps a terminal break exit disconnected from the following block.
+                // reconnect the large exit block. A conditional break retains an explicit exit
+                // edge when it is non-tail, when its cleanup crosses a protected region, or when
+                // it shares a final `if` with an explicit fallthrough branch. A surrounding
+                // control-flow region can still rewrite that edge during cleanup. A coroutine
+                // stop handler with a continue edge also keeps a terminal break exit disconnected
+                // from the following block.
                 self.assembler.prevent_borrow_reachability(end);
             }
             self.set_depth(base_depth);
@@ -4166,6 +4212,8 @@ impl Compiler {
                 .as_except_handler()
                 .is_some_and(|handler| suite_terminates(&handler.body))
         });
+        let propagates_protected_loop_tail_mode =
+            try_propagates_protected_loop_tail_mode(statement);
         let nested_handler_tail_if_with_terminal_handlers = handlers_terminate
             && self.control.in_exception_handler()
             && statement.orelse.is_empty()
@@ -4304,8 +4352,11 @@ impl Compiler {
                     statement,
                     restart,
                     split_short_circuit,
-                    false,
-                    true,
+                    LoopTailMode {
+                        non_final_branch: false,
+                        try_body_normal_exit: true,
+                        propagate_try_body_normal_exit: propagates_protected_loop_tail_mode,
+                    },
                     leading,
                 )?;
             } else if terminal
@@ -4891,15 +4942,48 @@ impl Compiler {
             }
             let handler_body_has_instructions =
                 self.assembler.instruction_count() > handler_body_start;
-            let handler_ends_with_inlineable_cleanup = handler.name.is_some()
-                && handler
-                    .body
-                    .last()
-                    .is_some_and(|statement| match statement {
-                        Stmt::Try(_) => true,
-                        Stmt::With(statement) => !suite_terminates(&statement.body),
-                        _ => false,
-                    });
+            let handler_ends_with_inlineable_cleanup =
+                handler.body.last().is_some_and(|tail| match tail {
+                    Stmt::Try(nested) => {
+                        handler.name.is_some()
+                            || (statement.body.len() == 1
+                                && !suite_terminates(&statement.body)
+                                && nested.finalbody.is_empty()
+                                && nested.orelse.is_empty()
+                                && nested.handlers.iter().any(|nested_handler| {
+                                    let Some(nested_handler) = nested_handler.as_except_handler()
+                                    else {
+                                        return false;
+                                    };
+                                    match nested_handler.body.last() {
+                                        Some(Stmt::Try(_)) => true,
+                                        Some(Stmt::Raise(statement)) => matches!(
+                                            statement.cause.as_deref(),
+                                            Some(Expr::NoneLiteral(_))
+                                        ),
+                                        _ => false,
+                                    }
+                                }))
+                    }
+                    Stmt::With(statement) => {
+                        handler.name.is_some() && !suite_terminates(&statement.body)
+                    }
+                    Stmt::If(tail) => {
+                        handler.name.is_none()
+                            && tail
+                                .elif_else_clauses
+                                .last()
+                                .is_some_and(|clause| clause.test.is_none())
+                            && if_normal_exit_count(tail) >= 2
+                            && tail.body.len() == 1
+                            && tail
+                                .elif_else_clauses
+                                .iter()
+                                .all(|clause| clause.body.len() == 1)
+                            && (handler.body.len() > 1 || suite_terminates(&tail.body))
+                    }
+                    _ => false,
+                });
             let handler_ends_with_nonterminal_with = matches!(
                 handler.body.last(),
                 Some(Stmt::With(statement)) if !suite_terminates(&statement.body)
@@ -4944,7 +5028,7 @@ impl Compiler {
                 {
                     self.assembler
                         .set_location(self.source_location(statement.range()));
-                // CPython leaves named cleanup after a nested try or trailing with unlocated so
+                // CPython leaves cleanup after these direct trailing compound joins unlocated so
                 // every incoming edge can inline its own copy with the predecessor's line.
                 } else if handler_ends_with_inlineable_cleanup {
                     self.assembler.set_location(SourceLocation::NONE);
@@ -7004,6 +7088,25 @@ fn try_requires_loop_tail_inlining(statement: &ruff_python_ast::StmtTry) -> bool
         )
 }
 
+pub(super) fn try_propagates_protected_loop_tail_mode(
+    statement: &ruff_python_ast::StmtTry,
+) -> bool {
+    // CPython carries the protected source-order layout through nested loop-tail branches when
+    // every handler contains only assignments before a final raise. Other handler shapes retain
+    // the legacy exception-owner layout.
+    !statement.handlers.is_empty()
+        && statement.handlers.iter().all(|handler| {
+            handler.as_except_handler().is_some_and(|handler| {
+                let Some((Stmt::Raise(_), leading)) = handler.body.split_last() else {
+                    return false;
+                };
+                leading
+                    .iter()
+                    .all(|statement| matches!(statement, Stmt::Assign(_)))
+            })
+        })
+}
+
 pub(super) fn suite_contains_yield(body: &[Stmt]) -> bool {
     #[derive(Default)]
     struct YieldCollector {
@@ -7309,7 +7412,23 @@ fn suite_contains_loop_continue(body: &[Stmt]) -> bool {
     })
 }
 
-fn suite_contains_unprotected_nontail_conditional_loop_break(body: &[Stmt]) -> bool {
+fn suite_contains_borrow_reachable_conditional_loop_break(body: &[Stmt]) -> bool {
+    fn has_reachable_explicit_fallthrough(statement: &ruff_python_ast::StmtIf) -> bool {
+        for clause in &statement.elif_else_clauses {
+            let falls_through = !suite_terminates(&clause.body);
+            let Some(test) = &clause.test else {
+                return falls_through;
+            };
+            match early_condition_truthiness(test) {
+                Some(false) => {}
+                Some(true) => return falls_through,
+                None if falls_through => return true,
+                None => {}
+            }
+        }
+        false
+    }
+
     fn contains(body: &[Stmt], conditional: bool) -> bool {
         for statement in body {
             let found = match statement {
@@ -7327,9 +7446,29 @@ fn suite_contains_unprotected_nontail_conditional_loop_break(body: &[Stmt]) -> b
                             contains(&clause.body, conditional)
                         })
                 }
-                // CPython's borrowed-load traversal can stop at the normal exit of these
-                // regions, so a later break does not prove that the loop exit is visited.
-                Stmt::Try(_) | Stmt::With(_) => return false,
+                Stmt::Try(statement)
+                    if !statement.is_star
+                        && statement.orelse.is_empty()
+                        && statement.finalbody.is_empty() =>
+                {
+                    if contains(&statement.body, conditional) {
+                        true
+                    } else {
+                        // CPython's borrowed-load traversal can stop at the normal exit of a
+                        // protected region, so a later break does not prove that the loop exit
+                        // is visited.
+                        return false;
+                    }
+                }
+                Stmt::Try(_) => return false,
+                Stmt::With(statement) if !statement.is_async => {
+                    if contains(&statement.body, conditional) {
+                        true
+                    } else {
+                        return false;
+                    }
+                }
+                Stmt::With(_) => return false,
                 Stmt::Match(_) | Stmt::For(_) | Stmt::While(_) => false,
                 Stmt::FunctionDef(_) | Stmt::ClassDef(_) => false,
                 _ => false,
@@ -7349,7 +7488,34 @@ fn suite_contains_unprotected_nontail_conditional_loop_break(body: &[Stmt]) -> b
     {
         return false;
     }
-    contains(leading, false)
+    if contains(leading, false) {
+        return true;
+    }
+
+    match last {
+        // Cleanup preserves the conditional break edge even when the protected statement is the
+        // loop tail.
+        Stmt::Try(statement)
+            if !statement.is_star
+                && statement.orelse.is_empty()
+                && statement.finalbody.is_empty() =>
+        {
+            contains(&statement.body, false)
+        }
+        // A simple final conditional break is disconnected, but CPython retains the shared exit
+        // when another branch of the final `if` can fall through.
+        Stmt::If(statement)
+            if has_reachable_explicit_fallthrough(statement)
+                && !statement
+                    .elif_else_clauses
+                    .iter()
+                    .any(|clause| suite_contains_loop_break(&clause.body)) =>
+        {
+            let conditional = early_condition_truthiness(&statement.test).is_none();
+            contains(&statement.body, conditional)
+        }
+        _ => false,
+    }
 }
 
 fn suite_ends_in_simple_conditional_break(body: &[Stmt]) -> bool {

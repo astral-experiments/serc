@@ -52,7 +52,8 @@ use super::source::{
 };
 use super::statement::{is_wildcard_pattern, suite_terminates};
 use super::symbol::{
-    ComparisonMode, ReraiseStackState, ResumeDepth, expression_name, to_u32, unsupported,
+    ComparisonMode, ComprehensionRestore, ReraiseStackState, ResumeDepth, expression_name, to_u32,
+    unsupported,
 };
 use super::{Compiler, SHADOWED_SUPER_SENTINEL, SUPPORTED_FUTURE_FLAGS, Scope};
 
@@ -2401,6 +2402,14 @@ impl Compiler {
                 self.emit(MAKE_CELL, index, 0)?;
             }
         }
+        let temporary_restores = temporary_names
+            .iter()
+            .zip(&temporary_indices)
+            .map(|(name, index)| ComprehensionRestore {
+                index: *index,
+                name: self.required_name_id(name),
+            })
+            .collect::<Vec<_>>();
         if !temporary_names.is_empty() {
             self.emit(
                 SWAP,
@@ -2548,7 +2557,7 @@ impl Compiler {
         if deferred_normal_restore {
             self.control
                 .pending_comprehension_restores
-                .push((temporary_indices.clone(), comprehension_location));
+                .push((temporary_restores, comprehension_location));
         } else {
             if discard_result {
                 self.emit(POP_TOP, 0, -1)?;
@@ -2560,26 +2569,25 @@ impl Compiler {
                 )?;
             }
             if discard_result {
-                let final_index = temporary_indices.last();
-                let restore_indices = temporary_indices
-                    [..temporary_indices.len().saturating_sub(1)]
+                let final_restore = temporary_restores.last();
+                let restores = temporary_restores[..temporary_restores.len().saturating_sub(1)]
                     .iter()
                     .rev()
-                    .chain(final_index);
-                for (position, index) in restore_indices.enumerate() {
+                    .chain(final_restore);
+                for (position, restore) in restores.copied().enumerate() {
                     if position > 0 {
                         self.assembler.fusion_barrier();
                     }
-                    self.emit(STORE_FAST, *index, -1)?;
+                    self.emit_comprehension_restore(restore)?;
                     self.assembler
                         .prevent_last_instruction_fusion_with_previous();
                 }
             } else {
-                for (position, index) in temporary_indices.iter().rev().enumerate() {
+                for (position, restore) in temporary_restores.iter().rev().copied().enumerate() {
                     if position > 0 {
                         self.assembler.fusion_barrier();
                     }
-                    self.emit(STORE_FAST, *index, -1)?;
+                    self.emit_comprehension_restore(restore)?;
                     self.assembler
                         .prevent_last_instruction_fusion_with_previous();
                 }
@@ -4065,9 +4073,21 @@ impl Compiler {
         let end = self.assembler.label();
         self.compile_jump_if(&expression.test, false, else_label)?;
         self.compile_expression(&expression.body)?;
-        self.assembler
-            .set_location(self.source_location(expression.body.range()));
+        // CPython emits the conditional-expression join without a location. Its later
+        // propagation pass inherits the body location only when the join remains in the same
+        // basic block; short-circuit bodies can leave it deliberately unlocated.
+        if matches!(expression.body.as_ref(), Expr::If(_)) {
+            // Keep the provisional range until Serc models CPython's propagation across the
+            // nested conditional's join block.
+            self.assembler
+                .set_location(self.source_location(expression.body.range()));
+        } else {
+            self.assembler.set_location(SourceLocation::NONE);
+        }
         self.emit_jump_forward(JUMP_FORWARD, end, 0)?;
+        if matches!(expression.body.as_ref(), Expr::BoolOp(_)) {
+            self.assembler.preserve_last_no_location();
+        }
         self.assembler.mark(else_label);
         self.set_depth(base_depth);
         self.compile_expression(&expression.orelse)?;

@@ -16,6 +16,7 @@ use super::source::{
     debug_text_range, interpolated_string_content_range, strip_expression_comments,
     unparse_annotation,
 };
+use super::statement::try_propagates_protected_loop_tail_mode;
 use super::symbol::{
     CompilerStackEffect, ReraiseStackState, compiler_stack_effect, validate_compiler_stack_effect,
 };
@@ -43,6 +44,43 @@ fn compiler_stack_effects_distinguish_values_from_scope_exit_bookkeeping() {
         compiler_stack_effect(RERAISE, 1),
         CompilerStackEffect::ContextDependent
     );
+}
+
+#[test]
+fn protected_loop_tail_mode_requires_assign_then_raise_handlers() {
+    let cases = [
+        (
+            "def f():\n    try:\n        action()\n    except FirstError:\n        raise\n    except SecondError as error:\n        message = 'details'\n        raise WrappedError(message) from error\n",
+            true,
+        ),
+        (
+            "def f():\n    try:\n        action()\n    except Error:\n        log()\n        raise\n",
+            false,
+        ),
+        (
+            "def f():\n    try:\n        action()\n    except Error:\n        return\n",
+            false,
+        ),
+        (
+            "def f():\n    try:\n        action()\n    except Error:\n        recover()\n",
+            false,
+        ),
+    ];
+
+    for (source, expected) in cases {
+        let parsed = parse_module(source).unwrap();
+        let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+            panic!("expected one function definition");
+        };
+        let [Stmt::Try(statement)] = function.body.as_slice() else {
+            panic!("expected one try statement");
+        };
+        assert_eq!(
+            try_propagates_protected_loop_tail_mode(statement),
+            expected,
+            "unexpected protected loop-tail handler classification for:\n{source}"
+        );
+    }
 }
 
 #[test]

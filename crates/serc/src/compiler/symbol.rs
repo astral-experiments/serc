@@ -57,6 +57,12 @@ pub(super) enum ResumeDepth {
     One,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ComprehensionRestore {
+    pub(super) index: u32,
+    pub(super) name: NameId,
+}
+
 impl ResumeDepth {
     const fn is_one(self) -> bool {
         matches!(self, Self::One)
@@ -591,14 +597,14 @@ impl Compiler {
 
     pub(super) fn emit_pending_comprehension_restores(&mut self) -> Result<(), CompileError> {
         let restores = std::mem::take(&mut self.control.pending_comprehension_restores);
-        for (indices, location) in restores {
+        for (restores, location) in restores {
             self.assembler.set_location(location);
-            for (position, index) in indices.iter().enumerate() {
+            for (position, restore) in restores.iter().copied().enumerate() {
                 self.assembler.fusion_barrier();
                 if position > 0 {
                     self.assembler.set_location(location);
                 }
-                self.emit(STORE_FAST, *index, -1)?;
+                self.emit_comprehension_restore(restore)?;
                 self.assembler
                     .prevent_last_instruction_fusion_with_previous();
             }
@@ -606,6 +612,20 @@ impl Compiler {
             self.assembler.add_last_hidden_exception_owner_slots(1);
             // CPython converts STORE_FAST_MAYBE_NULL only after inserting superinstructions.
             self.assembler.prevent_last_instruction_fusion();
+        }
+        Ok(())
+    }
+
+    pub(super) fn emit_comprehension_restore(
+        &mut self,
+        restore: ComprehensionRestore,
+    ) -> Result<(), CompileError> {
+        self.emit(STORE_FAST, restore.index, -1)?;
+        if usize::try_from(restore.index).is_ok_and(|index| index < self.symbols.fast_local_count)
+            && !self.symbols.cell_names.contains(restore.name)
+        {
+            self.assembler
+                .mark_last_store_fast_as_maybe_null_comprehension_restore();
         }
         Ok(())
     }
