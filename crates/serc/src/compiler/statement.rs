@@ -5628,6 +5628,22 @@ impl Compiler {
                     }
                     _ => false,
                 });
+            // CPython keeps this simple conditional handler cleanup source-less before copying
+            // its exit, rather than inheriting the call location from the taken branch.
+            let handler_ends_with_unlocated_if_cleanup =
+                self.control.current_statement_has_following
+                    && matches!(
+                        handler.body.last(),
+                        Some(Stmt::If(tail))
+                            if handler.body.len() == 1
+                                && tail.elif_else_clauses.is_empty()
+                                && matches!(tail.test.as_ref(), Expr::Compare(_))
+                                && matches!(
+                                    tail.body.as_slice(),
+                                    [Stmt::Expr(expression)]
+                                        if matches!(expression.value.as_ref(), Expr::Call(_))
+                                )
+                    );
             let handler_ends_with_preserved_unlocated_cleanup = matches!(
                 handler.body.last(),
                 Some(Stmt::If(tail))
@@ -5642,6 +5658,7 @@ impl Compiler {
                         )
             );
             let handler_ends_with_unlocated_cleanup = handler_ends_with_inlineable_cleanup
+                || handler_ends_with_unlocated_if_cleanup
                 || handler_ends_with_preserved_unlocated_cleanup;
             let handler_ends_with_nonterminal_with = matches!(
                 handler.body.last(),
@@ -5721,7 +5738,9 @@ impl Compiler {
                     self.assembler
                         .make_last_no_location_copy_inherit_shared_predecessor();
                 }
-                if handler_ends_with_preserved_unlocated_cleanup {
+                if handler_ends_with_preserved_unlocated_cleanup
+                    || handler_ends_with_unlocated_if_cleanup
+                {
                     self.assembler.preserve_last_no_location();
                 }
                 if let Some(name) = &handler.name {

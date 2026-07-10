@@ -2642,6 +2642,64 @@ def explicit_else(flag):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_trailing_if_handler_cleanup() {
+        let source = r"def call_body(mapping, key):
+    try:
+        value = mapping[key]
+    except KeyError:
+        if key not in mapping.values():
+            print(key)
+    value = key
+
+
+def named_call_body(mapping, key):
+    try:
+        value = mapping[key]
+    except KeyError as error:
+        if key not in mapping.values():
+            print(error)
+    value = key
+
+
+def bare_call_body(mapping, key):
+    try:
+        value = mapping[key]
+    except:
+        if key not in mapping.values():
+            print(key)
+    value = key
+
+
+def direct_tail(mapping, key):
+    try:
+        value = mapping[key]
+    except KeyError:
+        print(key)
+    value = key
+
+
+def terminating_if(mapping, key):
+    try:
+        value = mapping[key]
+    except KeyError:
+        if key not in mapping.values():
+            raise
+    value = key
+
+
+def followed_statement(mapping, key):
+    try:
+        value = mapping[key]
+    except KeyError:
+        if key not in mapping.values():
+            print(key)
+        finish()
+    value = key
+";
+        assert_matches_cpython_marshal(source, "trailing_if_handler_cleanup.py");
+    }
+
+    #[test]
     fn matches_cpython_none_condition_marker_owners_in_exception_handlers() {
         let source = r"def is_none(value):
     try:
