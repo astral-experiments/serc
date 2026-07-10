@@ -4039,6 +4039,22 @@ def final_elif(action, first, second):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_nested_if_trailing_try_exits() {
+        let source = r"def nested_try(flag, outer):
+    if outer:
+        if flag:
+            try:
+                action()
+            except Error:
+                raise
+    else:
+        other()
+    return None
+";
+        assert_matches_cpython_marshal(source, "nested_if_trailing_try.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_try_body_exits_after_if_joins() {
         let source = include_str!("fixtures/try_body_exit_joins.py");
         assert_matches_cpython_marshal(source, "try_body_exit_joins.py");

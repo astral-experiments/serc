@@ -6948,11 +6948,15 @@ fn nested_if_exit_location(
     if early_condition_truthiness(test).is_some() {
         return None;
     }
-    Some(if suite_terminates(body) {
-        NestedIfExitLocation::Located(test)
-    } else {
-        NestedIfExitLocation::Unlocated
-    })
+    Some(
+        if suite_terminates(body)
+            || matches!(body.last(), Some(Stmt::Try(statement)) if statement.finalbody.is_empty())
+        {
+            NestedIfExitLocation::Located(test)
+        } else {
+            NestedIfExitLocation::Unlocated
+        },
+    )
 }
 
 fn suite_unary_not_fallthrough_range(body: &[Stmt]) -> Option<TextRange> {
