@@ -2339,6 +2339,73 @@ def explicit_else(flag):
     }
 
     #[test]
+    fn matches_cpython_none_condition_marker_owners_in_exception_handlers() {
+        let source = r"def is_none(value):
+    try:
+        action()
+    except Error:
+        if value is None:
+            recover()
+        finish()
+
+
+def is_not_none(value, items):
+    try:
+        action()
+    except Error:
+        if value is not None:
+            recover()
+        result = [item for item in items]
+
+
+def named(value):
+    try:
+        action()
+    except Error as error:
+        if value is None:
+            recover(error)
+        finish()
+
+
+def nested(value):
+    try:
+        action()
+    except Error:
+        if predicate(value):
+            if value is not None:
+                recover()
+        finish()
+
+
+def reversed_control(value):
+    try:
+        action()
+    except Error:
+        if None is value:
+            recover()
+        finish()
+
+
+def outside_handler_control(value):
+    if value is None:
+        recover()
+    finish()
+
+
+def later_bare_handler_control(value):
+    try:
+        action()
+    except ValueError as error:
+        consume(error)
+    except TypeError:
+        if value is None:
+            recover()
+        finish()
+";
+        assert_matches_cpython_marshal(source, "handler_none_condition_owners.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_named_handler_nested_finally_cleanup() {
         let source = r"class Container:
     def fallthrough_from_nested_try(self):
@@ -3463,6 +3530,79 @@ def call_control(condition):
     return result
 "#;
         assert_matches_cpython_marshal(source, "assert_branch_exit.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_later_assertion_branches_before_function_exits() {
+        let source = r"def before_return(first, second):
+    if first:
+        consume()
+    elif second:
+        assert second.value
+    else:
+        consume()
+    return
+
+
+def before_raise(first, second):
+    if first:
+        consume()
+    elif second:
+        assert second.value
+    else:
+        consume()
+    raise RuntimeError
+
+
+def ordinary_successor_control(first, second):
+    if first:
+        consume()
+    elif second:
+        assert second.value
+    else:
+        consume()
+    after()
+
+
+def terminating_else_control(first, second):
+    if first:
+        consume()
+    elif second:
+        assert second.value
+    else:
+        return
+    after()
+
+
+def terminating_else_before_return(first, second):
+    if first:
+        consume()
+    elif second:
+        assert second.value
+    else:
+        return
+    return
+
+
+def loop_controls(items, first, second):
+    for item in items:
+        if first:
+            consume()
+        elif second:
+            assert second.value
+        else:
+            consume()
+        break
+    for item in items:
+        if first:
+            consume()
+        elif second:
+            assert second.value
+        else:
+            consume()
+        continue
+";
+        assert_matches_cpython_marshal(source, "later_assertion_function_exits.py");
     }
 
     #[test]

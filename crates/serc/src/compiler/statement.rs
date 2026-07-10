@@ -70,6 +70,7 @@ impl LoopBreakPolicy {
 #[derive(Clone, Copy, Debug)]
 struct ExceptionHandlerContext {
     name: Option<NameId>,
+    first: bool,
     loop_depth: usize,
     protect_outer_return_pop: bool,
     common_cleanup: Label,
@@ -245,6 +246,9 @@ pub(super) struct ControlFlowState {
     // Whether that successor is a direct return of one local. CPython copies this tiny exit
     // before removing a constant-loop break edge, so its borrowed-load pass still visits it.
     current_statement_followed_by_name_return: bool,
+    // Whether that successor exits the function by returning or raising. CPython copies these
+    // exit blocks before removing assertion-branch jumps, including jumps from later clauses.
+    current_statement_followed_by_return_or_raise: bool,
     // The direct final synchronous `with` in an active non-final try body, if any.
     direct_final_sync_with_try_body: Option<ruff_text_size::TextRange>,
     // The direct final synchronous `with` with a normal body fallthrough in the nested
@@ -262,6 +266,12 @@ pub(super) struct ControlFlowState {
 }
 
 impl ControlFlowState {
+    pub(super) fn in_first_unnamed_exception_handler(&self) -> bool {
+        self.active_exception_handlers
+            .last()
+            .is_some_and(|handler| handler.first && handler.name.is_none())
+    }
+
     pub(super) fn current_exception_handler_binds_name(&self) -> bool {
         self.active_exception_handlers
             .last()
@@ -824,6 +834,8 @@ impl Compiler {
                     Some(Stmt::Return(statement))
                         if matches!(statement.value.as_deref(), Some(Expr::Name(_)))
                 );
+                let followed_by_return_or_raise =
+                    matches!(body.get(index + 1), Some(Stmt::Return(_) | Stmt::Raise(_)));
                 self.with_control_override(
                     |control| &mut control.emit_protected_async_for_end_nop,
                     emit_protected_async_for_end_nop,
@@ -840,10 +852,22 @@ impl Compiler {
                                     |compiler| {
                                         compiler.with_control_override(
                                             |control| {
-                                                &mut control.suite_fallthrough_to_loop_backedge
+                                                &mut control
+                                                    .current_statement_followed_by_return_or_raise
                                             },
-                                            suite_fallthrough_to_loop_backedge,
-                                            |compiler| compiler.compile_statement(statement),
+                                            followed_by_return_or_raise,
+                                            |compiler| {
+                                                compiler.with_control_override(
+                                                    |control| {
+                                                        &mut control
+                                                            .suite_fallthrough_to_loop_backedge
+                                                    },
+                                                    suite_fallthrough_to_loop_backedge,
+                                                    |compiler| {
+                                                        compiler.compile_statement(statement)
+                                                    },
+                                                )
+                                            },
                                         )
                                     },
                                 )
@@ -2681,10 +2705,12 @@ impl Compiler {
                     }
                     self.emit_jump_forward(JUMP_FORWARD, end, 0)?;
                     // CPython retains the first assertion branch's source jump when it copies a
-                    // nonterminal join onto that edge. Later clauses and terminating `else`
-                    // blocks take different CFG paths and drop the jump instead.
-                    let retain_assertion_exit = branch_index == 0
-                        && !has_terminating_else
+                    // nonterminal join onto that edge. A directly following return or raise
+                    // copies the function-exit block onto later clauses too. Without a copied
+                    // function exit, terminating `else` blocks take a different CFG path and
+                    // drop the jump instead.
+                    let retain_assertion_exit = ((branch_index == 0 && !has_terminating_else)
+                        || self.control.current_statement_followed_by_return_or_raise)
                         && matches!(body.last(), Some(Stmt::Assert(_)));
                     if nested_if_ends_in_break && has_terminating_else {
                         self.assembler.preserve_last_inlined_jump_nop();
@@ -5027,6 +5053,7 @@ impl Compiler {
                     );
                     let context = ExceptionHandlerContext {
                         name: handler_name,
+                        first: handler_index == 0,
                         loop_depth: self.control.loops.len(),
                         common_cleanup,
                         protect_outer_return_pop: nested_handler_tail_if_with_terminal_handlers
