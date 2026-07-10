@@ -289,8 +289,6 @@ pub(super) struct ControlFlowState {
     // Direct statements in the innermost normal try body. Nested branch suites must not inherit
     // CPython's temporary block ownership for a sibling statement in that body.
     direct_try_body_statements: Vec<TextRange>,
-    // Whether the innermost normal try statement has a sibling successor.
-    direct_try_statement_has_following: bool,
     // A nested try under a normal body with an else suite exits there instead of directly
     // crossing the enclosing handler boundary.
     direct_try_body_has_else: bool,
@@ -438,7 +436,6 @@ impl Compiler {
         .then_some(final_sync_with_try_body)
         .flatten();
         let direct_try_body_statements = statement.body.iter().map(Ranged::range).collect();
-        let direct_try_statement_has_following = self.control.current_statement_has_following;
         let direct_try_body_has_else = !statement.orelse.is_empty();
         let direct_try_body_has_single_raise_handler = matches!(
             statement.handlers.as_slice(),
@@ -475,13 +472,7 @@ impl Compiler {
                                                         &mut control.direct_final_sync_with_try_body
                                                     },
                                                     direct_final_sync_with_try_body,
-                                                    |compiler| {
-                                                        compiler.with_control_override(
-                                                            |control| &mut control.direct_try_statement_has_following,
-                                                            direct_try_statement_has_following,
-                                                            compile,
-                                                        )
-                                                    },
+                                                    compile,
                                                 )
                                             },
                                         )
@@ -2982,11 +2973,10 @@ impl Compiler {
                         .last()
                         .is_some_and(|direct| *direct == statement.range)
                         && !self.control.direct_try_body_has_else
-                        && self.control.active_finally_try_bodies == 0
-                        && ((self.control.direct_try_body_has_single_raise_handler
-                            && is_membership_assignment_branch(statement))
-                            || (self.control.direct_try_statement_has_following
-                                && !self.control.loops.is_empty()));
+                        && self.control.direct_try_body_has_single_raise_handler
+                        && self.control.active_finally_try_bodies == 0;
+                    let direct_try_body_exit =
+                        direct_try_body_exit && is_membership_assignment_branch(statement);
                     let nested_if_exit = body.last().and_then(|statement| match statement {
                         Stmt::If(statement) => nested_if_exit_location(statement),
                         _ => None,
