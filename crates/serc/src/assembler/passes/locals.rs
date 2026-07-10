@@ -52,6 +52,11 @@ impl OptimizationPipeline {
             let mut unsafe_locals = vec![true; local_count];
             unsafe_locals[..parameter_count.min(local_count).min(64)].fill(false);
             for instruction in graph.instructions_mut(order[0]) {
+                if instruction.local_policy.is_post_analysis_closure_load()
+                    || instruction.local_policy.is_known_initialized_load()
+                {
+                    continue;
+                }
                 let Operand::Value(argument) = instruction.operand else {
                     continue;
                 };
@@ -183,6 +188,11 @@ impl OptimizationPipeline {
                 let Item::Instruction(instruction) = graph.item(position) else {
                     continue;
                 };
+                if instruction.local_policy.is_post_analysis_closure_load()
+                    || instruction.local_policy.is_known_initialized_load()
+                {
+                    continue;
+                }
                 if let Some(target) = exception_successors[block_starts[block.index()] + offset] {
                     propagate(target, &unsafe_locals);
                 }

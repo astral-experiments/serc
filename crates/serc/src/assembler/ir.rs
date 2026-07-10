@@ -103,6 +103,8 @@ impl LocalPolicy {
     const STRICT_OWNED_LOAD: u8 = 1 << 1;
     const MAYBE_NULL_COMPREHENSION_RESTORE: u8 = 1 << 2;
     const FORCE_BORROWED_LOAD: u8 = 1 << 3;
+    const POST_ANALYSIS_CLOSURE_LOAD: u8 = 1 << 4;
+    const KNOWN_INITIALIZED_LOAD: u8 = 1 << 5;
 
     pub(super) const fn for_load(force_owned: bool, strict_owned: bool) -> Self {
         let mut policy = 0;
@@ -137,6 +139,22 @@ impl LocalPolicy {
 
     pub(super) fn mark_maybe_null_comprehension_restore(&mut self) {
         self.0 |= Self::MAYBE_NULL_COMPREHENSION_RESTORE;
+    }
+
+    pub(super) const fn is_post_analysis_closure_load(self) -> bool {
+        self.0 & Self::POST_ANALYSIS_CLOSURE_LOAD != 0
+    }
+
+    pub(super) fn mark_post_analysis_closure_load(&mut self) {
+        self.0 |= Self::POST_ANALYSIS_CLOSURE_LOAD;
+    }
+
+    pub(super) const fn is_known_initialized_load(self) -> bool {
+        self.0 & Self::KNOWN_INITIALIZED_LOAD != 0
+    }
+
+    pub(super) fn mark_known_initialized_load(&mut self) {
+        self.0 |= Self::KNOWN_INITIALIZED_LOAD;
     }
 
     const fn fused(first: Self, second: Self) -> Self {

@@ -579,6 +579,19 @@ impl Assembler {
             .mark_maybe_null_comprehension_restore();
     }
 
+    pub(crate) fn mark_last_load_fast_as_post_analysis_closure(&mut self) {
+        let instruction =
+            self.required_last_instruction_mut("marking a post-analysis closure load");
+        assert_eq!(instruction.opcode, LOAD_FAST);
+        instruction.local_policy.mark_post_analysis_closure_load();
+    }
+
+    pub(crate) fn mark_last_load_fast_as_known_initialized(&mut self) {
+        let instruction = self.required_last_instruction_mut("marking an initialized local load");
+        assert_eq!(instruction.opcode, LOAD_FAST);
+        instruction.local_policy.mark_known_initialized_load();
+    }
+
     /// Defers a redundant jump until the pass after exit-block duplication.
     pub(crate) fn defer_last_jump_removal(&mut self) {
         self.last_jump_instruction_mut("deferring redundant jump removal")
@@ -610,6 +623,30 @@ impl Assembler {
         self.last_jump_instruction_mut("allowing a split return copy")
             .no_location_policy
             .allow_split_return_exit_copy();
+    }
+
+    /// Allows a condition jump followed by a marker to copy a split return.
+    pub(crate) fn allow_last_condition_split_return_copy(&mut self) {
+        let mut instructions =
+            self.linear_items_mut()
+                .iter_mut()
+                .rev()
+                .filter_map(|item| match item {
+                    Item::Instruction(instruction) => Some(instruction),
+                    Item::Label(_) => None,
+                });
+        let marker = instructions
+            .next()
+            .expect("condition marker should be present");
+        assert_eq!(marker.opcode, NOT_TAKEN, "condition marker should be last");
+        let jump = instructions
+            .next()
+            .expect("condition jump should precede marker");
+        assert!(
+            matches!(jump.operand, Operand::Forward(_) | Operand::Backward(_)),
+            "condition marker should follow a jump"
+        );
+        jump.no_location_policy.allow_split_return_exit_copy();
     }
 
     pub(crate) fn preserve_last_inlined_jump_nop(&mut self) {

@@ -284,10 +284,17 @@ impl Compiler {
                         }
                     } else if self.symbols.initialized_locals.contains(name_id) {
                         if self.symbols.owned_load_locals.contains(name_id) {
-                            self.emit_owned_fast(index, 1)
+                            self.emit_owned_fast(index, 1)?;
                         } else {
-                            self.emit(LOAD_FAST, index, 1)
+                            self.emit(LOAD_FAST, index, 1)?;
                         }
+                        if self
+                            .control
+                            .take_direct_comprehension_assignment_result(name_id)
+                        {
+                            self.assembler.mark_last_load_fast_as_known_initialized();
+                        }
+                        Ok(())
                     } else {
                         self.emit(LOAD_FAST_CHECK, index, 1)
                     }
@@ -587,8 +594,10 @@ impl Compiler {
         for name in names {
             let local = self.closure_index_id(*name)?;
             self.emit(LOAD_FAST, local, 1)?;
-            // CPython inserts pseudo `LOAD_CLOSURE` instructions after forming
-            // superinstructions, without introducing a control-flow boundary.
+            // CPython lowers pseudo `LOAD_CLOSURE` instructions after checking ordinary fast
+            // loads for initialization and after forming superinstructions.
+            self.assembler
+                .mark_last_load_fast_as_post_analysis_closure();
             self.assembler
                 .prevent_last_instruction_fusion_with_previous();
         }

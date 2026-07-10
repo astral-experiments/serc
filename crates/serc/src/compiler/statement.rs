@@ -92,6 +92,7 @@ struct ReturnFinallyContext {
     loop_depth: usize,
     handler: Label,
     depth: u32,
+    preserves_conditional_exit_owner: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -123,6 +124,7 @@ struct WithExitContext {
     is_async: bool,
     exception_region_depth: usize,
     loop_depth: usize,
+    preserves_none_condition_owner: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -231,12 +233,15 @@ pub(super) struct ControlFlowState {
     // Exception-group handlers retain their body marker owner after coroutine suspension.
     pub(super) active_exception_group_handlers: usize,
     active_return_finally_contexts: Vec<ReturnFinallyContext>,
+    // A sole copied finally condition can duplicate the preserved return onto its false edge.
+    copy_return_finally_condition_exit: bool,
     // CPython's normalized `NOT_TAKEN` can reuse a normal-finally CFG slot that still owns the
     // coroutine stop-iteration handler.
     pub(super) active_normal_finally_bodies: usize,
     pub(super) active_finally_end_blocks: usize,
     // Set while compiling a condition introduced by exceptional-finally lowering.
     pub(super) exceptional_finally_condition: bool,
+    active_conditional_cleanup_finally_try_bodies: usize,
     active_finally_try_bodies: usize,
     active_pass_finally_locations: Vec<SourceLocation>,
     active_overriding_finally_returns: usize,
@@ -277,13 +282,14 @@ pub(super) struct ControlFlowState {
     pub(super) same_line_try_body: bool,
     // Whether the statement currently entered by `compile_suite` has a sibling successor.
     pub(super) current_statement_has_following: bool,
+    direct_comprehension_assignment_results: NameSet,
     // Whether that successor is another try statement. A loop break that targets this sibling
     // remains inside the current protected region instead of exiting through its normal edge.
     current_statement_followed_by_try: bool,
     branch_join_successor: Option<TextRange>,
     // Whether the current statement is nested directly in a terminal if branch suite.
     pub(super) in_terminal_if_branch_suite: bool,
-
+    copied_nested_handler_join_successor: bool,
     // Whether that successor is a direct loop break.
     current_statement_followed_by_break: bool,
     // Whether the current expression is the complete value of an ordinary assignment and is an
@@ -378,6 +384,24 @@ impl ControlFlowState {
         self.active_with_exits
             .last()
             .is_some_and(|context| !context.is_async)
+    }
+
+    pub(super) fn synchronous_with_preserves_none_condition_owner(&self) -> bool {
+        self.active_with_exits
+            .last()
+            .is_some_and(|context| !context.is_async && context.preserves_none_condition_owner)
+    }
+
+    pub(super) fn finally_try_body_preserves_none_condition_owner(&self) -> bool {
+        self.active_conditional_cleanup_finally_try_bodies > 0
+    }
+
+    pub(super) fn follows_copied_nested_handler_join(&self) -> bool {
+        self.copied_nested_handler_join_successor
+    }
+
+    pub(super) fn take_direct_comprehension_assignment_result(&mut self, name: NameId) -> bool {
+        self.direct_comprehension_assignment_results.remove(name)
     }
 
     fn is_direct_trailing_handler_statement(&self, range: TextRange) -> bool {
@@ -702,6 +726,7 @@ impl Compiler {
         pass_location: Option<SourceLocation>,
         overriding_return: bool,
         preserve_break_exit_loop_range: Option<ruff_text_size::TextRange>,
+        preserves_none_condition_owner: bool,
         return_context: Option<ReturnFinallyContext>,
         compile: impl FnOnce(&mut Self) -> Result<T, CompileError>,
     ) -> Result<(T, Vec<(Label, Label)>), CompileError> {
@@ -727,9 +752,15 @@ impl Compiler {
         );
         let previous_try_bodies = self.control.active_finally_try_bodies;
         self.control.active_finally_try_bodies = previous_try_bodies + 1;
+        let previous_conditional_cleanup_bodies =
+            self.control.active_conditional_cleanup_finally_try_bodies;
+        self.control.active_conditional_cleanup_finally_try_bodies =
+            previous_conditional_cleanup_bodies + usize::from(preserves_none_condition_owner);
 
         let result = compile(self);
 
+        self.control.active_conditional_cleanup_finally_try_bodies =
+            previous_conditional_cleanup_bodies;
         self.control.active_finally_try_bodies = previous_try_bodies;
         self.control.preserve_finally_break_exit_loop_range = previous_break_exit_loop_range;
         self.control.active_overriding_finally_returns = previous_overriding_returns;
@@ -1057,13 +1088,39 @@ impl Compiler {
                 let followed_by_return_or_raise =
                     matches!(body.get(index + 1), Some(Stmt::Return(_) | Stmt::Raise(_)));
                 let followed_by_try = matches!(body.get(index + 1), Some(Stmt::Try(_)));
-                let preceded_by_branch_join = body[..index].last().is_some_and(|statement| {
-                    matches!(
-                        statement,
-                        Stmt::If(statement) if if_normal_exit_count(statement) > 1
-                    )
+                let previous_statement = body[..index].last();
+                let preceded_by_branch_join = previous_statement.is_some_and(|statement| {
+                    matches!(statement, Stmt::If(previous) if if_normal_exit_count(previous) > 1)
                 });
-                self.with_control_override(
+                let preceded_by_copied_nested_handler_join = previous_statement.is_some_and(
+                    |statement| matches!(statement, Stmt::If(previous) if if_contains_copied_nested_handler_exit(previous)),
+                );
+                let direct_comprehension_assignment_results = if index == 0 {
+                    self.control.direct_comprehension_assignment_results.clone()
+                } else if matches!(statement, Stmt::If(_) | Stmt::Try(_))
+                    && let Some(Stmt::Assign(assignment)) = body.get(index - 1)
+                    && matches!(
+                        assignment.value.as_ref(),
+                        Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_)
+                    )
+                {
+                    let mut target_names = Vec::new();
+                    for target in &assignment.targets {
+                        collect_target_names(target, &mut target_names);
+                    }
+                    self.name_id_set(target_names).into_iter().collect()
+                } else {
+                    NameSet::default()
+                };
+                let previous_direct_comprehension_assignment_results = std::mem::replace(
+                    &mut self.control.direct_comprehension_assignment_results,
+                    direct_comprehension_assignment_results,
+                );
+                let previous_copied_nested_handler_join_successor = std::mem::replace(
+                    &mut self.control.copied_nested_handler_join_successor,
+                    preceded_by_copied_nested_handler_join,
+                );
+                let result = self.with_control_override(
                     |control| &mut control.emit_protected_async_for_end_nop,
                     emit_protected_async_for_end_nop,
                     |compiler| {
@@ -1122,11 +1179,7 @@ impl Compiler {
                                                                             },
                                                                             preceded_by_branch_join
                                                                                 .then_some(statement.range()),
-                                                                            |compiler| {
-                                                                                compiler.compile_statement(
-                                                                                    statement,
-                                                                                )
-                                                                            },
+                                                                            |compiler| compiler.compile_statement(statement),
                                                                         )
                                                                     },
                                                                 )
@@ -1145,7 +1198,12 @@ impl Compiler {
                             },
                         )
                     },
-                )?;
+                );
+                self.control.copied_nested_handler_join_successor =
+                    previous_copied_nested_handler_join_successor;
+                self.control.direct_comprehension_assignment_results =
+                    previous_direct_comprehension_assignment_results;
+                result?;
             }
             if statement_terminates(statement) {
                 let unreachable = &body[index + 1..];
@@ -2706,6 +2764,11 @@ impl Compiler {
                     } else {
                         None
                     };
+                    let previous_copy_return_finally_condition_exit =
+                        self.control.copy_return_finally_condition_exit;
+                    self.control.copy_return_finally_condition_exit =
+                        matches!(statement.value.as_deref(), Some(Expr::Name(_)))
+                            && finally_context.preserves_conditional_exit_owner;
                     let initialized_locals = self.symbols.initialized_locals.clone();
                     let result = if context_index > 0 {
                         self.with_region_exclusion_collector(
@@ -2716,6 +2779,8 @@ impl Compiler {
                         self.compile_suite(&finally_context.body)
                             .map(|()| ((), Vec::new()))
                     };
+                    self.control.copy_return_finally_condition_exit =
+                        previous_copy_return_finally_condition_exit;
                     self.symbols.initialized_locals = initialized_locals;
                     let ((), copied_finally_exclusions) = result?;
                     if let (Some(copied_finally_start), Some(outer_context)) = (
@@ -3064,6 +3129,20 @@ impl Compiler {
                         .active_with_exits
                         .last()
                         .is_some_and(|context| !context.is_async);
+
+                let preserve_sync_with_terminating_call_owner = branch_index == 0
+                    && statement.elif_else_clauses.len() > 1
+                    && matches!(test, Expr::Call(_))
+                    && suite_terminates(body)
+                    && self.control.loops.is_empty()
+                    && self.control.active_exception_region_exclusions.is_empty()
+                    && self.control.active_with_region_exclusions.len() == 1
+                    && self.control.active_with_exits.len() == 1
+                    && self
+                        .control
+                        .active_with_exits
+                        .last()
+                        .is_some_and(|context| !context.is_async);
                 let preserve_sync_with_direct_return_chain_owner =
                     self.control.sync_with_direct_return_chain
                         || (!self.control.current_statement_has_following
@@ -3183,7 +3262,15 @@ impl Compiler {
                             && !self.control.active_exception_region_exclusions.is_empty()
                             && self.control.active_normal_finally_bodies == 0
                             && !self.control.in_exception_handler()
-                            && is_simple_none_default_assignment(test, body)));
+                            && is_simple_none_default_assignment(test, body))
+                        || (self.control.current_statement_has_following
+                            && !self.control.in_iterator_loop()
+                            && self.control.generator_region_start.is_none()
+                            && self.control.active_with_region_exclusions.is_empty()
+                            && self.control.active_exception_region_exclusions.len() == 1
+                            && self.control.active_normal_finally_bodies == 0
+                            && !self.control.in_exception_handler()
+                            && is_call_none_default_assignment(test, body)));
                 let exclude_later_handler_leading_marker = branch_index == 0
                     && !is_specialized_none_condition(test)
                     && is_later_bare_raise_fallback_if(statement)
@@ -3246,6 +3333,10 @@ impl Compiler {
                     self.assembler.set_forced_borrowed_loads(previous);
                 }
                 compile_condition?;
+                if branch_index == 0 && self.control.copy_return_finally_condition_exit {
+                    self.assembler.allow_last_condition_split_return_copy();
+                }
+
                 if preserve_sync_with_continue_owner {
                     // CPython keeps the protected CFG owner when normalization reuses a removed
                     // loop-control block slot.
@@ -3264,6 +3355,11 @@ impl Compiler {
                     // marker consumes the with setup's stale owner slot.
                     self.assembler.preserve_last_not_taken_exception_owner();
                 }
+                if preserve_sync_with_terminating_call_owner {
+                    // The removed branch edge leaves its manager owner on this marker.
+                    self.assembler.preserve_last_not_taken_exception_owner();
+                }
+
                 if preserve_sync_with_direct_return_chain_owner {
                     // This one-return branch chain retains the surrounding manager's owner on
                     // each normalized condition marker.
@@ -3301,6 +3397,7 @@ impl Compiler {
                         if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
                             && matches!(assignment.value.as_ref(), Expr::Call(call)
                                 if optimized_generator_callable(call) == Some("tuple")));
+                self.control.direct_comprehension_assignment_results = NameSet::default();
                 self.mark_definitely_evaluated_locals(test);
                 let body_start = self.assembler.instruction_count();
                 let copied_split_return_try =
@@ -5167,7 +5264,8 @@ impl Compiler {
                     .active_with_exits
                     .last()
                     .is_some_and(|context| !context.is_async)
-                && is_direct_return_handler_try(statement);
+                && (is_direct_return_handler_try(statement)
+                    || is_direct_return_raise_handler_try(statement));
         let nested_in_final_outer_try_statement =
             !self.control.active_exception_region_exclusions.is_empty()
                 && self
@@ -7160,12 +7258,15 @@ impl Compiler {
             loop_depth: self.control.loops.len(),
             handler: finally_handler,
             depth: base_depth.cast_unsigned(),
+            preserves_conditional_exit_owner: statement.handlers.is_empty()
+                && finally_suite_preserves_none_condition_owner(&statement.finalbody),
         });
         let (protected_has_instructions, protected_exclusions) = self
             .with_finally_protected_context(
                 pass_finally_location,
                 overriding_return,
                 preserve_break_exit_loop_range,
+                finally_suite_preserves_none_condition_owner(&statement.finalbody),
                 return_context,
                 |compiler| {
                     if statement.handlers.is_empty() {
@@ -7831,6 +7932,8 @@ impl Compiler {
             is_async: false,
             exception_region_depth: self.control.active_exception_region_exclusions.len(),
             loop_depth: self.control.loops.len(),
+            preserves_none_condition_owner: remaining.is_empty()
+                && with_suite_has_fallthrough_handler_try(body),
         };
         let (body_noop, region_exclusions) = self.with_region_exclusion_collector(
             |control| &mut control.active_with_region_exclusions,
@@ -8041,6 +8144,7 @@ impl Compiler {
             is_async: true,
             exception_region_depth: self.control.active_exception_region_exclusions.len(),
             loop_depth: self.control.loops.len(),
+            preserves_none_condition_owner: false,
         };
         let outer_exception_owns_exit = context.exception_region_depth > 0
         // Without the converted end NOP, CPython gives the async-with exit back to the
@@ -8468,6 +8572,22 @@ fn is_direct_return_handler_try(statement: &ruff_python_ast::StmtTry) -> bool {
         )
 }
 
+fn is_direct_return_raise_handler_try(statement: &ruff_python_ast::StmtTry) -> bool {
+    !statement.is_star
+        && statement.orelse.is_empty()
+        && statement.finalbody.is_empty()
+        && matches!(statement.body.as_slice(), [Stmt::Return(_)])
+        && matches!(
+            statement.handlers.as_slice(),
+            [handler]
+                if handler.as_except_handler().is_some_and(|handler| {
+                    matches!(
+                        handler.type_.as_deref(),
+                        Some(Expr::Name(name)) if name.id.as_str() == "Exception"
+                    ) && matches!(handler.body.as_slice(), [Stmt::Raise(_)])
+                })
+        )
+}
 fn suite_terminates_in_direct_return_handler_chain(body: &[Stmt]) -> bool {
     let [statement] = body else {
         return false;
@@ -8513,6 +8633,32 @@ fn suite_is_constant_false_assertion(body: &[Stmt]) -> bool {
         )
 }
 
+fn if_contains_copied_nested_handler_exit(statement: &ruff_python_ast::StmtIf) -> bool {
+    std::iter::once(statement.body.as_slice())
+        .chain(
+            statement
+                .elif_else_clauses
+                .iter()
+                .map(|clause| clause.body.as_slice()),
+        )
+        .flatten()
+        .any(|statement| {
+            matches!(
+                statement,
+                Stmt::Try(outer)
+                    if outer.handlers.iter().any(|handler| {
+                        handler.as_except_handler().is_some_and(|handler| {
+                            matches!(
+                                handler.body.last(),
+                                Some(Stmt::Try(nested))
+                                    if try_has_fallthrough_body_and_handler(nested)
+                            )
+                        })
+                    })
+            )
+        })
+}
+
 fn try_has_fallthrough_body_and_handler(statement: &ruff_python_ast::StmtTry) -> bool {
     statement.orelse.is_empty()
         && statement.finalbody.is_empty()
@@ -8522,7 +8668,10 @@ fn try_has_fallthrough_body_and_handler(statement: &ruff_python_ast::StmtTry) ->
             [handler]
                 if handler.as_except_handler().is_some_and(|handler| {
                     handler.name.is_none()
-                        && matches!(handler.body.as_slice(), [Stmt::Expr(_)])
+                        && matches!(
+                            handler.body.as_slice(),
+                            [Stmt::Expr(_) | Stmt::Assign(_)]
+                        )
                 })
         )
 }
@@ -8811,6 +8960,27 @@ fn is_simple_none_default_assignment(test: &Expr, body: &[Stmt]) -> bool {
         [Stmt::Assign(assignment)]
             if matches!(assignment.targets.as_slice(), [Expr::Name(target)] if target.id == name.id)
                 && is_literal_constant(&assignment.value)
+    )
+}
+
+fn is_call_none_default_assignment(test: &Expr, body: &[Stmt]) -> bool {
+    let Expr::Compare(comparison) = test else {
+        return false;
+    };
+    if comparison.ops.len() != 1
+        || comparison.ops[0] != CmpOp::Is
+        || !matches!(comparison.comparators.as_ref(), [Expr::NoneLiteral(_)])
+    {
+        return false;
+    }
+    let Expr::Name(name) = comparison.left.as_ref() else {
+        return false;
+    };
+    matches!(
+        body,
+        [Stmt::Assign(assignment)]
+            if matches!(assignment.targets.as_slice(), [Expr::Name(target)] if target.id == name.id)
+                && matches!(assignment.value.as_ref(), Expr::Call(_))
     )
 }
 
@@ -9554,6 +9724,38 @@ fn suite_is_import_assignment(body: &[Stmt]) -> bool {
         body,
         [first, Stmt::Assign(_)]
             if matches!(first, Stmt::Import(_) | Stmt::ImportFrom(_))
+    )
+}
+
+fn with_suite_has_fallthrough_handler_try(body: &[Stmt]) -> bool {
+    body.iter().any(|statement| {
+        let Stmt::Try(statement) = statement else {
+            return false;
+        };
+        !statement.is_star
+            && statement.orelse.is_empty()
+            && statement.finalbody.is_empty()
+            && !statement.handlers.is_empty()
+            && !suite_terminates(&statement.body)
+            && statement.handlers.iter().all(|handler| {
+                handler
+                    .as_except_handler()
+                    .is_some_and(|handler| !suite_terminates(&handler.body))
+            })
+    })
+}
+
+fn finally_suite_preserves_none_condition_owner(body: &[Stmt]) -> bool {
+    matches!(
+        body,
+        [Stmt::If(statement)]
+            if statement.elif_else_clauses.is_empty()
+                && matches!(statement.test.as_ref(), Expr::Name(_))
+                && matches!(
+                    statement.body.as_slice(),
+                    [Stmt::Expr(expression)]
+                        if matches!(expression.value.as_ref(), Expr::Call(_))
+                )
     )
 }
 

@@ -101,7 +101,16 @@ fn no_exit_copy_analysis(
             && graph[source]
                 .last_instruction()
                 .is_some_and(|instruction| instruction.jump_policy.inline_small_exit());
-        shared_exit || no_location_exit || split_no_location_exit || small_exit_source
+        let conditional_split_return_source = source_has_fallthrough
+            && predecessors[target.index()] > 1
+            && graph[source].last_instruction().is_some_and(|instruction| {
+                instruction.no_location_policy.copies_split_return_exit()
+            });
+        shared_exit
+            || no_location_exit
+            || split_no_location_exit
+            || small_exit_source
+            || conditional_split_return_source
     });
     if !possible_copy {
         return Some(NoExitCopyAnalysis {
@@ -191,6 +200,11 @@ fn no_exit_copy_analysis(
                 })
             })
             && !exception_handler_blocks.contains(&target);
+        let copy_conditional_split_return = source_has_fallthrough
+            && source_copies_split_return
+            && target_is_small_exit
+            && predecessors[target.index()] > 1
+            && !exception_handler_blocks.contains(&target);
         let target_has_no_location = target_blocks.iter().all(|block| {
             graph[*block].items().iter().all(|item| {
                 !matches!(item, Item::Instruction(instruction) if instruction.location.line >= 0)
@@ -203,6 +217,7 @@ fn no_exit_copy_analysis(
             && ((target_has_no_location && ends_scope(target_last.opcode))
                 || target_last.no_location_policy.is_artificial_eval_break());
         if inline_small_exit
+            || copy_conditional_split_return
             || (!source_has_fallthrough && no_location_exit)
             || (predecessors[target.index()] > 1 && (shared_exit || no_location_exit))
         {
@@ -1016,6 +1031,11 @@ impl OptimizationPipeline {
                 && !exception_handler_blocks.contains(&target);
             let inline_no_location_block =
                 !source_has_fallthrough && target_is_no_location_no_fallthrough;
+            let copy_conditional_split_return = source_has_fallthrough
+                && source_copies_split_return
+                && target_is_small_exit
+                && remaining_predecessors[&target] > 1
+                && !exception_handler_blocks.contains(&target);
             let later_jump_predecessor = order[source_position + 1..].iter().any(|predecessor| {
                 block_jump_target(graph[*predecessor].items())
                     .and_then(|label| graph.label_block(label))
@@ -1031,7 +1051,7 @@ impl OptimizationPipeline {
                 // predecessor receive the copy while the warm predecessor keeps the original.
                 continue;
             }
-            if !(inline_small_exit || inline_no_location_block)
+            if !(inline_small_exit || inline_no_location_block || copy_conditional_split_return)
                 && (!(exit_without_unique_predecessor.contains(&target)
                     || target_is_no_location_no_fallthrough)
                     || remaining_predecessors[&target] <= 1)
@@ -1156,7 +1176,9 @@ impl OptimizationPipeline {
                     let inherits_shared_predecessor = instruction
                         .no_location_policy
                         .copy_inherits_shared_predecessor();
-                    (target_has_no_location || target_has_artificial_eval_break)
+                    (target_has_no_location
+                        || target_has_artificial_eval_break
+                        || copy_conditional_split_return)
                         && (!inline_no_location_block
                             || predecessors[&source] <= 1
                             || inherits_shared_predecessor)
