@@ -73,6 +73,7 @@ struct ExceptionHandlerContext {
     name: Option<NameId>,
     first: bool,
     loop_depth: usize,
+    trailing_statement: Option<TextRange>,
     protect_outer_return_pop: bool,
     common_cleanup: Label,
     common_cleanup_depth: u32,
@@ -287,6 +288,8 @@ pub(super) struct ControlFlowState {
     // A nested try under a normal body with an else suite exits there instead of directly
     // crossing the enclosing handler boundary.
     direct_try_body_has_else: bool,
+    // The direct body belongs to an ordinary try with one handler that only raises.
+    direct_try_body_has_single_raise_handler: bool,
     pub(super) generator_region_start: Option<Label>,
     pub(super) generator_region_exclusions: Vec<(Label, Label)>,
     pub(super) emitted_fallthrough_return: bool,
@@ -310,6 +313,12 @@ impl ControlFlowState {
 
     pub(super) fn in_exception_handler(&self) -> bool {
         !self.active_exception_handlers.is_empty()
+    }
+
+    fn is_direct_trailing_handler_statement(&self, range: TextRange) -> bool {
+        self.active_exception_handlers
+            .last()
+            .is_some_and(|handler| handler.trailing_statement == Some(range))
     }
 
     pub(super) fn in_iterator_loop(&self) -> bool {
@@ -423,6 +432,13 @@ impl Compiler {
         .flatten();
         let direct_try_body_statements = statement.body.iter().map(Ranged::range).collect();
         let direct_try_body_has_else = !statement.orelse.is_empty();
+        let direct_try_body_has_single_raise_handler = matches!(
+            statement.handlers.as_slice(),
+            [handler]
+                if handler.as_except_handler().is_some_and(|handler| {
+                    matches!(handler.body.as_slice(), [Stmt::Raise(_)])
+                })
+        );
         self.with_control_override(
             |control| &mut control.same_line_try_body,
             same_line,
@@ -432,17 +448,28 @@ impl Compiler {
                     direct_try_body_has_else,
                     |compiler| {
                         compiler.with_control_override(
-                            |control| &mut control.direct_try_body_statements,
-                            direct_try_body_statements,
+                            |control| &mut control.direct_try_body_has_single_raise_handler,
+                            direct_try_body_has_single_raise_handler,
                             |compiler| {
                                 compiler.with_control_override(
-                                    |control| &mut control.direct_final_sync_with_combined_try_body,
-                                    direct_final_sync_with_combined_try_body,
+                                    |control| &mut control.direct_try_body_statements,
+                                    direct_try_body_statements,
                                     |compiler| {
                                         compiler.with_control_override(
-                                            |control| &mut control.direct_final_sync_with_try_body,
-                                            direct_final_sync_with_try_body,
-                                            compile,
+                                            |control| {
+                                                &mut control
+                                                    .direct_final_sync_with_combined_try_body
+                                            },
+                                            direct_final_sync_with_combined_try_body,
+                                            |compiler| {
+                                                compiler.with_control_override(
+                                                    |control| {
+                                                        &mut control.direct_final_sync_with_try_body
+                                                    },
+                                                    direct_final_sync_with_try_body,
+                                                    compile,
+                                                )
+                                            },
                                         )
                                     },
                                 )
@@ -2895,6 +2922,16 @@ impl Compiler {
                     first_branch_max_depth = Some(self.control.max_depth);
                 }
                 if !suite_terminates(body) && branch_index + 1 < branch_count {
+                    let direct_try_body_exit = self
+                        .control
+                        .direct_try_body_statements
+                        .last()
+                        .is_some_and(|direct| *direct == statement.range)
+                        && !self.control.direct_try_body_has_else
+                        && self.control.direct_try_body_has_single_raise_handler
+                        && self.control.active_finally_try_bodies == 0;
+                    let direct_try_body_exit =
+                        direct_try_body_exit && is_membership_assignment_branch(statement);
                     let nested_if_exit = body.last().and_then(|statement| match statement {
                         Stmt::If(statement) => nested_if_exit_location(statement),
                         _ => None,
@@ -2919,7 +2956,21 @@ impl Compiler {
                     } else {
                         self.set_branch_end_location(body, body_start);
                     }
+                    let direct_try_body_exit_start = direct_try_body_exit.then(|| {
+                        let start = self.assembler.label();
+                        self.assembler.mark(start);
+                        start
+                    });
                     self.emit_jump_forward(JUMP_FORWARD, end, 0)?;
+                    if let Some(start) = direct_try_body_exit_start {
+                        let exclusion_end = self.assembler.label();
+                        self.assembler.mark(exclusion_end);
+                        self.control
+                            .active_exception_region_exclusions
+                            .last_mut()
+                            .expect("direct try-body branch exit requires an active try")
+                            .push((start, exclusion_end));
+                    }
                     // CPython retains the first assertion branch's source jump when it copies a
                     // nonterminal join onto that edge. A directly following return or raise
                     // copies the function-exit block onto later clauses too. Without a copied
@@ -4629,6 +4680,15 @@ impl Compiler {
                 .as_except_handler()
                 .is_some_and(|handler| matches!(handler.body.as_slice(), [Stmt::Pass(_)]))
         });
+        let trailing_fallthrough_handler_try = self
+            .control
+            .active_exception_handlers
+            .last()
+            .is_some_and(|handler| handler.name.is_none())
+            && self
+                .control
+                .is_direct_trailing_handler_statement(statement.range)
+            && try_has_fallthrough_body_and_handler(statement);
         let propagates_protected_loop_tail_mode =
             try_propagates_protected_loop_tail_mode(statement);
         let nested_handler_tail_if_with_terminal_handlers = handlers_terminate
@@ -5053,6 +5113,12 @@ impl Compiler {
             // is the synthetic protected body of try/finally.
             let exclude_nested_normal_exit = nested_in_final_outer_try_statement
                 && self.control.active_pass_finally_locations.is_empty();
+            let trailing_handler_exit_exclusion_start =
+                trailing_fallthrough_handler_try.then(|| {
+                    let start = self.assembler.label();
+                    self.assembler.mark(start);
+                    start
+                });
             let exception_policy = if exclude_nested_normal_exit
                 || (body_noop_location.is_some()
                     && statement.orelse.is_empty()
@@ -5064,6 +5130,15 @@ impl Compiler {
                 ExceptionPolicy::default()
             };
             self.emit_jump_forward_with_exception_policy(JUMP_FORWARD, end, 0, exception_policy)?;
+            if let Some(start) = trailing_handler_exit_exclusion_start {
+                let exclusion_end = self.assembler.label();
+                self.assembler.mark(exclusion_end);
+                self.control
+                    .active_exception_region_exclusions
+                    .last_mut()
+                    .expect("trailing handler try exit requires an outer handler")
+                    .push((start, exclusion_end));
+            }
             if copy_break_only_loop_exit {
                 // Copy the following try exit directly onto the only reachable loop break.
                 self.assembler.prepare_last_no_location_block_for_inlining();
@@ -5404,6 +5479,7 @@ impl Compiler {
                         name: handler_name,
                         first: handler_index == 0,
                         loop_depth: self.control.loops.len(),
+                        trailing_statement: handler.body.last().map(Ranged::range),
                         common_cleanup,
                         protect_outer_return_pop: nested_handler_tail_if_with_terminal_handlers
                             || (handler_name.is_none()
@@ -5500,6 +5576,11 @@ impl Compiler {
                                                 )
                                         })
                                 }))
+                            // A trailing nested try with fallthrough from both its body and a
+                            // handler feeds the outer bare-handler cleanup from multiple edges.
+                            // Leave that cleanup unlocated so CPython's repeated exit-copy pass
+                            // can inline it onto each nested normal exit.
+                            || try_has_fallthrough_body_and_handler(nested)
                             || (statement.body.len() == 1
                                 && !suite_terminates(&statement.body)
                                 && nested.finalbody.is_empty()
@@ -5653,6 +5734,12 @@ impl Compiler {
 
                     // A pass-only finally keeps these extended handler exits in its protected
                     // region; executable finally bodies use CPython's stale-owner exclusion.
+                    let trailing_handler_exit_exclusion_start = trailing_fallthrough_handler_try
+                        .then(|| {
+                            let start = self.assembler.label();
+                            self.assembler.mark(start);
+                            start
+                        });
                     let exception_policy = if handler_body_has_instructions
                         && nested_in_final_outer_try_statement
                         && self.control.active_pass_finally_locations.is_empty()
@@ -5674,6 +5761,15 @@ impl Compiler {
                         0,
                         exception_policy,
                     )?;
+                    if let Some(start) = trailing_handler_exit_exclusion_start {
+                        let exclusion_end = self.assembler.label();
+                        self.assembler.mark(exclusion_end);
+                        self.control
+                            .active_exception_region_exclusions
+                            .last_mut()
+                            .expect("trailing handler try exit requires an outer handler")
+                            .push((start, exclusion_end));
+                    }
                     if handler_ends_with_inlineable_cleanup {
                         // The cleanup is larger than a small exit, but is still eligible because
                         // it has no line number and cannot fall through.
@@ -7575,6 +7671,20 @@ fn suite_is_constant_false_assertion(body: &[Stmt]) -> bool {
         )
 }
 
+fn try_has_fallthrough_body_and_handler(statement: &ruff_python_ast::StmtTry) -> bool {
+    statement.orelse.is_empty()
+        && statement.finalbody.is_empty()
+        && matches!(statement.body.as_slice(), [Stmt::Assign(_)])
+        && matches!(
+            statement.handlers.as_slice(),
+            [handler]
+                if handler.as_except_handler().is_some_and(|handler| {
+                    handler.name.is_none()
+                        && matches!(handler.body.as_slice(), [Stmt::Expr(_)])
+                })
+        )
+}
+
 fn try_normal_exit_predecessors(statement: &ruff_python_ast::StmtTry) -> usize {
     let normal_body =
         usize::from(!suite_terminates(&statement.body) && !suite_terminates(&statement.orelse));
@@ -7776,6 +7886,23 @@ fn if_normal_exit_count(statement: &ruff_python_ast::StmtIf) -> usize {
                 .elif_else_clauses
                 .last()
                 .is_none_or(|clause| clause.test.is_some()),
+        )
+}
+
+fn is_membership_assignment_branch(statement: &ruff_python_ast::StmtIf) -> bool {
+    matches!(
+        statement.test.as_ref(),
+        Expr::Compare(comparison)
+            if comparison.ops.len() == 1 && comparison.ops[0] == CmpOp::In
+    ) && matches!(statement.body.as_slice(), [Stmt::Assign(_)])
+        && matches!(
+            statement.elif_else_clauses.as_slice(),
+            [clause]
+                if clause.test.is_none()
+                    && matches!(
+                        clause.body.as_slice(),
+                        [Stmt::Assign(_), Stmt::Assign(_)]
+                    )
         )
 }
 
