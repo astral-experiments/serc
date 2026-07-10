@@ -4771,6 +4771,19 @@ impl Compiler {
             }
             let handler_body_has_instructions =
                 self.assembler.instruction_count() > handler_body_start;
+            let handler_ends_with_inlineable_cleanup = handler.name.is_some()
+                && handler
+                    .body
+                    .last()
+                    .is_some_and(|statement| match statement {
+                        Stmt::Try(_) => true,
+                        Stmt::With(statement) => !suite_terminates(&statement.body),
+                        _ => false,
+                    });
+            let handler_ends_with_nonterminal_with = matches!(
+                handler.body.last(),
+                Some(Stmt::With(statement)) if !suite_terminates(&statement.body)
+            );
             self.assembler.mark(body_end);
             if handler.name.is_some() {
                 self.add_exception_regions_with_exclusions(
@@ -4811,11 +4824,9 @@ impl Compiler {
                 {
                     self.assembler
                         .set_location(self.source_location(statement.range()));
-                // CPython leaves named cleanup after a nested try unlocated so every incoming
-                // edge can inline its own copy with the predecessor's line.
-                } else if handler.name.is_some()
-                    && matches!(handler.body.last(), Some(Stmt::Try(_)))
-                {
+                // CPython leaves named cleanup after a nested try or trailing with unlocated so
+                // every incoming edge can inline its own copy with the predecessor's line.
+                } else if handler_ends_with_inlineable_cleanup {
                     self.assembler.set_location(SourceLocation::NONE);
                 } else if let Some(location) = self.assembler.last_instruction_location() {
                     self.assembler.set_location(location);
@@ -4846,10 +4857,13 @@ impl Compiler {
                         0,
                         exception_policy,
                     )?;
-                    if handler.name.is_some() && matches!(handler.body.last(), Some(Stmt::Try(_))) {
+                    if handler_ends_with_inlineable_cleanup {
                         // The cleanup is larger than a small exit, but is still eligible because
                         // it has no line number and cannot fall through.
                         self.assembler.prepare_last_no_location_block_for_inlining();
+                        if handler_ends_with_nonterminal_with {
+                            self.assembler.make_last_no_location_copy_interruptible();
+                        }
                     }
                     let return_is_overridden = self.control.active_overriding_finally_returns > 0
                         && matches!(handler.body.last(), Some(Stmt::Return(_)));

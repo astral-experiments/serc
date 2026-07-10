@@ -582,6 +582,12 @@ impl Assembler {
         instruction.no_location_policy.allow_block_inlining = true;
     }
 
+    pub(crate) fn make_last_no_location_copy_interruptible(&mut self) {
+        self.last_jump_instruction_mut("making a no-location copy interruptible")
+            .no_location_policy
+            .first_copy_as_interruptible_backward = true;
+    }
+
     pub(crate) fn preserve_last_no_location(&mut self) {
         self.required_last_instruction_mut("preserving a no-location instruction")
             .no_location_policy

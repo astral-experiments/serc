@@ -1016,6 +1016,21 @@ impl OptimizationPipeline {
                 .iter()
                 .flat_map(|block| graph[*block].items().iter().copied())
                 .collect::<Vec<_>>();
+            if inline_no_location_block
+                && let Some(instruction) = copied.iter_mut().rev().find_map(|item| match item {
+                    Item::Instruction(instruction) => Some(instruction),
+                    Item::Label(_) => None,
+                })
+                && instruction
+                    .no_location_policy
+                    .first_copy_as_interruptible_backward
+                && remaining_predecessors[&target] == predecessors[&target]
+                && instruction.opcode == JUMP_FORWARD
+            {
+                // CPython's copied normal exit checks the eval breaker if cold-block ordering
+                // turns it backward. The original synthetic cleanup edge remains no-interrupt.
+                instruction.opcode = JUMP_BACKWARD;
+            }
             let preserve_inlined_jump_nop = inline_small_exit
                 && source_location.line >= 0
                 && graph[source].last_instruction().is_some_and(|instruction| {

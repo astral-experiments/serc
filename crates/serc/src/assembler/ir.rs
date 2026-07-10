@@ -114,6 +114,9 @@ impl LoadPolicy {
 pub(super) struct NoLocationPolicy {
     /// Whether an unlocated block ending at this instruction may be inlined.
     pub(super) allow_block_inlining: bool,
+    /// Whether a copied forward exit becomes an interruptible backward jump after cold-block
+    /// ordering. The original cleanup edge remains non-interruptible.
+    pub(super) first_copy_as_interruptible_backward: bool,
     pub(super) preserve: bool,
     /// An unresolved percent target or its deferred-location side-table index.
     pub(super) percent_target_location: u8,
@@ -123,6 +126,8 @@ impl NoLocationPolicy {
     const fn fused(first: Self, second: Self) -> Self {
         Self {
             allow_block_inlining: first.allow_block_inlining || second.allow_block_inlining,
+            first_copy_as_interruptible_backward: first.first_copy_as_interruptible_backward
+                || second.first_copy_as_interruptible_backward,
             preserve: first.preserve || second.preserve,
             percent_target_location: if matches!(first.percent_target_location, 0 | u8::MAX) {
                 second.percent_target_location
