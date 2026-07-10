@@ -4265,9 +4265,16 @@ impl Compiler {
                 })
             })
         });
+        let handler_contains_nested_handler_cold_join = !handlers_terminate
+            && statement.handlers.iter().any(|handler| {
+                handler
+                    .as_except_handler()
+                    .is_some_and(|handler| suite_contains_nested_handler_cold_join(&handler.body))
+            });
         let normal_exit_starts_in_empty_block = self.control.current_statement_has_following
             && (suite_ends_in_empty_try_exit_block(normal_exit_suite)
-                || handler_contains_terminal_nested_try);
+                || handler_contains_terminal_nested_try
+                || handler_contains_nested_handler_cold_join);
         // CPython removes the with handler's normal-exit edge before borrowed-load traversal,
         // so a following suite cannot reach this try join through that edge.
         if self.control.current_statement_has_following
@@ -7184,6 +7191,57 @@ pub(super) fn suite_contains_yield(body: &[Stmt]) -> bool {
     }
     collector.found
 }
+
+// CPython's cold-block ordering disconnects the normal outer exit when a nested try/except
+// ends a handler-side suite and its own handler is more than straight-line assignment or pass.
+// Simple assignment/pass handlers stay threaded into the following borrow-reachable block.
+
+fn suite_contains_nested_handler_cold_join(body: &[Stmt]) -> bool {
+    #[derive(Default)]
+    struct Detector {
+        found: bool,
+    }
+
+    impl<'ast> Visitor<'ast> for Detector {
+        fn visit_stmt(&mut self, statement: &'ast Stmt) {
+            if matches!(statement, Stmt::FunctionDef(_) | Stmt::ClassDef(_)) {
+                return;
+            }
+            if !self.found {
+                walk_stmt(self, statement);
+            }
+        }
+
+        fn visit_body(&mut self, body: &'ast [Stmt]) {
+            if matches!(
+                body.last(),
+                Some(Stmt::Try(statement))
+                    if statement.handlers.iter().any(|handler| {
+                        handler.as_except_handler().is_some_and(|handler| {
+                            handler
+                                .body
+                                .iter()
+                                .any(|statement| !matches!(statement, Stmt::Assign(_) | Stmt::Pass(_)))
+                        })
+                    })
+            ) {
+                self.found = true;
+                return;
+            }
+            for statement in body {
+                self.visit_stmt(statement);
+                if self.found {
+                    return;
+                }
+            }
+        }
+    }
+
+    let mut detector = Detector::default();
+    detector.visit_body(body);
+    detector.found
+}
+
 // A final fallthrough `if` without an `else` leaves CPython's normal try-exit block empty.
 fn suite_ends_in_empty_try_exit_block(body: &[Stmt]) -> bool {
     let Some(Stmt::If(statement)) = body.last() else {

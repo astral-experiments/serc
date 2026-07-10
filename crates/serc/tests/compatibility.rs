@@ -3804,6 +3804,69 @@ def ordinary_guard(value):
     }
 
     #[test]
+    fn uses_cpython_owned_loads_after_nested_handler_cold_joins() {
+        let source = r#"import dis
+
+
+def direct_handler_tail(value):
+    try:
+        result = action()
+    except Error:
+        try:
+            recover()
+        except OtherError:
+            alternate()
+    consume(value)
+    return result
+
+
+def conditional_handler_tail(value, flag):
+    try:
+        result = action()
+    except Error:
+        if flag:
+            try:
+                recover()
+            except OtherError:
+                alternate()
+        else:
+            fallback()
+    consume(value)
+    return result
+
+
+def loop_handler_tail(value, items):
+    try:
+        result = action()
+    except Error:
+        for item in items:
+            if item:
+                try:
+                    recover(item)
+                except OtherError:
+                    alternate(item)
+        result = fallback()
+    consume(value)
+    return result
+
+
+def load_after_consume(function):
+    instructions = list(dis.get_instructions(function))
+    consume = next(
+        index
+        for index, instruction in enumerate(instructions)
+        if instruction.opname == "LOAD_GLOBAL" and instruction.argval == "consume"
+    )
+    return instructions[consume + 1].opname
+
+
+for function in (direct_handler_tail, conditional_handler_tail, loop_handler_tail):
+    print(load_after_consume(function))
+"#;
+        assert_executes(source, "LOAD_FAST\nLOAD_FAST\nLOAD_FAST\n");
+    }
+
+    #[test]
     fn uses_cpython_borrow_kinds_after_terminal_nested_handlers() {
         let source = r#"import dis
 
