@@ -264,6 +264,9 @@ pub(super) struct ControlFlowState {
     // Whether that successor is a direct return of one local. CPython copies this tiny exit
     // before removing a constant-loop break edge, so its borrowed-load pass still visits it.
     current_statement_followed_by_name_return: bool,
+    // Whether that successor is a direct literal return. CPython can copy this small exit onto
+    // the normal edge of a preceding try/else before retaining the edge as a source NOP.
+    current_statement_followed_by_literal_return: bool,
     // Whether that successor exits the function by returning or raising. CPython copies these
     // exit blocks before removing assertion-branch jumps, including jumps from later clauses.
     current_statement_followed_by_return_or_raise: bool,
@@ -890,6 +893,11 @@ impl Compiler {
                     Some(Stmt::Return(statement))
                         if matches!(statement.value.as_deref(), Some(Expr::Name(_)))
                 );
+                let followed_by_literal_return = matches!(
+                    body.get(index + 1),
+                    Some(Stmt::Return(statement))
+                        if statement.value.as_deref().is_none_or(is_literal_constant)
+                );
                 let followed_by_return_or_raise =
                     matches!(body.get(index + 1), Some(Stmt::Return(_) | Stmt::Raise(_)));
                 self.with_control_override(
@@ -909,18 +917,28 @@ impl Compiler {
                                         compiler.with_control_override(
                                             |control| {
                                                 &mut control
-                                                    .current_statement_followed_by_return_or_raise
+                                                    .current_statement_followed_by_literal_return
                                             },
-                                            followed_by_return_or_raise,
+                                            followed_by_literal_return,
                                             |compiler| {
                                                 compiler.with_control_override(
                                                     |control| {
                                                         &mut control
-                                                            .suite_fallthrough_to_loop_backedge
+                                                    .current_statement_followed_by_return_or_raise
                                                     },
-                                                    suite_fallthrough_to_loop_backedge,
+                                                    followed_by_return_or_raise,
                                                     |compiler| {
-                                                        compiler.compile_statement(statement)
+                                                        compiler.with_control_override(
+                                                            |control| {
+                                                                &mut control
+                                                            .suite_fallthrough_to_loop_backedge
+                                                            },
+                                                            suite_fallthrough_to_loop_backedge,
+                                                            |compiler| {
+                                                                compiler
+                                                                    .compile_statement(statement)
+                                                            },
+                                                        )
                                                     },
                                                 )
                                             },
@@ -2411,7 +2429,9 @@ impl Compiler {
                     Vec::new()
                 };
                 let unwinds_return_finally = nested_call_finally_return;
-                for finally_context in return_finally_contexts.iter().rev() {
+                for (context_index, finally_context) in
+                    return_finally_contexts.iter().enumerate().rev()
+                {
                     let iterator_cleanup_start = self.assembler.label();
                     self.assembler.mark(iterator_cleanup_start);
                     self.emit_loop_iterator_cleanup(
@@ -2435,10 +2455,44 @@ impl Compiler {
                             false,
                         );
                     }
+                    // A copied inner finally remains protected by the next outer finally. The
+                    // outermost copy runs after every protected region has been unwound.
+                    let copied_finally_start = if context_index > 0 {
+                        let start = self.assembler.label();
+                        self.assembler.mark(start);
+                        Some(start)
+                    } else {
+                        None
+                    };
                     let initialized_locals = self.symbols.initialized_locals.clone();
-                    let result = self.compile_suite(&finally_context.body);
+                    let result = if context_index > 0 {
+                        self.with_region_exclusion_collector(
+                            |control| &mut control.active_exception_region_exclusions,
+                            |compiler| compiler.compile_suite(&finally_context.body),
+                        )
+                    } else {
+                        self.compile_suite(&finally_context.body)
+                            .map(|()| ((), Vec::new()))
+                    };
                     self.symbols.initialized_locals = initialized_locals;
-                    result?;
+                    let ((), copied_finally_exclusions) = result?;
+                    if let (Some(copied_finally_start), Some(outer_context)) = (
+                        copied_finally_start,
+                        context_index
+                            .checked_sub(1)
+                            .and_then(|index| return_finally_contexts.get(index)),
+                    ) {
+                        let copied_finally_end = self.assembler.label();
+                        self.assembler.mark(copied_finally_end);
+                        self.add_exception_regions_with_exclusions(
+                            copied_finally_start,
+                            copied_finally_end,
+                            &copied_finally_exclusions,
+                            outer_context.handler,
+                            outer_context.depth,
+                            false,
+                        );
+                    }
                     if let Some(location) = self.assembler.last_instruction_location() {
                         self.assembler.set_location(location);
                     }
@@ -4855,6 +4909,16 @@ impl Compiler {
             } else if let Some(location) = direct_exit_location {
                 self.assembler
                     .set_location(self.source_location(location.range()));
+            } else if self.control.current_statement_followed_by_literal_return
+                && let Some(Stmt::If(nested)) = statement.orelse.last()
+                && nested.elif_else_clauses.is_empty()
+                && matches!(nested.body.as_slice(), [Stmt::Return(_)])
+                && let Some(test) = terminating_if_fallthrough_test(nested)
+            {
+                // Exit duplication copies the following literal return onto this normal edge;
+                // CPython then retains the edge as a NOP carrying the condition's exit range.
+                self.assembler
+                    .set_location(self.source_location(synthetic_condition_exit_range(test)));
             } else if statement.orelse.is_empty()
                 && let Some(Stmt::If(nested)) = statement.body.last()
                 && let Some(test) = terminating_if_fallthrough_test(nested)
@@ -6134,8 +6198,7 @@ impl Compiler {
         };
         let copy_finally_on_return = pass_finally_location.is_none()
             && !suite_terminates(&statement.finalbody)
-            && self.control.active_exception_handlers.is_empty()
-            && self.control.active_return_finally_contexts.is_empty();
+            && self.control.active_exception_handlers.is_empty();
         let return_context = copy_finally_on_return.then(|| ReturnFinallyContext {
             body: statement.finalbody.to_vec(),
             loop_depth: self.control.loops.len(),
