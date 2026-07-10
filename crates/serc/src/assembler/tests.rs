@@ -518,6 +518,7 @@ fn fusion_preserves_each_typed_instruction_policy() {
         fused.no_location_policy,
         NoLocationPolicy {
             allow_block_inlining: true,
+            first_copy_as_interruptible_backward: false,
             preserve: true,
             percent_target_location: 7,
         }
