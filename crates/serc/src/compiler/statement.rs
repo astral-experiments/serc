@@ -292,8 +292,9 @@ pub(super) struct ControlFlowState {
     // A nested try under a normal body with an else suite exits there instead of directly
     // crossing the enclosing handler boundary.
     direct_try_body_has_else: bool,
-    // The direct body belongs to an ordinary try with one handler that only raises.
-    direct_try_body_has_single_raise_handler: bool,
+    // A direct final assignment branch whose copied normal exit crosses to a following statement
+    // outside the try.
+    direct_try_assignment_branch_exit: Option<TextRange>,
     pub(super) generator_region_start: Option<Label>,
     pub(super) generator_region_exclusions: Vec<(Label, Label)>,
     pub(super) emitted_fallthrough_return: bool,
@@ -444,6 +445,25 @@ impl Compiler {
                     matches!(handler.body.as_slice(), [Stmt::Raise(_)])
                 })
         );
+        let direct_try_assignment_branch_exit = if self.control.current_statement_has_following
+            && statement.orelse.is_empty()
+            && statement.finalbody.is_empty()
+            && !statement.handlers.is_empty()
+        {
+            match statement.body.last() {
+                Some(Stmt::If(branch))
+                    if is_direct_try_assignment_branch(branch)
+                        && (statement.body.len() == 1
+                            || (direct_try_body_has_single_raise_handler
+                                && is_membership_assignment_branch(branch))) =>
+                {
+                    Some(branch.range)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
         self.with_control_override(
             |control| &mut control.same_line_try_body,
             same_line,
@@ -453,8 +473,8 @@ impl Compiler {
                     direct_try_body_has_else,
                     |compiler| {
                         compiler.with_control_override(
-                            |control| &mut control.direct_try_body_has_single_raise_handler,
-                            direct_try_body_has_single_raise_handler,
+                            |control| &mut control.direct_try_assignment_branch_exit,
+                            direct_try_assignment_branch_exit,
                             |compiler| {
                                 compiler.with_control_override(
                                     |control| &mut control.direct_try_body_statements,
@@ -2967,16 +2987,8 @@ impl Compiler {
                     first_branch_max_depth = Some(self.control.max_depth);
                 }
                 if !suite_terminates(body) && branch_index + 1 < branch_count {
-                    let direct_try_body_exit = self
-                        .control
-                        .direct_try_body_statements
-                        .last()
-                        .is_some_and(|direct| *direct == statement.range)
-                        && !self.control.direct_try_body_has_else
-                        && self.control.direct_try_body_has_single_raise_handler
-                        && self.control.active_finally_try_bodies == 0;
                     let direct_try_body_exit =
-                        direct_try_body_exit && is_membership_assignment_branch(statement);
+                        self.control.direct_try_assignment_branch_exit == Some(statement.range);
                     let nested_if_exit = body.last().and_then(|statement| match statement {
                         Stmt::If(statement) => nested_if_exit_location(statement),
                         _ => None,
@@ -7957,19 +7969,15 @@ fn if_normal_exit_count(statement: &ruff_python_ast::StmtIf) -> usize {
         )
 }
 
-fn is_membership_assignment_branch(statement: &ruff_python_ast::StmtIf) -> bool {
-    matches!(
-        statement.test.as_ref(),
-        Expr::Compare(comparison)
-            if comparison.ops.len() == 1 && comparison.ops[0] == CmpOp::In
-    ) && matches!(statement.body.as_slice(), [Stmt::Assign(_)])
+fn is_direct_try_assignment_branch(statement: &ruff_python_ast::StmtIf) -> bool {
+    matches!(statement.body.as_slice(), [Stmt::Assign(_)])
         && matches!(
             statement.elif_else_clauses.as_slice(),
             [clause]
                 if clause.test.is_none()
                     && matches!(
                         clause.body.as_slice(),
-                        [Stmt::Assign(_), Stmt::Assign(_)]
+                        [Stmt::Assign(_)] | [Stmt::Assign(_), Stmt::Assign(_)]
                     )
         )
 }
@@ -7993,6 +8001,15 @@ fn is_simple_none_default_assignment(test: &Expr, body: &[Stmt]) -> bool {
             if matches!(assignment.targets.as_slice(), [Expr::Name(target)] if target.id == name.id)
                 && is_literal_constant(&assignment.value)
     )
+}
+
+fn is_membership_assignment_branch(statement: &ruff_python_ast::StmtIf) -> bool {
+    is_direct_try_assignment_branch(statement)
+        && matches!(
+            statement.test.as_ref(),
+            Expr::Compare(comparison)
+                if comparison.ops.len() == 1 && comparison.ops[0] == CmpOp::In
+        )
 }
 
 fn try_requires_legacy_loop_tail_exclusion(statement: &ruff_python_ast::StmtTry) -> bool {
