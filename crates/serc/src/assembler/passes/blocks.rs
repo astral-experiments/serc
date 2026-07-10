@@ -1109,12 +1109,17 @@ impl OptimizationPipeline {
                     )),
                 );
             }
-            if (target_has_no_location || target_has_artificial_eval_break)
-                && !(inline_no_location_block && predecessors[&source] > 1)
+            if let Some(Item::Instruction(instruction)) = copied
+                .iter_mut()
+                .find(|item| matches!(item, Item::Instruction(_)))
             {
-                if let Some(Item::Instruction(instruction)) = copied
-                    .iter_mut()
-                    .find(|item| matches!(item, Item::Instruction(_)))
+                let inherits_shared_predecessor = instruction
+                    .no_location_policy
+                    .copy_inherits_shared_predecessor();
+                if (target_has_no_location || target_has_artificial_eval_break)
+                    && (!inline_no_location_block
+                        || predecessors[&source] <= 1
+                        || inherits_shared_predecessor)
                     && !instruction.no_location_policy.preserve
                 {
                     instruction.location = source_location;

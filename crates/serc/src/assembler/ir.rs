@@ -142,6 +142,7 @@ impl NoLocationBlockPolicy {
     const ALLOW_INLINING: u8 = 1 << 0;
     const FIRST_COPY_INTERRUPTIBLE: u8 = 1 << 1;
     const ARTIFICIAL_EVAL_BREAK: u8 = 1 << 2;
+    const COPY_INHERITS_SHARED_PREDECESSOR: u8 = 1 << 3;
 
     const fn fused(first: Self, second: Self) -> Self {
         Self(first.0 | second.0)
@@ -184,6 +185,13 @@ impl NoLocationPolicy {
             .contains(NoLocationBlockPolicy::ARTIFICIAL_EVAL_BREAK)
     }
 
+    /// Whether a copied no-location block inherits a source location even when its predecessor
+    /// is itself the join of multiple incoming edges.
+    pub(super) const fn copy_inherits_shared_predecessor(self) -> bool {
+        self.block_policy
+            .contains(NoLocationBlockPolicy::COPY_INHERITS_SHARED_PREDECESSOR)
+    }
+
     pub(super) fn allow_block_inlining(&mut self) {
         self.block_policy
             .insert(NoLocationBlockPolicy::ALLOW_INLINING);
@@ -198,6 +206,11 @@ impl NoLocationPolicy {
     pub(super) fn mark_artificial_eval_break(&mut self) {
         self.block_policy
             .insert(NoLocationBlockPolicy::ARTIFICIAL_EVAL_BREAK);
+    }
+
+    pub(super) fn make_copy_inherit_shared_predecessor(&mut self) {
+        self.block_policy
+            .insert(NoLocationBlockPolicy::COPY_INHERITS_SHARED_PREDECESSOR);
     }
 
     const fn fused(first: Self, second: Self) -> Self {

@@ -478,6 +478,9 @@ fn fusion_preserves_each_typed_instruction_policy() {
     first.no_location_policy.allow_block_inlining();
     first.no_location_policy.make_first_copy_interruptible();
     first.no_location_policy.mark_artificial_eval_break();
+    first
+        .no_location_policy
+        .make_copy_inherit_shared_predecessor();
     first.no_location_policy.percent_target_location = 7;
     first.converted_pop_block = true;
     first.hidden_exception_owner_slots = 2;
@@ -521,6 +524,7 @@ fn fusion_preserves_each_typed_instruction_policy() {
             .first_copy_is_interruptible_backward()
     );
     assert!(fused.no_location_policy.is_artificial_eval_break());
+    assert!(fused.no_location_policy.copy_inherits_shared_predecessor());
     assert!(fused.no_location_policy.preserve);
     assert_eq!(fused.no_location_policy.percent_target_location, 7);
     assert_eq!(fused.fusion_policy, FusionPolicy::default());

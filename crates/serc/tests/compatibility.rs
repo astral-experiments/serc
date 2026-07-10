@@ -2262,6 +2262,21 @@ def trailing_if(flag):
     return value
 
 
+def trailing_if_with_expression_join(flag):
+    try:
+        action()
+    except Error:
+        value = None
+        if flag:
+            value = (
+                first()
+                or second()
+            )
+        else:
+            value = fallback()
+    return value
+
+
 def trailing_if_with_terminating_arm(first, second):
     try:
         action()

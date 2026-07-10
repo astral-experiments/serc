@@ -4988,6 +4988,24 @@ impl Compiler {
                 handler.body.last(),
                 Some(Stmt::With(statement)) if !suite_terminates(&statement.body)
             );
+            let inlineable_bare_handler_if_with_multiline_join =
+                handler_ends_with_inlineable_cleanup
+                    && handler.name.is_none()
+                    && handler.body.len() > 1
+                    && matches!(
+                        handler.body.last(),
+                        Some(Stmt::If(tail))
+                            if matches!(
+                                tail.body.as_slice(),
+                                [Stmt::Assign(assignment)]
+                                    if matches!(assignment.value.as_ref(), Expr::BoolOp(_))
+                                        && {
+                                            let location = self
+                                                .source_location(assignment.value.range());
+                                            location.line != location.end_line
+                                        }
+                            )
+                    );
             self.assembler.mark(body_end);
             if handler.name.is_some() {
                 self.add_exception_regions_with_exclusions(
@@ -5036,6 +5054,14 @@ impl Compiler {
                     self.assembler.set_location(location);
                 }
                 self.emit(POP_EXCEPT, 0, -1)?;
+                if inlineable_bare_handler_if_with_multiline_join {
+                    // CPython first keeps this cleanup unlocated so exits from both arms can be
+                    // copied. A multiline boolean assignment gives its joined store a distinct
+                    // source location, which the optimizer propagates onto the cleanup copy even
+                    // though that store block has multiple predecessors.
+                    self.assembler
+                        .make_last_no_location_copy_inherit_shared_predecessor();
+                }
                 if let Some(name) = &handler.name {
                     let none = self.add_constant(Constant::None)?;
                     self.emit(LOAD_CONST, none, 1)?;

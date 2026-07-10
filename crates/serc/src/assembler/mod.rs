@@ -598,6 +598,16 @@ impl Assembler {
             .make_first_copy_interruptible();
     }
 
+    /// Gives a copied no-location block its predecessor's location even when that predecessor is
+    /// itself a control-flow join.
+    pub(crate) fn make_last_no_location_copy_inherit_shared_predecessor(&mut self) {
+        self.required_last_instruction_mut(
+            "making a no-location copy inherit its shared predecessor",
+        )
+        .no_location_policy
+        .make_copy_inherit_shared_predecessor();
+    }
+
     /// Records that the provisional source location on the last eval-break instruction was
     /// propagated from an artificial CPython instruction emitted with `NO_LOCATION`.
     pub(crate) fn mark_last_as_artificial_eval_break(&mut self) {
