@@ -3951,6 +3951,91 @@ def no_else_control():
     }
 
     #[test]
+    fn matches_cpython_marshal_for_compound_none_comparison_try_owners() {
+        let source = r"def direct_control(value):
+    try:
+        if value is not None:
+            return 1
+    except Exception:
+        pass
+    return 0
+
+
+def compound(first, second, third, fourth, fifth):
+    try:
+        if ((first is not None and second is not None)
+                or (third is not None and fourth is not None)
+                or fifth is not None):
+            return 1
+    except Exception:
+        pass
+    return 0
+
+
+def leading_comparisons(a, b, first, second):
+    try:
+        if a >= 0 and b >= 0 and (first is not None or second is not None):
+            return 1
+    except Exception:
+        pass
+    return 0
+";
+        assert_matches_cpython_marshal(source, "compound_none_comparison_try_owners.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_retained_try_else_borrow_fallthrough() {
+        let source = r"def terminal_else_if(value, flag):
+    try:
+        action()
+    except Exception:
+        pass
+    else:
+        if flag:
+            return flag
+    consume(value)
+
+
+def fallthrough_else_if_control(value, flag):
+    try:
+        action()
+    except Exception:
+        pass
+    else:
+        if flag:
+            consume(flag)
+    consume(value)
+
+
+def terminal_and_fallthrough_arms(value, flag):
+    try:
+        action()
+    except Exception:
+        pass
+    else:
+        if flag:
+            return flag
+        else:
+            other()
+    consume(value)
+
+
+def two_terminal_arms_control(value, flag):
+    try:
+        action()
+    except Exception:
+        pass
+    else:
+        if flag:
+            return flag
+        else:
+            raise RuntimeError
+    consume(value)
+";
+        assert_matches_cpython_marshal(source, "retained_try_else_borrow_fallthrough.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_multiline_conditional_expressions() {
         let source = "value = (\n    'body'\n    if True\n    else 'otherwise'\n)\n\ndef nested():\n    target.attribute = (\n        (first if inner else second)\n        if outer\n        else third\n    )\n";
         assert_matches_cpython_marshal(source, "conditional_expression.py");

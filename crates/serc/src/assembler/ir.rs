@@ -246,6 +246,7 @@ pub(super) enum BorrowFallthrough {
     #[default]
     Reachable,
     Barrier,
+    RetainedNopReachable,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

@@ -453,6 +453,12 @@ impl Assembler {
             .borrow_fallthrough = BorrowFallthrough::Barrier;
     }
 
+    /// Keeps borrowed-load traversal connected through a retained redundant-jump NOP.
+    pub(crate) fn mark_last_retained_nop_borrow_fallthrough(&mut self) {
+        self.last_jump_instruction_mut("marking retained NOP borrow fallthrough")
+            .borrow_fallthrough = BorrowFallthrough::RetainedNopReachable;
+    }
+
     /// Retains a redundant jump as an analysis-only marker for CPython's empty CFG block.
     pub(crate) fn mark_last_borrow_empty_block(&mut self) {
         self.last_jump_instruction_mut("marking an empty borrowed-load block")

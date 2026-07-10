@@ -4819,6 +4819,7 @@ impl Compiler {
                 ordinary: ExceptionPolicy::normalized_owner(
                     self.control.generator_region_start.is_some()
                         || self.control.include_assert_none_condition_owner
+                        || self.control.include_compound_none_condition_owner
                         || self.control.in_first_unnamed_exception_handler()
                         || self.control.active_normal_finally_bodies > 0,
                 ),

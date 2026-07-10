@@ -210,6 +210,9 @@ pub(super) struct ControlFlowState {
     // try-else suite. The range keeps nested and preceding if statements from consuming it.
     retained_try_body_if_exit: Option<ruff_text_size::TextRange>,
     pub(super) active_exception_region_exclusions: Vec<Vec<(Label, Label)>>,
+    // Whether each active ordinary try body has only pass handlers. The innermost entry controls
+    // normalized markers whose reused slots depend on that try's handler CFG.
+    pub(super) active_pass_only_try_bodies: Vec<bool>,
     active_try_marker_slots: Vec<Option<TryMarkerSlotContext>>,
     active_exception_handlers: Vec<ExceptionHandlerContext>,
     // Exception-group handlers retain their body marker owner after coroutine suspension.
@@ -237,6 +240,7 @@ pub(super) struct ControlFlowState {
     pub(super) protected_iterator_continue_condition: Option<ruff_text_size::TextRange>,
     pub(super) exclude_condition_not_taken_from_exception: bool,
     pub(super) include_assert_none_condition_owner: bool,
+    pub(super) include_compound_none_condition_owner: bool,
     // The final chained comparison whose fallthrough jump survives small-exit inlining as a NOP.
     pub(super) retained_chained_comparison_exit: Option<TextRange>,
     pub(super) exclude_condition_not_taken_from_all_exception_regions: bool,
@@ -2790,6 +2794,17 @@ impl Compiler {
                         && stable_terminal_exit_layout)
                         .then(|| final_chained_comparison_jump(test, false))
                         .flatten();
+                let include_compound_none_condition_owner = branch_count == 1
+                    && branch_index == 0
+                    && matches!(self.unit.scope, Scope::Function { .. })
+                    && !self.control.current_statement_has_following
+                    && self
+                        .control
+                        .direct_try_body_statements
+                        .contains(&statement.range)
+                    && self.control.active_pass_only_try_bodies.last() == Some(&true)
+                    && suite_terminates(body)
+                    && matches!(test, Expr::BoolOp(_));
                 self.with_control_override(
                     |control| &mut control.protected_iterator_continue_condition,
                     protected_iterator_continue_condition,
@@ -2802,12 +2817,17 @@ impl Compiler {
                                     |control| &mut control.exclude_terminal_if_not_taken,
                                     exclude_not_taken,
                                     |compiler| {
-                                        compiler.with_terminal_try_condition_exception_exclusion(
-                                            compiler
-                                                .terminal_try_condition_includes_generator_region(
-                                                    branch_index,
-                                                ),
-                                            |compiler| compiler.compile_jump_if(test, false, next),
+                                        compiler.with_control_override(
+                                            |control| &mut control.include_compound_none_condition_owner,
+                                            include_compound_none_condition_owner,
+                                            |compiler| {
+                                                compiler.with_terminal_try_condition_exception_exclusion(
+                                                    compiler.terminal_try_condition_includes_generator_region(
+                                                        branch_index,
+                                                    ),
+                                                    |compiler| compiler.compile_jump_if(test, false, next),
+                                                )
+                                            },
                                         )
                                     },
                                 )
@@ -4580,6 +4600,11 @@ impl Compiler {
                 .as_except_handler()
                 .is_some_and(|handler| suite_terminates(&handler.body))
         });
+        let pass_only_handlers = statement.handlers.iter().all(|handler| {
+            handler
+                .as_except_handler()
+                .is_some_and(|handler| matches!(handler.body.as_slice(), [Stmt::Pass(_)]))
+        });
         let propagates_protected_loop_tail_mode =
             try_propagates_protected_loop_tail_mode(statement);
         let nested_handler_tail_if_with_terminal_handlers = handlers_terminate
@@ -4693,6 +4718,9 @@ impl Compiler {
         self.control
             .active_exception_region_exclusions
             .push(Vec::new());
+        self.control
+            .active_pass_only_try_bodies
+            .push(pass_only_handlers);
         self.control.active_try_marker_slots.push(try_marker_slots);
         let direct_continue =
             statement.orelse.is_empty() && matches!(statement.body.as_slice(), [Stmt::Continue(_)]);
@@ -4877,6 +4905,11 @@ impl Compiler {
             .active_try_marker_slots
             .pop()
             .expect("active try region has marker slot context");
+        let _pass_only_try_body = self
+            .control
+            .active_pass_only_try_bodies
+            .pop()
+            .expect("active try region has pass-only handler context");
         let try_exclusions = self
             .control
             .active_exception_region_exclusions
@@ -4959,17 +4992,22 @@ impl Compiler {
                 && let Some(location) = body_noop_location
             {
                 self.assembler.set_location(location);
+            } else if pass_only_handlers
+                && matches!(self.unit.scope, Scope::Function { .. })
+                && !statement.orelse.is_empty()
+                && suite_retained_try_exit_has_normal_fallthrough(&statement.orelse)
+                && let Some(Stmt::If(nested)) = statement.orelse.last()
+                && let Some(test) = terminating_if_fallthrough_test(nested)
+                && matches!(test, Expr::Name(_))
+            {
+                self.assembler
+                    .set_location(self.source_location(condition_fallthrough_range(test)));
             } else if let Some(location) = self.assembler.last_instruction_location() {
                 self.assembler.set_location(location);
             }
             if nested_handler_tail_if_with_terminal_handlers {
                 self.assembler.set_location(SourceLocation::NONE);
             }
-            let pass_only_handlers = statement.handlers.iter().all(|handler| {
-                handler
-                    .as_except_handler()
-                    .is_some_and(|handler| matches!(handler.body.as_slice(), [Stmt::Pass(_)]))
-            });
             let body_ends_with_overridden_return = self.control.active_overriding_finally_returns
                 > 0
                 && matches!(statement.body.last(), Some(Stmt::Return(_)));
@@ -5028,6 +5066,12 @@ impl Compiler {
             {
                 self.assembler
                     .preserve_last_redundant_jump_nop_after_threading();
+                if pass_only_handlers
+                    && matches!(self.unit.scope, Scope::Function { .. })
+                    && suite_retained_try_exit_has_normal_fallthrough(&statement.orelse)
+                {
+                    self.assembler.mark_last_retained_nop_borrow_fallthrough();
+                }
             }
             if direct_exit_location.is_some() {
                 self.assembler.preserve_last_direct_inlined_jump_nop();
@@ -7597,6 +7641,40 @@ fn suite_ends_in_retained_try_exit_join(body: &[Stmt]) -> bool {
         return suite_ends_in_retained_try_exit_join(selected);
     }
     !statement.elif_else_clauses.is_empty() || terminating_if_fallthrough_test(statement).is_some()
+}
+
+// A retained try-else exit NOP can still represent a live normal edge. CPython's borrowed-load
+// traversal follows that edge when at least one branch falls through the final conditional.
+fn suite_retained_try_exit_has_normal_fallthrough(body: &[Stmt]) -> bool {
+    let Some(Stmt::If(statement)) = body.last() else {
+        return false;
+    };
+    if let Some(truthiness) = early_condition_truthiness(&statement.test)
+        && statement.elif_else_clauses.len() <= 1
+        && statement
+            .elif_else_clauses
+            .first()
+            .is_none_or(|clause| clause.test.is_none())
+    {
+        let selected = if truthiness {
+            statement.body.as_slice()
+        } else {
+            statement
+                .elif_else_clauses
+                .first()
+                .map_or(&[] as &[Stmt], |clause| clause.body.as_slice())
+        };
+        return suite_retained_try_exit_has_normal_fallthrough(selected);
+    }
+    if_normal_exit_count(statement) > 0
+        && std::iter::once(statement.body.as_slice())
+            .chain(
+                statement
+                    .elif_else_clauses
+                    .iter()
+                    .map(|clause| clause.body.as_slice()),
+            )
+            .any(|body| matches!(body.last(), Some(Stmt::Return(_) | Stmt::Raise(_))))
 }
 
 // A terminal final branch leaves the try body's normal exit with one direct predecessor. If
