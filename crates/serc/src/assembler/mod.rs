@@ -588,6 +588,15 @@ impl Assembler {
             .make_first_copy_interruptible();
     }
 
+    /// Records that the provisional source location on the last eval-break instruction was
+    /// propagated from an artificial CPython instruction emitted with `NO_LOCATION`.
+    pub(crate) fn mark_last_as_artificial_eval_break(&mut self) {
+        let instruction =
+            self.required_last_instruction_mut("marking an artificial eval-break instruction");
+        debug_assert_eq!(instruction.opcode, JUMP_BACKWARD);
+        instruction.no_location_policy.mark_artificial_eval_break();
+    }
+
     pub(crate) fn preserve_last_no_location(&mut self) {
         self.required_last_instruction_mut("preserving a no-location instruction")
             .no_location_policy

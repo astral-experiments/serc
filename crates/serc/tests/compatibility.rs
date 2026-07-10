@@ -796,6 +796,31 @@ def single_exit_break(items):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_shared_artificial_loop_backedges() {
+        let source = r"def try_else(values, output):
+    for value in values:
+        try:
+            callback = lookup(value)
+        except KeyError:
+            pass
+        else:
+            if callback(value):
+                output.append(value)
+    return output
+
+
+def try_finally(values):
+    for value in values:
+        try:
+            consume()
+        finally:
+            if enabled():
+                cleanup()
+";
+        assert_matches_cpython_marshal(source, "shared_artificial_loop_backedges.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_terminal_try_suite_implicit_returns() {
         let source = r"def body_if(flag):
     try:

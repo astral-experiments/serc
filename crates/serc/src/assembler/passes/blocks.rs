@@ -76,8 +76,8 @@ fn no_exit_copy_analysis(
         });
         let source_has_fallthrough = block_has_fallthrough(graph[source].items());
         let shared_exit = predecessors[target.index()] > 1
-            && target_has_no_location
-            && ends_scope(target_last.opcode);
+            && ((target_has_no_location && ends_scope(target_last.opcode))
+                || target_last.no_location_policy.is_artificial_eval_break());
         let no_location_exit = target_has_no_location
             && !block_has_fallthrough(graph[target].items())
             && target_last.no_location_policy.allows_block_inlining()
@@ -181,10 +181,10 @@ fn no_exit_copy_analysis(
             && !block_has_fallthrough(graph[target].items())
             && target_last.no_location_policy.allows_block_inlining();
         let shared_exit = predecessors[target.index()] > 1
-            && graph[target].items().iter().all(|item| {
+            && ((graph[target].items().iter().all(|item| {
                 !matches!(item, Item::Instruction(instruction) if instruction.location.line >= 0)
-            })
-            && ends_scope(target_last.opcode);
+            }) && ends_scope(target_last.opcode))
+                || target_last.no_location_policy.is_artificial_eval_break());
         if inline_small_exit
             || (!source_has_fallthrough && no_location_exit)
             || (predecessors[target.index()] > 1 && (shared_exit || no_location_exit))
@@ -871,13 +871,18 @@ impl OptimizationPipeline {
             .iter()
             .copied()
             .filter(|block| {
-                predecessors[block] > 1
-                    && graph[*block].items().iter().all(|item| {
+                let unlocated_scope_exit = graph[*block].items().iter().all(|item| {
                         !matches!(item, Item::Instruction(instruction) if instruction.location.line >= 0)
                     })
                     && graph[*block]
                         .last_instruction()
-                        .is_some_and(|instruction| ends_scope(instruction.opcode))
+                        .is_some_and(|instruction| ends_scope(instruction.opcode));
+                let artificial_eval_break = graph[*block]
+                    .last_instruction()
+                    .is_some_and(|instruction| {
+                        instruction.no_location_policy.is_artificial_eval_break()
+                    });
+                predecessors[block] > 1 && (unlocated_scope_exit || artificial_eval_break)
             })
             .collect::<FxHashSet<_>>();
 
@@ -963,6 +968,12 @@ impl OptimizationPipeline {
             let target_has_no_location = target_blocks.iter().all(|block| {
                 graph[*block].items().iter().all(|item| {
                     !matches!(item, Item::Instruction(instruction) if instruction.location.line >= 0)
+                })
+            });
+            let target_has_artificial_eval_break = target_blocks.iter().any(|block| {
+                graph[*block].items().iter().any(|item| {
+                    matches!(item, Item::Instruction(instruction)
+                        if instruction.no_location_policy.is_artificial_eval_break())
                 })
             });
             let target_allows_no_location_block_inlining = graph[target]
@@ -1098,7 +1109,9 @@ impl OptimizationPipeline {
                     )),
                 );
             }
-            if target_has_no_location && !(inline_no_location_block && predecessors[&source] > 1) {
+            if (target_has_no_location || target_has_artificial_eval_break)
+                && !(inline_no_location_block && predecessors[&source] > 1)
+            {
                 if let Some(Item::Instruction(instruction)) = copied
                     .iter_mut()
                     .find(|item| matches!(item, Item::Instruction(_)))

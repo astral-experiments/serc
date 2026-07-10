@@ -3645,6 +3645,13 @@ impl Compiler {
                     .set_location(self.source_location(statement.range()));
             }
             self.emit_jump_backward(JUMP_BACKWARD, start, 0)?;
+            if statement
+                .body
+                .last()
+                .is_some_and(try_has_conditional_shared_loop_exit)
+            {
+                self.assembler.mark_last_as_artificial_eval_break();
+            }
         }
 
         self.assembler.mark(cleanup);
@@ -7351,5 +7358,28 @@ fn suite_ends_in_simple_conditional_break(body: &[Stmt]) -> bool {
         Some(Stmt::If(statement))
             if statement.elif_else_clauses.is_empty()
                 && matches!(statement.body.as_slice(), [Stmt::Break(_)])
+    )
+}
+
+fn try_has_conditional_shared_loop_exit(statement: &Stmt) -> bool {
+    let Stmt::Try(statement) = statement else {
+        return false;
+    };
+    let normal_exit = if !statement.finalbody.is_empty() {
+        statement.finalbody.as_slice()
+    } else if !statement.orelse.is_empty() {
+        statement.orelse.as_slice()
+    } else {
+        return false;
+    };
+    if normal_exit.len() != 1 || suite_terminates(&statement.body) {
+        return false;
+    }
+    matches!(
+        normal_exit.last(),
+        Some(Stmt::If(statement))
+            if statement.elif_else_clauses.is_empty()
+                && early_condition_truthiness(&statement.test).is_none()
+                && matches!(statement.body.as_slice(), [Stmt::Expr(_)])
     )
 }
