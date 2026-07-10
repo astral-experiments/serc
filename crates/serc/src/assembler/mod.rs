@@ -88,6 +88,10 @@ impl Assembler {
         std::mem::replace(&mut self.strict_owned_loads, enabled)
     }
 
+    pub(crate) fn set_forced_borrowed_loads(&mut self, enabled: bool) -> bool {
+        std::mem::replace(&mut self.forced_borrowed_loads, enabled)
+    }
+
     pub(crate) fn location(&self) -> SourceLocation {
         self.location
     }
@@ -538,6 +542,16 @@ impl Assembler {
             self.required_last_instruction_mut("preserving a NOT_TAKEN exception owner");
         if instruction.opcode == NOT_TAKEN {
             instruction.exception_policy.normalized_owner = NormalizedExceptionOwner::Present;
+        }
+    }
+
+    /// Restores the innermost normalized exception owner on a trailing condition marker.
+    pub(crate) fn override_last_not_taken_exception_owner(&mut self) {
+        let instruction =
+            self.required_last_instruction_mut("overriding a NOT_TAKEN exception owner");
+        if instruction.opcode == NOT_TAKEN {
+            instruction.exception_policy.normalized_owner =
+                NormalizedExceptionOwner::OverridePresent;
         }
     }
 
@@ -1091,6 +1105,9 @@ impl Assembler {
         let mut instruction = Instruction::new(opcode, operand, self.location, depth_after);
         instruction.exception_policy = exception_policy;
         instruction.local_policy = LocalPolicy::for_load(force_owned_load, strict_owned_load);
+        if self.forced_borrowed_loads && opcode == LOAD_FAST {
+            instruction.local_policy.mark_force_borrowed_load();
+        }
         self.linear_items_mut().push(Item::Instruction(instruction));
     }
 }

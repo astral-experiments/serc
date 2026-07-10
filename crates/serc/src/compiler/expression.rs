@@ -4186,11 +4186,21 @@ impl Compiler {
                 .control
                 .current_try_handler_starts_with_optimized_boolean_generator()
                 && matches!(expression.test.as_ref(), Expr::Name(_)));
+        let preserve_generator_with_none_owner =
+            self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) != 0
+                && self.control.in_synchronous_with()
+                && matches!(expression.test.as_ref(), Expr::Compare(comparison)
+                if comparison.ops.len() == 1
+                    && matches!(comparison.ops[0], CmpOp::Is | CmpOp::IsNot)
+                    && matches!(comparison.comparators[0], Expr::NoneLiteral(_)));
         self.with_control_override(
             |control| &mut control.exclude_condition_not_taken_from_exception,
             exclude_try_marker,
             |compiler| compiler.compile_jump_if(&expression.test, false, else_label),
         )?;
+        if preserve_generator_with_none_owner {
+            self.assembler.override_last_not_taken_exception_owner();
+        }
         self.compile_expression(&expression.body)?;
         // CPython emits the conditional-expression join without a location. Its later
         // propagation pass inherits the body location only when the join remains in the same
@@ -4283,13 +4293,14 @@ impl Compiler {
         &mut self,
         expression: &ruff_python_ast::ExprBoolOp,
     ) -> Result<(), CompileError> {
-        self.compile_bool_expression_at(expression, self.source_location(expression.range))
+        self.compile_bool_expression_at(expression, self.source_location(expression.range), false)
     }
 
     fn compile_bool_expression_at(
         &mut self,
         expression: &ruff_python_ast::ExprBoolOp,
         location: SourceLocation,
+        nested_leading_group: bool,
     ) -> Result<(), CompileError> {
         let mut effective = Vec::with_capacity(expression.values.len());
         let mut short_circuited = false;
@@ -4340,7 +4351,7 @@ impl Compiler {
             if let Expr::BoolOp(inner) = value
                 && inner.op == expression.op
             {
-                self.compile_bool_expression_at(inner, location)?;
+                self.compile_bool_expression_at(inner, location, true)?;
             } else {
                 self.compile_expression(value)?;
             }
@@ -4349,9 +4360,16 @@ impl Compiler {
                 && self.assembler.current_block_resumes_after_yield();
             // CPython inserts `COPY`, `TO_BOOL`, and `NOT_TAKEN` after compacting the CFG. The
             // marker can only reuse a stale exception owner when all three inserted slots were
-            // vacated by earlier optimizations in this block.
+            // vacated in this block, or in a tuple handler's fallthrough label chain.
             let marker_owner_slots = self.assembler.current_block_dynamic_exception_owner_slots();
-            let marker_reuses_exception_owner = marker_owner_slots >= 3;
+            let fallthrough_marker_reuses_exception_owner = self
+                .control
+                .active_tuple_handler_try_bodies
+                .last()
+                .is_some_and(|tuple_handler| *tuple_handler)
+                && self.assembler.fallthrough_dynamic_exception_owner_slots() >= 3;
+            let marker_reuses_exception_owner =
+                marker_owner_slots >= 3 || fallthrough_marker_reuses_exception_owner;
             let current_block = self.assembler.current_block_token();
             let exception_type_marker_owner = self
                 .control
@@ -4369,9 +4387,9 @@ impl Compiler {
             self.assembler.mark(exclusion_start);
             self.emit(COPY, 1, 1)?;
             self.emit(TO_BOOL, 0, 0)?;
+            self.emit_jump_forward(jump, end, -1)?;
             let exclusion_end = self.assembler.label();
             self.assembler.mark(exclusion_end);
-            self.emit_jump_forward(jump, end, -1)?;
 
             let exception_group_handler = self.control.active_exception_group_handlers > 0;
             let normalized_owner = self.control.active_normal_finally_bodies > 0
@@ -4408,6 +4426,11 @@ impl Compiler {
                 && !marker_reuses_exception_owner
                 && exception_type_marker_owner.is_none()
                 && !self.control.active_exception_region_exclusions.is_empty();
+            if nested_leading_group && exclude_from_plain_try {
+                for exclusions in &mut self.control.active_exception_region_exclusions {
+                    exclusions.push((exclusion_start, exclusion_end));
+                }
+            }
             let exclude_from_all_owners = exclude_exception_type_owner
                 || exclude_inlined_comprehension_owner
                 || exclude_after_coroutine_suspension
@@ -4478,7 +4501,7 @@ impl Compiler {
         {
             // CPython preserves the trailing group's own range after recursively lowering it;
             // leading groups instead share the surrounding expression's short-circuit marker.
-            self.compile_bool_expression_at(inner, self.source_location(inner.range))?;
+            self.compile_bool_expression_at(inner, self.source_location(inner.range), false)?;
         } else {
             self.compile_expression(last)?;
         }

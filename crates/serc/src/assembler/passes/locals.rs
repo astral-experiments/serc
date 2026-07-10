@@ -436,6 +436,12 @@ impl OptimizationPipeline {
         }
 
         for block in blocks {
+            for instruction in graph.instructions_mut(block) {
+                if instruction.local_policy.force_borrowed_load() && instruction.opcode == LOAD_FAST
+                {
+                    instruction.opcode = LOAD_FAST_BORROW;
+                }
+            }
             if !reachable[block.index()] {
                 continue;
             }

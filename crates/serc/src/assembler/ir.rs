@@ -102,6 +102,7 @@ impl LocalPolicy {
     const FORCE_OWNED_LOAD: u8 = 1 << 0;
     const STRICT_OWNED_LOAD: u8 = 1 << 1;
     const MAYBE_NULL_COMPREHENSION_RESTORE: u8 = 1 << 2;
+    const FORCE_BORROWED_LOAD: u8 = 1 << 3;
 
     pub(super) const fn for_load(force_owned: bool, strict_owned: bool) -> Self {
         let mut policy = 0;
@@ -120,6 +121,14 @@ impl LocalPolicy {
 
     pub(super) const fn strict_owned_load(self) -> bool {
         self.0 & Self::STRICT_OWNED_LOAD != 0
+    }
+
+    pub(super) const fn force_borrowed_load(self) -> bool {
+        self.0 & Self::FORCE_BORROWED_LOAD != 0
+    }
+
+    pub(super) fn mark_force_borrowed_load(&mut self) {
+        self.0 |= Self::FORCE_BORROWED_LOAD;
     }
 
     pub(super) const fn may_store_null(self) -> bool {
@@ -516,15 +525,16 @@ pub(super) enum NormalizedExceptionOwner {
     #[default]
     Unchanged,
     Present,
+    OverridePresent,
     Absent,
 }
 
 impl NormalizedExceptionOwner {
     const fn merged(self, other: Self) -> Self {
-        if matches!(self, Self::Unchanged) {
-            other
-        } else {
-            self
+        match (self, other) {
+            (Self::OverridePresent, _) | (_, Self::OverridePresent) => Self::OverridePresent,
+            (Self::Unchanged, other) => other,
+            (owner, _) => owner,
         }
     }
 }
@@ -702,6 +712,7 @@ pub(crate) struct Assembler {
     pub(super) borrow_unreachable_blocks: FxHashSet<Label>,
     pub(super) load_fast_borrowing_enabled: bool,
     pub(super) strict_owned_loads: bool,
+    pub(super) forced_borrowed_loads: bool,
     pub(super) has_synthesized_percent_target_locations: bool,
 }
 
@@ -776,6 +787,7 @@ impl Default for Assembler {
             borrow_unreachable_blocks: FxHashSet::default(),
             load_fast_borrowing_enabled: true,
             strict_owned_loads: false,
+            forced_borrowed_loads: false,
             has_synthesized_percent_target_locations: false,
         }
     }

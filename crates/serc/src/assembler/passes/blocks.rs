@@ -1185,12 +1185,36 @@ impl OptimizationPipeline {
                 }
             }
             if inline_small_exit || inline_no_location_block {
-                let excluded_regions = region_memberships
+                let entirely_excluded_regions = region_memberships
                     .iter()
                     .enumerate()
                     .filter_map(|(index, membership)| {
                         (membership.contains(&source) && !membership.contains(&target))
                             .then_some(index)
+                    })
+                    .collect::<Vec<_>>();
+                // CPython carries an internal protected-region end into an exit copy when the
+                // return entry still has its preserved boundary alias. A single-label shared
+                // return is reached only after branch threading, so its region holes belong to
+                // the individual branch copies rather than this target-chain copy.
+                let target_has_preserved_boundary_alias = graph[target]
+                    .items()
+                    .iter()
+                    .take_while(|item| matches!(item, Item::Label(_)))
+                    .count()
+                    > 1;
+                let split_excluded_regions = self
+                    .exception_regions
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, region)| {
+                        let membership = &region_memberships[index];
+                        (target_has_preserved_boundary_alias
+                            && membership.contains(&source)
+                            && membership.contains(&target))
+                        .then(|| copied_labels.get(&region.end).copied())
+                        .flatten()
+                        .map(|start| (index, start))
                     })
                     .collect::<Vec<_>>();
                 let split_return_exclusions = self
@@ -1206,8 +1230,11 @@ impl OptimizationPipeline {
                         .map(|start| (index, start))
                     })
                     .collect::<Vec<_>>();
-                if !excluded_regions.is_empty() || !split_return_exclusions.is_empty() {
-                    let mut exclusion_start = copied_label;
+                if !entirely_excluded_regions.is_empty()
+                    || !split_excluded_regions.is_empty()
+                    || !split_return_exclusions.is_empty()
+                {
+                    let mut whole_copy_exclusion_start = copied_label;
                     let trailing_nop_position = graph[source]
                         .items()
                         .iter()
@@ -1221,14 +1248,18 @@ impl OptimizationPipeline {
                         .filter(|(_, opcode)| *opcode == NOP)
                         .map(|(position, _)| position);
                     if let Some(position) = trailing_nop_position {
-                        exclusion_start = Label(self.next_label);
+                        whole_copy_exclusion_start = Label(self.next_label);
                         self.next_label += 1;
-                        graph.insert_label(source, position, exclusion_start);
+                        graph.insert_label(source, position, whole_copy_exclusion_start);
                     }
                     let copied_end = Label(self.next_label);
                     self.next_label += 1;
                     copied.push(Item::Label(copied_end));
-                    for index in excluded_regions {
+                    for index in entirely_excluded_regions {
+                        copied_region_exclusions[index]
+                            .push((whole_copy_exclusion_start, copied_end));
+                    }
+                    for (index, exclusion_start) in split_excluded_regions {
                         copied_region_exclusions[index].push((exclusion_start, copied_end));
                     }
                     for (index, start) in split_return_exclusions {
