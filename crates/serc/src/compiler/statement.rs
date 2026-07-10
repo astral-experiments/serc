@@ -244,6 +244,9 @@ pub(super) struct ControlFlowState {
     current_statement_followed_by_name_return: bool,
     // The direct final synchronous `with` in an active non-final try body, if any.
     direct_final_sync_with_try_body: Option<ruff_text_size::TextRange>,
+    // The direct final synchronous `with` with a normal body fallthrough in the nested
+    // try/except body synthesized while lowering a combined try/except/finally statement.
+    direct_final_sync_with_combined_try_body: Option<ruff_text_size::TextRange>,
     pub(super) generator_region_start: Option<Label>,
     pub(super) generator_region_exclusions: Vec<(Label, Label)>,
     pub(super) emitted_fallthrough_return: bool,
@@ -267,6 +270,13 @@ impl ControlFlowState {
         self.loops
             .last()
             .is_some_and(|context| context.iterator_cleanup != IteratorCleanup::None)
+    }
+
+    fn in_exception_protected_iterator_loop(&self) -> bool {
+        self.loops.last().is_some_and(|context| {
+            context.iterator_cleanup != IteratorCleanup::None
+                && context.exception_region_depth == self.active_exception_region_exclusions.len()
+        })
     }
 
     /// Returns whether a direct Boolean exception-type marker should retain its owner.
@@ -314,22 +324,43 @@ impl Compiler {
             .body
             .first()
             .is_some_and(|body| self.source_location(body.range()).line == try_line);
+        let final_sync_with_try_body =
+            statement.body.last().and_then(|statement| match statement {
+                Stmt::With(statement) if !statement.is_async => Some(statement.range),
+                _ => None,
+            });
+        let final_sync_with_body_falls_through = statement.body.last().is_some_and(|statement| {
+            matches!(
+                statement,
+                Stmt::With(statement)
+                    if !statement.is_async && !suite_terminates(&statement.body)
+            )
+        });
         let direct_final_sync_with_try_body = (self.control.current_statement_has_following
             && statement.orelse.is_empty())
-        .then(|| statement.body.last())
-        .flatten()
-        .and_then(|statement| match statement {
-            Stmt::With(statement) if !statement.is_async => Some(statement.range),
-            _ => None,
-        });
+        .then_some(final_sync_with_try_body)
+        .flatten();
+        let direct_final_sync_with_combined_try_body = (statement.orelse.is_empty()
+            && !statement.handlers.is_empty()
+            && !statement.finalbody.is_empty()
+            && final_sync_with_body_falls_through
+            && self.control.generator_region_start.is_none())
+        .then_some(final_sync_with_try_body)
+        .flatten();
         self.with_control_override(
             |control| &mut control.same_line_try_body,
             same_line,
             |compiler| {
                 compiler.with_control_override(
-                    |control| &mut control.direct_final_sync_with_try_body,
-                    direct_final_sync_with_try_body,
-                    compile,
+                    |control| &mut control.direct_final_sync_with_combined_try_body,
+                    direct_final_sync_with_combined_try_body,
+                    |compiler| {
+                        compiler.with_control_override(
+                            |control| &mut control.direct_final_sync_with_try_body,
+                            direct_final_sync_with_try_body,
+                            compile,
+                        )
+                    },
                 )
             },
         )
@@ -2118,12 +2149,24 @@ impl Compiler {
                         (self.control.active_finally_end_blocks, start)
                     });
                 let finally_end_unwind_start = self.emit_finally_end_unwind(0, preserve_tos)?;
-                let delay_exception_unwind_start = overriding_unwind_start.is_none()
+                // A call result returned from a loop that was already protected by this try
+                // keeps the iterator SWAP/POP protected. Exclude only the RETURN_VALUE itself;
+                // nested handlers and finally bodies take distinct cleanup paths.
+                let delay_iterator_exception_unwind_start = overriding_unwind_start.is_none()
                     && !self.control.active_exception_region_exclusions.is_empty()
                     && self.control.active_with_exits.is_empty()
                     && !unwinds_pass_finally
-                    && preserve_tos
-                    && !self.control.active_exception_handlers.is_empty();
+                    && self.control.active_exception_handlers.is_empty()
+                    && self.control.active_return_finally_contexts.is_empty()
+                    && matches!(statement.value.as_deref(), Some(Expr::Call(_)))
+                    && self.control.in_exception_protected_iterator_loop();
+                let delay_exception_unwind_start = delay_iterator_exception_unwind_start
+                    || (overriding_unwind_start.is_none()
+                        && !self.control.active_exception_region_exclusions.is_empty()
+                        && self.control.active_with_exits.is_empty()
+                        && !unwinds_pass_finally
+                        && preserve_tos
+                        && !self.control.active_exception_handlers.is_empty());
                 let mut exception_unwind_start = if overriding_unwind_start.is_some() {
                     overriding_unwind_start
                 } else if return_finally_unwind_start.is_some() {
@@ -2492,6 +2535,26 @@ impl Compiler {
         for (branch_index, (test, body)) in branches.into_iter().enumerate() {
             if let Some(test) = test {
                 let next = self.assembler.label();
+                let negated_method_call_condition = matches!(test, Expr::UnaryOp(unary)
+                    if unary.op == UnaryOp::Not
+                        && matches!(unary.operand.as_ref(), Expr::Call(call)
+                            if matches!(call.func.as_ref(), Expr::Attribute(_))));
+                let preserve_sync_with_continue_owner = negated_method_call_condition
+                    && branch_index == 0
+                    && matches!(body, [Stmt::Continue(_)])
+                    && self.control.in_iterator_loop()
+                    && self.control.loops.last().is_some_and(|context| {
+                        self.assembler.instruction_count() == context.body_start
+                    })
+                    && self
+                        .control
+                        .active_with_exits
+                        .last()
+                        .is_some_and(|context| {
+                            !context.is_async
+                                && context.loop_depth.checked_add(1)
+                                    == Some(self.control.loops.len())
+                        });
                 let exclude_not_taken = self.control.exclude_terminal_if_not_taken
                     || (!self.control.active_with_region_exclusions.is_empty()
                         && branch_index > 0
@@ -2511,6 +2574,12 @@ impl Compiler {
                         )
                     },
                 )?;
+                if preserve_sync_with_continue_owner {
+                    // A direct continue from the first condition inside a surrounding
+                    // synchronous with reuses the protected CFG slot when the loop-control NOP
+                    // is removed. Keep that owner on the normalized fallthrough marker.
+                    self.assembler.preserve_last_not_taken_exception_owner();
+                }
                 if retain_folded_test_in_protected_region {
                     // CPython keeps the first folded branch marker inside the surrounding
                     // protected region instead of treating it as an artificial condition NOP.
@@ -6194,9 +6263,11 @@ impl Compiler {
         terminal: bool,
     ) -> Result<(), CompileError> {
         // A direct try/except omits its owner from the suppressed handler exit. A synthetic
-        // try/finally protected body keeps that owner instead.
-        let exclude_handler_exit = self.control.active_finally_try_bodies == 0
-            && self.control.direct_final_sync_with_try_body == Some(statement.range);
+        // try/finally protected body keeps its sole owner, while a combined try/except/finally
+        // omits only the nested try/except owner and remains covered by the outer finally.
+        let exclude_handler_exit = (self.control.active_finally_try_bodies == 0
+            && self.control.direct_final_sync_with_try_body == Some(statement.range))
+            || self.control.direct_final_sync_with_combined_try_body == Some(statement.range);
         self.compile_with_items(
             &statement.items,
             &statement.body,
