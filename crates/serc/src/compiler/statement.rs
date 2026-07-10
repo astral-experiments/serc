@@ -285,9 +285,9 @@ pub(super) struct ControlFlowState {
     current_statement_followed_by_return_or_raise: bool,
     // The direct final synchronous `with` in an active non-final try body, if any.
     direct_final_sync_with_try_body: Option<ruff_text_size::TextRange>,
-    // The direct final synchronous `with` with a normal body fallthrough in the nested
-    // try/except body synthesized while lowering a combined try/except/finally statement.
-    direct_final_sync_with_combined_try_body: Option<ruff_text_size::TextRange>,
+    // The direct final synchronous `with` with a normal body fallthrough in a handler-form try
+    // nested in an active try/finally protected body.
+    direct_final_sync_with_protected_handler_try_body: Option<ruff_text_size::TextRange>,
     // Direct statements in the innermost normal try body. Nested branch suites must not inherit
     // CPython's temporary block ownership for a sibling statement in that body.
     direct_try_body_statements: Vec<TextRange>,
@@ -437,9 +437,9 @@ impl Compiler {
             && statement.orelse.is_empty())
         .then_some(final_sync_with_try_body)
         .flatten();
-        let direct_final_sync_with_combined_try_body = (statement.orelse.is_empty()
+        let direct_final_sync_with_protected_handler_try_body = (statement.orelse.is_empty()
             && !statement.handlers.is_empty()
-            && !statement.finalbody.is_empty()
+            && self.control.active_finally_try_bodies > 0
             && final_sync_with_body_falls_through
             && self.control.generator_region_start.is_none())
         .then_some(final_sync_with_try_body)
@@ -502,9 +502,9 @@ impl Compiler {
                                                         compiler.with_control_override(
                                                             |control| {
                                                                 &mut control
-                                                                    .direct_final_sync_with_combined_try_body
+                                                                    .direct_final_sync_with_protected_handler_try_body
                                                             },
-                                                            direct_final_sync_with_combined_try_body,
+                                                            direct_final_sync_with_protected_handler_try_body,
                                                             |compiler| {
                                                                 compiler.with_control_override(
                                                                     |control| {
@@ -7051,12 +7051,15 @@ impl Compiler {
         statement: &ruff_python_ast::StmtWith,
         terminal: bool,
     ) -> Result<(), CompileError> {
-        // A direct try/except omits its owner from the suppressed handler exit. A synthetic
-        // try/finally protected body keeps its sole owner, while a combined try/except/finally
-        // omits only the nested try/except owner and remains covered by the outer finally.
+        // A direct try/except omits its owner from the suppressed handler exit. A sole synthetic
+        // try/finally owner remains, while a handler-form try nested in its protected body omits
+        // only that nested owner and remains covered by the outer finally.
         let exclude_handler_exit = (self.control.active_finally_try_bodies == 0
             && self.control.direct_final_sync_with_try_body == Some(statement.range))
-            || self.control.direct_final_sync_with_combined_try_body == Some(statement.range);
+            || self
+                .control
+                .direct_final_sync_with_protected_handler_try_body
+                == Some(statement.range);
         self.compile_with_items(
             &statement.items,
             &statement.body,
