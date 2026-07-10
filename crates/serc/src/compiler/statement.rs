@@ -3517,14 +3517,16 @@ impl Compiler {
                 && (!self.control.active_exception_region_exclusions.is_empty()
                     || !self.control.active_with_region_exclusions.is_empty()
                     || coroutine_terminal_break_exit
-                    || !suite_contains_unprotected_nontail_conditional_loop_break(&statement.body))
+                    || !suite_contains_borrow_reachable_conditional_loop_break(&statement.body))
             {
                 // A constant-true loop can reach its exit only through `break`. CPython removes
                 // an unconditional break jump before borrowed-load analysis but does not
-                // reconnect the large exit block. An unprotected non-tail conditional break
-                // retains an explicit exit edge unless a surrounding control-flow region
-                // rewrites that edge during cleanup. A coroutine stop handler with a continue
-                // edge also keeps a terminal break exit disconnected from the following block.
+                // reconnect the large exit block. A conditional break retains an explicit exit
+                // edge when it is non-tail, when its cleanup crosses a protected region, or when
+                // it shares a final `if` with an explicit fallthrough branch. A surrounding
+                // control-flow region can still rewrite that edge during cleanup. A coroutine
+                // stop handler with a continue edge also keeps a terminal break exit disconnected
+                // from the following block.
                 self.assembler.prevent_borrow_reachability(end);
             }
             self.set_depth(base_depth);
@@ -7309,7 +7311,23 @@ fn suite_contains_loop_continue(body: &[Stmt]) -> bool {
     })
 }
 
-fn suite_contains_unprotected_nontail_conditional_loop_break(body: &[Stmt]) -> bool {
+fn suite_contains_borrow_reachable_conditional_loop_break(body: &[Stmt]) -> bool {
+    fn has_reachable_explicit_fallthrough(statement: &ruff_python_ast::StmtIf) -> bool {
+        for clause in &statement.elif_else_clauses {
+            let falls_through = !suite_terminates(&clause.body);
+            let Some(test) = &clause.test else {
+                return falls_through;
+            };
+            match early_condition_truthiness(test) {
+                Some(false) => {}
+                Some(true) => return falls_through,
+                None if falls_through => return true,
+                None => {}
+            }
+        }
+        false
+    }
+
     fn contains(body: &[Stmt], conditional: bool) -> bool {
         for statement in body {
             let found = match statement {
@@ -7327,9 +7345,29 @@ fn suite_contains_unprotected_nontail_conditional_loop_break(body: &[Stmt]) -> b
                             contains(&clause.body, conditional)
                         })
                 }
-                // CPython's borrowed-load traversal can stop at the normal exit of these
-                // regions, so a later break does not prove that the loop exit is visited.
-                Stmt::Try(_) | Stmt::With(_) => return false,
+                Stmt::Try(statement)
+                    if !statement.is_star
+                        && statement.orelse.is_empty()
+                        && statement.finalbody.is_empty() =>
+                {
+                    if contains(&statement.body, conditional) {
+                        true
+                    } else {
+                        // CPython's borrowed-load traversal can stop at the normal exit of a
+                        // protected region, so a later break does not prove that the loop exit
+                        // is visited.
+                        return false;
+                    }
+                }
+                Stmt::Try(_) => return false,
+                Stmt::With(statement) if !statement.is_async => {
+                    if contains(&statement.body, conditional) {
+                        true
+                    } else {
+                        return false;
+                    }
+                }
+                Stmt::With(_) => return false,
                 Stmt::Match(_) | Stmt::For(_) | Stmt::While(_) => false,
                 Stmt::FunctionDef(_) | Stmt::ClassDef(_) => false,
                 _ => false,
@@ -7349,7 +7387,34 @@ fn suite_contains_unprotected_nontail_conditional_loop_break(body: &[Stmt]) -> b
     {
         return false;
     }
-    contains(leading, false)
+    if contains(leading, false) {
+        return true;
+    }
+
+    match last {
+        // Cleanup preserves the conditional break edge even when the protected statement is the
+        // loop tail.
+        Stmt::Try(statement)
+            if !statement.is_star
+                && statement.orelse.is_empty()
+                && statement.finalbody.is_empty() =>
+        {
+            contains(&statement.body, false)
+        }
+        // A simple final conditional break is disconnected, but CPython retains the shared exit
+        // when another branch of the final `if` can fall through.
+        Stmt::If(statement)
+            if has_reachable_explicit_fallthrough(statement)
+                && !statement
+                    .elif_else_clauses
+                    .iter()
+                    .any(|clause| suite_contains_loop_break(&clause.body)) =>
+        {
+            let conditional = early_condition_truthiness(&statement.test).is_none();
+            contains(&statement.body, conditional)
+        }
+        _ => false,
+    }
 }
 
 fn suite_ends_in_simple_conditional_break(body: &[Stmt]) -> bool {

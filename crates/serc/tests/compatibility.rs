@@ -3891,6 +3891,125 @@ def earlier_and_tail_break(first_flag, last_flag, result):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_terminal_constant_loop_if_alternatives() {
+        let source = r"def simple_final_if(flag, result):
+    while True:
+        step()
+        if flag:
+            break
+    first(result)
+    second(result)
+    third(result)
+    fourth(result)
+    fifth(result)
+    return result
+
+def final_if_with_fallthrough(result):
+    while True:
+        value = read()
+        if value is None:
+            break
+        elif value is ignored:
+            pass
+        else:
+            consume(value)
+    first(result)
+    second(result)
+    third(result)
+    fourth(result)
+    fifth(result)
+    return result
+";
+        assert_matches_cpython_marshal(source, "terminal_constant_loop_if_alternatives.py");
+    }
+
+    #[test]
+    fn matches_cpython_load_ownership_for_constant_loop_exit_shapes() {
+        let source = r"import dis
+
+def break_inside_try(fp, size, result):
+    data = b''
+    while True:
+        try:
+            chunk = fp.read(size - len(data))
+            data += chunk
+            if len(chunk) == 0 or len(data) == size:
+                break
+        except BlockingIOError:
+            pass
+    first(result)
+    second(result)
+    third(result)
+    fourth(result)
+    fifth(result)
+    return result
+
+def break_inside_with(lock, result):
+    while True:
+        with lock:
+            if ready():
+                break
+        wait()
+    first(result)
+    second(result)
+    third(result)
+    fourth(result)
+    fifth(result)
+    return result
+
+def breaking_fallthrough_alternative(first_flag, last_flag, result):
+    while True:
+        if first_flag:
+            break
+        else:
+            step()
+            if last_flag:
+                break
+    first(result)
+    second(result)
+    third(result)
+    fourth(result)
+    fifth(result)
+    return result
+
+def final_else_break(first_flag, second_flag, result):
+    while True:
+        if first_flag:
+            first(result)
+        elif second_flag:
+            second(result)
+        else:
+            break
+    first(result)
+    second(result)
+    third(result)
+    fourth(result)
+    fifth(result)
+    return result
+
+def result_loads(function):
+    return [
+        instruction.opname
+        for instruction in dis.get_instructions(function)
+        if instruction.argval == 'result'
+        and instruction.opname.startswith('LOAD_FAST')
+    ]
+
+for function in (
+    break_inside_try,
+    break_inside_with,
+    breaking_fallthrough_alternative,
+    final_else_break,
+):
+    print(','.join(result_loads(function)))
+";
+        assert_executes(
+            source,
+            "LOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST_BORROW\nLOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST_BORROW\nLOAD_FAST,LOAD_FAST,LOAD_FAST,LOAD_FAST,LOAD_FAST,LOAD_FAST\nLOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST,LOAD_FAST,LOAD_FAST,LOAD_FAST,LOAD_FAST,LOAD_FAST\n",
+        );
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_superinstruction_location_propagation() {
         let source = r#"def load_pair(first, second, item):
     consume(first, second, message=("Expected %s" % item))
