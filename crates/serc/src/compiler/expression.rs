@@ -4632,6 +4632,8 @@ impl Compiler {
                 && !self.control.active_with_region_exclusions.is_empty()
                 && (operands_are_negated
                     || self.control.defer_terminal_with_exclusion_through_negation);
+            let preserve_leading_protected_loop_owner =
+                self.control.protected_iterator_continue_condition == Some(expression.range());
             let short_circuit_jumps_to_target = matches!(boolean.op, BoolOp::Or) == jump_on;
             if short_circuit_jumps_to_target {
                 for value in leading {
@@ -4643,6 +4645,9 @@ impl Compiler {
                         )?;
                     } else {
                         self.compile_jump_if(value, jump_on, label)?;
+                    }
+                    if preserve_leading_protected_loop_owner {
+                        self.assembler.preserve_last_not_taken_exception_owner();
                     }
                 }
                 return self.compile_jump_if(last, jump_on, label);
@@ -4657,6 +4662,9 @@ impl Compiler {
                     )?;
                 } else {
                     self.compile_jump_if(value, !jump_on, end)?;
+                }
+                if preserve_leading_protected_loop_owner {
+                    self.assembler.preserve_last_not_taken_exception_owner();
                 }
             }
             self.compile_jump_if(last, jump_on, label)?;

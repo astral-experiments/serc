@@ -232,6 +232,9 @@ pub(super) struct ControlFlowState {
     // A leading `not` around a two-operand Boolean condition routes the synchronous-with
     // terminal marker exclusion to the inner condition's final operand.
     pub(super) defer_terminal_with_exclusion_through_negation: bool,
+    // The first single-line two-operand condition of a protected iterator-loop continue.
+    // CPython keeps its leading marker in the synchronous-with owner.
+    pub(super) protected_iterator_continue_condition: Option<ruff_text_size::TextRange>,
     pub(super) exclude_condition_not_taken_from_exception: bool,
     pub(super) include_assert_none_condition_owner: bool,
     // The final chained comparison whose fallthrough jump survives small-exit inlining as a NOP.
@@ -2683,6 +2686,28 @@ impl Compiler {
                     || (!self.control.active_with_region_exclusions.is_empty()
                         && branch_index > 0
                         && suite_terminates(body));
+                let protected_iterator_continue_condition = (branch_index == 0
+                    && matches!(body, [Stmt::Continue(_)])
+                    && self.control.in_iterator_loop()
+                    && !self.control.active_with_region_exclusions.is_empty()
+                    && self
+                        .control
+                        .active_with_exits
+                        .last()
+                        .is_some_and(|context| {
+                            !context.is_async && context.location.line == context.location.end_line
+                        })
+                    && {
+                        let location = self.source_location(test.range());
+                        location.line == location.end_line
+                    }
+                    && matches!(test, Expr::BoolOp(boolean) if boolean.values.len() == 2)
+                    && self.control.loops.last().is_some_and(|context| {
+                        !self
+                            .assembler
+                            .contains_opcode_since(NOT_TAKEN, context.body_start)
+                    }))
+                .then(|| test.range());
                 let retain_folded_test_in_protected_region = branch_index == 0
                     && early_condition_truthiness(test) == Some(true)
                     && (!self.control.active_with_region_exclusions.is_empty()
@@ -2700,18 +2725,25 @@ impl Compiler {
                         .then(|| final_chained_comparison_jump(test, false))
                         .flatten();
                 self.with_control_override(
-                    |control| &mut control.retained_chained_comparison_exit,
-                    retained_chained_comparison_exit,
+                    |control| &mut control.protected_iterator_continue_condition,
+                    protected_iterator_continue_condition,
                     |compiler| {
                         compiler.with_control_override(
-                            |control| &mut control.exclude_terminal_if_not_taken,
-                            exclude_not_taken,
+                            |control| &mut control.retained_chained_comparison_exit,
+                            retained_chained_comparison_exit,
                             |compiler| {
-                                compiler.with_terminal_try_condition_exception_exclusion(
-                                    compiler.terminal_try_condition_includes_generator_region(
-                                        branch_index,
-                                    ),
-                                    |compiler| compiler.compile_jump_if(test, false, next),
+                                compiler.with_control_override(
+                                    |control| &mut control.exclude_terminal_if_not_taken,
+                                    exclude_not_taken,
+                                    |compiler| {
+                                        compiler.with_terminal_try_condition_exception_exclusion(
+                                            compiler
+                                                .terminal_try_condition_includes_generator_region(
+                                                    branch_index,
+                                                ),
+                                            |compiler| compiler.compile_jump_if(test, false, next),
+                                        )
+                                    },
                                 )
                             },
                         )
