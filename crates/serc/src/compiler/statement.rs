@@ -3027,7 +3027,9 @@ impl Compiler {
                 && !split_short_circuit
                 && !self.has_active_control_flow_region()
                 && condition_jump_target_count(&statement.test, false) == 1
-                && condition_jump_target_count(&statement.test, true) == 1
+                && (condition_jump_target_count(&statement.test, true) == 1
+                    || (statement.body.len() == 1
+                        && matches!(statement.body.first(), Some(Stmt::Assign(_)))))
             {
                 let body = statement.body.as_slice();
                 let fallback = self.assembler.label();

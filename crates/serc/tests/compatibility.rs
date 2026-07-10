@@ -2399,6 +2399,34 @@ def final_elif_in_non_final_branch(items):
     }
 
     #[test]
+    fn uses_cpython_non_final_short_circuit_assignment_orientation() {
+        let source = r#"import dis
+
+
+def short_circuit_assignment(items, force, accepted, replacement):
+    for item in items:
+        if is_first(item):
+            if force or item not in accepted:
+                accepted[item] = replacement[item]
+        else:
+            fallback(item)
+
+
+line = short_circuit_assignment.__code__.co_firstlineno + 3
+print(" ".join(
+    instruction.opname
+    for instruction in dis.get_instructions(short_circuit_assignment)
+    if instruction.positions.lineno == line
+    and (
+        instruction.opname.startswith("POP_JUMP")
+        or instruction.opname == "JUMP_BACKWARD"
+    )
+))
+"#;
+        assert_executes(source, "POP_JUMP_IF_TRUE POP_JUMP_IF_FALSE JUMP_BACKWARD\n");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_loop_and_async_iteration_edges() {
         let source = include_str!("fixtures/benchmark/loop_async_edges.py");
         assert_matches_cpython_marshal(source, "loop_tail.py");
