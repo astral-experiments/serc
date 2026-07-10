@@ -1357,15 +1357,19 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_> {
 }
 
 fn function_default_expressions(definition: &StmtFunctionDef) -> impl Iterator<Item = &Expr> {
-    definition
-        .parameters
+    parameter_default_expressions(&definition.parameters)
+}
+
+fn parameter_default_expressions(
+    parameters: &ruff_python_ast::Parameters,
+) -> impl Iterator<Item = &Expr> {
+    parameters
         .posonlyargs
         .iter()
-        .chain(&definition.parameters.args)
+        .chain(&parameters.args)
         .filter_map(|parameter| parameter.default.as_deref())
         .chain(
-            definition
-                .parameters
+            parameters
                 .kwonlyargs
                 .iter()
                 .filter_map(|parameter| parameter.default.as_deref()),
@@ -1470,14 +1474,34 @@ impl LocalCollector {
         if self.globals.contains(name) || self.nonlocals.contains(name) {
             return;
         }
+        if self
+            .candidate_bindings
+            .as_ref()
+            .is_some_and(|candidate_bindings| candidate_bindings.contains_key(name))
+        {
+            self.claim_annotation_only_position(name);
+            return;
+        }
         let Some(candidate_bindings) = &mut self.candidate_bindings else {
             return;
         };
-        if candidate_bindings.contains_key(name) {
-            return;
-        }
         candidate_bindings.insert(name.to_string(), false);
         self.names.push(name.to_string());
+    }
+
+    fn claim_annotation_only_position(&mut self, name: &str) {
+        // A no-value function annotation emits no fast-local operation in CPython. Keep its
+        // symbol-table position provisional until the first runtime load or binding claims it.
+        if !self.annotation_only.remove(name) {
+            return;
+        }
+        let index = self
+            .names
+            .iter()
+            .position(|candidate| candidate == name)
+            .expect("an annotation-only local should have a candidate position");
+        let name = self.names.remove(index);
+        self.names.push(name);
     }
 
     fn retain_bindings(&mut self) {
@@ -1489,7 +1513,7 @@ impl LocalCollector {
 
     fn insert(&mut self, name: &str) {
         self.non_comprehension_bindings.insert(name.to_string());
-        self.annotation_only.remove(name);
+        self.claim_annotation_only_position(name);
         self.mark_binding(name);
     }
 
@@ -1504,39 +1528,34 @@ impl LocalCollector {
         for statement in body {
             match statement {
                 Stmt::Assign(assignment) => {
-                    let mut references = ReferenceCollector::default();
-                    references.visit_expr(&assignment.value);
+                    let mut bindings = FxHashSet::default();
                     for target in &assignment.targets {
                         let mut names = Vec::new();
                         collect_target_names(target, &mut names);
-                        for name in names {
-                            if references.references.contains(name.as_str()) {
-                                self.insert(&name);
-                            }
-                        }
+                        bindings.extend(names);
                     }
-                    self.collect_expression(&assignment.value);
+                    self.collect_assignment_expression(&assignment.value, bindings);
                     for target in &assignment.targets {
                         self.collect_target(target);
                     }
                 }
                 Stmt::AugAssign(assignment) => {
+                    self.collect_target(&assignment.target);
                     self.collect_expression(&assignment.value);
-                    if let Expr::Name(name) = assignment.target.as_ref() {
-                        self.insert(name.id.as_str());
-                    }
                 }
                 Stmt::AnnAssign(assignment) => {
                     if let Some(value) = &assignment.value {
-                        self.collect_expression(value);
-                    }
-                    if (assignment.simple || assignment.value.is_some())
-                        && let Expr::Name(name) = assignment.target.as_ref()
-                    {
-                        if assignment.value.is_some() {
-                            self.insert(name.id.as_str());
-                        } else {
-                            self.insert_annotation_only(name.id.as_str());
+                        let mut names = Vec::new();
+                        collect_target_names(&assignment.target, &mut names);
+                        self.collect_assignment_expression(value, names.into_iter().collect());
+                        self.collect_target(&assignment.target);
+                    } else {
+                        match assignment.target.as_ref() {
+                            Expr::Name(name) if assignment.simple => {
+                                self.insert_annotation_only(name.id.as_str());
+                            }
+                            Expr::Name(_) => {}
+                            target => self.collect_target(target),
                         }
                     }
                 }
@@ -1624,11 +1643,11 @@ impl LocalCollector {
                     self.collect_suite(&statement.orelse);
                     for handler in &statement.handlers {
                         if let Some(handler) = handler.as_except_handler() {
-                            if let Some(name) = &handler.name {
-                                self.insert(name.as_str());
-                            }
                             if let Some(exception_type) = &handler.type_ {
                                 self.collect_expression(exception_type);
+                            }
+                            if let Some(name) = &handler.name {
+                                self.insert(name.as_str());
                             }
                             self.collect_suite(&handler.body);
                         }
@@ -1693,6 +1712,11 @@ impl LocalCollector {
                 }
             }
             Expr::Starred(starred) => self.collect_target(&starred.value),
+            Expr::Attribute(attribute) => self.collect_expression(&attribute.value),
+            Expr::Subscript(subscript) => {
+                self.collect_expression(&subscript.value);
+                self.collect_expression(&subscript.slice);
+            }
             _ => {}
         }
     }
@@ -1700,6 +1724,7 @@ impl LocalCollector {
     fn collect_comprehension_target(&mut self, target: &Expr) {
         match target {
             Expr::Name(name) => {
+                self.claim_annotation_only_position(name.id.as_str());
                 self.mark_binding(name.id.as_str());
             }
             Expr::List(list) => {
@@ -1723,6 +1748,24 @@ impl LocalCollector {
             in_inlined_comprehension: false,
             collect_known_loads: true,
             named_target_after_value: false,
+            known_assignment_bindings: FxHashSet::default(),
+            ignored_candidate_loads: FxHashSet::default(),
+        }
+        .visit_expr(expression);
+    }
+
+    fn collect_assignment_expression(
+        &mut self,
+        expression: &Expr,
+        known_assignment_bindings: FxHashSet<String>,
+    ) {
+        NamedExpressionCollector {
+            collector: self,
+            in_inlined_comprehension: false,
+            collect_known_loads: true,
+            named_target_after_value: false,
+            known_assignment_bindings,
+            ignored_candidate_loads: FxHashSet::default(),
         }
         .visit_expr(expression);
     }
@@ -1733,6 +1776,8 @@ impl LocalCollector {
             in_inlined_comprehension: false,
             collect_known_loads: true,
             named_target_after_value: true,
+            known_assignment_bindings: FxHashSet::default(),
+            ignored_candidate_loads: FxHashSet::default(),
         }
         .visit_expr(expression);
     }
@@ -1793,24 +1838,28 @@ struct NamedExpressionCollector<'a> {
     in_inlined_comprehension: bool,
     collect_known_loads: bool,
     named_target_after_value: bool,
+    known_assignment_bindings: FxHashSet<String>,
+    ignored_candidate_loads: FxHashSet<String>,
 }
 
 impl<'ast> Visitor<'ast> for NamedExpressionCollector<'_> {
     fn visit_expr(&mut self, expression: &'ast Expr) {
-        if matches!(expression, Expr::Lambda(_)) {
+        if let Expr::Lambda(lambda) = expression {
+            if let Some(parameters) = lambda.parameters.as_deref() {
+                for default in parameter_default_expressions(parameters) {
+                    self.visit_expr(default);
+                }
+            }
             return;
         }
-        if matches!(expression, Expr::Generator(_)) {
-            let previous = std::mem::replace(&mut self.in_inlined_comprehension, false);
+        if let Expr::Generator(generator) = expression {
+            let previous = self.in_inlined_comprehension;
+            if let Some(first) = generator.generators.first() {
+                self.visit_expr(&first.iter);
+            }
+            self.in_inlined_comprehension = false;
             let previous_loads = std::mem::replace(&mut self.collect_known_loads, false);
-            if self.collector.ignore_generator_body_comprehension_targets {
-                let Expr::Generator(generator) = expression else {
-                    unreachable!();
-                };
-                if let Some(first) = generator.generators.first() {
-                    self.visit_expr(&first.iter);
-                }
-            } else {
+            if !self.collector.ignore_generator_body_comprehension_targets {
                 walk_expr(self, expression);
             }
             self.collect_known_loads = previous_loads;
@@ -1833,6 +1882,7 @@ impl<'ast> Visitor<'ast> for NamedExpressionCollector<'_> {
         if self.collect_known_loads
             && let Expr::Name(name) = expression
             && name.ctx == ExprContext::Load
+            && !self.ignored_candidate_loads.contains(name.id.as_str())
         {
             self.collector.insert_candidate(name.id.as_str());
         }
@@ -1843,6 +1893,26 @@ impl<'ast> Visitor<'ast> for NamedExpressionCollector<'_> {
             _ => None,
         };
         if let Some(generators) = generators {
+            if !self.in_inlined_comprehension {
+                // CPython evaluates the outermost iterable before reserving the inlined targets.
+                // Target names without a known outer binding are ignored during this early walk
+                // so a global reference does not claim the later temporary's fast-local position.
+                let mut target_names = Vec::new();
+                for generator in generators {
+                    collect_target_names(&generator.target, &mut target_names);
+                }
+                let previous_ignored = self.ignored_candidate_loads.clone();
+                self.ignored_candidate_loads
+                    .extend(target_names.into_iter().filter(|name| {
+                        !self.collector.non_comprehension_bindings.contains(name)
+                            && !self.known_assignment_bindings.contains(name)
+                    }));
+                if let Some(first) = generators.first() {
+                    self.visit_expr(&first.iter);
+                }
+                self.ignored_candidate_loads = previous_ignored;
+            }
+
             if let Some(first) = generators.first() {
                 let mut names = Vec::new();
                 collect_nested_comprehension_target_names(&first.iter, &mut names);
@@ -1851,8 +1921,10 @@ impl<'ast> Visitor<'ast> for NamedExpressionCollector<'_> {
                     // target. Inlined comprehensions there therefore allocate their temporary
                     // fast locals first; the later full expression walk only observes them
                     // after the enclosing targets have already been collected.
+                    self.collector
+                        .insert_comprehension_iteration_target(name.clone());
+                    self.collector.claim_annotation_only_position(&name);
                     self.collector.mark_binding(&name);
-                    self.collector.insert_comprehension_iteration_target(name);
                 }
             }
             for generator in generators {

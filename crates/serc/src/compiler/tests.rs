@@ -269,12 +269,252 @@ fn single_pass_local_collection_preserves_source_order() {
         })
         .expect("module should contain the function body");
 
-    // A self-referencing assignment target precedes every load in its value, while a local that
-    // is loaded before its eventual store keeps the position of that first load. A referenced
-    // annotation-only local follows the same rule.
+    // A self-reference is claimed at its load in the assignment value. A local loaded before its
+    // eventual store keeps the position of that first load, and a referenced annotation-only
+    // local follows the same rule.
     assert_eq!(
         function.locals,
         ["target", "later", "earlier", "annotation_only"]
+    );
+}
+
+#[test]
+fn annotation_only_locals_claim_slots_at_first_runtime_use() {
+    let source = r"def ordering(values):
+    assigned_late: object
+    tuple_late: object
+    read_late: object
+    callback_late: object
+    never_used: object
+
+    first = 1
+    first, tuple_late = values
+    captured = read_late
+    assigned_late = 2
+
+    def callback_late():
+        pass
+
+    return first, tuple_late, captured, assigned_late, callback_late
+
+
+def comprehension_order(values):
+    item: object
+    first = 1
+    result = [item for item in values]
+    return first, result
+
+
+def complex_comprehension_order():
+    source: object
+    container: object
+    first = 1
+    result = [0 for container.value in source]
+    return first, result
+
+
+def mixed_comprehension_order(values):
+    container: object
+    index: object
+    named: object
+    first = 1
+    result = [named for container[index], named in values]
+    return first, result
+";
+    let parsed = parse_module(source).unwrap();
+    let module = module_compiler(source, &parsed)
+        .compile_module(parsed.suite())
+        .unwrap();
+    let function = module
+        .constants
+        .iter()
+        .find_map(|constant| match constant {
+            Constant::Code(code) if code.name == "ordering" => Some(code),
+            _ => None,
+        })
+        .expect("module should contain the function body");
+
+    assert_eq!(
+        function.locals,
+        [
+            "values",
+            "first",
+            "tuple_late",
+            "read_late",
+            "captured",
+            "assigned_late",
+            "callback_late",
+        ]
+    );
+
+    let comprehension = module
+        .constants
+        .iter()
+        .find_map(|constant| match constant {
+            Constant::Code(code) if code.name == "comprehension_order" => Some(code),
+            _ => None,
+        })
+        .expect("module should contain the comprehension function");
+
+    assert_eq!(comprehension.locals, ["values", "first", "item", "result"]);
+
+    let complex = module
+        .constants
+        .iter()
+        .find_map(|constant| match constant {
+            Constant::Code(code) if code.name == "complex_comprehension_order" => Some(code),
+            _ => None,
+        })
+        .expect("module should contain the complex-comprehension function");
+
+    assert_eq!(complex.locals, ["first", "source", "container", "result"]);
+
+    let mixed = module
+        .constants
+        .iter()
+        .find_map(|constant| match constant {
+            Constant::Code(code) if code.name == "mixed_comprehension_order" => Some(code),
+            _ => None,
+        })
+        .expect("module should contain the mixed-comprehension function");
+
+    assert_eq!(
+        mixed.locals,
+        ["values", "first", "named", "container", "index", "result"]
+    );
+}
+
+#[test]
+fn local_collection_follows_runtime_evaluation_order() {
+    let source = r"def assignment_order():
+    target: object
+    rhs: object
+    first = 1
+    target = rhs + target
+
+
+def augmented_order():
+    target: object
+    rhs: object
+    first = 1
+    target += rhs
+
+
+def stored_subscript_order():
+    container: object
+    index: object
+    rhs: object
+    first = 1
+    container[index] = rhs
+
+
+def augmented_subscript_order():
+    container: object
+    index: object
+    rhs: object
+    first = 1
+    container[index] += rhs
+
+
+def deferred_expression_order():
+    defaulted: object
+    iterable: object
+    exception: object
+    exception_type: object
+    first = 1
+    callback = lambda value=defaulted: value
+    generated = (value for value in iterable)
+    try:
+        pass
+    except exception_type as exception:
+        pass
+
+
+def comprehension_reuses_assignment_target():
+    tasks = [task for task in tasks]
+    return tasks
+
+
+def comprehension_body_uses_assignment_target(values):
+    tasks = [tasks for task in values]
+    return tasks
+
+
+def comprehension_outer_iterable_order():
+    earlier: object
+    target: object
+    first = 1
+    target = [item for item in (earlier, target)]
+    return target
+
+
+def nested_comprehension_order(outer):
+    result = [[nested for nested in inner] for item in outer]
+    inner = ()
+    return result
+
+
+def generator_first_iterable_comprehension_order(outer):
+    result = [(nested for nested in [inner_item for inner_item in inner]) for item in outer]
+    inner = ()
+    return result
+";
+    let parsed = parse_module(source).unwrap();
+    let module = module_compiler(source, &parsed)
+        .compile_module(parsed.suite())
+        .unwrap();
+    let locals = |name: &str| {
+        module
+            .constants
+            .iter()
+            .find_map(|constant| match constant {
+                Constant::Code(code) if code.name == name => Some(code.locals.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("module should contain {name}"))
+    };
+
+    assert_eq!(locals("assignment_order"), ["first", "rhs", "target"]);
+    assert_eq!(locals("augmented_order"), ["first", "target", "rhs"]);
+    assert_eq!(
+        locals("stored_subscript_order"),
+        ["first", "rhs", "container", "index"]
+    );
+    assert_eq!(
+        locals("augmented_subscript_order"),
+        ["first", "container", "index", "rhs"]
+    );
+    assert_eq!(
+        locals("deferred_expression_order"),
+        [
+            "first",
+            "defaulted",
+            "callback",
+            "iterable",
+            "generated",
+            "exception_type",
+            "exception",
+        ]
+    );
+    assert_eq!(
+        locals("comprehension_reuses_assignment_target"),
+        ["tasks", "task"]
+    );
+    assert_eq!(
+        locals("comprehension_body_uses_assignment_target"),
+        ["values", "task", "tasks"]
+    );
+    assert_eq!(
+        locals("comprehension_outer_iterable_order"),
+        ["first", "earlier", "target", "item"]
+    );
+    assert_eq!(
+        locals("nested_comprehension_order"),
+        ["outer", "item", "nested", "inner", "result"]
+    );
+    assert_eq!(
+        locals("generator_first_iterable_comprehension_order"),
+        ["outer", "item", "inner_item", "inner", "result"]
     );
 }
 
