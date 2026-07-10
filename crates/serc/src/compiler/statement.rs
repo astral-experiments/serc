@@ -233,7 +233,8 @@ pub(super) struct ControlFlowState {
     pub(super) defer_terminal_with_exclusion_through_negation: bool,
     pub(super) exclude_condition_not_taken_from_exception: bool,
     pub(super) include_assert_none_condition_owner: bool,
-    pub(super) preserve_assert_chained_comparison_exit_nop: bool,
+    // The final chained comparison whose fallthrough jump survives small-exit inlining as a NOP.
+    pub(super) retained_chained_comparison_exit: Option<TextRange>,
     pub(super) exclude_condition_not_taken_from_all_exception_regions: bool,
     // CPython normalizes a loop-tail while condition through a fresh backward-jump block. Its
     // `NOT_TAKEN` slot therefore cannot inherit the compacted condition block's stale owner.
@@ -2666,13 +2667,32 @@ impl Compiler {
                     && (!self.control.active_with_region_exclusions.is_empty()
                         || !self.control.active_exception_region_exclusions.is_empty()
                         || self.control.generator_region_start.is_some());
+                // An earlier or active handler can leave independently mismatched cold blocks
+                // whose offsets currently balance CPython's table. Iterator-loop exits already
+                // have the stable copied layout needed to retain this otherwise-missing NOP.
+                let stable_terminal_exit_layout = self.control.in_iterator_loop()
+                    || (self.control.active_exception_region_exclusions.is_empty()
+                        && !self.assembler.contains_opcode(PUSH_EXC_INFO));
+                let retained_chained_comparison_exit =
+                    (matches!(body, [Stmt::Return(_) | Stmt::Raise(_)])
+                        && stable_terminal_exit_layout)
+                        .then(|| final_chained_comparison_jump(test, false))
+                        .flatten();
                 self.with_control_override(
-                    |control| &mut control.exclude_terminal_if_not_taken,
-                    exclude_not_taken,
+                    |control| &mut control.retained_chained_comparison_exit,
+                    retained_chained_comparison_exit,
                     |compiler| {
-                        compiler.with_terminal_try_condition_exception_exclusion(
-                            compiler.terminal_try_condition_includes_generator_region(branch_index),
-                            |compiler| compiler.compile_jump_if(test, false, next),
+                        compiler.with_control_override(
+                            |control| &mut control.exclude_terminal_if_not_taken,
+                            exclude_not_taken,
+                            |compiler| {
+                                compiler.with_terminal_try_condition_exception_exclusion(
+                                    compiler.terminal_try_condition_includes_generator_region(
+                                        branch_index,
+                                    ),
+                                    |compiler| compiler.compile_jump_if(test, false, next),
+                                )
+                            },
                         )
                     },
                 )?;
@@ -4299,14 +4319,17 @@ impl Compiler {
         let base_depth = self.control.depth;
         let end = self.assembler.label();
         let include_none_owner = !self.control.active_with_region_exclusions.is_empty();
-        let preserve_chained_comparison_exit_nop = matches!(statement.test.as_ref(), Expr::Compare(comparison) if comparison.ops.len() > 1);
+        let retained_chained_comparison_exit = match statement.test.as_ref() {
+            Expr::Compare(comparison) if comparison.ops.len() > 1 => Some(comparison.range),
+            _ => None,
+        };
         self.with_control_override(
             |control| &mut control.include_assert_none_condition_owner,
             include_none_owner,
             |compiler| {
                 compiler.with_control_override(
-                    |control| &mut control.preserve_assert_chained_comparison_exit_nop,
-                    preserve_chained_comparison_exit_nop,
+                    |control| &mut control.retained_chained_comparison_exit,
+                    retained_chained_comparison_exit,
                     |compiler| compiler.compile_jump_if(&statement.test, true, end),
                 )
             },
@@ -7183,6 +7206,38 @@ fn expression_contains_chained_comparison(expression: &Expr) -> bool {
     let mut detector = Detector::default();
     detector.visit_expr(expression);
     detector.found
+}
+
+// Returns the final chained comparison that `compile_jump_if` lowers with the requested edge.
+// Only this final comparison can be adjacent to a copied terminal exit after CFG optimization.
+fn final_chained_comparison_jump(expression: &Expr, jump_on: bool) -> Option<TextRange> {
+    if let Expr::UnaryOp(unary) = expression
+        && unary.op == UnaryOp::Not
+    {
+        return final_chained_comparison_jump(&unary.operand, !jump_on);
+    }
+    if let Expr::If(conditional) = expression
+        && let Some(truthiness) = early_condition_truthiness(&conditional.test)
+    {
+        return final_chained_comparison_jump(
+            if truthiness {
+                &conditional.body
+            } else {
+                &conditional.orelse
+            },
+            jump_on,
+        );
+    }
+    if let Expr::BoolOp(boolean) = expression {
+        return boolean
+            .values
+            .last()
+            .and_then(|value| final_chained_comparison_jump(value, jump_on));
+    }
+    match expression {
+        Expr::Compare(comparison) if jump_on && comparison.ops.len() > 1 => Some(comparison.range),
+        _ => None,
+    }
 }
 
 pub(super) fn suite_terminates(body: &[Stmt]) -> bool {
