@@ -656,7 +656,7 @@ pub(super) fn should_intern(value: &str) -> bool {
             .all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
 }
 
-fn is_cached_character(value: &str) -> bool {
+pub(super) fn is_cached_character(value: &str) -> bool {
     let mut characters = value.chars();
     characters
         .next()

@@ -605,6 +605,51 @@ def direct_first():
 def direct_second():
     value = {"left", "center", "right"}
     return value, 2
+
+
+def direct_static_first():
+    value = {"set", "no", "longer", "accepted"}
+    return value, 1
+
+
+def direct_static_second():
+    value = {"set", "no", "longer", "accepted"}
+    return value, 2
+
+
+def identifier_seed():
+    cubic = 1
+    return cubic
+
+
+def identifier_direct_first():
+    value = {"cubic", "quintic"}
+    return value, 1
+
+
+def identifier_direct_second():
+    value = {"cubic", "quintic"}
+    return value, 2
+
+
+def cached_character_first():
+    value = {"a", "b", "c"}
+    return value, 1
+
+
+def cached_character_second():
+    value = {"a", "b", "c"}
+    return value, 2
+
+
+def empty_string_first():
+    value = {"", ".", "/"}
+    return value, 1
+
+
+def empty_string_second():
+    value = {"", ".", "/"}
+    return value, 2
 "#;
         assert_matches_cpython_marshal(source, "origin_sensitive_frozensets.py");
     }
@@ -622,6 +667,35 @@ class Outer:
         pass
 "#;
         assert_matches_cpython_marshal(source, "string_metadata_collision.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_qualified_name_constant_provenance() {
+        let source = r#"module_name = "<module>"
+
+def outer():
+    def nested():
+        pass
+    return "outer.<locals>.nested"
+"#;
+        assert_matches_cpython_marshal(source, "qualified_name_constants.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_class_qualified_name_collisions() {
+        let source = r#"ordinary_before = "Before.Nested"
+
+class Before:
+    class Nested:
+        pass
+
+class After:
+    class Nested:
+        pass
+
+ordinary_after = "After.Nested"
+"#;
+        assert_matches_cpython_marshal(source, "class_qualified_name_collision.py");
     }
 
     #[test]

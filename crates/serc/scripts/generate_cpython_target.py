@@ -118,13 +118,20 @@ def read_inputs(checkout: Path) -> dict[str, str]:
     }
 
 
-def parse_static_identifiers(source: str) -> list[str]:
-    identifiers = sorted(
-        set(re.findall(r"STRUCT_FOR_ID\(([A-Za-z_][A-Za-z0-9_]*)\)", source))
+def parse_preinterned_strings(source: str) -> list[str]:
+    strings = set(re.findall(r"STRUCT_FOR_ID\(([A-Za-z_][A-Za-z0-9_]*)\)", source))
+    literal_tokens = re.findall(
+        r'STRUCT_FOR_STR\([^,]+,\s*("(?:\\.|[^"\\])*")\)',
+        source,
     )
-    if not identifiers or "sort" not in identifiers:
-        raise ValueError("static identifier table is incomplete")
-    return identifiers
+    try:
+        strings.update(ast.literal_eval(token) for token in literal_tokens)
+    except (SyntaxError, ValueError) as error:
+        raise ValueError("invalid static string literal") from error
+    required = {"", "<module>", "sort"}
+    if not required.issubset(strings):
+        raise ValueError("pre-interned string table is incomplete")
+    return sorted(strings)
 
 
 def parse_opcodes(source: str) -> list[tuple[str, int]]:
@@ -338,7 +345,7 @@ def render(sources: dict[str, str]) -> str:
     codegen = sources["Python/codegen.c"]
     flowgraph = sources["Python/flowgraph.c"]
 
-    static_identifiers = parse_static_identifiers(global_strings)
+    preinterned_strings = parse_preinterned_strings(global_strings)
     opcodes = parse_opcodes(opcode_ids)
     opcode_names = {name for name, _ in opcodes}
     caches = parse_caches(metadata)
@@ -590,14 +597,14 @@ def render(sources: dict[str, str]) -> str:
         lines.append(
             f"    pub(crate) const {name}: Opcode = Opcode::new({code}, {caches.get(name, 0)});"
         )
-    lines.extend(["}", "", "pub(crate) static STATIC_IDENTIFIERS: &[&str] = &["])
-    lines.extend(f'    "{identifier}",' for identifier in static_identifiers)
+    lines.extend(["}", "", "pub(crate) static PREINTERNED_STRINGS: &[&str] = &["])
+    lines.extend(f'    "{value}",' for value in preinterned_strings)
     lines.extend(
         [
             "];",
             "",
-            "pub(crate) fn is_static_identifier(value: &str) -> bool {",
-            "    STATIC_IDENTIFIERS.binary_search(&value).is_ok()",
+            "pub(crate) fn is_preinterned_string(value: &str) -> bool {",
+            "    PREINTERNED_STRINGS.binary_search(&value).is_ok()",
             "}",
             "",
             "#[allow(dead_code)]",

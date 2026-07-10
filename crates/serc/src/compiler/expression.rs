@@ -4079,7 +4079,7 @@ impl Compiler {
                     self.emit_folded_tuple_not_nops(element)?;
                 }
                 self.assembler.set_location(expression_location);
-                self.emit_deferred_iterable_frozenset(unique)?;
+                self.emit_deferred_constant(Constant::FrozenSet(unique))?;
                 self.assembler
                     .add_last_hidden_exception_owner_slots(folded_elements_owner_slots(
                         &set.elts,

@@ -151,7 +151,25 @@ pub(crate) mod opcodes {
     pub(crate) const RESUME: Opcode = Opcode::new(128, 0);
 }
 
-pub(crate) static STATIC_IDENTIFIERS: &[&str] = &[
+pub(crate) static PREINTERNED_STRINGS: &[&str] = &[
+    "",
+    "%%",
+    ".<locals>",
+    ".defaults",
+    ".format",
+    ".generic_base",
+    ".kwdefaults",
+    ".type_params",
+    "1e309",
+    "<NULL>",
+    "<dictcomp>",
+    "<genexpr>",
+    "<lambda>",
+    "<listcomp>",
+    "<module>",
+    "<setcomp>",
+    "<string>",
+    "<unknown>",
     "CANCELLED",
     "FINISHED",
     "False",
@@ -634,6 +652,7 @@ pub(crate) static STATIC_IDENTIFIERS: &[&str] = &[
     "iterable",
     "iterations",
     "join",
+    "json.decoder",
     "jump",
     "keepends",
     "key",
@@ -661,6 +680,7 @@ pub(crate) static STATIC_IDENTIFIERS: &[&str] = &[
     "line",
     "line_buffering",
     "lineno",
+    "list index out of range",
     "listcomp",
     "little",
     "lo",
@@ -888,6 +908,7 @@ pub(crate) static STATIC_IDENTIFIERS: &[&str] = &[
     "unraisablehook",
     "uri",
     "usedforsecurity",
+    "utf-8",
     "value",
     "values",
     "version",
@@ -908,10 +929,12 @@ pub(crate) static STATIC_IDENTIFIERS: &[&str] = &[
     "year",
     "zdict",
     "zstd_dict",
+    "{{",
+    "}}",
 ];
 
-pub(crate) fn is_static_identifier(value: &str) -> bool {
-    STATIC_IDENTIFIERS.binary_search(&value).is_ok()
+pub(crate) fn is_preinterned_string(value: &str) -> bool {
+    PREINTERNED_STRINGS.binary_search(&value).is_ok()
 }
 
 #[allow(dead_code)]
