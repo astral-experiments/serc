@@ -96,17 +96,42 @@ pub(super) struct OperandPatch {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(super) struct LoadPolicy {
-    pub(super) force_owned: bool,
-    pub(super) strict_owned: bool,
-}
+pub(super) struct LocalPolicy(u8);
 
-impl LoadPolicy {
-    const fn fused(first: Self, second: Self) -> Self {
-        Self {
-            force_owned: first.force_owned || second.force_owned,
-            strict_owned: first.strict_owned || second.strict_owned,
+impl LocalPolicy {
+    const FORCE_OWNED_LOAD: u8 = 1 << 0;
+    const STRICT_OWNED_LOAD: u8 = 1 << 1;
+    const MAYBE_NULL_COMPREHENSION_RESTORE: u8 = 1 << 2;
+
+    pub(super) const fn for_load(force_owned: bool, strict_owned: bool) -> Self {
+        let mut policy = 0;
+        if force_owned {
+            policy |= Self::FORCE_OWNED_LOAD;
         }
+        if strict_owned {
+            policy |= Self::STRICT_OWNED_LOAD;
+        }
+        Self(policy)
+    }
+
+    pub(super) const fn force_owned_load(self) -> bool {
+        self.0 & Self::FORCE_OWNED_LOAD != 0
+    }
+
+    pub(super) const fn strict_owned_load(self) -> bool {
+        self.0 & Self::STRICT_OWNED_LOAD != 0
+    }
+
+    pub(super) const fn may_store_null(self) -> bool {
+        self.0 & Self::MAYBE_NULL_COMPREHENSION_RESTORE != 0
+    }
+
+    pub(super) fn mark_maybe_null_comprehension_restore(&mut self) {
+        self.0 |= Self::MAYBE_NULL_COMPREHENSION_RESTORE;
+    }
+
+    const fn fused(first: Self, second: Self) -> Self {
+        Self(first.0 | second.0)
     }
 }
 
@@ -484,7 +509,7 @@ pub(super) struct Instruction {
     // Keep that provenance separate from the provisional source location used by earlier passes.
     pub(super) location_from_next: bool,
     pub(super) depth_after: Option<u32>,
-    pub(super) load_policy: LoadPolicy,
+    pub(super) local_policy: LocalPolicy,
     pub(super) no_location_policy: NoLocationPolicy,
     pub(super) fusion_policy: FusionPolicy,
     pub(super) converted_pop_block: bool,
@@ -513,7 +538,7 @@ impl Instruction {
             location,
             location_from_next: false,
             depth_after,
-            load_policy: LoadPolicy::default(),
+            local_policy: LocalPolicy::default(),
             no_location_policy: NoLocationPolicy::default(),
             fusion_policy: FusionPolicy::default(),
             converted_pop_block: false,
@@ -561,7 +586,7 @@ impl Instruction {
             location,
             location_from_next,
             depth_after: second.depth_after,
-            load_policy: LoadPolicy::fused(first.load_policy, second.load_policy),
+            local_policy: LocalPolicy::fused(first.local_policy, second.local_policy),
             no_location_policy: NoLocationPolicy::fused(
                 first.no_location_policy,
                 second.no_location_policy,

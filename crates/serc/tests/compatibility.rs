@@ -2847,6 +2847,63 @@ def retained(manager, condition, items):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_maybe_null_comprehension_restores() {
+        let source = r#"def assigned(items):
+    target = "outer"
+    [target for target in items]
+    first(target)
+    second(target)
+
+def parameter(target, items):
+    [target for target in items]
+    first(target)
+    second(target)
+
+def with_target(manager, items):
+    with manager as target:
+        [target for target in items]
+        first(target)
+        second(target)
+
+def unrelated(items):
+    value = "outer"
+    [target for target in items]
+    first(value)
+    second(value)
+
+def rebound(items):
+    target = "outer"
+    [target for target in items]
+    target = "new"
+    first(target)
+    second(target)
+
+def discarded(items):
+    target = "outer"
+    {target for target in items}
+    first(target)
+    second(target)
+"#;
+        assert_matches_cpython_marshal(source, "maybe_null_comprehension_restore.py");
+    }
+
+    #[test]
+    fn leaves_comprehension_cell_restores_definitely_initialized() {
+        let source = r#"import dis
+
+def cell_restore(items):
+    target = "outer"
+    [target for target in items]
+    return (target for _ in items)
+
+for instruction in dis.get_instructions(cell_restore):
+    if instruction.argval == "target" and instruction.opname.startswith("LOAD_FAST"):
+        print(instruction.opname)
+"#;
+        assert_executes(source, "LOAD_FAST_AND_CLEAR\nLOAD_FAST_BORROW\n");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_inlined_comprehension_cells() {
         let source = r"module_result = [lambda: x for x in range(2)]
 

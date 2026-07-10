@@ -63,7 +63,9 @@ impl OptimizationPipeline {
                 }
                 match instruction.opcode {
                     DELETE_FAST | LOAD_FAST_AND_CLEAR => unsafe_locals[local] = true,
-                    STORE_FAST => unsafe_locals[local] = false,
+                    STORE_FAST => {
+                        unsafe_locals[local] = instruction.local_policy.may_store_null();
+                    }
                     LOAD_FAST_CHECK => {
                         if !unsafe_locals[local] {
                             instruction.opcode = LOAD_FAST;
@@ -195,7 +197,9 @@ impl OptimizationPipeline {
                 }
                 match instruction.opcode {
                     DELETE_FAST | LOAD_FAST_AND_CLEAR => unsafe_locals[local] = true,
-                    STORE_FAST => unsafe_locals[local] = false,
+                    STORE_FAST => {
+                        unsafe_locals[local] = instruction.local_policy.may_store_null();
+                    }
                     LOAD_FAST_CHECK => {
                         if unsafe_locals[local] {
                             checked_loads_needing_check.insert(position);
@@ -273,8 +277,15 @@ impl OptimizationPipeline {
                         }
                         initialized.insert(argument);
                     }
-                    LOAD_FAST | STORE_DEREF | STORE_FAST => {
+                    LOAD_FAST | STORE_DEREF => {
                         initialized.insert(argument);
+                    }
+                    STORE_FAST => {
+                        if instruction.local_policy.may_store_null() {
+                            initialized.remove(&argument);
+                        } else {
+                            initialized.insert(argument);
+                        }
                     }
                     LOAD_FAST_LOAD_FAST | STORE_FAST_LOAD_FAST | STORE_FAST_STORE_FAST => {
                         initialized.extend([argument >> 4, argument & 15]);
@@ -632,14 +643,14 @@ impl OptimizationPipeline {
                 if unsafe_loads.contains(&position) {
                     continue;
                 }
-                let load_policy = match *graph.item(position) {
-                    Item::Instruction(instruction) => instruction.load_policy,
+                let local_policy = match *graph.item(position) {
+                    Item::Instruction(instruction) => instruction.local_policy,
                     Item::Label(_) => unreachable!(),
                 };
-                if load_policy.strict_owned {
+                if local_policy.strict_owned_load() {
                     continue;
                 }
-                if load_policy.force_owned {
+                if local_policy.force_owned_load() {
                     let following = instruction_positions[index + 1..]
                         .iter()
                         .filter_map(|position| match *graph.item(*position) {

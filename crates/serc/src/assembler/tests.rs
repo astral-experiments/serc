@@ -1,5 +1,5 @@
 use super::ir::{
-    BorrowFallthrough, ExceptionPolicy, FusionPolicy, JumpPolicy, LoadPolicy, NoLocationPolicy,
+    BorrowFallthrough, ExceptionPolicy, FusionPolicy, JumpPolicy, LocalPolicy, NoLocationPolicy,
     RetainedJumpNop, UnoptimizedCode,
 };
 use super::{
@@ -19,7 +19,8 @@ fn instruction_items_remain_cache_compact() {
 #[test]
 fn instruction_constructors_set_audited_defaults() {
     let regular = Instruction::new(LOAD_CONST, Operand::Value(0), SourceLocation::NONE, None);
-    assert_eq!(regular.load_policy, LoadPolicy::default());
+    assert_eq!(regular.local_policy, LocalPolicy::default());
+    assert!(!regular.local_policy.may_store_null());
     assert_eq!(regular.no_location_policy, NoLocationPolicy::default());
     assert_eq!(regular.fusion_policy, FusionPolicy::default());
     assert!(!regular.location_from_next);
@@ -472,7 +473,8 @@ fn fusion_preserves_each_typed_instruction_policy() {
         SourceLocation::new(2, 2, 0, 1),
         Some(1),
     );
-    first.load_policy.force_owned = true;
+    first.local_policy = LocalPolicy::for_load(true, false);
+    first.local_policy.mark_maybe_null_comprehension_restore();
     first.no_location_policy.allow_block_inlining();
     first.no_location_policy.make_first_copy_interruptible();
     first.no_location_policy.mark_artificial_eval_break();
@@ -496,7 +498,7 @@ fn fusion_preserves_each_typed_instruction_policy() {
         SourceLocation::new(2, 2, 2, 3),
         Some(2),
     );
-    second.load_policy.strict_owned = true;
+    second.local_policy = LocalPolicy::for_load(false, true);
     second.no_location_policy.preserve = true;
     second.fusion_policy.prevent_with_previous = true;
     second.jump_policy.prevent_small_exit_inlining();
@@ -509,13 +511,9 @@ fn fusion_preserves_each_typed_instruction_policy() {
 
     let fused = Instruction::fused(LOAD_FAST_LOAD_FAST, Operand::Value(0x12), first, second);
 
-    assert_eq!(
-        fused.load_policy,
-        LoadPolicy {
-            force_owned: true,
-            strict_owned: true,
-        }
-    );
+    let mut expected_local_policy = LocalPolicy::for_load(true, true);
+    expected_local_policy.mark_maybe_null_comprehension_restore();
+    assert_eq!(fused.local_policy, expected_local_policy);
     assert!(fused.no_location_policy.allows_block_inlining());
     assert!(
         fused
@@ -600,8 +598,8 @@ fn owned_fast_loads_use_real_opcodes_with_provenance() {
         panic!("owned load was not emitted");
     };
     assert_eq!(instruction.opcode, LOAD_FAST);
-    assert!(instruction.load_policy.force_owned);
-    assert!(!instruction.load_policy.strict_owned);
+    assert!(instruction.local_policy.force_owned_load());
+    assert!(!instruction.local_policy.strict_owned_load());
 }
 
 #[test]
@@ -1017,6 +1015,24 @@ fn uninitialized_load_analysis_follows_single_block_backedges() {
     assert_eq!(
         graph_opcodes(&assembler),
         [LOAD_FAST_CHECK, DELETE_FAST, JUMP_BACKWARD]
+    );
+}
+
+#[test]
+fn maybe_null_comprehension_restore_checks_only_the_first_later_load() {
+    let mut restore = Instruction::new(STORE_FAST, Operand::Value(0), SourceLocation::NONE, None);
+    restore.local_policy.mark_maybe_null_comprehension_restore();
+    let mut assembler = optimization_pipeline(vec![
+        Item::Instruction(restore),
+        pass_instruction(LOAD_FAST, 0, 1),
+        pass_instruction(LOAD_FAST, 0, 1),
+    ]);
+
+    assembler.add_checks_for_uninitialized_loads(1, 1);
+
+    assert_eq!(
+        graph_opcodes(&assembler),
+        [STORE_FAST, LOAD_FAST_CHECK, LOAD_FAST]
     );
 }
 

@@ -33,7 +33,9 @@ use super::source::{
     condition_exit_range, implicit_return_range, synthetic_condition_exit_range,
     unary_not_condition_exit_range, unparse_annotation,
 };
-use super::symbol::{ReraiseStackState, ResumeDepth, statement_name, to_u32, unsupported};
+use super::symbol::{
+    ComprehensionRestore, ReraiseStackState, ResumeDepth, statement_name, to_u32, unsupported,
+};
 use super::{Compiler, Scope};
 
 #[derive(Clone, Copy, Debug)]
@@ -182,7 +184,7 @@ impl TryCompileOptions {
 pub(super) struct ControlFlowState {
     pub(super) defer_async_comprehension_restore: bool,
     pub(super) reorder_async_comprehension_cleanup_throw: bool,
-    pub(super) pending_comprehension_restores: Vec<(Vec<u32>, SourceLocation)>,
+    pub(super) pending_comprehension_restores: Vec<(Vec<ComprehensionRestore>, SourceLocation)>,
     pub(super) active_comprehension_cleanups: Vec<(Label, u32)>,
     pub(super) active_comprehension_local_names: Vec<NameSet>,
     pub(super) active_comprehension_region_exclusions: Vec<Vec<(Label, Label)>>,
