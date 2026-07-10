@@ -44,6 +44,7 @@ struct LoopContext {
     continue_label: Label,
     break_label: Label,
     iterator_cleanup: IteratorCleanup,
+    protect_boolean_return_cleanup: bool,
     with_depth: usize,
     finally_end_depth: usize,
     exception_region_depth: usize,
@@ -233,7 +234,8 @@ pub(super) struct ControlFlowState {
     pub(super) defer_terminal_with_exclusion_through_negation: bool,
     pub(super) exclude_condition_not_taken_from_exception: bool,
     pub(super) include_assert_none_condition_owner: bool,
-    pub(super) preserve_assert_chained_comparison_exit_nop: bool,
+    // The final chained comparison whose fallthrough jump survives small-exit inlining as a NOP.
+    pub(super) retained_chained_comparison_exit: Option<TextRange>,
     pub(super) exclude_condition_not_taken_from_all_exception_regions: bool,
     // CPython normalizes a loop-tail while condition through a fresh backward-jump block. Its
     // `NOT_TAKEN` slot therefore cannot inherit the compacted condition block's stale owner.
@@ -328,6 +330,13 @@ impl ControlFlowState {
         })
     }
 
+    fn protects_boolean_return_iterator_cleanup(&self) -> bool {
+        self.loops.last().is_some_and(|context| {
+            context.protect_boolean_return_cleanup
+                && context.exception_region_depth == self.active_exception_region_exclusions.len()
+        })
+    }
+
     /// Returns whether a direct Boolean exception-type marker should retain its owner.
     ///
     /// CPython appends normalized markers without initializing the reused CFG instruction slot.
@@ -356,6 +365,7 @@ impl Compiler {
             continue_label,
             break_label,
             iterator_cleanup,
+            protect_boolean_return_cleanup: false,
             with_depth: self.control.active_with_exits.len(),
             finally_end_depth: self.control.active_finally_end_blocks,
             exception_region_depth: self.control.active_exception_region_exclusions.len(),
@@ -2251,17 +2261,21 @@ impl Compiler {
                         (self.control.active_finally_end_blocks, start)
                     });
                 let finally_end_unwind_start = self.emit_finally_end_unwind(0, preserve_tos)?;
-                // A call result returned from a loop that was already protected by this try
-                // keeps the iterator SWAP/POP protected. Exclude only the RETURN_VALUE itself;
-                // nested handlers and finally bodies take distinct cleanup paths.
+                // A result returned from a loop that was already protected by this try keeps the
+                // iterator cleanup protected. For a Boolean literal, start the exclusion before
+                // loading the returned constant; a call already has its value on the stack.
+                let delay_boolean_iterator_exception_unwind_start =
+                    matches!(statement.value.as_deref(), Some(Expr::BooleanLiteral(_)))
+                        && self.control.protects_boolean_return_iterator_cleanup();
                 let delay_iterator_exception_unwind_start = overriding_unwind_start.is_none()
                     && !self.control.active_exception_region_exclusions.is_empty()
                     && self.control.active_with_exits.is_empty()
                     && !unwinds_pass_finally
                     && self.control.active_exception_handlers.is_empty()
                     && self.control.active_return_finally_contexts.is_empty()
-                    && matches!(statement.value.as_deref(), Some(Expr::Call(_)))
-                    && self.control.in_exception_protected_iterator_loop();
+                    && (delay_boolean_iterator_exception_unwind_start
+                        || (matches!(statement.value.as_deref(), Some(Expr::Call(_)))
+                            && self.control.in_exception_protected_iterator_loop()));
                 let delay_exception_unwind_start = delay_iterator_exception_unwind_start
                     || (overriding_unwind_start.is_none()
                         && !self.control.active_exception_region_exclusions.is_empty()
@@ -2421,6 +2435,14 @@ impl Compiler {
                     self.control.active_return_finally_contexts = return_finally_contexts;
                 }
                 self.emit_loop_iterator_cleanup(0, next_loop, preserve_tos)?;
+                if delay_boolean_iterator_exception_unwind_start
+                    && delay_iterator_exception_unwind_start
+                    && exception_unwind_start.is_none()
+                {
+                    let start = self.assembler.label();
+                    self.assembler.mark(start);
+                    exception_unwind_start = Some(start);
+                }
                 let with_unwind_starts = self.emit_active_with_unwind(0, preserve_tos)?;
                 let finally_unwind_start = if unwinds_pass_finally {
                     let start = if let Some(start) = pass_finally_edge_start {
@@ -2666,13 +2688,32 @@ impl Compiler {
                     && (!self.control.active_with_region_exclusions.is_empty()
                         || !self.control.active_exception_region_exclusions.is_empty()
                         || self.control.generator_region_start.is_some());
+                // An earlier or active handler can leave independently mismatched cold blocks
+                // whose offsets currently balance CPython's table. Iterator-loop exits already
+                // have the stable copied layout needed to retain this otherwise-missing NOP.
+                let stable_terminal_exit_layout = self.control.in_iterator_loop()
+                    || (self.control.active_exception_region_exclusions.is_empty()
+                        && !self.assembler.contains_opcode(PUSH_EXC_INFO));
+                let retained_chained_comparison_exit =
+                    (matches!(body, [Stmt::Return(_) | Stmt::Raise(_)])
+                        && stable_terminal_exit_layout)
+                        .then(|| final_chained_comparison_jump(test, false))
+                        .flatten();
                 self.with_control_override(
-                    |control| &mut control.exclude_terminal_if_not_taken,
-                    exclude_not_taken,
+                    |control| &mut control.retained_chained_comparison_exit,
+                    retained_chained_comparison_exit,
                     |compiler| {
-                        compiler.with_terminal_try_condition_exception_exclusion(
-                            compiler.terminal_try_condition_includes_generator_region(branch_index),
-                            |compiler| compiler.compile_jump_if(test, false, next),
+                        compiler.with_control_override(
+                            |control| &mut control.exclude_terminal_if_not_taken,
+                            exclude_not_taken,
+                            |compiler| {
+                                compiler.with_terminal_try_condition_exception_exclusion(
+                                    compiler.terminal_try_condition_includes_generator_region(
+                                        branch_index,
+                                    ),
+                                    |compiler| compiler.compile_jump_if(test, false, next),
+                                )
+                            },
                         )
                     },
                 )?;
@@ -3845,11 +3886,24 @@ impl Compiler {
         self.emit_jump_forward(FOR_ITER, cleanup, 1)?;
         self.compile_store_target(&statement.target)?;
 
-        let context = self.loop_context(
+        let mut context = self.loop_context(
             start,
             end,
             IteratorCleanup::Sync,
             self.loop_break_policy(statement.range),
+        );
+        context.protect_boolean_return_cleanup = matches!(
+            statement.body.as_slice(),
+            [Stmt::If(branch)]
+                if branch.elif_else_clauses.is_empty()
+                    && matches!(
+                        branch.body.as_slice(),
+                        [Stmt::Return(return_statement)]
+                            if matches!(
+                                return_statement.value.as_deref(),
+                                Some(Expr::BooleanLiteral(_))
+                            )
+                    )
         );
         let body_start = self.assembler.instruction_count();
         let tail_jumps = self.with_loop_context(context, |compiler| {
@@ -4299,14 +4353,17 @@ impl Compiler {
         let base_depth = self.control.depth;
         let end = self.assembler.label();
         let include_none_owner = !self.control.active_with_region_exclusions.is_empty();
-        let preserve_chained_comparison_exit_nop = matches!(statement.test.as_ref(), Expr::Compare(comparison) if comparison.ops.len() > 1);
+        let retained_chained_comparison_exit = match statement.test.as_ref() {
+            Expr::Compare(comparison) if comparison.ops.len() > 1 => Some(comparison.range),
+            _ => None,
+        };
         self.with_control_override(
             |control| &mut control.include_assert_none_condition_owner,
             include_none_owner,
             |compiler| {
                 compiler.with_control_override(
-                    |control| &mut control.preserve_assert_chained_comparison_exit_nop,
-                    preserve_chained_comparison_exit_nop,
+                    |control| &mut control.retained_chained_comparison_exit,
+                    retained_chained_comparison_exit,
                     |compiler| compiler.compile_jump_if(&statement.test, true, end),
                 )
             },
@@ -5113,7 +5170,8 @@ impl Compiler {
                         common_cleanup,
                         protect_outer_return_pop: nested_handler_tail_if_with_terminal_handlers
                             || (handler_name.is_none()
-                                && suite_terminates(&statement.body)
+                                && (suite_terminates(&statement.body)
+                                    || self.control.current_statement_has_following)
                                 && matches!(handler.body.as_slice(), [Stmt::Return(_)])
                                 && matches!(
                                     self.control.active_exception_handlers.as_slice(),
@@ -7183,6 +7241,38 @@ fn expression_contains_chained_comparison(expression: &Expr) -> bool {
     let mut detector = Detector::default();
     detector.visit_expr(expression);
     detector.found
+}
+
+// Returns the final chained comparison that `compile_jump_if` lowers with the requested edge.
+// Only this final comparison can be adjacent to a copied terminal exit after CFG optimization.
+fn final_chained_comparison_jump(expression: &Expr, jump_on: bool) -> Option<TextRange> {
+    if let Expr::UnaryOp(unary) = expression
+        && unary.op == UnaryOp::Not
+    {
+        return final_chained_comparison_jump(&unary.operand, !jump_on);
+    }
+    if let Expr::If(conditional) = expression
+        && let Some(truthiness) = early_condition_truthiness(&conditional.test)
+    {
+        return final_chained_comparison_jump(
+            if truthiness {
+                &conditional.body
+            } else {
+                &conditional.orelse
+            },
+            jump_on,
+        );
+    }
+    if let Expr::BoolOp(boolean) = expression {
+        return boolean
+            .values
+            .last()
+            .and_then(|value| final_chained_comparison_jump(value, jump_on));
+    }
+    match expression {
+        Expr::Compare(comparison) if jump_on && comparison.ops.len() > 1 => Some(comparison.range),
+        _ => None,
+    }
 }
 
 pub(super) fn suite_terminates(body: &[Stmt]) -> bool {

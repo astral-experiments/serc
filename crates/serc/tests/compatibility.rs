@@ -1886,6 +1886,16 @@ def inner_try_return(items):
             pass
 
 
+def protected_boolean_return(items):
+    try:
+        for item in items:
+            if item.ready():
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def unprotected_continue(items):
     for item in items:
         if not item.ready():
@@ -2583,6 +2593,20 @@ def trailing_if_with_terminating_arm(first, second):
             value = recover()
         else:
             value = fallback()
+    return value
+
+
+def nested_handler_return_before_following(first, second):
+    try:
+        value = first()
+    except Error:
+        try:
+            result = second()
+        except OtherError:
+            return None
+        def normalize(value):
+            return value
+        return normalize(result)
     return value
 ";
         assert_matches_cpython_marshal(source, "bare_handler_inlineable_cleanup.py");
@@ -3525,6 +3549,24 @@ def consecutive_fresh(values):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_recursive_tail_conditional_lambdas() {
+        let source = r"lambda_else = lambda outer, inner, first, second, third: (
+    first if outer else second if inner else third
+)
+lambda_body = lambda outer, inner, first, second, third: (
+    (first if inner else second) if outer else third
+)
+
+
+def assignment_control(holder, outer, inner, first, second, third):
+    holder.value = (
+        (first if inner else second) if outer else third
+    )
+";
+        assert_matches_cpython_marshal(source, "recursive_tail_conditional_lambdas.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_a_folded_dictionary_comprehension_key() {
         let source = "def folded_key():\n    return {x if True else y: y for x in range(10) for y in range(10)}\n";
         assert_matches_cpython_marshal(source, "folded_key.py");
@@ -3791,6 +3833,80 @@ def non_assertion_chain(first, middle, last):
     after()
 "#;
         assert_matches_cpython_marshal(source, "assert_chained_comparison_exit_nops.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_terminal_negated_chained_comparison_exit_nops() {
+        let source = r#"def direct_raise(low, value, high):
+    if not (low <= value < high):
+        raise IndexError
+    consume()
+
+
+def prefixed_elif(kind, enabled, low, value, high):
+    if kind == "simple":
+        consume()
+    elif enabled and not (low <= value < high):
+        raise IndexError
+    finish()
+
+
+def direct_return(low, value, high):
+    if not (low <= value < high):
+        return value
+    consume()
+
+
+def two_negated_chains(a, b, c, d, e, f):
+    if not (a < b < c) and not (d < e < f):
+        raise ValueError
+    finish()
+
+
+def terminating_else(low, value, high):
+    if not (low <= value < high):
+        raise IndexError
+    else:
+        raise ValueError
+
+
+def loop_raise_after_try(items, enabled, low, value, high):
+    for item in items:
+        try:
+            prepare(item)
+        except ValueError:
+            recover()
+        if item is None:
+            consume(item)
+        elif enabled and not (low <= value < high):
+            raise IndexError
+        finish(item)
+
+
+def final_operand_control(low, value, high, enabled):
+    if not (low <= value < high) and enabled:
+        raise IndexError
+    consume()
+
+
+def multi_statement_control(low, value, high):
+    if not (low <= value < high):
+        consume()
+        raise IndexError
+    finish()
+
+
+def loop_controls(items, low, value, high):
+    for item in items:
+        if not (low <= value < high):
+            break
+        consume(item)
+    for item in items:
+        if not (low <= value < high):
+            continue
+        consume(item)
+"#;
+        assert_matches_cpython_marshal(source, "terminal_negated_chained_comparison_exit_nops.py");
     }
 
     #[test]
