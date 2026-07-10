@@ -3822,6 +3822,20 @@ async def coroutine_terminal_break(result, read, stop):
     fourth(result)
     fifth(result)
     return result
+
+def earlier_and_tail_break(first_flag, last_flag, result):
+    while True:
+        if first_flag:
+            break
+        step()
+        if last_flag:
+            break
+    first(result)
+    second(result)
+    third(result)
+    fourth(result)
+    fifth(result)
+    return result
 ";
         assert_matches_cpython_marshal(source, "constant_loop_break_borrowing.py");
     }

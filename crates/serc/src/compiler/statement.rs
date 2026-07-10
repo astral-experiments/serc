@@ -7212,9 +7212,14 @@ fn suite_contains_unprotected_nontail_conditional_loop_break(body: &[Stmt]) -> b
         false
     }
 
-    let Some((_, leading)) = body.split_last() else {
+    let Some((last, leading)) = body.split_last() else {
         return false;
     };
+    if suite_contains_loop_break(std::slice::from_ref(last))
+        && suite_contains_loop_continue(leading)
+    {
+        return false;
+    }
     contains(leading, false)
 }
 
