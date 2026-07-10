@@ -3832,6 +3832,35 @@ def finally_guard(value, manager):
     except Error:
         raise
 
+def combined_loop(manager, items):
+    for item in items:
+        try:
+            with manager:
+                action(item)
+        except Error:
+            recover()
+        finally:
+            cleanup()
+
+def combined_following(manager):
+    try:
+        with manager:
+            action()
+    except Error:
+        recover()
+    finally:
+        cleanup()
+    after()
+
+def combined_terminal(manager):
+    try:
+        with manager:
+            action()
+    except Error:
+        recover()
+    finally:
+        cleanup()
+
 def ordinary_guard(value):
     try:
         action()

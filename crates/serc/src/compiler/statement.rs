@@ -244,6 +244,9 @@ pub(super) struct ControlFlowState {
     current_statement_followed_by_name_return: bool,
     // The direct final synchronous `with` in an active non-final try body, if any.
     direct_final_sync_with_try_body: Option<ruff_text_size::TextRange>,
+    // The direct final synchronous `with` with a normal body fallthrough in the nested
+    // try/except body synthesized while lowering a combined try/except/finally statement.
+    direct_final_sync_with_combined_try_body: Option<ruff_text_size::TextRange>,
     pub(super) generator_region_start: Option<Label>,
     pub(super) generator_region_exclusions: Vec<(Label, Label)>,
     pub(super) emitted_fallthrough_return: bool,
@@ -314,22 +317,43 @@ impl Compiler {
             .body
             .first()
             .is_some_and(|body| self.source_location(body.range()).line == try_line);
+        let final_sync_with_try_body =
+            statement.body.last().and_then(|statement| match statement {
+                Stmt::With(statement) if !statement.is_async => Some(statement.range),
+                _ => None,
+            });
+        let final_sync_with_body_falls_through = statement.body.last().is_some_and(|statement| {
+            matches!(
+                statement,
+                Stmt::With(statement)
+                    if !statement.is_async && !suite_terminates(&statement.body)
+            )
+        });
         let direct_final_sync_with_try_body = (self.control.current_statement_has_following
             && statement.orelse.is_empty())
-        .then(|| statement.body.last())
-        .flatten()
-        .and_then(|statement| match statement {
-            Stmt::With(statement) if !statement.is_async => Some(statement.range),
-            _ => None,
-        });
+        .then_some(final_sync_with_try_body)
+        .flatten();
+        let direct_final_sync_with_combined_try_body = (statement.orelse.is_empty()
+            && !statement.handlers.is_empty()
+            && !statement.finalbody.is_empty()
+            && final_sync_with_body_falls_through
+            && self.control.generator_region_start.is_none())
+        .then_some(final_sync_with_try_body)
+        .flatten();
         self.with_control_override(
             |control| &mut control.same_line_try_body,
             same_line,
             |compiler| {
                 compiler.with_control_override(
-                    |control| &mut control.direct_final_sync_with_try_body,
-                    direct_final_sync_with_try_body,
-                    compile,
+                    |control| &mut control.direct_final_sync_with_combined_try_body,
+                    direct_final_sync_with_combined_try_body,
+                    |compiler| {
+                        compiler.with_control_override(
+                            |control| &mut control.direct_final_sync_with_try_body,
+                            direct_final_sync_with_try_body,
+                            compile,
+                        )
+                    },
                 )
             },
         )
@@ -6194,9 +6218,11 @@ impl Compiler {
         terminal: bool,
     ) -> Result<(), CompileError> {
         // A direct try/except omits its owner from the suppressed handler exit. A synthetic
-        // try/finally protected body keeps that owner instead.
-        let exclude_handler_exit = self.control.active_finally_try_bodies == 0
-            && self.control.direct_final_sync_with_try_body == Some(statement.range);
+        // try/finally protected body keeps its sole owner, while a combined try/except/finally
+        // omits only the nested try/except owner and remains covered by the outer finally.
+        let exclude_handler_exit = (self.control.active_finally_try_bodies == 0
+            && self.control.direct_final_sync_with_try_body == Some(statement.range))
+            || self.control.direct_final_sync_with_combined_try_body == Some(statement.range);
         self.compile_with_items(
             &statement.items,
             &statement.body,
