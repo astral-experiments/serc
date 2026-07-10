@@ -83,11 +83,25 @@ fn no_exit_copy_analysis(
             && !block_has_fallthrough(graph[target].items())
             && target_last.no_location_policy.allows_block_inlining()
             && (!source_has_fallthrough || predecessors[target.index()] > 1);
+        let split_no_location_exit = target_has_no_location
+            && block_has_fallthrough(graph[target].items())
+            && order
+                .get(positions[target.index()] + 1)
+                .is_some_and(|next| {
+                    predecessors[next.index()] == 1
+                        && graph[*next].items().iter().any(|item| {
+                            matches!(item, Item::Label(label) if exception_regions.iter().any(
+                                |region| {
+                                    region.start == *label || region.end == *label
+                                }
+                            ))
+                        })
+                });
         let small_exit_source = !source_has_fallthrough
             && graph[source]
                 .last_instruction()
                 .is_some_and(|instruction| instruction.jump_policy.inline_small_exit());
-        shared_exit || no_location_exit || small_exit_source
+        shared_exit || no_location_exit || split_no_location_exit || small_exit_source
     });
     if !possible_copy {
         return Some(NoExitCopyAnalysis {
@@ -106,14 +120,10 @@ fn no_exit_copy_analysis(
         .iter()
         .flat_map(|region| [region.start, region.end])
         .collect::<FxHashSet<_>>();
-
     for source in order.iter().copied() {
         let Some(target) =
             block_jump_target(graph[source].items()).and_then(|label| graph.label_block(label))
         else {
-            continue;
-        };
-        let Some(target_last) = graph[target].last_instruction() else {
             continue;
         };
         let target_position = positions[target.index()];
@@ -128,6 +138,10 @@ fn no_exit_copy_analysis(
             target_chain_end += 1;
         }
         let target_blocks = &order[target_position..=target_chain_end];
+        let target_exit = *target_blocks.last().expect("target chain is nonempty");
+        let Some(target_last) = graph[target_exit].last_instruction() else {
+            continue;
+        };
         let target_pre_fusion_size = target_blocks
             .iter()
             .flat_map(|block| graph[*block].items())
@@ -183,12 +197,10 @@ fn no_exit_copy_analysis(
             })
         });
         let no_location_exit = target_has_no_location
-            && !block_has_fallthrough(graph[target].items())
+            && !block_has_fallthrough(graph[target_exit].items())
             && target_last.no_location_policy.allows_block_inlining();
         let shared_exit = predecessors[target.index()] > 1
-            && ((graph[target].items().iter().all(|item| {
-                !matches!(item, Item::Instruction(instruction) if instruction.location.line >= 0)
-            }) && ends_scope(target_last.opcode))
+            && ((target_has_no_location && ends_scope(target_last.opcode))
                 || target_last.no_location_policy.is_artificial_eval_break());
         if inline_small_exit
             || (!source_has_fallthrough && no_location_exit)
@@ -929,6 +941,7 @@ impl OptimizationPipeline {
                 target_chain_end += 1;
             }
             let target_blocks = &order[target_position..=target_chain_end];
+            let target_exit = *target_blocks.last().expect("target chain is nonempty");
             let target_pre_fusion_size = target_blocks
                 .iter()
                 .flat_map(|block| graph[*block].items())
@@ -990,12 +1003,12 @@ impl OptimizationPipeline {
                         if instruction.no_location_policy.is_artificial_eval_break())
                 })
             });
-            let target_allows_no_location_block_inlining = graph[target]
+            let target_allows_no_location_block_inlining = graph[target_exit]
                 .last_instruction()
                 .is_some_and(|instruction| instruction.no_location_policy.allows_block_inlining());
             let target_is_no_location_no_fallthrough = target_has_no_location
                 && target_allows_no_location_block_inlining
-                && !block_has_fallthrough(graph[target].items());
+                && !block_has_fallthrough(graph[target_exit].items());
             let inline_small_exit = !source_has_fallthrough
                 && target_is_small_exit
                 && source_allows_small_exit_inlining
@@ -1096,18 +1109,28 @@ impl OptimizationPipeline {
                 copied.push(Item::Label(copied_end));
                 copied_labels.insert(original, copied_end);
             }
-            copied_exception_regions.extend(self.exception_regions.iter().filter_map(|region| {
-                Some(ExceptionRegion {
-                    start: *copied_labels.get(&region.start)?,
-                    end: *copied_labels.get(&region.end)?,
-                    target: copied_labels
-                        .get(&region.target)
-                        .copied()
-                        .unwrap_or(region.target),
-                    depth: region.depth,
-                    preserve_lasti: region.preserve_lasti,
-                })
-            }));
+            // An exception split can end inside the copied cleanup even when its region began in
+            // the predecessor's handler body. Preserve that leading intersection in the copy;
+            // inner exclusions still divide the successive POP_EXCEPT instructions below.
+            copied_exception_regions.extend(self.exception_regions.iter().enumerate().filter_map(
+                |(index, region)| {
+                    let start = copied_labels.get(&region.start).copied().or_else(|| {
+                        (target_chain_end > target_position
+                            && region_memberships[index].contains(&target))
+                        .then_some(copied_label)
+                    })?;
+                    Some(ExceptionRegion {
+                        start,
+                        end: *copied_labels.get(&region.end)?,
+                        target: copied_labels
+                            .get(&region.target)
+                            .copied()
+                            .unwrap_or(region.target),
+                        depth: region.depth,
+                        preserve_lasti: region.preserve_lasti,
+                    })
+                },
+            ));
             if preserve_inlined_jump_nop {
                 let position = copied
                     .iter()
@@ -1123,20 +1146,42 @@ impl OptimizationPipeline {
                     )),
                 );
             }
-            if let Some(Item::Instruction(instruction)) = copied
-                .iter_mut()
-                .find(|item| matches!(item, Item::Instruction(_)))
-            {
-                let inherits_shared_predecessor = instruction
-                    .no_location_policy
-                    .copy_inherits_shared_predecessor();
-                if (target_has_no_location || target_has_artificial_eval_break)
-                    && (!inline_no_location_block
-                        || predecessors[&source] <= 1
-                        || inherits_shared_predecessor)
-                    && !instruction.no_location_policy.preserve
-                {
-                    instruction.location = source_location;
+            let inherit_copied_locations = copied
+                .iter()
+                .find_map(|item| match item {
+                    Item::Instruction(instruction) => Some(instruction),
+                    Item::Label(_) => None,
+                })
+                .is_some_and(|instruction| {
+                    let inherits_shared_predecessor = instruction
+                        .no_location_policy
+                        .copy_inherits_shared_predecessor();
+                    (target_has_no_location || target_has_artificial_eval_break)
+                        && (!inline_no_location_block
+                            || predecessors[&source] <= 1
+                            || inherits_shared_predecessor)
+                        && !instruction.no_location_policy.preserve
+                });
+            if inherit_copied_locations {
+                // Exception boundaries split the IR into blocks after CPython has already treated
+                // the synthetic cleanup as one source-less exit. Every copied split therefore
+                // inherits the same predecessor location as the entry block.
+                let copied_exception_split_labels = exception_split_labels
+                    .iter()
+                    .filter_map(|label| copied_labels.get(label).copied())
+                    .collect::<FxHashSet<_>>();
+                let mut block_needs_location = true;
+                for item in &mut copied {
+                    match item {
+                        Item::Label(label) if copied_exception_split_labels.contains(label) => {
+                            block_needs_location = true;
+                        }
+                        Item::Instruction(instruction) if block_needs_location => {
+                            instruction.location = source_location;
+                            block_needs_location = false;
+                        }
+                        Item::Instruction(_) | Item::Label(_) => {}
+                    }
                 }
             }
             if inline_small_exit || inline_no_location_block {

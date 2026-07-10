@@ -1185,6 +1185,78 @@ fn no_location_block_inlining_reaches_a_fixed_point() {
 }
 
 #[test]
+fn no_location_block_inlining_crosses_exception_splits() {
+    let restart = super::Label(0);
+    let source = super::Label(1);
+    let cleanup = super::Label(2);
+    let outer_unwind = super::Label(3);
+    let handler = super::Label(4);
+    let mut cleanup_jump = Instruction::new(
+        JUMP_BACKWARD_NO_INTERRUPT,
+        Operand::Backward(restart),
+        SourceLocation::NONE,
+        None,
+    );
+    cleanup_jump.jump_policy.prevent_threading_target();
+    cleanup_jump.no_location_policy.allow_block_inlining();
+    let mut assembler = optimization_pipeline(vec![
+        Item::Label(restart),
+        pass_instruction(NOP, 0, 0),
+        Item::Label(source),
+        pass_instruction(LOAD_CONST, 0, 1),
+        Item::Instruction(Instruction::new(
+            JUMP_FORWARD,
+            Operand::Forward(cleanup),
+            SourceLocation::new(1, 1, 0, 0),
+            None,
+        )),
+        Item::Label(cleanup),
+        pass_instruction(POP_EXCEPT, 0, -1),
+        Item::Label(outer_unwind),
+        pass_instruction(POP_EXCEPT, 0, -1),
+        Item::Instruction(cleanup_jump),
+        Item::Label(handler),
+        pass_instruction(RERAISE, 0, -1),
+    ]);
+    assembler.exception_regions.push(super::ExceptionRegion {
+        start: source,
+        end: outer_unwind,
+        target: handler,
+        depth: 0,
+        preserve_lasti: true,
+    });
+
+    assembler.duplicate_exit_blocks();
+    assembler.propagate_locations_within_blocks();
+
+    assert_eq!(
+        graph_opcodes(&assembler),
+        [
+            NOP,
+            LOAD_CONST,
+            POP_EXCEPT,
+            POP_EXCEPT,
+            JUMP_BACKWARD_NO_INTERRUPT,
+            POP_EXCEPT,
+            JUMP_BACKWARD_NO_INTERRUPT,
+            RERAISE,
+        ]
+    );
+    assert_eq!(
+        assembler
+            .graph
+            .iter_items()
+            .filter_map(|item| match item {
+                Item::Instruction(instruction) => Some(instruction.location.line),
+                Item::Label(_) => None,
+            })
+            .collect::<Vec<_>>(),
+        [0, 1, 1, 1, 1, -1, -1, -1]
+    );
+    assert_eq!(assembler.exception_regions.len(), 2);
+}
+
+#[test]
 fn direct_target_return_copy_crosses_an_exception_boundary() {
     let return_start = super::Label(0);
     let return_split = super::Label(1);

@@ -5112,6 +5112,18 @@ impl Compiler {
                 .as_except_handler()
                 .is_some_and(|handler| matches!(handler.body.as_slice(), [Stmt::Pass(_)]))
         });
+        // CPython folds every successful arm of a trailing nested conversion chain directly onto
+        // the iterator backedge. Restrict that layout to recursive one-call try/except/else arms
+        // so ordinary nested handlers keep their shared joins.
+        let nested_loop_conversion_try = self.control.in_iterator_loop()
+            && !self.control.current_statement_has_following
+            && is_loop_conversion_try(statement)
+            && (!self.control.active_exception_handlers.is_empty()
+                || statement.handlers.iter().any(|handler| {
+                    handler
+                        .as_except_handler()
+                        .is_some_and(|handler| matches!(handler.body.as_slice(), [Stmt::Try(_)]))
+                }));
         let trailing_fallthrough_handler_try = self
             .control
             .active_exception_handlers
@@ -5120,7 +5132,7 @@ impl Compiler {
             && self
                 .control
                 .is_direct_trailing_handler_statement(statement.range)
-            && try_has_fallthrough_body_and_handler(statement);
+            && (try_has_fallthrough_body_and_handler(statement) || nested_loop_conversion_try);
         let propagates_protected_loop_tail_mode =
             try_propagates_protected_loop_tail_mode(statement);
         let nested_handler_tail_if_with_terminal_handlers = handlers_terminate
@@ -6043,6 +6055,12 @@ impl Compiler {
                                 )
                         })
             );
+            let direct_nested_loop_handler_backedge = nested_loop_conversion_try;
+            let copy_nested_loop_handler_backedge = direct_nested_loop_handler_backedge
+                && matches!(
+                    handler.body.as_slice(),
+                    [Stmt::Try(nested)] if is_loop_conversion_try(nested)
+                );
             let handler_ends_with_inlineable_cleanup = handler_ends_with_preordered_named_cleanup
                 || handler.body.last().is_some_and(|tail| match tail {
                     Stmt::Try(nested) => {
@@ -6157,7 +6175,29 @@ impl Compiler {
                                 if matches!(expression.value.as_ref(), Expr::Call(_))
                         )
             );
-            let handler_ends_with_unlocated_cleanup = handler_ends_with_inlineable_cleanup
+            let handler_ends_with_unlocated_bare_raise_branch_cleanup = handler.name.is_none()
+                && handler.body.len() > 1
+                && matches!(
+                    handler.body.last(),
+                    Some(Stmt::If(tail))
+                        if tail.elif_else_clauses.is_empty()
+                            && matches!(
+                                tail.test.as_ref(),
+                                Expr::UnaryOp(unary)
+                                    if unary.op == UnaryOp::Not
+                                        && matches!(
+                                            unary.operand.as_ref(),
+                                            Expr::BoolOp(boolean) if boolean.op == BoolOp::Or
+                                        )
+                            )
+                            && matches!(
+                                tail.body.as_slice(),
+                                [Stmt::Raise(statement)]
+                                    if statement.exc.is_none() && statement.cause.is_none()
+                            )
+                );
+            let handler_ends_with_unlocated_cleanup = copy_nested_loop_handler_backedge
+                || handler_ends_with_inlineable_cleanup
                 || handler_ends_with_unlocated_if_cleanup
                 || handler_ends_with_preserved_unlocated_cleanup;
             let handler_ends_with_nonterminal_with = matches!(
@@ -6209,7 +6249,9 @@ impl Compiler {
             if terminal_handler_exclusions.is_none() && !terminal_handler_try_return {
                 // CPython propagates a handler's sole condition-fallthrough edge onto the
                 // normal cleanup block, even when code follows the enclosing try statement.
-                if let Some(Stmt::If(statement)) = handler.body.last()
+                if handler_ends_with_unlocated_bare_raise_branch_cleanup {
+                    self.assembler.set_location(SourceLocation::NONE);
+                } else if let Some(Stmt::If(statement)) = handler.body.last()
                     && let Some(test) = terminating_if_fallthrough_test(statement)
                     && let Some(test) = unique_condition_jump_target(test, false)
                 {
@@ -6239,6 +6281,7 @@ impl Compiler {
                         .make_last_no_location_copy_inherit_shared_predecessor();
                 }
                 if handler_ends_with_preserved_unlocated_cleanup
+                    || handler_ends_with_unlocated_bare_raise_branch_cleanup
                     || handler_ends_with_unlocated_if_cleanup
                 {
                     self.assembler.preserve_last_no_location();
@@ -6249,7 +6292,47 @@ impl Compiler {
                     self.store_name(name.as_str())?;
                     self.delete_name(name.as_str())?;
                 }
-                if terminal {
+                // Each copied arm leaves the current handler, then unwinds enclosing handlers at
+                // the same loop depth before taking the backedge. Exception exclusions begin at
+                // each successive POP_EXCEPT so the earlier pops retain their outer owners.
+                if direct_nested_loop_handler_backedge {
+                    let context = self.control.loops.last().copied().ok_or_else(|| {
+                        CompileError::Internal(
+                            "nested conversion handler outside iterator loop".to_string(),
+                        )
+                    })?;
+                    let loop_depth = self.control.loops.len();
+                    let mut unwind_exclusions = Vec::new();
+                    for index in (0..self.control.active_exception_handlers.len()).rev() {
+                        let (handler_loop_depth, name) = {
+                            let handler = &self.control.active_exception_handlers[index];
+                            (handler.loop_depth, handler.name)
+                        };
+                        if handler_loop_depth < loop_depth {
+                            break;
+                        }
+                        let exclusion_start = self.assembler.label();
+                        self.assembler.mark(exclusion_start);
+                        unwind_exclusions.push((index, exclusion_start));
+                        self.emit(POP_EXCEPT, 0, -1)?;
+                        if let Some(name) = name {
+                            let none = self.add_constant(Constant::None)?;
+                            self.emit(LOAD_CONST, none, 1)?;
+                            self.store_name_id(name)?;
+                            self.delete_name_id(name)?;
+                        }
+                    }
+                    self.emit_jump_backward(JUMP_BACKWARD, context.continue_label, 0)?;
+                    if copy_nested_loop_handler_backedge {
+                        self.assembler.prepare_last_no_location_block_for_inlining();
+                    }
+                    let unwind_end = self.assembler.label();
+                    self.assembler.mark(unwind_end);
+                    for (index, exclusion_start) in unwind_exclusions {
+                        self.control.active_exception_region_exclusions[index]
+                            .push((exclusion_start, unwind_end));
+                    }
+                } else if terminal {
                     self.emit_deferred_implicit_return()?;
                 } else {
                     let protected_loop_value_return = self.control.in_iterator_loop()
@@ -8265,6 +8348,38 @@ fn try_has_fallthrough_body_and_handler(statement: &ruff_python_ast::StmtTry) ->
                 if handler.as_except_handler().is_some_and(|handler| {
                     handler.name.is_none()
                         && matches!(handler.body.as_slice(), [Stmt::Expr(_)])
+                })
+        )
+}
+
+fn is_call_expression_suite(body: &[Stmt]) -> bool {
+    matches!(
+        body,
+        [Stmt::Expr(statement)] if matches!(statement.value.as_ref(), Expr::Call(_))
+    )
+}
+
+fn is_loop_conversion_try(statement: &ruff_python_ast::StmtTry) -> bool {
+    !statement.is_star
+        && statement.finalbody.is_empty()
+        && is_call_expression_suite(&statement.body)
+        && is_call_expression_suite(&statement.orelse)
+        && matches!(
+            statement.handlers.as_slice(),
+            [handler]
+                if handler.as_except_handler().is_some_and(|handler| {
+                    handler.name.is_none()
+                        && matches!(
+                            handler.type_.as_deref(),
+                            Some(Expr::Tuple(tuple)) if tuple.elts.len() >= 2
+                        )
+                        && match handler.body.as_slice() {
+                            [Stmt::Expr(statement)] => {
+                                matches!(statement.value.as_ref(), Expr::Call(_))
+                            }
+                            [Stmt::Try(statement)] => is_loop_conversion_try(statement),
+                            _ => false,
+                        }
                 })
         )
 }
