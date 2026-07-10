@@ -812,7 +812,9 @@ impl Compiler {
                     || matches!(statement, Stmt::If(statement)
                             if statement.elif_else_clauses.is_empty()
                                 || matches!(statement.elif_else_clauses.as_slice(), [clause]
-                                    if clause.test.is_none()));
+                                    if clause.test.is_none()))
+                    || matches!(statement, Stmt::Expr(expression)
+                        if matches!(expression.value.as_ref(), Expr::BoolOp(_)));
                 let suite_fallthrough_to_loop_backedge =
                     self.control.suite_fallthrough_to_loop_backedge
                         && is_final
@@ -1941,8 +1943,18 @@ impl Compiler {
                             .set_location(self.source_location(discard_range));
                     }
                 }
+                let loop_tail_boolean = self.control.suite_fallthrough_to_loop_backedge
+                    && !self.control.current_statement_has_following
+                    && matches!(expression.value.as_ref(), Expr::BoolOp(_));
+                if loop_tail_boolean
+                    && let Expr::BoolOp(boolean) = expression.value.as_ref()
+                    && let Some(last) = boolean.values.last()
+                {
+                    self.assembler
+                        .set_location(self.source_location(last.range()));
+                }
                 self.emit(POP_TOP, 0, -1)?;
-                if preserve_no_location {
+                if preserve_no_location && !loop_tail_boolean {
                     self.assembler.preserve_last_no_location();
                 }
             }
@@ -3793,7 +3805,16 @@ impl Compiler {
                 self.assembler
                     .set_location(self.source_location(statement.range()));
             }
+            let loop_tail_boolean = matches!(statement.body.last(), Some(Stmt::Expr(expression))
+                if matches!(expression.value.as_ref(), Expr::BoolOp(_)));
+            if loop_tail_boolean {
+                self.assembler.set_location(SourceLocation::NONE);
+            }
             self.emit_jump_backward(JUMP_BACKWARD, start, 0)?;
+            if loop_tail_boolean {
+                // CPython duplicates this unlocated loop exit onto every short-circuit edge.
+                self.assembler.mark_last_as_artificial_eval_break();
+            }
             if statement
                 .body
                 .last()
@@ -5008,7 +5029,14 @@ impl Compiler {
                         name: handler_name,
                         loop_depth: self.control.loops.len(),
                         common_cleanup,
-                        protect_outer_return_pop: nested_handler_tail_if_with_terminal_handlers,
+                        protect_outer_return_pop: nested_handler_tail_if_with_terminal_handlers
+                            || (handler_name.is_none()
+                                && suite_terminates(&statement.body)
+                                && matches!(handler.body.as_slice(), [Stmt::Return(_)])
+                                && matches!(
+                                    self.control.active_exception_handlers.as_slice(),
+                                    [outer] if outer.name.is_none()
+                                )),
                         common_cleanup_depth: (base_depth + 1).cast_unsigned(),
                     };
                     let ((), exclusions) = self.with_exception_handler(context, |compiler| {

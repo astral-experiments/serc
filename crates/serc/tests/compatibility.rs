@@ -5127,6 +5127,81 @@ def nested_handler(compiler):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_loop_tail_boolean_expression_exits() {
+        let source = r"def conjunction(items):
+    for item in items:
+        left(item) and right(item)
+
+
+def disjunction(items):
+    for item in items:
+        first(item) or second(item) or third(item)
+
+
+def non_tail(items):
+    for item in items:
+        left(item) and right(item)
+        consume(item)
+
+
+def final_call(items):
+    for item in items:
+        consume(item)
+
+
+def assigned(items):
+    for item in items:
+        result = left(item) and right(item)
+";
+        assert_matches_cpython_marshal(source, "loop_tail_boolean_exits.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_direct_nested_handler_return_owners() {
+        let source = r"def direct_none(action):
+    try:
+        outer()
+    except TypeError:
+        try:
+            action()
+            raise AssertionError()
+        except TypeError:
+            return
+
+
+def direct_value(action):
+    try:
+        outer()
+    except TypeError:
+        try:
+            action()
+            raise AssertionError()
+        except ValueError:
+            return False
+        except TypeError:
+            return True
+
+
+def top_level(action):
+    try:
+        action()
+    except TypeError:
+        return
+
+
+def nested_fallthrough(action):
+    try:
+        outer()
+    except TypeError:
+        try:
+            action()
+        except TypeError:
+            recover()
+";
+        assert_matches_cpython_marshal(source, "nested_handler_return_owners.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_finally_end_control_flow() {
         let source = "def conditional_return(flag):\n    try:\n        pass\n    finally:\n        if flag:\n            return\n\ndef nested_return():\n    try:\n        try:\n            pass\n        finally:\n            return\n    finally:\n        pass\n\ndef nested_handler_return():\n    try:\n        pass\n    finally:\n        try:\n            return\n        except Exception:\n            pass\n\ndef break_from_finally():\n    while True:\n        try:\n            pass\n        finally:\n            break\n\ndef continue_from_finally():\n    while True:\n        try:\n            pass\n        finally:\n            continue\n";
         assert_matches_cpython_marshal(source, "finally_end.py");
