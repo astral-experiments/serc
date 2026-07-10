@@ -162,6 +162,12 @@ mod tests {
     }
 
     #[test]
+    fn matches_cpython_marshal_for_if_branch_ending_in_while() {
+        let source = "def f(condition, index, limit):\n    if condition:\n        value = 1\n        while index < limit:\n            index += 1\n    else:\n        fallback = 1\n        while index > 0:\n            index -= 1\n    tail0 = 0\n    tail1 = 1\n    tail2 = 2\n    tail3 = 3\n    tail4 = 4\n";
+        assert_matches_cpython_marshal(source, "if_while.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_a_module_containing_only_global_statements() {
         let source = "global x\nglobal x, y, z\n";
         assert_matches_cpython_marshal(source, "global.py");

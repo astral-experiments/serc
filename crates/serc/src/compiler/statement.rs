@@ -3297,6 +3297,23 @@ impl Compiler {
                             .set_location(self.source_location(condition_fallthrough_range(test)));
                     } else if matches!(nested_if_exit, Some(NestedIfExitLocation::Unlocated)) {
                         self.assembler.set_location(SourceLocation::NONE);
+                    // When both arms end in plain loops, CPython threads this branch exit from
+                    // the first loop's false edge and retains that condition's source location.
+                    } else if let Some(Stmt::While(while_statement)) = body.last()
+                        && while_statement.orelse.is_empty()
+                        && statement.elif_else_clauses.last().is_some_and(|clause| {
+                            clause.test.is_none()
+                                && matches!(
+                                    clause.body.last(),
+                                    Some(Stmt::While(else_while)) if else_while.orelse.is_empty()
+                                )
+                        })
+                    {
+                        self.assembler.set_location(
+                            self.source_location(condition_fallthrough_range(
+                                &while_statement.test,
+                            )),
+                        );
                     } else {
                         self.set_branch_end_location(body, body_start);
                     }
