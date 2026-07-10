@@ -1860,7 +1860,24 @@ impl Compiler {
         self.emit_common_constant(common_constant)?;
         self.emit(IS_OP, 0, -1)?;
         self.emit_jump_forward(POP_JUMP_IF_FALSE, fallback, -1)?;
+        let not_taken_exclusion_start = (collect_tuple
+            && self.control.current_statement_has_following
+            && self.control.direct_optimized_generator_assignment
+            && self.optimized_generator_dispatch_is_in_normal_try()
+            && !self.control.active_exception_region_exclusions.is_empty())
+        .then(|| {
+            let start = self.assembler.label();
+            self.assembler.mark(start);
+            start
+        });
         self.emit(NOT_TAKEN, 0, 0)?;
+        if let Some(start) = not_taken_exclusion_start {
+            let end = self.assembler.label();
+            self.assembler.mark(end);
+            for exclusions in &mut self.control.active_exception_region_exclusions {
+                exclusions.push((start, end));
+            }
+        }
         self.emit(POP_TOP, 0, -1)?;
 
         if collect_tuple {

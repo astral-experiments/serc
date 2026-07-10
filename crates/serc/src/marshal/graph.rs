@@ -1,8 +1,6 @@
 use std::collections::hash_map::Entry;
 
-use rustc_hash::FxHashMap;
-#[cfg(debug_assertions)]
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::code_object::{CodeObject, Constant};
 
@@ -117,14 +115,20 @@ pub(super) struct ObjectGraph<'a> {
     occurrences: Vec<Occurrence>,
     #[cfg(debug_assertions)]
     unique_objects: FxHashSet<HashedObjectKey<'a>>,
-    explicitly_interned: Vec<&'a str>,
 }
 
 impl<'a> ObjectGraph<'a> {
     pub(super) fn for_code(code: &'a CodeObject) -> Self {
+        let mut explicitly_interned = FxHashSet::default();
+        collect_explicitly_interned(code, &mut explicitly_interned);
         let mut graph = Self::default();
-        traverse_code(code, &mut GraphVisitor { graph: &mut graph });
-        graph.mark_explicitly_interned();
+        traverse_code(
+            code,
+            &mut GraphVisitor {
+                graph: &mut graph,
+                explicitly_interned: &explicitly_interned,
+            },
+        );
         graph
     }
 
@@ -163,21 +167,6 @@ impl<'a> ObjectGraph<'a> {
         let id = self.record_unique(key);
         self.occurrences.push(Occurrence { object: id, kind });
         true
-    }
-
-    fn mark_explicitly_interned(&mut self) {
-        for value in std::mem::take(&mut self.explicitly_interned) {
-            let Some(id) = self
-                .objects
-                .get(&HashedObjectKey::from(ObjectKey::String(value)))
-                .copied()
-            else {
-                continue;
-            };
-            let object = &mut self.objects_by_id[id.index()];
-            object.cached = true;
-            object.interned = true;
-        }
     }
 
     #[cfg(test)]
@@ -320,20 +309,60 @@ impl<'a> ObjectGraph<'a> {
     }
 }
 
+fn collect_explicitly_interned<'a>(code: &'a CodeObject, values: &mut FxHashSet<&'a str>) {
+    // A class body loads its qualified name from `co_consts` while the same string is also the
+    // code object's interned metadata. CPython deliberately reuses that identity.
+    values.insert(&code.qualified_name);
+    values.extend(
+        code.marshal_hints
+            .explicitly_interned_strings
+            .iter()
+            .map(String::as_str),
+    );
+    for constant in &code.constants {
+        collect_explicitly_interned_from_constant(constant, values);
+    }
+}
+
+fn collect_explicitly_interned_from_constant<'a>(
+    constant: &'a Constant,
+    values: &mut FxHashSet<&'a str>,
+) {
+    match constant {
+        Constant::Code(code) => collect_explicitly_interned(code, values),
+        Constant::Tuple(constants) | Constant::FrozenSet(constants) => {
+            for constant in constants {
+                collect_explicitly_interned_from_constant(constant, values);
+            }
+        }
+        Constant::Slice { lower, upper, step } => {
+            collect_explicitly_interned_from_constant(lower, values);
+            collect_explicitly_interned_from_constant(upper, values);
+            collect_explicitly_interned_from_constant(step, values);
+        }
+        Constant::None
+        | Constant::Bool(_)
+        | Constant::Ellipsis
+        | Constant::Int(_)
+        | Constant::SignedInt(_)
+        | Constant::BigInt { .. }
+        | Constant::Float(_)
+        | Constant::Complex { .. }
+        | Constant::String(_)
+        | Constant::SurrogateString(_)
+        | Constant::Bytes(_) => {}
+    }
+}
+
 struct GraphVisitor<'graph, 'code> {
     graph: &'graph mut ObjectGraph<'code>,
+    explicitly_interned: &'graph FxHashSet<&'code str>,
 }
 
 impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
     #[inline]
     fn code(&mut self, code: &'code CodeObject, _reference_mode: ReferenceMode) -> bool {
         self.graph.reserve_for_code(code);
-        self.graph.explicitly_interned.extend(
-            code.marshal_hints
-                .explicitly_interned_strings
-                .iter()
-                .map(String::as_str),
-        );
         self.graph
             .record_unique_value(OccurrenceKind::Code, code_key(code))
     }
@@ -431,11 +460,19 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
             Constant::Tuple(_) | Constant::Code(_) => {
                 unreachable!("tuple and code constants have dedicated traversal methods")
             }
-            Constant::String(value) => self.graph.record_keyed(
-                OccurrenceKind::Constant,
-                ObjectKey::String(value),
-                should_intern(value),
-            ),
+            Constant::String(value) => {
+                let interned =
+                    should_intern(value) || self.explicitly_interned.contains(value.as_str());
+                self.graph.record_keyed(
+                    OccurrenceKind::Constant,
+                    if interned {
+                        ObjectKey::String(value)
+                    } else {
+                        ObjectKey::ConstantString(value)
+                    },
+                    interned,
+                )
+            }
             Constant::Bytes(value) if value.is_empty() => self
                 .graph
                 .record_cached_value(OccurrenceKind::Constant, CachedObject::EmptyBytes),
