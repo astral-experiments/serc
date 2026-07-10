@@ -188,6 +188,9 @@ pub(super) struct ControlFlowState {
     // CPython retains the normal finally exit when it directly ends a synchronous with body.
     // This is consumed by the selected outer try before compiling any nested try statements.
     preserve_next_finally_exit_nop: bool,
+    // The complete final if whose fallthrough retains a converted POP_BLOCK before a terminal
+    // try-else suite. The range keeps nested and preceding if statements from consuming it.
+    retained_try_body_if_exit: Option<ruff_text_size::TextRange>,
     pub(super) active_exception_region_exclusions: Vec<Vec<(Label, Label)>>,
     active_exception_handlers: Vec<ExceptionHandlerContext>,
     // Exception-group handlers retain their body marker owner after coroutine suspension.
@@ -2542,6 +2545,23 @@ impl Compiler {
             }
         }
 
+        if self.control.retained_try_body_if_exit == Some(statement.range) {
+            let exit_start = self.assembler.label();
+            self.assembler.mark(exit_start);
+            if let Some(location) = self.assembler.last_instruction_location() {
+                self.assembler.set_location(location);
+            }
+            self.emit(NOP, 0, 0)?;
+            self.assembler.mark_last_as_converted_pop_block();
+            self.assembler.preserve_last_nop();
+            let exit_end = self.assembler.label();
+            self.assembler.mark(exit_end);
+            self.control
+                .active_exception_region_exclusions
+                .last_mut()
+                .expect("retained try-body if exit requires an active try")
+                .push((exit_start, exit_end));
+        }
         self.assembler.mark(end);
         self.set_depth(base_depth);
         if let Some(max_depth) = first_branch_max_depth {
@@ -4069,6 +4089,17 @@ impl Compiler {
         } else {
             statement.orelse.as_slice()
         };
+        let retained_try_body_if_exit = (suite_terminates(&statement.orelse)
+            && matches!(
+                statement.body.last(),
+                Some(Stmt::If(statement))
+                    if early_condition_truthiness(&statement.test).is_none()
+                        && matches!(statement.body.as_slice(), [Stmt::Expr(_)])
+                        && matches!(statement.elif_else_clauses.as_slice(), [clause]
+                            if clause.test.is_none()
+                                && matches!(clause.body.as_slice(), [Stmt::Expr(_)]))
+            ))
+        .then(|| statement.body.last().expect("matched final if").range());
         // A direct nested try with a terminating handler leaves the outer try body followed by
         // an empty normal-exit block after CPython reorders the cold handler blocks.
         let handler_contains_terminal_nested_try = statement.handlers.iter().any(|handler| {
@@ -4199,7 +4230,11 @@ impl Compiler {
                 normal_return_emitted = emitted;
             } else {
                 self.with_try_body_context(statement, |compiler| {
-                    compiler.compile_suite(&statement.body)
+                    compiler.with_control_override(
+                        |control| &mut control.retained_try_body_if_exit,
+                        retained_try_body_if_exit,
+                        |compiler| compiler.compile_suite(&statement.body),
+                    )
                 })?;
             }
             let location = (self.assembler.instruction_count() == body_instruction_count)

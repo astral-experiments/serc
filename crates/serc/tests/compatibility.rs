@@ -4055,6 +4055,23 @@ def final_elif(action, first, second):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_terminal_try_else_after_complete_if() {
+        let source = r"def terminal_else(flag):
+    try:
+        if flag:
+            action()
+        else:
+            other()
+    except Error:
+        failed()
+    else:
+        return None
+    after()
+";
+        assert_matches_cpython_marshal(source, "terminal_try_else_complete_if.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_try_body_exits_after_if_joins() {
         let source = include_str!("fixtures/try_body_exit_joins.py");
         assert_matches_cpython_marshal(source, "try_body_exit_joins.py");
