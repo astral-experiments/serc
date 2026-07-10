@@ -107,6 +107,7 @@ impl ExceptionTypeBoolMarkerState {
 struct TryMarkerSlotContext {
     ownerless_prefix_slots: usize,
     protected_start_instruction: usize,
+    ownerless_direct_condition: Option<TextRange>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -269,6 +270,7 @@ pub(super) struct ControlFlowState {
     // Whether that successor is another try statement. A loop break that targets this sibling
     // remains inside the current protected region instead of exiting through its normal edge.
     current_statement_followed_by_try: bool,
+    branch_join_successor: Option<TextRange>,
     // Whether the current expression is the complete value of an ordinary assignment and is an
     // optimized all/any/tuple generator call.
     pub(super) direct_optimized_generator_assignment: bool,
@@ -295,6 +297,10 @@ pub(super) struct ControlFlowState {
     // A direct final assignment branch whose copied normal exit crosses to a following statement
     // outside the try.
     direct_try_assignment_branch_exit: Option<TextRange>,
+    // Whether code follows the enclosing try statement in its current suite.
+    direct_try_body_has_successor: bool,
+    // Normal exits from a trailing if chain cross the innermost handler boundary.
+    direct_try_if_exit: bool,
     pub(super) generator_region_start: Option<Label>,
     pub(super) generator_region_exclusions: Vec<(Label, Label)>,
     pub(super) emitted_fallthrough_return: bool,
@@ -341,14 +347,16 @@ impl ControlFlowState {
     pub(super) fn current_try_marker_is_shifted_to_ownerless_slot(
         &self,
         current_instruction: usize,
+        condition: TextRange,
     ) -> bool {
         self.active_try_marker_slots
             .last()
             .copied()
             .flatten()
             .is_some_and(|context| {
-                context.ownerless_prefix_slots
-                    >= current_instruction.saturating_sub(context.protected_start_instruction)
+                context.ownerless_direct_condition == Some(condition)
+                    || context.ownerless_prefix_slots
+                        >= current_instruction.saturating_sub(context.protected_start_instruction)
             })
     }
 
@@ -464,6 +472,7 @@ impl Compiler {
         } else {
             None
         };
+        let direct_try_body_has_successor = self.control.current_statement_has_following;
         self.with_control_override(
             |control| &mut control.same_line_try_body,
             same_line,
@@ -477,22 +486,37 @@ impl Compiler {
                             direct_try_assignment_branch_exit,
                             |compiler| {
                                 compiler.with_control_override(
-                                    |control| &mut control.direct_try_body_statements,
-                                    direct_try_body_statements,
+                                    |control| &mut control.direct_try_body_has_successor,
+                                    direct_try_body_has_successor,
                                     |compiler| {
                                         compiler.with_control_override(
-                                            |control| {
-                                                &mut control
-                                                    .direct_final_sync_with_combined_try_body
-                                            },
-                                            direct_final_sync_with_combined_try_body,
+                                            |control| &mut control.direct_try_if_exit,
+                                            false,
                                             |compiler| {
                                                 compiler.with_control_override(
                                                     |control| {
-                                                        &mut control.direct_final_sync_with_try_body
+                                                        &mut control.direct_try_body_statements
                                                     },
-                                                    direct_final_sync_with_try_body,
-                                                    compile,
+                                                    direct_try_body_statements,
+                                                    |compiler| {
+                                                        compiler.with_control_override(
+                                                            |control| {
+                                                                &mut control
+                                                                    .direct_final_sync_with_combined_try_body
+                                                            },
+                                                            direct_final_sync_with_combined_try_body,
+                                                            |compiler| {
+                                                                compiler.with_control_override(
+                                                                    |control| {
+                                                                        &mut control
+                                                                            .direct_final_sync_with_try_body
+                                                                    },
+                                                                    direct_final_sync_with_try_body,
+                                                                    compile,
+                                                                )
+                                                            },
+                                                        )
+                                                    },
                                                 )
                                             },
                                         )
@@ -959,6 +983,12 @@ impl Compiler {
                 let followed_by_return_or_raise =
                     matches!(body.get(index + 1), Some(Stmt::Return(_) | Stmt::Raise(_)));
                 let followed_by_try = matches!(body.get(index + 1), Some(Stmt::Try(_)));
+                let preceded_by_branch_join = body[..index].last().is_some_and(|statement| {
+                    matches!(
+                        statement,
+                        Stmt::If(statement) if if_normal_exit_count(statement) > 1
+                    )
+                });
                 self.with_control_override(
                     |control| &mut control.emit_protected_async_for_end_nop,
                     emit_protected_async_for_end_nop,
@@ -997,12 +1027,22 @@ impl Compiler {
                                                                 compiler.with_control_override(
                                                                     |control| {
                                                                         &mut control
-                                                                    .suite_fallthrough_to_loop_backedge
+                                                                            .suite_fallthrough_to_loop_backedge
                                                                     },
                                                                     suite_fallthrough_to_loop_backedge,
                                                                     |compiler| {
-                                                                        compiler.compile_statement(
-                                                                            statement,
+                                                                        compiler.with_control_override(
+                                                                            |control| {
+                                                                                &mut control
+                                                                                    .branch_join_successor
+                                                                            },
+                                                                            preceded_by_branch_join
+                                                                                .then_some(statement.range()),
+                                                                            |compiler| {
+                                                                                compiler.compile_statement(
+                                                                                    statement,
+                                                                                )
+                                                                            },
                                                                         )
                                                                     },
                                                                 )
@@ -2811,7 +2851,37 @@ impl Compiler {
             return Ok(());
         }
 
+        // The normal joins of a final direct `if` leave this try body. Trailing nested `if`
+        // statements share that exit after jump threading, unless another statement follows.
+        let direct_try_if_exit = (self
+            .control
+            .direct_try_body_statements
+            .last()
+            .is_some_and(|direct| *direct == statement.range)
+            || (self.control.direct_try_if_exit && !self.control.current_statement_has_following))
+            && matches!(
+                statement.elif_else_clauses.as_slice(),
+                [clause] if clause.test.is_none()
+            )
+            && !matches!(
+                statement.test.as_ref(),
+                Expr::Compare(comparison)
+                    if comparison.ops.len() == 1
+                        && matches!(comparison.ops[0], CmpOp::Is | CmpOp::IsNot)
+                        && matches!(comparison.comparators[0], Expr::NoneLiteral(_))
+            )
+            && (!self.control.in_iterator_loop() || self.control.direct_try_body_has_successor)
+            && !self.control.in_exception_handler()
+            && !matches!(statement.body.as_slice(), [Stmt::Pass(_)])
+            && !statement
+                .elif_else_clauses
+                .iter()
+                .any(|clause| matches!(clause.body.as_slice(), [Stmt::Pass(_)]))
+            && !self.control.direct_try_body_has_else
+            && self.control.active_finally_try_bodies == 0;
         let base_depth = self.control.depth;
+        let direct_try_body_exit = direct_try_if_exit
+            || self.control.direct_try_assignment_branch_exit == Some(statement.range);
         let end = self.assembler.label();
         let mut branches: Vec<(Option<&Expr>, &[Stmt])> =
             vec![(Some(&statement.test), statement.body.as_slice())];
@@ -2994,7 +3064,11 @@ impl Compiler {
                 self.mark_definitely_evaluated_locals(test);
                 let body_start = self.assembler.instruction_count();
                 self.compile_with_strict_owned_loads(matches!(test, Expr::If(_)), |compiler| {
-                    compiler.compile_suite(body)
+                    compiler.with_control_override(
+                        |control| &mut control.direct_try_if_exit,
+                        direct_try_if_exit,
+                        |compiler| compiler.compile_suite(body),
+                    )
                 })?;
                 let pass_only_body = matches!(body, [Stmt::Pass(_)]);
                 if self.assembler.instruction_count() == body_start
@@ -3008,8 +3082,6 @@ impl Compiler {
                     first_branch_max_depth = Some(self.control.max_depth);
                 }
                 if !suite_terminates(body) && branch_index + 1 < branch_count {
-                    let direct_try_body_exit =
-                        self.control.direct_try_assignment_branch_exit == Some(statement.range);
                     let nested_if_exit = body.last().and_then(|statement| match statement {
                         Stmt::If(statement) => nested_if_exit_location(statement),
                         _ => None,
@@ -3095,7 +3167,13 @@ impl Compiler {
                 // separate failure block that its borrowed-load traversal never visits.
                 self.compile_with_strict_owned_loads(
                     suite_is_constant_false_assertion(body),
-                    |compiler| compiler.compile_suite(body),
+                    |compiler| {
+                        compiler.with_control_override(
+                            |control| &mut control.direct_try_if_exit,
+                            direct_try_if_exit,
+                            |compiler| compiler.compile_suite(body),
+                        )
+                    },
                 )?;
                 if branch_index + 1 == branch_count
                     && self.assembler.instruction_count() == body_start
@@ -4860,9 +4938,19 @@ impl Compiler {
                     .push((statement_nop_start, statement_nop_end));
             }
         }
-        // CPython compacts the surrounding block without clearing its exception targets. Enough
-        // ownerless vacancies before an iterator-loop try can therefore shift a normalized
-        // condition marker into a slot before the protected region's setup boundary.
+        // A first direct condition after a multi-edge branch join starts in a fresh ownerless
+        // block. Separately, enough vacancies before an assignment-led iterator-loop try can
+        // shift a later normalized marker before the protected region's setup boundary.
+        let ownerless_direct_condition = self
+            .control
+            .branch_join_successor
+            .is_some_and(|successor| successor == statement.range)
+            .then(|| match statement.body.first() {
+                Some(Stmt::If(statement)) => Some(statement.test.range()),
+                _ => None,
+            })
+            .flatten();
+        let track_shifted_marker_slots = matches!(statement.body.first(), Some(Stmt::Assign(_)));
         let try_marker_slots = (self.control.generator_region_start.is_none()
             && self.control.active_exception_region_exclusions.is_empty()
             && self.control.active_with_region_exclusions.is_empty()
@@ -4871,10 +4959,15 @@ impl Compiler {
                 .active_comprehension_region_exclusions
                 .is_empty()
             && self.control.in_iterator_loop()
-            && matches!(statement.body.first(), Some(Stmt::Assign(_))))
+            && (track_shifted_marker_slots || ownerless_direct_condition.is_some()))
         .then(|| TryMarkerSlotContext {
-            ownerless_prefix_slots: self.assembler.fallthrough_dynamic_exception_owner_slots(),
+            ownerless_prefix_slots: if track_shifted_marker_slots {
+                self.assembler.fallthrough_dynamic_exception_owner_slots()
+            } else {
+                0
+            },
             protected_start_instruction: self.assembler.instruction_count(),
+            ownerless_direct_condition,
         });
         self.assembler.mark(try_start);
         self.control

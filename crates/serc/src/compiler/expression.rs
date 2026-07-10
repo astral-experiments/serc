@@ -4917,6 +4917,7 @@ impl Compiler {
                 .control
                 .current_try_marker_is_shifted_to_ownerless_slot(
                     self.assembler.instruction_count(),
+                    expression.range(),
                 );
         let exclude_plain_try_marker = !comparison_is_boolean
             && (shifted_plain_try_marker
