@@ -8,7 +8,8 @@ use super::super::{
 use crate::assembler::block_graph::{BasicBlockId, BlockGraph};
 use crate::target::is_conditional_jump;
 use crate::target::opcodes::{
-    CLEANUP_THROW, END_ASYNC_FOR, END_SEND, LOAD_GLOBAL, NOP, RAISE_VARARGS, RETURN_VALUE,
+    CLEANUP_THROW, END_ASYNC_FOR, END_SEND, LOAD_CONST, LOAD_GLOBAL, NOP, RAISE_VARARGS,
+    RETURN_VALUE,
 };
 
 struct NoExitCopyAnalysis {
@@ -1218,6 +1219,71 @@ impl OptimizationPipeline {
             .iter()
             .any(|exclusions| !exclusions.is_empty())
         {
+            // Fixed-point no-location inlining can revisit an earlier source after copying a
+            // later cleanup block. Apply the resulting holes in final emission order; treating
+            // discovery order as source order can extend an enclosing handler across the next
+            // copied cleanup in a nested unwind chain.
+            let label_positions = graph
+                .iter_items()
+                .enumerate()
+                .filter_map(|(position, item)| match item {
+                    Item::Label(label) => Some((*label, position)),
+                    Item::Instruction(_) => None,
+                })
+                .collect::<FxHashMap<_, _>>();
+            let named_handler_cleanup_regions = self
+                .exception_regions
+                .iter()
+                .map(|region| {
+                    graph
+                        .label_block(region.target)
+                        .and_then(|target| {
+                            let mut after_target = false;
+                            graph[target].items().iter().find_map(|item| match item {
+                                Item::Label(label) => {
+                                    after_target |= *label == region.target;
+                                    None
+                                }
+                                Item::Instruction(instruction) if after_target => Some(instruction),
+                                Item::Instruction(_) => None,
+                            })
+                        })
+                        .is_some_and(|instruction| instruction.opcode == LOAD_CONST)
+                })
+                .collect::<Vec<_>>();
+            let named_handler_region_keys = self
+                .exception_regions
+                .iter()
+                .zip(&named_handler_cleanup_regions)
+                .filter_map(|(region, named_cleanup)| {
+                    named_cleanup.then_some((
+                        region.start,
+                        region.end,
+                        region.depth,
+                        region.preserve_lasti,
+                    ))
+                })
+                .collect::<FxHashSet<_>>();
+            for (index, (region, exclusions)) in self
+                .exception_regions
+                .iter()
+                .zip(&mut copied_region_exclusions)
+                .enumerate()
+            {
+                let paired_named_handler_region = named_handler_region_keys.contains(&(
+                    region.start,
+                    region.end,
+                    region.depth,
+                    region.preserve_lasti,
+                ));
+                if region.preserve_lasti
+                    && (named_handler_cleanup_regions[index] || paired_named_handler_region)
+                {
+                    exclusions.sort_by_key(|(start, _)| {
+                        label_positions.get(start).copied().unwrap_or(usize::MAX)
+                    });
+                }
+            }
             let original_regions = std::mem::take(&mut self.exception_regions);
             for (region, exclusions) in original_regions.into_iter().zip(copied_region_exclusions) {
                 let mut start = region.start;

@@ -1758,6 +1758,20 @@ impl<'ast> Visitor<'ast> for NamedExpressionCollector<'_> {
                 let mut names = Vec::new();
                 collect_nested_comprehension_target_names(&first.iter, &mut names);
                 for name in names {
+                    // The first iterable executes before the enclosing comprehension binds its
+                    // target. Inlined comprehensions there therefore allocate their temporary
+                    // fast locals first; the later full expression walk only observes them
+                    // after the enclosing targets have already been collected.
+                    if !self
+                        .collector
+                        .non_comprehension_bindings
+                        .contains(name.as_str())
+                    {
+                        self.collector
+                            .comprehension_first_bindings
+                            .insert(name.clone());
+                    }
+                    self.collector.mark_binding(&name);
                     self.collector.insert_comprehension_target(name);
                 }
             }

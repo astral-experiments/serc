@@ -48,6 +48,7 @@ struct LoopContext {
     with_depth: usize,
     finally_end_depth: usize,
     exception_region_depth: usize,
+    break_target_keeps_exception_owner: bool,
     break_policy: LoopBreakPolicy,
 }
 
@@ -265,6 +266,9 @@ pub(super) struct ControlFlowState {
     pub(super) same_line_try_body: bool,
     // Whether the statement currently entered by `compile_suite` has a sibling successor.
     pub(super) current_statement_has_following: bool,
+    // Whether that successor is another try statement. A loop break that targets this sibling
+    // remains inside the current protected region instead of exiting through its normal edge.
+    current_statement_followed_by_try: bool,
     // Whether the current expression is the complete value of an ordinary assignment and is an
     // optimized all/any/tuple generator call.
     pub(super) direct_optimized_generator_assignment: bool,
@@ -393,6 +397,7 @@ impl Compiler {
             with_depth: self.control.active_with_exits.len(),
             finally_end_depth: self.control.active_finally_end_blocks,
             exception_region_depth: self.control.active_exception_region_exclusions.len(),
+            break_target_keeps_exception_owner: self.control.current_statement_followed_by_try,
             break_policy,
         }
     }
@@ -933,6 +938,7 @@ impl Compiler {
                 );
                 let followed_by_return_or_raise =
                     matches!(body.get(index + 1), Some(Stmt::Return(_) | Stmt::Raise(_)));
+                let followed_by_try = matches!(body.get(index + 1), Some(Stmt::Try(_)));
                 self.with_control_override(
                     |control| &mut control.emit_protected_async_for_end_nop,
                     emit_protected_async_for_end_nop,
@@ -964,12 +970,22 @@ impl Compiler {
                                                         compiler.with_control_override(
                                                             |control| {
                                                                 &mut control
-                                                            .suite_fallthrough_to_loop_backedge
+                                                                    .current_statement_followed_by_try
                                                             },
-                                                            suite_fallthrough_to_loop_backedge,
+                                                            followed_by_try,
                                                             |compiler| {
-                                                                compiler
-                                                                    .compile_statement(statement)
+                                                                compiler.with_control_override(
+                                                                    |control| {
+                                                                        &mut control
+                                                                    .suite_fallthrough_to_loop_backedge
+                                                                    },
+                                                                    suite_fallthrough_to_loop_backedge,
+                                                                    |compiler| {
+                                                                        compiler.compile_statement(
+                                                                            statement,
+                                                                        )
+                                                                    },
+                                                                )
                                                             },
                                                         )
                                                     },
@@ -2135,6 +2151,7 @@ impl Compiler {
                             == context.exception_region_depth
                             && context.exception_region_depth > 0
                             && context.finally_end_depth == 0
+                            && !context.break_target_keeps_exception_owner
                             && self.control.active_exception_handlers.is_empty())
                         .then(|| {
                             let start = self.assembler.label();
@@ -2816,6 +2833,10 @@ impl Compiler {
                     || (!self.control.active_with_region_exclusions.is_empty()
                         && branch_index > 0
                         && suite_terminates(body));
+                let preserve_first_unnamed_handler_loop_owner = branch_index == 0
+                    && self.control.synthesized_loop_tail_predecessor == Some(statement.range)
+                    && self.control.in_iterator_loop()
+                    && self.control.in_first_unnamed_exception_handler();
                 let protected_iterator_continue_condition = (branch_index == 0
                     && matches!(body, [Stmt::Continue(_)])
                     && self.control.in_iterator_loop()
@@ -2899,6 +2920,13 @@ impl Compiler {
                     // A direct continue from the first condition inside a surrounding
                     // synchronous with reuses the protected CFG slot when the loop-control NOP
                     // is removed. Keep that owner on the normalized fallthrough marker.
+                    self.assembler.preserve_last_not_taken_exception_owner();
+                }
+                if preserve_first_unnamed_handler_loop_owner {
+                    // The condition immediately before a synthesized loop-tail branch inside
+                    // the first bare handler reuses the handler block's protected slot. An
+                    // ordinary non-final condition and the final loop-control condition each
+                    // start in fresh blocks.
                     self.assembler.preserve_last_not_taken_exception_owner();
                 }
                 if retain_folded_test_in_protected_region {
@@ -5759,6 +5787,9 @@ impl Compiler {
                             Some(Stmt::Return(statement))
                                 if matches!(statement.value.as_deref(), Some(Expr::Name(_)))
                         );
+                    let following_expression_exit_keeps_owner =
+                        self.control.current_statement_has_following
+                            && matches!(statement.body.as_slice(), [Stmt::Expr(_)]);
 
                     // A pass-only finally keeps these extended handler exits in its protected
                     // region; executable finally bodies use CPython's stale-owner exclusion.
@@ -5778,6 +5809,7 @@ impl Compiler {
                         && !self.control.active_exception_region_exclusions.is_empty()
                         && self.control.active_pass_finally_locations.is_empty()
                         && !protected_loop_value_return
+                        && !following_expression_exit_keeps_owner
                     {
                         ExceptionPolicy::EXCLUDE_IF_EXTENDED
                     } else {

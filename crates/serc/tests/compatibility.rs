@@ -3145,6 +3145,78 @@ def single_normal_exit(flag):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_nested_handler_loop_and_cleanup_owners() {
+        let source = r#"def bare_handler_loop_marker(values):
+    try:
+        action()
+    except Error:
+        for value in values:
+            match = regex.search("value", value)
+            if match:
+                result = match.group("value")
+            if result is not None:
+                break
+        return result
+
+
+def ordinary_bare_handler_condition(value):
+    try:
+        action()
+    except Error:
+        if regex.search("value", value):
+            recover()
+        finish()
+
+
+def protected_break_and_following_empty_handler(values):
+    result = []
+    try:
+        for value in values:
+            if value == "stop":
+                break
+            result.append(value)
+        try:
+            result.append(source.attribute())
+        except AttributeError:
+            pass
+        consume(
+            value00, value01, value02, value03, value04,
+            value05, value06, value07, value08, value09,
+            value10, value11, value12, value13, value14,
+            value15, value16, value17, value18, value19,
+            value20, value21, value22, value23, value24,
+            value25, value26, value27, value28, value29,
+            value30, value31, value32, value33, value34,
+            value35, value36, value37, value38, value39,
+        )
+    except ImportError:
+        pass
+    return result
+
+
+def triple_named_handlers_with_continuation():
+    try:
+        first()
+    except Error as error:
+        first_message = str(error)
+        try:
+            second()
+        except Error as error:
+            second_message = str(error)
+            try:
+                third()
+                result = 3
+            except Error as error:
+                third_message = str(error)
+                consume(first_message, second_message, third_message)
+    normalized = normalize(result)
+    consume(normalized)
+    return normalized
+"#;
+        assert_matches_cpython_marshal(source, "nested_handler_cleanup_owners.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_bare_handler_call_cleanup_inside_with() {
         let source = r"def protected(manager, flag):
     with manager:
@@ -4084,6 +4156,26 @@ def assignment_control(holder, outer, inner, first, second, third):
     fn matches_cpython_marshal_for_a_named_comprehension_target() {
         let source = "[value for value in values]\n{key: (left, right) for key, (left, right) in values}\nmodule_result = {last := value for value in range(2)}\nnested_filter = [(key, value) for key, value in pairs if key in [field.name for field in fields]]\nnested_iterable = [(left, right) for left in values for right in [item.value for item in items]]\ngenerator_assignment = list((captured := value for value in values))\n\ndef f():\n    exponential, base_multiplier = 1, 2\n    hash_map = {\n        (exponential := (exponential * base_multiplier) % 3): i + 1\n        for i in range(2)\n    }\n    return hash_map\n";
         assert_matches_cpython_marshal(source, "named_comprehension.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_first_iterable_comprehension_target_order() {
+        let source = r"def first_iterable_targets(values):
+    return [outer for outer in [inner for inner in values]]
+
+
+def body_targets(values):
+    return [[inner for inner in values] for outer in values]
+
+
+def later_iterable_targets(values):
+    return [(outer, inner) for outer in values for inner in [nested for nested in values]]
+
+
+def generator_first_iterable(values):
+    return [outer for outer in (inner for inner in values)]
+";
+        assert_matches_cpython_marshal(source, "first_iterable_comprehension_targets.py");
     }
 
     #[test]
