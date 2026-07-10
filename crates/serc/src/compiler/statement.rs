@@ -279,6 +279,12 @@ pub(super) struct ControlFlowState {
     // Whether the current expression is the complete value of an ordinary assignment and is an
     // optimized all/any/tuple generator call.
     pub(super) direct_optimized_generator_assignment: bool,
+    // Whether an optimized tuple call is the right operand of a name addition in an inlined
+    // comprehension. CPython excludes its dispatch marker from the comprehension's restore range.
+    pub(super) exclude_optimized_tuple_guard_from_comprehension: bool,
+    // Whether an optimized tuple call is the assignment in the first branch of an `if` whose
+    // join is immediately followed by a local return.
+    pub(super) copy_optimized_tuple_branch_exit: bool,
     // Whether that successor is a direct return of one local. CPython copies this tiny exit
     // before removing a constant-loop break edge, so its borrowed-load pass still visits it.
     current_statement_followed_by_name_return: bool,
@@ -3192,6 +3198,20 @@ impl Compiler {
                         exclusions.pop();
                     }
                 }
+                let copy_optimized_tuple_branch_exit = branch_index == 0
+                    && self.control.current_statement_followed_by_name_return
+                    && self.control.generator_region_start.is_none()
+                    && self.control.active_exception_region_exclusions.is_empty()
+                    && self.control.active_with_region_exclusions.is_empty()
+                    && self
+                        .control
+                        .active_comprehension_region_exclusions
+                        .is_empty()
+                    && matches!(statement.elif_else_clauses.as_slice(), [clause] if clause.test.is_none())
+                    && matches!(body, [Stmt::Assign(assignment)]
+                        if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                            && matches!(assignment.value.as_ref(), Expr::Call(call)
+                                if optimized_generator_callable(call) == Some("tuple")));
                 self.mark_definitely_evaluated_locals(test);
                 let body_start = self.assembler.instruction_count();
                 let copied_split_return_try =
@@ -3213,25 +3233,34 @@ impl Compiler {
                         _ => None,
                     })
                     .flatten();
-                self.compile_with_strict_owned_loads(matches!(test, Expr::If(_)), |compiler| {
-                    compiler.with_control_override(
-                        |control| &mut control.sync_with_direct_return_chain,
-                        preserve_sync_with_direct_return_chain_owner,
-                        |compiler| {
-                            compiler.with_control_override(
-                                |control| &mut control.copied_split_return_try,
-                                copied_split_return_try,
-                                |compiler| {
-                                    compiler.with_control_override(
-                                        |control| &mut control.direct_try_if_exit,
-                                        direct_try_if_exit,
-                                        |compiler| compiler.compile_suite(body),
-                                    )
-                                },
-                            )
-                        },
-                    )
-                })?;
+                self.with_control_override(
+                    |control| &mut control.copy_optimized_tuple_branch_exit,
+                    copy_optimized_tuple_branch_exit,
+                    |compiler| {
+                        compiler.compile_with_strict_owned_loads(
+                            matches!(test, Expr::If(_)),
+                            |compiler| {
+                                compiler.with_control_override(
+                                    |control| &mut control.sync_with_direct_return_chain,
+                                    preserve_sync_with_direct_return_chain_owner,
+                                    |compiler| {
+                                        compiler.with_control_override(
+                                            |control| &mut control.copied_split_return_try,
+                                            copied_split_return_try,
+                                            |compiler| {
+                                                compiler.with_control_override(
+                                                    |control| &mut control.direct_try_if_exit,
+                                                    direct_try_if_exit,
+                                                    |compiler| compiler.compile_suite(body),
+                                                )
+                                            },
+                                        )
+                                    },
+                                )
+                            },
+                        )
+                    },
+                )?;
                 let pass_only_body = matches!(body, [Stmt::Pass(_)]);
                 if self.assembler.instruction_count() == body_start
                     && let Some(statement) = body.last()
@@ -3928,6 +3957,21 @@ impl Compiler {
             }
             if !try_body_normal_exit {
                 if self.control.generator_region_start.is_none()
+                    && self.control.protects_boolean_return_iterator_cleanup()
+                    && let Expr::UnaryOp(unary) = statement.test.as_ref()
+                    && unary.op == UnaryOp::Not
+                    && let Expr::Compare(comparison) = unary.operand.as_ref()
+                    && comparison.ops.len() > 1
+                {
+                    return self.compile_loop_tail_chained_compare(
+                        statement,
+                        comparison,
+                        restart,
+                        split_short_circuit,
+                        true,
+                    );
+                }
+                if self.control.generator_region_start.is_none()
                     && let Expr::Compare(comparison) = statement.test.as_ref()
                     && comparison.ops.len() > 1
                 {
@@ -3936,6 +3980,7 @@ impl Compiler {
                         comparison,
                         restart,
                         split_short_circuit,
+                        false,
                     );
                 }
                 let body = statement.body.as_slice();
@@ -4210,6 +4255,7 @@ impl Compiler {
         comparison: &ruff_python_ast::ExprCompare,
         restart: Label,
         split_short_circuit: bool,
+        negated: bool,
     ) -> Result<(), CompileError> {
         let base_depth = self.control.depth;
         let cleanup = self.assembler.label();
@@ -4239,7 +4285,15 @@ impl Compiler {
             .set_location(self.source_location(comparison.range));
         let (opcode, argument) = comparison_operator_boolean(*comparison.ops.last().unwrap());
         self.emit(opcode, argument, -1)?;
-        self.emit_jump_forward(POP_JUMP_IF_TRUE, success, -1)?;
+        self.emit_jump_forward(
+            if negated {
+                POP_JUMP_IF_FALSE
+            } else {
+                POP_JUMP_IF_TRUE
+            },
+            success,
+            -1,
+        )?;
         self.emit(NOT_TAKEN, 0, 0)?;
         self.emit_jump_backward(JUMP_BACKWARD, restart, 0)?;
 
@@ -4248,13 +4302,20 @@ impl Compiler {
         self.assembler
             .set_location(self.source_location(comparison.range));
         self.emit_jump_forward(JUMP_FORWARD, body, 0)?;
+        if negated {
+            self.assembler.preserve_last_inlined_jump_nop();
+        }
 
         self.assembler.mark(cleanup);
         self.set_depth(base_depth + 1);
         self.assembler
             .set_location(self.source_location(comparison.range));
         self.emit(POP_TOP, 0, -1)?;
-        self.emit_jump_backward(JUMP_BACKWARD, restart, 0)?;
+        if negated {
+            self.emit_jump_forward(JUMP_FORWARD, body, 0)?;
+        } else {
+            self.emit_jump_backward(JUMP_BACKWARD, restart, 0)?;
+        }
 
         self.assembler.mark(body);
         self.set_depth(base_depth);

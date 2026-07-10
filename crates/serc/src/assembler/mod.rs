@@ -571,6 +571,11 @@ impl Assembler {
             .jump_policy
             .defer_removal();
     }
+    pub(crate) fn allow_last_transitive_small_exit_inlining(&mut self) {
+        self.last_jump_instruction_mut("allowing transitive small-exit inlining")
+            .jump_provenance
+            .allow_transitive_small_exit_inlining();
+    }
 
     /// Allows incoming jumps to thread through the last jump before retaining it as a NOP.
     pub(crate) fn preserve_last_redundant_jump_nop_after_threading(&mut self) {
@@ -615,7 +620,7 @@ impl Assembler {
 
     pub(crate) fn mark_last_jump_as_authored_break(&mut self) {
         self.last_jump_instruction_mut("marking an authored break jump")
-            .backward_jump_provenance
+            .jump_provenance
             .mark_authored_break();
     }
 

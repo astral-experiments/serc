@@ -8,8 +8,8 @@ use super::super::{
 use crate::assembler::block_graph::{BasicBlockId, BlockGraph};
 use crate::target::is_conditional_jump;
 use crate::target::opcodes::{
-    CLEANUP_THROW, END_ASYNC_FOR, END_SEND, LOAD_CONST, LOAD_GLOBAL, NOP, RAISE_VARARGS,
-    RETURN_VALUE,
+    CLEANUP_THROW, END_ASYNC_FOR, END_SEND, LOAD_CONST, LOAD_FAST, LOAD_GLOBAL, NOP, RAISE_VARARGS,
+    RETURN_VALUE, STORE_FAST,
 };
 
 struct NoExitCopyAnalysis {
@@ -769,8 +769,7 @@ impl OptimizationPipeline {
             if target_position < index {
                 instruction.retarget(Operand::Backward(target));
                 if instruction.opcode == JUMP_FORWARD {
-                    instruction.opcode = if instruction.backward_jump_provenance.is_authored_break()
-                    {
+                    instruction.opcode = if instruction.jump_provenance.is_authored_break() {
                         JUMP_BACKWARD
                     } else {
                         JUMP_BACKWARD_NO_INTERRUPT
@@ -1189,6 +1188,89 @@ impl OptimizationPipeline {
                     }
                     for (index, start) in split_return_exclusions {
                         copied_region_exclusions[index].push((start, copied_end));
+                    }
+                }
+            }
+            // CPython copies a direct local return through the first branch before revisiting an
+            // optimized tuple guard in that branch. The guard is already earlier in block order,
+            // so honor the compiler's narrow marker when this source is exactly STORE/LOAD/RETURN.
+            let transitive_predecessors = if inline_small_exit {
+                order
+                    .iter()
+                    .copied()
+                    .take(source_position)
+                    .filter(|predecessor| {
+                        block_jump_target(graph[*predecessor].items())
+                            .and_then(|label| graph.label_block(label))
+                            == Some(source)
+                            && graph[*predecessor]
+                                .last_instruction()
+                                .is_some_and(|instruction| {
+                                    instruction.jump_provenance.transitive_small_exit_inlining()
+                                })
+                            && region_memberships.iter().all(|membership| {
+                                membership.contains(predecessor) == membership.contains(&source)
+                                    && membership.contains(&source) == membership.contains(&target)
+                            })
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            if !transitive_predecessors.is_empty() {
+                let source_jump_position = graph[source]
+                    .items()
+                    .iter()
+                    .rposition(|item| matches!(item, Item::Instruction(_)))
+                    .expect("an exit-copy source must end in a jump");
+                let source_instructions = graph[source].items()[..source_jump_position]
+                    .iter()
+                    .filter_map(|item| match item {
+                        Item::Instruction(instruction) => Some(*instruction),
+                        Item::Label(_) => None,
+                    })
+                    .collect::<Vec<_>>();
+                let copied_instructions = copied
+                    .iter()
+                    .filter_map(|item| match item {
+                        Item::Instruction(instruction) => Some(*instruction),
+                        Item::Label(_) => None,
+                    })
+                    .collect::<Vec<_>>();
+                let transitive_copy = match (
+                    source_instructions.as_slice(),
+                    copied_instructions.as_slice(),
+                ) {
+                    ([store], [load, return_value])
+                        if store.opcode == STORE_FAST
+                            && load.opcode == LOAD_FAST
+                            && return_value.opcode == RETURN_VALUE
+                            && store.operand == load.operand =>
+                    {
+                        Some([*store, *load, *return_value])
+                    }
+                    _ => None,
+                };
+                if let Some(transitive_copy) = transitive_copy {
+                    for predecessor in transitive_predecessors {
+                        let copied_label = Label(self.next_label);
+                        self.next_label += 1;
+                        let mut predecessor_copy = vec![Item::Label(copied_label)];
+                        predecessor_copy
+                            .extend(transitive_copy.iter().copied().map(Item::Instruction));
+                        let jump_position = graph[predecessor]
+                            .items()
+                            .iter()
+                            .rposition(|item| matches!(item, Item::Instruction(_)))
+                            .expect("a transitive exit-copy predecessor must end in a jump");
+                        graph.remove_item_at(predecessor, jump_position);
+                        inline_copies
+                            .entry(predecessor)
+                            .or_default()
+                            .push(predecessor_copy);
+                        remaining_predecessors
+                            .entry(source)
+                            .and_modify(|count| *count -= 1);
                     }
                 }
             }
