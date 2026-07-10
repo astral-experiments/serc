@@ -2679,6 +2679,19 @@ def unreachable_target():
 
 def nested_targets(xs, ys):
     return [[lambda: x for x in ys] for x in xs]
+
+def target_captured_after_comprehension(types, values):
+    normalized = {normalize(type_) for type_ in types}
+    for type_ in types:
+        converted = (convert(value, type_) for value in values)
+    return normalized, converted
+
+def target_captured_after_extended_comprehension(types, values):
+    normalized = []
+    normalized.extend([normalize(type_) for type_ in types])
+    for type_ in types:
+        converted = (convert(value, type_) for value in values)
+    return normalized, converted
 ";
         assert_matches_cpython_marshal(source, "comprehension_cells.py");
     }
