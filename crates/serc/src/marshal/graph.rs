@@ -3,6 +3,7 @@ use std::collections::hash_map::Entry;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::code_object::{CodeObject, Constant};
+use crate::target::is_static_identifier;
 
 use super::key::{
     HashedObjectKey, ObjectKey, code_bytes_key, code_key, constant_key, constants_tuple_key,
@@ -121,12 +122,15 @@ impl<'a> ObjectGraph<'a> {
     pub(super) fn for_code(code: &'a CodeObject) -> Self {
         let mut explicitly_interned = FxHashSet::default();
         collect_explicitly_interned(code, &mut explicitly_interned);
+        let mut recreated_frozensets = FxHashSet::default();
+        collect_recreated_frozensets(code, &mut recreated_frozensets);
         let mut graph = Self::default();
         traverse_code(
             code,
             &mut GraphVisitor {
                 graph: &mut graph,
                 explicitly_interned: &explicitly_interned,
+                recreated_frozensets: &recreated_frozensets,
             },
         );
         graph
@@ -324,6 +328,35 @@ fn collect_explicitly_interned<'a>(code: &'a CodeObject, values: &mut FxHashSet<
     }
 }
 
+fn collect_recreated_frozensets(code: &CodeObject, values: &mut FxHashSet<usize>) {
+    let mut indices: Vec<_> = code
+        .marshal_hints
+        .iterable_frozenset_indices
+        .iter()
+        .copied()
+        .collect();
+    indices.sort_unstable();
+    for index in indices {
+        let index = usize::try_from(index).expect("constant index always fits in usize");
+        let Some(Constant::FrozenSet(members)) = code.constants.get(index) else {
+            continue;
+        };
+        if members
+            .iter()
+            .any(|member| {
+                matches!(member, Constant::String(value) if should_intern(value) && is_static_identifier(value))
+            })
+        {
+            values.insert(std::ptr::from_ref(&code.constants[index]).addr());
+        }
+    }
+    for constant in &code.constants {
+        if let Constant::Code(code) = constant {
+            collect_recreated_frozensets(code, values);
+        }
+    }
+}
+
 fn collect_explicitly_interned_from_constant<'a>(
     constant: &'a Constant,
     values: &mut FxHashSet<&'a str>,
@@ -357,6 +390,7 @@ fn collect_explicitly_interned_from_constant<'a>(
 struct GraphVisitor<'graph, 'code> {
     graph: &'graph mut ObjectGraph<'code>,
     explicitly_interned: &'graph FxHashSet<&'code str>,
+    recreated_frozensets: &'graph FxHashSet<usize>,
 }
 
 impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
@@ -471,6 +505,17 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
                         ObjectKey::ConstantString(value)
                     },
                     interned,
+                )
+            }
+            Constant::FrozenSet(_)
+                if self
+                    .recreated_frozensets
+                    .contains(&std::ptr::from_ref(value).addr()) =>
+            {
+                let address = std::ptr::from_ref(value).addr();
+                self.graph.record_unique_value(
+                    OccurrenceKind::Constant,
+                    ObjectKey::RecreatedFrozenSet(address),
                 )
             }
             Constant::Bytes(value) if value.is_empty() => self

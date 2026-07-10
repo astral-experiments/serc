@@ -26,6 +26,7 @@ TARGET_INPUTS = (
     "Include/cpython/code.h",
     "Include/internal/pycore_code.h",
     "Include/internal/pycore_magic_number.h",
+    "Include/internal/pycore_global_strings.h",
     "Include/patchlevel.h",
     "Python/codegen.c",
     "Python/flowgraph.c",
@@ -115,6 +116,15 @@ def read_inputs(checkout: Path) -> dict[str, str]:
         relative: read_committed_file(checkout, relative)
         for relative in TARGET_INPUTS + MARSHAL_INPUTS
     }
+
+
+def parse_static_identifiers(source: str) -> list[str]:
+    identifiers = sorted(
+        set(re.findall(r"STRUCT_FOR_ID\(([A-Za-z_][A-Za-z0-9_]*)\)", source))
+    )
+    if not identifiers or "sort" not in identifiers:
+        raise ValueError("static identifier table is incomplete")
+    return identifiers
 
 
 def parse_opcodes(source: str) -> list[tuple[str, int]]:
@@ -323,10 +333,12 @@ def render(sources: dict[str, str]) -> str:
     code_header = sources["Include/cpython/code.h"]
     local_header = sources["Include/internal/pycore_code.h"]
     magic_header = sources["Include/internal/pycore_magic_number.h"]
+    global_strings = sources["Include/internal/pycore_global_strings.h"]
     patchlevel = sources["Include/patchlevel.h"]
     codegen = sources["Python/codegen.c"]
     flowgraph = sources["Python/flowgraph.c"]
 
+    static_identifiers = parse_static_identifiers(global_strings)
     opcodes = parse_opcodes(opcode_ids)
     opcode_names = {name for name, _ in opcodes}
     caches = parse_caches(metadata)
@@ -578,7 +590,20 @@ def render(sources: dict[str, str]) -> str:
         lines.append(
             f"    pub(crate) const {name}: Opcode = Opcode::new({code}, {caches.get(name, 0)});"
         )
-    lines.extend(["}", "", "#[allow(dead_code)]", "impl Opcode {"])
+    lines.extend(["}", "", "pub(crate) static STATIC_IDENTIFIERS: &[&str] = &["])
+    lines.extend(f'    "{identifier}",' for identifier in static_identifiers)
+    lines.extend(
+        [
+            "];",
+            "",
+            "pub(crate) fn is_static_identifier(value: &str) -> bool {",
+            "    STATIC_IDENTIFIERS.binary_search(&value).is_ok()",
+            "}",
+            "",
+            "#[allow(dead_code)]",
+            "impl Opcode {",
+        ]
+    )
     for method, flag in (
         ("has_argument", "HAS_ARG_FLAG"),
         ("has_constant", "HAS_CONST_FLAG"),

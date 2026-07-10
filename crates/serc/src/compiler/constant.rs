@@ -69,11 +69,12 @@ impl ConstantPool {
 pub(super) struct OutputState {
     pub(super) constants: ConstantPool,
     pub(super) deferred_constants_before_return: Vec<(OperandPatchId, Constant)>,
-    pub(super) deferred_constants: Vec<(Option<OperandPatchId>, Constant)>,
+    pub(super) deferred_constants: Vec<(Option<OperandPatchId>, Constant, bool)>,
     pub(super) deferred_names: Vec<(OperandPatchId, String)>,
     pub(super) names: Vec<String>,
     name_indices: FxHashMap<NameId, u32>,
     pub(super) interned_constant_strings: FxHashSet<String>,
+    pub(super) iterable_frozenset_indices: FxHashSet<u32>,
 }
 
 impl Compiler {
@@ -195,7 +196,7 @@ impl Compiler {
         if let Some(constant) = fold_constant(expression)
             && !matches!(constant, Constant::Int(value) if u8::try_from(value).is_ok())
         {
-            self.output.deferred_constants.push((None, constant));
+            self.output.deferred_constants.push((None, constant, false));
         }
         Ok(())
     }
@@ -266,6 +267,15 @@ impl Compiler {
         let index_map = self.output.constants.retain_used(&used)?;
         self.assembler
             .remap_constant_indices(LOAD_CONST, &index_map);
+        self.output.iterable_frozenset_indices =
+            std::mem::take(&mut self.output.iterable_frozenset_indices)
+                .into_iter()
+                .filter_map(|index| {
+                    let index =
+                        usize::try_from(index).expect("constant index always fits in usize");
+                    index_map[index]
+                })
+                .collect();
         Ok(())
     }
 
@@ -273,13 +283,28 @@ impl Compiler {
         &mut self,
         constant: Constant,
     ) -> Result<(), CompileError> {
+        self.emit_deferred_constant_with_identity(constant, false)
+    }
+
+    pub(super) fn emit_deferred_iterable_frozenset(
+        &mut self,
+        values: Vec<Constant>,
+    ) -> Result<(), CompileError> {
+        self.emit_deferred_constant_with_identity(Constant::FrozenSet(values), true)
+    }
+
+    fn emit_deferred_constant_with_identity(
+        &mut self,
+        constant: Constant,
+        iterable_frozenset: bool,
+    ) -> Result<(), CompileError> {
         self.apply_compiler_stack_effect(LOAD_CONST, 0, 1)?;
         let instruction = self
             .assembler
             .emit_placeholder_with_depth(LOAD_CONST, self.control.depth.cast_unsigned());
         self.output
             .deferred_constants
-            .push((Some(instruction), constant));
+            .push((Some(instruction), constant, iterable_frozenset));
         Ok(())
     }
 

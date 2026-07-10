@@ -564,6 +564,52 @@ def parent():
     }
 
     #[test]
+    fn matches_cpython_marshal_for_origin_sensitive_frozenset_identity() {
+        let source = r#"def membership_first(kind):
+    if kind in {None, "sort"}:
+        return 1
+    return 0
+
+
+def membership_second(kind):
+    if kind in {None, "sort"}:
+        return 2
+    return 0
+
+
+def nonstatic_membership_first(kind):
+    if kind in {None, "linux"}:
+        return 3
+    return 0
+
+
+def nonstatic_membership_second(kind):
+    if kind in {None, "linux"}:
+        return 4
+    return 0
+
+
+def shared_membership_first(kind):
+    return kind in {None, "sort"}
+
+
+def shared_membership_second(kind):
+    return kind in {None, "sort"}
+
+
+def direct_first():
+    value = {"left", "center", "right"}
+    return value, 1
+
+
+def direct_second():
+    value = {"left", "center", "right"}
+    return value, 2
+"#;
+        assert_matches_cpython_marshal(source, "origin_sensitive_frozensets.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_noninterned_constant_metadata_collisions() {
         let source = r#"from package.config import exported, café
 from other import *
@@ -1805,7 +1851,7 @@ def terminal_loop(manager):
 
     #[test]
     fn matches_cpython_marshal_for_direct_handler_returns_inside_synchronous_with() {
-        let source = r#"def direct(manager):
+        let source = r"def direct(manager):
     with manager:
         try:
             return produce()
@@ -1835,7 +1881,7 @@ def enclosing_try_control(manager):
             return produce()
     except Error:
         return recover()
-"#;
+";
         assert_matches_cpython_marshal(source, "with_direct_handler_returns.py");
     }
 

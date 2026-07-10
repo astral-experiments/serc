@@ -122,6 +122,8 @@ pub(crate) enum LocalsIdentity {
 pub(crate) struct MarshalHints {
     pub(crate) locals_identity: LocalsIdentity,
     pub(crate) explicitly_interned_strings: FxHashSet<String>,
+    /// Constants created by iterable set folding before code-object string interning.
+    pub(crate) iterable_frozenset_indices: FxHashSet<u32>,
 }
 
 impl MarshalHints {
