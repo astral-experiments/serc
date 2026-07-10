@@ -69,6 +69,7 @@ impl LoopBreakPolicy {
 struct ExceptionHandlerContext {
     name: Option<NameId>,
     loop_depth: usize,
+    protect_outer_return_pop: bool,
     common_cleanup: Label,
     common_cleanup_depth: u32,
 }
@@ -2037,6 +2038,32 @@ impl Compiler {
                 } else {
                     None
                 };
+                let supported_nested_finally_return = matches!(
+                    statement.value.as_deref(),
+                    Some(Expr::Name(_) | Expr::BooleanLiteral(_) | Expr::NoneLiteral(_))
+                );
+                let nested_call_finally_return = supported_nested_finally_return
+                    && self
+                        .control
+                        .active_return_finally_contexts
+                        .last()
+                        .is_some_and(|context| {
+                            matches!(context.body.as_slice(), [Stmt::Expr(expression)]
+                            if matches!(expression.value.as_ref(), Expr::Call(_)))
+                        })
+                    && (self.control.active_exception_region_exclusions.len()
+                        > self.control.active_return_finally_contexts.len()
+                        || !self.control.active_exception_handlers.is_empty());
+                let return_finally_unwind_start = (overriding_unwind_start.is_none()
+                    && !preserve_tos
+                    && nested_call_finally_return
+                    && self.control.active_exception_handlers.is_empty())
+                .then(|| {
+                    let start = self.assembler.label();
+                    self.assembler.mark(start);
+                    start
+                });
+
                 if !preserve_tos {
                     let range = statement
                         .value
@@ -2089,6 +2116,8 @@ impl Compiler {
                     && !self.control.active_exception_handlers.is_empty();
                 let mut exception_unwind_start = if overriding_unwind_start.is_some() {
                     overriding_unwind_start
+                } else if return_finally_unwind_start.is_some() {
+                    return_finally_unwind_start
                 } else if finally_end_unwind_start.is_some() {
                     finally_end_unwind_start
                 } else if !self.control.active_exception_region_exclusions.is_empty()
@@ -2148,8 +2177,12 @@ impl Compiler {
                         self.assembler.mark(start);
                         exception_unwind_start = Some(start);
                     }
-                    let protected_pop_except = (!return_is_overridden
-                        && !self.control.active_return_finally_contexts.is_empty())
+                    let protects_outer_handler = handler_index > 0
+                        && self.control.active_exception_handlers[handler_index]
+                            .protect_outer_return_pop;
+                    let protected_pop_except = (protects_outer_handler
+                        || (!return_is_overridden
+                            && !self.control.active_return_finally_contexts.is_empty()))
                     .then(|| {
                         let start = self.assembler.label();
                         self.assembler.mark(start);
@@ -2159,14 +2192,27 @@ impl Compiler {
                     if let Some(start) = protected_pop_except {
                         let end = self.assembler.label();
                         self.assembler.mark(end);
-                        for context in &self.control.active_return_finally_contexts {
+                        if let Some(handler) = handler_index
+                            .checked_sub(1)
+                            .map(|index| &self.control.active_exception_handlers[index])
+                        {
                             self.assembler.add_exception_region(
                                 start,
                                 end,
-                                context.handler,
-                                context.depth,
-                                false,
+                                handler.common_cleanup,
+                                handler.common_cleanup_depth,
+                                true,
                             );
+                        } else {
+                            for context in &self.control.active_return_finally_contexts {
+                                self.assembler.add_exception_region(
+                                    start,
+                                    end,
+                                    context.handler,
+                                    context.depth,
+                                    false,
+                                );
+                            }
                         }
                     }
                     if let Some(name) = name {
@@ -2182,12 +2228,31 @@ impl Compiler {
                 } else {
                     Vec::new()
                 };
+                let unwinds_return_finally = nested_call_finally_return;
                 for finally_context in return_finally_contexts.iter().rev() {
+                    let iterator_cleanup_start = self.assembler.label();
+                    self.assembler.mark(iterator_cleanup_start);
                     self.emit_loop_iterator_cleanup(
                         finally_context.loop_depth,
                         next_loop,
                         preserve_tos,
                     )?;
+                    let iterator_cleanup_end = self.assembler.label();
+                    self.assembler.mark(iterator_cleanup_end);
+                    if preserve_tos
+                        && nested_call_finally_return
+                        && self.control.active_exception_handlers.is_empty()
+                        && matches!(statement.value.as_deref(), Some(Expr::Name(_)))
+                        && finally_context.loop_depth < next_loop
+                    {
+                        self.assembler.add_exception_region(
+                            iterator_cleanup_start,
+                            iterator_cleanup_end,
+                            finally_context.handler,
+                            finally_context.depth,
+                            false,
+                        );
+                    }
                     let initialized_locals = self.symbols.initialized_locals.clone();
                     let result = self.compile_suite(&finally_context.body);
                     self.symbols.initialized_locals = initialized_locals;
@@ -2220,7 +2285,10 @@ impl Compiler {
                     if let Some(value) = &statement.value {
                         let return_location = self.source_location(statement.range);
                         let return_spans_lines = return_location.line != return_location.end_line;
-                        if !with_unwind_starts.is_empty() || finally_unwind_start.is_some() {
+                        if unwinds_return_finally
+                            || !with_unwind_starts.is_empty()
+                            || finally_unwind_start.is_some()
+                        {
                             let constant = fold_constant(value).ok_or_else(|| {
                                 CompileError::Internal(
                                     "literal return value did not fold to a constant".to_string(),
@@ -4091,6 +4159,24 @@ impl Compiler {
                 .as_except_handler()
                 .is_some_and(|handler| suite_terminates(&handler.body))
         });
+        let nested_handler_tail_if_with_terminal_handlers = handlers_terminate
+            && self.control.in_exception_handler()
+            && statement.orelse.is_empty()
+            && matches!(
+                statement.body.as_slice(),
+                [Stmt::If(tail)]
+                    if tail.elif_else_clauses.is_empty()
+                        && matches!(tail.test.as_ref(), Expr::UnaryOp(unary) if unary.op == UnaryOp::Not)
+                        && matches!(tail.body.as_slice(), [Stmt::Expr(expression)] if matches!(expression.value.as_ref(), Expr::Call(_)))
+            )
+            && matches!(
+                statement.handlers.as_slice(),
+                [handler]
+                    if handler.as_except_handler().is_some_and(|handler| {
+                        matches!(handler.body.as_slice(), [Stmt::Return(statement)]
+                            if matches!(statement.value.as_deref(), Some(Expr::BooleanLiteral(_))))
+                    })
+            );
         let normal_exit_suite = if statement.orelse.is_empty() {
             statement.body.as_slice()
         } else {
@@ -4235,6 +4321,26 @@ impl Compiler {
                     )
                 })?;
                 normal_return_emitted = emitted;
+            } else if nested_handler_tail_if_with_terminal_handlers
+                && let Some((last @ Stmt::If(_), leading)) = statement.body.split_last()
+            {
+                self.with_try_body_context(statement, |compiler| {
+                    compiler.compile_suite(leading)?;
+                    compiler.with_control_override(
+                        |control| &mut control.exclude_condition_not_taken_from_exception,
+                        true,
+                        |compiler| {
+                            compiler.with_control_override(
+                                |control| {
+                                    &mut control
+                                        .exclude_condition_not_taken_from_all_exception_regions
+                                },
+                                true,
+                                |compiler| compiler.compile_statement(last),
+                            )
+                        },
+                    )
+                })?;
             } else {
                 self.with_try_body_context(statement, |compiler| {
                     compiler.with_control_override(
@@ -4371,6 +4477,9 @@ impl Compiler {
             } else if let Some(location) = self.assembler.last_instruction_location() {
                 self.assembler.set_location(location);
             }
+            if nested_handler_tail_if_with_terminal_handlers {
+                self.assembler.set_location(SourceLocation::NONE);
+            }
             let pass_only_handlers = statement.handlers.iter().all(|handler| {
                 handler
                     .as_except_handler()
@@ -4405,6 +4514,9 @@ impl Compiler {
                 ExceptionPolicy::default()
             };
             self.emit_jump_forward_with_exception_policy(JUMP_FORWARD, end, 0, exception_policy)?;
+            if nested_handler_tail_if_with_terminal_handlers {
+                self.assembler.preserve_last_no_location();
+            }
             if normal_exit_starts_in_empty_block {
                 self.assembler.mark_last_borrow_empty_block();
             }
@@ -4727,6 +4839,7 @@ impl Compiler {
                         name: handler_name,
                         loop_depth: self.control.loops.len(),
                         common_cleanup,
+                        protect_outer_return_pop: nested_handler_tail_if_with_terminal_handlers,
                         common_cleanup_depth: (base_depth + 1).cast_unsigned(),
                     };
                     let ((), exclusions) = self.with_exception_handler(context, |compiler| {
@@ -4841,11 +4954,20 @@ impl Compiler {
                 if terminal {
                     self.emit_deferred_implicit_return()?;
                 } else {
+                    let protected_loop_value_return = self.control.in_iterator_loop()
+                        && self.control.active_finally_try_bodies > 0
+                        && matches!(
+                            statement.body.last(),
+                            Some(Stmt::Return(statement))
+                                if matches!(statement.value.as_deref(), Some(Expr::Name(_)))
+                        );
+
                     // A pass-only finally keeps these extended handler exits in its protected
                     // region; executable finally bodies use CPython's stale-owner exclusion.
                     let exception_policy = if !handler_body_has_instructions
                         && !self.control.active_exception_region_exclusions.is_empty()
                         && self.control.active_pass_finally_locations.is_empty()
+                        && !protected_loop_value_return
                     {
                         ExceptionPolicy::EXCLUDE_IF_EXTENDED
                     } else {
