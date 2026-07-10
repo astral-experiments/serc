@@ -796,6 +796,48 @@ def single_exit_break(items):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_protected_non_final_branch_loop_tails() {
+        let source = r"def protected_state_machine(items):
+    for index, item in enumerate(items):
+        try:
+            if state == SCANNING:
+                if item.startswith(tag):
+                    if item.endswith(end):
+                        state = STATE_RETTYPE
+                    else:
+                        state = STATE_DOC
+            elif state == STATE_DOC:
+                if item.startswith(end):
+                    state = STATE_RETTYPE
+                else:
+                    output.append(item)
+            elif state == STATE_RETTYPE:
+                state = STATE_NAME
+            elif state == STATE_NAME:
+                state = STATE_ARGS
+            elif state == STATE_ARGS:
+                if item.startswith(start):
+                    state = SCANNING
+                else:
+                    arguments.append(item)
+        except ParseError:
+            raise
+        except Exception as error:
+            raise ParseError(index, message) from error
+
+
+def single_normal_exit_control(items):
+    for item in items:
+        try:
+            if accepted(item):
+                consume(item)
+        except LookupError:
+            continue
+";
+        assert_matches_cpython_marshal(source, "protected_non_final_branch_loop_tails.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_shared_artificial_loop_backedges() {
         let source = r"def try_else(values, output):
     for value in values:
@@ -2436,6 +2478,43 @@ def final_elif_in_non_final_branch(items):
             fallback(item)
 "#;
         assert_matches_cpython_marshal(source, "non_final_branch_loop_tail.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_inherited_non_final_branch_loop_tails() {
+        let source = r"def append_library(libraries, item):
+    for existing in libraries:
+        if is_sequence(existing):
+            if is_sequence(item):
+                if item[0] == existing[0]:
+                    if item[1] is existing[1]:
+                        return
+                    warn(item[0])
+                    break
+            else:
+                if item == existing[0]:
+                    warn(item[0])
+                    break
+        else:
+            if is_sequence(item):
+                if item[0] == existing:
+                    warn(item[0])
+                    break
+            else:
+                if item == existing:
+                    return
+    libraries.append(item)
+
+
+def final_else_control(items):
+    for item in items:
+        if is_sequence(item):
+            consume(item)
+        else:
+            if accepted(item):
+                consume(item)
+";
+        assert_matches_cpython_marshal(source, "inherited_non_final_branch_loop_tails.py");
     }
 
     #[test]
