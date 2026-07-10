@@ -1263,6 +1263,63 @@ def while_plain_try(flag):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_shifted_plain_try_condition_markers() {
+        let source = r"def retained(items):
+    for item in items:
+        consume(item, 0)
+        consume(item, 1)
+        consume(item, 2)
+        consume(item, 3)
+        consume(item, 4)
+        consume(item, 5)
+        consume(item, 6)
+        consume(item, 7)
+        try:
+            value = item.make()
+            if value.flags.owned:
+                continue
+            value = value.view(Type)
+        except Error:
+            continue
+        use(value)
+
+
+def shifted(items):
+    for item in items:
+        consume(item, 0)
+        consume(item, 1)
+        consume(item, 2)
+        consume(item, 3)
+        consume(item, 4)
+        consume(item, 5)
+        consume(item, 6)
+        consume(item, 7)
+        consume(item, 8)
+        try:
+            value = item.make()
+            if value.flags.owned:
+                continue
+            value = value.view(Type)
+        except Error:
+            continue
+        use(value)
+
+
+def direct_condition(items, first, second):
+    for item in items:
+        consume(first, second)
+        consume(first, second)
+        try:
+            if item:
+                continue
+            use(item)
+        except Error:
+            continue
+";
+        assert_matches_cpython_marshal(source, "shifted_plain_try_condition_markers.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_generator_like_terminal_elif_owners() {
         let source = r"def generator_elif(first, second):
     yield 1
@@ -1718,6 +1775,47 @@ def boolean_elif(manager, first, second, third):
     return value
 ";
         assert_matches_cpython_marshal(source, "with_final_fallthrough_branches.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_terminal_two_operand_conditions_in_with_bodies() {
+        let source = r"def terminal(manager, first, second):
+    with manager:
+        value = make()
+        if not first or not second:
+            raise Error(value)
+
+
+def negated_conjunction(z, msgform):
+    with np.errstate(invalid='ignore'):
+        if not (np.isnan(z.real) and np.isinf(z.imag)):
+            raise AssertionError(msgform % (z.real, z.imag))
+
+
+def nonterminal(manager, first, second):
+    with manager:
+        if not first or not second:
+            raise Error
+        consume()
+
+
+def fallthrough_body(manager, first, second):
+    with manager:
+        if not first or not second:
+            consume()
+
+
+def outside_with(first, second):
+    if not first or not second:
+        raise Error
+
+
+async def asynchronous(manager, first, second):
+    async with manager:
+        if not first or not second:
+            raise Error
+";
+        assert_matches_cpython_marshal(source, "with_terminal_two_operand_condition.py");
     }
 
     #[test]
@@ -2336,6 +2434,73 @@ def explicit_else(flag):
     after()
 ";
         assert_matches_cpython_marshal(source, "nonterminal_handler_fallthrough.py");
+    }
+
+    #[test]
+    fn matches_cpython_none_condition_marker_owners_in_exception_handlers() {
+        let source = r"def is_none(value):
+    try:
+        action()
+    except Error:
+        if value is None:
+            recover()
+        finish()
+
+
+def is_not_none(value, items):
+    try:
+        action()
+    except Error:
+        if value is not None:
+            recover()
+        result = [item for item in items]
+
+
+def named(value):
+    try:
+        action()
+    except Error as error:
+        if value is None:
+            recover(error)
+        finish()
+
+
+def nested(value):
+    try:
+        action()
+    except Error:
+        if predicate(value):
+            if value is not None:
+                recover()
+        finish()
+
+
+def reversed_control(value):
+    try:
+        action()
+    except Error:
+        if None is value:
+            recover()
+        finish()
+
+
+def outside_handler_control(value):
+    if value is None:
+        recover()
+    finish()
+
+
+def later_bare_handler_control(value):
+    try:
+        action()
+    except ValueError as error:
+        consume(error)
+    except TypeError:
+        if value is None:
+            recover()
+        finish()
+";
+        assert_matches_cpython_marshal(source, "handler_none_condition_owners.py");
     }
 
     #[test]
@@ -3308,6 +3473,46 @@ def keyword_unpacking():
     }
 
     #[test]
+    fn matches_cpython_marshal_for_generator_guard_marker_owners() {
+        let source = r"def after_resume(values):
+    yield before()
+    result = tuple(value for value in values)
+    yield result
+
+
+def while_fresh(values):
+    yield before()
+    while True:
+        result = tuple(value for value in values)
+        yield result
+
+
+def after_dynamic(flag, values):
+    yield before()
+    if flag:
+        prepare()
+        result = tuple(value for value in values)
+        yield result
+
+
+def iterator_owned(groups):
+    yield before()
+    for values in groups:
+        result = tuple(value for value in values)
+        yield result
+
+
+def consecutive_fresh(values):
+    yield before()
+    while True:
+        first = tuple(value for value in values)
+        second = tuple(value for value in values)
+        yield first, second
+";
+        assert_matches_cpython_marshal(source, "generator_guard_marker_owners.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_boolean_optimized_generator_calls() {
         let source = "def disjunction(prefix, values):\n    return prefix or any(value for value in values)\n\ndef conjunction(prefix, values):\n    return prefix and all(value for value in values)\n\ndef nested(first, second, values):\n    return first or second or any(value for value in values)\n\nwrapped = lambda first, second, values: first and second and all(value for value in values)\n";
         assert_matches_cpython_marshal(source, "boolean_generator_calls.py");
@@ -3463,6 +3668,79 @@ def call_control(condition):
     return result
 "#;
         assert_matches_cpython_marshal(source, "assert_branch_exit.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_later_assertion_branches_before_function_exits() {
+        let source = r"def before_return(first, second):
+    if first:
+        consume()
+    elif second:
+        assert second.value
+    else:
+        consume()
+    return
+
+
+def before_raise(first, second):
+    if first:
+        consume()
+    elif second:
+        assert second.value
+    else:
+        consume()
+    raise RuntimeError
+
+
+def ordinary_successor_control(first, second):
+    if first:
+        consume()
+    elif second:
+        assert second.value
+    else:
+        consume()
+    after()
+
+
+def terminating_else_control(first, second):
+    if first:
+        consume()
+    elif second:
+        assert second.value
+    else:
+        return
+    after()
+
+
+def terminating_else_before_return(first, second):
+    if first:
+        consume()
+    elif second:
+        assert second.value
+    else:
+        return
+    return
+
+
+def loop_controls(items, first, second):
+    for item in items:
+        if first:
+            consume()
+        elif second:
+            assert second.value
+        else:
+            consume()
+        break
+    for item in items:
+        if first:
+            consume()
+        elif second:
+            assert second.value
+        else:
+            consume()
+        continue
+";
+        assert_matches_cpython_marshal(source, "later_assertion_function_exits.py");
     }
 
     #[test]
@@ -5124,6 +5402,81 @@ def nested_handler(compiler):
     return command
 ";
         assert_matches_cpython_marshal(source, "nested_return_unwinds.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_loop_tail_boolean_expression_exits() {
+        let source = r"def conjunction(items):
+    for item in items:
+        left(item) and right(item)
+
+
+def disjunction(items):
+    for item in items:
+        first(item) or second(item) or third(item)
+
+
+def non_tail(items):
+    for item in items:
+        left(item) and right(item)
+        consume(item)
+
+
+def final_call(items):
+    for item in items:
+        consume(item)
+
+
+def assigned(items):
+    for item in items:
+        result = left(item) and right(item)
+";
+        assert_matches_cpython_marshal(source, "loop_tail_boolean_exits.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_direct_nested_handler_return_owners() {
+        let source = r"def direct_none(action):
+    try:
+        outer()
+    except TypeError:
+        try:
+            action()
+            raise AssertionError()
+        except TypeError:
+            return
+
+
+def direct_value(action):
+    try:
+        outer()
+    except TypeError:
+        try:
+            action()
+            raise AssertionError()
+        except ValueError:
+            return False
+        except TypeError:
+            return True
+
+
+def top_level(action):
+    try:
+        action()
+    except TypeError:
+        return
+
+
+def nested_fallthrough(action):
+    try:
+        outer()
+    except TypeError:
+        try:
+            action()
+        except TypeError:
+            recover()
+";
+        assert_matches_cpython_marshal(source, "nested_handler_return_owners.py");
     }
 
     #[test]

@@ -1854,6 +1854,25 @@ impl Compiler {
         let fallback = self.assembler.label();
         let end = self.assembler.label();
 
+        // The optimized-call guard's NOT_TAKEN is appended after exception targets are labeled.
+        // In a plain generator's while body, it inherits the stop-iteration owner after a direct
+        // yield resume but uses a fresh ownerless slot on the loop's initial entry.
+        let generator_guard_exception_policy = (self.unit.flags & CO_GENERATOR != 0
+            && !self.control.generator_expression
+            && self.control.active_exception_region_exclusions.is_empty()
+            && self.control.active_with_region_exclusions.is_empty()
+            && self
+                .control
+                .active_comprehension_region_exclusions
+                .is_empty()
+            && self.control.active_normal_finally_bodies == 0
+            && self.control.active_finally_end_blocks == 0
+            && self.control.active_exception_group_handlers == 0
+            && !self.control.in_exception_handler()
+            && self.control.in_while_loop())
+        .then(|| {
+            ExceptionPolicy::normalized_owner(self.assembler.current_block_resumes_after_yield())
+        });
         self.compile_expression(&call.func)?;
         self.assembler.set_location(callable_location);
         self.emit(COPY, 1, 1)?;
@@ -1870,7 +1889,12 @@ impl Compiler {
             self.assembler.mark(start);
             start
         });
-        self.emit(NOT_TAKEN, 0, 0)?;
+        self.emit_with_exception_policy(
+            NOT_TAKEN,
+            0,
+            0,
+            generator_guard_exception_policy.unwrap_or_default(),
+        )?;
         if let Some(start) = not_taken_exclusion_start {
             let end = self.assembler.label();
             self.assembler.mark(end);
@@ -4468,6 +4492,18 @@ impl Compiler {
         if let Expr::UnaryOp(unary) = expression
             && unary.op == UnaryOp::Not
         {
+            let defer_terminal_with_exclusion = self.control.terminal_with_condition
+                == Some(expression.range())
+                && self.control.exclude_terminal_if_not_taken
+                && !self.control.active_with_region_exclusions.is_empty()
+                && matches!(unary.operand.as_ref(), Expr::BoolOp(boolean) if boolean.values.len() == 2);
+            if defer_terminal_with_exclusion {
+                return self.with_control_override(
+                    |control| &mut control.defer_terminal_with_exclusion_through_negation,
+                    true,
+                    |compiler| compiler.compile_jump_if(&unary.operand, !jump_on, label),
+                );
+            }
             return self.compile_jump_if(&unary.operand, !jump_on, label);
         }
         if let Expr::If(conditional) = expression
@@ -4524,16 +4560,44 @@ impl Compiler {
                     "boolean expression contains no values".to_string(),
                 ));
             };
+            let operands_are_negated =
+                self.control.terminal_with_condition == Some(expression.range())
+                    && matches!(boolean.op, BoolOp::Or)
+                    && !jump_on
+                    && boolean.values.iter().all(
+                        |value| matches!(value, Expr::UnaryOp(unary) if unary.op == UnaryOp::Not),
+                    );
+            let defer_terminal_with_exclusion = leading.len() == 1
+                && self.control.exclude_terminal_if_not_taken
+                && !self.control.active_with_region_exclusions.is_empty()
+                && (operands_are_negated
+                    || self.control.defer_terminal_with_exclusion_through_negation);
             let short_circuit_jumps_to_target = matches!(boolean.op, BoolOp::Or) == jump_on;
             if short_circuit_jumps_to_target {
                 for value in leading {
-                    self.compile_jump_if(value, jump_on, label)?;
+                    if defer_terminal_with_exclusion {
+                        self.with_control_override(
+                            |control| &mut control.exclude_terminal_if_not_taken,
+                            false,
+                            |compiler| compiler.compile_jump_if(value, jump_on, label),
+                        )?;
+                    } else {
+                        self.compile_jump_if(value, jump_on, label)?;
+                    }
                 }
                 return self.compile_jump_if(last, jump_on, label);
             }
             let end = self.assembler.label();
             for value in leading {
-                self.compile_jump_if(value, !jump_on, end)?;
+                if defer_terminal_with_exclusion {
+                    self.with_control_override(
+                        |control| &mut control.exclude_terminal_if_not_taken,
+                        false,
+                        |compiler| compiler.compile_jump_if(value, !jump_on, end),
+                    )?;
+                } else {
+                    self.compile_jump_if(value, !jump_on, end)?;
+                }
             }
             self.compile_jump_if(last, jump_on, label)?;
             self.assembler.preserve_block_boundary(end);
@@ -4687,6 +4751,7 @@ impl Compiler {
                 ordinary: ExceptionPolicy::normalized_owner(
                     self.control.generator_region_start.is_some()
                         || self.control.include_assert_none_condition_owner
+                        || self.control.in_first_unnamed_exception_handler()
                         || self.control.active_normal_finally_bodies > 0,
                 ),
             };
@@ -4753,23 +4818,30 @@ impl Compiler {
                 .terminal_try_condition_exception_exclusion_depth
                 .is_some()
                 && self.assembler.current_block_has_dynamic_exception_owner());
-        let exclude_plain_try_marker = !comparison_is_boolean
-            && !self.assembler.fallthrough_has_dynamic_exception_owner()
-            && self.control.generator_region_start.is_none()
-            && !self.control.in_iterator_loop()
-            && !self.control.exceptional_finally_condition
+        let shifted_plain_try_marker = !comparison_is_boolean
             && self
                 .control
-                .active_comprehension_region_exclusions
-                .is_empty()
-            && self.control.active_with_region_exclusions.is_empty()
-            && self.control.active_normal_finally_bodies == 0
-            && self.control.active_finally_end_blocks == 0
-            && self.control.active_exception_group_handlers == 0
-            && !self.control.same_line_try_body
-            && !self.control.current_exception_handler_binds_name()
-            && !self.control.in_exception_handler()
-            && self.control.active_exception_region_exclusions.len() == 1;
+                .current_try_marker_is_shifted_to_ownerless_slot(
+                    self.assembler.instruction_count(),
+                );
+        let exclude_plain_try_marker = !comparison_is_boolean
+            && (shifted_plain_try_marker
+                || (!self.assembler.fallthrough_has_dynamic_exception_owner()
+                    && self.control.generator_region_start.is_none()
+                    && !self.control.in_iterator_loop()
+                    && !self.control.exceptional_finally_condition
+                    && self
+                        .control
+                        .active_comprehension_region_exclusions
+                        .is_empty()
+                    && self.control.active_with_region_exclusions.is_empty()
+                    && self.control.active_normal_finally_bodies == 0
+                    && self.control.active_finally_end_blocks == 0
+                    && self.control.active_exception_group_handlers == 0
+                    && !self.control.same_line_try_body
+                    && !self.control.current_exception_handler_binds_name()
+                    && !self.control.in_exception_handler()
+                    && self.control.active_exception_region_exclusions.len() == 1));
         if exclude_plain_try_marker {
             // CPython appends normalized markers after exception targets are labeled. Force the
             // plain try marker ownerless only when no optimized CFG slot can carry an owner.
