@@ -3565,6 +3565,24 @@ impl Compiler {
                         }
                     }
                 }
+                if self.control.active_finally_end_blocks > 0
+                    && branch_count == 1
+                    && branch_index == 0
+                    && statement.elif_else_clauses.is_empty()
+                    && !self.control.current_statement_has_following
+                    && !suite_terminates(body)
+                {
+                    if !matches!(body.last(), Some(Stmt::If(_))) {
+                        self.set_branch_end_location(body, body_start);
+                        self.emit_reraise(ReraiseStackState::ActiveExceptionHandler)?;
+                    }
+                    self.assembler.mark(next);
+                    self.set_depth(base_depth);
+                    self.assembler
+                        .set_location(self.source_location(synthetic_condition_exit_range(test)));
+                    self.emit_reraise(ReraiseStackState::ActiveExceptionHandler)?;
+                    continue;
+                }
                 self.assembler.mark(next);
                 self.set_depth(base_depth);
             } else {
@@ -7347,8 +7365,24 @@ impl Compiler {
         // `POP_BLOCK` is converted to a NOP before CPython's CFG optimizer runs. It normally
         // disappears, but can retain the sole predecessor's line when a small finally exit is
         // copied onto another edge.
+        let normal_finally_pop_block_exclusion_start =
+            (!self.control.active_with_region_exclusions.is_empty()
+                && !self.control.current_statement_has_following
+                && matches!(statement.finalbody.as_slice(), [Stmt::If(_)]))
+            .then(|| {
+                let start = self.assembler.label();
+                self.assembler.mark(start);
+                start
+            });
         self.assembler.set_location(SourceLocation::NONE);
         self.emit(NOP, 0, 0)?;
+        if let Some(start) = normal_finally_pop_block_exclusion_start {
+            let end = self.assembler.label();
+            self.assembler.mark(end);
+            for exclusions in &mut self.control.active_with_region_exclusions {
+                exclusions.push((start, end));
+            }
+        }
         let noop_finally_body = statement.finalbody.iter().all(|statement| {
             matches!(statement, Stmt::Pass(_))
                 || matches!(statement, Stmt::Expr(expression) if fold_constant(&expression.value).is_some())
