@@ -4645,9 +4645,13 @@ impl Compiler {
         let terminal_try_depth = self
             .control
             .terminal_try_condition_exception_exclusion_depth;
+        let exclude_normal_finally_not_taken_from_with = self.control.active_normal_finally_bodies
+            > 0
+            && !self.control.active_with_region_exclusions.is_empty();
         if !self.control.exclude_terminal_if_not_taken
             && !self.control.exclude_condition_not_taken_from_exception
             && terminal_try_depth.is_none()
+            && !exclude_normal_finally_not_taken_from_with
         {
             return self.emit_with_exception_policy(NOT_TAKEN, 0, 0, policy.ordinary);
         }

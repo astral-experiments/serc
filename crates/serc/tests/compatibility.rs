@@ -7987,4 +7987,42 @@ print(Box.__type_params__, Box[int], Box[int](42).value)
             "list[int] ()\n(T,) Pair[int] tuple[T, T]\n42 (T,) {'value': T, 'return': T}\n<class 'int'> <class 'bool'>\n(T,) __main__.Box[int] 42\n",
         );
     }
+
+    #[test]
+    fn matches_cpython_marshal_for_tail_finally_cleanup_condition_in_with() {
+        let source = r#"def f(cm, cw, cond):
+    with cm() as tmp:
+        with cw():
+            for i in range(1, 3):
+                try:
+                    body(tmp)
+                except Exception as e:
+                    msg = f"failed: {e}"
+                    raise AssertionError(msg)
+                finally:
+                    if cond:
+                        cleanup()
+"#;
+        assert_matches_cpython_marshal(source, "tail_finally_cleanup_condition_in_with.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_followed_finally_cleanup_condition_in_with() {
+        let source = r#"def f(cm, cond, max_workers):
+    with cm() as manager:
+        try:
+            futures = []
+            for arg in all_args:
+                futures.append(manager.submit(*arg))
+        except RuntimeError as e:
+            import pytest
+            pytest.skip(f"Spawning failed with error {e!r}")
+        finally:
+            if len(futures) < max_workers and cond:
+                cleanup()
+        for future in futures:
+            future.result()
+"#;
+        assert_matches_cpython_marshal(source, "followed_finally_cleanup_condition_in_with.py");
+    }
 }
