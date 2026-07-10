@@ -5544,6 +5544,44 @@ def final_elif(action, first, second):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_try_body_exit_nops_before_direct_exits_only() {
+        let source = r"def before_return(flag):
+    try:
+        prepare()
+        if flag:
+            raise ValueError
+    except TypeError:
+        recover()
+    return flag
+
+def before_raise(flag):
+    try:
+        prepare()
+        if flag:
+            raise ValueError
+    except TypeError:
+        recover()
+    raise RuntimeError
+
+def before_conditional_return(values, required):
+    for value in values:
+        result = None
+        try:
+            result = prepare(value)
+            if required and value is None:
+                raise ValueError(value)
+        except TypeError:
+            recover(value)
+        except LookupError:
+            recover_again(value)
+        if result is not None:
+            return value
+    return None
+";
+        assert_matches_cpython_marshal(source, "try_body_exit_before_direct_exits.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_a_constant_true_comprehension_filter() {
         let source = "value: int\n[x for x in values if True]\n[x for x in values if not None]\n[result for x in values if not predicate]\n{target.attr: None for target.attr in values}\n[\n    result\n    for x in values\n    if True\n]\n[\n    result\n    for x in values\n    if x\n    if not None\n]\n[x for x in values if left and right]\n{x for x in values if lower < x < upper if accepted}\n(x for x in values if left and right if accepted)\n(x for x in values if left and right async for y in async_values if accepted)\n\ndef restored_then_subscript(values):\n    result = {}\n    result['key'] = [value for value in values]\n\ndef assignment_reuses_target():\n    tasks = [task for task in tasks]\n";
         assert_matches_cpython_marshal(source, "comprehension.py");

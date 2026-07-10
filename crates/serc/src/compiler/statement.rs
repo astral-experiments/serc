@@ -247,6 +247,8 @@ pub(super) struct ControlFlowState {
     // CPython threads that exit before jump normalization, which likewise moves `NOT_TAKEN`
     // into a fresh backward-jump block instead of reusing the condition block's stale slot.
     suite_fallthrough_to_loop_backedge: bool,
+    // The final source statement compiled before a split loop-tail `if`, if any.
+    synthesized_loop_tail_predecessor: Option<TextRange>,
     exclude_loop_tail_not_taken_from_control_flow_regions: bool,
     exception_type_bool_marker_state: Option<ExceptionTypeBoolMarkerState>,
     implicit_return_exception_exclusion_depth: Option<usize>,
@@ -3033,9 +3035,15 @@ impl Compiler {
         match body.split_last() {
             Some((Stmt::If(statement), leading)) => {
                 self.with_control_override(
-                    |control| &mut control.suite_fallthrough_to_loop_backedge,
-                    false,
-                    |compiler| compiler.compile_suite(leading),
+                    |control| &mut control.synthesized_loop_tail_predecessor,
+                    leading.last().map(Ranged::range),
+                    |compiler| {
+                        compiler.with_control_override(
+                            |control| &mut control.suite_fallthrough_to_loop_backedge,
+                            false,
+                            |compiler| compiler.compile_suite(leading),
+                        )
+                    },
                 )?;
                 self.compile_loop_tail_if(statement, restart, split_short_circuit, mode, leading)?;
                 Ok(LoopBackedge::Emitted)
@@ -4701,6 +4709,18 @@ impl Compiler {
                 Some(Stmt::Assert(assertion))
                     if condition_jump_target_count(&assertion.test, true) == 1
             );
+        let unlocated_conditional_exit = statement.orelse.is_empty()
+            && self.control.in_iterator_loop()
+            && self.control.synthesized_loop_tail_predecessor == Some(statement.range)
+            && matches!(
+                statement.body.last(),
+                Some(Stmt::If(nested))
+                    if terminating_if_fallthrough_test(nested).is_some_and(|test| {
+                        condition_jump_target_count(test, false) > 1
+                    })
+            );
+        let include_try_none_condition_owner =
+            self.control.include_assert_none_condition_owner || unlocated_conditional_exit;
         let mut normal_return_emitted = false;
         let body_noop_location = if direct_continue {
             self.assembler.mark(try_end);
@@ -4788,9 +4808,15 @@ impl Compiler {
             } else {
                 self.with_try_body_context(statement, |compiler| {
                     compiler.with_control_override(
-                        |control| &mut control.retained_try_body_if_exit,
-                        retained_try_body_if_exit,
-                        |compiler| compiler.compile_suite(&statement.body),
+                        |control| &mut control.include_assert_none_condition_owner,
+                        include_try_none_condition_owner,
+                        |compiler| {
+                            compiler.with_control_override(
+                                |control| &mut control.retained_try_body_if_exit,
+                                retained_try_body_if_exit,
+                                |compiler| compiler.compile_suite(&statement.body),
+                            )
+                        },
                     )
                 })?;
             }
@@ -4899,9 +4925,7 @@ impl Compiler {
                 self.emit_deferred_implicit_return()?;
             }
         } else {
-            let direct_exit_location = statement
-                .orelse
-                .is_empty()
+            let direct_exit_location = (statement.orelse.is_empty() && !unlocated_conditional_exit)
                 .then(|| direct_try_body_exit_location(&statement.body))
                 .flatten();
             if let Some(location) = orelse_noop_location {
@@ -4909,6 +4933,8 @@ impl Compiler {
             } else if let Some(location) = direct_exit_location {
                 self.assembler
                     .set_location(self.source_location(location.range()));
+            } else if unlocated_conditional_exit {
+                self.assembler.set_location(SourceLocation::NONE);
             } else if self.control.current_statement_followed_by_literal_return
                 && let Some(Stmt::If(nested)) = statement.orelse.last()
                 && nested.elif_else_clauses.is_empty()
@@ -4979,6 +5005,10 @@ impl Compiler {
             if copy_break_only_loop_exit {
                 // Copy the following try exit directly onto the only reachable loop break.
                 self.assembler.prepare_last_no_location_block_for_inlining();
+            }
+            if unlocated_conditional_exit {
+                self.assembler.prevent_borrow_reachability(end);
+                self.assembler.preserve_last_no_location();
             }
             if nested_handler_tail_if_with_terminal_handlers {
                 self.assembler.preserve_last_no_location();
