@@ -132,7 +132,6 @@ impl Compiler {
                 *index < parameter_count
                     || !plan.cellvars.contains(*name)
                     || plan.inlined_comprehension_cellvars.contains(*name)
-                    || plan.inlined_comprehension_fast_cellvars.contains(*name)
             })
             .map(|(_, name)| *name)
             .collect();
@@ -145,7 +144,6 @@ impl Compiler {
                 *index >= parameter_count
                     && plan.cellvars.contains(*name)
                     && !plan.inlined_comprehension_cellvars.contains(*name)
-                    && !plan.inlined_comprehension_fast_cellvars.contains(*name)
             })
             .map(|(_, name)| *name)
             .collect();
@@ -175,11 +173,6 @@ impl Compiler {
             fast_local_count,
             cell_names: cell_names.clone(),
             free_names,
-            temporary_fast_cells: plan
-                .inlined_comprehension_fast_cellvars
-                .iter()
-                .copied()
-                .collect(),
             initialized_locals,
             ..SymbolState::default()
         };

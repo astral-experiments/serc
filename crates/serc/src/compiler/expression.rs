@@ -2416,21 +2416,9 @@ impl Compiler {
             .iter()
             .map(|name| self.required_name_id(name))
             .collect();
-        let comprehension_cell_ids = self.name_id_set(&comprehension_cell_names);
         self.symbols
             .active_temporaries
             .extend(active_temporary_ids.iter().copied());
-        for name in &active_temporary_ids {
-            self.symbols.active_temporaries.insert(*name);
-            if comprehension_cell_ids.contains(name)
-                || self.symbols.cell_names.contains(*name)
-                    && !self.symbols.temporary_fast_cells.contains(*name)
-            {
-                self.symbols.active_temporary_cells.insert(*name);
-            } else {
-                self.symbols.active_temporary_cells.remove(*name);
-            }
-        }
 
         let protected_start = self.assembler.label();
         let protected_end = self.assembler.label();
@@ -2583,7 +2571,6 @@ impl Compiler {
         }
         for name in active_temporary_ids {
             self.symbols.active_temporaries.remove(name);
-            self.symbols.active_temporary_cells.remove(name);
         }
 
         let mut region_start = protected_start;

@@ -227,7 +227,6 @@ pub(super) struct FunctionPlan {
     pub(super) annotation_references: FxHashSet<NameId>,
     pub(super) cellvars: FxHashSet<NameId>,
     pub(super) inlined_comprehension_cellvars: FxHashSet<NameId>,
-    pub(super) inlined_comprehension_fast_cellvars: FxHashSet<NameId>,
     pub(super) freevars: Vec<NameId>,
     pub(super) annotation_freevars: Vec<NameId>,
     pub(super) comprehension_shadowed_targets: FxHashSet<NameId>,
@@ -262,7 +261,6 @@ pub(super) struct LoweringFunctionPlan {
     pub(super) annotation_references: FxHashSet<NameId>,
     pub(super) cellvars: FxHashSet<NameId>,
     pub(super) inlined_comprehension_cellvars: FxHashSet<NameId>,
-    pub(super) inlined_comprehension_fast_cellvars: FxHashSet<NameId>,
     pub(super) freevars: Vec<NameId>,
     pub(super) annotation_freevars: Vec<NameId>,
     pub(super) required: FxHashSet<NameId>,
@@ -495,14 +493,6 @@ impl FunctionPlan {
             .flat_map(|parameters| parameters.iter())
             .map(|parameter| parameter.name().as_str().to_string())
             .collect::<Vec<_>>();
-        let mut inlined_comprehension_fast_cellvars =
-            rebound_comprehension_generator_cellvars(&definition.body);
-        if inlined_comprehension_fast_cellvars.len() == 1 {
-            inlined_comprehension_fast_cellvars
-                .retain(|name| locals.comprehension_first_bindings.contains(name));
-        } else {
-            inlined_comprehension_fast_cellvars.clear();
-        }
         let mut plan = Self {
             locals: locals
                 .names
@@ -513,8 +503,6 @@ impl FunctionPlan {
             annotation_references: names.intern_set(annotation_collector.references),
             cellvars: names.intern_set(cellvars),
             inlined_comprehension_cellvars: names.intern_set(inlined_comprehension_cellvars),
-            inlined_comprehension_fast_cellvars: names
-                .intern_set(inlined_comprehension_fast_cellvars),
             freevars: Vec::new(),
             annotation_freevars: Vec::new(),
             comprehension_shadowed_targets: names.intern_set(comprehension_shadowed_targets),
@@ -525,9 +513,6 @@ impl FunctionPlan {
             nested_function_requirements.iter().copied(),
             nested_function_annotation_references.iter().copied(),
         );
-        let cellvars = &plan.cellvars;
-        plan.inlined_comprehension_fast_cellvars
-            .retain(|name| cellvars.contains(name));
         plan
     }
 
@@ -557,7 +542,6 @@ impl FunctionPlan {
             annotation_references: self.annotation_references,
             cellvars: self.cellvars,
             inlined_comprehension_cellvars: self.inlined_comprehension_cellvars,
-            inlined_comprehension_fast_cellvars: self.inlined_comprehension_fast_cellvars,
             freevars: self.freevars,
             annotation_freevars: self.annotation_freevars,
             required: self.required,
@@ -1338,63 +1322,12 @@ fn function_default_expressions(definition: &StmtFunctionDef) -> impl Iterator<I
                 .filter_map(|parameter| parameter.default.as_deref()),
         )
 }
-
-fn rebound_comprehension_generator_cellvars(body: &[Stmt]) -> FxHashSet<String> {
-    let mut result = FxHashSet::default();
-    for statements in body.windows(2) {
-        let value = match &statements[0] {
-            Stmt::Assign(assignment) => Some(assignment.value.as_ref()),
-            Stmt::AnnAssign(assignment) => assignment.value.as_deref(),
-            Stmt::Expr(statement) => match statement.value.as_ref() {
-                Expr::Call(call)
-                    if call.arguments.keywords.is_empty()
-                        && matches!(call.func.as_ref(), Expr::Attribute(attribute) if attribute.attr.as_str() == "extend") =>
-                {
-                    call.arguments
-                        .args
-                        .as_ref()
-                        .first()
-                        .filter(|_| call.arguments.args.len() == 1)
-                }
-                _ => None,
-            },
-            _ => None,
-        };
-        let Some(generators) = value.and_then(|value| match value {
-            Expr::ListComp(comprehension) => Some(comprehension.generators.as_slice()),
-            Expr::SetComp(comprehension) => Some(comprehension.generators.as_slice()),
-            Expr::DictComp(comprehension) => Some(comprehension.generators.as_slice()),
-            _ => None,
-        }) else {
-            continue;
-        };
-        let Stmt::For(statement) = &statements[1] else {
-            continue;
-        };
-        let mut comprehension_targets = Vec::new();
-        for generator in generators {
-            collect_target_names(&generator.target, &mut comprehension_targets);
-        }
-        let mut loop_targets = Vec::new();
-        collect_target_names(&statement.target, &mut loop_targets);
-        let generator_requirements =
-            ScopeBodyFacts::for_function(&statement.body).nested_generator_requirements;
-        result.extend(
-            comprehension_targets.into_iter().filter(|name| {
-                loop_targets.contains(name) && generator_requirements.contains(name)
-            }),
-        );
-    }
-    result
-}
-
 #[derive(Debug, Default)]
 struct LocalCollector {
     names: Vec<String>,
     seen: FxHashSet<String>,
     comprehension_targets: Vec<String>,
     seen_comprehension_targets: FxHashSet<String>,
-    comprehension_first_bindings: FxHashSet<String>,
     non_comprehension_bindings: FxHashSet<String>,
     candidate_bindings: Option<FxHashMap<String, bool>>,
     annotation_only: FxHashSet<String>,
@@ -1665,10 +1598,6 @@ impl LocalCollector {
     fn collect_comprehension_target(&mut self, target: &Expr) {
         match target {
             Expr::Name(name) => {
-                if !self.non_comprehension_bindings.contains(name.id.as_str()) {
-                    self.comprehension_first_bindings
-                        .insert(name.id.as_str().to_string());
-                }
                 self.mark_binding(name.id.as_str());
             }
             Expr::List(list) => {
@@ -2215,7 +2144,7 @@ pub(super) fn analyze_lambda_scope(lambda: &ruff_python_ast::ExprLambda) -> Lamb
     let mut nested_requirements = nested_lambda_required_names_in_expression(&lambda.body);
     nested_requirements.extend(nested_generator_required_names_in_expression(&lambda.body));
     let local_names = locals.names.iter().cloned().collect::<FxHashSet<_>>();
-    let cellvars: FxHashSet<_> = nested_requirements
+    let cellvars = nested_requirements
         .iter()
         .filter(|name| local_names.contains(*name))
         .cloned()
