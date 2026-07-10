@@ -2240,6 +2240,83 @@ def iteration(items, flag):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_break_after_try_handler() {
+        let source = r"def after_handler(items):
+    for item in items:
+        if item:
+            try:
+                value = item()
+            except Error:
+                pass
+            break
+    return None, None, None
+
+
+def terminal_branch_before_break(items, first, second):
+    for item in items:
+        try:
+            value = item()
+            if first and second:
+                return value
+        except Error:
+            pass
+        break
+    return None, None, None
+
+
+def direct_control(items):
+    for item in items:
+        if item:
+            value = item()
+            break
+    return None, None, None
+
+
+def named_tuple_control(items):
+    first = None
+    second = None
+    for item in items:
+        if item:
+            first = item
+            break
+    return first, second
+";
+        assert_matches_cpython_marshal(source, "break_after_try_handler.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_short_circuit_loop_tail_backedge() {
+        let source = r#"def update(target, source, force):
+    for key in source:
+        if key == "first":
+            if force or key not in target:
+                target[key] = source[key]
+        elif key == "second":
+            target[key] = source[key]
+        else:
+            raise ValueError(key)
+"#;
+        assert_matches_cpython_marshal(source, "short_circuit_loop_tail_backedge.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_nested_fallthrough_if_exit() {
+        let source = r"def nested(flag, inner, extra):
+    if flag:
+        if inner:
+            first()
+        else:
+            second()
+            if extra:
+                third()
+    else:
+        fallback()
+    after()
+";
+        assert_matches_cpython_marshal(source, "nested_fallthrough_if_exit.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_folded_while_constant_order() {
         let source = r#"async def empty_pool_retained(action, consume):
     while True:

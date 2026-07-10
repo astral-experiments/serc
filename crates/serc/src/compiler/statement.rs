@@ -45,6 +45,7 @@ struct LoopContext {
     break_label: Label,
     iterator_cleanup: IteratorCleanup,
     protect_boolean_return_cleanup: bool,
+    prevent_break_exit_inlining: bool,
     with_depth: usize,
     finally_end_depth: usize,
     exception_region_depth: usize,
@@ -271,6 +272,8 @@ pub(super) struct ControlFlowState {
     // remains inside the current protected region instead of exiting through its normal edge.
     current_statement_followed_by_try: bool,
     branch_join_successor: Option<TextRange>,
+    // Whether that successor is a direct loop break.
+    current_statement_followed_by_break: bool,
     // Whether the current expression is the complete value of an ordinary assignment and is an
     // optimized all/any/tuple generator call.
     pub(super) direct_optimized_generator_assignment: bool,
@@ -280,6 +283,9 @@ pub(super) struct ControlFlowState {
     // Whether that successor is a direct literal return. CPython can copy this small exit onto
     // the normal edge of a preceding try/else before retaining the edge as a source NOP.
     current_statement_followed_by_literal_return: bool,
+    // Whether that successor is a direct folded tuple return. CPython keeps loop breaks targeting
+    // this constant exit instead of copying the tuple-return block onto each break edge.
+    current_statement_followed_by_tuple_return: bool,
     // Whether that successor exits the function by returning or raising. CPython copies these
     // exit blocks before removing assertion-branch jumps, including jumps from later clauses.
     current_statement_followed_by_return_or_raise: bool,
@@ -403,6 +409,8 @@ impl Compiler {
             break_label,
             iterator_cleanup,
             protect_boolean_return_cleanup: false,
+            prevent_break_exit_inlining: iterator_cleanup != IteratorCleanup::None
+                && self.control.current_statement_followed_by_tuple_return,
             with_depth: self.control.active_with_exits.len(),
             finally_end_depth: self.control.active_finally_end_blocks,
             exception_region_depth: self.control.active_exception_region_exclusions.len(),
@@ -970,6 +978,7 @@ impl Compiler {
                     self.control.suite_fallthrough_to_loop_backedge
                         && is_final
                         && transparent_loop_tail;
+                let followed_by_break = matches!(body.get(index + 1), Some(Stmt::Break(_)));
                 let followed_by_name_return = matches!(
                     body.get(index + 1),
                     Some(Stmt::Return(statement))
@@ -979,6 +988,14 @@ impl Compiler {
                     body.get(index + 1),
                     Some(Stmt::Return(statement))
                         if statement.value.as_deref().is_none_or(is_literal_constant)
+                );
+                let followed_by_tuple_return = matches!(
+                    body.get(index + 1),
+                    Some(Stmt::Return(statement))
+                        if matches!(
+                            statement.value.as_deref(),
+                            Some(value @ Expr::Tuple(_)) if fold_constant(value).is_some()
+                        )
                 );
                 let followed_by_return_or_raise =
                     matches!(body.get(index + 1), Some(Stmt::Return(_) | Stmt::Raise(_)));
@@ -998,6 +1015,10 @@ impl Compiler {
                             !is_final,
                             |compiler| {
                                 compiler.with_control_override(
+                                    |control| &mut control.current_statement_followed_by_break,
+                                    followed_by_break,
+                                    |compiler| {
+                                compiler.with_control_override(
                                     |control| {
                                         &mut control.current_statement_followed_by_name_return
                                     },
@@ -1010,6 +1031,12 @@ impl Compiler {
                                             },
                                             followed_by_literal_return,
                                             |compiler| {
+                                                compiler.with_control_override(
+                                                    |control| {
+                                                        &mut control.current_statement_followed_by_tuple_return
+                                                    },
+                                                    followed_by_tuple_return,
+                                                    |compiler| {
                                                 compiler.with_control_override(
                                                     |control| {
                                                         &mut control
@@ -1050,8 +1077,12 @@ impl Compiler {
                                                         )
                                                     },
                                                 )
+                                                    },
+                                                )
                                             },
                                         )
+                                    },
+                                )
                                     },
                                 )
                             },
@@ -2234,7 +2265,9 @@ impl Compiler {
                     let has_no_emitted_cleanup = self.assembler.instruction_count() == marker_end;
                     self.emit_jump_forward(JUMP_FORWARD, context.break_label, 0)?;
                     self.assembler.mark_last_jump_as_authored_break();
-                    if context.break_policy.preserves_jump_exit() {
+                    if context.prevent_break_exit_inlining {
+                        self.assembler.prevent_last_jump_inlining();
+                    } else if context.break_policy.preserves_jump_exit() {
                         // CPython inlines small exit blocks before removing a jump to the next
                         // block. Keep this terminal protected-loop break through that pass so
                         // the following finally return is copied onto the edge.
@@ -3103,7 +3136,10 @@ impl Compiler {
                 }
                 if !suite_terminates(body) && branch_index + 1 < branch_count {
                     let nested_if_exit = body.last().and_then(|statement| match statement {
-                        Stmt::If(statement) => nested_if_exit_location(statement),
+                        Stmt::If(statement) => nested_if_exit_location(
+                            statement,
+                            self.control.current_statement_has_following,
+                        ),
                         _ => None,
                     });
                     let nested_if_ends_in_break = matches!(
@@ -3770,7 +3806,7 @@ impl Compiler {
                 self.assembler.mark(fallback);
                 self.set_depth(base_depth);
                 self.assembler.set_location(
-                    self.source_location(synthetic_condition_exit_range(&statement.test)),
+                    self.source_location(condition_fallthrough_range(&statement.test)),
                 );
                 self.emit_loop_tail_backedge(restart, protected_try_normal_exit)?;
                 return Ok(());
@@ -5236,7 +5272,20 @@ impl Compiler {
             let direct_exit_location = (statement.orelse.is_empty() && !unlocated_conditional_exit)
                 .then(|| direct_try_body_exit_location(&statement.body))
                 .flatten();
-            if let Some(location) = orelse_noop_location {
+            let unlocated_direct_exit_before_break =
+                self.control.current_statement_followed_by_break
+                    && statement.orelse.is_empty()
+                    && matches!(
+                        statement.body.last(),
+                        Some(Stmt::If(branch))
+                            if terminating_if_fallthrough_test(branch).is_some()
+                                && condition_jump_target_count(&branch.test, false) > 1
+                    );
+            if unlocated_direct_exit_before_break {
+                // A following break remains a separate CFG exit, so the converted `POP_BLOCK`
+                // does not inherit the terminal branch's source range.
+                self.assembler.set_location(SourceLocation::NONE);
+            } else if let Some(location) = orelse_noop_location {
                 self.assembler.set_location(location);
             } else if let Some(location) = direct_exit_location {
                 self.assembler
@@ -5333,6 +5382,9 @@ impl Compiler {
             if copy_break_only_loop_exit {
                 // Copy the following try exit directly onto the only reachable loop break.
                 self.assembler.prepare_last_no_location_block_for_inlining();
+            }
+            if unlocated_direct_exit_before_break {
+                self.assembler.preserve_last_no_location();
             }
             if unlocated_conditional_exit {
                 self.assembler.prevent_borrow_reachability(end);
@@ -8400,9 +8452,29 @@ fn statement_terminates(statement: &Stmt) -> bool {
 
 fn nested_if_exit_location(
     statement: &ruff_python_ast::StmtIf,
+    allow_recursive_fallthrough: bool,
 ) -> Option<NestedIfExitLocation<'_>> {
     if early_condition_truthiness(&statement.test).is_some() {
         return None;
+    }
+    if allow_recursive_fallthrough
+        && !suite_terminates(&statement.body)
+        && statement
+            .elif_else_clauses
+            .iter()
+            .all(|clause| !suite_terminates(&clause.body))
+        && let Some(clause) = statement.elif_else_clauses.last()
+        && clause.test.is_none()
+        && matches!(
+            clause.body.last(),
+            Some(Stmt::If(tail))
+                if matches!(
+                    nested_if_exit_location(tail, allow_recursive_fallthrough),
+                    Some(NestedIfExitLocation::Unlocated)
+                )
+        )
+    {
+        return Some(NestedIfExitLocation::Unlocated);
     }
     let (test, body) = if let Some(clause) = statement.elif_else_clauses.last() {
         (clause.test.as_ref()?, clause.body.as_slice())
