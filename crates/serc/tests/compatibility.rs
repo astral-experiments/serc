@@ -1798,6 +1798,42 @@ def terminal_loop(manager):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_direct_handler_returns_inside_synchronous_with() {
+        let source = r#"def direct(manager):
+    with manager:
+        try:
+            return produce()
+        except Error:
+            return recover()
+
+
+def fully_terminating(manager, value, output):
+    with manager:
+        if is_array(value):
+            if output is None:
+                return first()
+            else:
+                return second()
+        elif output is None:
+            try:
+                return typed()
+            except AttributeError:
+                return fallback()
+        else:
+            return third()
+
+
+def enclosing_try_control(manager):
+    try:
+        with manager:
+            return produce()
+    except Error:
+        return recover()
+"#;
+        assert_matches_cpython_marshal(source, "with_direct_handler_returns.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_trailing_finally_exits_in_synchronous_with_bodies() {
         let source = r"def direct(manager):
     with manager:

@@ -75,6 +75,7 @@ struct ExceptionHandlerContext {
     name: Option<NameId>,
     first: bool,
     loop_depth: usize,
+    unwinds_before_sync_with: bool,
     trailing_statement: Option<TextRange>,
     protect_outer_return_pop: bool,
     common_cleanup: Label,
@@ -307,6 +308,12 @@ pub(super) struct ControlFlowState {
     direct_try_body_has_successor: bool,
     // Normal exits from a trailing if chain cross the innermost handler boundary.
     direct_try_if_exit: bool,
+    // A one-return try/handler nested directly in a synchronous with unwinds that try before
+    // running the surrounding manager exit.
+    direct_return_handler_try_inside_sync_with: bool,
+    // Conditions nested within a fully terminating synchronous-with return chain retain the
+    // manager's normalized exception owner.
+    sync_with_direct_return_chain: bool,
     pub(super) generator_region_start: Option<Label>,
     pub(super) generator_region_exclusions: Vec<(Label, Label)>,
     pub(super) emitted_fallthrough_return: bool,
@@ -2487,8 +2494,16 @@ impl Compiler {
                 } else {
                     None
                 };
+                let unwinds_handler_before_sync_with = !self.control.active_with_exits.is_empty()
+                    && !self.control.active_exception_handlers.is_empty()
+                    && self
+                        .control
+                        .active_exception_handlers
+                        .iter()
+                        .all(|handler| handler.unwinds_before_sync_with);
                 let handler_count = if !return_is_overridden
-                    && self.control.active_with_exits.is_empty()
+                    && (self.control.active_with_exits.is_empty()
+                        || unwinds_handler_before_sync_with)
                     && !unwinds_pass_finally
                 {
                     self.control.active_exception_handlers.len()
@@ -2536,7 +2551,9 @@ impl Compiler {
                             );
                         }
                     }
-                    if delay_exception_unwind_start && exception_unwind_start.is_none() {
+                    if (delay_exception_unwind_start || unwinds_handler_before_sync_with)
+                        && exception_unwind_start.is_none()
+                    {
                         let start = self.assembler.label();
                         self.assembler.mark(start);
                         exception_unwind_start = Some(start);
@@ -2668,6 +2685,13 @@ impl Compiler {
                 self.emit_loop_iterator_cleanup(0, next_loop, preserve_tos)?;
                 if delay_boolean_iterator_exception_unwind_start
                     && delay_iterator_exception_unwind_start
+                    && exception_unwind_start.is_none()
+                {
+                    let start = self.assembler.label();
+                    self.assembler.mark(start);
+                    exception_unwind_start = Some(start);
+                }
+                if self.control.direct_return_handler_try_inside_sync_with
                     && exception_unwind_start.is_none()
                 {
                     let start = self.assembler.label();
@@ -2979,6 +3003,30 @@ impl Compiler {
                         .active_with_exits
                         .last()
                         .is_some_and(|context| !context.is_async);
+                let preserve_sync_with_direct_return_chain_owner =
+                    self.control.sync_with_direct_return_chain
+                        || (!self.control.current_statement_has_following
+                            && self.control.loops.is_empty()
+                            && self.control.active_exception_region_exclusions.is_empty()
+                            && self.control.active_with_region_exclusions.len() == 1
+                            && self.control.active_with_exits.len() == 1
+                            && self
+                                .control
+                                .active_with_exits
+                                .last()
+                                .is_some_and(|context| !context.is_async)
+                            && suite_terminates_in_direct_return_handler_chain(&statement.body)
+                            && statement
+                                .elif_else_clauses
+                                .last()
+                                .is_some_and(|clause| clause.test.is_none())
+                            && statement.elif_else_clauses.iter().all(|clause| {
+                                suite_terminates_in_direct_return_handler_chain(&clause.body)
+                            })
+                            && (suite_contains_direct_return_handler_try(&statement.body)
+                                || statement.elif_else_clauses.iter().any(|clause| {
+                                    suite_contains_direct_return_handler_try(&clause.body)
+                                })));
                 let exclude_not_taken = self.control.exclude_terminal_if_not_taken
                     || (!self.control.active_with_region_exclusions.is_empty()
                         && branch_index > 0
@@ -3101,6 +3149,11 @@ impl Compiler {
                     // marker consumes the with setup's stale owner slot.
                     self.assembler.preserve_last_not_taken_exception_owner();
                 }
+                if preserve_sync_with_direct_return_chain_owner {
+                    // This one-return branch chain retains the surrounding manager's owner on
+                    // each normalized condition marker.
+                    self.assembler.preserve_last_not_taken_exception_owner();
+                }
                 if retain_folded_test_in_protected_region {
                     // CPython keeps the first folded branch marker inside the surrounding
                     // protected region instead of treating it as an artificial condition NOP.
@@ -3118,9 +3171,15 @@ impl Compiler {
                 let body_start = self.assembler.instruction_count();
                 self.compile_with_strict_owned_loads(matches!(test, Expr::If(_)), |compiler| {
                     compiler.with_control_override(
-                        |control| &mut control.direct_try_if_exit,
-                        direct_try_if_exit,
-                        |compiler| compiler.compile_suite(body),
+                        |control| &mut control.sync_with_direct_return_chain,
+                        preserve_sync_with_direct_return_chain_owner,
+                        |compiler| {
+                            compiler.with_control_override(
+                                |control| &mut control.direct_try_if_exit,
+                                direct_try_if_exit,
+                                |compiler| compiler.compile_suite(body),
+                            )
+                        },
                     )
                 })?;
                 let pass_only_body = matches!(body, [Stmt::Pass(_)]);
@@ -4856,6 +4915,18 @@ impl Compiler {
         }
 
         let base_depth = self.control.depth;
+        let direct_return_handler_try_inside_sync_with =
+            self.control.active_exception_region_exclusions.is_empty()
+                && self.control.active_with_region_exclusions.len() == 1
+                && self.control.active_with_exits.len() == 1
+                && self.control.loops.is_empty()
+                && self.control.active_finally_try_bodies == 0
+                && self
+                    .control
+                    .active_with_exits
+                    .last()
+                    .is_some_and(|context| !context.is_async)
+                && is_direct_return_handler_try(statement);
         let nested_in_final_outer_try_statement =
             !self.control.active_exception_region_exclusions.is_empty()
                 && self
@@ -5147,13 +5218,19 @@ impl Compiler {
             } else {
                 self.with_try_body_context(statement, |compiler| {
                     compiler.with_control_override(
-                        |control| &mut control.include_assert_none_condition_owner,
-                        include_try_none_condition_owner,
+                        |control| &mut control.direct_return_handler_try_inside_sync_with,
+                        direct_return_handler_try_inside_sync_with,
                         |compiler| {
                             compiler.with_control_override(
-                                |control| &mut control.retained_try_body_if_exit,
-                                retained_try_body_if_exit,
-                                |compiler| compiler.compile_suite(&statement.body),
+                                |control| &mut control.include_assert_none_condition_owner,
+                                include_try_none_condition_owner,
+                                |compiler| {
+                                    compiler.with_control_override(
+                                        |control| &mut control.retained_try_body_if_exit,
+                                        retained_try_body_if_exit,
+                                        |compiler| compiler.compile_suite(&statement.body),
+                                    )
+                                },
                             )
                         },
                     )
@@ -5722,6 +5799,7 @@ impl Compiler {
                         name: handler_name,
                         first: handler_index == 0,
                         loop_depth: self.control.loops.len(),
+                        unwinds_before_sync_with: direct_return_handler_try_inside_sync_with,
                         trailing_statement: handler.body.last().map(Ranged::range),
                         common_cleanup,
                         protect_outer_return_pop: nested_handler_tail_if_with_terminal_handlers
@@ -7946,6 +8024,55 @@ fn final_chained_comparison_jump(expression: &Expr, jump_on: bool) -> Option<Tex
 
 pub(super) fn suite_terminates(body: &[Stmt]) -> bool {
     body.iter().any(statement_terminates)
+}
+fn is_direct_return_handler_try(statement: &ruff_python_ast::StmtTry) -> bool {
+    !statement.is_star
+        && statement.orelse.is_empty()
+        && statement.finalbody.is_empty()
+        && matches!(statement.body.as_slice(), [Stmt::Return(_)])
+        && matches!(
+            statement.handlers.as_slice(),
+            [handler]
+                if handler.as_except_handler().is_some_and(|handler| {
+                    matches!(handler.body.as_slice(), [Stmt::Return(_)])
+                })
+        )
+}
+
+fn suite_terminates_in_direct_return_handler_chain(body: &[Stmt]) -> bool {
+    let [statement] = body else {
+        return false;
+    };
+    match statement {
+        Stmt::Return(_) => true,
+        Stmt::If(statement) => {
+            suite_terminates_in_direct_return_handler_chain(&statement.body)
+                && !statement.elif_else_clauses.is_empty()
+                && statement
+                    .elif_else_clauses
+                    .iter()
+                    .all(|clause| suite_terminates_in_direct_return_handler_chain(&clause.body))
+                && statement
+                    .elif_else_clauses
+                    .last()
+                    .is_some_and(|clause| clause.test.is_none())
+        }
+        Stmt::Try(statement) => is_direct_return_handler_try(statement),
+        _ => false,
+    }
+}
+fn suite_contains_direct_return_handler_try(body: &[Stmt]) -> bool {
+    body.iter().any(|statement| match statement {
+        Stmt::Try(statement) => is_direct_return_handler_try(statement),
+        Stmt::If(statement) => {
+            suite_contains_direct_return_handler_try(&statement.body)
+                || statement
+                    .elif_else_clauses
+                    .iter()
+                    .any(|clause| suite_contains_direct_return_handler_try(&clause.body))
+        }
+        _ => false,
+    })
 }
 
 fn suite_is_constant_false_assertion(body: &[Stmt]) -> bool {
