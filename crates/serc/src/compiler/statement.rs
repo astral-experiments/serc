@@ -44,6 +44,7 @@ struct LoopContext {
     continue_label: Label,
     break_label: Label,
     iterator_cleanup: IteratorCleanup,
+    protect_boolean_return_cleanup: bool,
     with_depth: usize,
     finally_end_depth: usize,
     exception_region_depth: usize,
@@ -329,6 +330,13 @@ impl ControlFlowState {
         })
     }
 
+    fn protects_boolean_return_iterator_cleanup(&self) -> bool {
+        self.loops.last().is_some_and(|context| {
+            context.protect_boolean_return_cleanup
+                && context.exception_region_depth == self.active_exception_region_exclusions.len()
+        })
+    }
+
     /// Returns whether a direct Boolean exception-type marker should retain its owner.
     ///
     /// CPython appends normalized markers without initializing the reused CFG instruction slot.
@@ -357,6 +365,7 @@ impl Compiler {
             continue_label,
             break_label,
             iterator_cleanup,
+            protect_boolean_return_cleanup: false,
             with_depth: self.control.active_with_exits.len(),
             finally_end_depth: self.control.active_finally_end_blocks,
             exception_region_depth: self.control.active_exception_region_exclusions.len(),
@@ -2252,17 +2261,21 @@ impl Compiler {
                         (self.control.active_finally_end_blocks, start)
                     });
                 let finally_end_unwind_start = self.emit_finally_end_unwind(0, preserve_tos)?;
-                // A call result returned from a loop that was already protected by this try
-                // keeps the iterator SWAP/POP protected. Exclude only the RETURN_VALUE itself;
-                // nested handlers and finally bodies take distinct cleanup paths.
+                // A result returned from a loop that was already protected by this try keeps the
+                // iterator cleanup protected. For a Boolean literal, start the exclusion before
+                // loading the returned constant; a call already has its value on the stack.
+                let delay_boolean_iterator_exception_unwind_start =
+                    matches!(statement.value.as_deref(), Some(Expr::BooleanLiteral(_)))
+                        && self.control.protects_boolean_return_iterator_cleanup();
                 let delay_iterator_exception_unwind_start = overriding_unwind_start.is_none()
                     && !self.control.active_exception_region_exclusions.is_empty()
                     && self.control.active_with_exits.is_empty()
                     && !unwinds_pass_finally
                     && self.control.active_exception_handlers.is_empty()
                     && self.control.active_return_finally_contexts.is_empty()
-                    && matches!(statement.value.as_deref(), Some(Expr::Call(_)))
-                    && self.control.in_exception_protected_iterator_loop();
+                    && (delay_boolean_iterator_exception_unwind_start
+                        || (matches!(statement.value.as_deref(), Some(Expr::Call(_)))
+                            && self.control.in_exception_protected_iterator_loop()));
                 let delay_exception_unwind_start = delay_iterator_exception_unwind_start
                     || (overriding_unwind_start.is_none()
                         && !self.control.active_exception_region_exclusions.is_empty()
@@ -2422,6 +2435,14 @@ impl Compiler {
                     self.control.active_return_finally_contexts = return_finally_contexts;
                 }
                 self.emit_loop_iterator_cleanup(0, next_loop, preserve_tos)?;
+                if delay_boolean_iterator_exception_unwind_start
+                    && delay_iterator_exception_unwind_start
+                    && exception_unwind_start.is_none()
+                {
+                    let start = self.assembler.label();
+                    self.assembler.mark(start);
+                    exception_unwind_start = Some(start);
+                }
                 let with_unwind_starts = self.emit_active_with_unwind(0, preserve_tos)?;
                 let finally_unwind_start = if unwinds_pass_finally {
                     let start = if let Some(start) = pass_finally_edge_start {
@@ -3865,11 +3886,24 @@ impl Compiler {
         self.emit_jump_forward(FOR_ITER, cleanup, 1)?;
         self.compile_store_target(&statement.target)?;
 
-        let context = self.loop_context(
+        let mut context = self.loop_context(
             start,
             end,
             IteratorCleanup::Sync,
             self.loop_break_policy(statement.range),
+        );
+        context.protect_boolean_return_cleanup = matches!(
+            statement.body.as_slice(),
+            [Stmt::If(branch)]
+                if branch.elif_else_clauses.is_empty()
+                    && matches!(
+                        branch.body.as_slice(),
+                        [Stmt::Return(return_statement)]
+                            if matches!(
+                                return_statement.value.as_deref(),
+                                Some(Expr::BooleanLiteral(_))
+                            )
+                    )
         );
         let body_start = self.assembler.instruction_count();
         let tail_jumps = self.with_loop_context(context, |compiler| {
@@ -5136,7 +5170,8 @@ impl Compiler {
                         common_cleanup,
                         protect_outer_return_pop: nested_handler_tail_if_with_terminal_handlers
                             || (handler_name.is_none()
-                                && suite_terminates(&statement.body)
+                                && (suite_terminates(&statement.body)
+                                    || self.control.current_statement_has_following)
                                 && matches!(handler.body.as_slice(), [Stmt::Return(_)])
                                 && matches!(
                                     self.control.active_exception_handlers.as_slice(),

@@ -1886,6 +1886,16 @@ def inner_try_return(items):
             pass
 
 
+def protected_boolean_return(items):
+    try:
+        for item in items:
+            if item.ready():
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def unprotected_continue(items):
     for item in items:
         if not item.ready():
@@ -2583,6 +2593,20 @@ def trailing_if_with_terminating_arm(first, second):
             value = recover()
         else:
             value = fallback()
+    return value
+
+
+def nested_handler_return_before_following(first, second):
+    try:
+        value = first()
+    except Error:
+        try:
+            result = second()
+        except OtherError:
+            return None
+        def normalize(value):
+            return value
+        return normalize(result)
     return value
 ";
         assert_matches_cpython_marshal(source, "bare_handler_inlineable_cleanup.py");
