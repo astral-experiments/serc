@@ -272,6 +272,13 @@ impl ControlFlowState {
             .is_some_and(|context| context.iterator_cleanup != IteratorCleanup::None)
     }
 
+    fn in_exception_protected_iterator_loop(&self) -> bool {
+        self.loops.last().is_some_and(|context| {
+            context.iterator_cleanup != IteratorCleanup::None
+                && context.exception_region_depth == self.active_exception_region_exclusions.len()
+        })
+    }
+
     /// Returns whether a direct Boolean exception-type marker should retain its owner.
     ///
     /// CPython appends normalized markers without initializing the reused CFG instruction slot.
@@ -2142,12 +2149,24 @@ impl Compiler {
                         (self.control.active_finally_end_blocks, start)
                     });
                 let finally_end_unwind_start = self.emit_finally_end_unwind(0, preserve_tos)?;
-                let delay_exception_unwind_start = overriding_unwind_start.is_none()
+                // A call result returned from a loop that was already protected by this try
+                // keeps the iterator SWAP/POP protected. Exclude only the RETURN_VALUE itself;
+                // nested handlers and finally bodies take distinct cleanup paths.
+                let delay_iterator_exception_unwind_start = overriding_unwind_start.is_none()
                     && !self.control.active_exception_region_exclusions.is_empty()
                     && self.control.active_with_exits.is_empty()
                     && !unwinds_pass_finally
-                    && preserve_tos
-                    && !self.control.active_exception_handlers.is_empty();
+                    && self.control.active_exception_handlers.is_empty()
+                    && self.control.active_return_finally_contexts.is_empty()
+                    && matches!(statement.value.as_deref(), Some(Expr::Call(_)))
+                    && self.control.in_exception_protected_iterator_loop();
+                let delay_exception_unwind_start = delay_iterator_exception_unwind_start
+                    || (overriding_unwind_start.is_none()
+                        && !self.control.active_exception_region_exclusions.is_empty()
+                        && self.control.active_with_exits.is_empty()
+                        && !unwinds_pass_finally
+                        && preserve_tos
+                        && !self.control.active_exception_handlers.is_empty());
                 let mut exception_unwind_start = if overriding_unwind_start.is_some() {
                     overriding_unwind_start
                 } else if return_finally_unwind_start.is_some() {
@@ -2516,6 +2535,26 @@ impl Compiler {
         for (branch_index, (test, body)) in branches.into_iter().enumerate() {
             if let Some(test) = test {
                 let next = self.assembler.label();
+                let negated_method_call_condition = matches!(test, Expr::UnaryOp(unary)
+                    if unary.op == UnaryOp::Not
+                        && matches!(unary.operand.as_ref(), Expr::Call(call)
+                            if matches!(call.func.as_ref(), Expr::Attribute(_))));
+                let preserve_sync_with_continue_owner = negated_method_call_condition
+                    && branch_index == 0
+                    && matches!(body, [Stmt::Continue(_)])
+                    && self.control.in_iterator_loop()
+                    && self.control.loops.last().is_some_and(|context| {
+                        self.assembler.instruction_count() == context.body_start
+                    })
+                    && self
+                        .control
+                        .active_with_exits
+                        .last()
+                        .is_some_and(|context| {
+                            !context.is_async
+                                && context.loop_depth.checked_add(1)
+                                    == Some(self.control.loops.len())
+                        });
                 let exclude_not_taken = self.control.exclude_terminal_if_not_taken
                     || (!self.control.active_with_region_exclusions.is_empty()
                         && branch_index > 0
@@ -2535,6 +2574,12 @@ impl Compiler {
                         )
                     },
                 )?;
+                if preserve_sync_with_continue_owner {
+                    // A direct continue from the first condition inside a surrounding
+                    // synchronous with reuses the protected CFG slot when the loop-control NOP
+                    // is removed. Keep that owner on the normalized fallthrough marker.
+                    self.assembler.preserve_last_not_taken_exception_owner();
+                }
                 if retain_folded_test_in_protected_region {
                     // CPython keeps the first folded branch marker inside the surrounding
                     // protected region instead of treating it as an artificial condition NOP.
