@@ -482,6 +482,7 @@ impl Compiler {
         let qualified_name =
             self.add_constant(Constant::String(self.unit.qualified_name.clone()))?;
         self.emit(LOAD_CONST, qualified_name, 1)?;
+        self.output.qualified_name_constant_index = Some(qualified_name);
         self.store_name("__qualname__")?;
         if u8::try_from(self.unit.first_line_number).is_ok() {
             self.emit(LOAD_SMALL_INT, self.unit.first_line_number, 1)?;
@@ -673,13 +674,8 @@ impl Compiler {
             )));
         }
 
-        for (instruction, constant, iterable_frozenset) in
-            std::mem::take(&mut self.output.deferred_constants)
-        {
+        for (instruction, constant) in std::mem::take(&mut self.output.deferred_constants) {
             let index = self.add_constant(constant)?;
-            if iterable_frozenset {
-                self.output.iterable_frozenset_indices.insert(index);
-            }
             if let Some(instruction) = instruction {
                 self.assembler.patch_argument(instruction, index)?;
             }
@@ -803,7 +799,7 @@ impl Compiler {
                     LocalsIdentity::ByValue
                 },
                 explicitly_interned_strings: self.output.interned_constant_strings,
-                iterable_frozenset_indices: self.output.iterable_frozenset_indices,
+                qualified_name_constant_index: self.output.qualified_name_constant_index,
             },
         };
         code.validate()?;

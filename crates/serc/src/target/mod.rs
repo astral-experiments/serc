@@ -8,7 +8,7 @@ pub(crate) use cpython_3_14_5::opcodes;
 pub(crate) use cpython_3_14_5::operands;
 pub(crate) use cpython_3_14_5::{
     TARGET_COMMIT, TARGET_IMPLEMENTATION, TARGET_MAGIC_NUMBER, TARGET_TAG, TARGET_VERSION,
-    is_conditional_jump, is_scope_exit, is_static_identifier, is_unconditional_jump, num_popped,
+    is_conditional_jump, is_preinterned_string, is_scope_exit, is_unconditional_jump, num_popped,
     num_pushed,
 };
 
