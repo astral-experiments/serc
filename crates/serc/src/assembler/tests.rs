@@ -473,7 +473,7 @@ fn fusion_preserves_each_typed_instruction_policy() {
         Some(1),
     );
     first.load_policy.force_owned = true;
-    first.no_location_policy.allow_block_inlining = true;
+    first.no_location_policy.allow_block_inlining();
     first.no_location_policy.percent_target_location = 7;
     first.converted_pop_block = true;
     first.hidden_exception_owner_slots = 2;
@@ -514,15 +514,14 @@ fn fusion_preserves_each_typed_instruction_policy() {
             strict_owned: true,
         }
     );
-    assert_eq!(
-        fused.no_location_policy,
-        NoLocationPolicy {
-            allow_block_inlining: true,
-            first_copy_as_interruptible_backward: false,
-            preserve: true,
-            percent_target_location: 7,
-        }
+    assert!(fused.no_location_policy.allows_block_inlining());
+    assert!(
+        !fused
+            .no_location_policy
+            .first_copy_is_interruptible_backward()
     );
+    assert!(fused.no_location_policy.preserve);
+    assert_eq!(fused.no_location_policy.percent_target_location, 7);
     assert_eq!(fused.fusion_policy, FusionPolicy::default());
     assert!(fused.converted_pop_block);
     assert!(fused.jump_policy.preserves_explicit_nop());
@@ -1099,7 +1098,7 @@ fn no_location_block_inlining_reaches_a_fixed_point() {
         None,
     );
     first_cleanup_jump.jump_policy.prevent_threading_target();
-    first_cleanup_jump.no_location_policy.allow_block_inlining = true;
+    first_cleanup_jump.no_location_policy.allow_block_inlining();
     let mut second_cleanup_jump = Instruction::new(
         JUMP_BACKWARD_NO_INTERRUPT,
         Operand::Backward(restart),
@@ -1107,7 +1106,9 @@ fn no_location_block_inlining_reaches_a_fixed_point() {
         None,
     );
     second_cleanup_jump.jump_policy.prevent_threading_target();
-    second_cleanup_jump.no_location_policy.allow_block_inlining = true;
+    second_cleanup_jump
+        .no_location_policy
+        .allow_block_inlining();
     let mut assembler = optimization_pipeline(vec![
         Item::Label(restart),
         pass_instruction(NOP, 0, 0),

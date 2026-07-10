@@ -111,23 +111,65 @@ impl LoadPolicy {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum NoLocationBlockInlining {
+    #[default]
+    Disabled,
+    Allowed,
+    FirstCopyInterruptible,
+}
+
+impl NoLocationBlockInlining {
+    const fn fused(first: Self, second: Self) -> Self {
+        match (first, second) {
+            (Self::FirstCopyInterruptible, _) | (_, Self::FirstCopyInterruptible) => {
+                Self::FirstCopyInterruptible
+            }
+            (Self::Allowed, _) | (_, Self::Allowed) => Self::Allowed,
+            (Self::Disabled, Self::Disabled) => Self::Disabled,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct NoLocationPolicy {
     /// Whether an unlocated block ending at this instruction may be inlined.
-    pub(super) allow_block_inlining: bool,
-    /// Whether a copied forward exit becomes an interruptible backward jump after cold-block
-    /// ordering. The original cleanup edge remains non-interruptible.
-    pub(super) first_copy_as_interruptible_backward: bool,
+    block_inlining: NoLocationBlockInlining,
     pub(super) preserve: bool,
     /// An unresolved percent target or its deferred-location side-table index.
     pub(super) percent_target_location: u8,
 }
 
 impl NoLocationPolicy {
+    pub(super) const fn allows_block_inlining(self) -> bool {
+        !matches!(self.block_inlining, NoLocationBlockInlining::Disabled)
+    }
+
+    /// Whether a copied forward exit becomes an interruptible backward jump after cold-block
+    /// ordering. The original cleanup edge remains non-interruptible.
+    pub(super) const fn first_copy_is_interruptible_backward(self) -> bool {
+        matches!(
+            self.block_inlining,
+            NoLocationBlockInlining::FirstCopyInterruptible
+        )
+    }
+
+    pub(super) fn allow_block_inlining(&mut self) {
+        if matches!(self.block_inlining, NoLocationBlockInlining::Disabled) {
+            self.block_inlining = NoLocationBlockInlining::Allowed;
+        }
+    }
+
+    pub(super) fn make_first_copy_interruptible(&mut self) {
+        debug_assert!(self.allows_block_inlining());
+        self.block_inlining = NoLocationBlockInlining::FirstCopyInterruptible;
+    }
+
     const fn fused(first: Self, second: Self) -> Self {
         Self {
-            allow_block_inlining: first.allow_block_inlining || second.allow_block_inlining,
-            first_copy_as_interruptible_backward: first.first_copy_as_interruptible_backward
-                || second.first_copy_as_interruptible_backward,
+            block_inlining: NoLocationBlockInlining::fused(
+                first.block_inlining,
+                second.block_inlining,
+            ),
             preserve: first.preserve || second.preserve,
             percent_target_location: if matches!(first.percent_target_location, 0 | u8::MAX) {
                 second.percent_target_location

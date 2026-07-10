@@ -80,7 +80,7 @@ fn no_exit_copy_analysis(
             && ends_scope(target_last.opcode);
         let no_location_exit = target_has_no_location
             && !block_has_fallthrough(graph[target].items())
-            && target_last.no_location_policy.allow_block_inlining
+            && target_last.no_location_policy.allows_block_inlining()
             && (!source_has_fallthrough || predecessors[target.index()] > 1);
         let small_exit_source = !source_has_fallthrough
             && graph[source]
@@ -179,7 +179,7 @@ fn no_exit_copy_analysis(
         });
         let no_location_exit = target_has_no_location
             && !block_has_fallthrough(graph[target].items())
-            && target_last.no_location_policy.allow_block_inlining;
+            && target_last.no_location_policy.allows_block_inlining();
         let shared_exit = predecessors[target.index()] > 1
             && graph[target].items().iter().all(|item| {
                 !matches!(item, Item::Instruction(instruction) if instruction.location.line >= 0)
@@ -967,7 +967,7 @@ impl OptimizationPipeline {
             });
             let target_allows_no_location_block_inlining = graph[target]
                 .last_instruction()
-                .is_some_and(|instruction| instruction.no_location_policy.allow_block_inlining);
+                .is_some_and(|instruction| instruction.no_location_policy.allows_block_inlining());
             let target_is_no_location_no_fallthrough = target_has_no_location
                 && target_allows_no_location_block_inlining
                 && !block_has_fallthrough(graph[target].items());
@@ -1023,7 +1023,7 @@ impl OptimizationPipeline {
                 })
                 && instruction
                     .no_location_policy
-                    .first_copy_as_interruptible_backward
+                    .first_copy_is_interruptible_backward()
                 && remaining_predecessors[&target] == predecessors[&target]
                 && instruction.opcode == JUMP_FORWARD
             {

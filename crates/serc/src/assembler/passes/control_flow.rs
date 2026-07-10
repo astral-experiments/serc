@@ -493,7 +493,7 @@ impl OptimizationPipeline {
                     && let Item::Instruction(next) = &mut items[next].1
                     && next.location.line < 0
                     && !next.no_location_policy.preserve
-                    && !next.no_location_policy.allow_block_inlining
+                    && !next.no_location_policy.allows_block_inlining()
                 {
                     next.location = instruction.location;
                 }
