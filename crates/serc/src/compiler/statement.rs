@@ -242,7 +242,7 @@ pub(super) struct ControlFlowState {
     pub(super) protected_iterator_continue_condition: Option<ruff_text_size::TextRange>,
     pub(super) exclude_condition_not_taken_from_exception: bool,
     pub(super) include_assert_none_condition_owner: bool,
-    pub(super) include_compound_none_condition_owner: bool,
+    pub(super) include_scoped_none_condition_owner: bool,
     // The final chained comparison whose fallthrough jump survives small-exit inlining as a NOP.
     pub(super) retained_chained_comparison_exit: Option<TextRange>,
     pub(super) exclude_condition_not_taken_from_all_exception_regions: bool,
@@ -2884,17 +2884,25 @@ impl Compiler {
                         && stable_terminal_exit_layout)
                         .then(|| final_chained_comparison_jump(test, false))
                         .flatten();
-                let include_compound_none_condition_owner = branch_count == 1
+                let include_scoped_none_condition_owner = branch_count == 1
                     && branch_index == 0
                     && matches!(self.unit.scope, Scope::Function { .. })
-                    && !self.control.current_statement_has_following
-                    && self
-                        .control
-                        .direct_try_body_statements
-                        .contains(&statement.range)
-                    && self.control.active_pass_only_try_bodies.last() == Some(&true)
-                    && suite_terminates(body)
-                    && matches!(test, Expr::BoolOp(_));
+                    && ((!self.control.current_statement_has_following
+                        && self
+                            .control
+                            .direct_try_body_statements
+                            .contains(&statement.range)
+                        && self.control.active_pass_only_try_bodies.last() == Some(&true)
+                        && suite_terminates(body)
+                        && matches!(test, Expr::BoolOp(_)))
+                        || (self.control.current_statement_has_following
+                            && self.control.in_iterator_loop()
+                            && self.control.generator_region_start.is_none()
+                            && self.control.active_with_region_exclusions.is_empty()
+                            && !self.control.active_exception_region_exclusions.is_empty()
+                            && self.control.active_normal_finally_bodies == 0
+                            && !self.control.in_exception_handler()
+                            && is_simple_none_default_assignment(test, body)));
                 self.with_control_override(
                     |control| &mut control.protected_iterator_continue_condition,
                     protected_iterator_continue_condition,
@@ -2908,8 +2916,8 @@ impl Compiler {
                                     exclude_not_taken,
                                     |compiler| {
                                         compiler.with_control_override(
-                                            |control| &mut control.include_compound_none_condition_owner,
-                                            include_compound_none_condition_owner,
+                                            |control| &mut control.include_scoped_none_condition_owner,
+                                            include_scoped_none_condition_owner,
                                             |compiler| {
                                                 compiler.with_terminal_try_condition_exception_exclusion(
                                                     compiler.terminal_try_condition_includes_generator_region(
@@ -7974,6 +7982,27 @@ fn is_membership_assignment_branch(statement: &ruff_python_ast::StmtIf) -> bool 
                         [Stmt::Assign(_), Stmt::Assign(_)]
                     )
         )
+}
+
+fn is_simple_none_default_assignment(test: &Expr, body: &[Stmt]) -> bool {
+    let Expr::Compare(comparison) = test else {
+        return false;
+    };
+    if comparison.ops.len() != 1
+        || comparison.ops[0] != CmpOp::Is
+        || !matches!(comparison.comparators.as_ref(), [Expr::NoneLiteral(_)])
+    {
+        return false;
+    }
+    let Expr::Name(name) = comparison.left.as_ref() else {
+        return false;
+    };
+    matches!(
+        body,
+        [Stmt::Assign(assignment)]
+            if matches!(assignment.targets.as_slice(), [Expr::Name(target)] if target.id == name.id)
+                && is_literal_constant(&assignment.value)
+    )
 }
 
 fn try_requires_legacy_loop_tail_exclusion(statement: &ruff_python_ast::StmtTry) -> bool {
