@@ -24,6 +24,9 @@ pub(super) enum ObjectKey<'a> {
     BigInt(bool, &'a [u16]),
     Float(u64),
     Complex(u64, u64),
+    // A noninterned constant does not share identity with an equal metadata string. CPython's
+    // compiler constant cache still shares equal constants with each other.
+    ConstantString(&'a str),
     String(&'a str),
     SurrogateString(&'a [u8]),
     Bytes(&'a [u8]),

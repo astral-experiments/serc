@@ -558,6 +558,21 @@ def parent():
     }
 
     #[test]
+    fn matches_cpython_marshal_for_noninterned_constant_metadata_collisions() {
+        let source = r#"from package.config import exported, café
+from other import *
+
+if error.name == "package.config":
+    recover()
+
+class Outer:
+    class Inner:
+        pass
+"#;
+        assert_matches_cpython_marshal(source, "string_metadata_collision.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_multiline_literal_return_locations() {
         let source = r#"def triple_quoted():
     return """alpha
@@ -2433,6 +2448,31 @@ def single_normal_exit(flag):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_bare_handler_call_cleanup_inside_with() {
+        let source = r"def protected(manager, flag):
+    with manager:
+        try:
+            action()
+        except Error:
+            result = check()
+            if result:
+                report(result)
+
+
+def explicit_else_control(flag):
+    try:
+        action()
+    except Error:
+        first()
+        if flag:
+            second()
+        else:
+            third()
+";
+        assert_matches_cpython_marshal(source, "bare_handler_call_cleanup.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_folded_expressions_in_protected_regions() {
         let source = "def try_except():\n    try:\n        'try'\n        body()\n    except:\n        'except'\n        recover()\n\ndef except_only():\n    try:\n        body()\n    except:\n        'except'\n\ndef nested_handlers():\n    try:\n        try:\n            body()\n        except ValueError:\n            recover()\n        except TypeError:\n            recover()\n    finally:\n        cleanup()\n\ndef with_body(manager):\n    with manager:\n        'with'\n        body()\n\ndef with_only(manager):\n    with manager:\n        'with'\n\nasync def protected_condition():\n    await source\n    if test:\n        await other\n\ntry:\n    pass\nexcept (ValueError if True else TypeError):\n    pass\n\ntry:\n    pass\nexcept* (ValueError if True else TypeError):\n    pass\n\ndef protected_conditions(manager, first, second):\n    with manager:\n        if first:\n            body()\n        if second:\n            body()\n\ndef generator_try():\n    yield 1\n    try:\n        pass\n    except Exception:\n        pass\n\nif condition:\n    try:\n        with manager:\n            body()\n    except Error:\n        pass\n";
         assert_matches_cpython_marshal(source, "protected_nop.py");
@@ -3252,6 +3292,19 @@ def keyword_unpacking():
     fn matches_cpython_marshal_for_optimized_generator_calls() {
         let source = "module_any = any(value for value in values)\nmodule_all = all(value for value in values)\nmodule_tuple = tuple(value for value in values)\nany(value for value in values)\nall(value for value in values)\ntuple(value for value in values)\nafter = None\n\n\ndef optimized(values):\n    return (\n        any(value for value in values),\n        all(value for value in values),\n        tuple(value for value in values),\n    )\n\n\ndef rebound(values, any):\n    return any(value for value in values)\n\n\ndef terminal_discard(values):\n    all(value for value in values)\n";
         assert_matches_cpython_marshal(source, "optimized_generator_calls.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_optimized_generator_calls_in_try_bodies() {
+        let source = r"def direct_nonterminal(values):
+    try:
+        result = tuple(int(value) for value in values)
+        if result:
+            consume(result)
+    except ValueError:
+        recover()
+";
+        assert_matches_cpython_marshal(source, "optimized_generator_try.py");
     }
 
     #[test]

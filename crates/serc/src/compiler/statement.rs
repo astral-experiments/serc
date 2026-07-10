@@ -238,7 +238,10 @@ pub(super) struct ControlFlowState {
     pub(super) generator_expression: bool,
     pub(super) same_line_try_body: bool,
     // Whether the statement currently entered by `compile_suite` has a sibling successor.
-    current_statement_has_following: bool,
+    pub(super) current_statement_has_following: bool,
+    // Whether the current expression is the complete value of an ordinary assignment and is an
+    // optimized all/any/tuple generator call.
+    pub(super) direct_optimized_generator_assignment: bool,
     // Whether that successor is a direct return of one local. CPython copies this tiny exit
     // before removing a constant-loop break edge, so its borrowed-load pass still visits it.
     current_statement_followed_by_name_return: bool,
@@ -247,6 +250,9 @@ pub(super) struct ControlFlowState {
     // The direct final synchronous `with` with a normal body fallthrough in the nested
     // try/except body synthesized while lowering a combined try/except/finally statement.
     direct_final_sync_with_combined_try_body: Option<ruff_text_size::TextRange>,
+    // Direct statements in the innermost normal try body. Nested branch suites must not inherit
+    // CPython's temporary block ownership for a sibling statement in that body.
+    direct_try_body_statements: Vec<TextRange>,
     pub(super) generator_region_start: Option<Label>,
     pub(super) generator_region_exclusions: Vec<(Label, Label)>,
     pub(super) emitted_fallthrough_return: bool,
@@ -347,18 +353,25 @@ impl Compiler {
             && self.control.generator_region_start.is_none())
         .then_some(final_sync_with_try_body)
         .flatten();
+        let direct_try_body_statements = statement.body.iter().map(Ranged::range).collect();
         self.with_control_override(
             |control| &mut control.same_line_try_body,
             same_line,
             |compiler| {
                 compiler.with_control_override(
-                    |control| &mut control.direct_final_sync_with_combined_try_body,
-                    direct_final_sync_with_combined_try_body,
+                    |control| &mut control.direct_try_body_statements,
+                    direct_try_body_statements,
                     |compiler| {
                         compiler.with_control_override(
-                            |control| &mut control.direct_final_sync_with_try_body,
-                            direct_final_sync_with_try_body,
-                            compile,
+                            |control| &mut control.direct_final_sync_with_combined_try_body,
+                            direct_final_sync_with_combined_try_body,
+                            |compiler| {
+                                compiler.with_control_override(
+                                    |control| &mut control.direct_final_sync_with_try_body,
+                                    direct_final_sync_with_try_body,
+                                    compile,
+                                )
+                            },
                         )
                     },
                 )
@@ -598,6 +611,11 @@ impl Compiler {
         let result = compile(self);
         let emitted = std::mem::replace(&mut self.control.emitted_fallthrough_return, previous);
         result.map(|value| (value, emitted))
+    }
+
+    pub(super) fn optimized_generator_dispatch_is_in_normal_try(&self) -> bool {
+        self.control.active_exception_handlers.is_empty()
+            && self.control.active_finally_try_bodies == 0
     }
 
     pub(super) fn compile_suite(&mut self, body: &[Stmt]) -> Result<(), CompileError> {
@@ -1790,27 +1808,42 @@ impl Compiler {
                 } else {
                     let defer_restore =
                         expression_defers_async_comprehension_restore(&assignment.value);
+                    let direct_optimized_generator_assignment = matches!(
+                        assignment.value.as_ref(),
+                        Expr::Call(call) if optimized_generator_callable(call).is_some()
+                    ) && self
+                        .control
+                        .direct_try_body_statements
+                        .contains(&statement.range());
                     self.with_control_override(
                         |control| &mut control.defer_async_comprehension_restore,
                         defer_restore,
                         |compiler| {
-                            let newly_owned = if assignment
-                                .targets
-                                .iter()
-                                .any(|target| matches!(target, Expr::Name(_)))
-                                && let Expr::Name(name) = assignment.value.as_ref()
-                            {
-                                let name = compiler.required_name_id(name.id.as_str());
-                                compiler.symbols.owned_load_locals.insert(name)
-                            } else {
-                                false
-                            };
-                            compiler.compile_expression(&assignment.value)?;
-                            if newly_owned && let Expr::Name(name) = assignment.value.as_ref() {
-                                let name = compiler.required_name_id(name.id.as_str());
-                                compiler.symbols.owned_load_locals.remove(name);
-                            }
-                            Ok(())
+                            compiler.with_control_override(
+                                |control| &mut control.direct_optimized_generator_assignment,
+                                direct_optimized_generator_assignment,
+                                |compiler| {
+                                    let newly_owned = if assignment
+                                        .targets
+                                        .iter()
+                                        .any(|target| matches!(target, Expr::Name(_)))
+                                        && let Expr::Name(name) = assignment.value.as_ref()
+                                    {
+                                        let name = compiler.required_name_id(name.id.as_str());
+                                        compiler.symbols.owned_load_locals.insert(name)
+                                    } else {
+                                        false
+                                    };
+                                    compiler.compile_expression(&assignment.value)?;
+                                    if newly_owned
+                                        && let Expr::Name(name) = assignment.value.as_ref()
+                                    {
+                                        let name = compiler.required_name_id(name.id.as_str());
+                                        compiler.symbols.owned_load_locals.remove(name);
+                                    }
+                                    Ok(())
+                                },
+                            )
                         },
                     )?;
                     for (index, target) in assignment.targets.iter().enumerate() {
@@ -5062,6 +5095,21 @@ impl Compiler {
                     }
                     _ => false,
                 });
+            let handler_ends_with_preserved_unlocated_cleanup = matches!(
+                handler.body.last(),
+                Some(Stmt::If(tail))
+                    if handler.name.is_none()
+                        && handler.body.len() > 1
+                        && !self.control.active_with_exits.is_empty()
+                        && tail.elif_else_clauses.is_empty()
+                        && matches!(
+                            tail.body.as_slice(),
+                            [Stmt::Expr(expression)]
+                                if matches!(expression.value.as_ref(), Expr::Call(_))
+                        )
+            );
+            let handler_ends_with_unlocated_cleanup = handler_ends_with_inlineable_cleanup
+                || handler_ends_with_preserved_unlocated_cleanup;
             let handler_ends_with_nonterminal_with = matches!(
                 handler.body.last(),
                 Some(Stmt::With(statement)) if !suite_terminates(&statement.body)
@@ -5126,7 +5174,7 @@ impl Compiler {
                         .set_location(self.source_location(statement.range()));
                 // CPython leaves cleanup after these direct trailing compound joins unlocated so
                 // every incoming edge can inline its own copy with the predecessor's line.
-                } else if handler_ends_with_inlineable_cleanup {
+                } else if handler_ends_with_unlocated_cleanup {
                     self.assembler.set_location(SourceLocation::NONE);
                 } else if let Some(location) = self.assembler.last_instruction_location() {
                     self.assembler.set_location(location);
@@ -5139,6 +5187,9 @@ impl Compiler {
                     // though that store block has multiple predecessors.
                     self.assembler
                         .make_last_no_location_copy_inherit_shared_predecessor();
+                }
+                if handler_ends_with_preserved_unlocated_cleanup {
+                    self.assembler.preserve_last_no_location();
                 }
                 if let Some(name) = &handler.name {
                     let none = self.add_constant(Constant::None)?;
@@ -6859,13 +6910,20 @@ impl Compiler {
             .iter()
             .map(|alias| Constant::String(alias.name.as_str().to_string()))
             .collect();
-        let names = self.add_constant(Constant::Tuple(imported_names))?;
+        let star_import = statement.names.len() == 1 && statement.names[0].name.as_str() == "*";
+        let names = if star_import {
+            self.add_constant(Constant::Tuple(imported_names))?
+        } else {
+            // `IMPORT_FROM` also places every imported name in `co_names`; CPython reuses those
+            // interned string identities in the fromlist tuple, including non-ASCII names.
+            self.add_interned_string_tuple(imported_names)?
+        };
         self.emit(LOAD_CONST, names, 1)?;
         let module = statement.module.as_ref().map_or("", |name| name.as_str());
         let module_index = self.name_index(module)?;
         self.emit(IMPORT_NAME, module_index, -1)?;
 
-        if statement.names.len() == 1 && statement.names[0].name.as_str() == "*" {
+        if star_import {
             self.emit_unary_intrinsic(UnaryIntrinsic::IMPORT_STAR)?;
             self.emit(POP_TOP, 0, -1)?;
             return Ok(());
