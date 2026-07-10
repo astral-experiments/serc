@@ -2653,6 +2653,47 @@ def later_bare_handler_control(value):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_handler_cleanup_before_terminating_else() {
+        let source = r#"class VisualCompiler:
+    if platform:
+        try:
+            compiler = make_compiler()
+            compiler.initialize()
+        except AttributeError as error:
+            if "root" in str(error):
+                report(error)
+            else:
+                raise
+        except OSError as error:
+            if not expected(error):
+                report(error)
+                raise
+
+    executable = compiler
+
+
+def terminating_body_control(flag):
+    try:
+        action()
+    except Error as error:
+        if flag:
+            raise
+        else:
+            recover(error)
+    after()
+
+
+def outside_handler_control(flag):
+    if flag:
+        recover()
+    else:
+        raise Error
+    after()
+"#;
+        assert_matches_cpython_marshal(source, "handler_cleanup_before_else.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_bare_handler_inlineable_cleanup() {
         let source = r"def trailing_try(key):
     try:

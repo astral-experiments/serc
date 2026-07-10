@@ -5296,8 +5296,25 @@ impl Compiler {
             }
             let handler_body_has_instructions =
                 self.assembler.instruction_count() > handler_body_start;
-            let handler_ends_with_inlineable_cleanup =
-                handler.body.last().is_some_and(|tail| match tail {
+            // CPython allocates the normal exit before an explicit `else`, so collecting this
+            // cold class-body handler puts the named cleanup before the bare-raise arm.
+            let handler_ends_with_preordered_named_cleanup = matches!(
+                handler.body.last(),
+                Some(Stmt::If(tail))
+                    if handler.name.is_some()
+                        && matches!(self.unit.scope, Scope::Class { .. })
+                        && handler.body.len() == 1
+                        && !suite_terminates(&tail.body)
+                        && tail.elif_else_clauses.last().is_some_and(|clause| {
+                            clause.test.is_none()
+                                && matches!(
+                                    clause.body.as_slice(),
+                                    [Stmt::Raise(statement)] if statement.exc.is_none()
+                                )
+                        })
+            );
+            let handler_ends_with_inlineable_cleanup = handler_ends_with_preordered_named_cleanup
+                || handler.body.last().is_some_and(|tail| match tail {
                     Stmt::Try(nested) => {
                         handler.name.is_some()
                             // Fallback imports feed the outer handler cleanup from the successful
