@@ -376,9 +376,14 @@ impl FunctionPlan {
         if let Some(parameter) = &definition.parameters.kwarg {
             locals.insert(parameter.name.as_str());
         }
+        let parameter_names = locals.names.iter().cloned().collect::<FxHashSet<_>>();
         locals.collect_suite(&definition.body);
         locals.retain_bindings();
-        let comprehension_first_bindings = locals.comprehension_first_bindings.clone();
+        let comprehension_fast_bindings = locals.comprehension_iteration_targets.clone();
+        let comprehension_target_predecessors = locals.comprehension_target_predecessors.clone();
+        let comprehension_late_bindings = locals.comprehension_late_bindings.clone();
+        let comprehension_annotation_only_predecessors =
+            locals.comprehension_annotation_only_predecessors.clone();
 
         let comprehension_shadowed_targets = locals
             .comprehension_targets
@@ -514,11 +519,47 @@ impl FunctionPlan {
             nested_function_requirements.iter().copied(),
             nested_function_annotation_references.iter().copied(),
         );
-        let comprehension_fast_cellvars = comprehension_first_bindings
+        let comprehension_fast_cellvars = comprehension_fast_bindings
             .iter()
             .filter_map(|name| names.get(name))
             .filter(|name| plan.cellvars.contains(name))
             .collect::<Vec<_>>();
+        let comprehension_reordered_fast_cellvars = comprehension_fast_bindings
+            .iter()
+            .filter(|name| {
+                comprehension_late_bindings.contains(*name)
+                    || comprehension_annotation_only_predecessors
+                        .get(*name)
+                        .is_some_and(|predecessors| !predecessors.is_empty())
+            })
+            .filter(|name| !parameter_names.contains(*name))
+            .filter_map(|name| names.get(name))
+            .filter(|name| plan.cellvars.contains(name))
+            .collect::<Vec<_>>();
+        let comprehension_fast_predecessors = comprehension_target_predecessors
+            .into_iter()
+            .filter_map(|(name, predecessors)| {
+                let annotation_only_predecessors =
+                    comprehension_annotation_only_predecessors.get(&name);
+                Some((
+                    names.get(&name)?,
+                    predecessors
+                        .into_iter()
+                        .filter(|predecessor| {
+                            annotation_only_predecessors.is_none_or(|annotation_only| {
+                                !annotation_only.contains(predecessor)
+                            })
+                        })
+                        .filter_map(|predecessor| names.get(&predecessor))
+                        .collect(),
+                ))
+            })
+            .collect();
+        reorder_comprehension_fast_cells(
+            &mut plan.locals,
+            &comprehension_reordered_fast_cellvars,
+            &comprehension_fast_predecessors,
+        );
         plan.inlined_comprehension_cellvars
             .extend(comprehension_fast_cellvars);
         plan
@@ -1335,8 +1376,12 @@ struct LocalCollector {
     names: Vec<String>,
     seen: FxHashSet<String>,
     comprehension_targets: Vec<String>,
+    comprehension_iteration_targets: Vec<String>,
+    seen_comprehension_iteration_targets: FxHashSet<String>,
+    comprehension_annotation_only_predecessors: FxHashMap<String, Vec<String>>,
     seen_comprehension_targets: FxHashSet<String>,
-    comprehension_first_bindings: FxHashSet<String>,
+    comprehension_late_bindings: FxHashSet<String>,
+    comprehension_target_predecessors: FxHashMap<String, Vec<String>>,
     non_comprehension_bindings: FxHashSet<String>,
     candidate_bindings: Option<FxHashMap<String, bool>>,
     annotation_only: FxHashSet<String>,
@@ -1345,10 +1390,58 @@ struct LocalCollector {
     ignore_generator_body_comprehension_targets: bool,
 }
 
+fn reorder_comprehension_fast_cells<T>(
+    locals: &mut Vec<T>,
+    fast_cells: &[T],
+    target_predecessors: &FxHashMap<T, Vec<T>>,
+) where
+    T: Clone + Eq + std::hash::Hash,
+{
+    let mut placed = FxHashSet::default();
+    for cell in fast_cells {
+        locals.retain(|candidate| candidate != cell);
+        let mut predecessors = target_predecessors
+            .get(cell)
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect::<FxHashSet<_>>();
+        predecessors.extend(placed.iter().cloned());
+        let index = locals
+            .iter()
+            .rposition(|candidate| predecessors.contains(candidate))
+            .map_or(0, |index| index + 1);
+        locals.insert(index, cell.clone());
+        placed.insert(cell.clone());
+    }
+}
+
 impl LocalCollector {
     fn insert_comprehension_target(&mut self, name: String) {
         if self.seen_comprehension_targets.insert(name.clone()) {
+            self.comprehension_annotation_only_predecessors
+                .insert(name.clone(), self.annotation_only.iter().cloned().collect());
+            if self.non_comprehension_bindings.contains(&name) {
+                self.comprehension_late_bindings.insert(name.clone());
+            }
+            self.comprehension_target_predecessors.insert(
+                name.clone(),
+                self.names
+                    .iter()
+                    .filter(|predecessor| *predecessor != &name)
+                    .cloned()
+                    .collect(),
+            );
             self.comprehension_targets.push(name);
+        }
+    }
+    fn insert_comprehension_iteration_target(&mut self, name: String) {
+        self.insert_comprehension_target(name.clone());
+        if self
+            .seen_comprehension_iteration_targets
+            .insert(name.clone())
+        {
+            self.comprehension_iteration_targets.push(name);
         }
     }
 
@@ -1607,10 +1700,6 @@ impl LocalCollector {
     fn collect_comprehension_target(&mut self, target: &Expr) {
         match target {
             Expr::Name(name) => {
-                if !self.non_comprehension_bindings.contains(name.id.as_str()) {
-                    self.comprehension_first_bindings
-                        .insert(name.id.as_str().to_string());
-                }
                 self.mark_binding(name.id.as_str());
             }
             Expr::List(list) => {
@@ -1762,24 +1851,28 @@ impl<'ast> Visitor<'ast> for NamedExpressionCollector<'_> {
                     // target. Inlined comprehensions there therefore allocate their temporary
                     // fast locals first; the later full expression walk only observes them
                     // after the enclosing targets have already been collected.
-                    if !self
-                        .collector
-                        .non_comprehension_bindings
-                        .contains(name.as_str())
-                    {
-                        self.collector
-                            .comprehension_first_bindings
-                            .insert(name.clone());
-                    }
                     self.collector.mark_binding(&name);
-                    self.collector.insert_comprehension_target(name);
+                    self.collector.insert_comprehension_iteration_target(name);
                 }
             }
             for generator in generators {
                 let mut names = Vec::new();
                 collect_target_names(&generator.target, &mut names);
+                let mut previous_target_names = Vec::new();
                 for name in names {
-                    self.collector.insert_comprehension_target(name);
+                    let is_new_target = !self.collector.seen_comprehension_targets.contains(&name);
+                    self.collector
+                        .insert_comprehension_iteration_target(name.clone());
+                    if is_new_target
+                        && self.collector.comprehension_late_bindings.contains(&name)
+                        && let Some(predecessors) = self
+                            .collector
+                            .comprehension_target_predecessors
+                            .get_mut(&name)
+                    {
+                        predecessors.extend(previous_target_names.iter().cloned());
+                    }
+                    previous_target_names.push(name);
                 }
                 self.collector
                     .collect_comprehension_target(&generator.target);
@@ -2161,6 +2254,7 @@ pub(super) fn analyze_lambda_scope(lambda: &ruff_python_ast::ExprLambda) -> Lamb
     if let Some(parameter) = &parameters.kwarg {
         locals.insert(parameter.name.as_str());
     }
+    let parameter_names = locals.names.iter().cloned().collect::<FxHashSet<_>>();
     locals.collect_expression(&lambda.body);
 
     let mut references = ReferenceCollector {
@@ -2186,11 +2280,25 @@ pub(super) fn analyze_lambda_scope(lambda: &ruff_python_ast::ExprLambda) -> Lamb
     let mut inlined_comprehension_cellvars =
         inlined_comprehension_cell_names_in_expression(&lambda.body);
     let comprehension_fast_cellvars = locals
-        .comprehension_first_bindings
+        .comprehension_iteration_targets
         .iter()
         .filter(|name| cellvars.contains(*name))
         .cloned()
-        .collect::<FxHashSet<_>>();
+        .collect::<Vec<_>>();
+    let comprehension_target_predecessors = locals.comprehension_target_predecessors.clone();
+    let comprehension_reordered_fast_cellvars = locals
+        .comprehension_iteration_targets
+        .iter()
+        .filter(|name| !parameter_names.contains(*name))
+        .filter(|name| locals.comprehension_late_bindings.contains(*name))
+        .filter(|name| cellvars.contains(*name))
+        .cloned()
+        .collect::<Vec<_>>();
+    reorder_comprehension_fast_cells(
+        &mut locals.names,
+        &comprehension_reordered_fast_cellvars,
+        &comprehension_target_predecessors,
+    );
     inlined_comprehension_cellvars.extend(comprehension_fast_cellvars.iter().cloned());
     LambdaScopeAnalysis {
         locals: locals.names,
@@ -2358,6 +2466,40 @@ pub(super) fn collect_nested_comprehension_target_names(
             if let Some(generators) = generators {
                 for generator in generators {
                     collect_target_names(&generator.target, self.names);
+                }
+            }
+            walk_expr(self, expression);
+        }
+    }
+
+    Collector { names }.visit_expr(expression);
+}
+pub(super) fn collect_self_iterated_nested_comprehension_targets(
+    expression: &Expr,
+    names: &mut Vec<String>,
+) {
+    struct Collector<'a> {
+        names: &'a mut Vec<String>,
+    }
+
+    impl<'ast> Visitor<'ast> for Collector<'_> {
+        fn visit_expr(&mut self, expression: &'ast Expr) {
+            let generators = match expression {
+                Expr::ListComp(comprehension) => Some(comprehension.generators.as_slice()),
+                Expr::SetComp(comprehension) => Some(comprehension.generators.as_slice()),
+                Expr::DictComp(comprehension) => Some(comprehension.generators.as_slice()),
+                Expr::Generator(_) | Expr::Lambda(_) => return,
+                _ => None,
+            };
+            if let Some(generators) = generators {
+                for generator in generators {
+                    let Some(references) = definitely_evaluated_references(&generator.iter) else {
+                        continue;
+                    };
+                    let mut targets = Vec::new();
+                    collect_target_names(&generator.target, &mut targets);
+                    self.names
+                        .extend(targets.into_iter().filter(|name| references.contains(name)));
                 }
             }
             walk_expr(self, expression);

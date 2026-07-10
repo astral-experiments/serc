@@ -44,7 +44,8 @@ use super::constant::{
 use super::scope::{
     LoweringFunctionPlan, NameId, NameSet, analyze_lambda_scope,
     collect_named_expression_target_names, collect_nested_comprehension_target_names,
-    collect_target_names, comprehension_cell_names, generator_cellvars, generator_required_names,
+    collect_self_iterated_nested_comprehension_targets, collect_target_names,
+    comprehension_cell_names, generator_cellvars, generator_required_names,
 };
 use super::source::{
     debug_text_range, statement_execution_range, strip_expression_comments,
@@ -1920,7 +1921,17 @@ impl Compiler {
             0,
             handler_boolean_loop_policy
                 .or(generator_guard_exception_policy)
-                .unwrap_or_default(),
+                .unwrap_or_else(|| {
+                    if self
+                        .control
+                        .synchronous_with_preserves_none_condition_owner()
+                        && !self.control.current_statement_has_following
+                    {
+                        ExceptionPolicy::normalized_owner(false)
+                    } else {
+                        ExceptionPolicy::default()
+                    }
+                }),
         )?;
         if let Some(start) = not_taken_exclusion_start {
             let end = self.assembler.label();
@@ -2446,21 +2457,38 @@ impl Compiler {
 
         let mut temporary_names = Vec::new();
         let mut local_names = Vec::new();
+        let mut self_iterated_nested_targets = Vec::new();
         for (index, generator) in generators.iter().enumerate() {
             collect_target_names(&generator.target, &mut temporary_names);
             collect_target_names(&generator.target, &mut local_names);
             // The first iterable runs before entering the inlined comprehension scope.
             if index > 0 {
                 collect_nested_comprehension_target_names(&generator.iter, &mut temporary_names);
+                collect_self_iterated_nested_comprehension_targets(
+                    &generator.iter,
+                    &mut self_iterated_nested_targets,
+                );
             }
             for condition in &generator.ifs {
                 collect_nested_comprehension_target_names(condition, &mut temporary_names);
+                collect_self_iterated_nested_comprehension_targets(
+                    condition,
+                    &mut self_iterated_nested_targets,
+                );
             }
         }
         if let Some(key) = key {
             collect_nested_comprehension_target_names(key, &mut temporary_names);
+            collect_self_iterated_nested_comprehension_targets(
+                key,
+                &mut self_iterated_nested_targets,
+            );
         }
         collect_nested_comprehension_target_names(value, &mut temporary_names);
+        collect_self_iterated_nested_comprehension_targets(
+            value,
+            &mut self_iterated_nested_targets,
+        );
         let active_temporary_names = temporary_names.clone();
         if matches!(self.unit.scope, Scope::Module) {
             // CPython assigns a hidden fast-local slot to module-scope walrus targets while
@@ -2476,6 +2504,18 @@ impl Compiler {
                 }
             }
         }
+        // An inner target read by its own iterable must keep the enclosing value live until the
+        // inner comprehension starts and takes ownership of its save/restore.
+        let direct_temporary_names = local_names.iter().cloned().collect::<FxHashSet<_>>();
+        let self_iterated_nested_targets = self_iterated_nested_targets
+            .into_iter()
+            .collect::<FxHashSet<_>>();
+        temporary_names.retain(|name| {
+            direct_temporary_names.contains(name)
+                || !self_iterated_nested_targets.contains(name)
+                || !self.is_initialized(name)
+        });
+
         let mut seen_temporaries = FxHashSet::default();
         temporary_names.retain(|name| seen_temporaries.insert(name.clone()));
         let mut temporary_indices = Vec::with_capacity(temporary_names.len());
@@ -3489,17 +3529,41 @@ impl Compiler {
         if index + 1 < generators.len() {
             let nested = &generators[index + 1];
             let singleton = match &nested.iter {
-                Expr::List(list) if list.elts.len() == 1 => Some(&list.elts[0]),
-                Expr::Tuple(tuple) if tuple.elts.len() == 1 => Some(&tuple.elts[0]),
+                Expr::List(list) => match list.elts.as_slice() {
+                    [element] if !matches!(element, Expr::Starred(_)) => Some(element),
+                    _ => None,
+                },
+                Expr::Tuple(tuple) => match tuple.elts.as_slice() {
+                    [element] if !matches!(element, Expr::Starred(_)) => Some(element),
+                    _ => None,
+                },
                 _ => None,
             };
             if index + 2 == generators.len()
-                && nested.ifs.is_empty()
+                && (nested.ifs.is_empty() || generators.len() == 2)
                 && !nested.is_async
                 && let Some(singleton) = singleton
             {
                 self.compile_expression(singleton)?;
                 self.compile_store_target(&nested.target)?;
+                for condition in &nested.ifs {
+                    let accepted = self.assembler.label();
+                    let element_range = key.map_or_else(
+                        || value.range(),
+                        |key| {
+                            ruff_text_size::TextRange::new(key.range().start(), value.range().end())
+                        },
+                    );
+                    self.compile_comprehension_filter(
+                        condition,
+                        self.source_location(element_range),
+                        accepted,
+                        start,
+                        add_opcode == LIST_APPEND,
+                    )?;
+                    self.assembler.mark(accepted);
+                }
+
                 self.compile_comprehension_element(key, value)?;
                 let add_range = key.map_or_else(
                     || value.range(),
@@ -4368,13 +4432,18 @@ impl Compiler {
                 .last()
                 .is_some_and(|tuple_handler| *tuple_handler)
                 && self.assembler.fallthrough_dynamic_exception_owner_slots() >= 3;
-            let marker_reuses_exception_owner =
-                marker_owner_slots >= 3 || fallthrough_marker_reuses_exception_owner;
+            let marker_reuses_exception_owner = (marker_owner_slots >= 3
+                && !(self.control.in_synchronous_with()
+                    && self.control.follows_copied_nested_handler_join()))
+                || fallthrough_marker_reuses_exception_owner;
             let current_block = self.assembler.current_block_token();
             let exception_type_marker_owner = self
                 .control
                 .exception_type_bool_marker_preserves_owner(current_block);
-            let preserve_exception_type_owner = exception_type_marker_owner == Some(true);
+            let follows_sync_with_branch_join = self.control.in_synchronous_with()
+                && self.control.follows_copied_nested_handler_join();
+            let preserve_exception_type_owner =
+                exception_type_marker_owner == Some(true) && !follows_sync_with_branch_join;
             let exclude_exception_type_owner =
                 exception_type_marker_owner == Some(false) && !marker_reuses_exception_owner;
             let exclude_inlined_comprehension_owner = !self
@@ -4434,7 +4503,8 @@ impl Compiler {
             let exclude_from_all_owners = exclude_exception_type_owner
                 || exclude_inlined_comprehension_owner
                 || exclude_after_coroutine_suspension
-                || exclude_from_plain_try;
+                || exclude_from_plain_try
+                || follows_sync_with_branch_join;
             let marker_start = (!exclude_inlined_comprehension_owner
                 && (exclude_generator_expression_owner
                     || exclude_after_coroutine_suspension
@@ -4930,6 +5000,12 @@ impl Compiler {
                     self.control.generator_region_start.is_some()
                         || self.control.include_assert_none_condition_owner
                         || self.control.include_scoped_none_condition_owner
+                        || self
+                            .control
+                            .synchronous_with_preserves_none_condition_owner()
+                        || self
+                            .control
+                            .finally_try_body_preserves_none_condition_owner()
                         || self.control.in_first_unnamed_exception_handler()
                         || self.control.active_normal_finally_bodies > 0,
                 ),
