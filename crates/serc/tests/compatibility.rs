@@ -1680,6 +1680,48 @@ async def synchronous_outside_async(sync_manager, async_manager):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_final_fallthrough_branches_in_with_bodies() {
+        let source = r"def simple(manager, first, second):
+    with manager:
+        if first:
+            value = 1
+        elif second:
+            value = 2
+        else:
+            value = 3
+    return value
+
+
+def boolean_elif(manager, first, second, third):
+    with manager:
+        if first:
+            value = 1
+        elif second and third:
+            value = 2
+        else:
+            value = 3
+    return value
+";
+        assert_matches_cpython_marshal(source, "with_final_fallthrough_branches.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_nonfinal_branching_with_body_control() {
+        let source = r"def nonfinal(manager, first, second):
+    with manager:
+        if first:
+            value = 1
+        elif second:
+            value = 2
+        else:
+            value = 3
+        consume(value)
+    return value
+";
+        assert_matches_cpython_marshal(source, "with_nonfinal_branching_control.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_async_with_returns() {
         let source = "async def value(manager):\n    async with manager as result:\n        return result.value\n\nasync def constant(manager):\n    async with manager:\n        return 1\n\nasync def nested(outer, inner):\n    async with outer:\n        with inner:\n            return value\n";
         assert_matches_cpython_marshal(source, "async_with_return.py");

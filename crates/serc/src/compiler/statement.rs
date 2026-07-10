@@ -6227,6 +6227,23 @@ impl Compiler {
                         .elif_else_clauses
                         .iter()
                         .any(|clause| clause.test.is_some())
+                        && (statement
+                            .elif_else_clauses
+                            .last()
+                            .is_some_and(|clause| clause.test.is_some())
+                            || suite_terminates(&statement.body)
+                            || statement
+                                .elif_else_clauses
+                                .iter()
+                                .any(|clause| suite_terminates(&clause.body))
+                            || !std::iter::once(statement.body.as_slice())
+                                .chain(
+                                    statement
+                                        .elif_else_clauses
+                                        .iter()
+                                        .map(|clause| clause.body.as_slice()),
+                                )
+                                .all(|body| matches!(body, [Stmt::Assign(_)])))
             );
             if terminal_if || terminal_branching {
                 let (last, leading) = body.split_last().expect("with body has a final if");
