@@ -253,6 +253,10 @@ impl JumpPolicy {
         matches!(self.retained_nop(), RetainedJumpNop::Always)
     }
 
+    pub(super) const fn retains_direct_target_nop(self) -> bool {
+        matches!(self.retained_nop(), RetainedJumpNop::DirectTarget)
+    }
+
     pub(super) fn retains_nop_for(self, operand: Operand) -> bool {
         match (self.retained_nop(), operand) {
             (RetainedJumpNop::Always, _) => true,

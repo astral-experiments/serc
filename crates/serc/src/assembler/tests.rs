@@ -1151,3 +1151,51 @@ fn no_location_block_inlining_reaches_a_fixed_point() {
         [0, 1, 1, 1, 1]
     );
 }
+
+#[test]
+fn direct_target_return_copy_crosses_an_exception_boundary() {
+    let return_start = super::Label(0);
+    let return_split = super::Label(1);
+    let handler = super::Label(2);
+    let mut jump = Instruction::new(
+        JUMP_FORWARD,
+        Operand::Forward(return_start),
+        SourceLocation::new(1, 1, 0, 0),
+        None,
+    );
+    jump.jump_policy.retain_nop_for_direct_target();
+    let mut assembler = optimization_pipeline(vec![
+        Item::Instruction(jump),
+        Item::Label(return_start),
+        pass_instruction(LOAD_CONST, 0, 2),
+        Item::Label(return_split),
+        pass_instruction(RETURN_VALUE, 0, 2),
+        Item::Label(handler),
+        pass_instruction(RERAISE, 0, -1),
+    ]);
+    assembler.exception_regions.push(super::ExceptionRegion {
+        start: return_start,
+        end: return_split,
+        target: handler,
+        depth: 0,
+        preserve_lasti: false,
+    });
+
+    assembler.duplicate_exit_blocks();
+
+    assert_eq!(
+        graph_opcodes(&assembler),
+        [NOP, LOAD_CONST, RETURN_VALUE, RETURN_VALUE, RERAISE]
+    );
+    assert_eq!(
+        assembler
+            .graph
+            .iter_items()
+            .filter_map(|item| match item {
+                Item::Instruction(instruction) => Some(instruction.location.line),
+                Item::Label(_) => None,
+            })
+            .collect::<Vec<_>>(),
+        [1, 2, 2, 2, -1]
+    );
+}
