@@ -2638,6 +2638,76 @@ def later_bare_handler_control(value):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_nested_return_finally_copies() {
+        let source = r"def nested_conditional_cleanup(path, left, right):
+    try:
+        try:
+            return left == right
+        finally:
+            if path.exists():
+                path.unlink()
+    finally:
+        release()
+
+
+def three_nested_cleanups(value):
+    try:
+        try:
+            try:
+                return value
+            finally:
+                inner()
+        finally:
+            middle()
+    finally:
+        outer()
+
+
+def single_cleanup_control(value):
+    try:
+        return value
+    finally:
+        cleanup()
+";
+        assert_matches_cpython_marshal(source, "nested_return_finally.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_terminal_try_else_exit_locations() {
+        let source = r#"def terminal_try_else(flag):
+    try:
+        action()
+    except Error:
+        pass
+    else:
+        if flag:
+            return produce()
+    return ""
+
+
+def nonterminal_try_else_control(flag):
+    try:
+        action()
+    except Error:
+        pass
+    else:
+        if flag:
+            consume()
+    return ""
+
+
+def try_body_control(flag):
+    try:
+        if flag:
+            return produce()
+    except Error:
+        pass
+    return ""
+"#;
+        assert_matches_cpython_marshal(source, "try_else_terminal_exit.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_named_handler_trailing_with_cleanup() {
         let source = r"def named_handler_trailing_with(outer, inner):
     with outer:
@@ -5471,6 +5541,44 @@ def final_elif(action, first, second):
         for (filename, source) in cases {
             assert_matches_cpython_marshal(source, filename);
         }
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_try_body_exit_nops_before_direct_exits_only() {
+        let source = r"def before_return(flag):
+    try:
+        prepare()
+        if flag:
+            raise ValueError
+    except TypeError:
+        recover()
+    return flag
+
+def before_raise(flag):
+    try:
+        prepare()
+        if flag:
+            raise ValueError
+    except TypeError:
+        recover()
+    raise RuntimeError
+
+def before_conditional_return(values, required):
+    for value in values:
+        result = None
+        try:
+            result = prepare(value)
+            if required and value is None:
+                raise ValueError(value)
+        except TypeError:
+            recover(value)
+        except LookupError:
+            recover_again(value)
+        if result is not None:
+            return value
+    return None
+";
+        assert_matches_cpython_marshal(source, "try_body_exit_before_direct_exits.py");
     }
 
     #[test]
