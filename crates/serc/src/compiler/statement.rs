@@ -2932,6 +2932,20 @@ impl Compiler {
                                     .assembler
                                     .contains_opcode_since(NOT_TAKEN, context.body_start)
                             })));
+                let preserve_sync_with_none_owner = branch_index == 0
+                    && !suite_terminates(body)
+                    && matches!(statement.elif_else_clauses.as_slice(), [clause]
+                        if clause.test.is_none() && !suite_terminates(&clause.body))
+                    && matches!(test, Expr::Compare(comparison)
+                        if comparison.ops.len() == 1
+                            && comparison.ops[0] == CmpOp::Is
+                            && matches!(comparison.comparators[0], Expr::NoneLiteral(_)))
+                    && !self.control.active_with_region_exclusions.is_empty()
+                    && self
+                        .control
+                        .active_with_exits
+                        .last()
+                        .is_some_and(|context| !context.is_async);
                 let exclude_not_taken = self.control.exclude_terminal_if_not_taken
                     || (!self.control.active_with_region_exclusions.is_empty()
                         && branch_index > 0
@@ -3046,6 +3060,12 @@ impl Compiler {
                     // the first bare handler reuses the handler block's protected slot. An
                     // ordinary non-final condition and the final loop-control condition each
                     // start in fresh blocks.
+                    self.assembler.preserve_last_not_taken_exception_owner();
+                }
+                if preserve_sync_with_none_owner {
+                    // A complete non-exiting branch keeps its specialized `is None` marker in
+                    // the surrounding synchronous-with region even after an earlier normalized
+                    // marker consumes the with setup's stale owner slot.
                     self.assembler.preserve_last_not_taken_exception_owner();
                 }
                 if retain_folded_test_in_protected_region {
