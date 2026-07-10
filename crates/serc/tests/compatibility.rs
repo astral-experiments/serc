@@ -1721,6 +1721,47 @@ def boolean_elif(manager, first, second, third):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_terminal_two_operand_conditions_in_with_bodies() {
+        let source = r"def terminal(manager, first, second):
+    with manager:
+        value = make()
+        if not first or not second:
+            raise Error(value)
+
+
+def negated_conjunction(z, msgform):
+    with np.errstate(invalid='ignore'):
+        if not (np.isnan(z.real) and np.isinf(z.imag)):
+            raise AssertionError(msgform % (z.real, z.imag))
+
+
+def nonterminal(manager, first, second):
+    with manager:
+        if not first or not second:
+            raise Error
+        consume()
+
+
+def fallthrough_body(manager, first, second):
+    with manager:
+        if not first or not second:
+            consume()
+
+
+def outside_with(first, second):
+    if not first or not second:
+        raise Error
+
+
+async def asynchronous(manager, first, second):
+    async with manager:
+        if not first or not second:
+            raise Error
+";
+        assert_matches_cpython_marshal(source, "with_terminal_two_operand_condition.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_nonfinal_branching_with_body_control() {
         let source = r"def nonfinal(manager, first, second):
     with manager:

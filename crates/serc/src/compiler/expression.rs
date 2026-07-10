@@ -4468,6 +4468,18 @@ impl Compiler {
         if let Expr::UnaryOp(unary) = expression
             && unary.op == UnaryOp::Not
         {
+            let defer_terminal_with_exclusion = self.control.terminal_with_condition
+                == Some(expression.range())
+                && self.control.exclude_terminal_if_not_taken
+                && !self.control.active_with_region_exclusions.is_empty()
+                && matches!(unary.operand.as_ref(), Expr::BoolOp(boolean) if boolean.values.len() == 2);
+            if defer_terminal_with_exclusion {
+                return self.with_control_override(
+                    |control| &mut control.defer_terminal_with_exclusion_through_negation,
+                    true,
+                    |compiler| compiler.compile_jump_if(&unary.operand, !jump_on, label),
+                );
+            }
             return self.compile_jump_if(&unary.operand, !jump_on, label);
         }
         if let Expr::If(conditional) = expression
@@ -4524,16 +4536,44 @@ impl Compiler {
                     "boolean expression contains no values".to_string(),
                 ));
             };
+            let operands_are_negated =
+                self.control.terminal_with_condition == Some(expression.range())
+                    && matches!(boolean.op, BoolOp::Or)
+                    && !jump_on
+                    && boolean.values.iter().all(
+                        |value| matches!(value, Expr::UnaryOp(unary) if unary.op == UnaryOp::Not),
+                    );
+            let defer_terminal_with_exclusion = leading.len() == 1
+                && self.control.exclude_terminal_if_not_taken
+                && !self.control.active_with_region_exclusions.is_empty()
+                && (operands_are_negated
+                    || self.control.defer_terminal_with_exclusion_through_negation);
             let short_circuit_jumps_to_target = matches!(boolean.op, BoolOp::Or) == jump_on;
             if short_circuit_jumps_to_target {
                 for value in leading {
-                    self.compile_jump_if(value, jump_on, label)?;
+                    if defer_terminal_with_exclusion {
+                        self.with_control_override(
+                            |control| &mut control.exclude_terminal_if_not_taken,
+                            false,
+                            |compiler| compiler.compile_jump_if(value, jump_on, label),
+                        )?;
+                    } else {
+                        self.compile_jump_if(value, jump_on, label)?;
+                    }
                 }
                 return self.compile_jump_if(last, jump_on, label);
             }
             let end = self.assembler.label();
             for value in leading {
-                self.compile_jump_if(value, !jump_on, end)?;
+                if defer_terminal_with_exclusion {
+                    self.with_control_override(
+                        |control| &mut control.exclude_terminal_if_not_taken,
+                        false,
+                        |compiler| compiler.compile_jump_if(value, !jump_on, end),
+                    )?;
+                } else {
+                    self.compile_jump_if(value, !jump_on, end)?;
+                }
             }
             self.compile_jump_if(last, jump_on, label)?;
             self.assembler.preserve_block_boundary(end);

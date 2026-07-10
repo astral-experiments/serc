@@ -217,7 +217,13 @@ pub(super) struct ControlFlowState {
     active_pass_finally_locations: Vec<SourceLocation>,
     active_overriding_finally_returns: usize,
     preserve_finally_break_exit_loop_range: Option<ruff_text_size::TextRange>,
+    // The final synchronous-with `if` test whose converted POP_BLOCK exclusion can be
+    // routed across a short-circuit condition without affecting nested body expressions.
+    pub(super) terminal_with_condition: Option<ruff_text_size::TextRange>,
     pub(super) exclude_terminal_if_not_taken: bool,
+    // A leading `not` around a two-operand Boolean condition routes the synchronous-with
+    // terminal marker exclusion to the inner condition's final operand.
+    pub(super) defer_terminal_with_exclusion_through_negation: bool,
     pub(super) exclude_condition_not_taken_from_exception: bool,
     pub(super) include_assert_none_condition_owner: bool,
     pub(super) preserve_assert_chained_comparison_exit_nop: bool,
@@ -6424,11 +6430,20 @@ impl Compiler {
             );
             if terminal_if || terminal_branching {
                 let (last, leading) = body.split_last().expect("with body has a final if");
+                let Stmt::If(statement) = last else {
+                    unreachable!("terminal with condition must be an if statement");
+                };
                 self.compile_suite(leading)?;
                 self.with_control_override(
-                    |control| &mut control.exclude_terminal_if_not_taken,
-                    true,
-                    |compiler| compiler.compile_statement(last),
+                    |control| &mut control.terminal_with_condition,
+                    Some(statement.test.range()),
+                    |compiler| {
+                        compiler.with_control_override(
+                            |control| &mut control.exclude_terminal_if_not_taken,
+                            true,
+                            |compiler| compiler.compile_statement(last),
+                        )
+                    },
                 )?;
             } else if let Some((last @ Stmt::Try(statement), leading)) = body.split_last()
                 && statement.handlers.is_empty()
