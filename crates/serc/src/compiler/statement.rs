@@ -3439,17 +3439,24 @@ impl Compiler {
                 && self.control.active_exception_region_exclusions.is_empty()
                 && self.control.active_with_region_exclusions.is_empty()
                 && suite_ends_in_simple_conditional_break(&statement.body);
+            let coroutine_terminal_break_exit = self.control.generator_region_start.is_some()
+                && suite_contains_loop_continue(&statement.body)
+                && statement.body.last().is_some_and(|statement| {
+                    suite_contains_loop_break(std::slice::from_ref(statement))
+                });
             if suite_contains_loop_break(&statement.body)
                 && !copied_direct_return_exit
                 && (!self.control.active_exception_region_exclusions.is_empty()
                     || !self.control.active_with_region_exclusions.is_empty()
+                    || coroutine_terminal_break_exit
                     || !suite_contains_unprotected_nontail_conditional_loop_break(&statement.body))
             {
                 // A constant-true loop can reach its exit only through `break`. CPython removes
                 // an unconditional break jump before borrowed-load analysis but does not
                 // reconnect the large exit block. An unprotected non-tail conditional break
                 // retains an explicit exit edge unless a surrounding control-flow region
-                // rewrites that edge during cleanup.
+                // rewrites that edge during cleanup. A coroutine stop handler with a continue
+                // edge also keeps a terminal break exit disconnected from the following block.
                 self.assembler.prevent_borrow_reachability(end);
             }
             self.set_depth(base_depth);
@@ -7127,6 +7134,38 @@ fn suite_contains_loop_break(body: &[Stmt]) -> bool {
     })
 }
 
+fn suite_contains_loop_continue(body: &[Stmt]) -> bool {
+    body.iter().any(|statement| match statement {
+        Stmt::Continue(_) => true,
+        Stmt::If(statement) => {
+            suite_contains_loop_continue(&statement.body)
+                || statement
+                    .elif_else_clauses
+                    .iter()
+                    .any(|clause| suite_contains_loop_continue(&clause.body))
+        }
+        Stmt::Try(statement) => {
+            suite_contains_loop_continue(&statement.body)
+                || statement
+                    .handlers
+                    .iter()
+                    .filter_map(ruff_python_ast::ExceptHandler::as_except_handler)
+                    .any(|handler| suite_contains_loop_continue(&handler.body))
+                || suite_contains_loop_continue(&statement.orelse)
+                || suite_contains_loop_continue(&statement.finalbody)
+        }
+        Stmt::With(statement) => suite_contains_loop_continue(&statement.body),
+        Stmt::Match(statement) => statement
+            .cases
+            .iter()
+            .any(|case| suite_contains_loop_continue(&case.body)),
+        Stmt::For(statement) => suite_contains_loop_continue(&statement.orelse),
+        Stmt::While(statement) => suite_contains_loop_continue(&statement.orelse),
+        Stmt::FunctionDef(_) | Stmt::ClassDef(_) => false,
+        _ => false,
+    })
+}
+
 fn suite_contains_unprotected_nontail_conditional_loop_break(body: &[Stmt]) -> bool {
     fn contains(body: &[Stmt], conditional: bool) -> bool {
         for statement in body {
@@ -7159,12 +7198,9 @@ fn suite_contains_unprotected_nontail_conditional_loop_break(body: &[Stmt]) -> b
         false
     }
 
-    let Some((last, leading)) = body.split_last() else {
+    let Some((_, leading)) = body.split_last() else {
         return false;
     };
-    if suite_contains_loop_break(std::slice::from_ref(last)) {
-        return false;
-    }
     contains(leading, false)
 }
 

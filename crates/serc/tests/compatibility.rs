@@ -3785,6 +3785,41 @@ def tail_break(flag, result):
     fourth(result)
     fifth(result)
     return result
+
+def nested_terminal_break(flag, result, next_item, stop):
+    while True:
+        outer = next_item()
+        if outer is None:
+            break
+        if flag:
+            while True:
+                item = next_item()
+                if item is None:
+                    break
+                consume(item)
+                if stop(item):
+                    break
+        first(result)
+        second(result)
+        third(result)
+        fourth(result)
+        fifth(result)
+    return result
+
+async def coroutine_terminal_break(result, read, stop):
+    while True:
+        item = await read()
+        if item is None:
+            break
+        consume(item)
+        if stop(item):
+            break
+    first(result)
+    second(result)
+    third(result)
+    fourth(result)
+    fifth(result)
+    return result
 ";
         assert_matches_cpython_marshal(source, "constant_loop_break_borrowing.py");
     }
