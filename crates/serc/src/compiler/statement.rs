@@ -1049,6 +1049,17 @@ impl Compiler {
         Ok(())
     }
 
+    fn mark_terminal_assignment_implicit_return_boundary(&mut self, body: &[Stmt]) {
+        if matches!(body.last(), Some(Stmt::Assign(_))) {
+            // CPython emits the function's implicit return after compiling the source suite, so
+            // a terminal assignment and that return begin in separate basic blocks. Keep the
+            // boundary so a preceding handler exit does not see their combined four instructions
+            // as a small exit block and copy both onto the cold edge.
+            let implicit_return = self.assembler.label();
+            self.assembler.mark(implicit_return);
+        }
+    }
+
     pub(super) fn emit_deferred_implicit_return(&mut self) -> Result<(), CompileError> {
         let initialized_locals = self
             .control
@@ -1471,6 +1482,7 @@ impl Compiler {
                         self.assembler
                             .set_location(self.source_location(condition_fallthrough_range(test)));
                     }
+                    self.mark_terminal_assignment_implicit_return_boundary(body);
                     self.emit_deferred_implicit_return()?;
                 }
                 self.assembler.mark(next);
@@ -1507,6 +1519,7 @@ impl Compiler {
                         self.assembler
                             .set_location(self.source_location(statement.range()));
                     }
+                    self.mark_terminal_assignment_implicit_return_boundary(body);
                     self.emit_deferred_implicit_return()?;
                 }
             }

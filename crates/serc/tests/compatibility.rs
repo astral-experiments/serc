@@ -1023,6 +1023,59 @@ async def coroutine_if(flag):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_terminal_assignment_return_boundaries() {
+        let source = r"def consecutive_handlers(flag):
+    global state
+    if flag:
+        try:
+            first()
+        except FirstError:
+            pass
+        try:
+            second()
+        except SecondError:
+            pass
+        state = None
+
+
+def explicit_else(flag):
+    if flag:
+        use(flag)
+    else:
+        try:
+            value = first()
+        except FirstError:
+            pass
+        value = None
+
+
+def call_tail_control(flag):
+    if flag:
+        try:
+            first()
+        except FirstError:
+            pass
+        finish()
+
+
+def nonterminal_control(flag):
+    if flag:
+        try:
+            first()
+        except FirstError:
+            pass
+        value = None
+    finish()
+
+
+def simple_assignment_control(flag):
+    if flag:
+        value = None
+";
+        assert_matches_cpython_marshal(source, "terminal_assignment_return_boundary.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_nested_terminal_try_condition_ownership() {
         let source = r"def nested_try(a, b):
     try:
