@@ -823,6 +823,7 @@ def single_exit_break(items):
         except ParseError:
             raise
         except Exception as error:
+            message = 'details'
             raise ParseError(index, message) from error
 
 

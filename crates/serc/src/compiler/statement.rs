@@ -134,6 +134,7 @@ enum LoopBackedge {
 struct LoopTailMode {
     non_final_branch: bool,
     try_body_normal_exit: bool,
+    propagate_try_body_normal_exit: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2706,6 +2707,7 @@ impl Compiler {
             LoopTailMode {
                 non_final_branch: true,
                 try_body_normal_exit,
+                propagate_try_body_normal_exit: try_body_normal_exit,
             },
         )
     }
@@ -2724,14 +2726,7 @@ impl Compiler {
                     false,
                     |compiler| compiler.compile_suite(leading),
                 )?;
-                self.compile_loop_tail_if(
-                    statement,
-                    restart,
-                    split_short_circuit,
-                    mode.non_final_branch,
-                    mode.try_body_normal_exit,
-                    leading,
-                )?;
+                self.compile_loop_tail_if(statement, restart, split_short_circuit, mode, leading)?;
                 Ok(LoopBackedge::Emitted)
             }
             Some((Stmt::While(statement), leading))
@@ -3119,10 +3114,14 @@ impl Compiler {
         statement: &ruff_python_ast::StmtIf,
         restart: Label,
         split_short_circuit: bool,
-        non_final_branch: bool,
-        try_body_normal_exit: bool,
+        mode: LoopTailMode,
         leading: &[Stmt],
     ) -> Result<(), CompileError> {
+        let LoopTailMode {
+            non_final_branch,
+            try_body_normal_exit,
+            propagate_try_body_normal_exit,
+        } = mode;
         let base_depth = self.control.depth;
         let first_branch_reuses_protected_owner = matches!(
             (leading, statement.test.as_ref()),
@@ -3159,7 +3158,7 @@ impl Compiler {
                         compiler.compile_non_final_branch_loop_tail_suite(
                             body,
                             restart,
-                            try_body_normal_exit,
+                            propagate_try_body_normal_exit,
                         )
                     },
                 )?;
@@ -3330,7 +3329,8 @@ impl Compiler {
                         false,
                         LoopTailMode {
                             non_final_branch: test.is_some() || non_final_branch,
-                            try_body_normal_exit,
+                            try_body_normal_exit: propagate_try_body_normal_exit,
+                            propagate_try_body_normal_exit,
                         },
                     )
                 },
@@ -4212,6 +4212,8 @@ impl Compiler {
                 .as_except_handler()
                 .is_some_and(|handler| suite_terminates(&handler.body))
         });
+        let propagates_protected_loop_tail_mode =
+            try_propagates_protected_loop_tail_mode(statement);
         let nested_handler_tail_if_with_terminal_handlers = handlers_terminate
             && self.control.in_exception_handler()
             && statement.orelse.is_empty()
@@ -4350,8 +4352,11 @@ impl Compiler {
                     statement,
                     restart,
                     split_short_circuit,
-                    false,
-                    true,
+                    LoopTailMode {
+                        non_final_branch: false,
+                        try_body_normal_exit: true,
+                        propagate_try_body_normal_exit: propagates_protected_loop_tail_mode,
+                    },
                     leading,
                 )?;
             } else if terminal
@@ -7081,6 +7086,25 @@ fn try_requires_loop_tail_inlining(statement: &ruff_python_ast::StmtTry) -> bool
             statement.body.last(),
             Some(Stmt::If(statement)) if if_normal_exit_count(statement) > 1
         )
+}
+
+pub(super) fn try_propagates_protected_loop_tail_mode(
+    statement: &ruff_python_ast::StmtTry,
+) -> bool {
+    // CPython carries the protected source-order layout through nested loop-tail branches when
+    // every handler contains only assignments before a final raise. Other handler shapes retain
+    // the legacy exception-owner layout.
+    !statement.handlers.is_empty()
+        && statement.handlers.iter().all(|handler| {
+            handler.as_except_handler().is_some_and(|handler| {
+                let Some((Stmt::Raise(_), leading)) = handler.body.split_last() else {
+                    return false;
+                };
+                leading
+                    .iter()
+                    .all(|statement| matches!(statement, Stmt::Assign(_)))
+            })
+        })
 }
 
 pub(super) fn suite_contains_yield(body: &[Stmt]) -> bool {
