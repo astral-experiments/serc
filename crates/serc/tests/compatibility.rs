@@ -879,6 +879,64 @@ def try_finally(values):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_nested_try_else_loop_backedges() {
+        let source = r"def nested_try_else_loop(first, second):
+    try:
+        while True:
+            try:
+                outer_value = take_outer()
+            except OuterError:
+                break
+            else:
+                while True:
+                    try:
+                        inner_value = take_inner()
+                    except InnerError:
+                        break
+                    else:
+                        consume(inner_value)
+                        if first:
+                            consume(outer_value)
+                            if second:
+                                consume(second)
+    except Exception:
+        recover()
+    finish()
+";
+        assert_matches_cpython_marshal(source, "nested_try_else_loop_backedges.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_nested_try_else_loop_backedge_controls() {
+        let source = r"def final_conditional_else(values):
+    for value in values:
+        try:
+            callback = lookup(value)
+        except KeyError:
+            pass
+        else:
+            prepare(callback)
+            if callback(value):
+                consume(value)
+            else:
+                reject(value)
+
+
+def constant_final_condition(values):
+    for value in values:
+        try:
+            callback = lookup(value)
+        except KeyError:
+            pass
+        else:
+            prepare(callback)
+            if True:
+                consume(value)
+";
+        assert_matches_cpython_marshal(source, "nested_try_else_loop_backedge_controls.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_terminal_try_suite_implicit_returns() {
         let source = r"def body_if(flag):
     try:

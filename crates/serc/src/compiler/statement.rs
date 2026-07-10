@@ -3265,7 +3265,10 @@ impl Compiler {
             Stmt::Try(statement) if self.control.generator_region_start.is_some() => {
                 try_requires_legacy_loop_tail_exclusion(statement)
             }
-            Stmt::Try(statement) => try_requires_loop_tail_inlining(statement),
+            Stmt::Try(statement) => {
+                try_requires_loop_tail_inlining(statement)
+                    || try_normal_exit_ends_in_break_only_loop(statement)
+            }
             _ => false,
         });
         if !inline_try_tail {
@@ -3274,6 +3277,13 @@ impl Compiler {
         self.emit_jump_backward(JUMP_BACKWARD, restart, 0)?;
         if inline_try_tail {
             self.assembler.prepare_last_no_location_block_for_inlining();
+        }
+        if body
+            .last()
+            .is_some_and(try_has_conditional_shared_loop_exit)
+        {
+            // CPython copies this shared backedge onto each conditional fallthrough.
+            self.assembler.mark_last_as_artificial_eval_break();
         }
         Ok(())
     }
@@ -4546,6 +4556,8 @@ impl Compiler {
             && (suite_ends_in_empty_try_exit_block(normal_exit_suite)
                 || handler_contains_terminal_nested_try
                 || handler_contains_nested_handler_cold_join);
+        let copy_break_only_loop_exit = self.control.current_statement_has_following
+            && suite_ends_in_nested_break_only_loop(normal_exit_suite);
         // CPython removes the with handler's normal-exit edge before borrowed-load traversal,
         // so a following suite cannot reach this try join through that edge.
         if self.control.current_statement_has_following
@@ -4873,6 +4885,10 @@ impl Compiler {
                 ExceptionPolicy::default()
             };
             self.emit_jump_forward_with_exception_policy(JUMP_FORWARD, end, 0, exception_policy)?;
+            if copy_break_only_loop_exit {
+                // Copy the following try exit directly onto the only reachable loop break.
+                self.assembler.prepare_last_no_location_block_for_inlining();
+            }
             if nested_handler_tail_if_with_terminal_handlers {
                 self.assembler.preserve_last_no_location();
             }
@@ -7512,6 +7528,48 @@ fn try_requires_loop_tail_inlining(statement: &ruff_python_ast::StmtTry) -> bool
         )
 }
 
+fn try_normal_exit_ends_in_break_only_loop(statement: &ruff_python_ast::StmtTry) -> bool {
+    !statement.is_star
+        && statement.finalbody.is_empty()
+        && has_direct_break_handler(statement)
+        && matches!(
+            statement.orelse.last(),
+            Some(Stmt::While(loop_statement))
+                if is_break_only_loop(loop_statement)
+                    && loop_statement
+                        .body
+                        .last()
+                        .is_some_and(try_has_conditional_shared_loop_exit)
+        )
+}
+
+fn has_direct_break_handler(statement: &ruff_python_ast::StmtTry) -> bool {
+    statement.handlers.iter().any(|handler| {
+        handler
+            .as_except_handler()
+            .is_some_and(|handler| matches!(handler.body.as_slice(), [Stmt::Break(_)]))
+    })
+}
+
+fn is_break_only_loop(statement: &ruff_python_ast::StmtWhile) -> bool {
+    statement.orelse.is_empty()
+        && early_condition_truthiness(&statement.test) == Some(true)
+        && suite_contains_loop_break(&statement.body)
+}
+
+fn suite_ends_in_nested_break_only_loop(body: &[Stmt]) -> bool {
+    matches!(
+        body.last(),
+        Some(Stmt::While(statement))
+            if is_break_only_loop(statement)
+                && matches!(
+                    statement.body.last(),
+                    Some(Stmt::Try(statement))
+                        if try_normal_exit_ends_in_break_only_loop(statement)
+                )
+    )
+}
+
 pub(super) fn try_propagates_protected_loop_tail_mode(
     statement: &ruff_python_ast::StmtTry,
 ) -> bool {
@@ -8013,14 +8071,29 @@ fn try_has_conditional_shared_loop_exit(statement: &Stmt) -> bool {
     } else {
         return false;
     };
-    if normal_exit.len() != 1 || suite_terminates(&statement.body) {
+    if suite_terminates(&statement.body) {
         return false;
     }
-    matches!(
-        normal_exit.last(),
-        Some(Stmt::If(statement))
-            if statement.elif_else_clauses.is_empty()
-                && early_condition_truthiness(&statement.test).is_none()
-                && matches!(statement.body.as_slice(), [Stmt::Expr(_)])
-    )
+    let Some(Stmt::If(final_if)) = normal_exit.last() else {
+        return false;
+    };
+    if !final_if.elif_else_clauses.is_empty()
+        || early_condition_truthiness(&final_if.test).is_some()
+        || suite_terminates(&final_if.body)
+    {
+        return false;
+    }
+    let direct_expression =
+        normal_exit.len() == 1 && matches!(final_if.body.as_slice(), [Stmt::Expr(_)]);
+    let nested_condition = normal_exit.len() > 1
+        && !statement.is_star
+        && has_direct_break_handler(statement)
+        && matches!(
+            final_if.body.last(),
+            Some(Stmt::If(statement))
+                if statement.elif_else_clauses.is_empty()
+                    && early_condition_truthiness(&statement.test).is_none()
+                    && !suite_terminates(&statement.body)
+        );
+    direct_expression || nested_condition
 }
