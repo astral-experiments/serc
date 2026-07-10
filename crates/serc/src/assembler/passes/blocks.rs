@@ -764,7 +764,12 @@ impl OptimizationPipeline {
             if target_position < index {
                 instruction.retarget(Operand::Backward(target));
                 if instruction.opcode == JUMP_FORWARD {
-                    instruction.opcode = JUMP_BACKWARD_NO_INTERRUPT;
+                    instruction.opcode = if instruction.backward_jump_provenance.is_authored_break()
+                    {
+                        JUMP_BACKWARD
+                    } else {
+                        JUMP_BACKWARD_NO_INTERRUPT
+                    };
                 }
             } else {
                 instruction.retarget(Operand::Forward(target));

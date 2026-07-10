@@ -1936,6 +1936,7 @@ impl Compiler {
                         });
                     let has_no_emitted_cleanup = self.assembler.instruction_count() == marker_end;
                     self.emit_jump_forward(JUMP_FORWARD, context.break_label, 0)?;
+                    self.assembler.mark_last_jump_as_authored_break();
                     if context.break_policy.preserves_jump_exit() {
                         // CPython inlines small exit blocks before removing a jump to the next
                         // block. Keep this terminal protected-loop break through that pass so
@@ -4803,6 +4804,7 @@ impl Compiler {
                     self.emit_implicit_return()?;
                 } else {
                     self.emit_jump_forward(JUMP_BACKWARD, context.break_label, 0)?;
+                    self.assembler.mark_last_jump_as_authored_break();
                 }
                 self.set_depth(unreachable_depth);
                 self.assembler.mark(next_handler);
@@ -6065,6 +6067,7 @@ impl Compiler {
             self.emit_implicit_return()?;
         } else {
             self.emit_jump_forward(JUMP_FORWARD, context.break_label, 0)?;
+            self.assembler.mark_last_jump_as_authored_break();
         }
 
         self.assembler.mark(handler);
@@ -6084,6 +6087,7 @@ impl Compiler {
             self.emit_implicit_return()?;
         } else {
             self.emit_jump_forward(JUMP_FORWARD, context.break_label, 0)?;
+            self.assembler.mark_last_jump_as_authored_break();
         }
         self.assembler.add_exception_region(
             handler,

@@ -584,6 +584,12 @@ impl Assembler {
             .prevent_threading_target();
     }
 
+    pub(crate) fn mark_last_jump_as_authored_break(&mut self) {
+        self.last_jump_instruction_mut("marking an authored break jump")
+            .backward_jump_provenance
+            .mark_authored_break();
+    }
+
     pub(crate) fn prepare_last_no_location_block_for_inlining(&mut self) {
         let instruction =
             self.last_jump_instruction_mut("preparing a no-location block for inlining");
