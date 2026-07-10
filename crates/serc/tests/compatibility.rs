@@ -6580,6 +6580,83 @@ def try_else_control(items, flag):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_numpy_testing_utils_try_owners() {
+        let source = r"def tuple_boolean_marker(left, right):
+    try:
+        result = predicate(left) or predicate(right)
+    except (ValueError, TypeError):
+        result = False
+    return result
+
+
+def single_boolean_marker(left, right):
+    try:
+        result = predicate(left) or predicate(right)
+    except ValueError:
+        result = False
+    return result
+
+
+def assignment_handler(flag):
+    try:
+        if flag:
+            value = first
+        else:
+            prepare()
+            value = second
+    except AttributeError:
+        value = False
+    consume(value)
+
+
+def nonfinal_assignment_branch(flag):
+    try:
+        if flag:
+            value = first
+        else:
+            prepare()
+            value = second
+        inspect(value)
+    except AttributeError:
+        value = False
+    consume(value)
+
+
+def sequential_tries(first, second):
+    try:
+        value = load(first)
+        if first and second:
+            if ready(value):
+                return value
+            else:
+                raise ValueError(value)
+    except (TypeError, ValueError):
+        pass
+
+    try:
+        consume(value)
+    except RuntimeError:
+        pass
+    return value
+";
+        assert_matches_cpython_marshal(source, "numpy_testing_utils_try_owners.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_finally_iterator_break_synchronous_generator() {
+        let source = r"def sync_generator(items):
+    try:
+        for item in items:
+            if item:
+                break
+        yield item
+    finally:
+        cleanup()
+";
+        assert_matches_cpython_marshal(source, "finally_iterator_break_sync_generator.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_direct_try_body_exit_nops() {
         let cases = [
             (

@@ -66,6 +66,7 @@ impl LayoutAssembler {
         let mut block_has_stale_exception_owner = false;
         let mut block_has_applied_comprehension_swap = false;
         let mut late_exception_inclusions = Vec::new();
+        let mut late_exception_overrides = Vec::new();
         let mut previous_instruction = None;
         for item in &self.items {
             match item {
@@ -118,6 +119,11 @@ impl LayoutAssembler {
                         == NormalizedExceptionOwner::Present
                     {
                         late_exception_inclusions.push((position, end));
+                    }
+                    if instruction.exception_policy.normalized_owner
+                        == NormalizedExceptionOwner::OverridePresent
+                    {
+                        late_exception_overrides.push((position, end));
                     }
                     if matches!(
                         instruction.opcode,
@@ -177,6 +183,32 @@ impl LayoutAssembler {
             else {
                 continue;
             };
+            regions.push((start, end, target, depth, preserve_lasti, index));
+        }
+        for (start, end) in late_exception_overrides {
+            let Some((_, _, target, depth, preserve_lasti, index)) = regions
+                .iter()
+                .filter(|(region_start, region_end, _, _, _, _)| {
+                    *region_start < start && *region_end >= start
+                })
+                .min_by_key(|(region_start, region_end, _, _, _, index)| {
+                    (region_end - region_start, *index)
+                })
+                .copied()
+            else {
+                continue;
+            };
+            if regions.iter().any(
+                |(region_start, region_end, region_target, region_depth, region_lasti, _)| {
+                    *region_start <= start
+                        && *region_end >= end
+                        && *region_target == target
+                        && *region_depth == depth
+                        && *region_lasti == preserve_lasti
+                },
+            ) {
+                continue;
+            }
             regions.push((start, end, target, depth, preserve_lasti, index));
         }
         let mut boundaries = regions
