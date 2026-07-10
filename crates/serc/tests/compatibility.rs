@@ -4451,7 +4451,7 @@ match subject:
 
     #[test]
     fn matches_cpython_marshal_for_nested_return_unwind_owners() {
-        let source = r#"def loop_value(items):
+        let source = r"def loop_value(items):
     try:
         for item in items:
             try:
@@ -4507,7 +4507,7 @@ def nested_handler(compiler):
             return False
         command = [compiler.cc]
     return command
-"#;
+";
         assert_matches_cpython_marshal(source, "nested_return_unwinds.py");
     }
 
