@@ -3590,6 +3590,34 @@ print(" ".join(
     }
 
     #[test]
+    fn matches_cpython_marshal_for_protected_comprehension_filter_exits() {
+        let source = r"def with_owner(manager, items):
+    with manager:
+        values = [item.name for item in items if item.is_file()]
+    return values
+
+def none_filter_owner(manager, items):
+    with manager:
+        present = [item for item in items if item is not None]
+    return present
+";
+        assert_matches_cpython_marshal(source, "protected_comprehension_filter_exits.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_unprotected_comprehension_filter_exits() {
+        let source = r"def unprotected(items):
+    return [item for item in items if keep(item)]
+
+def generator_scope(manager, items):
+    with manager:
+        values = (item for item in items if keep(item))
+    return values
+";
+        assert_matches_cpython_marshal(source, "unprotected_comprehension_filter_exits.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_imported_attribute_calls_in_module_comprehensions() {
         let source = r#"import re
 import re as captured_module

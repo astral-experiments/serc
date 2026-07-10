@@ -3263,6 +3263,7 @@ impl Compiler {
         element_location: SourceLocation,
         accepted: Label,
         restart: Label,
+        include_with_region_exclusion: bool,
     ) -> Result<(), CompileError> {
         if comprehension_filter_truthiness(condition) == Some(true) {
             self.record_folded_value(condition)?;
@@ -3285,10 +3286,22 @@ impl Compiler {
             };
             for value in leading {
                 let next = self.assembler.label();
-                self.compile_comprehension_filter(value, element_location, next, restart)?;
+                self.compile_comprehension_filter(
+                    value,
+                    element_location,
+                    next,
+                    restart,
+                    include_with_region_exclusion,
+                )?;
                 self.assembler.mark(next);
             }
-            return self.compile_comprehension_filter(last, element_location, accepted, restart);
+            return self.compile_comprehension_filter(
+                last,
+                element_location,
+                accepted,
+                restart,
+                include_with_region_exclusion,
+            );
         }
         if let Expr::BoolOp(boolean) = condition
             && boolean.op == BoolOp::Or
@@ -3301,7 +3314,13 @@ impl Compiler {
             for value in leading {
                 self.compile_jump_if(value, true, accepted)?;
             }
-            return self.compile_comprehension_filter(last, element_location, accepted, restart);
+            return self.compile_comprehension_filter(
+                last,
+                element_location,
+                accepted,
+                restart,
+                include_with_region_exclusion,
+            );
         }
         if let Expr::UnaryOp(unary) = condition
             && unary.op == UnaryOp::Not
@@ -3348,11 +3367,13 @@ impl Compiler {
             self.emit_jump_backward(JUMP_BACKWARD, restart, 0)?;
             let exclusion_end = self.assembler.label();
             self.assembler.mark(exclusion_end);
-            self.control
-                .generator_region_exclusions
-                .push((exclusion_start, exclusion_end));
-            for exclusions in &mut self.control.active_comprehension_region_exclusions {
-                exclusions.push((exclusion_start, exclusion_end));
+            self.record_filter_exclusion(exclusion_start, exclusion_end, true);
+            if include_with_region_exclusion
+                && self.control.active_exception_region_exclusions.is_empty()
+            {
+                for exclusions in &mut self.control.active_with_region_exclusions {
+                    exclusions.push((exclusion_start, exclusion_end));
+                }
             }
             return Ok(());
         }
@@ -3368,11 +3389,13 @@ impl Compiler {
         self.emit_jump_backward(JUMP_BACKWARD, restart, 0)?;
         let exclusion_end = self.assembler.label();
         self.assembler.mark(exclusion_end);
-        self.control
-            .generator_region_exclusions
-            .push((exclusion_start, exclusion_end));
-        for exclusions in &mut self.control.active_comprehension_region_exclusions {
-            exclusions.push((exclusion_start, exclusion_end));
+        self.record_filter_exclusion(exclusion_start, exclusion_end, true);
+        if include_with_region_exclusion
+            && self.control.active_exception_region_exclusions.is_empty()
+        {
+            for exclusions in &mut self.control.active_with_region_exclusions {
+                exclusions.push((exclusion_start, exclusion_end));
+            }
         }
         Ok(())
     }
@@ -3410,6 +3433,7 @@ impl Compiler {
                 self.source_location(element_range),
                 accepted,
                 start,
+                add_opcode == LIST_APPEND,
             )?;
             self.assembler.mark(accepted);
         }
@@ -3575,6 +3599,7 @@ impl Compiler {
                 self.source_location(element_range),
                 accepted,
                 start,
+                add_opcode == LIST_APPEND,
             )?;
             self.assembler.mark(accepted);
         }
