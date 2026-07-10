@@ -1863,6 +1863,13 @@ impl Compiler {
         let fallback = self.assembler.label();
         let end = self.assembler.label();
 
+        // CPython appends the optimized Boolean loop's artificial control-flow instructions
+        // after exception-handler regions are labeled, so they do not inherit handler cleanup.
+        let handler_boolean_loop_policy = (!collect_tuple
+            && self.control.optimized_generator_boolean_condition
+            && self.control.in_exception_handler())
+        .then_some(ExceptionPolicy::EXCLUDE_ALWAYS);
+
         // The optimized-call guard's NOT_TAKEN is appended after exception targets are labeled.
         // In a plain generator's while body, it inherits the stop-iteration owner after a direct
         // yield resume but uses a fresh ownerless slot on the loop's initial entry.
@@ -1911,7 +1918,9 @@ impl Compiler {
             NOT_TAKEN,
             0,
             0,
-            generator_guard_exception_policy.unwrap_or_default(),
+            handler_boolean_loop_policy
+                .or(generator_guard_exception_policy)
+                .unwrap_or_default(),
         )?;
         if let Some(start) = not_taken_exclusion_start {
             let end = self.assembler.label();
@@ -1955,8 +1964,18 @@ impl Compiler {
                 matched,
                 -1,
             )?;
-            self.emit(NOT_TAKEN, 0, 0)?;
-            self.emit_jump_backward(JUMP_BACKWARD, loop_start, 0)?;
+            self.emit_with_exception_policy(
+                NOT_TAKEN,
+                0,
+                0,
+                handler_boolean_loop_policy.unwrap_or_default(),
+            )?;
+            self.emit_jump_backward_with_exception_policy(
+                JUMP_BACKWARD,
+                loop_start,
+                0,
+                handler_boolean_loop_policy.unwrap_or_default(),
+            )?;
             self.assembler.mark(matched);
             self.emit(POP_ITER, 0, -1)?;
             let result = self.add_constant(Constant::Bool(!initial_result))?;
@@ -4162,7 +4181,16 @@ impl Compiler {
         let base_depth = self.control.depth;
         let else_label = self.assembler.label();
         let end = self.assembler.label();
-        self.compile_jump_if(&expression.test, false, else_label)?;
+        let exclude_try_marker = self.control.exclude_condition_not_taken_from_exception
+            || (self
+                .control
+                .current_try_handler_starts_with_optimized_boolean_generator()
+                && matches!(expression.test.as_ref(), Expr::Name(_)));
+        self.with_control_override(
+            |control| &mut control.exclude_condition_not_taken_from_exception,
+            exclude_try_marker,
+            |compiler| compiler.compile_jump_if(&expression.test, false, else_label),
+        )?;
         self.compile_expression(&expression.body)?;
         // CPython emits the conditional-expression join without a location. Its later
         // propagation pass inherits the body location only when the join remains in the same
@@ -4824,6 +4852,12 @@ impl Compiler {
             self.emit(POP_TOP, 0, -1)?;
             if !jump_on {
                 self.emit_jump_forward(JUMP_FORWARD, label, 0)?;
+                if self.control.in_terminal_if_branch_suite
+                    && self.control.retained_chained_comparison_exit == Some(comparison.range)
+                {
+                    // The cleanup and false edges must continue sharing a small following exit.
+                    self.assembler.prevent_last_jump_inlining();
+                }
             }
 
             self.assembler.mark(end);
@@ -4900,7 +4934,14 @@ impl Compiler {
             self.emit(opcode, argument, -1)?;
             true
         } else {
-            self.compile_expression(expression)?;
+            let ownerless_boolean_generator = self
+                .control
+                .is_ownerless_optimized_boolean_generator_test(expression.range());
+            self.with_control_override(
+                |control| &mut control.optimized_generator_boolean_condition,
+                ownerless_boolean_generator,
+                |compiler| compiler.compile_expression(expression),
+            )?;
             false
         };
         self.assembler

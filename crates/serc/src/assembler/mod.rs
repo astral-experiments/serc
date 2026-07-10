@@ -1027,13 +1027,19 @@ impl Assembler {
         self.emit_operand(opcode, Operand::Backward(label));
     }
 
-    pub(crate) fn emit_backward_with_depth(
+    pub(crate) fn emit_backward_with_depth_and_exception_policy(
         &mut self,
         opcode: Opcode,
         label: Label,
         depth_after: u32,
+        exception_policy: ExceptionPolicy,
     ) {
-        self.emit_operand_with_depth(opcode, Operand::Backward(label), Some(depth_after));
+        self.emit_operand_with_depth_and_exception_policy(
+            opcode,
+            Operand::Backward(label),
+            Some(depth_after),
+            exception_policy,
+        );
     }
 
     fn emit_operand(&mut self, opcode: Opcode, operand: Operand) {

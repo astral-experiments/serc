@@ -1089,6 +1089,21 @@ impl Compiler {
         label: Label,
         effect: i32,
     ) -> Result<(), CompileError> {
+        self.emit_jump_backward_with_exception_policy(
+            opcode,
+            label,
+            effect,
+            ExceptionPolicy::default(),
+        )
+    }
+
+    pub(super) fn emit_jump_backward_with_exception_policy(
+        &mut self,
+        opcode: Opcode,
+        label: Label,
+        effect: i32,
+        exception_policy: ExceptionPolicy,
+    ) -> Result<(), CompileError> {
         if is_unconditional_jump(opcode)
             && let Some(location) = self.take_trailing_nop_location()
         {
@@ -1096,7 +1111,12 @@ impl Compiler {
         }
         self.apply_compiler_stack_effect(opcode, 0, effect)?;
         self.assembler
-            .emit_backward_with_depth(opcode, label, self.control.depth.cast_unsigned());
+            .emit_backward_with_depth_and_exception_policy(
+                opcode,
+                label,
+                self.control.depth.cast_unsigned(),
+                exception_policy,
+            );
         Ok(())
     }
 

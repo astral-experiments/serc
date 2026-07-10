@@ -2436,6 +2436,72 @@ def named_tuple_control(items):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_chained_return_exit_sharing() {
+        let source = r#"def direct(first, second, third):
+    if first <= second <= third:
+        return
+    after()
+
+
+def copied_global_exit(first, second, third):
+    if first <= second <= third:
+        return
+    global target
+    target = first
+
+
+def shared_nested_exit(kind, first, second, third):
+    if kind == "chain":
+        if first <= second <= third:
+            return
+        global nested_target
+        nested_target = first
+    else:
+        consume()
+
+
+def identity_chain(xre, xim):
+    if xre is xim is None:
+        return (None,) * 4
+    if xim:
+        raise NotImplementedError
+    return xre
+"#;
+        assert_matches_cpython_marshal(source, "chained_return_exit_sharing.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_handler_generator_and_try_conditional_owners() {
+        let source = r#"def optimized_any_in_handler(matches):
+    try:
+        result = matches[0]
+    except IndexError:
+        if any("*" in match for match in matches):
+            expanded = []
+            for match in matches:
+                if "*" in match:
+                    try:
+                        expanded.append(int(match))
+                    except ValueError:
+                        expanded.append(match)
+                else:
+                    expanded.append(match)
+            matches = expanded
+        result = matches[0]
+    return result
+
+
+def conditional_try_marker(flag, values, index):
+    try:
+        result = build(values) if flag else values[index]
+    except Error:
+        recover()
+    return result
+"#;
+        assert_matches_cpython_marshal(source, "handler_generator_try_conditional.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_folded_while_constant_order() {
         let source = r#"async def empty_pool_retained(action, consume):
     while True:
