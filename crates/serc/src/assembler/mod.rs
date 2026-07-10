@@ -579,7 +579,13 @@ impl Assembler {
             self.last_jump_instruction_mut("preparing a no-location block for inlining");
         instruction.location = SourceLocation::NONE;
         instruction.jump_policy.prevent_threading_target();
-        instruction.no_location_policy.allow_block_inlining = true;
+        instruction.no_location_policy.allow_block_inlining();
+    }
+
+    pub(crate) fn make_last_no_location_copy_interruptible(&mut self) {
+        self.last_jump_instruction_mut("making a no-location copy interruptible")
+            .no_location_policy
+            .make_first_copy_interruptible();
     }
 
     pub(crate) fn preserve_last_no_location(&mut self) {

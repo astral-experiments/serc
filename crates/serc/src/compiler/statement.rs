@@ -188,6 +188,9 @@ pub(super) struct ControlFlowState {
     // CPython retains the normal finally exit when it directly ends a synchronous with body.
     // This is consumed by the selected outer try before compiling any nested try statements.
     preserve_next_finally_exit_nop: bool,
+    // The complete final if whose fallthrough retains a converted POP_BLOCK before a terminal
+    // try-else suite. The range keeps nested and preceding if statements from consuming it.
+    retained_try_body_if_exit: Option<ruff_text_size::TextRange>,
     pub(super) active_exception_region_exclusions: Vec<Vec<(Label, Label)>>,
     active_exception_handlers: Vec<ExceptionHandlerContext>,
     // Exception-group handlers retain their body marker owner after coroutine suspension.
@@ -2542,6 +2545,23 @@ impl Compiler {
             }
         }
 
+        if self.control.retained_try_body_if_exit == Some(statement.range) {
+            let exit_start = self.assembler.label();
+            self.assembler.mark(exit_start);
+            if let Some(location) = self.assembler.last_instruction_location() {
+                self.assembler.set_location(location);
+            }
+            self.emit(NOP, 0, 0)?;
+            self.assembler.mark_last_as_converted_pop_block();
+            self.assembler.preserve_last_nop();
+            let exit_end = self.assembler.label();
+            self.assembler.mark(exit_end);
+            self.control
+                .active_exception_region_exclusions
+                .last_mut()
+                .expect("retained try-body if exit requires an active try")
+                .push((exit_start, exit_end));
+        }
         self.assembler.mark(end);
         self.set_depth(base_depth);
         if let Some(max_depth) = first_branch_max_depth {
@@ -3419,17 +3439,24 @@ impl Compiler {
                 && self.control.active_exception_region_exclusions.is_empty()
                 && self.control.active_with_region_exclusions.is_empty()
                 && suite_ends_in_simple_conditional_break(&statement.body);
+            let coroutine_terminal_break_exit = self.control.generator_region_start.is_some()
+                && suite_contains_loop_continue(&statement.body)
+                && statement.body.last().is_some_and(|statement| {
+                    suite_contains_loop_break(std::slice::from_ref(statement))
+                });
             if suite_contains_loop_break(&statement.body)
                 && !copied_direct_return_exit
                 && (!self.control.active_exception_region_exclusions.is_empty()
                     || !self.control.active_with_region_exclusions.is_empty()
+                    || coroutine_terminal_break_exit
                     || !suite_contains_unprotected_nontail_conditional_loop_break(&statement.body))
             {
                 // A constant-true loop can reach its exit only through `break`. CPython removes
                 // an unconditional break jump before borrowed-load analysis but does not
                 // reconnect the large exit block. An unprotected non-tail conditional break
                 // retains an explicit exit edge unless a surrounding control-flow region
-                // rewrites that edge during cleanup.
+                // rewrites that edge during cleanup. A coroutine stop handler with a continue
+                // edge also keeps a terminal break exit disconnected from the following block.
                 self.assembler.prevent_borrow_reachability(end);
             }
             self.set_depth(base_depth);
@@ -4069,6 +4096,17 @@ impl Compiler {
         } else {
             statement.orelse.as_slice()
         };
+        let retained_try_body_if_exit = (suite_terminates(&statement.orelse)
+            && matches!(
+                statement.body.last(),
+                Some(Stmt::If(statement))
+                    if early_condition_truthiness(&statement.test).is_none()
+                        && matches!(statement.body.as_slice(), [Stmt::Expr(_)])
+                        && matches!(statement.elif_else_clauses.as_slice(), [clause]
+                            if clause.test.is_none()
+                                && matches!(clause.body.as_slice(), [Stmt::Expr(_)]))
+            ))
+        .then(|| statement.body.last().expect("matched final if").range());
         // A direct nested try with a terminating handler leaves the outer try body followed by
         // an empty normal-exit block after CPython reorders the cold handler blocks.
         let handler_contains_terminal_nested_try = statement.handlers.iter().any(|handler| {
@@ -4199,7 +4237,11 @@ impl Compiler {
                 normal_return_emitted = emitted;
             } else {
                 self.with_try_body_context(statement, |compiler| {
-                    compiler.compile_suite(&statement.body)
+                    compiler.with_control_override(
+                        |control| &mut control.retained_try_body_if_exit,
+                        retained_try_body_if_exit,
+                        |compiler| compiler.compile_suite(&statement.body),
+                    )
                 })?;
             }
             let location = (self.assembler.instruction_count() == body_instruction_count)
@@ -4729,6 +4771,19 @@ impl Compiler {
             }
             let handler_body_has_instructions =
                 self.assembler.instruction_count() > handler_body_start;
+            let handler_ends_with_inlineable_cleanup = handler.name.is_some()
+                && handler
+                    .body
+                    .last()
+                    .is_some_and(|statement| match statement {
+                        Stmt::Try(_) => true,
+                        Stmt::With(statement) => !suite_terminates(&statement.body),
+                        _ => false,
+                    });
+            let handler_ends_with_nonterminal_with = matches!(
+                handler.body.last(),
+                Some(Stmt::With(statement)) if !suite_terminates(&statement.body)
+            );
             self.assembler.mark(body_end);
             if handler.name.is_some() {
                 self.add_exception_regions_with_exclusions(
@@ -4769,11 +4824,9 @@ impl Compiler {
                 {
                     self.assembler
                         .set_location(self.source_location(statement.range()));
-                // CPython leaves named cleanup after a nested try unlocated so every incoming
-                // edge can inline its own copy with the predecessor's line.
-                } else if handler.name.is_some()
-                    && matches!(handler.body.last(), Some(Stmt::Try(_)))
-                {
+                // CPython leaves named cleanup after a nested try or trailing with unlocated so
+                // every incoming edge can inline its own copy with the predecessor's line.
+                } else if handler_ends_with_inlineable_cleanup {
                     self.assembler.set_location(SourceLocation::NONE);
                 } else if let Some(location) = self.assembler.last_instruction_location() {
                     self.assembler.set_location(location);
@@ -4804,10 +4857,13 @@ impl Compiler {
                         0,
                         exception_policy,
                     )?;
-                    if handler.name.is_some() && matches!(handler.body.last(), Some(Stmt::Try(_))) {
+                    if handler_ends_with_inlineable_cleanup {
                         // The cleanup is larger than a small exit, but is still eligible because
                         // it has no line number and cannot fall through.
                         self.assembler.prepare_last_no_location_block_for_inlining();
+                        if handler_ends_with_nonterminal_with {
+                            self.assembler.make_last_no_location_copy_interruptible();
+                        }
                     }
                     let return_is_overridden = self.control.active_overriding_finally_returns > 0
                         && matches!(handler.body.last(), Some(Stmt::Return(_)));
@@ -7092,6 +7148,38 @@ fn suite_contains_loop_break(body: &[Stmt]) -> bool {
     })
 }
 
+fn suite_contains_loop_continue(body: &[Stmt]) -> bool {
+    body.iter().any(|statement| match statement {
+        Stmt::Continue(_) => true,
+        Stmt::If(statement) => {
+            suite_contains_loop_continue(&statement.body)
+                || statement
+                    .elif_else_clauses
+                    .iter()
+                    .any(|clause| suite_contains_loop_continue(&clause.body))
+        }
+        Stmt::Try(statement) => {
+            suite_contains_loop_continue(&statement.body)
+                || statement
+                    .handlers
+                    .iter()
+                    .filter_map(ruff_python_ast::ExceptHandler::as_except_handler)
+                    .any(|handler| suite_contains_loop_continue(&handler.body))
+                || suite_contains_loop_continue(&statement.orelse)
+                || suite_contains_loop_continue(&statement.finalbody)
+        }
+        Stmt::With(statement) => suite_contains_loop_continue(&statement.body),
+        Stmt::Match(statement) => statement
+            .cases
+            .iter()
+            .any(|case| suite_contains_loop_continue(&case.body)),
+        Stmt::For(statement) => suite_contains_loop_continue(&statement.orelse),
+        Stmt::While(statement) => suite_contains_loop_continue(&statement.orelse),
+        Stmt::FunctionDef(_) | Stmt::ClassDef(_) => false,
+        _ => false,
+    })
+}
+
 fn suite_contains_unprotected_nontail_conditional_loop_break(body: &[Stmt]) -> bool {
     fn contains(body: &[Stmt], conditional: bool) -> bool {
         for statement in body {
@@ -7127,7 +7215,9 @@ fn suite_contains_unprotected_nontail_conditional_loop_break(body: &[Stmt]) -> b
     let Some((last, leading)) = body.split_last() else {
         return false;
     };
-    if suite_contains_loop_break(std::slice::from_ref(last)) {
+    if suite_contains_loop_break(std::slice::from_ref(last))
+        && suite_contains_loop_continue(leading)
+    {
         return false;
     }
     contains(leading, false)

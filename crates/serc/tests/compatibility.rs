@@ -2155,6 +2155,21 @@ def explicit_else(flag):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_named_handler_trailing_with_cleanup() {
+        let source = r"def named_handler_trailing_with(outer, inner):
+    with outer:
+        try:
+            action()
+        except Error as error:
+            with inner:
+                recover(error)
+        else:
+            finish()
+";
+        assert_matches_cpython_marshal(source, "named_handler_trailing_with.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_folded_expressions_in_protected_regions() {
         let source = "def try_except():\n    try:\n        'try'\n        body()\n    except:\n        'except'\n        recover()\n\ndef except_only():\n    try:\n        body()\n    except:\n        'except'\n\ndef nested_handlers():\n    try:\n        try:\n            body()\n        except ValueError:\n            recover()\n        except TypeError:\n            recover()\n    finally:\n        cleanup()\n\ndef with_body(manager):\n    with manager:\n        'with'\n        body()\n\ndef with_only(manager):\n    with manager:\n        'with'\n\nasync def protected_condition():\n    await source\n    if test:\n        await other\n\ntry:\n    pass\nexcept (ValueError if True else TypeError):\n    pass\n\ntry:\n    pass\nexcept* (ValueError if True else TypeError):\n    pass\n\ndef protected_conditions(manager, first, second):\n    with manager:\n        if first:\n            body()\n        if second:\n            body()\n\ndef generator_try():\n    yield 1\n    try:\n        pass\n    except Exception:\n        pass\n\nif condition:\n    try:\n        with manager:\n            body()\n    except Error:\n        pass\n";
         assert_matches_cpython_marshal(source, "protected_nop.py");
@@ -3772,6 +3787,55 @@ def tail_break(flag, result):
     fourth(result)
     fifth(result)
     return result
+
+def nested_terminal_break(flag, result, next_item, stop):
+    while True:
+        outer = next_item()
+        if outer is None:
+            break
+        if flag:
+            while True:
+                item = next_item()
+                if item is None:
+                    break
+                consume(item)
+                if stop(item):
+                    break
+        first(result)
+        second(result)
+        third(result)
+        fourth(result)
+        fifth(result)
+    return result
+
+async def coroutine_terminal_break(result, read, stop):
+    while True:
+        item = await read()
+        if item is None:
+            break
+        consume(item)
+        if stop(item):
+            break
+    first(result)
+    second(result)
+    third(result)
+    fourth(result)
+    fifth(result)
+    return result
+
+def earlier_and_tail_break(first_flag, last_flag, result):
+    while True:
+        if first_flag:
+            break
+        step()
+        if last_flag:
+            break
+    first(result)
+    second(result)
+    third(result)
+    fourth(result)
+    fifth(result)
+    return result
 ";
         assert_matches_cpython_marshal(source, "constant_loop_break_borrowing.py");
     }
@@ -4052,6 +4116,23 @@ def final_elif(action, first, second):
     return None
 ";
         assert_matches_cpython_marshal(source, "nested_if_trailing_try.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_terminal_try_else_after_complete_if() {
+        let source = r"def terminal_else(flag):
+    try:
+        if flag:
+            action()
+        else:
+            other()
+    except Error:
+        failed()
+    else:
+        return None
+    after()
+";
+        assert_matches_cpython_marshal(source, "terminal_try_else_complete_if.py");
     }
 
     #[test]

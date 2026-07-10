@@ -8,7 +8,7 @@ use super::super::{
 use crate::assembler::block_graph::{BasicBlockId, BlockGraph};
 use crate::target::is_conditional_jump;
 use crate::target::opcodes::{
-    CLEANUP_THROW, END_ASYNC_FOR, END_SEND, LOAD_GLOBAL, NOP, RAISE_VARARGS,
+    CLEANUP_THROW, END_ASYNC_FOR, END_SEND, LOAD_GLOBAL, NOP, RAISE_VARARGS, RETURN_VALUE,
 };
 
 struct NoExitCopyAnalysis {
@@ -80,7 +80,7 @@ fn no_exit_copy_analysis(
             && ends_scope(target_last.opcode);
         let no_location_exit = target_has_no_location
             && !block_has_fallthrough(graph[target].items())
-            && target_last.no_location_policy.allow_block_inlining
+            && target_last.no_location_policy.allows_block_inlining()
             && (!source_has_fallthrough || predecessors[target.index()] > 1);
         let small_exit_source = !source_has_fallthrough
             && graph[source]
@@ -150,10 +150,15 @@ fn no_exit_copy_analysis(
                 Item::Instruction(instruction) => Some(instruction.opcode),
                 Item::Label(_) => None,
             });
+        let source_retains_direct_exit_nop = graph[source]
+            .last_instruction()
+            .is_some_and(|instruction| instruction.jump_policy.retains_direct_target_nop());
         let target_is_small_exit = target_pre_fusion_size <= 4
             && target_terminal_opcode.is_some_and(|opcode| {
                 ends_scope(opcode)
-                    && (target_chain_end == target_position || opcode == RAISE_VARARGS)
+                    && (target_chain_end == target_position
+                        || opcode == RAISE_VARARGS
+                        || (opcode == RETURN_VALUE && source_retains_direct_exit_nop))
             });
         let source_has_fallthrough = block_has_fallthrough(graph[source].items());
         let inline_small_exit = !source_has_fallthrough
@@ -174,7 +179,7 @@ fn no_exit_copy_analysis(
         });
         let no_location_exit = target_has_no_location
             && !block_has_fallthrough(graph[target].items())
-            && target_last.no_location_policy.allow_block_inlining;
+            && target_last.no_location_policy.allows_block_inlining();
         let shared_exit = predecessors[target.index()] > 1
             && graph[target].items().iter().all(|item| {
                 !matches!(item, Item::Instruction(instruction) if instruction.location.line >= 0)
@@ -933,14 +938,19 @@ impl OptimizationPipeline {
                     Item::Instruction(instruction) => Some(instruction.opcode),
                     Item::Label(_) => None,
                 });
+            let source_retains_direct_exit_nop = graph[source]
+                .last_instruction()
+                .is_some_and(|instruction| instruction.jump_policy.retains_direct_target_nop());
             let target_is_small_exit = target_pre_fusion_size <= 4
                 && target_terminal_opcode.is_some_and(|opcode| {
                     ends_scope(opcode)
                         // An exception-boundary split before a raise represents CPython's
-                        // `SETUP_FINALLY` inside one basic block. Return paths can also contain
-                        // optimized-away `POP_BLOCK` instructions that are not recoverable from
-                        // the final region labels, so keep their existing block boundary.
-                        && (target_chain_end == target_position || opcode == RAISE_VARARGS)
+                        // `SETUP_FINALLY` inside one basic block. Split returns normally keep
+                        // their boundary, but direct-target NOP retention proves that this
+                        // concrete return is copied onto the source edge.
+                        && (target_chain_end == target_position
+                            || opcode == RAISE_VARARGS
+                            || (opcode == RETURN_VALUE && source_retains_direct_exit_nop))
                 });
             let source_allows_small_exit_inlining = graph[source]
                 .last_instruction()
@@ -957,7 +967,7 @@ impl OptimizationPipeline {
             });
             let target_allows_no_location_block_inlining = graph[target]
                 .last_instruction()
-                .is_some_and(|instruction| instruction.no_location_policy.allow_block_inlining);
+                .is_some_and(|instruction| instruction.no_location_policy.allows_block_inlining());
             let target_is_no_location_no_fallthrough = target_has_no_location
                 && target_allows_no_location_block_inlining
                 && !block_has_fallthrough(graph[target].items());
@@ -1006,6 +1016,21 @@ impl OptimizationPipeline {
                 .iter()
                 .flat_map(|block| graph[*block].items().iter().copied())
                 .collect::<Vec<_>>();
+            if inline_no_location_block
+                && let Some(instruction) = copied.iter_mut().rev().find_map(|item| match item {
+                    Item::Instruction(instruction) => Some(instruction),
+                    Item::Label(_) => None,
+                })
+                && instruction
+                    .no_location_policy
+                    .first_copy_is_interruptible_backward()
+                && remaining_predecessors[&target] == predecessors[&target]
+                && instruction.opcode == JUMP_FORWARD
+            {
+                // CPython's copied normal exit checks the eval breaker if cold-block ordering
+                // turns it backward. The original synthetic cleanup edge remains no-interrupt.
+                instruction.opcode = JUMP_BACKWARD;
+            }
             let preserve_inlined_jump_nop = inline_small_exit
                 && source_location.line >= 0
                 && graph[source].last_instruction().is_some_and(|instruction| {

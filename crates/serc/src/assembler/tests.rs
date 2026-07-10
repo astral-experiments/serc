@@ -473,7 +473,7 @@ fn fusion_preserves_each_typed_instruction_policy() {
         Some(1),
     );
     first.load_policy.force_owned = true;
-    first.no_location_policy.allow_block_inlining = true;
+    first.no_location_policy.allow_block_inlining();
     first.no_location_policy.percent_target_location = 7;
     first.converted_pop_block = true;
     first.hidden_exception_owner_slots = 2;
@@ -514,14 +514,14 @@ fn fusion_preserves_each_typed_instruction_policy() {
             strict_owned: true,
         }
     );
-    assert_eq!(
-        fused.no_location_policy,
-        NoLocationPolicy {
-            allow_block_inlining: true,
-            preserve: true,
-            percent_target_location: 7,
-        }
+    assert!(fused.no_location_policy.allows_block_inlining());
+    assert!(
+        !fused
+            .no_location_policy
+            .first_copy_is_interruptible_backward()
     );
+    assert!(fused.no_location_policy.preserve);
+    assert_eq!(fused.no_location_policy.percent_target_location, 7);
     assert_eq!(fused.fusion_policy, FusionPolicy::default());
     assert!(fused.converted_pop_block);
     assert!(fused.jump_policy.preserves_explicit_nop());
@@ -1098,7 +1098,7 @@ fn no_location_block_inlining_reaches_a_fixed_point() {
         None,
     );
     first_cleanup_jump.jump_policy.prevent_threading_target();
-    first_cleanup_jump.no_location_policy.allow_block_inlining = true;
+    first_cleanup_jump.no_location_policy.allow_block_inlining();
     let mut second_cleanup_jump = Instruction::new(
         JUMP_BACKWARD_NO_INTERRUPT,
         Operand::Backward(restart),
@@ -1106,7 +1106,9 @@ fn no_location_block_inlining_reaches_a_fixed_point() {
         None,
     );
     second_cleanup_jump.jump_policy.prevent_threading_target();
-    second_cleanup_jump.no_location_policy.allow_block_inlining = true;
+    second_cleanup_jump
+        .no_location_policy
+        .allow_block_inlining();
     let mut assembler = optimization_pipeline(vec![
         Item::Label(restart),
         pass_instruction(NOP, 0, 0),
@@ -1149,5 +1151,53 @@ fn no_location_block_inlining_reaches_a_fixed_point() {
             })
             .collect::<Vec<_>>(),
         [0, 1, 1, 1, 1]
+    );
+}
+
+#[test]
+fn direct_target_return_copy_crosses_an_exception_boundary() {
+    let return_start = super::Label(0);
+    let return_split = super::Label(1);
+    let handler = super::Label(2);
+    let mut jump = Instruction::new(
+        JUMP_FORWARD,
+        Operand::Forward(return_start),
+        SourceLocation::new(1, 1, 0, 0),
+        None,
+    );
+    jump.jump_policy.retain_nop_for_direct_target();
+    let mut assembler = optimization_pipeline(vec![
+        Item::Instruction(jump),
+        Item::Label(return_start),
+        pass_instruction(LOAD_CONST, 0, 2),
+        Item::Label(return_split),
+        pass_instruction(RETURN_VALUE, 0, 2),
+        Item::Label(handler),
+        pass_instruction(RERAISE, 0, -1),
+    ]);
+    assembler.exception_regions.push(super::ExceptionRegion {
+        start: return_start,
+        end: return_split,
+        target: handler,
+        depth: 0,
+        preserve_lasti: false,
+    });
+
+    assembler.duplicate_exit_blocks();
+
+    assert_eq!(
+        graph_opcodes(&assembler),
+        [NOP, LOAD_CONST, RETURN_VALUE, RETURN_VALUE, RERAISE]
+    );
+    assert_eq!(
+        assembler
+            .graph
+            .iter_items()
+            .filter_map(|item| match item {
+                Item::Instruction(instruction) => Some(instruction.location.line),
+                Item::Label(_) => None,
+            })
+            .collect::<Vec<_>>(),
+        [1, 2, 2, 2, -1]
     );
 }
