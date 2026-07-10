@@ -2340,11 +2340,8 @@ impl Compiler {
             // handler used by `def` generators and generator expressions.
             child.control.generator_region_start = None;
         }
-        child.compile_expression(&lambda.body)?;
-        child
-            .assembler
-            .set_location(child.source_location(lambda.body.range()));
-        child.emit(RETURN_VALUE, 0, -1)?;
+        let return_location = child.source_location(lambda.body.range());
+        child.compile_tail_return_expression(&lambda.body, return_location)?;
         let child = child.finish_inner(false)?;
 
         if !closure_names.is_empty() {
@@ -4135,6 +4132,69 @@ impl Compiler {
         self.assembler.preserve_block_boundary(end);
         self.assembler.mark(end);
         self.set_depth(base_depth + 1);
+        Ok(())
+    }
+
+    fn compile_tail_return_expression(
+        &mut self,
+        expression: &Expr,
+        return_location: SourceLocation,
+    ) -> Result<(), CompileError> {
+        self.compile_tail_return_expression_inner(expression, return_location, false)
+    }
+
+    fn compile_tail_return_expression_inner(
+        &mut self,
+        expression: &Expr,
+        return_location: SourceLocation,
+        final_fallthrough: bool,
+    ) -> Result<(), CompileError> {
+        let Expr::If(conditional) = expression else {
+            self.compile_with_strict_owned_loads(
+                final_fallthrough && matches!(expression, Expr::Name(_)),
+                |compiler| compiler.compile_expression(expression),
+            )?;
+            self.assembler.set_location(return_location);
+            self.emit(RETURN_VALUE, 0, -1)?;
+            return Ok(());
+        };
+
+        if let Some(truthiness) = early_condition_truthiness(&conditional.test) {
+            if let Some(constant) = fold_constant(&conditional.test)
+                && (self.output.constants.is_empty() || matches!(constant, Constant::None))
+            {
+                self.add_constant(constant)?;
+            }
+            self.pre_register_expression_names(&conditional.body)?;
+            self.pre_register_expression_names(&conditional.orelse)?;
+            let selected = if truthiness {
+                &conditional.body
+            } else {
+                &conditional.orelse
+            };
+            if self.source_location(conditional.test.range()).line
+                != self.source_location(selected.range()).line
+            {
+                self.assembler
+                    .set_location(self.source_location(conditional.test.range()));
+                self.emit(NOP, 0, 0)?;
+            }
+            return self.compile_tail_return_expression_inner(
+                selected,
+                return_location,
+                final_fallthrough,
+            );
+        }
+
+        let base_depth = self.control.depth;
+        let otherwise = self.assembler.label();
+        self.compile_jump_if(&conditional.test, false, otherwise)?;
+        self.compile_tail_return_expression_inner(&conditional.body, return_location, false)?;
+
+        self.assembler.mark(otherwise);
+        self.set_depth(base_depth);
+        self.compile_tail_return_expression_inner(&conditional.orelse, return_location, true)?;
+        self.set_depth(base_depth);
         Ok(())
     }
 

@@ -3525,6 +3525,24 @@ def consecutive_fresh(values):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_recursive_tail_conditional_lambdas() {
+        let source = r"lambda_else = lambda outer, inner, first, second, third: (
+    first if outer else second if inner else third
+)
+lambda_body = lambda outer, inner, first, second, third: (
+    (first if inner else second) if outer else third
+)
+
+
+def assignment_control(holder, outer, inner, first, second, third):
+    holder.value = (
+        (first if inner else second) if outer else third
+    )
+";
+        assert_matches_cpython_marshal(source, "recursive_tail_conditional_lambdas.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_a_folded_dictionary_comprehension_key() {
         let source = "def folded_key():\n    return {x if True else y: y for x in range(10) for y in range(10)}\n";
         assert_matches_cpython_marshal(source, "folded_key.py");
