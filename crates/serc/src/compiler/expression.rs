@@ -1854,6 +1854,25 @@ impl Compiler {
         let fallback = self.assembler.label();
         let end = self.assembler.label();
 
+        // The optimized-call guard's NOT_TAKEN is appended after exception targets are labeled.
+        // In a plain generator's while body, it inherits the stop-iteration owner after a direct
+        // yield resume but uses a fresh ownerless slot on the loop's initial entry.
+        let generator_guard_exception_policy = (self.unit.flags & CO_GENERATOR != 0
+            && !self.control.generator_expression
+            && self.control.active_exception_region_exclusions.is_empty()
+            && self.control.active_with_region_exclusions.is_empty()
+            && self
+                .control
+                .active_comprehension_region_exclusions
+                .is_empty()
+            && self.control.active_normal_finally_bodies == 0
+            && self.control.active_finally_end_blocks == 0
+            && self.control.active_exception_group_handlers == 0
+            && !self.control.in_exception_handler()
+            && self.control.in_while_loop())
+        .then(|| {
+            ExceptionPolicy::normalized_owner(self.assembler.current_block_resumes_after_yield())
+        });
         self.compile_expression(&call.func)?;
         self.assembler.set_location(callable_location);
         self.emit(COPY, 1, 1)?;
@@ -1870,7 +1889,12 @@ impl Compiler {
             self.assembler.mark(start);
             start
         });
-        self.emit(NOT_TAKEN, 0, 0)?;
+        self.emit_with_exception_policy(
+            NOT_TAKEN,
+            0,
+            0,
+            generator_guard_exception_policy.unwrap_or_default(),
+        )?;
         if let Some(start) = not_taken_exclusion_start {
             let end = self.assembler.label();
             self.assembler.mark(end);
@@ -4794,23 +4818,30 @@ impl Compiler {
                 .terminal_try_condition_exception_exclusion_depth
                 .is_some()
                 && self.assembler.current_block_has_dynamic_exception_owner());
-        let exclude_plain_try_marker = !comparison_is_boolean
-            && !self.assembler.fallthrough_has_dynamic_exception_owner()
-            && self.control.generator_region_start.is_none()
-            && !self.control.in_iterator_loop()
-            && !self.control.exceptional_finally_condition
+        let shifted_plain_try_marker = !comparison_is_boolean
             && self
                 .control
-                .active_comprehension_region_exclusions
-                .is_empty()
-            && self.control.active_with_region_exclusions.is_empty()
-            && self.control.active_normal_finally_bodies == 0
-            && self.control.active_finally_end_blocks == 0
-            && self.control.active_exception_group_handlers == 0
-            && !self.control.same_line_try_body
-            && !self.control.current_exception_handler_binds_name()
-            && !self.control.in_exception_handler()
-            && self.control.active_exception_region_exclusions.len() == 1;
+                .current_try_marker_is_shifted_to_ownerless_slot(
+                    self.assembler.instruction_count(),
+                );
+        let exclude_plain_try_marker = !comparison_is_boolean
+            && (shifted_plain_try_marker
+                || (!self.assembler.fallthrough_has_dynamic_exception_owner()
+                    && self.control.generator_region_start.is_none()
+                    && !self.control.in_iterator_loop()
+                    && !self.control.exceptional_finally_condition
+                    && self
+                        .control
+                        .active_comprehension_region_exclusions
+                        .is_empty()
+                    && self.control.active_with_region_exclusions.is_empty()
+                    && self.control.active_normal_finally_bodies == 0
+                    && self.control.active_finally_end_blocks == 0
+                    && self.control.active_exception_group_handlers == 0
+                    && !self.control.same_line_try_body
+                    && !self.control.current_exception_handler_binds_name()
+                    && !self.control.in_exception_handler()
+                    && self.control.active_exception_region_exclusions.len() == 1));
         if exclude_plain_try_marker {
             // CPython appends normalized markers after exception targets are labeled. Force the
             // plain try marker ownerless only when no optimized CFG slot can carry an owner.

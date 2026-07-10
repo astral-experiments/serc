@@ -101,6 +101,12 @@ impl ExceptionTypeBoolMarkerState {
 }
 
 #[derive(Clone, Copy, Debug)]
+struct TryMarkerSlotContext {
+    ownerless_prefix_slots: usize,
+    protected_start_instruction: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
 struct WithExitContext {
     location: SourceLocation,
     is_async: bool,
@@ -203,6 +209,7 @@ pub(super) struct ControlFlowState {
     // try-else suite. The range keeps nested and preceding if statements from consuming it.
     retained_try_body_if_exit: Option<ruff_text_size::TextRange>,
     pub(super) active_exception_region_exclusions: Vec<Vec<(Label, Label)>>,
+    active_try_marker_slots: Vec<Option<TryMarkerSlotContext>>,
     active_exception_handlers: Vec<ExceptionHandlerContext>,
     // Exception-group handlers retain their body marker owner after coroutine suspension.
     pub(super) active_exception_group_handlers: usize,
@@ -292,6 +299,26 @@ impl ControlFlowState {
         self.loops
             .last()
             .is_some_and(|context| context.iterator_cleanup != IteratorCleanup::None)
+    }
+
+    pub(super) fn in_while_loop(&self) -> bool {
+        self.loops
+            .last()
+            .is_some_and(|context| context.iterator_cleanup == IteratorCleanup::None)
+    }
+
+    pub(super) fn current_try_marker_is_shifted_to_ownerless_slot(
+        &self,
+        current_instruction: usize,
+    ) -> bool {
+        self.active_try_marker_slots
+            .last()
+            .copied()
+            .flatten()
+            .is_some_and(|context| {
+                context.ownerless_prefix_slots
+                    >= current_instruction.saturating_sub(context.protected_start_instruction)
+            })
     }
 
     fn in_exception_protected_iterator_loop(&self) -> bool {
@@ -4459,10 +4486,27 @@ impl Compiler {
                     .push((statement_nop_start, statement_nop_end));
             }
         }
+        // CPython compacts the surrounding block without clearing its exception targets. Enough
+        // ownerless vacancies before an iterator-loop try can therefore shift a normalized
+        // condition marker into a slot before the protected region's setup boundary.
+        let try_marker_slots = (self.control.generator_region_start.is_none()
+            && self.control.active_exception_region_exclusions.is_empty()
+            && self.control.active_with_region_exclusions.is_empty()
+            && self
+                .control
+                .active_comprehension_region_exclusions
+                .is_empty()
+            && self.control.in_iterator_loop()
+            && matches!(statement.body.first(), Some(Stmt::Assign(_))))
+        .then(|| TryMarkerSlotContext {
+            ownerless_prefix_slots: self.assembler.fallthrough_dynamic_exception_owner_slots(),
+            protected_start_instruction: self.assembler.instruction_count(),
+        });
         self.assembler.mark(try_start);
         self.control
             .active_exception_region_exclusions
             .push(Vec::new());
+        self.control.active_try_marker_slots.push(try_marker_slots);
         let direct_continue =
             statement.orelse.is_empty() && matches!(statement.body.as_slice(), [Stmt::Continue(_)]);
         let direct_with_exit = self
@@ -4623,6 +4667,11 @@ impl Compiler {
             }
             location
         };
+        let _try_marker_slots = self
+            .control
+            .active_try_marker_slots
+            .pop()
+            .expect("active try region has marker slot context");
         let try_exclusions = self
             .control
             .active_exception_region_exclusions

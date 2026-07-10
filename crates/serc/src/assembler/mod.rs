@@ -354,6 +354,11 @@ impl Assembler {
         self.current_block_dynamic_exception_owner_slots() > 0
     }
 
+    /// Returns how many stale exception-owner slots can cross labels that only delimit regions.
+    pub(crate) fn fallthrough_dynamic_exception_owner_slots(&self) -> usize {
+        self.dynamic_exception_owner_slots(true)
+    }
+
     /// Returns whether optimization can leave a dynamic exception owner before a normalized
     /// condition marker, including across labels that only delimit exception regions.
     ///
@@ -361,7 +366,7 @@ impl Assembler {
     /// label, so compaction before a try body can shift stale owners into a marker appended
     /// inside the body.
     pub(crate) fn fallthrough_has_dynamic_exception_owner(&self) -> bool {
-        self.dynamic_exception_owner_slots(true) > 0
+        self.fallthrough_dynamic_exception_owner_slots() > 0
     }
 
     /// Returns whether the current block resumes directly after a plain `yield`.

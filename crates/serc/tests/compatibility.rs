@@ -1263,6 +1263,63 @@ def while_plain_try(flag):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_shifted_plain_try_condition_markers() {
+        let source = r"def retained(items):
+    for item in items:
+        consume(item, 0)
+        consume(item, 1)
+        consume(item, 2)
+        consume(item, 3)
+        consume(item, 4)
+        consume(item, 5)
+        consume(item, 6)
+        consume(item, 7)
+        try:
+            value = item.make()
+            if value.flags.owned:
+                continue
+            value = value.view(Type)
+        except Error:
+            continue
+        use(value)
+
+
+def shifted(items):
+    for item in items:
+        consume(item, 0)
+        consume(item, 1)
+        consume(item, 2)
+        consume(item, 3)
+        consume(item, 4)
+        consume(item, 5)
+        consume(item, 6)
+        consume(item, 7)
+        consume(item, 8)
+        try:
+            value = item.make()
+            if value.flags.owned:
+                continue
+            value = value.view(Type)
+        except Error:
+            continue
+        use(value)
+
+
+def direct_condition(items, first, second):
+    for item in items:
+        consume(first, second)
+        consume(first, second)
+        try:
+            if item:
+                continue
+            use(item)
+        except Error:
+            continue
+";
+        assert_matches_cpython_marshal(source, "shifted_plain_try_condition_markers.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_generator_like_terminal_elif_owners() {
         let source = r"def generator_elif(first, second):
     yield 1
@@ -3413,6 +3470,46 @@ def keyword_unpacking():
         recover()
 ";
         assert_matches_cpython_marshal(source, "optimized_generator_try.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_generator_guard_marker_owners() {
+        let source = r"def after_resume(values):
+    yield before()
+    result = tuple(value for value in values)
+    yield result
+
+
+def while_fresh(values):
+    yield before()
+    while True:
+        result = tuple(value for value in values)
+        yield result
+
+
+def after_dynamic(flag, values):
+    yield before()
+    if flag:
+        prepare()
+        result = tuple(value for value in values)
+        yield result
+
+
+def iterator_owned(groups):
+    yield before()
+    for values in groups:
+        result = tuple(value for value in values)
+        yield result
+
+
+def consecutive_fresh(values):
+    yield before()
+    while True:
+        first = tuple(value for value in values)
+        second = tuple(value for value in values)
+        yield first, second
+";
+        assert_matches_cpython_marshal(source, "generator_guard_marker_owners.py");
     }
 
     #[test]
