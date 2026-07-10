@@ -2539,6 +2539,22 @@ impl Compiler {
                 } else {
                     None
                 };
+                // A literal returned through the direct final `with` in a normal try body is
+                // reloaded after manager cleanup. CPython excludes that reload and return from
+                // the surrounding try's handler.
+                if !preserve_tos
+                    && !return_is_overridden
+                    && !with_unwind_starts.is_empty()
+                    && self.control.terminal_with_condition.is_some()
+                    && self.control.direct_final_sync_with_try_body.is_some()
+                    && exception_unwind_start.is_none()
+                    && finally_unwind_start.is_none()
+                    && !self.control.active_exception_region_exclusions.is_empty()
+                {
+                    let start = self.assembler.label();
+                    self.assembler.mark(start);
+                    exception_unwind_start = Some(start);
+                }
                 if !preserve_tos && !return_is_overridden {
                     if let Some(value) = &statement.value {
                         let return_location = self.source_location(statement.range);
@@ -6858,7 +6874,14 @@ impl Compiler {
                 })
             {
                 body_noop = Some(WithBodyExitNoop::Located(statement.range()));
-            } else if terminal_if && let Some(Stmt::If(statement)) = body.last() {
+            } else if terminal_if
+                && let Some(Stmt::If(statement)) = body.last()
+                && (condition_jump_target_count(&statement.test, false) == 1
+                    || self.control.direct_final_sync_with_try_body.is_none())
+            {
+                // On the direct normal edge of a surrounding try, CPython drops a converted
+                // `POP_BLOCK` marker fed by multiple condition fallthroughs. A sole predecessor
+                // still supplies the marker's visible location.
                 body_noop = Some(WithBodyExitNoop::Located(condition_fallthrough_range(
                     &statement.test,
                 )));

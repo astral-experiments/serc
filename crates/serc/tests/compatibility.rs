@@ -1877,6 +1877,28 @@ async def asynchronous(manager, first, second):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_with_body_exit_marker_predecessors() {
+        let source = r"def multiple_fallthrough_edges(manager, source, expected):
+    try:
+        with manager:
+            values = source()
+            if len(values) == 2 and int(values[1]) == expected:
+                return True
+    except Error:
+        pass
+    after()
+
+
+def single_fallthrough_edge(manager, first, second):
+    with manager:
+        value = make()
+        if not first or not second:
+            raise Error(value)
+";
+        assert_matches_cpython_marshal(source, "with_body_exit_marker_predecessors.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_protected_iterator_boolean_continue_owners() {
         let source = r##"def nested_positive(manager, outer, inner, predicates):
     with manager:
