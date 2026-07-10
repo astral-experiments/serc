@@ -1692,6 +1692,31 @@ async def synchronous_outside_async(sync_manager, async_manager):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_authored_breaks_after_cold_block_ordering() {
+        let source = r"def authored_break(items):
+    for item in items:
+        try:
+            action(item)
+        except Error:
+            recover(item)
+            break
+        use(item)
+    after()
+
+
+def synthetic_cold_fallthrough(items):
+    for item in items:
+        try:
+            action(item)
+        except Error:
+            recover(item)
+        use(item)
+    after()
+";
+        assert_matches_cpython_marshal(source, "cold_handler_break.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_inlined_break_line_nops() {
         let source = r"def conditional(flag):
     while True:
@@ -2257,6 +2282,21 @@ def trailing_if(flag):
         value = None
         if flag:
             value = recover()
+        else:
+            value = fallback()
+    return value
+
+
+def trailing_if_with_expression_join(flag):
+    try:
+        action()
+    except Error:
+        value = None
+        if flag:
+            value = (
+                first()
+                or second()
+            )
         else:
             value = fallback()
     return value

@@ -584,6 +584,12 @@ impl Assembler {
             .prevent_threading_target();
     }
 
+    pub(crate) fn mark_last_jump_as_authored_break(&mut self) {
+        self.last_jump_instruction_mut("marking an authored break jump")
+            .backward_jump_provenance
+            .mark_authored_break();
+    }
+
     pub(crate) fn prepare_last_no_location_block_for_inlining(&mut self) {
         let instruction =
             self.last_jump_instruction_mut("preparing a no-location block for inlining");
@@ -596,6 +602,16 @@ impl Assembler {
         self.last_jump_instruction_mut("making a no-location copy interruptible")
             .no_location_policy
             .make_first_copy_interruptible();
+    }
+
+    /// Gives a copied no-location block its predecessor's location even when that predecessor is
+    /// itself a control-flow join.
+    pub(crate) fn make_last_no_location_copy_inherit_shared_predecessor(&mut self) {
+        self.required_last_instruction_mut(
+            "making a no-location copy inherit its shared predecessor",
+        )
+        .no_location_policy
+        .make_copy_inherit_shared_predecessor();
     }
 
     /// Records that the provisional source location on the last eval-break instruction was

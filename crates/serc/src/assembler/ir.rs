@@ -142,6 +142,7 @@ impl NoLocationBlockPolicy {
     const ALLOW_INLINING: u8 = 1 << 0;
     const FIRST_COPY_INTERRUPTIBLE: u8 = 1 << 1;
     const ARTIFICIAL_EVAL_BREAK: u8 = 1 << 2;
+    const COPY_INHERITS_SHARED_PREDECESSOR: u8 = 1 << 3;
 
     const fn fused(first: Self, second: Self) -> Self {
         Self(first.0 | second.0)
@@ -184,6 +185,13 @@ impl NoLocationPolicy {
             .contains(NoLocationBlockPolicy::ARTIFICIAL_EVAL_BREAK)
     }
 
+    /// Whether a copied no-location block inherits a source location even when its predecessor
+    /// is itself the join of multiple incoming edges.
+    pub(super) const fn copy_inherits_shared_predecessor(self) -> bool {
+        self.block_policy
+            .contains(NoLocationBlockPolicy::COPY_INHERITS_SHARED_PREDECESSOR)
+    }
+
     pub(super) fn allow_block_inlining(&mut self) {
         self.block_policy
             .insert(NoLocationBlockPolicy::ALLOW_INLINING);
@@ -198,6 +206,11 @@ impl NoLocationPolicy {
     pub(super) fn mark_artificial_eval_break(&mut self) {
         self.block_policy
             .insert(NoLocationBlockPolicy::ARTIFICIAL_EVAL_BREAK);
+    }
+
+    pub(super) fn make_copy_inherit_shared_predecessor(&mut self) {
+        self.block_policy
+            .insert(NoLocationBlockPolicy::COPY_INHERITS_SHARED_PREDECESSOR);
     }
 
     const fn fused(first: Self, second: Self) -> Self {
@@ -242,6 +255,37 @@ pub(super) enum RetainedJumpNop {
     // Retain the jump's line event only while it still points at its original direct target.
     DirectTarget,
     Always,
+}
+
+/// Records why a forward jump may become backward after cold-block ordering.
+///
+/// Generated fallthrough edges must remain non-interruptible, while a source-authored `break`
+/// continues to check the eval breaker even if its exception-handler block moves after the loop
+/// exit.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(u8)]
+pub(super) enum BackwardJumpProvenance {
+    #[default]
+    Generated,
+    AuthoredBreak,
+}
+
+impl BackwardJumpProvenance {
+    pub(super) const fn is_authored_break(self) -> bool {
+        matches!(self, Self::AuthoredBreak)
+    }
+
+    pub(super) fn mark_authored_break(&mut self) {
+        *self = Self::AuthoredBreak;
+    }
+
+    const fn fused(first: Self, second: Self) -> Self {
+        if first.is_authored_break() || second.is_authored_break() {
+            Self::AuthoredBreak
+        } else {
+            Self::Generated
+        }
+    }
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -517,6 +561,7 @@ pub(super) struct Instruction {
     // three slots that a normalized boolean value marker can reuse.
     pub(super) hidden_exception_owner_slots: u8,
     pub(super) jump_policy: JumpPolicy,
+    pub(super) backward_jump_provenance: BackwardJumpProvenance,
     // `NOT_TAKEN` is added after CPython labels exception handlers. The new instruction keeps
     // whatever exception target remains in its reused CFG slot, if there is one.
     pub(super) exception_policy: ExceptionPolicy,
@@ -544,6 +589,7 @@ impl Instruction {
             converted_pop_block: false,
             hidden_exception_owner_slots: 0,
             jump_policy: JumpPolicy::default(),
+            backward_jump_provenance: BackwardJumpProvenance::default(),
             exception_policy: ExceptionPolicy::default(),
             borrow_fallthrough: BorrowFallthrough::default(),
         }
@@ -598,6 +644,10 @@ impl Instruction {
                 .saturating_add(second.hidden_exception_owner_slots)
                 .min(3),
             jump_policy: JumpPolicy::fused(first.jump_policy, second.jump_policy),
+            backward_jump_provenance: BackwardJumpProvenance::fused(
+                first.backward_jump_provenance,
+                second.backward_jump_provenance,
+            ),
             exception_policy: first.exception_policy.merged(second.exception_policy),
             borrow_fallthrough: second.borrow_fallthrough,
         }

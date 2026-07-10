@@ -764,7 +764,12 @@ impl OptimizationPipeline {
             if target_position < index {
                 instruction.retarget(Operand::Backward(target));
                 if instruction.opcode == JUMP_FORWARD {
-                    instruction.opcode = JUMP_BACKWARD_NO_INTERRUPT;
+                    instruction.opcode = if instruction.backward_jump_provenance.is_authored_break()
+                    {
+                        JUMP_BACKWARD
+                    } else {
+                        JUMP_BACKWARD_NO_INTERRUPT
+                    };
                 }
             } else {
                 instruction.retarget(Operand::Forward(target));
@@ -1109,12 +1114,17 @@ impl OptimizationPipeline {
                     )),
                 );
             }
-            if (target_has_no_location || target_has_artificial_eval_break)
-                && !(inline_no_location_block && predecessors[&source] > 1)
+            if let Some(Item::Instruction(instruction)) = copied
+                .iter_mut()
+                .find(|item| matches!(item, Item::Instruction(_)))
             {
-                if let Some(Item::Instruction(instruction)) = copied
-                    .iter_mut()
-                    .find(|item| matches!(item, Item::Instruction(_)))
+                let inherits_shared_predecessor = instruction
+                    .no_location_policy
+                    .copy_inherits_shared_predecessor();
+                if (target_has_no_location || target_has_artificial_eval_break)
+                    && (!inline_no_location_block
+                        || predecessors[&source] <= 1
+                        || inherits_shared_predecessor)
                     && !instruction.no_location_policy.preserve
                 {
                     instruction.location = source_location;

@@ -27,12 +27,14 @@ fn instruction_constructors_set_audited_defaults() {
     assert!(!regular.converted_pop_block);
     assert_eq!(regular.hidden_exception_owner_slots, 0);
     assert_eq!(regular.jump_policy, JumpPolicy::default());
+    assert!(!regular.backward_jump_provenance.is_authored_break());
 
     let synthetic = Instruction::synthetic(NOP, Operand::Value(0), SourceLocation::NONE, None);
     assert!(!synthetic.jump_policy.inline_small_exit());
     let mut expected_synthetic_policy = JumpPolicy::default();
     expected_synthetic_policy.prevent_small_exit_inlining();
     assert_eq!(synthetic.jump_policy, expected_synthetic_policy);
+    assert!(!synthetic.backward_jump_provenance.is_authored_break());
     assert_eq!(synthetic.exception_policy, ExceptionPolicy::default());
     assert_eq!(regular.borrow_fallthrough, BorrowFallthrough::Reachable);
     assert_eq!(synthetic.borrow_fallthrough, BorrowFallthrough::Reachable);
@@ -478,6 +480,9 @@ fn fusion_preserves_each_typed_instruction_policy() {
     first.no_location_policy.allow_block_inlining();
     first.no_location_policy.make_first_copy_interruptible();
     first.no_location_policy.mark_artificial_eval_break();
+    first
+        .no_location_policy
+        .make_copy_inherit_shared_predecessor();
     first.no_location_policy.percent_target_location = 7;
     first.converted_pop_block = true;
     first.hidden_exception_owner_slots = 2;
@@ -487,6 +492,7 @@ fn fusion_preserves_each_typed_instruction_policy() {
     first.jump_policy.retain_nop();
     first.jump_policy.mark_borrow_empty_block();
     first.jump_policy.preserve_explicit_nop();
+    first.backward_jump_provenance.mark_authored_break();
     first
         .exception_policy
         .exclude(ExceptionExclusion::IfExtended);
@@ -521,11 +527,13 @@ fn fusion_preserves_each_typed_instruction_policy() {
             .first_copy_is_interruptible_backward()
     );
     assert!(fused.no_location_policy.is_artificial_eval_break());
+    assert!(fused.no_location_policy.copy_inherits_shared_predecessor());
     assert!(fused.no_location_policy.preserve);
     assert_eq!(fused.no_location_policy.percent_target_location, 7);
     assert_eq!(fused.fusion_policy, FusionPolicy::default());
     assert!(fused.converted_pop_block);
     assert!(fused.jump_policy.preserves_explicit_nop());
+    assert!(fused.backward_jump_provenance.is_authored_break());
     assert_eq!(fused.hidden_exception_owner_slots, 3);
     assert_eq!(fused.location, first.location);
     assert_eq!(fused.depth_after, second.depth_after);
