@@ -2722,6 +2722,80 @@ def nested_handler_return_before_following(first, second):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_bare_handler_nested_try_normal_exits() {
+        let source = r"def fallback_import():
+    try:
+        import primary
+        state = 2
+    except ImportError:
+        try:
+            import fallback
+            state = 1
+        except ImportError as error:
+            report(error)
+            state = 0
+    consume(state)
+
+
+def nested_try_with_following_handler_statement():
+    try:
+        value = first()
+    except LookupError:
+        try:
+            value = second()
+        except LookupError:
+            value = fallback()
+        consume(value)
+    return value
+
+
+def terminating_nested_handler(key):
+    try:
+        value = first[key]
+    except KeyError:
+        try:
+            value = second[key]
+        except KeyError:
+            raise NameError(key) from None
+    return value
+";
+        assert_matches_cpython_marshal(source, "bare_handler_nested_try_exits.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_terminal_nested_try_exception_owners() {
+        let source = r"def terminal_nested_try(flag, items):
+    try:
+        if flag:
+            try:
+                for item in items:
+                    consume(item)
+            except Exception as error:
+                report(error)
+                report_done()
+    except OuterError:
+        recover()
+    finish()
+
+
+def nonterminal_nested_try(flag, items):
+    try:
+        if flag:
+            try:
+                for item in items:
+                    consume(item)
+            except Exception as error:
+                report(error)
+                report_done()
+        finish_inside()
+    except OuterError:
+        recover()
+    finish()
+";
+        assert_matches_cpython_marshal(source, "terminal_nested_try_owners.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_bare_handler_cleanup_controls() {
         let source = r"def implicit_fallthrough(flag):
     try:

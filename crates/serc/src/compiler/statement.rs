@@ -275,6 +275,9 @@ pub(super) struct ControlFlowState {
     // Direct statements in the innermost normal try body. Nested branch suites must not inherit
     // CPython's temporary block ownership for a sibling statement in that body.
     direct_try_body_statements: Vec<TextRange>,
+    // A nested try under a normal body with an else suite exits there instead of directly
+    // crossing the enclosing handler boundary.
+    direct_try_body_has_else: bool,
     pub(super) generator_region_start: Option<Label>,
     pub(super) generator_region_exclusions: Vec<(Label, Label)>,
     pub(super) emitted_fallthrough_return: bool,
@@ -410,22 +413,29 @@ impl Compiler {
         .then_some(final_sync_with_try_body)
         .flatten();
         let direct_try_body_statements = statement.body.iter().map(Ranged::range).collect();
+        let direct_try_body_has_else = !statement.orelse.is_empty();
         self.with_control_override(
             |control| &mut control.same_line_try_body,
             same_line,
             |compiler| {
                 compiler.with_control_override(
-                    |control| &mut control.direct_try_body_statements,
-                    direct_try_body_statements,
+                    |control| &mut control.direct_try_body_has_else,
+                    direct_try_body_has_else,
                     |compiler| {
                         compiler.with_control_override(
-                            |control| &mut control.direct_final_sync_with_combined_try_body,
-                            direct_final_sync_with_combined_try_body,
+                            |control| &mut control.direct_try_body_statements,
+                            direct_try_body_statements,
                             |compiler| {
                                 compiler.with_control_override(
-                                    |control| &mut control.direct_final_sync_with_try_body,
-                                    direct_final_sync_with_try_body,
-                                    compile,
+                                    |control| &mut control.direct_final_sync_with_combined_try_body,
+                                    direct_final_sync_with_combined_try_body,
+                                    |compiler| {
+                                        compiler.with_control_override(
+                                            |control| &mut control.direct_final_sync_with_try_body,
+                                            direct_final_sync_with_try_body,
+                                            compile,
+                                        )
+                                    },
                                 )
                             },
                         )
@@ -4477,6 +4487,20 @@ impl Compiler {
         }
 
         let base_depth = self.control.depth;
+        let nested_in_final_outer_try_statement =
+            !self.control.active_exception_region_exclusions.is_empty()
+                && self
+                    .control
+                    .direct_try_body_statements
+                    .last()
+                    .is_some_and(|outer| {
+                        outer.start() <= statement.range.start()
+                            && statement.range.end() <= outer.end()
+                    })
+                && !self.control.direct_try_body_has_else
+                && self.control.active_finally_try_bodies == 0
+                && !self.control.in_iterator_loop()
+                && try_has_named_pair_exception_handler(statement);
         let try_start = self.assembler.label();
         let try_end = self.assembler.label();
         let handler_start = self.assembler.label();
@@ -4875,10 +4899,13 @@ impl Compiler {
                 };
             // A pass-only nested try leaves an ownerless exit NOP unless the enclosing region
             // is the synthetic protected body of try/finally.
-            let exception_policy = if body_noop_location.is_some()
-                && statement.orelse.is_empty()
-                && !self.control.active_exception_region_exclusions.is_empty()
-                && self.control.active_finally_try_bodies == 0
+            let exclude_nested_normal_exit = nested_in_final_outer_try_statement
+                && self.control.active_pass_finally_locations.is_empty();
+            let exception_policy = if exclude_nested_normal_exit
+                || (body_noop_location.is_some()
+                    && statement.orelse.is_empty()
+                    && !self.control.active_exception_region_exclusions.is_empty()
+                    && self.control.active_finally_try_bodies == 0)
             {
                 ExceptionPolicy::EXCLUDE_ALWAYS
             } else {
@@ -5273,6 +5300,27 @@ impl Compiler {
                 handler.body.last().is_some_and(|tail| match tail {
                     Stmt::Try(nested) => {
                         handler.name.is_some()
+                            // Fallback imports feed the outer handler cleanup from the successful
+                            // import and from the nested handler. CPython leaves that cleanup
+                            // unlocated so its exit-copy pass can inline one copy onto each edge.
+                            || (handler.body.len() == 1
+                                && suite_is_import_assignment(&statement.body)
+                                && nested.orelse.is_empty()
+                                && nested.finalbody.is_empty()
+                                && suite_is_import_assignment(&nested.body)
+                                && !suite_terminates(&nested.body)
+                                && nested.handlers.iter().any(|nested_handler| {
+                                    nested_handler
+                                        .as_except_handler()
+                                        .is_some_and(|nested_handler| {
+                                            nested_handler.name.is_some()
+                                                && !suite_terminates(&nested_handler.body)
+                                                && matches!(
+                                                    nested_handler.body.last(),
+                                                    Some(Stmt::Assign(_))
+                                                )
+                                        })
+                                }))
                             || (statement.body.len() == 1
                                 && !suite_terminates(&statement.body)
                                 && nested.finalbody.is_empty()
@@ -5426,7 +5474,13 @@ impl Compiler {
 
                     // A pass-only finally keeps these extended handler exits in its protected
                     // region; executable finally bodies use CPython's stale-owner exclusion.
-                    let exception_policy = if !handler_body_has_instructions
+                    let exception_policy = if handler_body_has_instructions
+                        && nested_in_final_outer_try_statement
+                        && self.control.active_pass_finally_locations.is_empty()
+                        && !protected_loop_value_return
+                    {
+                        ExceptionPolicy::EXCLUDE_ALWAYS
+                    } else if !handler_body_has_instructions
                         && !self.control.active_exception_region_exclusions.is_empty()
                         && self.control.active_pass_finally_locations.is_empty()
                         && !protected_loop_value_return
@@ -8057,6 +8111,29 @@ fn suite_ends_in_simple_conditional_break(body: &[Stmt]) -> bool {
         Some(Stmt::If(statement))
             if statement.elif_else_clauses.is_empty()
                 && matches!(statement.body.as_slice(), [Stmt::Break(_)])
+    )
+}
+
+fn suite_is_import_assignment(body: &[Stmt]) -> bool {
+    matches!(
+        body,
+        [first, Stmt::Assign(_)]
+            if matches!(first, Stmt::Import(_) | Stmt::ImportFrom(_))
+    )
+}
+
+fn try_has_named_pair_exception_handler(statement: &ruff_python_ast::StmtTry) -> bool {
+    matches!(
+        statement.handlers.as_slice(),
+        [handler]
+            if handler.as_except_handler().is_some_and(|handler| {
+                handler.name.is_some()
+                    && matches!(
+                        handler.type_.as_deref(),
+                        Some(Expr::Name(name)) if name.id.as_str() == "Exception"
+                    )
+                    && matches!(handler.body.as_slice(), [Stmt::Expr(_), Stmt::Expr(_)])
+            })
     )
 }
 
