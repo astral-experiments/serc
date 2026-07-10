@@ -2476,6 +2476,44 @@ async def bare_fallback_control():
     }
 
     #[test]
+    fn matches_cpython_marshal_for_nested_try_return_swap_owners() {
+        let source = r"def target(var):
+    try:
+        return var['kindselector']['*']
+    except KeyError:
+        try:
+            return var['kindselector']['kind']
+        except KeyError:
+            pass
+
+def direct(var):
+    try:
+        return var['kindselector']['*']
+    except KeyError:
+        return var['kindselector']['kind']
+
+def named(var):
+    try:
+        return var['kindselector']['*']
+    except KeyError as error:
+        try:
+            return var['kindselector']['kind']
+        except KeyError:
+            pass
+
+def literal(var):
+    try:
+        action()
+    except KeyError:
+        try:
+            return False
+        except TypeError:
+            pass
+";
+        assert_matches_cpython_marshal(source, "nested_try_return_swap_owners.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_named_exception_cleanup() {
         let source = r"class Container:
     def nested_handler(self):
@@ -3948,6 +3986,91 @@ def no_else_control():
     return initial
 ";
         assert_matches_cpython_marshal(source, "try_else_local_order.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_compound_none_comparison_try_owners() {
+        let source = r"def direct_control(value):
+    try:
+        if value is not None:
+            return 1
+    except Exception:
+        pass
+    return 0
+
+
+def compound(first, second, third, fourth, fifth):
+    try:
+        if ((first is not None and second is not None)
+                or (third is not None and fourth is not None)
+                or fifth is not None):
+            return 1
+    except Exception:
+        pass
+    return 0
+
+
+def leading_comparisons(a, b, first, second):
+    try:
+        if a >= 0 and b >= 0 and (first is not None or second is not None):
+            return 1
+    except Exception:
+        pass
+    return 0
+";
+        assert_matches_cpython_marshal(source, "compound_none_comparison_try_owners.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_retained_try_else_borrow_fallthrough() {
+        let source = r"def terminal_else_if(value, flag):
+    try:
+        action()
+    except Exception:
+        pass
+    else:
+        if flag:
+            return flag
+    consume(value)
+
+
+def fallthrough_else_if_control(value, flag):
+    try:
+        action()
+    except Exception:
+        pass
+    else:
+        if flag:
+            consume(flag)
+    consume(value)
+
+
+def terminal_and_fallthrough_arms(value, flag):
+    try:
+        action()
+    except Exception:
+        pass
+    else:
+        if flag:
+            return flag
+        else:
+            other()
+    consume(value)
+
+
+def two_terminal_arms_control(value, flag):
+    try:
+        action()
+    except Exception:
+        pass
+    else:
+        if flag:
+            return flag
+        else:
+            raise RuntimeError
+    consume(value)
+";
+        assert_matches_cpython_marshal(source, "retained_try_else_borrow_fallthrough.py");
     }
 
     #[test]

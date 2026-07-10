@@ -417,8 +417,9 @@ impl OptimizationPipeline {
             };
             let borrow_traversal_stops = last.borrow_fallthrough == BorrowFallthrough::Barrier
                 || last.jump_policy.borrow_empty_block();
-            let folded_jump_has_no_fallthrough =
-                last.opcode == NOP && last.jump_policy.always_retains_nop();
+            let folded_jump_has_no_fallthrough = last.opcode == NOP
+                && last.jump_policy.always_retains_nop()
+                && last.borrow_fallthrough != BorrowFallthrough::RetainedNopReachable;
             if !borrow_traversal_stops
                 && !folded_jump_has_no_fallthrough
                 && block_has_fallthrough(&[Item::Instruction(*last)])
