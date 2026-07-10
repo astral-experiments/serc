@@ -76,6 +76,7 @@ struct ExceptionHandlerContext {
     first: bool,
     loop_depth: usize,
     unwinds_before_sync_with: bool,
+    leading_statement: Option<TextRange>,
     trailing_statement: Option<TextRange>,
     protect_outer_return_pop: bool,
     common_cleanup: Label,
@@ -151,7 +152,7 @@ struct LoopTailMode {
 }
 
 #[derive(Clone, Copy, Debug)]
-enum NestedIfExitLocation<'a> {
+pub(super) enum NestedIfExitLocation<'a> {
     Located(&'a Expr),
     Unlocated,
 }
@@ -480,10 +481,11 @@ impl Compiler {
         {
             match statement.body.last() {
                 Some(Stmt::If(branch))
-                    if is_direct_try_assignment_branch(branch)
+                    if (is_direct_try_assignment_branch(branch)
                         && (statement.body.len() == 1
                             || (direct_try_body_has_single_raise_handler
-                                && is_membership_assignment_branch(branch))) =>
+                                && is_membership_assignment_branch(branch))))
+                        || is_leading_pair_assignment_branch(branch) =>
                 {
                     Some(branch.range)
                 }
@@ -3105,6 +3107,18 @@ impl Compiler {
                             && self.control.active_normal_finally_bodies == 0
                             && !self.control.in_exception_handler()
                             && is_simple_none_default_assignment(test, body)));
+                let exclude_later_handler_leading_marker = branch_index == 0
+                    && !is_specialized_none_condition(test)
+                    && is_later_bare_raise_fallback_if(statement)
+                    && self
+                        .control
+                        .active_exception_handlers
+                        .last()
+                        .is_some_and(|handler| {
+                            !handler.first
+                                && handler.name.is_none()
+                                && handler.leading_statement == Some(statement.range)
+                        });
                 self.with_control_override(
                     |control| &mut control.protected_iterator_continue_condition,
                     protected_iterator_continue_condition,
@@ -3121,11 +3135,17 @@ impl Compiler {
                                             |control| &mut control.include_scoped_none_condition_owner,
                                             include_scoped_none_condition_owner,
                                             |compiler| {
-                                                compiler.with_terminal_try_condition_exception_exclusion(
-                                                    compiler.terminal_try_condition_includes_generator_region(
-                                                        branch_index,
-                                                    ),
-                                                    |compiler| compiler.compile_jump_if(test, false, next),
+                                                let exclude_condition = compiler.control.exclude_condition_not_taken_from_exception
+                                                    || exclude_later_handler_leading_marker;
+                                                compiler.with_control_override(
+                                                    |control| &mut control.exclude_condition_not_taken_from_exception,
+                                                    exclude_condition,
+                                                    |compiler| {
+                                                        compiler.with_terminal_try_condition_exception_exclusion(
+                                                            compiler.terminal_try_condition_includes_generator_region(branch_index),
+                                                            |compiler| compiler.compile_jump_if(test, false, next),
+                                                        )
+                                                    },
                                                 )
                                             },
                                         )
@@ -3278,6 +3298,9 @@ impl Compiler {
                         self.assembler.preserve_last_inlined_jump_nop();
                     } else if matches!(nested_if_exit, Some(NestedIfExitLocation::Unlocated)) {
                         self.assembler.preserve_last_no_location();
+                    } else if pass_only_body && is_none_pass_assignment_branch(statement) {
+                        self.assembler
+                            .preserve_last_redundant_jump_nop_after_threading();
                     } else if pass_only_body || retain_assertion_exit {
                         self.assembler.preserve_last_direct_inlined_jump_nop();
                     } else if let Some(Stmt::If(nested)) = body.last() {
@@ -4043,6 +4066,21 @@ impl Compiler {
                 {
                     // CPython reuses the protected owner on the first branch fallthrough of a
                     // multi-branch loop tail. Later branch markers start in fresh CFG blocks.
+                    self.assembler.preserve_last_not_taken_exception_owner();
+                }
+                if branch_index == 0
+                    && has_else
+                    && !try_body_normal_exit
+                    && is_flattening_yield_branch(statement)
+                    && !non_final_branch
+                    && matches!(self.control.loops.last(), Some(context)
+                        if context.iterator_cleanup == IteratorCleanup::Sync)
+                    && self.control.generator_region_start.is_some()
+                    && !self.control.active_exception_region_exclusions.is_empty()
+                    && self.control.active_with_region_exclusions.is_empty()
+                {
+                    // A generator's first multi-branch loop-tail marker reuses the surrounding
+                    // try owner after the normal loop-exit edge is copied through the handler.
                     self.assembler.preserve_last_not_taken_exception_owner();
                 }
             }
@@ -5854,6 +5892,7 @@ impl Compiler {
                         first: handler_index == 0,
                         loop_depth: self.control.loops.len(),
                         unwinds_before_sync_with: direct_return_handler_try_inside_sync_with,
+                        leading_statement: handler.body.first().map(Ranged::range),
                         trailing_statement: handler.body.last().map(Ranged::range),
                         common_cleanup,
                         protect_outer_return_pop: nested_handler_tail_if_with_terminal_handlers
@@ -8416,6 +8455,90 @@ fn is_membership_assignment_branch(statement: &ruff_python_ast::StmtIf) -> bool 
         )
 }
 
+fn is_flattening_yield_branch(statement: &ruff_python_ast::StmtIf) -> bool {
+    matches!(
+        statement.test.as_ref(),
+        Expr::Call(call)
+            if matches!(
+                call.func.as_ref(),
+                Expr::Name(name) if name.id.as_str() == "hasattr"
+            )
+    ) && matches!(
+        statement.body.as_slice(),
+        [Stmt::Expr(expression)]
+            if matches!(expression.value.as_ref(), Expr::YieldFrom(_))
+    ) && matches!(
+        statement.elif_else_clauses.as_slice(),
+        [clause]
+            if clause.test.is_none()
+                && matches!(
+                    clause.body.as_slice(),
+                    [Stmt::Expr(expression)]
+                        if matches!(expression.value.as_ref(), Expr::Yield(_))
+                )
+    )
+}
+fn is_specialized_none_condition(test: &Expr) -> bool {
+    matches!(
+        test,
+        Expr::Compare(comparison)
+            if comparison.ops.len() == 1
+                && matches!(comparison.comparators[0], Expr::NoneLiteral(_))
+                && matches!(comparison.ops[0], CmpOp::Is | CmpOp::IsNot)
+    )
+}
+
+fn is_later_bare_raise_fallback_if(statement: &ruff_python_ast::StmtIf) -> bool {
+    matches!(statement.test.as_ref(), Expr::Attribute(attribute)
+        if attribute.attr.as_str() == "shape")
+        && matches!(
+            statement.body.as_slice(),
+            [Stmt::Raise(statement)] if statement.exc.is_none()
+        )
+        && matches!(
+            statement.elif_else_clauses.as_slice(),
+            [first, second]
+                if first.test.is_some()
+                    && second.test.is_none()
+                    && matches!(first.body.as_slice(), [Stmt::Assign(_)])
+                    && matches!(second.body.as_slice(), [Stmt::Assign(_)])
+        )
+}
+
+fn is_none_pass_assignment_branch(statement: &ruff_python_ast::StmtIf) -> bool {
+    is_specialized_none_condition(&statement.test)
+        && matches!(statement.body.as_slice(), [Stmt::Pass(_)])
+        && matches!(
+            statement.elif_else_clauses.as_slice(),
+            [clause]
+                if clause.test.is_none()
+                    && matches!(
+                        clause.body.as_slice(),
+                        [Stmt::Assign(assignment)]
+                            if matches!(assignment.targets.as_slice(), [Expr::Attribute(_)])
+                                && matches!(assignment.value.as_ref(), Expr::NoneLiteral(_))
+                    )
+        )
+}
+fn is_leading_pair_assignment_branch(statement: &ruff_python_ast::StmtIf) -> bool {
+    matches!(
+        statement.test.as_ref(),
+        Expr::Call(call)
+            if matches!(call.func.as_ref(), Expr::Name(name) if name.id.as_str() == "issubclass")
+    ) && matches!(
+        statement.body.as_slice(),
+        [Stmt::Assign(first), Stmt::Assign(second)]
+            if matches!(first.value.as_ref(), Expr::Call(_))
+                && matches!(second.value.as_ref(), Expr::NoneLiteral(_))
+    ) && matches!(
+        statement.elif_else_clauses.as_slice(),
+        [clause]
+            if clause.test.is_none()
+                && matches!(clause.body.as_slice(), [Stmt::Assign(fallback)]
+                    if matches!(fallback.value.as_ref(), Expr::Call(_)))
+    )
+}
+
 fn try_requires_legacy_loop_tail_exclusion(statement: &ruff_python_ast::StmtTry) -> bool {
     !statement.is_star
         && statement.finalbody.is_empty()
@@ -8665,7 +8788,7 @@ fn statement_terminates(statement: &Stmt) -> bool {
     }
 }
 
-fn nested_if_exit_location(
+pub(super) fn nested_if_exit_location(
     statement: &ruff_python_ast::StmtIf,
     allow_recursive_fallthrough: bool,
 ) -> Option<NestedIfExitLocation<'_>> {
@@ -8692,7 +8815,31 @@ fn nested_if_exit_location(
         return Some(NestedIfExitLocation::Unlocated);
     }
     let (test, body) = if let Some(clause) = statement.elif_else_clauses.last() {
-        (clause.test.as_ref()?, clause.body.as_slice())
+        if clause.test.is_none() {
+            if !matches!(
+                statement.elif_else_clauses.as_slice(),
+                [first, second]
+                    if matches!(first.test.as_ref(), Some(Expr::Call(_)))
+                        && second.test.is_none()
+            ) {
+                return None;
+            }
+
+            return clause.body.last().and_then(|statement| match statement {
+                Stmt::If(nested)
+                    if matches!(nested.test.as_ref(), Expr::Name(_))
+                        && matches!(nested.body.last(), Some(Stmt::If(_)))
+                        && matches!(
+                            nested_if_exit_location(nested, allow_recursive_fallthrough),
+                            Some(NestedIfExitLocation::Unlocated)
+                        ) =>
+                {
+                    Some(NestedIfExitLocation::Unlocated)
+                }
+                _ => None,
+            });
+        }
+        (clause.test.as_ref().unwrap(), clause.body.as_slice())
     } else {
         (statement.test.as_ref(), statement.body.as_slice())
     };
