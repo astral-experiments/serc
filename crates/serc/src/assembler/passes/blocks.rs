@@ -154,12 +154,16 @@ fn no_exit_copy_analysis(
         let source_retains_direct_exit_nop = graph[source]
             .last_instruction()
             .is_some_and(|instruction| instruction.jump_policy.retains_direct_target_nop());
+        let source_copies_split_return = graph[source]
+            .last_instruction()
+            .is_some_and(|instruction| instruction.no_location_policy.copies_split_return_exit());
         let target_is_small_exit = target_pre_fusion_size <= 4
             && target_terminal_opcode.is_some_and(|opcode| {
                 ends_scope(opcode)
                     && (target_chain_end == target_position
                         || opcode == RAISE_VARARGS
-                        || (opcode == RETURN_VALUE && source_retains_direct_exit_nop))
+                        || (opcode == RETURN_VALUE
+                            && (source_retains_direct_exit_nop || source_copies_split_return)))
             });
         let source_has_fallthrough = block_has_fallthrough(graph[source].items());
         let inline_small_exit = !source_has_fallthrough
@@ -952,6 +956,10 @@ impl OptimizationPipeline {
             let source_retains_direct_exit_nop = graph[source]
                 .last_instruction()
                 .is_some_and(|instruction| instruction.jump_policy.retains_direct_target_nop());
+            let source_copies_split_return =
+                graph[source].last_instruction().is_some_and(|instruction| {
+                    instruction.no_location_policy.copies_split_return_exit()
+                });
             let target_is_small_exit = target_pre_fusion_size <= 4
                 && target_terminal_opcode.is_some_and(|opcode| {
                     ends_scope(opcode)
@@ -961,7 +969,8 @@ impl OptimizationPipeline {
                         // concrete return is copied onto the source edge.
                         && (target_chain_end == target_position
                             || opcode == RAISE_VARARGS
-                            || (opcode == RETURN_VALUE && source_retains_direct_exit_nop))
+                            || (opcode == RETURN_VALUE
+                                && (source_retains_direct_exit_nop || source_copies_split_return)))
                 });
             let source_allows_small_exit_inlining = graph[source]
                 .last_instruction()
@@ -1140,7 +1149,20 @@ impl OptimizationPipeline {
                             .then_some(index)
                     })
                     .collect::<Vec<_>>();
-                if !excluded_regions.is_empty() {
+                let split_return_exclusions = self
+                    .exception_regions
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, region)| {
+                        (source_copies_split_return
+                            && region_memberships[index].contains(&source)
+                            && region_memberships[index].contains(&target))
+                        .then(|| copied_labels.get(&region.end).copied())
+                        .flatten()
+                        .map(|start| (index, start))
+                    })
+                    .collect::<Vec<_>>();
+                if !excluded_regions.is_empty() || !split_return_exclusions.is_empty() {
                     let mut exclusion_start = copied_label;
                     let trailing_nop_position = graph[source]
                         .items()
@@ -1164,6 +1186,9 @@ impl OptimizationPipeline {
                     copied.push(Item::Label(copied_end));
                     for index in excluded_regions {
                         copied_region_exclusions[index].push((exclusion_start, copied_end));
+                    }
+                    for (index, start) in split_return_exclusions {
+                        copied_region_exclusions[index].push((start, copied_end));
                     }
                 }
             }

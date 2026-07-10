@@ -290,6 +290,11 @@ pub(super) struct ControlFlowState {
     // Whether that successor exits the function by returning or raising. CPython copies these
     // exit blocks before removing assertion-branch jumps, including jumps from later clauses.
     current_statement_followed_by_return_or_raise: bool,
+    // A direct nested try whose normal edge copies a following return across the enclosing
+    // protected branch.
+    copied_split_return_try: Option<TextRange>,
+    // A final try-else `if` whose retained normal-exit marker moves to its first nested join.
+    relocated_try_else_exit: Option<TextRange>,
     // The direct final synchronous `with` in an active non-final try body, if any.
     direct_final_sync_with_try_body: Option<ruff_text_size::TextRange>,
     // The direct final synchronous `with` with a normal body fallthrough in a handler-form try
@@ -3169,15 +3174,40 @@ impl Compiler {
                 }
                 self.mark_definitely_evaluated_locals(test);
                 let body_start = self.assembler.instruction_count();
+                let copied_split_return_try =
+                    (self.control.current_statement_followed_by_return_or_raise
+                        && !self.control.in_exception_handler()
+                        && !self.control.active_exception_region_exclusions.is_empty()
+                        && self
+                            .control
+                            .direct_try_body_statements
+                            .contains(&statement.range))
+                    .then(|| match body.last() {
+                        Some(Stmt::Try(nested))
+                            if nested.orelse.is_empty()
+                                && nested.finalbody.is_empty()
+                                && !nested.handlers.is_empty() =>
+                        {
+                            Some(nested.range)
+                        }
+                        _ => None,
+                    })
+                    .flatten();
                 self.compile_with_strict_owned_loads(matches!(test, Expr::If(_)), |compiler| {
                     compiler.with_control_override(
                         |control| &mut control.sync_with_direct_return_chain,
                         preserve_sync_with_direct_return_chain_owner,
                         |compiler| {
                             compiler.with_control_override(
-                                |control| &mut control.direct_try_if_exit,
-                                direct_try_if_exit,
-                                |compiler| compiler.compile_suite(body),
+                                |control| &mut control.copied_split_return_try,
+                                copied_split_return_try,
+                                |compiler| {
+                                    compiler.with_control_override(
+                                        |control| &mut control.direct_try_if_exit,
+                                        direct_try_if_exit,
+                                        |compiler| compiler.compile_suite(body),
+                                    )
+                                },
                             )
                         },
                     )
@@ -3254,18 +3284,21 @@ impl Compiler {
                         // CPython emits this jump in the nested if's empty join block. When
                         // small-exit inlining replaces it with a NOP, no preceding instruction
                         // in that block can make the NOP redundant.
-                        if branch_index == 0
-                            && body.len() == 1
-                            && statement.elif_else_clauses.len() >= 2
-                            && statement
-                                .elif_else_clauses
-                                .last()
-                                .is_some_and(|clause| clause.test.is_none())
-                            && nested.elif_else_clauses.len() >= 2
-                            && nested
-                                .elif_else_clauses
-                                .last()
-                                .is_some_and(|clause| clause.test.is_none())
+                        let relocate_try_else_exit = branch_index == 0
+                            && self.control.relocated_try_else_exit == Some(statement.range);
+                        if relocate_try_else_exit
+                            || (branch_index == 0
+                                && body.len() == 1
+                                && statement.elif_else_clauses.len() >= 2
+                                && statement
+                                    .elif_else_clauses
+                                    .last()
+                                    .is_some_and(|clause| clause.test.is_none())
+                                && nested.elif_else_clauses.len() >= 2
+                                && nested
+                                    .elif_else_clauses
+                                    .last()
+                                    .is_some_and(|clause| clause.test.is_none()))
                         {
                             self.assembler
                                 .preserve_last_redundant_jump_nop_after_threading();
@@ -4997,6 +5030,16 @@ impl Compiler {
         } else {
             statement.orelse.as_slice()
         };
+        let relocated_try_else_exit = self
+            .control
+            .current_statement_followed_by_name_return
+            .then(|| match statement.orelse.last() {
+                Some(Stmt::If(tail)) if try_else_exit_moves_to_first_nested_join(tail) => {
+                    Some(tail.range)
+                }
+                _ => None,
+            })
+            .flatten();
         let retained_try_body_if_exit = (suite_terminates(&statement.orelse)
             && matches!(
                 statement.body.last(),
@@ -5304,19 +5347,26 @@ impl Compiler {
             .pop()
             .expect("active try region has exclusion collector");
         let orelse_instruction_count = self.assembler.instruction_count();
-        if terminal
-            && statement
-                .orelse
-                .last()
-                .is_some_and(terminal_try_distributes_implicit_return)
-        {
-            let ((), emitted) = self.with_fallthrough_tracking(|compiler| {
-                compiler.compile_suite_inner(&statement.orelse, true)
-            })?;
-            normal_return_emitted = emitted;
-        } else {
-            self.compile_suite(&statement.orelse)?;
-        }
+        self.with_control_override(
+            |control| &mut control.relocated_try_else_exit,
+            relocated_try_else_exit,
+            |compiler| {
+                if terminal
+                    && statement
+                        .orelse
+                        .last()
+                        .is_some_and(terminal_try_distributes_implicit_return)
+                {
+                    let ((), emitted) = compiler.with_fallthrough_tracking(|compiler| {
+                        compiler.compile_suite_inner(&statement.orelse, true)
+                    })?;
+                    normal_return_emitted = emitted;
+                    Ok(())
+                } else {
+                    compiler.compile_suite(&statement.orelse)
+                }
+            },
+        )?;
         let orelse_noop_location = (self.assembler.instruction_count() == orelse_instruction_count)
             .then(|| {
                 statement
@@ -5447,6 +5497,9 @@ impl Compiler {
                 ExceptionPolicy::default()
             };
             self.emit_jump_forward_with_exception_policy(JUMP_FORWARD, end, 0, exception_policy)?;
+            if self.control.copied_split_return_try == Some(statement.range) {
+                self.assembler.allow_last_split_return_copy();
+            }
             if let Some(start) = trailing_handler_exit_exclusion_start {
                 let exclusion_end = self.assembler.label();
                 self.assembler.mark(exclusion_end);
@@ -5482,6 +5535,7 @@ impl Compiler {
             }
             if !statement.orelse.is_empty()
                 && suite_ends_in_retained_try_exit_join(&statement.orelse)
+                && relocated_try_else_exit.is_none()
             {
                 self.assembler
                     .preserve_last_redundant_jump_nop_after_threading();
@@ -8195,6 +8249,23 @@ fn suite_ends_in_retained_try_exit_join(body: &[Stmt]) -> bool {
         return suite_ends_in_retained_try_exit_join(selected);
     }
     !statement.elif_else_clauses.is_empty() || terminating_if_fallthrough_test(statement).is_some()
+}
+// A direct following name return is copied through every normal edge of this try-else chain.
+// CPython retains the first nested join's source jump instead of the try's final normal exit.
+fn try_else_exit_moves_to_first_nested_join(statement: &ruff_python_ast::StmtIf) -> bool {
+    early_condition_truthiness(&statement.test).is_none()
+        && statement
+            .elif_else_clauses
+            .last()
+            .is_some_and(|clause| clause.test.is_some())
+        && matches!(
+            statement.body.last(),
+            Some(Stmt::If(nested))
+                if !suite_terminates(&nested.body)
+                    && nested.elif_else_clauses.last().is_some_and(|clause| {
+                        clause.test.is_none() && !suite_terminates(&clause.body)
+                    })
+        )
 }
 
 // A retained try-else exit NOP can still represent a live normal edge. CPython's borrowed-load

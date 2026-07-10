@@ -6274,6 +6274,38 @@ def final_elif(action, first, second):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_nested_try_return_and_try_else_join_copies() {
+        let source = r"def protected_branch_return(flag):
+    try:
+        if flag:
+            try:
+                action()
+            except Error:
+                raise ValueError
+        return value
+    except ValueError:
+        return fallback
+
+
+def try_else_nested_join(value, names, other):
+    try:
+        action()
+    except TypeError:
+        recover()
+    else:
+        if names is not None:
+            if value.names is None:
+                first()
+            else:
+                second()
+        elif other:
+            third()
+    return value
+";
+        assert_matches_cpython_marshal(source, "nested_try_return_and_try_else_join.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_try_body_exits_after_if_joins() {
         let source = include_str!("fixtures/try_body_exit_joins.py");
         assert_matches_cpython_marshal(source, "try_body_exit_joins.py");

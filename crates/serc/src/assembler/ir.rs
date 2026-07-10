@@ -143,6 +143,7 @@ impl NoLocationBlockPolicy {
     const FIRST_COPY_INTERRUPTIBLE: u8 = 1 << 1;
     const ARTIFICIAL_EVAL_BREAK: u8 = 1 << 2;
     const COPY_INHERITS_SHARED_PREDECESSOR: u8 = 1 << 3;
+    const COPY_SPLIT_RETURN_EXIT: u8 = 1 << 4;
 
     const fn fused(first: Self, second: Self) -> Self {
         Self(first.0 | second.0)
@@ -154,6 +155,10 @@ impl NoLocationBlockPolicy {
 
     fn insert(&mut self, flag: u8) {
         self.0 |= flag;
+    }
+
+    fn remove(&mut self, flag: u8) {
+        self.0 &= !flag;
     }
 }
 
@@ -192,6 +197,12 @@ impl NoLocationPolicy {
             .contains(NoLocationBlockPolicy::COPY_INHERITS_SHARED_PREDECESSOR)
     }
 
+    /// Whether a direct normal-exit jump may copy a return split by an exception-region boundary
+    /// without retaining the source jump as a NOP.
+    pub(super) const fn copies_split_return_exit(self) -> bool {
+        self.block_policy
+            .contains(NoLocationBlockPolicy::COPY_SPLIT_RETURN_EXIT)
+    }
     pub(super) fn allow_block_inlining(&mut self) {
         self.block_policy
             .insert(NoLocationBlockPolicy::ALLOW_INLINING);
@@ -211,6 +222,16 @@ impl NoLocationPolicy {
     pub(super) fn make_copy_inherit_shared_predecessor(&mut self) {
         self.block_policy
             .insert(NoLocationBlockPolicy::COPY_INHERITS_SHARED_PREDECESSOR);
+    }
+
+    pub(super) fn allow_split_return_exit_copy(&mut self) {
+        self.block_policy
+            .insert(NoLocationBlockPolicy::COPY_SPLIT_RETURN_EXIT);
+    }
+
+    pub(super) fn clear_split_return_exit_copy(&mut self) {
+        self.block_policy
+            .remove(NoLocationBlockPolicy::COPY_SPLIT_RETURN_EXIT);
     }
 
     const fn fused(first: Self, second: Self) -> Self {
@@ -604,6 +625,7 @@ impl Instruction {
         ));
         if self.operand != operand {
             self.jump_policy.clear_direct_target_retention();
+            self.no_location_policy.clear_split_return_exit_copy();
             self.operand = operand;
         }
     }

@@ -586,6 +586,13 @@ impl Assembler {
             .prevent_small_exit_inlining();
     }
 
+    /// Allows a direct jump to copy a return split by an exception-region boundary.
+    pub(crate) fn allow_last_split_return_copy(&mut self) {
+        self.last_jump_instruction_mut("allowing a split return copy")
+            .no_location_policy
+            .allow_split_return_exit_copy();
+    }
+
     pub(crate) fn preserve_last_inlined_jump_nop(&mut self) {
         self.last_jump_instruction_mut("retaining an inlined jump NOP")
             .jump_policy
