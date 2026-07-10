@@ -1798,6 +1798,23 @@ def direct_assertion_control(items):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_protected_loop_tail_first_branch_owners() {
+        let source = r"def with_owner(manager, items, match, accept, reject):
+    with manager:
+        for item in items:
+            found = match(item)
+            if found:
+                if accept(found):
+                    accept(item)
+                else:
+                    reject(found)
+            else:
+                reject(item)
+";
+        assert_matches_cpython_marshal(source, "protected_loop_tail_first_branch_owners.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_async_comprehension_cleanup_exits() {
         let source = "async def discarded():\n    [item async for item in source]\n\nasync def returned():\n    return [item async for item in source]\n";
         assert_matches_cpython_marshal(source, "async_comprehension.py");

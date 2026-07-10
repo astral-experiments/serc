@@ -510,6 +510,15 @@ impl Assembler {
             .min(3);
     }
 
+    /// Keeps the normalized exception owner on a trailing condition fallthrough marker.
+    pub(crate) fn preserve_last_not_taken_exception_owner(&mut self) {
+        let instruction =
+            self.required_last_instruction_mut("preserving a NOT_TAKEN exception owner");
+        if instruction.opcode == NOT_TAKEN {
+            instruction.exception_policy.normalized_owner = NormalizedExceptionOwner::Present;
+        }
+    }
+
     /// Prevents fusion with the next instruction without introducing a CFG boundary.
     pub(crate) fn prevent_last_instruction_fusion(&mut self) {
         self.required_last_instruction_mut("preventing fusion with the next instruction")
