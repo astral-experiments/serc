@@ -879,6 +879,64 @@ def try_finally(values):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_nested_try_else_loop_backedges() {
+        let source = r"def nested_try_else_loop(first, second):
+    try:
+        while True:
+            try:
+                outer_value = take_outer()
+            except OuterError:
+                break
+            else:
+                while True:
+                    try:
+                        inner_value = take_inner()
+                    except InnerError:
+                        break
+                    else:
+                        consume(inner_value)
+                        if first:
+                            consume(outer_value)
+                            if second:
+                                consume(second)
+    except Exception:
+        recover()
+    finish()
+";
+        assert_matches_cpython_marshal(source, "nested_try_else_loop_backedges.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_nested_try_else_loop_backedge_controls() {
+        let source = r"def final_conditional_else(values):
+    for value in values:
+        try:
+            callback = lookup(value)
+        except KeyError:
+            pass
+        else:
+            prepare(callback)
+            if callback(value):
+                consume(value)
+            else:
+                reject(value)
+
+
+def constant_final_condition(values):
+    for value in values:
+        try:
+            callback = lookup(value)
+        except KeyError:
+            pass
+        else:
+            prepare(callback)
+            if True:
+                consume(value)
+";
+        assert_matches_cpython_marshal(source, "nested_try_else_loop_backedge_controls.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_terminal_try_suite_implicit_returns() {
         let source = r"def body_if(flag):
     try:
@@ -1819,6 +1877,57 @@ async def asynchronous(manager, first, second):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_protected_iterator_boolean_continue_owners() {
+        let source = r##"def nested_positive(manager, outer, inner, predicates):
+    with manager:
+        for left in outer:
+            left = normalize(left)
+            for right in inner:
+                right = normalize(right)
+                if predicates.ready(left) and predicates.ready(right):
+                    continue
+                consume(left, right)
+
+
+def first_positive(manager, lines):
+    with manager:
+        for line in lines:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            consume(line)
+
+
+def multiline_condition(manager, values):
+    with manager:
+        for value in values:
+            if (
+                ignored(value)
+                or hidden(value)
+            ):
+                continue
+            consume(value)
+
+
+def non_continue(manager, values):
+    with manager:
+        for value in values:
+            if first(value) and second(value):
+                consume(value)
+            finish(value)
+
+
+async def asynchronous(manager, values):
+    async with manager:
+        for value in values:
+            if first(value) and second(value):
+                continue
+            consume(value)
+"##;
+        assert_matches_cpython_marshal(source, "protected_iterator_boolean_continue.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_nonfinal_branching_with_body_control() {
         let source = r"def nonfinal(manager, first, second):
     with manager:
@@ -2610,6 +2719,80 @@ def nested_handler_return_before_following(first, second):
     return value
 ";
         assert_matches_cpython_marshal(source, "bare_handler_inlineable_cleanup.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_bare_handler_nested_try_normal_exits() {
+        let source = r"def fallback_import():
+    try:
+        import primary
+        state = 2
+    except ImportError:
+        try:
+            import fallback
+            state = 1
+        except ImportError as error:
+            report(error)
+            state = 0
+    consume(state)
+
+
+def nested_try_with_following_handler_statement():
+    try:
+        value = first()
+    except LookupError:
+        try:
+            value = second()
+        except LookupError:
+            value = fallback()
+        consume(value)
+    return value
+
+
+def terminating_nested_handler(key):
+    try:
+        value = first[key]
+    except KeyError:
+        try:
+            value = second[key]
+        except KeyError:
+            raise NameError(key) from None
+    return value
+";
+        assert_matches_cpython_marshal(source, "bare_handler_nested_try_exits.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_terminal_nested_try_exception_owners() {
+        let source = r"def terminal_nested_try(flag, items):
+    try:
+        if flag:
+            try:
+                for item in items:
+                    consume(item)
+            except Exception as error:
+                report(error)
+                report_done()
+    except OuterError:
+        recover()
+    finish()
+
+
+def nonterminal_nested_try(flag, items):
+    try:
+        if flag:
+            try:
+                for item in items:
+                    consume(item)
+            except Exception as error:
+                report(error)
+                report_done()
+        finish_inside()
+    except OuterError:
+        recover()
+    finish()
+";
+        assert_matches_cpython_marshal(source, "terminal_nested_try_owners.py");
     }
 
     #[test]

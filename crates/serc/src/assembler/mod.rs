@@ -179,6 +179,17 @@ impl Assembler {
         )
     }
 
+    pub(crate) fn contains_opcode_since(&self, opcode: Opcode, instruction_offset: usize) -> bool {
+        self.linear_items()
+            .iter()
+            .filter_map(|item| match item {
+                Item::Instruction(instruction) => Some(instruction),
+                Item::Label(_) => None,
+            })
+            .skip(instruction_offset)
+            .any(|instruction| instruction.opcode == opcode)
+    }
+
     /// Returns how many instruction slots optimization can vacate before a normalized marker.
     ///
     /// CPython compacts instructions without clearing their exception-handler fields. Later
