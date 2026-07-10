@@ -1877,6 +1877,28 @@ async def asynchronous(manager, first, second):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_with_body_exit_marker_predecessors() {
+        let source = r"def multiple_fallthrough_edges(manager, source, expected):
+    try:
+        with manager:
+            values = source()
+            if len(values) == 2 and int(values[1]) == expected:
+                return True
+    except Error:
+        pass
+    after()
+
+
+def single_fallthrough_edge(manager, first, second):
+    with manager:
+        value = make()
+        if not first or not second:
+            raise Error(value)
+";
+        assert_matches_cpython_marshal(source, "with_body_exit_marker_predecessors.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_protected_iterator_boolean_continue_owners() {
         let source = r##"def nested_positive(manager, outer, inner, predicates):
     with manager:
@@ -2909,6 +2931,76 @@ def terminating_nested_handler(key):
     return value
 ";
         assert_matches_cpython_marshal(source, "bare_handler_nested_try_exits.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_bare_handler_trailing_fallthrough_try_cleanup() {
+        let source = r"def trailing_fallthrough_try(key):
+    try:
+        value = primary[key]
+    except KeyError:
+        if key:
+            value = fallback[key]
+        try:
+            value = secondary[key]
+        except KeyError:
+            report(key)
+    return value
+
+
+def following_handler_statement_control(key):
+    try:
+        value = primary[key]
+    except KeyError:
+        try:
+            value = secondary[key]
+        except KeyError:
+            report(key)
+        consume(value)
+    return value
+
+
+def nested_handler_branch_control(key):
+    try:
+        value = primary[key]
+    except KeyError:
+        if key:
+            try:
+                value = secondary[key]
+            except KeyError:
+                report(key)
+        consume(value)
+    return value
+";
+        assert_matches_cpython_marshal(source, "bare_handler_fallthrough_try_cleanup.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_direct_try_body_branch_exit_owners() {
+        let source = r"def direct_exit(marker, text):
+    try:
+        if marker in text:
+            left, right = first()
+        else:
+            value = second()
+            left, right = value.real, value.imag
+    except Error:
+        raise ValueError
+    consume(left, right)
+
+
+def protected_join_control(marker, text):
+    try:
+        if marker in text:
+            left, right = first()
+        else:
+            value = second()
+            left, right = value.real, value.imag
+        consume(left, right)
+    except Error:
+        raise ValueError
+";
+        assert_matches_cpython_marshal(source, "direct_try_body_branch_exit_owners.py");
     }
 
     #[test]
