@@ -2787,15 +2787,8 @@ impl Compiler {
                     if unary.op == UnaryOp::Not
                         && matches!(unary.operand.as_ref(), Expr::Call(call)
                             if matches!(call.func.as_ref(), Expr::Attribute(_))));
-                let preserve_sync_with_continue_owner = negated_method_call_condition
-                    && branch_index == 0
-                    && matches!(body, [Stmt::Continue(_)])
-                    && self.control.in_iterator_loop()
-                    && self.control.loops.last().is_some_and(|context| {
-                        self.assembler.instruction_count() == context.body_start
-                    })
-                    && self
-                        .control
+                let direct_sync_with_iterator =
+                    self.control
                         .active_with_exits
                         .last()
                         .is_some_and(|context| {
@@ -2803,6 +2796,22 @@ impl Compiler {
                                 && context.loop_depth.checked_add(1)
                                     == Some(self.control.loops.len())
                         });
+                let preserve_sync_with_continue_owner = branch_index == 0
+                    && self.control.in_iterator_loop()
+                    && direct_sync_with_iterator
+                    && ((negated_method_call_condition
+                        && matches!(body, [Stmt::Continue(_)])
+                        && self.control.loops.last().is_some_and(|context| {
+                            self.assembler.instruction_count() == context.body_start
+                        }))
+                        || (self.control.current_statement_has_following
+                            && matches!(test, Expr::Name(_) | Expr::Call(_))
+                            && matches!(body.last(), Some(Stmt::Continue(_)))
+                            && self.control.loops.last().is_some_and(|context| {
+                                !self
+                                    .assembler
+                                    .contains_opcode_since(NOT_TAKEN, context.body_start)
+                            })));
                 let exclude_not_taken = self.control.exclude_terminal_if_not_taken
                     || (!self.control.active_with_region_exclusions.is_empty()
                         && branch_index > 0

@@ -1950,6 +1950,32 @@ async def asynchronous(manager, values):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_protected_iterator_atomic_continue_owners() {
+        let source = r##"def call_condition(manager, lines):
+    with manager:
+        for line in lines:
+            if line.strip().startswith("#"):
+                continue
+            consume(line)
+
+
+def name_condition(manager, lines, initial):
+    ignoring = initial
+    with manager:
+        for line in lines:
+            if ignoring:
+                if line:
+                    ignoring = False
+                continue
+            if line.strip().startswith("#"):
+                continue
+            consume(line)
+
+"##;
+        assert_matches_cpython_marshal(source, "protected_iterator_atomic_continue.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_nonfinal_branching_with_body_control() {
         let source = r"def nonfinal(manager, first, second):
     with manager:
