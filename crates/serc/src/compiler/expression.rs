@@ -2412,10 +2412,30 @@ impl Compiler {
             .iter()
             .map(|name| self.required_name_id(name))
             .collect();
+        let direct_temporary_ids = local_names.iter_unordered().collect::<Vec<_>>();
         let active_temporary_ids: Vec<_> = active_temporary_names
             .iter()
             .map(|name| self.required_name_id(name))
             .collect();
+        let comprehension_cell_ids = self.name_id_set(&comprehension_cell_names);
+        let previous_fast_temporary_ids: NameSet = direct_temporary_ids
+            .iter()
+            .copied()
+            .filter(|name| self.symbols.active_temporary_fast_cells.contains(*name))
+            .collect();
+        for name in &direct_temporary_ids {
+            let is_fast_local = self
+                .symbols
+                .temporary_indices
+                .get(name)
+                .and_then(|index| usize::try_from(*index).ok())
+                .is_some_and(|index| index < self.symbols.fast_local_count);
+            if comprehension_cell_ids.contains(name) || !is_fast_local {
+                self.symbols.active_temporary_fast_cells.remove(*name);
+            } else {
+                self.symbols.active_temporary_fast_cells.insert(*name);
+            }
+        }
         self.symbols
             .active_temporaries
             .extend(active_temporary_ids.iter().copied());
@@ -2571,6 +2591,13 @@ impl Compiler {
         }
         for name in active_temporary_ids {
             self.symbols.active_temporaries.remove(name);
+        }
+        for name in direct_temporary_ids {
+            if previous_fast_temporary_ids.contains(name) {
+                self.symbols.active_temporary_fast_cells.insert(name);
+            } else {
+                self.symbols.active_temporary_fast_cells.remove(name);
+            }
         }
 
         let mut region_start = protected_start;

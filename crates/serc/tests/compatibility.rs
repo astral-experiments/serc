@@ -796,6 +796,31 @@ def single_exit_break(items):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_shared_artificial_loop_backedges() {
+        let source = r"def try_else(values, output):
+    for value in values:
+        try:
+            callback = lookup(value)
+        except KeyError:
+            pass
+        else:
+            if callback(value):
+                output.append(value)
+    return output
+
+
+def try_finally(values):
+    for value in values:
+        try:
+            consume()
+        finally:
+            if enabled():
+                cleanup()
+";
+        assert_matches_cpython_marshal(source, "shared_artificial_loop_backedges.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_terminal_try_suite_implicit_returns() {
         let source = r"def body_if(flag):
     try:
@@ -2694,6 +2719,12 @@ def unreachable_target():
 
 def nested_targets(xs, ys):
     return [[lambda: x for x in ys] for x in xs]
+
+def target_rebound_as_later_cell(types, values):
+    normalized = {normalize(type_) for type_ in types}
+    for type_ in types:
+        converted = (convert(value, type_) for value in values)
+    return normalized, converted
 ";
         assert_matches_cpython_marshal(source, "comprehension_cells.py");
     }
@@ -3435,7 +3466,7 @@ def render(value):
 
     #[test]
     fn matches_cpython_marshal_for_local_borrowing_across_exception_regions() {
-        let source = "def try_return():\n    try:\n        value = process()\n        return value\n    except ValueError:\n        pass\n\ndef with_return(manager):\n    with manager:\n        return 1\n\ndef match_subject(provided):\n    match provided:\n        case True:\n            return captured\n\ndef comprehension(collection):\n    return [element for element in collection if element is not None]\n\ndef repeated_checked_load():\n    value = value[value.attribute == 'key']\n\ndef maybe_unbound(condition):\n    if condition:\n        value = 1\n    else:\n        use()\n    return value\n\ndef consecutive_try_imports():\n    try:\n        from first import First\n    except ImportError:\n        from fallback import First\n    First()\n    try:\n        from second import Second\n    except ImportError:\n        from fallback import Second\n    Second()\n\ndef folded_false(value):\n    if value == 1:\n        return 1\n    elif False:\n        return 2\n    elif value == 3:\n        return 3\n\ndef loaded_before_binding():\n    for item in values:\n        use(values, item)\n    values = []\n";
+        let source = "def try_return():\n    try:\n        value = process()\n        return value\n    except ValueError:\n        pass\n\ndef with_return(manager):\n    with manager:\n        return 1\n\ndef match_subject(provided):\n    match provided:\n        case True:\n            return captured\n\ndef comprehension(collection):\n    return [element for element in collection if element is not None]\n\ndef repeated_checked_load():\n    value = value[value.attribute == 'key']\n\ndef maybe_unbound(condition):\n    if condition:\n        value = 1\n    else:\n        use()\n    return value\n\ndef consecutive_try_imports():\n    try:\n        from first import First\n    except ImportError:\n        from fallback import First\n    First()\n    try:\n        from second import Second\n    except ImportError:\n        from fallback import Second\n    Second()\n\ndef folded_false(value):\n    if value == 1:\n        return 1\n    elif False:\n        return 2\n    elif value == 3:\n        return 3\n\ndef loaded_before_binding():\n    for item in values:\n        use(values, item)\n    values = []\n\ndef conditional_import(flag):\n    values = []\n    if flag:\n        values.append(flag)\n    from package import imported\n    return values, imported\n";
         assert_matches_cpython_marshal(source, "borrowing.py");
     }
 
@@ -4416,6 +4447,68 @@ match subject:
     fn matches_cpython_marshal_for_a_return_through_finally() {
         let source = "def return_through_finally(items):\n    for item in items:\n        try:\n            pass\n        except Exception:\n            return\n        finally:\n            consume(item)\n\ndef preserve_return_value():\n    try:\n        pass\n        return produce()\n    finally:\n        consume()\n\ndef preserve_try_pass():\n    try:\n        pass\n        return produce()\n    except Exception:\n        recover()\n";
         assert_matches_cpython_marshal(source, "example.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_nested_return_unwind_owners() {
+        let source = r"def loop_value(items):
+    try:
+        for item in items:
+            try:
+                use(item)
+                use(item)
+                use(item)
+                use(item)
+                use(item)
+                use(item)
+                use(item)
+                use(item)
+                use(item)
+                use(item)
+                use(item)
+                use(item)
+                use(item)
+                use(item)
+                use(item)
+                use(item)
+                use(item)
+                use(item)
+                use(item)
+                use(item)
+                return item
+            except Error:
+                pass
+    finally:
+        cleanup()
+    return None
+
+
+def literal_values(manager):
+    try:
+        with manager:
+            prepare()
+        try:
+            action()
+            return True
+        except Error:
+            return False
+    finally:
+        cleanup()
+
+
+def nested_handler(compiler):
+    try:
+        command = compiler.compiler
+    except AttributeError:
+        try:
+            if not compiler.initialized:
+                compiler.initialize()
+        except (SetupError, ValueError):
+            return False
+        command = [compiler.cc]
+    return command
+";
+        assert_matches_cpython_marshal(source, "nested_return_unwinds.py");
     }
 
     #[test]

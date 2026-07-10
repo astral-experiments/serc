@@ -37,6 +37,7 @@ pub(super) struct SymbolState {
     pub(super) temporary_indices: FxHashMap<NameId, u32>,
     pub(super) hidden_names: NameSet,
     pub(super) active_temporaries: NameSet,
+    pub(super) active_temporary_fast_cells: NameSet,
     pub(super) initialized_locals: NameSet,
     pub(super) owned_load_locals: NameSet,
     pub(super) imported_scope_names: NameSet,
@@ -185,7 +186,9 @@ impl Compiler {
                 .copied()
                 .expect("active temporary should have an index");
             return self.emit(
-                if self.symbols.cell_names.contains(name_id) {
+                if self.symbols.cell_names.contains(name_id)
+                    && !self.symbols.active_temporary_fast_cells.contains(name_id)
+                {
                     LOAD_DEREF
                 } else {
                     LOAD_FAST
@@ -343,7 +346,9 @@ impl Compiler {
                 .copied()
                 .expect("active temporary should have an index");
             return self.emit(
-                if self.symbols.cell_names.contains(name_id) {
+                if self.symbols.cell_names.contains(name_id)
+                    && !self.symbols.active_temporary_fast_cells.contains(name_id)
+                {
                     STORE_DEREF
                 } else {
                     STORE_FAST
@@ -428,7 +433,9 @@ impl Compiler {
                 .copied()
                 .expect("active temporary should have an index");
             return self.emit(
-                if self.symbols.cell_names.contains(name_id) {
+                if self.symbols.cell_names.contains(name_id)
+                    && !self.symbols.active_temporary_fast_cells.contains(name_id)
+                {
                     DELETE_DEREF
                 } else {
                     DELETE_FAST

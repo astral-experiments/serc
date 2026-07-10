@@ -7,7 +7,7 @@ use super::super::{
     LOAD_CONST, LOAD_FAST, LOAD_FAST_AND_CLEAR, LOAD_FAST_BORROW,
     LOAD_FAST_BORROW_LOAD_FAST_BORROW, LOAD_FAST_CHECK, LOAD_FAST_LOAD_FAST, LOAD_SMALL_INT,
     LOAD_SPECIAL, LOAD_SUPER_ATTR, MAP_ADD, MATCH_KEYS, MATCH_MAPPING, MATCH_SEQUENCE, NOP,
-    Operand, POP_EXCEPT, POP_TOP, PUSH_EXC_INFO, RERAISE, RETURN_VALUE, SEND, SET_ADD,
+    NOT_TAKEN, Operand, POP_EXCEPT, POP_TOP, PUSH_EXC_INFO, RERAISE, RETURN_VALUE, SEND, SET_ADD,
     SET_FUNCTION_ATTRIBUTE, SET_UPDATE, STORE_DEREF, STORE_FAST, STORE_FAST_LOAD_FAST,
     STORE_FAST_STORE_FAST, STORE_GLOBAL, SWAP, WITH_EXCEPT_START, block_has_fallthrough,
     block_jump_target, ends_scope, opcode_num_popped, opcode_num_pushed, opcode_stack_effect,
@@ -365,6 +365,7 @@ impl OptimizationPipeline {
             |instruction| {
                 !matches!(instruction.operand, Operand::Value(_))
                     || ends_scope(instruction.opcode)
+                    || instruction.opcode == NOT_TAKEN
                     || (instruction.opcode == NOP && instruction.jump_policy.always_retains_nop())
                     || instruction.jump_policy.borrow_empty_block()
                     || instruction.borrow_fallthrough == BorrowFallthrough::Barrier

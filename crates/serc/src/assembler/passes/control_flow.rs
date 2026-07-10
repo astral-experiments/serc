@@ -329,7 +329,14 @@ impl OptimizationPipeline {
                             && let operand @ (Operand::Forward(_) | Operand::Backward(_)) =
                                 instruction.operand
                         {
-                            jump_targets.insert(*label, (operand, instruction.opcode));
+                            jump_targets.insert(
+                                *label,
+                                (
+                                    operand,
+                                    instruction.opcode,
+                                    instruction.no_location_policy.is_artificial_eval_break(),
+                                ),
+                            );
                         }
                     }
                 }
@@ -350,8 +357,11 @@ impl OptimizationPipeline {
                 };
                 let mut operand = instruction.operand;
                 let mut opcode = instruction.opcode;
+                let mut artificial_eval_break =
+                    instruction.no_location_policy.is_artificial_eval_break();
                 for _ in 0..jump_targets.len() {
-                    let Some((next_operand, next_opcode)) = jump_targets.get(&target).copied()
+                    let Some((next_operand, next_opcode, next_artificial_eval_break)) =
+                        jump_targets.get(&target).copied()
                     else {
                         break;
                     };
@@ -365,6 +375,7 @@ impl OptimizationPipeline {
                     operand = next_operand;
                     if next_opcode == JUMP_BACKWARD {
                         opcode = JUMP_BACKWARD;
+                        artificial_eval_break |= next_artificial_eval_break;
                     } else if next_opcode == JUMP_BACKWARD_NO_INTERRUPT {
                         opcode = JUMP_BACKWARD_NO_INTERRUPT;
                     }
@@ -372,6 +383,9 @@ impl OptimizationPipeline {
                 }
                 instruction.retarget(operand);
                 instruction.opcode = opcode;
+                if artificial_eval_break {
+                    instruction.no_location_policy.mark_artificial_eval_break();
+                }
             }
         }
     }

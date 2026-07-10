@@ -111,29 +111,30 @@ impl LoadPolicy {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-enum NoLocationBlockInlining {
-    #[default]
-    Disabled,
-    Allowed,
-    FirstCopyInterruptible,
-}
+struct NoLocationBlockPolicy(u8);
 
-impl NoLocationBlockInlining {
+impl NoLocationBlockPolicy {
+    const ALLOW_INLINING: u8 = 1 << 0;
+    const FIRST_COPY_INTERRUPTIBLE: u8 = 1 << 1;
+    const ARTIFICIAL_EVAL_BREAK: u8 = 1 << 2;
+
     const fn fused(first: Self, second: Self) -> Self {
-        match (first, second) {
-            (Self::FirstCopyInterruptible, _) | (_, Self::FirstCopyInterruptible) => {
-                Self::FirstCopyInterruptible
-            }
-            (Self::Allowed, _) | (_, Self::Allowed) => Self::Allowed,
-            (Self::Disabled, Self::Disabled) => Self::Disabled,
-        }
+        Self(first.0 | second.0)
+    }
+
+    const fn contains(self, flag: u8) -> bool {
+        self.0 & flag != 0
+    }
+
+    fn insert(&mut self, flag: u8) {
+        self.0 |= flag;
     }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct NoLocationPolicy {
     /// Whether an unlocated block ending at this instruction may be inlined.
-    block_inlining: NoLocationBlockInlining,
+    block_policy: NoLocationBlockPolicy,
     pub(super) preserve: bool,
     /// An unresolved percent target or its deferred-location side-table index.
     pub(super) percent_target_location: u8,
@@ -141,35 +142,42 @@ pub(super) struct NoLocationPolicy {
 
 impl NoLocationPolicy {
     pub(super) const fn allows_block_inlining(self) -> bool {
-        !matches!(self.block_inlining, NoLocationBlockInlining::Disabled)
+        self.block_policy
+            .contains(NoLocationBlockPolicy::ALLOW_INLINING)
     }
 
     /// Whether a copied forward exit becomes an interruptible backward jump after cold-block
     /// ordering. The original cleanup edge remains non-interruptible.
     pub(super) const fn first_copy_is_interruptible_backward(self) -> bool {
-        matches!(
-            self.block_inlining,
-            NoLocationBlockInlining::FirstCopyInterruptible
-        )
+        self.block_policy
+            .contains(NoLocationBlockPolicy::FIRST_COPY_INTERRUPTIBLE)
+    }
+
+    /// Whether this eval-break instruction was emitted with CPython's `NO_LOCATION`.
+    pub(super) const fn is_artificial_eval_break(self) -> bool {
+        self.block_policy
+            .contains(NoLocationBlockPolicy::ARTIFICIAL_EVAL_BREAK)
     }
 
     pub(super) fn allow_block_inlining(&mut self) {
-        if matches!(self.block_inlining, NoLocationBlockInlining::Disabled) {
-            self.block_inlining = NoLocationBlockInlining::Allowed;
-        }
+        self.block_policy
+            .insert(NoLocationBlockPolicy::ALLOW_INLINING);
     }
 
     pub(super) fn make_first_copy_interruptible(&mut self) {
         debug_assert!(self.allows_block_inlining());
-        self.block_inlining = NoLocationBlockInlining::FirstCopyInterruptible;
+        self.block_policy
+            .insert(NoLocationBlockPolicy::FIRST_COPY_INTERRUPTIBLE);
+    }
+
+    pub(super) fn mark_artificial_eval_break(&mut self) {
+        self.block_policy
+            .insert(NoLocationBlockPolicy::ARTIFICIAL_EVAL_BREAK);
     }
 
     const fn fused(first: Self, second: Self) -> Self {
         Self {
-            block_inlining: NoLocationBlockInlining::fused(
-                first.block_inlining,
-                second.block_inlining,
-            ),
+            block_policy: NoLocationBlockPolicy::fused(first.block_policy, second.block_policy),
             preserve: first.preserve || second.preserve,
             percent_target_location: if matches!(first.percent_target_location, 0 | u8::MAX) {
                 second.percent_target_location

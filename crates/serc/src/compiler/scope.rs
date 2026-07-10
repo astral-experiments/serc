@@ -378,6 +378,7 @@ impl FunctionPlan {
         }
         locals.collect_suite(&definition.body);
         locals.retain_bindings();
+        let comprehension_first_bindings = locals.comprehension_first_bindings.clone();
 
         let comprehension_shadowed_targets = locals
             .comprehension_targets
@@ -513,6 +514,13 @@ impl FunctionPlan {
             nested_function_requirements.iter().copied(),
             nested_function_annotation_references.iter().copied(),
         );
+        let comprehension_fast_cellvars = comprehension_first_bindings
+            .iter()
+            .filter_map(|name| names.get(name))
+            .filter(|name| plan.cellvars.contains(name))
+            .collect::<Vec<_>>();
+        plan.inlined_comprehension_cellvars
+            .extend(comprehension_fast_cellvars);
         plan
     }
 
@@ -1328,6 +1336,7 @@ struct LocalCollector {
     seen: FxHashSet<String>,
     comprehension_targets: Vec<String>,
     seen_comprehension_targets: FxHashSet<String>,
+    comprehension_first_bindings: FxHashSet<String>,
     non_comprehension_bindings: FxHashSet<String>,
     candidate_bindings: Option<FxHashMap<String, bool>>,
     annotation_only: FxHashSet<String>,
@@ -1598,6 +1607,10 @@ impl LocalCollector {
     fn collect_comprehension_target(&mut self, target: &Expr) {
         match target {
             Expr::Name(name) => {
+                if !self.non_comprehension_bindings.contains(name.id.as_str()) {
+                    self.comprehension_first_bindings
+                        .insert(name.id.as_str().to_string());
+                }
                 self.mark_binding(name.id.as_str());
             }
             Expr::List(list) => {
@@ -2144,7 +2157,7 @@ pub(super) fn analyze_lambda_scope(lambda: &ruff_python_ast::ExprLambda) -> Lamb
     let mut nested_requirements = nested_lambda_required_names_in_expression(&lambda.body);
     nested_requirements.extend(nested_generator_required_names_in_expression(&lambda.body));
     let local_names = locals.names.iter().cloned().collect::<FxHashSet<_>>();
-    let cellvars = nested_requirements
+    let cellvars: FxHashSet<_> = nested_requirements
         .iter()
         .filter(|name| local_names.contains(*name))
         .cloned()
@@ -2156,12 +2169,19 @@ pub(super) fn analyze_lambda_scope(lambda: &ruff_python_ast::ExprLambda) -> Lamb
         .filter(|name| !local_names.contains(*name))
         .cloned()
         .collect();
+    let mut inlined_comprehension_cellvars =
+        inlined_comprehension_cell_names_in_expression(&lambda.body);
+    let comprehension_fast_cellvars = locals
+        .comprehension_first_bindings
+        .iter()
+        .filter(|name| cellvars.contains(*name))
+        .cloned()
+        .collect::<FxHashSet<_>>();
+    inlined_comprehension_cellvars.extend(comprehension_fast_cellvars.iter().cloned());
     LambdaScopeAnalysis {
         locals: locals.names,
         cellvars,
-        inlined_comprehension_cellvars: inlined_comprehension_cell_names_in_expression(
-            &lambda.body,
-        ),
+        inlined_comprehension_cellvars,
         required,
     }
 }
