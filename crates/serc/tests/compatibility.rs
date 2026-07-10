@@ -3031,6 +3031,25 @@ def no_else_control():
     }
 
     #[test]
+    fn matches_cpython_marshal_for_conditional_expression_join_locations() {
+        let source = r"def split_short_circuit(manager, value):
+    manager.first = (value.items or []) if has_value(
+        value, 'items') else []
+    manager.second = (value.other or []) if has_value(
+        value, 'other') else []
+
+
+def same_block_control(condition, body, otherwise):
+    return body if condition else otherwise
+
+
+def call_control(condition):
+    return body() if condition else otherwise()
+";
+        assert_matches_cpython_marshal(source, "conditional_expression_join_locations.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_unpacked_class_arguments() {
         let source = "class C1(Generic[T], str, **{'metaclass': type}):\n    ...\n\nclass C2(Generic[T], str, metaclass=type):\n    ...\n\nclass C3(Generic[T], metaclass=type, *[str]):\n    ...\n\nclass C4(x=1, **y):\n    ...\n";
         assert_matches_cpython_marshal(source, "class_arguments.py");

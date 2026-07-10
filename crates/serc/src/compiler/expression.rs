@@ -4065,9 +4065,21 @@ impl Compiler {
         let end = self.assembler.label();
         self.compile_jump_if(&expression.test, false, else_label)?;
         self.compile_expression(&expression.body)?;
-        self.assembler
-            .set_location(self.source_location(expression.body.range()));
+        // CPython emits the conditional-expression join without a location. Its later
+        // propagation pass inherits the body location only when the join remains in the same
+        // basic block; short-circuit bodies can leave it deliberately unlocated.
+        if matches!(expression.body.as_ref(), Expr::If(_)) {
+            // Keep the provisional range until Serc models CPython's propagation across the
+            // nested conditional's join block.
+            self.assembler
+                .set_location(self.source_location(expression.body.range()));
+        } else {
+            self.assembler.set_location(SourceLocation::NONE);
+        }
         self.emit_jump_forward(JUMP_FORWARD, end, 0)?;
+        if matches!(expression.body.as_ref(), Expr::BoolOp(_)) {
+            self.assembler.preserve_last_no_location();
+        }
         self.assembler.mark(else_label);
         self.set_depth(base_depth);
         self.compile_expression(&expression.orelse)?;
