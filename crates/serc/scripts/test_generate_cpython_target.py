@@ -25,6 +25,17 @@ def git(checkout: Path, *arguments: str) -> str:
 
 
 class ReadInputsTest(unittest.TestCase):
+    def test_parses_static_identifiers(self) -> None:
+        source = """
+        STRUCT_FOR_ID(sort)
+        STRUCT_FOR_ID(alpha)
+        STRUCT_FOR_ID(sort)
+        """
+        self.assertEqual(
+            generator.parse_static_identifiers(source),
+            ["alpha", "sort"],
+        )
+
     def test_reads_pinned_commit_instead_of_dirty_worktree(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             checkout = Path(directory)

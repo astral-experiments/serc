@@ -673,8 +673,13 @@ impl Compiler {
             )));
         }
 
-        for (instruction, constant) in std::mem::take(&mut self.output.deferred_constants) {
+        for (instruction, constant, iterable_frozenset) in
+            std::mem::take(&mut self.output.deferred_constants)
+        {
             let index = self.add_constant(constant)?;
+            if iterable_frozenset {
+                self.output.iterable_frozenset_indices.insert(index);
+            }
             if let Some(instruction) = instruction {
                 self.assembler.patch_argument(instruction, index)?;
             }
@@ -798,6 +803,7 @@ impl Compiler {
                     LocalsIdentity::ByValue
                 },
                 explicitly_interned_strings: self.output.interned_constant_strings,
+                iterable_frozenset_indices: self.output.iterable_frozenset_indices,
             },
         };
         code.validate()?;

@@ -143,6 +143,7 @@ impl NoLocationBlockPolicy {
     const FIRST_COPY_INTERRUPTIBLE: u8 = 1 << 1;
     const ARTIFICIAL_EVAL_BREAK: u8 = 1 << 2;
     const COPY_INHERITS_SHARED_PREDECESSOR: u8 = 1 << 3;
+    const COPY_SPLIT_RETURN_EXIT: u8 = 1 << 4;
 
     const fn fused(first: Self, second: Self) -> Self {
         Self(first.0 | second.0)
@@ -154,6 +155,10 @@ impl NoLocationBlockPolicy {
 
     fn insert(&mut self, flag: u8) {
         self.0 |= flag;
+    }
+
+    fn remove(&mut self, flag: u8) {
+        self.0 &= !flag;
     }
 }
 
@@ -192,6 +197,12 @@ impl NoLocationPolicy {
             .contains(NoLocationBlockPolicy::COPY_INHERITS_SHARED_PREDECESSOR)
     }
 
+    /// Whether a direct normal-exit jump may copy a return split by an exception-region boundary
+    /// without retaining the source jump as a NOP.
+    pub(super) const fn copies_split_return_exit(self) -> bool {
+        self.block_policy
+            .contains(NoLocationBlockPolicy::COPY_SPLIT_RETURN_EXIT)
+    }
     pub(super) fn allow_block_inlining(&mut self) {
         self.block_policy
             .insert(NoLocationBlockPolicy::ALLOW_INLINING);
@@ -211,6 +222,16 @@ impl NoLocationPolicy {
     pub(super) fn make_copy_inherit_shared_predecessor(&mut self) {
         self.block_policy
             .insert(NoLocationBlockPolicy::COPY_INHERITS_SHARED_PREDECESSOR);
+    }
+
+    pub(super) fn allow_split_return_exit_copy(&mut self) {
+        self.block_policy
+            .insert(NoLocationBlockPolicy::COPY_SPLIT_RETURN_EXIT);
+    }
+
+    pub(super) fn clear_split_return_exit_copy(&mut self) {
+        self.block_policy
+            .remove(NoLocationBlockPolicy::COPY_SPLIT_RETURN_EXIT);
     }
 
     const fn fused(first: Self, second: Self) -> Self {
@@ -258,34 +279,37 @@ pub(super) enum RetainedJumpNop {
     Always,
 }
 
-/// Records why a forward jump may become backward after cold-block ordering.
+/// Records provenance that affects how a jump is rewritten by block optimization.
 ///
 /// Generated fallthrough edges must remain non-interruptible, while a source-authored `break`
 /// continues to check the eval breaker even if its exception-handler block moves after the loop
 /// exit.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-#[repr(u8)]
-pub(super) enum BackwardJumpProvenance {
-    #[default]
-    Generated,
-    AuthoredBreak,
-}
+#[repr(transparent)]
+pub(super) struct JumpProvenance(u8);
 
-impl BackwardJumpProvenance {
+impl JumpProvenance {
+    const AUTHORED_BREAK: u8 = 1 << 0;
+    const TRANSITIVE_SMALL_EXIT_INLINING: u8 = 1 << 1;
+
     pub(super) const fn is_authored_break(self) -> bool {
-        matches!(self, Self::AuthoredBreak)
+        self.0 & Self::AUTHORED_BREAK != 0
     }
 
     pub(super) fn mark_authored_break(&mut self) {
-        *self = Self::AuthoredBreak;
+        self.0 |= Self::AUTHORED_BREAK;
+    }
+
+    pub(super) const fn transitive_small_exit_inlining(self) -> bool {
+        self.0 & Self::TRANSITIVE_SMALL_EXIT_INLINING != 0
+    }
+
+    pub(super) fn allow_transitive_small_exit_inlining(&mut self) {
+        self.0 |= Self::TRANSITIVE_SMALL_EXIT_INLINING;
     }
 
     const fn fused(first: Self, second: Self) -> Self {
-        if first.is_authored_break() || second.is_authored_break() {
-            Self::AuthoredBreak
-        } else {
-            Self::Generated
-        }
+        Self(first.0 | second.0)
     }
 }
 
@@ -562,7 +586,7 @@ pub(super) struct Instruction {
     // three slots that a normalized boolean value marker can reuse.
     pub(super) hidden_exception_owner_slots: u8,
     pub(super) jump_policy: JumpPolicy,
-    pub(super) backward_jump_provenance: BackwardJumpProvenance,
+    pub(super) jump_provenance: JumpProvenance,
     // `NOT_TAKEN` is added after CPython labels exception handlers. The new instruction keeps
     // whatever exception target remains in its reused CFG slot, if there is one.
     pub(super) exception_policy: ExceptionPolicy,
@@ -590,7 +614,7 @@ impl Instruction {
             converted_pop_block: false,
             hidden_exception_owner_slots: 0,
             jump_policy: JumpPolicy::default(),
-            backward_jump_provenance: BackwardJumpProvenance::default(),
+            jump_provenance: JumpProvenance::default(),
             exception_policy: ExceptionPolicy::default(),
             borrow_fallthrough: BorrowFallthrough::default(),
         }
@@ -604,6 +628,7 @@ impl Instruction {
         ));
         if self.operand != operand {
             self.jump_policy.clear_direct_target_retention();
+            self.no_location_policy.clear_split_return_exit_copy();
             self.operand = operand;
         }
     }
@@ -645,10 +670,7 @@ impl Instruction {
                 .saturating_add(second.hidden_exception_owner_slots)
                 .min(3),
             jump_policy: JumpPolicy::fused(first.jump_policy, second.jump_policy),
-            backward_jump_provenance: BackwardJumpProvenance::fused(
-                first.backward_jump_provenance,
-                second.backward_jump_provenance,
-            ),
+            jump_provenance: JumpProvenance::fused(first.jump_provenance, second.jump_provenance),
             exception_policy: first.exception_policy.merged(second.exception_policy),
             borrow_fallthrough: second.borrow_fallthrough,
         }

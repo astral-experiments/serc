@@ -982,7 +982,16 @@ impl Compiler {
                     == SpecializedLowering::NotApplicable
                 {
                     self.compile_expression(&binary.left)?;
-                    self.compile_expression(&binary.right)?;
+                    let exclude_optimized_tuple_guard_from_comprehension = binary.op
+                        == Operator::Add
+                        && matches!(binary.left.as_ref(), Expr::Name(_))
+                        && matches!(binary.right.as_ref(), Expr::Call(call)
+                                if optimized_generator_callable(call) == Some("tuple"));
+                    self.with_control_override(
+                        |control| &mut control.exclude_optimized_tuple_guard_from_comprehension,
+                        exclude_optimized_tuple_guard_from_comprehension,
+                        |compiler| compiler.compile_expression(&binary.right),
+                    )?;
                     self.emit_binary_operation(binary_operator(binary.op, false))?;
                 }
             }
@@ -1879,16 +1888,25 @@ impl Compiler {
         self.emit_common_constant(common_constant)?;
         self.emit(IS_OP, 0, -1)?;
         self.emit_jump_forward(POP_JUMP_IF_FALSE, fallback, -1)?;
-        let not_taken_exclusion_start = (collect_tuple
+        let exclude_not_taken_from_comprehension = collect_tuple
+            && self
+                .control
+                .exclude_optimized_tuple_guard_from_comprehension
+            && !self
+                .control
+                .active_comprehension_region_exclusions
+                .is_empty();
+        let exclude_not_taken_from_exception = collect_tuple
             && self.control.current_statement_has_following
             && self.control.direct_optimized_generator_assignment
             && self.optimized_generator_dispatch_is_in_normal_try()
-            && !self.control.active_exception_region_exclusions.is_empty())
-        .then(|| {
-            let start = self.assembler.label();
-            self.assembler.mark(start);
-            start
-        });
+            && !self.control.active_exception_region_exclusions.is_empty();
+        let not_taken_exclusion_start =
+            (exclude_not_taken_from_comprehension || exclude_not_taken_from_exception).then(|| {
+                let start = self.assembler.label();
+                self.assembler.mark(start);
+                start
+            });
         self.emit_with_exception_policy(
             NOT_TAKEN,
             0,
@@ -1898,8 +1916,15 @@ impl Compiler {
         if let Some(start) = not_taken_exclusion_start {
             let end = self.assembler.label();
             self.assembler.mark(end);
-            for exclusions in &mut self.control.active_exception_region_exclusions {
-                exclusions.push((start, end));
+            if exclude_not_taken_from_comprehension {
+                for exclusions in &mut self.control.active_comprehension_region_exclusions {
+                    exclusions.push((start, end));
+                }
+            }
+            if exclude_not_taken_from_exception {
+                for exclusions in &mut self.control.active_exception_region_exclusions {
+                    exclusions.push((start, end));
+                }
             }
         }
         self.emit(POP_TOP, 0, -1)?;
@@ -1952,6 +1977,9 @@ impl Compiler {
             self.emit(LOAD_CONST, result, 1)?;
         }
         self.emit_jump_forward(JUMP_FORWARD, end, 0)?;
+        if collect_tuple && self.control.copy_optimized_tuple_branch_exit {
+            self.assembler.allow_last_transitive_small_exit_inlining();
+        }
 
         self.assembler.mark(fallback);
         self.set_depth(base_depth + 1);
@@ -3263,6 +3291,7 @@ impl Compiler {
         element_location: SourceLocation,
         accepted: Label,
         restart: Label,
+        include_with_region_exclusion: bool,
     ) -> Result<(), CompileError> {
         if comprehension_filter_truthiness(condition) == Some(true) {
             self.record_folded_value(condition)?;
@@ -3285,10 +3314,22 @@ impl Compiler {
             };
             for value in leading {
                 let next = self.assembler.label();
-                self.compile_comprehension_filter(value, element_location, next, restart)?;
+                self.compile_comprehension_filter(
+                    value,
+                    element_location,
+                    next,
+                    restart,
+                    include_with_region_exclusion,
+                )?;
                 self.assembler.mark(next);
             }
-            return self.compile_comprehension_filter(last, element_location, accepted, restart);
+            return self.compile_comprehension_filter(
+                last,
+                element_location,
+                accepted,
+                restart,
+                include_with_region_exclusion,
+            );
         }
         if let Expr::BoolOp(boolean) = condition
             && boolean.op == BoolOp::Or
@@ -3301,7 +3342,13 @@ impl Compiler {
             for value in leading {
                 self.compile_jump_if(value, true, accepted)?;
             }
-            return self.compile_comprehension_filter(last, element_location, accepted, restart);
+            return self.compile_comprehension_filter(
+                last,
+                element_location,
+                accepted,
+                restart,
+                include_with_region_exclusion,
+            );
         }
         if let Expr::UnaryOp(unary) = condition
             && unary.op == UnaryOp::Not
@@ -3348,11 +3395,13 @@ impl Compiler {
             self.emit_jump_backward(JUMP_BACKWARD, restart, 0)?;
             let exclusion_end = self.assembler.label();
             self.assembler.mark(exclusion_end);
-            self.control
-                .generator_region_exclusions
-                .push((exclusion_start, exclusion_end));
-            for exclusions in &mut self.control.active_comprehension_region_exclusions {
-                exclusions.push((exclusion_start, exclusion_end));
+            self.record_filter_exclusion(exclusion_start, exclusion_end, true);
+            if include_with_region_exclusion
+                && self.control.active_exception_region_exclusions.is_empty()
+            {
+                for exclusions in &mut self.control.active_with_region_exclusions {
+                    exclusions.push((exclusion_start, exclusion_end));
+                }
             }
             return Ok(());
         }
@@ -3368,11 +3417,13 @@ impl Compiler {
         self.emit_jump_backward(JUMP_BACKWARD, restart, 0)?;
         let exclusion_end = self.assembler.label();
         self.assembler.mark(exclusion_end);
-        self.control
-            .generator_region_exclusions
-            .push((exclusion_start, exclusion_end));
-        for exclusions in &mut self.control.active_comprehension_region_exclusions {
-            exclusions.push((exclusion_start, exclusion_end));
+        self.record_filter_exclusion(exclusion_start, exclusion_end, true);
+        if include_with_region_exclusion
+            && self.control.active_exception_region_exclusions.is_empty()
+        {
+            for exclusions in &mut self.control.active_with_region_exclusions {
+                exclusions.push((exclusion_start, exclusion_end));
+            }
         }
         Ok(())
     }
@@ -3410,6 +3461,7 @@ impl Compiler {
                 self.source_location(element_range),
                 accepted,
                 start,
+                add_opcode == LIST_APPEND,
             )?;
             self.assembler.mark(accepted);
         }
@@ -3575,6 +3627,7 @@ impl Compiler {
                 self.source_location(element_range),
                 accepted,
                 start,
+                add_opcode == LIST_APPEND,
             )?;
             self.assembler.mark(accepted);
         }
@@ -3943,7 +3996,7 @@ impl Compiler {
                     self.emit_folded_tuple_not_nops(element)?;
                 }
                 self.assembler.set_location(expression_location);
-                self.emit_deferred_constant(Constant::FrozenSet(unique))?;
+                self.emit_deferred_iterable_frozenset(unique)?;
                 self.assembler
                     .add_last_hidden_exception_owner_slots(folded_elements_owner_slots(
                         &set.elts,
@@ -4758,7 +4811,7 @@ impl Compiler {
             }
             self.emit(NOT_TAKEN, 0, 0)?;
             self.emit_jump_forward(JUMP_FORWARD, end, 0)?;
-            if jump_on && self.control.retained_chained_comparison_exit == Some(comparison.range) {
+            if self.control.retained_chained_comparison_exit == Some(comparison.range) {
                 // CPython retains this final comparison fallthrough jump as a NOP when its
                 // neighboring terminal exit is copied through the optimized CFG.
                 self.assembler.preserve_last_inlined_jump_nop();
@@ -4819,7 +4872,7 @@ impl Compiler {
                 ordinary: ExceptionPolicy::normalized_owner(
                     self.control.generator_region_start.is_some()
                         || self.control.include_assert_none_condition_owner
-                        || self.control.include_compound_none_condition_owner
+                        || self.control.include_scoped_none_condition_owner
                         || self.control.in_first_unnamed_exception_handler()
                         || self.control.active_normal_finally_bodies > 0,
                 ),
@@ -4892,6 +4945,7 @@ impl Compiler {
                 .control
                 .current_try_marker_is_shifted_to_ownerless_slot(
                     self.assembler.instruction_count(),
+                    expression.range(),
                 );
         let exclude_plain_try_marker = !comparison_is_boolean
             && (shifted_plain_try_marker

@@ -162,6 +162,12 @@ mod tests {
     }
 
     #[test]
+    fn matches_cpython_marshal_for_if_branch_ending_in_while() {
+        let source = "def f(condition, index, limit):\n    if condition:\n        value = 1\n        while index < limit:\n            index += 1\n    else:\n        fallback = 1\n        while index > 0:\n            index -= 1\n    tail0 = 0\n    tail1 = 1\n    tail2 = 2\n    tail3 = 3\n    tail4 = 4\n";
+        assert_matches_cpython_marshal(source, "if_while.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_a_module_containing_only_global_statements() {
         let source = "global x\nglobal x, y, z\n";
         assert_matches_cpython_marshal(source, "global.py");
@@ -558,6 +564,52 @@ def parent():
     }
 
     #[test]
+    fn matches_cpython_marshal_for_origin_sensitive_frozenset_identity() {
+        let source = r#"def membership_first(kind):
+    if kind in {None, "sort"}:
+        return 1
+    return 0
+
+
+def membership_second(kind):
+    if kind in {None, "sort"}:
+        return 2
+    return 0
+
+
+def nonstatic_membership_first(kind):
+    if kind in {None, "linux"}:
+        return 3
+    return 0
+
+
+def nonstatic_membership_second(kind):
+    if kind in {None, "linux"}:
+        return 4
+    return 0
+
+
+def shared_membership_first(kind):
+    return kind in {None, "sort"}
+
+
+def shared_membership_second(kind):
+    return kind in {None, "sort"}
+
+
+def direct_first():
+    value = {"left", "center", "right"}
+    return value, 1
+
+
+def direct_second():
+    value = {"left", "center", "right"}
+    return value, 2
+"#;
+        assert_matches_cpython_marshal(source, "origin_sensitive_frozensets.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_noninterned_constant_metadata_collisions() {
         let source = r#"from package.config import exported, café
 from other import *
@@ -764,6 +816,37 @@ def loop_tail():
     fn matches_cpython_marshal_for_a_try_at_the_end_of_a_loop() {
         let source = "async def show_status():\n    while True:\n        try:\n            if report_host:\n                data = value\n        except Exception as error:\n            pass\n";
         assert_matches_cpython_marshal(source, "loop_try.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_try_condition_fallthrough_ranges() {
+        let source = r"def short_circuit_break():
+    while True:
+        try:
+            if first() or second():
+                break
+        except BlockingIOError:
+            pass
+
+
+def single_condition_break():
+    while True:
+        try:
+            if first():
+                break
+        except BlockingIOError:
+            pass
+
+
+def short_circuit_continue():
+    while True:
+        try:
+            if first() or second():
+                continue
+        except BlockingIOError:
+            pass
+";
+        assert_matches_cpython_marshal(source, "try_condition_fallthrough_ranges.py");
     }
 
     #[test]
@@ -1020,6 +1103,59 @@ async def coroutine_if(flag):
         pass
 ";
         assert_matches_cpython_marshal(source, "terminal_try_returns.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_terminal_assignment_return_boundaries() {
+        let source = r"def consecutive_handlers(flag):
+    global state
+    if flag:
+        try:
+            first()
+        except FirstError:
+            pass
+        try:
+            second()
+        except SecondError:
+            pass
+        state = None
+
+
+def explicit_else(flag):
+    if flag:
+        use(flag)
+    else:
+        try:
+            value = first()
+        except FirstError:
+            pass
+        value = None
+
+
+def call_tail_control(flag):
+    if flag:
+        try:
+            first()
+        except FirstError:
+            pass
+        finish()
+
+
+def nonterminal_control(flag):
+    if flag:
+        try:
+            first()
+        except FirstError:
+            pass
+        value = None
+    finish()
+
+
+def simple_assignment_control(flag):
+    if flag:
+        value = None
+";
+        assert_matches_cpython_marshal(source, "terminal_assignment_return_boundary.py");
     }
 
     #[test]
@@ -1489,6 +1625,43 @@ async def async_generator_after_yield(value):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_protected_iterator_none_default_owners() {
+        let source = r"def protected_defaults(items):
+    try:
+        for item in items:
+            first = item.first
+            second = item.second
+            if first is None:
+                first = 0
+            if second is None:
+                second = 1
+            consume(first, second)
+    except Error:
+        recover()
+
+
+def direct_control(value):
+    try:
+        if value is None:
+            value = 0
+        consume(value)
+    except Error:
+        recover()
+
+
+def with_control(manager, value):
+    try:
+        with manager:
+            if value is None:
+                value = 0
+            consume(value)
+    except Error:
+        recover()
+";
+        assert_matches_cpython_marshal(source, "protected_iterator_none_default_owners.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_loop_tail_assertion_owners() {
         let source = r"async def coroutine_direct(wait, items, value):
     await wait()
@@ -1674,6 +1847,42 @@ def terminal_loop(manager):
             pass
 ";
         assert_matches_cpython_marshal(source, "with_handler_fed_pop_block.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_direct_handler_returns_inside_synchronous_with() {
+        let source = r"def direct(manager):
+    with manager:
+        try:
+            return produce()
+        except Error:
+            return recover()
+
+
+def fully_terminating(manager, value, output):
+    with manager:
+        if is_array(value):
+            if output is None:
+                return first()
+            else:
+                return second()
+        elif output is None:
+            try:
+                return typed()
+            except AttributeError:
+                return fallback()
+        else:
+            return third()
+
+
+def enclosing_try_control(manager):
+    try:
+        with manager:
+            return produce()
+    except Error:
+        return recover()
+";
+        assert_matches_cpython_marshal(source, "with_direct_handler_returns.py");
     }
 
     #[test]
@@ -1950,6 +2159,32 @@ async def asynchronous(manager, values):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_protected_iterator_atomic_continue_owners() {
+        let source = r##"def call_condition(manager, lines):
+    with manager:
+        for line in lines:
+            if line.strip().startswith("#"):
+                continue
+            consume(line)
+
+
+def name_condition(manager, lines, initial):
+    ignoring = initial
+    with manager:
+        for line in lines:
+            if ignoring:
+                if line:
+                    ignoring = False
+                continue
+            if line.strip().startswith("#"):
+                continue
+            consume(line)
+
+"##;
+        assert_matches_cpython_marshal(source, "protected_iterator_atomic_continue.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_nonfinal_branching_with_body_control() {
         let source = r"def nonfinal(manager, first, second):
     with manager:
@@ -2121,6 +2356,83 @@ def iteration(items, flag):
     return value
 ";
         assert_matches_cpython_marshal(source, "inlined_break_nop.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_break_after_try_handler() {
+        let source = r"def after_handler(items):
+    for item in items:
+        if item:
+            try:
+                value = item()
+            except Error:
+                pass
+            break
+    return None, None, None
+
+
+def terminal_branch_before_break(items, first, second):
+    for item in items:
+        try:
+            value = item()
+            if first and second:
+                return value
+        except Error:
+            pass
+        break
+    return None, None, None
+
+
+def direct_control(items):
+    for item in items:
+        if item:
+            value = item()
+            break
+    return None, None, None
+
+
+def named_tuple_control(items):
+    first = None
+    second = None
+    for item in items:
+        if item:
+            first = item
+            break
+    return first, second
+";
+        assert_matches_cpython_marshal(source, "break_after_try_handler.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_short_circuit_loop_tail_backedge() {
+        let source = r#"def update(target, source, force):
+    for key in source:
+        if key == "first":
+            if force or key not in target:
+                target[key] = source[key]
+        elif key == "second":
+            target[key] = source[key]
+        else:
+            raise ValueError(key)
+"#;
+        assert_matches_cpython_marshal(source, "short_circuit_loop_tail_backedge.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_nested_fallthrough_if_exit() {
+        let source = r"def nested(flag, inner, extra):
+    if flag:
+        if inner:
+            first()
+        else:
+            second()
+            if extra:
+                third()
+    else:
+        fallback()
+    after()
+";
+        assert_matches_cpython_marshal(source, "nested_fallthrough_if_exit.py");
     }
 
     #[test]
@@ -2616,6 +2928,64 @@ def explicit_else(flag):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_trailing_if_handler_cleanup() {
+        let source = r"def call_body(mapping, key):
+    try:
+        value = mapping[key]
+    except KeyError:
+        if key not in mapping.values():
+            print(key)
+    value = key
+
+
+def named_call_body(mapping, key):
+    try:
+        value = mapping[key]
+    except KeyError as error:
+        if key not in mapping.values():
+            print(error)
+    value = key
+
+
+def bare_call_body(mapping, key):
+    try:
+        value = mapping[key]
+    except:
+        if key not in mapping.values():
+            print(key)
+    value = key
+
+
+def direct_tail(mapping, key):
+    try:
+        value = mapping[key]
+    except KeyError:
+        print(key)
+    value = key
+
+
+def terminating_if(mapping, key):
+    try:
+        value = mapping[key]
+    except KeyError:
+        if key not in mapping.values():
+            raise
+    value = key
+
+
+def followed_statement(mapping, key):
+    try:
+        value = mapping[key]
+    except KeyError:
+        if key not in mapping.values():
+            print(key)
+        finish()
+    value = key
+";
+        assert_matches_cpython_marshal(source, "trailing_if_handler_cleanup.py");
+    }
+
+    #[test]
     fn matches_cpython_none_condition_marker_owners_in_exception_handlers() {
         let source = r"def is_none(value):
     try:
@@ -2695,6 +3065,41 @@ def later_bare_handler_control(value):
                 pass
 ";
         assert_matches_cpython_marshal(source, "named_handler_nested_finally.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_named_handler_nested_try_else_cleanup() {
+        let source = r"def nested_branch(flag, header):
+    try:
+        value = parse(header)
+    except SyntaxError as error:
+        if flag:
+            try:
+                value = parse_legacy(header)
+            except SyntaxError as nested:
+                raise ValueError(header) from nested
+            else:
+                warn(header)
+        else:
+            raise ValueError(header) from error
+    consume(value)
+    return value
+
+
+def direct_control(header):
+    try:
+        value = parse(header)
+    except SyntaxError as error:
+        try:
+            value = parse_legacy(header)
+        except SyntaxError as nested:
+            raise ValueError(header) from nested
+        else:
+            warn(header)
+    consume(value)
+    return value
+";
+        assert_matches_cpython_marshal(source, "named_handler_nested_try_else.py");
     }
 
     #[test]
@@ -2976,6 +3381,60 @@ def nested_handler_branch_control(key):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_nested_conversion_loop_handler_exits() {
+        let source = r"def classify(values):
+    result = []
+    for value in values:
+        try:
+            int(value)
+        except (ValueError, TypeError):
+            try:
+                float(value)
+            except (ValueError, TypeError):
+                try:
+                    complex(value)
+                except (ValueError, TypeError):
+                    result.append(type(value))
+                else:
+                    result.append(complex)
+            else:
+                result.append(float)
+        else:
+            result.append(int)
+    return result
+
+
+def two_levels(values):
+    result = []
+    for value in values:
+        try:
+            int(value)
+        except (ValueError, TypeError):
+            try:
+                float(value)
+            except (ValueError, TypeError):
+                result.append(type(value))
+            else:
+                result.append(float)
+        else:
+            result.append(int)
+    return result
+
+
+def unlocated_bare_raise_cleanup(attribute, fields, options):
+    try:
+        assign(attribute)
+    except Exception:
+        fields = fields or {}
+        options = options or {}
+        if not (attribute in fields or attribute in options):
+            raise
+    finish()
+";
+        assert_matches_cpython_marshal(source, "nested_conversion_loop_handler_exits.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_direct_try_body_branch_exit_owners() {
         let source = r"def direct_exit(marker, text):
     try:
@@ -2989,6 +3448,29 @@ def nested_handler_branch_control(key):
     consume(left, right)
 
 
+def direct_comparison_exit(array, dtype):
+    try:
+        if array.shape[1] > 0:
+            consolidated = array.view(dtype)
+        else:
+            consolidated = empty(len(array), dtype=dtype)
+    except TypeError as error:
+        message = 'unsupported dtype'
+        raise TypeError(message) from error
+    consume(consolidated)
+
+
+def direct_assignment_fallthrough(flag):
+    try:
+        if flag:
+            value = first()
+        else:
+            value = second()
+    except Error:
+        value = fallback()
+    consume(value)
+
+
 def protected_join_control(marker, text):
     try:
         if marker in text:
@@ -2999,6 +3481,19 @@ def protected_join_control(marker, text):
         consume(left, right)
     except Error:
         raise ValueError
+
+
+def try_else_control(flag):
+    try:
+        if flag:
+            first()
+        else:
+            second()
+    except Error:
+        report()
+    else:
+        success()
+    after()
 ";
         assert_matches_cpython_marshal(source, "direct_try_body_branch_exit_owners.py");
     }
@@ -3058,6 +3553,78 @@ def single_normal_exit(flag):
     after()
 ";
         assert_matches_cpython_marshal(source, "bare_handler_cleanup_controls.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_nested_handler_loop_and_cleanup_owners() {
+        let source = r#"def bare_handler_loop_marker(values):
+    try:
+        action()
+    except Error:
+        for value in values:
+            match = regex.search("value", value)
+            if match:
+                result = match.group("value")
+            if result is not None:
+                break
+        return result
+
+
+def ordinary_bare_handler_condition(value):
+    try:
+        action()
+    except Error:
+        if regex.search("value", value):
+            recover()
+        finish()
+
+
+def protected_break_and_following_empty_handler(values):
+    result = []
+    try:
+        for value in values:
+            if value == "stop":
+                break
+            result.append(value)
+        try:
+            result.append(source.attribute())
+        except AttributeError:
+            pass
+        consume(
+            value00, value01, value02, value03, value04,
+            value05, value06, value07, value08, value09,
+            value10, value11, value12, value13, value14,
+            value15, value16, value17, value18, value19,
+            value20, value21, value22, value23, value24,
+            value25, value26, value27, value28, value29,
+            value30, value31, value32, value33, value34,
+            value35, value36, value37, value38, value39,
+        )
+    except ImportError:
+        pass
+    return result
+
+
+def triple_named_handlers_with_continuation():
+    try:
+        first()
+    except Error as error:
+        first_message = str(error)
+        try:
+            second()
+        except Error as error:
+            second_message = str(error)
+            try:
+                third()
+                result = 3
+            except Error as error:
+                third_message = str(error)
+                consume(first_message, second_message, third_message)
+    normalized = normalize(result)
+    consume(normalized)
+    return normalized
+"#;
+        assert_matches_cpython_marshal(source, "nested_handler_cleanup_owners.py");
     }
 
     #[test]
@@ -3431,6 +3998,34 @@ print(" ".join(
     fn matches_cpython_marshal_for_short_circuit_comprehension_filters() {
         let source = "z = [a for a in range(5) if a or b or c or d and e]\n";
         assert_matches_cpython_marshal(source, "comprehension_filter.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_protected_comprehension_filter_exits() {
+        let source = r"def with_owner(manager, items):
+    with manager:
+        values = [item.name for item in items if item.is_file()]
+    return values
+
+def none_filter_owner(manager, items):
+    with manager:
+        present = [item for item in items if item is not None]
+    return present
+";
+        assert_matches_cpython_marshal(source, "protected_comprehension_filter_exits.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_unprotected_comprehension_filter_exits() {
+        let source = r"def unprotected(items):
+    return [item for item in items if keep(item)]
+
+def generator_scope(manager, items):
+    with manager:
+        values = (item for item in items if keep(item))
+    return values
+";
+        assert_matches_cpython_marshal(source, "unprotected_comprehension_filter_exits.py");
     }
 
     #[test]
@@ -3967,6 +4562,26 @@ def consecutive_fresh(values):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_optimized_tuple_calls_in_comprehension_and_branch_exits() {
+        let source = r"def comprehension_result(prefix, sizes, dimensions):
+    return [prefix + tuple(sizes[dimension] for dimension in core_dimensions)
+            for core_dimensions in dimensions]
+
+
+def branch_result(results, shapes, dtypes):
+    if results is None:
+        arrays = tuple(make(shape, dtype)
+                       for shape, dtype in zip(shapes, dtypes))
+    else:
+        arrays = tuple(make_like(result, shape, dtype)
+                       for result, shape, dtype
+                       in zip(results, shapes, dtypes))
+    return arrays
+";
+        assert_matches_cpython_marshal(source, "optimized_tuple_branch_exits.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_branch_result_ownership() {
         let source = "def ternary(name, suffix):\n    return name[:-len(suffix)] if name.endswith(suffix) else name\n\ndef simple(condition, left, right):\n    return left if condition else right\n\ndef terminal_attribute(condition, holder, left, right):\n    holder.value = left.value if condition else right\n\ndef boolean(left, right):\n    return left or right\n\ndef nested(condition, name):\n    return name.upper() if condition else name\n\ndef nested_boolean(left, middle, right):\n    return (left and middle) or right, (left or middle) and right\n\ndef folded_annotation(arg: 2 or None | int):\n    pass\n\nlambda_conditional = lambda condition, left, right: left if condition else right\nlambda_boolean = lambda left, right: left or right\nmodule_boolean = (left and middle) or right\n";
         assert_matches_cpython_marshal(source, "ownership.py");
@@ -4000,6 +4615,26 @@ def assignment_control(holder, outer, inner, first, second, third):
     fn matches_cpython_marshal_for_a_named_comprehension_target() {
         let source = "[value for value in values]\n{key: (left, right) for key, (left, right) in values}\nmodule_result = {last := value for value in range(2)}\nnested_filter = [(key, value) for key, value in pairs if key in [field.name for field in fields]]\nnested_iterable = [(left, right) for left in values for right in [item.value for item in items]]\ngenerator_assignment = list((captured := value for value in values))\n\ndef f():\n    exponential, base_multiplier = 1, 2\n    hash_map = {\n        (exponential := (exponential * base_multiplier) % 3): i + 1\n        for i in range(2)\n    }\n    return hash_map\n";
         assert_matches_cpython_marshal(source, "named_comprehension.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_first_iterable_comprehension_target_order() {
+        let source = r"def first_iterable_targets(values):
+    return [outer for outer in [inner for inner in values]]
+
+
+def body_targets(values):
+    return [[inner for inner in values] for outer in values]
+
+
+def later_iterable_targets(values):
+    return [(outer, inner) for outer in values for inner in [nested for nested in values]]
+
+
+def generator_first_iterable(values):
+    return [outer for outer in (inner for inner in values)]
+";
+        assert_matches_cpython_marshal(source, "first_iterable_comprehension_targets.py");
     }
 
     #[test]
@@ -4414,8 +5049,48 @@ def loop_controls(items, low, value, high):
         if not (low <= value < high):
             continue
         consume(item)
+
+
+def loop_return(items, low, high):
+    for item in items:
+        if not (low <= item <= high):
+            return False
+    return True
 "#;
         assert_matches_cpython_marshal(source, "terminal_negated_chained_comparison_exit_nops.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_positive_chained_comparison_small_exits() {
+        let source = r"def tuple_return(left, right, limit):
+    if left == right == limit:
+        return left, left
+    consume()
+    return fallback()
+
+
+def direct_raise(left, right, limit):
+    if left == right == limit:
+        raise ValueError
+    consume()
+    return fallback()
+
+
+def multi_statement_control(left, right, limit):
+    if left == right == limit:
+        consume(left)
+        return left, left
+    consume()
+    return fallback()
+
+
+def final_none_control(first, second):
+    if first is second is None:
+        return (None,) * 4
+    consume()
+    return fallback()
+";
+        assert_matches_cpython_marshal(source, "positive_chained_comparison_small_exits.py");
     }
 
     #[test]
@@ -4877,6 +5552,53 @@ def ordinary_guard(value):
         raise
 ";
         assert_matches_cpython_marshal(source, "try_with_normal_exits.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_try_with_suppressed_exit_in_finally_body() {
+        let source = r"def terminal_nested(manager):
+    try:
+        try:
+            with manager:
+                action()
+        except Error:
+            recover()
+    finally:
+        cleanup()
+
+
+def following_nested(manager):
+    try:
+        try:
+            with manager:
+                action()
+        except Error:
+            recover()
+        after()
+    finally:
+        cleanup()
+
+
+def with_not_final(manager):
+    try:
+        try:
+            with manager:
+                action()
+            after()
+        except Error:
+            recover()
+    finally:
+        cleanup()
+
+
+def sole_finally(manager):
+    try:
+        with manager:
+            action()
+    finally:
+        cleanup()
+";
+        assert_matches_cpython_marshal(source, "try_with_suppressed_exit_in_finally_body.py");
     }
 
     #[test]
@@ -5685,9 +6407,110 @@ def final_elif(action, first, second):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_nested_try_return_and_try_else_join_copies() {
+        let source = r"def protected_branch_return(flag):
+    try:
+        if flag:
+            try:
+                action()
+            except Error:
+                raise ValueError
+        return value
+    except ValueError:
+        return fallback
+
+
+def try_else_nested_join(value, names, other):
+    try:
+        action()
+    except TypeError:
+        recover()
+    else:
+        if names is not None:
+            if value.names is None:
+                first()
+            else:
+                second()
+        elif other:
+            third()
+    return value
+";
+        assert_matches_cpython_marshal(source, "nested_try_return_and_try_else_join.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_try_body_exits_after_if_joins() {
         let source = include_str!("fixtures/try_body_exit_joins.py");
         assert_matches_cpython_marshal(source, "try_body_exit_joins.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_direct_try_if_exit_owners() {
+        let source = r"def joined_loop(items, first, second):
+    for item in items:
+        if first:
+            prefix = item
+        else:
+            prefix = None
+        try:
+            if second:
+                value = item
+            else:
+                value = prefix
+        except ValueError:
+            value = None
+        consume(value)
+
+
+def nested_first_branch(items, outer, inner):
+    for item in items:
+        try:
+            if outer:
+                if inner:
+                    value = item
+                else:
+                    value = None
+            else:
+                value = 0
+        except ValueError:
+            value = -1
+        consume(value)
+
+
+def nested_call_branch(first, second, rowtype, coltype, item):
+    try:
+        if first:
+            row = rowtype(item)
+        else:
+            row = coltype(item)
+        if second:
+            result = row.dtype.char
+        else:
+            value = row + item
+            if predicate(value):
+                result = value.dtype.char
+            else:
+                result = type(value).dtype.char
+    except ValueError:
+        result = '!'
+    except TypeError:
+        result = '#'
+    consume(result)
+
+
+def try_else_control(items, flag):
+    for item in items:
+        try:
+            if flag:
+                value = item
+            else:
+                value = None
+        except ValueError:
+            value = 0
+        else:
+            consume(value)
+";
+        assert_matches_cpython_marshal(source, "direct_try_if_exit_owners.py");
     }
 
     #[test]
@@ -6253,6 +7076,61 @@ def shared_join(flag, left, right):
         assert_matches_cpython_marshal(source, "percent_format_fallthrough.py");
     }
 
+    #[test]
+    fn matches_cpython_marshal_for_masked_array_control_flow() {
+        let source = r#"def flatten(sequence):
+    try:
+        for element in sequence:
+            if hasattr(element, "__iter__"):
+                yield from flatten(element)
+            else:
+                yield element
+    except TypeError:
+        yield sequence
+
+
+def view(dtype, type_, output, fill):
+    if dtype is None:
+        output = convert(dtype)
+    elif type_ is None:
+        try:
+            if issubclass(dtype, object):
+                output = convert(dtype)
+                dtype = None
+            else:
+                output = convert(dtype)
+        except TypeError:
+            output = convert(dtype)
+    else:
+        output = convert(dtype)
+
+    if output is not None:
+        if fill is None:
+            if dtype is None:
+                pass
+            else:
+                output.fill = None
+        else:
+            output.fill = fill
+    return output
+
+
+def filled(action, self, mask, result):
+    try:
+        action()
+    except (TypeError, AttributeError):
+        result = fallback()
+    except IndexError:
+        if self.data.shape:
+            raise
+        elif mask:
+            result = replacement()
+        else:
+            result = self.data
+    return result
+"#;
+        assert_matches_cpython_marshal(source, "masked_array_control_flow.py");
+    }
     #[test]
     fn matches_cpython_marshal_for_folded_not_and_terminal_while() {
         let source = "folded = not (\n    True\n)\n\ndef loop():\n    while not check() and left < right:\n        pass\n";

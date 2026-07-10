@@ -27,14 +27,15 @@ fn instruction_constructors_set_audited_defaults() {
     assert!(!regular.converted_pop_block);
     assert_eq!(regular.hidden_exception_owner_slots, 0);
     assert_eq!(regular.jump_policy, JumpPolicy::default());
-    assert!(!regular.backward_jump_provenance.is_authored_break());
+    assert!(!regular.jump_provenance.is_authored_break());
+    assert!(!regular.jump_provenance.transitive_small_exit_inlining());
 
     let synthetic = Instruction::synthetic(NOP, Operand::Value(0), SourceLocation::NONE, None);
     assert!(!synthetic.jump_policy.inline_small_exit());
     let mut expected_synthetic_policy = JumpPolicy::default();
     expected_synthetic_policy.prevent_small_exit_inlining();
     assert_eq!(synthetic.jump_policy, expected_synthetic_policy);
-    assert!(!synthetic.backward_jump_provenance.is_authored_break());
+    assert!(!synthetic.jump_provenance.is_authored_break());
     assert_eq!(synthetic.exception_policy, ExceptionPolicy::default());
     assert_eq!(regular.borrow_fallthrough, BorrowFallthrough::Reachable);
     assert_eq!(synthetic.borrow_fallthrough, BorrowFallthrough::Reachable);
@@ -492,7 +493,8 @@ fn fusion_preserves_each_typed_instruction_policy() {
     first.jump_policy.retain_nop();
     first.jump_policy.mark_borrow_empty_block();
     first.jump_policy.preserve_explicit_nop();
-    first.backward_jump_provenance.mark_authored_break();
+    first.jump_provenance.mark_authored_break();
+    first.jump_provenance.allow_transitive_small_exit_inlining();
     first
         .exception_policy
         .exclude(ExceptionExclusion::IfExtended);
@@ -533,7 +535,8 @@ fn fusion_preserves_each_typed_instruction_policy() {
     assert_eq!(fused.fusion_policy, FusionPolicy::default());
     assert!(fused.converted_pop_block);
     assert!(fused.jump_policy.preserves_explicit_nop());
-    assert!(fused.backward_jump_provenance.is_authored_break());
+    assert!(fused.jump_provenance.is_authored_break());
+    assert!(fused.jump_provenance.transitive_small_exit_inlining());
     assert_eq!(fused.hidden_exception_owner_slots, 3);
     assert_eq!(fused.location, first.location);
     assert_eq!(fused.depth_after, second.depth_after);
@@ -1179,6 +1182,78 @@ fn no_location_block_inlining_reaches_a_fixed_point() {
             .collect::<Vec<_>>(),
         [0, 1, 1, 1, 1]
     );
+}
+
+#[test]
+fn no_location_block_inlining_crosses_exception_splits() {
+    let restart = super::Label(0);
+    let source = super::Label(1);
+    let cleanup = super::Label(2);
+    let outer_unwind = super::Label(3);
+    let handler = super::Label(4);
+    let mut cleanup_jump = Instruction::new(
+        JUMP_BACKWARD_NO_INTERRUPT,
+        Operand::Backward(restart),
+        SourceLocation::NONE,
+        None,
+    );
+    cleanup_jump.jump_policy.prevent_threading_target();
+    cleanup_jump.no_location_policy.allow_block_inlining();
+    let mut assembler = optimization_pipeline(vec![
+        Item::Label(restart),
+        pass_instruction(NOP, 0, 0),
+        Item::Label(source),
+        pass_instruction(LOAD_CONST, 0, 1),
+        Item::Instruction(Instruction::new(
+            JUMP_FORWARD,
+            Operand::Forward(cleanup),
+            SourceLocation::new(1, 1, 0, 0),
+            None,
+        )),
+        Item::Label(cleanup),
+        pass_instruction(POP_EXCEPT, 0, -1),
+        Item::Label(outer_unwind),
+        pass_instruction(POP_EXCEPT, 0, -1),
+        Item::Instruction(cleanup_jump),
+        Item::Label(handler),
+        pass_instruction(RERAISE, 0, -1),
+    ]);
+    assembler.exception_regions.push(super::ExceptionRegion {
+        start: source,
+        end: outer_unwind,
+        target: handler,
+        depth: 0,
+        preserve_lasti: true,
+    });
+
+    assembler.duplicate_exit_blocks();
+    assembler.propagate_locations_within_blocks();
+
+    assert_eq!(
+        graph_opcodes(&assembler),
+        [
+            NOP,
+            LOAD_CONST,
+            POP_EXCEPT,
+            POP_EXCEPT,
+            JUMP_BACKWARD_NO_INTERRUPT,
+            POP_EXCEPT,
+            JUMP_BACKWARD_NO_INTERRUPT,
+            RERAISE,
+        ]
+    );
+    assert_eq!(
+        assembler
+            .graph
+            .iter_items()
+            .filter_map(|item| match item {
+                Item::Instruction(instruction) => Some(instruction.location.line),
+                Item::Label(_) => None,
+            })
+            .collect::<Vec<_>>(),
+        [0, 1, 1, 1, 1, -1, -1, -1]
+    );
+    assert_eq!(assembler.exception_regions.len(), 2);
 }
 
 #[test]

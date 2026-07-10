@@ -16,7 +16,9 @@ use super::source::{
     debug_text_range, interpolated_string_content_range, strip_expression_comments,
     unparse_annotation,
 };
-use super::statement::try_propagates_protected_loop_tail_mode;
+use super::statement::{
+    NestedIfExitLocation, nested_if_exit_location, try_propagates_protected_loop_tail_mode,
+};
 use super::symbol::{
     CompilerStackEffect, ReraiseStackState, compiler_stack_effect, validate_compiler_stack_effect,
 };
@@ -81,6 +83,35 @@ fn protected_loop_tail_mode_requires_assign_then_raise_handlers() {
             "unexpected protected loop-tail handler classification for:\n{source}"
         );
     }
+}
+
+#[test]
+fn nested_final_else_propagates_an_unlocated_exit() {
+    let source = r"if mask is None:
+    if not keep:
+        mask = False
+    elif isinstance(data, tuple):
+        mask = data
+    else:
+        if copy:
+            data.mask = mask
+            if getmask(data):
+                if data.mask.shape != data.shape:
+                    data.mask.shape = data.shape
+else:
+    mask = True
+";
+    let parsed = parse_module(source).unwrap();
+    let [Stmt::If(outer)] = parsed.suite().as_slice() else {
+        panic!("expected an outer if statement");
+    };
+    let Some(Stmt::If(nested)) = outer.body.last() else {
+        panic!("expected a nested if statement");
+    };
+    assert!(matches!(
+        nested_if_exit_location(nested, true),
+        Some(NestedIfExitLocation::Unlocated)
+    ));
 }
 
 #[test]

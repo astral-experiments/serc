@@ -41,6 +41,7 @@ pub(super) enum ObjectKey<'a> {
     // These objects also retain identity. The address is used only as a marshal-graph key and is
     // never written to the output.
     SliceMember(usize),
+    RecreatedFrozenSet(usize),
     Code(usize),
     CodeBytes(usize),
     LocalKinds(usize),
