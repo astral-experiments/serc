@@ -767,6 +767,37 @@ def loop_tail():
     }
 
     #[test]
+    fn matches_cpython_marshal_for_try_condition_fallthrough_ranges() {
+        let source = r"def short_circuit_break():
+    while True:
+        try:
+            if first() or second():
+                break
+        except BlockingIOError:
+            pass
+
+
+def single_condition_break():
+    while True:
+        try:
+            if first():
+                break
+        except BlockingIOError:
+            pass
+
+
+def short_circuit_continue():
+    while True:
+        try:
+            if first() or second():
+                continue
+        except BlockingIOError:
+            pass
+";
+        assert_matches_cpython_marshal(source, "try_condition_fallthrough_ranges.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_multi_exit_try_loop_tails() {
         let source = r"def conditional(items):
     for item in items:
@@ -2946,6 +2977,41 @@ def later_bare_handler_control(value):
                 pass
 ";
         assert_matches_cpython_marshal(source, "named_handler_nested_finally.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_named_handler_nested_try_else_cleanup() {
+        let source = r"def nested_branch(flag, header):
+    try:
+        value = parse(header)
+    except SyntaxError as error:
+        if flag:
+            try:
+                value = parse_legacy(header)
+            except SyntaxError as nested:
+                raise ValueError(header) from nested
+            else:
+                warn(header)
+        else:
+            raise ValueError(header) from error
+    consume(value)
+    return value
+
+
+def direct_control(header):
+    try:
+        value = parse(header)
+    except SyntaxError as error:
+        try:
+            value = parse_legacy(header)
+        except SyntaxError as nested:
+            raise ValueError(header) from nested
+        else:
+            warn(header)
+    consume(value)
+    return value
+";
+        assert_matches_cpython_marshal(source, "named_handler_nested_try_else.py");
     }
 
     #[test]

@@ -5307,7 +5307,7 @@ impl Compiler {
                 && let Some(test) = terminating_if_fallthrough_test(nested)
             {
                 self.assembler
-                    .set_location(self.source_location(synthetic_condition_exit_range(test)));
+                    .set_location(self.source_location(condition_fallthrough_range(test)));
             } else if statement.orelse.is_empty()
                 && let Some(range) = suite_unary_not_fallthrough_range(&statement.body)
             {
@@ -5847,7 +5847,7 @@ impl Compiler {
                         handler.name.is_some() && !suite_terminates(&statement.body)
                     }
                     Stmt::If(tail) => {
-                        handler.name.is_none()
+                        (handler.name.is_none()
                             && tail
                                 .elif_else_clauses
                                 .last()
@@ -5858,7 +5858,24 @@ impl Compiler {
                                 .elif_else_clauses
                                 .iter()
                                 .all(|clause| clause.body.len() == 1)
-                            && (handler.body.len() > 1 || suite_terminates(&tail.body))
+                            && (handler.body.len() > 1 || suite_terminates(&tail.body)))
+                            // A terminating alternative leaves the nested try's normal exit as
+                            // the sole path to a named-handler cleanup. CPython copies the
+                            // cleanup onto that exit before placing the cold terminating arm.
+                            || (handler.name.is_some()
+                                && tail.elif_else_clauses.last().is_some_and(|clause| {
+                                    clause.test.is_none() && suite_terminates(&clause.body)
+                                })
+                                && matches!(
+                                    tail.body.last(),
+                                    Some(Stmt::Try(nested))
+                                        if !nested.orelse.is_empty()
+                                            && nested.handlers.iter().all(|handler| {
+                                                handler.as_except_handler().is_some_and(|handler| {
+                                                    suite_terminates(&handler.body)
+                                                })
+                                            })
+                                ))
                     }
                     _ => false,
                 });
