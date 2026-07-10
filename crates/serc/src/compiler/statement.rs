@@ -78,6 +78,7 @@ struct ExceptionHandlerContext {
     unwinds_before_sync_with: bool,
     leading_statement: Option<TextRange>,
     trailing_statement: Option<TextRange>,
+    ownerless_optimized_boolean_generator_test: Option<TextRange>,
     protect_outer_return_pop: bool,
     common_cleanup: Label,
     common_cleanup_depth: u32,
@@ -111,6 +112,7 @@ struct TryMarkerSlotContext {
     ownerless_prefix_slots: usize,
     protected_start_instruction: usize,
     ownerless_direct_condition: Option<TextRange>,
+    handler_starts_with_optimized_boolean_generator: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -274,6 +276,9 @@ pub(super) struct ControlFlowState {
     // remains inside the current protected region instead of exiting through its normal edge.
     current_statement_followed_by_try: bool,
     branch_join_successor: Option<TextRange>,
+    // Whether the current statement is nested directly in a terminal if branch suite.
+    pub(super) in_terminal_if_branch_suite: bool,
+
     // Whether that successor is a direct loop break.
     current_statement_followed_by_break: bool,
     // Whether the current expression is the complete value of an ordinary assignment and is an
@@ -285,6 +290,8 @@ pub(super) struct ControlFlowState {
     // Whether an optimized tuple call is the assignment in the first branch of an `if` whose
     // join is immediately followed by a local return.
     pub(super) copy_optimized_tuple_branch_exit: bool,
+    // Whether the current expression is being lowered as one atom of a Boolean condition.
+    pub(super) optimized_generator_boolean_condition: bool,
     // Whether that successor is a direct return of one local. CPython copies this tiny exit
     // before removing a constant-loop break edge, so its borrowed-load pass still visits it.
     current_statement_followed_by_name_return: bool,
@@ -351,6 +358,14 @@ impl ControlFlowState {
         !self.active_exception_handlers.is_empty()
     }
 
+    pub(super) fn is_ownerless_optimized_boolean_generator_test(&self, range: TextRange) -> bool {
+        self.active_exception_handlers
+            .last()
+            .is_some_and(|handler| {
+                handler.ownerless_optimized_boolean_generator_test == Some(range)
+            })
+    }
+
     fn is_direct_trailing_handler_statement(&self, range: TextRange) -> bool {
         self.active_exception_handlers
             .last()
@@ -383,6 +398,14 @@ impl ControlFlowState {
                     || context.ownerless_prefix_slots
                         >= current_instruction.saturating_sub(context.protected_start_instruction)
             })
+    }
+
+    pub(super) fn current_try_handler_starts_with_optimized_boolean_generator(&self) -> bool {
+        self.active_try_marker_slots
+            .last()
+            .copied()
+            .flatten()
+            .is_some_and(|context| context.handler_starts_with_optimized_boolean_generator)
     }
 
     fn in_exception_protected_iterator_loop(&self) -> bool {
@@ -1547,9 +1570,15 @@ impl Compiler {
                 )?;
                 self.mark_definitely_evaluated_locals(test);
                 let body_start = self.assembler.instruction_count();
-                let ((), emitted_fallthrough) = self.with_fallthrough_tracking(|compiler| {
-                    compiler.compile_suite_inner(body, true)
-                })?;
+                let ((), emitted_fallthrough) = self.with_control_override(
+                    |control| &mut control.in_terminal_if_branch_suite,
+                    true,
+                    |compiler| {
+                        compiler.with_fallthrough_tracking(|compiler| {
+                            compiler.compile_suite_inner(body, true)
+                        })
+                    },
+                )?;
                 if !suite_terminates(body) && !emitted_fallthrough {
                     if let Some(range) = suite_assert_success_fallthrough_range(body) {
                         self.assembler.set_location(self.source_location(range));
@@ -3085,7 +3114,7 @@ impl Compiler {
                     (matches!(body, [Stmt::Return(_) | Stmt::Raise(_)])
                         && stable_terminal_exit_layout)
                         .then(|| {
-                            final_chained_comparison_jump(test, false).or_else(|| {
+                            final_chained_comparison_jump(test).or_else(|| {
                                 (self.control.current_statement_has_following
                                     && matches!(test, Expr::Compare(comparison)
                                         if comparison.ops.len() > 1
@@ -5266,6 +5295,8 @@ impl Compiler {
             },
             protected_start_instruction: self.assembler.instruction_count(),
             ownerless_direct_condition,
+            handler_starts_with_optimized_boolean_generator:
+                try_handler_starts_with_optimized_boolean_generator(statement),
         });
         self.assembler.mark(try_start);
         self.control
@@ -5985,6 +6016,8 @@ impl Compiler {
                         leading_statement: handler.body.first().map(Ranged::range),
                         trailing_statement: handler.body.last().map(Ranged::range),
                         common_cleanup,
+                        ownerless_optimized_boolean_generator_test:
+                            handler_ownerless_optimized_boolean_generator_test(&handler.body),
                         protect_outer_return_pop: nested_handler_tail_if_with_terminal_handlers
                             || (handler_name.is_none()
                                 && (suite_terminates(&statement.body)
@@ -8244,34 +8277,39 @@ fn expression_contains_chained_comparison(expression: &Expr) -> bool {
     detector.found
 }
 
-// Returns the final chained comparison that `compile_jump_if` lowers with the requested edge.
+// Returns the final chained comparison that `compile_jump_if` lowers for this condition.
 // Only this final comparison can be adjacent to a copied terminal exit after CFG optimization.
-fn final_chained_comparison_jump(expression: &Expr, jump_on: bool) -> Option<TextRange> {
+fn final_chained_comparison_jump(expression: &Expr) -> Option<TextRange> {
     if let Expr::UnaryOp(unary) = expression
         && unary.op == UnaryOp::Not
     {
-        return final_chained_comparison_jump(&unary.operand, !jump_on);
+        return final_chained_comparison_jump(&unary.operand);
     }
     if let Expr::If(conditional) = expression
         && let Some(truthiness) = early_condition_truthiness(&conditional.test)
     {
-        return final_chained_comparison_jump(
-            if truthiness {
-                &conditional.body
-            } else {
-                &conditional.orelse
-            },
-            jump_on,
-        );
+        return final_chained_comparison_jump(if truthiness {
+            &conditional.body
+        } else {
+            &conditional.orelse
+        });
     }
     if let Expr::BoolOp(boolean) = expression {
         return boolean
             .values
             .last()
-            .and_then(|value| final_chained_comparison_jump(value, jump_on));
+            .and_then(final_chained_comparison_jump);
     }
     match expression {
-        Expr::Compare(comparison) if jump_on && comparison.ops.len() > 1 => Some(comparison.range),
+        Expr::Compare(comparison)
+            if comparison.ops.len() > 1
+                && !comparison
+                    .ops
+                    .iter()
+                    .any(|operator| matches!(operator, CmpOp::Is | CmpOp::IsNot)) =>
+        {
+            Some(comparison.range)
+        }
         _ => None,
     }
 }
@@ -9183,6 +9221,27 @@ fn suite_contains_loop_break(body: &[Stmt]) -> bool {
     })
 }
 
+fn try_handler_starts_with_optimized_boolean_generator(
+    statement: &ruff_python_ast::StmtTry,
+) -> bool {
+    statement.handlers.iter().any(|handler| {
+        handler.as_except_handler().is_some_and(|handler| {
+            handler_ownerless_optimized_boolean_generator_test(&handler.body).is_some()
+        })
+    })
+}
+
+fn handler_ownerless_optimized_boolean_generator_test(body: &[Stmt]) -> Option<TextRange> {
+    let Some(Stmt::If(statement)) = body.first() else {
+        return None;
+    };
+    let Expr::Call(call) = statement.test.as_ref() else {
+        return None;
+    };
+    (matches!(optimized_generator_callable(call), Some("all" | "any"))
+        && suite_contains_nested_handler_cold_join(&statement.body))
+    .then(|| statement.test.range())
+}
 fn suite_contains_loop_continue(body: &[Stmt]) -> bool {
     body.iter().any(|statement| match statement {
         Stmt::Continue(_) => true,
