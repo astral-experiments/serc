@@ -4935,15 +4935,48 @@ impl Compiler {
             }
             let handler_body_has_instructions =
                 self.assembler.instruction_count() > handler_body_start;
-            let handler_ends_with_inlineable_cleanup = handler.name.is_some()
-                && handler
-                    .body
-                    .last()
-                    .is_some_and(|statement| match statement {
-                        Stmt::Try(_) => true,
-                        Stmt::With(statement) => !suite_terminates(&statement.body),
-                        _ => false,
-                    });
+            let handler_ends_with_inlineable_cleanup =
+                handler.body.last().is_some_and(|tail| match tail {
+                    Stmt::Try(nested) => {
+                        handler.name.is_some()
+                            || (statement.body.len() == 1
+                                && !suite_terminates(&statement.body)
+                                && nested.finalbody.is_empty()
+                                && nested.orelse.is_empty()
+                                && nested.handlers.iter().any(|nested_handler| {
+                                    let Some(nested_handler) = nested_handler.as_except_handler()
+                                    else {
+                                        return false;
+                                    };
+                                    match nested_handler.body.last() {
+                                        Some(Stmt::Try(_)) => true,
+                                        Some(Stmt::Raise(statement)) => matches!(
+                                            statement.cause.as_deref(),
+                                            Some(Expr::NoneLiteral(_))
+                                        ),
+                                        _ => false,
+                                    }
+                                }))
+                    }
+                    Stmt::With(statement) => {
+                        handler.name.is_some() && !suite_terminates(&statement.body)
+                    }
+                    Stmt::If(tail) => {
+                        handler.name.is_none()
+                            && tail
+                                .elif_else_clauses
+                                .last()
+                                .is_some_and(|clause| clause.test.is_none())
+                            && if_normal_exit_count(tail) >= 2
+                            && tail.body.len() == 1
+                            && tail
+                                .elif_else_clauses
+                                .iter()
+                                .all(|clause| clause.body.len() == 1)
+                            && (handler.body.len() > 1 || suite_terminates(&tail.body))
+                    }
+                    _ => false,
+                });
             let handler_ends_with_nonterminal_with = matches!(
                 handler.body.last(),
                 Some(Stmt::With(statement)) if !suite_terminates(&statement.body)
@@ -4988,7 +5021,7 @@ impl Compiler {
                 {
                     self.assembler
                         .set_location(self.source_location(statement.range()));
-                // CPython leaves named cleanup after a nested try or trailing with unlocated so
+                // CPython leaves cleanup after these direct trailing compound joins unlocated so
                 // every incoming edge can inline its own copy with the predecessor's line.
                 } else if handler_ends_with_inlineable_cleanup {
                     self.assembler.set_location(SourceLocation::NONE);
