@@ -1092,6 +1092,14 @@ impl Compiler {
                     matches!(body.get(index + 1), Some(Stmt::Return(_) | Stmt::Raise(_)));
                 let followed_by_try = matches!(body.get(index + 1), Some(Stmt::Try(_)));
                 let previous_statement = body[..index].last();
+                // CPython leaves an empty join block after a sibling `if`; its borrowed-load
+                // traversal does not cross that block to reach a folded assertion's failure
+                // path, so the assertion message remains owned.
+                let constant_false_assert_after_if = matches!(
+                    (previous_statement, statement),
+                    (Some(Stmt::If(_)), Stmt::Assert(assertion))
+                        if early_condition_truthiness(&assertion.test) == Some(false)
+                );
                 let preceded_by_branch_join = previous_statement.is_some_and(|statement| {
                     matches!(statement, Stmt::If(previous) if if_normal_exit_count(previous) > 1)
                 });
@@ -1182,7 +1190,12 @@ impl Compiler {
                                                                             },
                                                                             preceded_by_branch_join
                                                                                 .then_some(statement.range()),
-                                                                            |compiler| compiler.compile_statement(statement),
+                                                                            |compiler| {
+                                                                                compiler.compile_with_strict_owned_loads(
+                                                                                    constant_false_assert_after_if,
+                                                                                    |compiler| compiler.compile_statement(statement),
+                                                                                )
+                                                                            },
                                                                         )
                                                                     },
                                                                 )
