@@ -6304,6 +6304,22 @@ def call_control(condition):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_future_import_name_call_collisions() {
+        let source = r"from __future__ import annotations, generator_stop as stopped
+
+def feature_name(annotations):
+    return annotations.items()
+
+def aliased_feature_name(stopped):
+    return stopped.items()
+
+def unrelated_name(receiver):
+    return receiver.items()
+";
+        assert_matches_cpython_marshal(source, "future_import_name_calls.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_a_nested_if_branch_exit() {
         let source = "seed = 0\nif True:\n    body()\ndef between():\n    pass\nreused = True\n\nif a:\n    if b:\n        body()\nelif c:\n    other()\nafter1(); after2(); after3(); after4(); after5(); after6()\n\nif x:\n    if True:\n        body()\nelif y:\n    other()\n\nif False if True else False:\n    body()\nelif True:\n    other()\nelse:\n    unreachable()\n\ndef conditional_in_loop(src, dst):\n    for k, v in src:\n        if True if True else False:\n            dst[k] = v\n\ndef terminating_nested_if(x, y):\n    if x:\n        if y:\n            raise Exception()\n        else:\n            body()\n    else:\n        other()\n    after()\n\ndef nested_if_before_implicit_return(x, y):\n    if x:\n        if y:\n            return\n        else:\n            value = 2\n    else:\n        value = 3\n    return\n\ndef nested_if_with_fallthrough_return(x, y):\n    if x:\n        if y:\n            return y\n    else:\n        return x\n    return None\n\ndef nested_if_before_loop_control(items, condition):\n    for item in items:\n        if item:\n            if condition:\n                value = 1\n            else:\n                value = 2\n            continue\n        else:\n            value = 3\n        continue\n\ndef protected_loop_control(items):\n    for item in items:\n        try:\n            body()\n            if item:\n                break\n        except Exception:\n            recover()\n    for item in items:\n        try:\n            body()\n            continue\n        except Exception:\n            recover()\n\ndef nested_break_then_return(items, condition):\n    for item in items:\n        if item:\n            if condition:\n                break\n        else:\n            return condition\n        return None\n\nif True:\n    if first:\n        one()\n    elif second:\n        two()\n";
         assert_matches_cpython_marshal(source, "nested_if.py");
