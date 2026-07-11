@@ -5008,6 +5008,9 @@ impl Compiler {
             self.compile_jump_if(&conditional.body, jump_on, label)?;
             self.assembler.set_location(SourceLocation::NONE);
             self.emit_jump_forward(JUMP_FORWARD, end, 0)?;
+            if self.control.retained_multiline_assert_ifexp_exit == Some(conditional.range) {
+                self.assembler.preserve_last_inlined_jump_nop();
+            }
             self.assembler.mark(otherwise);
             if self
                 .control
