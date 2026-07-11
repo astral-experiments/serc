@@ -6727,6 +6727,79 @@ print(load_after_consume(fallthrough_nested_handler))
     }
 
     #[test]
+    fn matches_cpython_marshal_for_bare_handler_normal_exit_borrowing() {
+        let source = r"def bare_pass(value):
+    try:
+        action()
+    except:
+        pass
+    consume(value)
+
+
+def bare_assignment(value):
+    try:
+        result = action()
+    except:
+        result = None
+    consume(value, result)
+
+
+def branch_local_tail(value, enabled):
+    if enabled:
+        try:
+            action()
+        except:
+            pass
+        consume(value)
+    finish()
+
+
+def loop_local_tail(value, items):
+    for item in items:
+        try:
+            action(item)
+        except:
+            pass
+        consume(value)
+
+
+def typed_handler_control(value):
+    try:
+        action()
+    except Error:
+        pass
+    consume(value)
+
+
+def direct_name_return(value):
+    try:
+        action()
+    except:
+        pass
+    return value
+
+
+def shared_branch_join(value, enabled):
+    if enabled:
+        try:
+            action()
+        except:
+            pass
+    consume(value)
+
+
+def shared_loop_join(value, items):
+    for item in items:
+        try:
+            action(item)
+        except:
+            pass
+    consume(value)
+";
+        assert_matches_cpython_marshal(source, "bare_handler_normal_exit_borrowing.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_empty_try_exit_borrow_boundaries() {
         let source = r"def fallthrough_if(value, flag):
     try:
