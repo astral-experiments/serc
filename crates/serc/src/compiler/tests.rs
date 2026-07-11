@@ -1542,6 +1542,53 @@ def loop_name(manager, flag, items):
 }
 
 #[test]
+fn protected_with_breaks_keep_loop_exit_nops() {
+    let source = r"def protected_break(manager, active, stop):
+    with manager:
+        try:
+            while active:
+                if stop:
+                    break
+                step()
+        except Error:
+            cleanup()
+
+def nested_finally_break(manager, active, stop):
+    with manager:
+        while True:
+            try:
+                while active:
+                    if stop:
+                        break
+                    step()
+            finally:
+                cleanup()
+";
+    let parsed = parse_module(source).unwrap();
+    let module = module_compiler(source, &parsed)
+        .compile_module(parsed.suite())
+        .unwrap();
+
+    for (name, expected_nops) in [("protected_break", 2), ("nested_finally_break", 3)] {
+        let function = module
+            .constants
+            .iter()
+            .find_map(|constant| match constant {
+                Constant::Code(code) if code.name == name => Some(code),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("module should contain {name}"));
+        let nops = function
+            .bytecode
+            .chunks_exact(2)
+            .filter(|instruction| instruction[0] == NOP.code())
+            .count();
+
+        assert_eq!(nops, expected_nops, "unexpected NOP count for {name}");
+    }
+}
+
+#[test]
 fn comparison_markers_distinguish_forward_and_threaded_loop_fallthroughs() {
     fn read_exception_varint(table: &[u8], index: &mut usize) -> u32 {
         let mut byte = table[*index];
