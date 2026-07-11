@@ -3637,6 +3637,35 @@ def direct_assertion_control(items):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_trailing_pass_handler_cleanup_locations() {
+        let source = r"def typed():
+    try:
+        body()
+    except Error:
+        recover()
+        pass
+    after()
+
+def bare():
+    try:
+        body()
+    except:
+        recover()
+        pass
+    after()
+
+def named():
+    try:
+        body()
+    except Error as error:
+        recover(error)
+        pass
+    after()
+";
+        assert_matches_cpython_marshal(source, "trailing_pass_handler_cleanup.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_noop_finally_bodies() {
         let source = r"try:
     body()
