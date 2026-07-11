@@ -4630,10 +4630,12 @@ impl Compiler {
             }
             self.pre_register_suite_names(&statement.orelse)?;
             self.assembler.mark(end);
+            // Small exit duplication copies a direct name return onto each authored break edge
+            // before redundant break jumps are removed. The copied load therefore remains
+            // visible to CPython's borrowed-load pass for every break layout.
             let copied_direct_return_exit = self.control.current_statement_followed_by_name_return
                 && self.control.active_exception_region_exclusions.is_empty()
-                && self.control.active_with_region_exclusions.is_empty()
-                && suite_ends_in_simple_conditional_break(&statement.body);
+                && self.control.active_with_region_exclusions.is_empty();
             let coroutine_terminal_break_exit = self.control.generator_region_start.is_some()
                 && suite_contains_loop_continue(&statement.body)
                 && statement.body.last().is_some_and(|statement| {
@@ -9905,15 +9907,6 @@ fn break_jump_needs_exception_region_exclusion(
     active_finally_try_bodies == 0
         || iterator_cleanup == IteratorCleanup::None
         || flags & CO_GENERATOR == 0
-}
-
-fn suite_ends_in_simple_conditional_break(body: &[Stmt]) -> bool {
-    matches!(
-        body.last(),
-        Some(Stmt::If(statement))
-            if statement.elif_else_clauses.is_empty()
-                && matches!(statement.body.as_slice(), [Stmt::Break(_)])
-    )
 }
 
 fn suite_is_import_assignment(body: &[Stmt]) -> bool {

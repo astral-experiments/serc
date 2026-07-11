@@ -7226,6 +7226,60 @@ def final_if_with_fallthrough(result):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_copied_name_returns_after_non_simple_breaks() {
+        let source = r"import dis
+
+def final_else_name_return(first, second, result):
+    while True:
+        if first:
+            step()
+        elif second:
+            other()
+        else:
+            break
+    return result
+
+def trailing_break_name_return(flag, result):
+    while True:
+        if flag:
+            step()
+            continue
+        other()
+        break
+    return result
+
+def final_else_call_return(first, second, result):
+    while True:
+        if first:
+            step()
+        elif second:
+            other()
+        else:
+            break
+    return wrap(result)
+
+def result_load(function):
+    loads = [
+        instruction.opname
+        for instruction in dis.get_instructions(function)
+        if instruction.argval == 'result'
+        and instruction.opname.startswith('LOAD_FAST')
+    ]
+    assert len(loads) == 1, loads
+    return loads[0]
+
+for function in (
+    final_else_name_return,
+    trailing_break_name_return,
+    final_else_call_return,
+):
+    print(result_load(function))
+";
+        assert_matches_cpython_marshal(source, "non_simple_break_name_returns.py");
+        assert_executes(source, "LOAD_FAST_BORROW\nLOAD_FAST_BORROW\nLOAD_FAST\n");
+    }
+
+    #[test]
     fn matches_cpython_load_ownership_for_constant_loop_exit_shapes() {
         let source = r"import dis
 
