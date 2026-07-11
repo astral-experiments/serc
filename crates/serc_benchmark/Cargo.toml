@@ -21,15 +21,15 @@ workspace = true
 [dependencies]
 codspeed-criterion-compat = { workspace = true, optional = true }
 criterion = { workspace = true, optional = true }
-mimalloc = { workspace = true, optional = true }
 serc_workloads = { workspace = true }
 
 [dev-dependencies]
+mimalloc = { workspace = true }
 serc = { path = "../serc" }
 
 [features]
 default = []
-benchmarks = ["dep:criterion", "dep:mimalloc"]
+benchmarks = ["dep:criterion"]
 codspeed = ["dep:codspeed-criterion-compat"]
 
 [[bench]]
