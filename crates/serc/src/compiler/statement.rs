@@ -7834,6 +7834,22 @@ impl Compiler {
         // `POP_BLOCK` is converted to a NOP before CPython's CFG optimizer runs. It normally
         // disappears, but can retain the sole predecessor's line when a small finally exit is
         // copied onto another edge.
+        let retained_assertion_test = if preserve_exit_nop
+            && matches!(
+                statement.finalbody.as_slice(),
+                [Stmt::Expr(_)] | [Stmt::Expr(_), Stmt::Expr(_) | Stmt::If(_)]
+            ) {
+            match statement.body.last() {
+                Some(Stmt::Assert(assertion))
+                    if matches!(assertion.test.as_ref(), Expr::Call(_) | Expr::Compare(_)) =>
+                {
+                    Some(assertion.test.as_ref())
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
         let exclude_assert_pop_block_from_enclosing_regions = statement.handlers.is_empty()
             && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR | CO_GENERATOR) == 0
             && !self.control.current_statement_has_following
@@ -7854,7 +7870,16 @@ impl Compiler {
                 });
         let normal_finally_pop_block = self.assembler.instruction_count();
         self.assembler.set_location(SourceLocation::NONE);
-        self.emit(NOP, 0, 0)?;
+        self.emit_with_exception_policy(
+            NOP,
+            0,
+            0,
+            if retained_assertion_test.is_some() {
+                ExceptionPolicy::EXCLUDE_ALWAYS
+            } else {
+                ExceptionPolicy::default()
+            },
+        )?;
         if let Some(start) = normal_finally_pop_block_exclusion_start {
             let end = self.assembler.label();
             self.assembler.mark(end);
@@ -7963,6 +7988,16 @@ impl Compiler {
             } else if preserve_exit_nop {
                 self.assembler
                     .preserve_last_redundant_jump_nop_after_threading();
+                let linear_finalbody = matches!(
+                    statement.finalbody.as_slice(),
+                    [Stmt::Expr(_)] | [Stmt::Expr(_), Stmt::Expr(_)]
+                );
+                if linear_finalbody
+                    && retained_assertion_test
+                        .is_some_and(|test| early_condition_truthiness(test) != Some(true))
+                {
+                    self.assembler.mark_last_retained_nop_borrow_fallthrough();
+                }
             }
             if let Some(exit_exclusion_start) = exit_exclusion_start {
                 let exit_exclusion_end = self.assembler.label();
