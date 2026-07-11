@@ -4914,11 +4914,21 @@ impl Compiler {
         if statement.orelse.is_empty()
             && !self.control.current_statement_has_following
             && !innermost_async_with
+            && self
+                .control
+                .active_with_exits
+                .last()
+                .is_some_and(|context| {
+                    !context.is_async
+                        && self.control.active_exception_region_exclusions.len()
+                            == context.exception_region_depth
+                })
+                .then_some(statement.body.as_slice())
+                .is_none_or(|body| !suite_contains_loop_break(body))
             && (!self.control.active_with_region_exclusions.is_empty()
                 || (!self.control.active_exception_region_exclusions.is_empty()
                     && self.control.active_finally_try_bodies == 0
                     && !matches!(statement.test.as_ref(), Expr::BoolOp(_))
-                    && !suite_contains_nested_loop_raise(&statement.body)
                     && self
                         .control
                         .direct_try_body_statements
@@ -9775,45 +9785,6 @@ fn suite_contains_abrupt_control_flow(body: &[Stmt]) -> bool {
     }
 
     let mut detector = AbruptControlFlowDetector::default();
-    for statement in body {
-        detector.visit_stmt(statement);
-    }
-    detector.found
-}
-
-// A raise inside an inner loop adds an independent protected exit. Keep that exception-region
-// layout separate from the normal final-while exit marker.
-fn suite_contains_nested_loop_raise(body: &[Stmt]) -> bool {
-    #[derive(Default)]
-    struct NestedLoopRaiseDetector {
-        found: bool,
-        loop_depth: usize,
-    }
-
-    impl<'ast> Visitor<'ast> for NestedLoopRaiseDetector {
-        fn visit_stmt(&mut self, statement: &'ast Stmt) {
-            if self.found {
-                return;
-            }
-            match statement {
-                Stmt::Raise(_) if self.loop_depth > 0 => {
-                    self.found = true;
-                    return;
-                }
-                Stmt::FunctionDef(_) | Stmt::ClassDef(_) => return,
-                Stmt::For(_) | Stmt::While(_) => {
-                    self.loop_depth += 1;
-                    walk_stmt(self, statement);
-                    self.loop_depth -= 1;
-                    return;
-                }
-                _ => {}
-            }
-            walk_stmt(self, statement);
-        }
-    }
-
-    let mut detector = NestedLoopRaiseDetector::default();
     for statement in body {
         detector.visit_stmt(statement);
     }

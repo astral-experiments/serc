@@ -1267,6 +1267,32 @@ def conditional_expression(manager, condition, first, second):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_terminal_sync_with_while_breaks() {
+        let source = r"def nested_tail_break(manager, enabled, stream):
+    with manager:
+        if enabled:
+            line = '\n'
+            position = stream.tell()
+            while line:
+                line = stream.readline()
+                if '[' in line:
+                    stream.seek(position)
+                    break
+                position = stream.tell()
+        finish(stream)
+
+def nested_break_only(manager, active, items, stop):
+    with manager:
+        while active:
+            for item in items:
+                if stop(item):
+                    break
+            step()
+";
+        assert_matches_cpython_marshal(source, "terminal_sync_with_while_break.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_terminal_while_exit_markers_in_async_with_bodies() {
         let source = r"async def direct_name(manager, flag):
     async with manager:
