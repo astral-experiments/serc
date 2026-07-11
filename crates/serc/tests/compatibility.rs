@@ -655,6 +655,34 @@ def empty_string_second():
     }
 
     #[test]
+    fn matches_cpython_marshal_for_startup_interned_frozenset_members() {
+        let source = r#"def startup_first(value):
+    if value in {None, "500", "ascii", "darwin", "kwargs", "l1", "l2", "update", "win32"}:
+        return 1
+    return 0
+
+
+def startup_second(value):
+    if value in {None, "500", "ascii", "darwin", "kwargs", "l1", "l2", "update", "win32"}:
+        return 2
+    return 0
+
+
+def ordinary_first(value):
+    if value in {None, "alpha", "elasticnet"}:
+        return 3
+    return 0
+
+
+def ordinary_second(value):
+    if value in {None, "alpha", "elasticnet"}:
+        return 4
+    return 0
+"#;
+        assert_matches_cpython_marshal(source, "startup_interned_frozensets.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_noninterned_constant_metadata_collisions() {
         let source = r#"from package.config import exported, café
 from other import *
