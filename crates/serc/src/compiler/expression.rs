@@ -2809,11 +2809,16 @@ impl Compiler {
                 "generator expression has no generators".to_string(),
             ));
         }
-        let is_async = generator.generators.iter().any(|generator| {
-            generator.is_async
-                || expression_contains_await(&generator.iter)
-                || generator.ifs.iter().any(expression_contains_await)
-        }) || expression_contains_await(&generator.elt);
+        let is_async = generator
+            .generators
+            .iter()
+            .enumerate()
+            .any(|(index, generator)| {
+                generator.is_async
+                    || (index > 0 && expression_suspends_current_scope(&generator.iter))
+                    || generator.ifs.iter().any(expression_suspends_current_scope)
+            })
+            || expression_suspends_current_scope(&generator.elt);
 
         let mut locals = vec![".0".to_string()];
         for comprehension in &generator.generators {
@@ -2855,19 +2860,21 @@ impl Compiler {
             freevars,
             ..LoweringFunctionPlan::default()
         };
-        let flags = if is_async {
-            CO_ASYNC_GENERATOR
-        } else {
-            CO_GENERATOR
-        } | if self.child_function_is_nested() {
-            CO_NESTED
-        } else {
-            0
-        } | if matches!(self.unit.scope, Scope::Class { .. }) {
-            CO_METHOD
-        } else {
-            0
-        } | (self.unit.flags & SUPPORTED_FUTURE_FLAGS);
+        let inlined_comprehension_parent = !self.control.active_comprehension_cleanups.is_empty();
+        let flags =
+            if is_async {
+                CO_ASYNC_GENERATOR
+            } else {
+                CO_GENERATOR
+            } | if self.child_function_is_nested() || inlined_comprehension_parent {
+                CO_NESTED
+            } else {
+                0
+            } | if matches!(self.unit.scope, Scope::Class { .. }) && !inlined_comprehension_parent {
+                CO_METHOD
+            } else {
+                0
+            } | (self.unit.flags & SUPPORTED_FUTURE_FLAGS);
         let mut child = Self::function(
             Arc::clone(&self.context),
             "<genexpr>",
@@ -5355,7 +5362,7 @@ pub(super) fn optimized_generator_callable(call: &ruff_python_ast::ExprCall) -> 
     Some(name.id.as_str())
 }
 
-fn expression_contains_await(expression: &Expr) -> bool {
+fn expression_suspends_current_scope(expression: &Expr) -> bool {
     #[derive(Default)]
     struct Collector {
         found: bool,
@@ -5363,10 +5370,29 @@ fn expression_contains_await(expression: &Expr) -> bool {
 
     impl<'ast> Visitor<'ast> for Collector {
         fn visit_expr(&mut self, expression: &'ast Expr) {
-            if matches!(expression, Expr::Lambda(_)) {
+            if self.found || matches!(expression, Expr::Lambda(_) | Expr::Generator(_)) {
                 return;
             }
             if matches!(expression, Expr::Await(_)) {
+                self.found = true;
+                return;
+            }
+            let has_async_comprehension = match expression {
+                Expr::ListComp(comprehension) => comprehension
+                    .generators
+                    .iter()
+                    .any(|generator| generator.is_async),
+                Expr::SetComp(comprehension) => comprehension
+                    .generators
+                    .iter()
+                    .any(|generator| generator.is_async),
+                Expr::DictComp(comprehension) => comprehension
+                    .generators
+                    .iter()
+                    .any(|generator| generator.is_async),
+                _ => false,
+            };
+            if has_async_comprehension {
                 self.found = true;
                 return;
             }
