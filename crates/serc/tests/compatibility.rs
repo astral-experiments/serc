@@ -7614,6 +7614,75 @@ def final_if_with_fallthrough(result):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_terminal_for_break_return_locations() {
+        let source = r"def multiple_breaks(items, flag):
+    if flag:
+        for item in items:
+            if first(item):
+                break
+            if second(item):
+                work(item)
+                break
+    else:
+        alternate()
+
+def for_else(items, flag):
+    if flag:
+        for item in items:
+            if first(item):
+                work(item)
+                break
+        else:
+            exhausted()
+    else:
+        alternate()
+
+def break_then_fallthrough(items, flag):
+    if flag:
+        for item in items:
+            if first(item):
+                break
+            work(item)
+    else:
+        alternate()
+
+def nested_break_control(items, flag):
+    if flag:
+        for item in items:
+            while ready(item):
+                break
+            work(item)
+    else:
+        alternate()
+
+def no_break_control(items, flag):
+    if flag:
+        for item in items:
+            work(item)
+    else:
+        alternate()
+
+def guarded_match_break(items, flag):
+    if flag:
+        for item in items:
+            match item:
+                case _ if ready(item):
+                    break
+                case _:
+                    work(item)
+    else:
+        alternate()
+
+def direct_loop_control(items):
+    for item in items:
+        if first(item):
+            work(item)
+            break
+";
+        assert_matches_cpython_marshal(source, "terminal_for_break_return_locations.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_copied_name_returns_after_non_simple_breaks() {
         let source = r"import dis
 

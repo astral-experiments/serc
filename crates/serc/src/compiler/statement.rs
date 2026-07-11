@@ -1,5 +1,5 @@
-use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
-use ruff_python_ast::{BoolOp, CmpOp, Expr, Pattern, Stmt, UnaryOp};
+use ruff_python_ast::visitor::{Visitor, walk_expr, walk_pattern, walk_stmt};
+use ruff_python_ast::{BoolOp, CmpOp, Expr, Pattern, PatternKeyword, Singleton, Stmt, UnaryOp};
 use ruff_text_size::{Ranged, TextRange};
 
 use super::{
@@ -1688,6 +1688,8 @@ impl Compiler {
                         self.assembler.set_location(
                             self.source_location(implicit_return_range(self, statement)),
                         );
+                    } else if terminal_for_break_exit_inherits_predecessor(body) {
+                        self.assembler.set_location(SourceLocation::NONE);
                     } else if self.assembler.instruction_count() > body_start
                         && let Some(location) = self.assembler.last_instruction_location()
                     {
@@ -1728,6 +1730,8 @@ impl Compiler {
                         self.assembler.set_location(
                             self.source_location(implicit_return_range(self, statement)),
                         );
+                    } else if terminal_for_break_exit_inherits_predecessor(body) {
+                        self.assembler.set_location(SourceLocation::NONE);
                     } else if self.assembler.instruction_count() > body_start
                         && let Some(location) = self.assembler.last_instruction_location()
                     {
@@ -9856,6 +9860,96 @@ fn terminal_try_bool_expression_supported(expression: &ruff_python_ast::ExprBool
     expression.values.iter().all(|value| match value {
         Expr::BoolOp(nested) => terminal_try_bool_expression_supported(nested),
         _ => jump_constant_truthiness(value).is_none(),
+    })
+}
+
+// CPython leaves this shared small exit source-less before copying it onto each authored break
+// edge. Each copy then inherits that break's location instead of the enclosing `for` location.
+fn terminal_for_break_exit_inherits_predecessor(body: &[Stmt]) -> bool {
+    matches!(
+        body.last(),
+        Some(Stmt::For(statement))
+            if !statement.is_async
+                && suite_contains_loop_break(&statement.body)
+                && !suite_contains_class_keyword_none_match_break(&statement.body)
+    )
+}
+
+fn pattern_contains_class_keyword_none(pattern: &Pattern) -> bool {
+    #[derive(Default)]
+    struct Detector {
+        in_class_keyword: bool,
+        found: bool,
+    }
+
+    impl<'a> Visitor<'a> for Detector {
+        fn visit_pattern(&mut self, pattern: &'a Pattern) {
+            if self.in_class_keyword
+                && matches!(
+                    pattern,
+                    Pattern::MatchSingleton(pattern) if pattern.value == Singleton::None
+                )
+            {
+                self.found = true;
+                return;
+            }
+            walk_pattern(self, pattern);
+        }
+
+        fn visit_pattern_keyword(&mut self, keyword: &'a PatternKeyword) {
+            let previous = self.in_class_keyword;
+            self.in_class_keyword = true;
+            self.visit_pattern(&keyword.pattern);
+            self.in_class_keyword = previous;
+        }
+    }
+
+    let mut detector = Detector::default();
+    detector.visit_pattern(pattern);
+    detector.found
+}
+
+// Class-keyword None subpatterns retain the generic match-failure layout. Keep their match-owned
+// breaks on the existing path until the surrounding instruction offsets can share this copy model.
+fn suite_contains_class_keyword_none_match_break(body: &[Stmt]) -> bool {
+    body.iter().any(|statement| match statement {
+        Stmt::If(statement) => {
+            suite_contains_class_keyword_none_match_break(&statement.body)
+                || statement
+                    .elif_else_clauses
+                    .iter()
+                    .any(|clause| suite_contains_class_keyword_none_match_break(&clause.body))
+        }
+        Stmt::Try(statement) => {
+            suite_contains_class_keyword_none_match_break(&statement.body)
+                || statement
+                    .handlers
+                    .iter()
+                    .filter_map(ruff_python_ast::ExceptHandler::as_except_handler)
+                    .any(|handler| suite_contains_class_keyword_none_match_break(&handler.body))
+                || suite_contains_class_keyword_none_match_break(&statement.orelse)
+                || suite_contains_class_keyword_none_match_break(&statement.finalbody)
+        }
+        Stmt::With(statement) => suite_contains_class_keyword_none_match_break(&statement.body),
+        Stmt::Match(statement) => {
+            let contains_class_keyword_none = statement
+                .cases
+                .iter()
+                .any(|case| pattern_contains_class_keyword_none(&case.pattern));
+            let contains_break = statement
+                .cases
+                .iter()
+                .any(|case| suite_contains_loop_break(&case.body));
+            (contains_class_keyword_none && contains_break)
+                || statement
+                    .cases
+                    .iter()
+                    .any(|case| suite_contains_class_keyword_none_match_break(&case.body))
+        }
+        Stmt::For(statement) => suite_contains_class_keyword_none_match_break(&statement.orelse),
+        Stmt::While(statement) => suite_contains_class_keyword_none_match_break(&statement.orelse),
+        Stmt::FunctionDef(_) | Stmt::ClassDef(_) => false,
+        _ => false,
     })
 }
 
