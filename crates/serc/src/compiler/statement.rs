@@ -282,6 +282,10 @@ pub(super) struct ControlFlowState {
     pub(super) same_line_try_body: bool,
     // Whether the statement currently entered by `compile_suite` has a sibling successor.
     pub(super) current_statement_has_following: bool,
+    // The first non-terminal assertion in the innermost iterator-loop body.
+    first_iterator_loop_assertion: Option<TextRange>,
+    // Set while that assertion's condition is lowered so its marker can inspect the final slot.
+    pub(super) preserve_first_iterator_loop_assertion_owner: bool,
     direct_comprehension_assignment_results: NameSet,
     // Whether that successor is another try statement. A loop break that targets this sibling
     // remains inside the current protected region instead of exiting through its normal edge.
@@ -4785,8 +4789,22 @@ impl Compiler {
                     )
         );
         let body_start = self.assembler.instruction_count();
+        let first_iterator_loop_assertion = match statement.body.as_slice() {
+            [Stmt::Assert(assertion), following, ..]
+                if condition_jump_target_count(&assertion.test, true) == 1
+                    && !is_optimized_generator_assert(following)
+                    && !matches!(assertion.test.as_ref(), Expr::Await(_) | Expr::Call(_)) =>
+            {
+                Some(assertion.range)
+            }
+            _ => None,
+        };
         let tail_jumps = self.with_loop_context(context, |compiler| {
-            compiler.compile_loop_tail_suite(&statement.body, start, true)
+            compiler.with_control_override(
+                |control| &mut control.first_iterator_loop_assertion,
+                first_iterator_loop_assertion,
+                |compiler| compiler.compile_loop_tail_suite(&statement.body, start, true),
+            )
         })?;
         if tail_jumps == LoopBackedge::Required && !suite_terminates(&statement.body) {
             if self.assembler.instruction_count() > body_start
@@ -4907,8 +4925,22 @@ impl Compiler {
             self.loop_break_policy(statement.range),
         );
         let body_start = self.assembler.instruction_count();
+        let first_iterator_loop_assertion = match statement.body.as_slice() {
+            [Stmt::Assert(assertion), following, ..]
+                if condition_jump_target_count(&assertion.test, true) == 1
+                    && !is_optimized_generator_assert(following)
+                    && !matches!(assertion.test.as_ref(), Expr::Await(_) | Expr::Call(_)) =>
+            {
+                Some(assertion.range)
+            }
+            _ => None,
+        };
         let tail_jumps = self.with_loop_context(context, |compiler| {
-            compiler.compile_loop_tail_suite(&statement.body, start, true)
+            compiler.with_control_override(
+                |control| &mut control.first_iterator_loop_assertion,
+                first_iterator_loop_assertion,
+                |compiler| compiler.compile_loop_tail_suite(&statement.body, start, true),
+            )
         })?;
         if tail_jumps == LoopBackedge::Required && !suite_terminates(&statement.body) {
             if self.assembler.instruction_count() > body_start
@@ -5244,6 +5276,9 @@ impl Compiler {
             Expr::Compare(comparison) if comparison.ops.len() > 1 => Some(comparison.range),
             _ => None,
         };
+        let preserve_iterator_loop_owner =
+            self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) != 0
+                && self.control.first_iterator_loop_assertion == Some(statement.range);
         self.with_control_override(
             |control| &mut control.include_assert_none_condition_owner,
             include_none_owner,
@@ -5251,7 +5286,13 @@ impl Compiler {
                 compiler.with_control_override(
                     |control| &mut control.retained_chained_comparison_exit,
                     retained_chained_comparison_exit,
-                    |compiler| compiler.compile_jump_if(&statement.test, true, end),
+                    |compiler| {
+                        compiler.with_control_override(
+                            |control| &mut control.preserve_first_iterator_loop_assertion_owner,
+                            preserve_iterator_loop_owner,
+                            |compiler| compiler.compile_jump_if(&statement.test, true, end),
+                        )
+                    },
                 )
             },
         )?;
@@ -8636,6 +8677,15 @@ fn condition_fallthrough_range(expression: &Expr) -> TextRange {
         .map_or_else(|| synthetic_condition_exit_range(expression), Ranged::range)
 }
 
+// A following optimized generator assertion rebuilds the coroutine owner around its inlined
+// Boolean loop. Extending the preceding marker into that range selects the wrong table merge.
+fn is_optimized_generator_assert(statement: &Stmt) -> bool {
+    let Stmt::Assert(assertion) = statement else {
+        return false;
+    };
+    matches!(assertion.test.as_ref(), Expr::Call(call)
+        if optimized_generator_callable(call).is_some())
+}
 fn expression_contains_chained_comparison(expression: &Expr) -> bool {
     #[derive(Default)]
     struct Detector {

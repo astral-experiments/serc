@@ -2544,6 +2544,73 @@ def expression_tail(manager):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_nonterminal_iterator_loop_assertion_owners() {
+        let source = r"async def coroutine(items):
+    for item in items:
+        assert item
+        consume(item)
+
+
+async def negated_coroutine(items):
+    for item in items:
+        assert not item
+        consume(item)
+
+
+def generator(items):
+    for item in items:
+        assert item
+        yield item
+
+
+async def async_generator(items):
+    for item in items:
+        assert item
+        yield item
+
+
+async def asynchronous_iterator(items):
+    async for item in items:
+        assert item
+        consume(item)
+
+
+async def awaited_control(items):
+    for item in items:
+        assert await predicate(item)
+        consume(item)
+
+
+def ordinary_control(items):
+    for item in items:
+        assert item
+        consume(item)
+
+
+async def terminal_control(items):
+    for item in items:
+        consume(item)
+        assert item
+
+
+async def nested_control(items):
+    for item in items:
+        if predicate(item):
+            assert item
+            consume(item)
+        after(item)
+
+
+async def while_control(items):
+    while items is not None:
+        assert items
+        consume(items)
+        break
+";
+        assert_matches_cpython_marshal(source, "iterator_loop_assertion_owners.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_terminal_assertions_in_with_bodies() {
         let source = "def simple(manager, condition):\n    with manager:\n        assert condition\n\ndef message(manager, condition):\n    with manager:\n        use()\n        assert condition, make_message()\n\ndef boolean(manager, first, second):\n    with manager:\n        assert first or second\n\ndef conjunction(manager, first, second):\n    with manager:\n        assert first and second\n\ndef conditional(manager, first, second, condition):\n    with manager:\n        assert first if condition else second\n\ndef constant_true():\n    with manager:\n        assert True\n\ndef constant_false():\n    with manager:\n        assert False\n\ndef followed(manager, condition):\n    with manager:\n        assert condition\n    use()\n\ndef same_line(manager, condition):\n    with manager: assert condition\n\ndef nested(outer, inner, condition):\n    try:\n        with outer:\n            with inner:\n                assert condition\n    finally:\n        cleanup()\n\nasync def asynchronous(manager, condition):\n    async with manager:\n        assert condition\n";
         assert_matches_cpython_marshal(source, "with_assert.py");
