@@ -704,7 +704,11 @@ if condition:
         plan.imported_scope_names
             .contains(name_id(SHADOWED_SUPER_SENTINEL))
     );
-    assert!(!plan.imported_scope_names.contains(name_id("annotations")));
+    assert!(plan.imported_scope_names.contains(name_id("annotations")));
+    assert!(
+        plan.imported_scope_names
+            .contains(name_id("barry_as_FLUFL"))
+    );
     assert!(plan.comprehension_cell_names.contains(name_id("item")));
     assert!(plan.has_annotations);
     assert!(plan.has_simple_annotations);

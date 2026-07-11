@@ -1221,10 +1221,6 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_> {
                 }
             }
             Stmt::ImportFrom(statement) => {
-                let is_future = statement
-                    .module
-                    .as_ref()
-                    .is_some_and(|module| module.as_str() == "__future__");
                 self.intern(
                     statement
                         .module
@@ -1239,7 +1235,9 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_> {
                             .as_ref()
                             .map_or(alias.name.as_str(), |name| name.as_str());
                         self.intern(bound_name);
-                        if at_module_scope && !is_future {
+                        // CPython's method-call optimization queries DEF_IMPORT on the module
+                        // symbol table, where future feature names and aliases remain imports.
+                        if at_module_scope {
                             self.facts
                                 .imported_scope_names
                                 .insert(bound_name.to_string());
