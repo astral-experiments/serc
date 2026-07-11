@@ -867,7 +867,7 @@ impl Compiler {
         if let Some(keys) = pattern
             .keys
             .iter()
-            .map(fold_constant)
+            .map(|key| self.source_aware_fold_constant(key))
             .collect::<Option<Vec<_>>>()
         {
             self.emit_deferred_constant(Constant::Tuple(keys))?;
@@ -4011,7 +4011,7 @@ impl Compiler {
             if kind == CollectionKind::Tuple
                 && let Some(constants) = elements
                     .iter()
-                    .map(fold_constant)
+                    .map(|element| self.source_aware_fold_constant(element))
                     .collect::<Option<Vec<_>>>()
             {
                 for element in elements {
@@ -4044,7 +4044,7 @@ impl Compiler {
                 && elements.len() >= 3
                 && let Some(constants) = elements
                     .iter()
-                    .map(fold_constant)
+                    .map(|element| self.source_aware_fold_constant(element))
                     .collect::<Option<Vec<_>>>()
             {
                 for element in elements {
@@ -4099,7 +4099,7 @@ impl Compiler {
         if unpacking_start >= 3
             && let Some(constants) = elements[..unpacking_start]
                 .iter()
-                .map(fold_constant)
+                .map(|element| self.source_aware_fold_constant(element))
                 .collect::<Option<Vec<_>>>()
         {
             for element in &elements[..unpacking_start] {
@@ -4176,7 +4176,7 @@ impl Compiler {
                     && let Some(constants) = list
                         .elts
                         .iter()
-                        .map(fold_constant)
+                        .map(|element| self.source_aware_fold_constant(element))
                         .collect::<Option<Vec<_>>>()
                 {
                     for element in &list.elts {
@@ -4214,12 +4214,12 @@ impl Compiler {
                     && set
                         .elts
                         .iter()
-                        .all(|element| fold_constant(element).is_some()) =>
+                        .all(|element| self.source_aware_fold_constant(element).is_some()) =>
             {
                 let mut unique = Vec::with_capacity(set.elts.len());
                 for element in &set.elts {
                     self.record_folded_value(element)?;
-                    let constant = fold_constant(element).unwrap();
+                    let constant = self.source_aware_fold_constant(element).unwrap();
                     if !unique
                         .iter()
                         .any(|existing| python_constant_values_equal(existing, &constant))

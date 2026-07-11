@@ -9506,6 +9506,18 @@ def nested_fallthrough(action):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_surrogates_in_folded_containers() {
+        let source = r#"def tuple_argument(function):
+    return function(("\uddf8",))
+
+def iterated_values():
+    for value in ["\ud800", ("\udfff",), "\ufffd"]:
+        consume(value)
+"#;
+        assert_matches_cpython_marshal(source, "nested_surrogates.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_synthesized_percent_format_target_locations() {
         let source = r#"def terminal_false_target(flag, value):
     if flag:

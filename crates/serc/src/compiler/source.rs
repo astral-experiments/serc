@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use ruff_python_ast::token::{TokenKind, Tokens};
-use ruff_python_ast::{Expr, FStringPart, InterpolatedStringElement, Stmt, Suite};
+use ruff_python_ast::{Expr, ExprContext, FStringPart, InterpolatedStringElement, Stmt, Suite};
 use ruff_python_codegen::{Generator, Indentation, Mode as CodegenMode};
 use ruff_source_file::{LineEnding, LineIndex};
 use ruff_text_size::{Ranged, TextLen, TextSize};
@@ -183,6 +183,20 @@ impl Compiler {
             Constant::SurrogateString(bytes)
         } else {
             Constant::String(string.value.to_str().to_string())
+        }
+    }
+
+    /// Folds constants while preserving surrogate escapes that Ruff represents as U+FFFD.
+    pub(super) fn source_aware_fold_constant(&self, expression: &Expr) -> Option<Constant> {
+        match expression {
+            Expr::StringLiteral(string) => Some(self.string_literal_constant(string)),
+            Expr::Tuple(tuple) if tuple.ctx == ExprContext::Load => tuple
+                .elts
+                .iter()
+                .map(|element| self.source_aware_fold_constant(element))
+                .collect::<Option<Vec<_>>>()
+                .map(Constant::Tuple),
+            _ => fold_constant(expression),
         }
     }
 

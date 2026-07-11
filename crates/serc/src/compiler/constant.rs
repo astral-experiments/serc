@@ -83,6 +83,9 @@ impl Compiler {
         expression: &Expr,
         constant: Constant,
     ) -> Result<(), CompileError> {
+        let constant = self
+            .source_aware_fold_constant(expression)
+            .unwrap_or(constant);
         if matches!(expression, Expr::Name(name) if name.id.as_str() == "__debug__") {
             return self.emit_preprocessed_constant(expression, constant);
         }
@@ -171,7 +174,11 @@ impl Compiler {
     }
 
     pub(super) fn record_folded_value(&mut self, expression: &Expr) -> Result<(), CompileError> {
-        if let Some(constant) = literal_constant(expression) {
+        let literal = match expression {
+            Expr::StringLiteral(string) => Some(self.string_literal_constant(string)),
+            _ => literal_constant(expression),
+        };
+        if let Some(constant) = literal {
             self.add_constant(constant)?;
             return Ok(());
         }
