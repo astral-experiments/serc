@@ -8454,7 +8454,7 @@ impl Compiler {
                 != self.source_location(next.context_expr.range()).line
         });
         if !remaining.is_empty()
-            && (suite_terminates(body)
+            && ((remaining.len() == 1 && suite_terminates(body))
                 || (self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
                     && nested_manager_has_distinct_line
                     && with_body_ends_in_terminal_try(body)))
@@ -9362,10 +9362,11 @@ fn with_body_ends_in_retained_pop_block(body: &[Stmt]) -> bool {
                 && try_normal_exit_predecessors(statement) == 1
         }
         Some(Stmt::With(statement)) => {
-            matches!(
-                statement.body.last(),
-                Some(Stmt::Return(_) | Stmt::Raise(_))
-            )
+            statement.items.len() == 1
+                && matches!(
+                    statement.body.last(),
+                    Some(Stmt::Return(_) | Stmt::Raise(_))
+                )
         }
         _ => false,
     }
