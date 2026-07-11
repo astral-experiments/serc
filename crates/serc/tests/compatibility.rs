@@ -2432,6 +2432,38 @@ async def synchronous_outside_async(sync_manager, async_manager):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_tail_assert_finally_pop_block_ownership() {
+        let source = r"def with_owner(manager, condition):
+    with manager:
+        try:
+            body()
+            assert condition
+        finally:
+            cleanup()
+
+
+def finally_owner(condition):
+    try:
+        try:
+            body()
+            assert condition, message()
+        finally:
+            inner_cleanup()
+    finally:
+        outer_cleanup()
+
+
+def expression_tail(manager):
+    with manager:
+        try:
+            body()
+        finally:
+            cleanup()
+";
+        assert_matches_cpython_marshal(source, "tail_assert_finally_pop_block.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_terminal_assertions_in_with_bodies() {
         let source = "def simple(manager, condition):\n    with manager:\n        assert condition\n\ndef message(manager, condition):\n    with manager:\n        use()\n        assert condition, make_message()\n\ndef boolean(manager, first, second):\n    with manager:\n        assert first or second\n\ndef conjunction(manager, first, second):\n    with manager:\n        assert first and second\n\ndef conditional(manager, first, second, condition):\n    with manager:\n        assert first if condition else second\n\ndef constant_true():\n    with manager:\n        assert True\n\ndef constant_false():\n    with manager:\n        assert False\n\ndef followed(manager, condition):\n    with manager:\n        assert condition\n    use()\n\ndef same_line(manager, condition):\n    with manager: assert condition\n\ndef nested(outer, inner, condition):\n    try:\n        with outer:\n            with inner:\n                assert condition\n    finally:\n        cleanup()\n\nasync def asynchronous(manager, condition):\n    async with manager:\n        assert condition\n";
         assert_matches_cpython_marshal(source, "with_assert.py");

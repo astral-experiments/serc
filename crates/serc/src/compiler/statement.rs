@@ -7425,20 +7425,34 @@ impl Compiler {
         // `POP_BLOCK` is converted to a NOP before CPython's CFG optimizer runs. It normally
         // disappears, but can retain the sole predecessor's line when a small finally exit is
         // copied onto another edge.
-        let normal_finally_pop_block_exclusion_start =
-            (!self.control.active_with_region_exclusions.is_empty()
+        let exclude_assert_pop_block_from_enclosing_regions = statement.handlers.is_empty()
+            && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR | CO_GENERATOR) == 0
+            && !self.control.current_statement_has_following
+            && matches!(statement.body.last(), Some(Stmt::Assert(_)))
+            && (!self.control.active_exception_region_exclusions.is_empty()
+                || !self.control.active_with_region_exclusions.is_empty());
+        let exclude_conditional_pop_block_from_with =
+            !self.control.active_with_region_exclusions.is_empty()
                 && !self.control.current_statement_has_following
-                && matches!(statement.finalbody.as_slice(), [Stmt::If(_)]))
-            .then(|| {
-                let start = self.assembler.label();
-                self.assembler.mark(start);
-                start
-            });
+                && matches!(statement.finalbody.as_slice(), [Stmt::If(_)]);
+        let normal_finally_pop_block_exclusion_start =
+            (exclude_assert_pop_block_from_enclosing_regions
+                || exclude_conditional_pop_block_from_with)
+                .then(|| {
+                    let start = self.assembler.label();
+                    self.assembler.mark(start);
+                    start
+                });
         self.assembler.set_location(SourceLocation::NONE);
         self.emit(NOP, 0, 0)?;
         if let Some(start) = normal_finally_pop_block_exclusion_start {
             let end = self.assembler.label();
             self.assembler.mark(end);
+            if exclude_assert_pop_block_from_enclosing_regions {
+                for exclusions in &mut self.control.active_exception_region_exclusions {
+                    exclusions.push((start, end));
+                }
+            }
             for exclusions in &mut self.control.active_with_region_exclusions {
                 exclusions.push((start, end));
             }
