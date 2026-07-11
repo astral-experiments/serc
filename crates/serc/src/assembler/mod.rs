@@ -207,6 +207,21 @@ impl Assembler {
         )
     }
 
+    /// Returns whether a normalized Boolean value marker was already emitted in this code unit.
+    pub(crate) fn contains_boolean_value_marker(&self) -> bool {
+        let mut previous = None;
+        for instruction in self.linear_items().iter().filter_map(|item| match item {
+            Item::Instruction(instruction) => Some(instruction),
+            Item::Label(_) => None,
+        }) {
+            if previous == Some(NOT_TAKEN) && instruction.opcode == POP_TOP {
+                return true;
+            }
+            previous = Some(instruction.opcode);
+        }
+        false
+    }
+
     pub(crate) fn contains_opcode_since(&self, opcode: Opcode, instruction_offset: usize) -> bool {
         self.linear_items()
             .iter()

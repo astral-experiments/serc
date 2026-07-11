@@ -4622,10 +4622,23 @@ impl Compiler {
                 || self.control.active_finally_end_blocks > 0
                 || resumes_after_yield
                 || exception_group_handler;
-            let in_generator_expression = self.control.generator_expression;
-            let exclude_generator_expression_owner =
-                in_generator_expression && !marker_reuses_exception_owner;
             let suspension_epoch = self.control.coroutine_suspension_epoch;
+            let follows_boolean_value_marker_before_coroutine_suspension =
+                self.unit.flags & CO_COROUTINE != 0
+                    && suspension_epoch == 0
+                    && self
+                        .control
+                        .active_comprehension_region_exclusions
+                        .is_empty()
+                    && self.control.active_with_region_exclusions.is_empty()
+                    && self.control.active_exception_region_exclusions.is_empty()
+                    && self.control.active_normal_finally_bodies == 0
+                    && self.control.active_finally_end_blocks == 0
+                    && self.control.active_exception_group_handlers == 0
+                    && self.assembler.contains_boolean_value_marker();
+            let exclude_generator_region_owner = (self.control.generator_expression
+                || follows_boolean_value_marker_before_coroutine_suspension)
+                && !marker_reuses_exception_owner;
             let after_coroutine_suspension =
                 self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR) != 0 && suspension_epoch > 0;
             let has_fresh_with_owner = after_coroutine_suspension
@@ -4663,7 +4676,7 @@ impl Compiler {
                 || exclude_from_plain_try
                 || follows_sync_with_branch_join;
             let marker_start = (!exclude_inlined_comprehension_owner
-                && (exclude_generator_expression_owner
+                && (exclude_generator_region_owner
                     || exclude_after_coroutine_suspension
                     || exclude_from_plain_try))
                 .then(|| {
@@ -4691,7 +4704,7 @@ impl Compiler {
                 let marker_end = self.assembler.label();
                 self.assembler.mark(marker_end);
                 if self.control.generator_region_start.is_some()
-                    && (exclude_generator_expression_owner || exclude_after_coroutine_suspension)
+                    && (exclude_generator_region_owner || exclude_after_coroutine_suspension)
                 {
                     self.control
                         .generator_region_exclusions
