@@ -2888,6 +2888,28 @@ async def while_control(items):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_first_sync_iterator_condition_owner() {
+        let source = r#"def two_good_fruits_generator(fruits):
+    """A return can be used to end the iterator early, but not a StopIteration."""
+    for fruit in fruits:
+        if not fruit.is_tasty():
+            continue
+        while True:
+            next_fruit = next(fruits, None)
+            if next_fruit is None:
+                print("Sorry there is only one fruit left.")
+                yield fruit, None
+                # We reached the end of the 'fruits' generator but raising a
+                # StopIteration instead of returning would create a RuntimeError
+                return
+            if next_fruit.is_tasty():
+                yield fruit, next_fruit
+                break
+"#;
+        assert_matches_cpython_marshal(source, "first_sync_iterator_condition_owner.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_terminal_assertions_in_with_bodies() {
         let source = "def simple(manager, condition):\n    with manager:\n        assert condition\n\ndef message(manager, condition):\n    with manager:\n        use()\n        assert condition, make_message()\n\ndef boolean(manager, first, second):\n    with manager:\n        assert first or second\n\ndef conjunction(manager, first, second):\n    with manager:\n        assert first and second\n\ndef conditional(manager, first, second, condition):\n    with manager:\n        assert first if condition else second\n\ndef constant_true():\n    with manager:\n        assert True\n\ndef constant_false():\n    with manager:\n        assert False\n\ndef followed(manager, condition):\n    with manager:\n        assert condition\n    use()\n\ndef same_line(manager, condition):\n    with manager: assert condition\n\ndef nested(outer, inner, condition):\n    try:\n        with outer:\n            with inner:\n                assert condition\n    finally:\n        cleanup()\n\nasync def asynchronous(manager, condition):\n    async with manager:\n        assert condition\n";
         assert_matches_cpython_marshal(source, "with_assert.py");

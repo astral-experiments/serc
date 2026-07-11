@@ -28,8 +28,8 @@ use super::constant::{
 };
 use super::expression::{
     binary_operator, comparison_operator, comparison_operator_boolean, early_condition_truthiness,
-    expression_defers_async_comprehension_restore, jump_constant_truthiness,
-    optimized_generator_callable,
+    expression_defers_async_comprehension_restore, expression_suspends_current_scope,
+    jump_constant_truthiness, optimized_generator_callable,
 };
 use super::scope::{NameId, NameSet, ReferenceCollector, collect_target_names};
 use super::source::{
@@ -3166,6 +3166,21 @@ impl Compiler {
                                     .assembler
                                     .contains_opcode_since(NOT_TAKEN, context.body_start)
                             })));
+                let preserve_first_sync_iterator_condition_owner = branch_index == 0
+                    && !self.context.has_lazy_imports
+                    && self.control.loops.len() == 1
+                    && self.control.loops.last().is_some_and(|context| {
+                        context.iterator_cleanup == IteratorCleanup::Sync
+                            && self.assembler.instruction_count() == context.body_start
+                            && context.with_depth == self.control.active_with_exits.len()
+                            && context.finally_end_depth == self.control.active_finally_end_blocks
+                            && context.exception_region_depth
+                                == self.control.active_exception_region_exclusions.len()
+                    })
+                    && condition_jump_target_count(test, false) == 1
+                    && !matches!(test, Expr::BoolOp(_) | Expr::If(_))
+                    && !expression_suspends_current_scope(test)
+                    && !expression_contains_generator(test);
                 let preserve_sync_with_none_owner = branch_index == 0
                     && !suite_terminates(body)
                     && matches!(statement.elif_else_clauses.as_slice(), [clause]
@@ -3391,6 +3406,11 @@ impl Compiler {
                 if preserve_sync_with_continue_owner {
                     // CPython keeps the protected CFG owner when normalization reuses a removed
                     // loop-control block slot.
+                    self.assembler.preserve_last_not_taken_exception_owner();
+                }
+                if preserve_first_sync_iterator_condition_owner {
+                    // CPython removes the synthetic NOP before a synchronous iterator target.
+                    // The first direct body condition reuses its protected CFG slot.
                     self.assembler.preserve_last_not_taken_exception_owner();
                 }
                 if preserve_first_unnamed_handler_loop_owner {
@@ -8850,6 +8870,30 @@ fn is_optimized_generator_assert(statement: &Stmt) -> bool {
     };
     matches!(assertion.test.as_ref(), Expr::Call(call)
         if optimized_generator_callable(call).is_some())
+}
+
+fn expression_contains_generator(expression: &Expr) -> bool {
+    #[derive(Default)]
+    struct Detector {
+        found: bool,
+    }
+
+    impl<'ast> Visitor<'ast> for Detector {
+        fn visit_expr(&mut self, expression: &'ast Expr) {
+            if self.found || matches!(expression, Expr::Lambda(_)) {
+                return;
+            }
+            if matches!(expression, Expr::Generator(_)) {
+                self.found = true;
+            } else {
+                walk_expr(self, expression);
+            }
+        }
+    }
+
+    let mut detector = Detector::default();
+    detector.visit_expr(expression);
+    detector.found
 }
 fn expression_contains_chained_comparison(expression: &Expr) -> bool {
     #[derive(Default)]

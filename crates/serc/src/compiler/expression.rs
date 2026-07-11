@@ -5488,7 +5488,7 @@ pub(super) fn optimized_generator_callable(call: &ruff_python_ast::ExprCall) -> 
     Some(name.id.as_str())
 }
 
-fn expression_suspends_current_scope(expression: &Expr) -> bool {
+pub(super) fn expression_suspends_current_scope(expression: &Expr) -> bool {
     #[derive(Default)]
     struct Collector {
         found: bool,
