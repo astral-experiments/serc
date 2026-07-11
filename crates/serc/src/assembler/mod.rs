@@ -177,6 +177,30 @@ impl Assembler {
             .count()
     }
 
+    pub(crate) fn instruction_opcode_at(&self, instruction_offset: usize) -> Option<Opcode> {
+        self.linear_items()
+            .iter()
+            .filter_map(|item| match item {
+                Item::Instruction(instruction) => Some(instruction.opcode),
+                Item::Label(_) => None,
+            })
+            .nth(instruction_offset)
+    }
+
+    /// Marks an emitted instruction as ownerless when normalization does not reuse a stale slot.
+    pub(crate) fn exclude_normalized_exception_owner_at(&mut self, instruction_offset: usize) {
+        let instruction = self
+            .linear_items_mut()
+            .iter_mut()
+            .filter_map(|item| match item {
+                Item::Instruction(instruction) => Some(instruction),
+                Item::Label(_) => None,
+            })
+            .nth(instruction_offset)
+            .expect("instruction offset should reference an emitted instruction");
+        instruction.exception_policy.normalized_owner = NormalizedExceptionOwner::Absent;
+    }
+
     pub(crate) fn contains_opcode(&self, opcode: Opcode) -> bool {
         self.linear_items().iter().any(
             |item| matches!(item, Item::Instruction(instruction) if instruction.opcode == opcode),

@@ -6,10 +6,11 @@ use super::{
     BINARY_SLICE, BUILD_LIST, BUILD_MAP, BUILD_SET, BUILD_TUPLE, CALL, CHECK_EG_MATCH,
     CHECK_EXC_MATCH, CLEANUP_THROW, COPY, END_ASYNC_FOR, END_FOR, END_SEND, FOR_ITER, GET_AITER,
     GET_ANEXT, GET_ITER, IMPORT_FROM, IMPORT_NAME, JUMP_BACKWARD, JUMP_BACKWARD_NO_INTERRUPT,
-    JUMP_FORWARD, LIST_APPEND, LOAD_ATTR, LOAD_CONST, LOAD_DEREF, LOAD_SMALL_INT, MAP_ADD, NOP,
-    NOT_TAKEN, POP_EXCEPT, POP_ITER, POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE,
-    POP_JUMP_IF_TRUE, POP_TOP, PUSH_EXC_INFO, RAISE_VARARGS, RETURN_VALUE, SEND, SET_ADD,
-    STORE_ATTR, STORE_SLICE, STORE_SUBSCR, SWAP, TO_BOOL, WITH_EXCEPT_START, YIELD_VALUE,
+    JUMP_FORWARD, LIST_APPEND, LOAD_ATTR, LOAD_CONST, LOAD_DEREF, LOAD_GLOBAL, LOAD_SMALL_INT,
+    MAP_ADD, NOP, NOT_TAKEN, POP_EXCEPT, POP_ITER, POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE,
+    POP_JUMP_IF_NOT_NONE, POP_JUMP_IF_TRUE, POP_TOP, PUSH_EXC_INFO, RAISE_VARARGS, RETURN_VALUE,
+    SEND, SET_ADD, STORE_ATTR, STORE_SLICE, STORE_SUBSCR, SWAP, TO_BOOL, WITH_EXCEPT_START,
+    YIELD_VALUE,
 };
 use crate::CompileError;
 use crate::assembler::{ExceptionPolicy, Label, SourceLocation};
@@ -7598,6 +7599,7 @@ impl Compiler {
                     self.assembler.mark(start);
                     start
                 });
+        let normal_finally_pop_block = self.assembler.instruction_count();
         self.assembler.set_location(SourceLocation::NONE);
         self.emit(NOP, 0, 0)?;
         if let Some(start) = normal_finally_pop_block_exclusion_start {
@@ -7657,6 +7659,18 @@ impl Compiler {
             }
             Ok(())
         })?;
+        if self.control.generator_region_start.is_some()
+            && !statement.handlers.is_empty()
+            && self
+                .assembler
+                .instruction_opcode_at(normal_finally_pop_block + 1)
+                == Some(LOAD_GLOBAL)
+        {
+            // CPython moves this converted POP_BLOCK into a fresh normal-finally block. The NOP
+            // loses the generator stop handler unless normalization reuses a stale owned slot.
+            self.assembler
+                .exclude_normalized_exception_owner_at(normal_finally_pop_block);
+        }
         if terminal && !finalbody_emitted_fallthrough && !suite_terminates(&statement.finalbody) {
             if let Some(range) = suite_unary_not_fallthrough_range(&statement.finalbody) {
                 self.assembler.set_location(self.source_location(range));
