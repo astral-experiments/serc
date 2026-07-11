@@ -24,6 +24,7 @@ criterion = { workspace = true, optional = true }
 serc_workloads = { workspace = true }
 
 [dev-dependencies]
+mimalloc = { workspace = true }
 serc = { path = "../serc" }
 
 [features]
