@@ -1896,14 +1896,15 @@ impl Compiler {
         self.emit_common_constant(common_constant)?;
         self.emit(IS_OP, 0, -1)?;
         self.emit_jump_forward(POP_JUMP_IF_FALSE, fallback, -1)?;
+        let in_inlined_comprehension = !self
+            .control
+            .active_comprehension_region_exclusions
+            .is_empty();
         let exclude_not_taken_from_comprehension = collect_tuple
             && self
                 .control
                 .exclude_optimized_tuple_guard_from_comprehension
-            && !self
-                .control
-                .active_comprehension_region_exclusions
-                .is_empty();
+            && in_inlined_comprehension;
         let exclude_not_taken_from_exception = collect_tuple
             && self.control.current_statement_has_following
             && self.control.direct_optimized_generator_assignment
@@ -1975,6 +1976,19 @@ impl Compiler {
                 matched,
                 -1,
             )?;
+            // CPython appends this artificial backward block after the inlined
+            // comprehension's restore target is labeled. Exclude it when the
+            // comprehension is the only active protected region; nested try/with
+            // ownership follows a separate CFG-sensitive path.
+            let exclude_boolean_loop_from_comprehension = in_inlined_comprehension
+                && self.control.active_exception_region_exclusions.is_empty()
+                && self.control.active_with_region_exclusions.is_empty();
+            let comprehension_exclusion_start =
+                exclude_boolean_loop_from_comprehension.then(|| {
+                    let start = self.assembler.label();
+                    self.assembler.mark(start);
+                    start
+                });
             self.emit_with_exception_policy(
                 NOT_TAKEN,
                 0,
@@ -1987,6 +2001,13 @@ impl Compiler {
                 0,
                 handler_boolean_loop_policy.unwrap_or_default(),
             )?;
+            if let Some(start) = comprehension_exclusion_start {
+                let end = self.assembler.label();
+                self.assembler.mark(end);
+                for exclusions in &mut self.control.active_comprehension_region_exclusions {
+                    exclusions.push((start, end));
+                }
+            }
             self.assembler.mark(matched);
             self.emit(POP_ITER, 0, -1)?;
             let result = self.add_constant(Constant::Bool(!initial_result))?;

@@ -4734,6 +4734,42 @@ def consecutive_fresh(values):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_optimized_boolean_generators_in_comprehensions() {
+        let source = r"def porcupine_shaped(items, filepath):
+    return consume(
+        {
+            name: filetype
+            for name, filetype in items
+            if any(
+                fnmatch.fnmatch(filepath.as_posix(), '*/' + pattern)
+                for pattern in filetype['filename_patterns']
+            )
+        },
+        str(filepath),
+    )
+
+
+def all_porcupine_shaped(items, filepath):
+    return consume(
+        {
+            name: filetype
+            for name, filetype in items
+            if all(
+                fnmatch.fnmatch(filepath.as_posix(), '*/' + pattern)
+                for pattern in filetype['filename_patterns']
+            )
+        },
+        str(filepath),
+    )
+
+
+def outside_comprehension(values):
+    return any(value for value in values)
+";
+        assert_matches_cpython_marshal(source, "optimized_boolean_comprehensions.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_optimized_tuple_calls_in_comprehension_and_branch_exits() {
         let source = r"def comprehension_result(prefix, sizes, dimensions):
     return [prefix + tuple(sizes[dimension] for dimension in core_dimensions)
