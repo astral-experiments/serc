@@ -2819,6 +2819,22 @@ async def synchronous_outside_async(sync_manager, async_manager):
         finally:
             if condition:
                 cleanup()
+
+def attribute_fallthrough(manager, resource):
+    with manager:
+        try:
+            assert body()
+        finally:
+            if resource.enabled:
+                cleanup()
+
+def call_fallthrough(manager, resource):
+    with manager:
+        try:
+            assert body()
+        finally:
+            if resource.enabled():
+                cleanup()
 ";
         assert_matches_cpython_marshal(expression_source, "with_conditional_finally_exit.py");
 

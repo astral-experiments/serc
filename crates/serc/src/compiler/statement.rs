@@ -7518,6 +7518,10 @@ impl Compiler {
                 statement.finalbody.last(),
                 Some(Stmt::If(tail))
                     if tail.elif_else_clauses.is_empty()
+                        && matches!(
+                            tail.test.as_ref(),
+                            Expr::Name(_) | Expr::Attribute(_) | Expr::Call(_)
+                        )
                         && matches!(tail.body.as_slice(), [Stmt::Expr(_)])
             );
 

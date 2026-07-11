@@ -83,9 +83,6 @@ impl Compiler {
         expression: &Expr,
         constant: Constant,
     ) -> Result<(), CompileError> {
-        let constant = self
-            .source_aware_fold_constant(expression)
-            .unwrap_or(constant);
         if matches!(expression, Expr::Name(name) if name.id.as_str() == "__debug__") {
             return self.emit_preprocessed_constant(expression, constant);
         }

@@ -867,7 +867,7 @@ impl Compiler {
         if let Some(keys) = pattern
             .keys
             .iter()
-            .map(|key| self.source_aware_fold_constant(key))
+            .map(fold_constant)
             .collect::<Option<Vec<_>>>()
         {
             self.emit_deferred_constant(Constant::Tuple(keys))?;
@@ -991,13 +991,14 @@ impl Compiler {
                 self.emit(NOP, 0, 0)?;
             }
             self.assembler.set_location(origin_location);
+            let constant = self.source_aware_fold_constant(origin).unwrap_or(constant);
             self.emit_folded_constant(origin, constant)?;
             return Ok(());
         }
         if matches!(
             expression,
             Expr::BinOp(_) | Expr::Name(_) | Expr::Subscript(_) | Expr::UnaryOp(_) | Expr::Tuple(_)
-        ) && let Some(constant) = fold_constant(expression)
+        ) && let Some(constant) = self.source_aware_fold_constant(expression)
         {
             self.emit_folded_constant(expression, constant)?;
             return Ok(());
