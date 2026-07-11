@@ -5218,7 +5218,16 @@ impl Compiler {
             self.add_constant(Constant::None)?;
             let left_location = self.source_location(comparison.left.range());
             let none_location = self.source_location(comparison.comparators[0].range());
-            if left_location.line != none_location.line {
+            let left_line = if matches!(
+                comparison.left.as_ref(),
+                Expr::Call(call)
+                    if call.arguments.args.is_empty() && call.arguments.keywords.is_empty()
+            ) {
+                left_location.end_line
+            } else {
+                left_location.line
+            };
+            if left_line != none_location.line {
                 self.assembler.set_location(none_location);
                 self.emit(NOP, 0, 0)?;
             }
