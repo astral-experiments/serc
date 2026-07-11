@@ -8367,11 +8367,12 @@ impl Compiler {
             } else if terminal_if
                 && let Some(Stmt::If(statement)) = body.last()
                 && (condition_jump_target_count(&statement.test, false) == 1
-                    || self.control.direct_final_sync_with_try_body.is_none())
+                    || !self.control.loops.is_empty()
+                    || matches!(body.first(), Some(Stmt::Import(_) | Stmt::ImportFrom(_))))
             {
-                // On the direct normal edge of a surrounding try, CPython drops a converted
-                // `POP_BLOCK` marker fed by multiple condition fallthroughs. A sole predecessor
-                // still supplies the marker's visible location.
+                // CPython drops a converted `POP_BLOCK` marker fed by multiple normal
+                // fallthroughs. Loop exits and import-prefixed bodies retain their protected
+                // marker; a sole predecessor still supplies the marker's visible location.
                 body_noop = Some(WithBodyExitNoop::Located(condition_fallthrough_range(
                     &statement.test,
                 )));
