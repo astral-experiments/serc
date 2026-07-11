@@ -2778,6 +2778,79 @@ def direct_assertion_control(items):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_generator_expression_child_scope_and_suspension() {
+        let cases = [
+            (
+                "module_direct_generator.py",
+                "value = (item for item in items)\n",
+            ),
+            (
+                "module_first_iterable_generator.py",
+                "value = [item for item in (inner for inner in items)]\n",
+            ),
+            (
+                "module_nested_generator.py",
+                "value = {item: tuple(inner for inner in items) for item in items}\n",
+            ),
+            (
+                "function_direct_generator.py",
+                "def f(items):\n    return (item for item in items)\n",
+            ),
+            (
+                "function_first_iterable_generator.py",
+                "def f(items):\n    return [item for item in (inner for inner in items)]\n",
+            ),
+            (
+                "function_nested_generator.py",
+                "def f(items):\n    return {item: tuple(inner for inner in items) for item in items}\n",
+            ),
+            (
+                "class_direct_generator.py",
+                "class Scope:\n    value = (item for item in items)\n",
+            ),
+            (
+                "class_first_iterable_generator.py",
+                "class Scope:\n    value = [item for item in (inner for inner in items)]\n",
+            ),
+            (
+                "class_nested_generator.py",
+                "class Scope:\n    value = {item: tuple(inner for inner in items) for item in items}\n",
+            ),
+            (
+                "generator_first_iterable_await.py",
+                "async def f():\n    return (item for item in await source())\n",
+            ),
+            (
+                "generator_async_for.py",
+                "async def f():\n    return (item async for item in source())\n",
+            ),
+            (
+                "generator_awaited_element.py",
+                "async def f(items):\n    return (await transform(item) for item in items)\n",
+            ),
+            (
+                "generator_awaited_filter.py",
+                "async def f(items):\n    return (item for item in items if await accept(item))\n",
+            ),
+            (
+                "generator_awaited_later_iterable.py",
+                "async def f(items):\n    return (value for item in items for value in await expand(item))\n",
+            ),
+            (
+                "generator_inlined_async_element.py",
+                "async def f(items):\n    return ([value async for value in expand(item)] for item in items)\n",
+            ),
+            (
+                "generator_nested_scope_boundary.py",
+                "async def f(items):\n    return ((await transform(value) for value in expand(item)) for item in items)\n",
+            ),
+        ];
+        for (filename, source) in cases {
+            assert_matches_cpython_marshal(source, filename);
+        }
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_multiline_constant_match_guards() {
         let source = "match 1:\n    case _ if (True):\n        pass\n\nmatch 1:\n    case _ if (\n        True\n    ):\n        pass\n";
         assert_matches_cpython_marshal(source, "match_guard.py");
