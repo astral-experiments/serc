@@ -4825,21 +4825,26 @@ impl Compiler {
                 && statement.body.last().is_some_and(|statement| {
                     suite_contains_loop_break(std::slice::from_ref(statement))
                 });
+            let conditional_break_exit =
+                suite_contains_borrow_reachable_conditional_loop_break(&statement.body);
+            let protected_break_crosses_cleanup =
+                (!self.control.active_exception_region_exclusions.is_empty()
+                    || !self.control.active_with_region_exclusions.is_empty())
+                    && !self.control.current_statement_has_following;
             if suite_contains_loop_break(&statement.body)
                 && !copied_direct_return_exit
-                && (!self.control.active_exception_region_exclusions.is_empty()
-                    || !self.control.active_with_region_exclusions.is_empty()
+                && (protected_break_crosses_cleanup
                     || coroutine_terminal_break_exit
-                    || !suite_contains_borrow_reachable_conditional_loop_break(&statement.body))
+                    || !conditional_break_exit)
             {
                 // A constant-true loop can reach its exit only through `break`. CPython removes
                 // an unconditional break jump before borrowed-load analysis but does not
                 // reconnect the large exit block. A conditional break retains an explicit exit
                 // edge when it is non-tail, when its cleanup crosses a protected region, or when
                 // it shares a final `if` with an explicit fallthrough branch. A surrounding
-                // control-flow region can still rewrite that edge during cleanup. A coroutine
-                // stop handler with a continue edge also keeps a terminal break exit disconnected
-                // from the following block.
+                // control-flow region rewrites that edge during cleanup only when the loop is
+                // terminal in its protected suite. A coroutine stop handler with a continue edge
+                // also keeps a terminal break exit disconnected from the following block.
                 self.assembler.prevent_borrow_reachability(end);
             }
             self.set_depth(base_depth);
