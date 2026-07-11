@@ -8304,6 +8304,27 @@ def work_handler(value):
         consume(value)
 
 
+def multi_statement_finally(value):
+    try:
+        work()
+    except Error:
+        recover()
+    finally:
+        prepare()
+        consume(value)
+
+
+def conditional_body(value, flag):
+    try:
+        if flag:
+            work()
+    except Error:
+        recover()
+    finally:
+        prepare()
+        consume(value)
+
+
 def two_fallthrough_handlers(value):
     try:
         work()
@@ -8380,6 +8401,58 @@ def fallthrough_handler(value):
         consume(value)
 
 
+def compound_handler(value, flag):
+    try:
+        work()
+    except Error:
+        assert flag
+        if flag:
+            recover()
+    finally:
+        prepare()
+        consume(value)
+
+
+def conditional_body(value, flag):
+    try:
+        if flag:
+            work()
+    except Error:
+        recover()
+    finally:
+        prepare()
+        consume(value)
+
+
+def multi_statement_finally(value):
+    try:
+        work()
+    except Error:
+        recover()
+    finally:
+        prepare()
+        consume(value)
+
+
+def conditional_finally(value, flag):
+    try:
+        work()
+    except Error:
+        recover()
+    finally:
+        if flag:
+            consume(value)
+
+
+def except_star_assignment_finally(value):
+    try:
+        work()
+    except* Error:
+        recover()
+    finally:
+        saved = value
+
+
 def bare_handler(value):
     try:
         work()
@@ -8424,6 +8497,11 @@ def value_loads(function):
 
 for function in (
     fallthrough_handler,
+    compound_handler,
+    conditional_body,
+    multi_statement_finally,
+    conditional_finally,
+    except_star_assignment_finally,
     bare_handler,
     loop_break_body,
     partial_raise_handler,
@@ -8432,7 +8510,7 @@ for function in (
 "#;
         assert_executes(
             source,
-            "LOAD_FAST_BORROW LOAD_FAST\nLOAD_FAST LOAD_FAST\nLOAD_FAST LOAD_FAST\nLOAD_FAST LOAD_FAST\n",
+            "LOAD_FAST_BORROW LOAD_FAST\nLOAD_FAST_BORROW LOAD_FAST\nLOAD_FAST LOAD_FAST\nLOAD_FAST_BORROW LOAD_FAST\nLOAD_FAST LOAD_FAST\nLOAD_FAST LOAD_FAST\nLOAD_FAST LOAD_FAST\nLOAD_FAST LOAD_FAST\nLOAD_FAST LOAD_FAST\n",
         );
     }
 

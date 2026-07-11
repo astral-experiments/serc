@@ -7462,7 +7462,7 @@ impl Compiler {
         let finally_handler = self.assembler.label();
         let cleanup = self.assembler.label();
         let end = self.assembler.label();
-        let fallthrough_handlers_reach_simple_finally =
+        let simple_fallthrough_handlers_reach_finally =
             statement.handlers.iter().all(|handler| {
                 handler.as_except_handler().is_some_and(|handler| {
                     handler.type_.is_some()
@@ -7488,10 +7488,41 @@ impl Compiler {
                     statement.body.last(),
                     Some(Stmt::If(_) | Stmt::Try(_) | Stmt::While(_) | Stmt::With(_))
                 );
-        if !statement.handlers.is_empty() && !fallthrough_handlers_reach_simple_finally {
-            // A terminating handler leaves an empty CPython CFG block before the normal finally
-            // body. Bare or compound handlers and compound try-body exits can leave the same
-            // boundary. Linear typed handlers keep a single-expression body reachable.
+        let compound_fallthrough_handlers_reach_finally = !statement.is_star
+            && !self.control.in_synchronous_with()
+            && statement.handlers.iter().all(|handler| {
+                handler.as_except_handler().is_some_and(|handler| {
+                    handler.type_.is_some() && !suite_contains_abrupt_control_flow(&handler.body)
+                })
+            })
+            && !suite_contains_loop_break(&statement.body)
+            && !matches!(
+                statement.body.last(),
+                Some(Stmt::If(_) | Stmt::Try(_) | Stmt::While(_) | Stmt::With(_))
+            )
+            && statement.finalbody.iter().all(|statement| {
+                !matches!(
+                    statement,
+                    Stmt::Assert(_)
+                        | Stmt::Break(_)
+                        | Stmt::Continue(_)
+                        | Stmt::For(_)
+                        | Stmt::If(_)
+                        | Stmt::Match(_)
+                        | Stmt::Raise(_)
+                        | Stmt::Return(_)
+                        | Stmt::Try(_)
+                        | Stmt::While(_)
+                        | Stmt::With(_)
+                )
+            });
+        let normal_finally_is_borrow_reachable = simple_fallthrough_handlers_reach_finally
+            || compound_fallthrough_handlers_reach_finally;
+        if !statement.handlers.is_empty() && !normal_finally_is_borrow_reachable {
+            // An abrupt or bare handler leaves an empty CPython CFG block before the normal
+            // finally body. Breaks and trailing structured try-body exits can leave the same
+            // boundary. Outside a synchronous with, ordinary typed fallthrough handlers keep the
+            // normal body reachable when the finally suite remains linear.
             self.assembler.prevent_borrow_reachability(protected_end);
         }
         if !statement.handlers.is_empty()
@@ -9602,6 +9633,36 @@ pub(super) fn try_propagates_protected_loop_tail_mode(
                     .all(|statement| matches!(statement, Stmt::Assign(_)))
             })
         })
+}
+
+fn suite_contains_abrupt_control_flow(body: &[Stmt]) -> bool {
+    #[derive(Default)]
+    struct AbruptControlFlowDetector {
+        found: bool,
+    }
+
+    impl<'ast> Visitor<'ast> for AbruptControlFlowDetector {
+        fn visit_stmt(&mut self, statement: &'ast Stmt) {
+            if self.found {
+                return;
+            }
+            match statement {
+                Stmt::Break(_) | Stmt::Continue(_) | Stmt::Raise(_) | Stmt::Return(_) => {
+                    self.found = true;
+                    return;
+                }
+                Stmt::FunctionDef(_) | Stmt::ClassDef(_) => return,
+                _ => {}
+            }
+            walk_stmt(self, statement);
+        }
+    }
+
+    let mut detector = AbruptControlFlowDetector::default();
+    for statement in body {
+        detector.visit_stmt(statement);
+    }
+    detector.found
 }
 
 // A raise inside an inner loop adds an independent protected exit. Keep that exception-region
