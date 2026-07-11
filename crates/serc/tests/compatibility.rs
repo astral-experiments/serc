@@ -8167,6 +8167,35 @@ def earlier_and_tail_break(first_flag, last_flag, result):
     fourth(result)
     fifth(result)
     return result
+
+def protected_try_terminal(flag, result):
+    try:
+        while True:
+            if flag:
+                break
+            step()
+    except Exception:
+        cleanup()
+    first(result)
+    second(result)
+    third(result)
+    fourth(result)
+    fifth(result)
+    return result
+
+def protected_with_following(manager, flag, result):
+    with manager:
+        while True:
+            if flag:
+                break
+            step()
+        first(result)
+        second(result)
+        third(result)
+        fourth(result)
+        fifth(result)
+    return result
+
 ";
         assert_matches_cpython_marshal(source, "constant_loop_break_borrowing.py");
     }
