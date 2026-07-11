@@ -6748,6 +6748,12 @@ impl Compiler {
                         .set_location(self.source_location(test.range()));
                 } else if let Some(range) = suite_unary_not_fallthrough_range(&handler.body) {
                     self.assembler.set_location(self.source_location(range));
+                // A trailing pass is removed before assembly, but it remains the source owner
+                // of the handler's normal cleanup. Do not inherit the preceding executable
+                // statement's location merely because it emitted the last instruction.
+                } else if let Some(Stmt::Pass(statement)) = handler.body.last() {
+                    self.assembler
+                        .set_location(self.source_location(statement.range));
                 } else if !handler_body_has_instructions
                     && let Some(statement) = handler.body.last()
                 {
