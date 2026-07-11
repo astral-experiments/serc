@@ -1476,6 +1476,23 @@ def single_exit_break(items):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_protected_short_circuit_loop_tail_backedges() {
+        let source = r"def collect(items):
+    output = {}
+    for item in items:
+        try:
+            name = item.name
+            version = item.version
+            if name and version:
+                output[name] = version
+        except Exception:
+            recover(item)
+    return output
+";
+        assert_matches_cpython_marshal(source, "protected_short_circuit_backedges.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_protected_non_final_branch_loop_tails() {
         let source = r"def protected_state_machine(items):
     for index, item in enumerate(items):

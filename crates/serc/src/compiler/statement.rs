@@ -4518,10 +4518,32 @@ impl Compiler {
             } else {
                 statement.test.as_ref()
             };
-            self.assembler.set_location(
-                self.source_location(synthetic_condition_exit_range(fallthrough_test)),
+            let copied_protected_fallthrough = if try_body_normal_exit
+                && !leading
+                    .iter()
+                    .any(|statement| matches!(statement, Stmt::Try(_)))
+                && !matches!(statement.body.as_slice(), [Stmt::With(_)])
+                && condition_jump_target_count(fallthrough_test, false) > 1
+                && let Expr::BoolOp(boolean) = fallthrough_test
+            {
+                boolean
+                    .values
+                    .last()
+                    .and_then(|last| unique_condition_jump_target(last, false))
+            } else {
+                None
+            };
+            let fallthrough_range = copied_protected_fallthrough.map_or_else(
+                || synthetic_condition_exit_range(fallthrough_test),
+                Ranged::range,
             );
+            self.assembler
+                .set_location(self.source_location(fallthrough_range));
             self.emit_loop_tail_backedge(restart, try_body_normal_exit)?;
+            if copied_protected_fallthrough.is_some() {
+                // CPython copies a protected loop-tail exit onto each short-circuit edge.
+                self.assembler.mark_last_as_artificial_eval_break();
+            }
         }
         Ok(())
     }
