@@ -4949,6 +4949,14 @@ impl Compiler {
         self.compile_suite(&statement.orelse)?;
         if has_break {
             self.assembler.mark(end);
+            if self.control.active_exception_region_exclusions.is_empty()
+                && !suite_contains_borrow_reachable_conditional_loop_break(&statement.body)
+            {
+                // The normal exhaustion edge reaches this block only through END_ASYNC_FOR's
+                // exception handler. A simple or tail break has its direct jump removed before
+                // borrowed-load traversal, leaving the following block unreachable.
+                self.assembler.prevent_borrow_reachability(end);
+            }
         }
         if self.control.emit_protected_async_for_end_nop
             && statement.orelse.is_empty()
@@ -5439,11 +5447,14 @@ impl Compiler {
                 || handler_contains_nested_handler_cold_join);
         let copy_break_only_loop_exit = self.control.current_statement_has_following
             && suite_ends_in_nested_break_only_loop(normal_exit_suite);
-        // CPython removes the with handler's normal-exit edge before borrowed-load traversal,
-        // so a following suite cannot reach this try join through that edge.
+        // CPython can leave an empty physical block after a final with or nested try. Borrowed-
+        // load traversal stops there, so a following suite cannot reach this try join through
+        // that normal-exit edge.
         if self.control.current_statement_has_following
-            && statement.orelse.is_empty()
-            && matches!(statement.body.last(), Some(Stmt::With(statement)) if !statement.is_async)
+            && ((statement.orelse.is_empty()
+                && matches!(statement.body.last(), Some(Stmt::With(_))))
+                || (matches!(normal_exit_suite.last(), Some(Stmt::Try(_)))
+                    && suite_ends_in_empty_try_exit_block(normal_exit_suite)))
         {
             self.assembler.prevent_borrow_reachability(end);
         }
@@ -9324,17 +9335,41 @@ fn suite_contains_nested_handler_cold_join(body: &[Stmt]) -> bool {
     detector.found
 }
 
-// A final fallthrough `if` without an `else` leaves CPython's normal try-exit block empty.
+// A final nested `try`, or a fallthrough `if` without an `else`, leaves CPython's normal
+// try-exit block empty after redundant jumps are removed.
 fn suite_ends_in_empty_try_exit_block(body: &[Stmt]) -> bool {
-    let Some(Stmt::If(statement)) = body.last() else {
-        return false;
-    };
-    statement.elif_else_clauses.is_empty()
-        && !suite_terminates(&statement.body)
-        && !statement
-            .body
-            .last()
-            .is_some_and(statement_threads_through_empty_join)
+    match body.last() {
+        Some(Stmt::Try(_)) => !body[..body.len() - 1].iter().any(|statement| {
+            let Stmt::If(statement) = statement else {
+                return false;
+            };
+            let has_terminal_branch = suite_terminates(&statement.body)
+                || statement
+                    .elif_else_clauses
+                    .iter()
+                    .any(|clause| suite_terminates(&clause.body));
+            let all_branches_terminate = suite_terminates(&statement.body)
+                && !statement.elif_else_clauses.is_empty()
+                && statement
+                    .elif_else_clauses
+                    .iter()
+                    .all(|clause| suite_terminates(&clause.body))
+                && statement
+                    .elif_else_clauses
+                    .last()
+                    .is_some_and(|clause| clause.test.is_none());
+            has_terminal_branch && !all_branches_terminate
+        }),
+        Some(Stmt::If(statement)) => {
+            statement.elif_else_clauses.is_empty()
+                && !suite_terminates(&statement.body)
+                && !statement
+                    .body
+                    .last()
+                    .is_some_and(statement_threads_through_empty_join)
+        }
+        _ => false,
+    }
 }
 
 // CPython threads these nested compound-statement exits through a following empty `if` join.
