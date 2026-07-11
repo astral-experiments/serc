@@ -6472,7 +6472,7 @@ impl Compiler {
                 });
             // CPython keeps this simple conditional handler cleanup source-less before copying
             // its exit, rather than inheriting the call location from the taken branch.
-            let handler_ends_with_unlocated_if_cleanup =
+            let handler_ends_with_simple_unlocated_if_cleanup =
                 self.control.current_statement_has_following
                     && matches!(
                         handler.body.last(),
@@ -6487,6 +6487,26 @@ impl Compiler {
                                         if matches!(expression.value.as_ref(), Expr::Call(_))
                                 )
                     );
+            let handler_ends_with_unlocated_if_cleanup = matches!(
+                handler.body.last(),
+                Some(Stmt::If(tail))
+                    if loop_tail.is_none()
+                        && self.control.current_statement_has_following
+                        && tail.elif_else_clauses.is_empty()
+                        && if_normal_exit_count(tail) >= 2
+                        && !matches!(tail.body.as_slice(), [Stmt::Assert(_)])
+                        && tail.body.iter().all(|statement| !matches!(
+                            statement,
+                            Stmt::If(_)
+                                | Stmt::Try(_)
+                                | Stmt::With(_)
+                                | Stmt::For(_)
+                                | Stmt::While(_)
+                                | Stmt::Match(_)
+                        ))
+            )
+                || handler_ends_with_simple_unlocated_if_cleanup;
+
             let handler_ends_with_preserved_unlocated_cleanup = matches!(
                 handler.body.last(),
                 Some(Stmt::If(tail))
