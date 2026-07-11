@@ -159,6 +159,14 @@ impl Compiler {
         &self,
         string: &ruff_python_ast::ExprStringLiteral,
     ) -> Constant {
+        if string
+            .value
+            .iter()
+            .all(|part| !part.as_str().contains('\u{fffd}'))
+        {
+            return Constant::String(string.value.to_str().to_string());
+        }
+
         let mut bytes = Vec::new();
         let mut has_surrogates = false;
         for part in &string.value {

@@ -836,13 +836,30 @@ fn constant_reachability_prepares_the_optimization_graph() {
     let mut assembler = assembler_with_preserved_constant_boundary();
 
     assert_eq!(
-        assembler.used_constant_indices(LOAD_CONST),
-        rustc_hash::FxHashSet::from_iter([0, 2])
+        assembler.used_constant_indices(LOAD_CONST, 3),
+        [true, false, true]
     );
     assert!(matches!(assembler.code, UnoptimizedCode::Prepared(_)));
     assembler.remap_constant_indices(LOAD_CONST, &[Some(0), Some(1), Some(2)]);
 
     assert_eq!(assembler.finish().unwrap(), expected);
+}
+
+#[test]
+fn straight_line_constant_reachability_uses_dense_indices() {
+    let mut assembler = Assembler {
+        code: UnoptimizedCode::Linear(vec![
+            pass_instruction(LOAD_CONST, 0, 1),
+            pass_instruction(LOAD_CONST, 2, 1),
+            pass_instruction(RETURN_VALUE, 0, 1),
+        ]),
+        ..Assembler::default()
+    };
+
+    assert_eq!(
+        assembler.used_constant_indices(LOAD_CONST, 3),
+        [true, false, true]
+    );
 }
 
 fn pass_instruction(opcode: crate::target::Opcode, argument: u32, line: i32) -> Item {
@@ -921,6 +938,52 @@ fn threads_unconditional_forward_jumps_without_conditional_jumps() {
         })
         .unwrap();
     assert!(matches!(first.operand, Operand::Forward(label) if label == final_target));
+}
+
+#[test]
+fn threads_unconditional_forward_jumps_without_conditional_targets() {
+    let conditional_target = super::Label(0);
+    let first_target = super::Label(1);
+    let final_target = super::Label(2);
+    let mut assembler = optimization_pipeline(vec![
+        Item::Instruction(Instruction::new(
+            POP_JUMP_IF_FALSE,
+            Operand::Forward(conditional_target),
+            SourceLocation::NONE,
+            None,
+        )),
+        Item::Instruction(Instruction::new(
+            JUMP_FORWARD,
+            Operand::Forward(first_target),
+            SourceLocation::NONE,
+            None,
+        )),
+        Item::Label(first_target),
+        Item::Instruction(Instruction::new(
+            JUMP_FORWARD,
+            Operand::Forward(final_target),
+            SourceLocation::NONE,
+            None,
+        )),
+        Item::Label(final_target),
+        pass_instruction(RETURN_VALUE, 0, 1),
+        Item::Label(conditional_target),
+        pass_instruction(RETURN_VALUE, 0, 1),
+    ]);
+
+    assembler.thread_forward_jumps();
+
+    let graph = &assembler.graph;
+    let first_jump = graph
+        .iter_items()
+        .find_map(|item| match item {
+            Item::Instruction(instruction) if instruction.opcode == JUMP_FORWARD => {
+                Some(instruction)
+            }
+            Item::Instruction(_) | Item::Label(_) => None,
+        })
+        .unwrap();
+    assert!(matches!(first_jump.operand, Operand::Forward(label) if label == final_target));
 }
 
 #[test]

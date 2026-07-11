@@ -6,7 +6,7 @@ mod passes;
 #[cfg(test)]
 mod tests;
 
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
 use crate::CompileError;
 use crate::target::opcodes::{
@@ -43,25 +43,27 @@ fn reachable_constant_indices(
     graph: &block_graph::BlockGraph,
     exception_regions: &[ExceptionRegion],
     load_const: Opcode,
-) -> FxHashSet<u32> {
-    let reachable = graph.item_reachability(exception_regions);
-    graph
-        .iter_items()
-        .enumerate()
-        .filter_map(|(position, item)| {
+    constant_count: usize,
+) -> Vec<bool> {
+    let reachable = graph.reachable_blocks(exception_regions);
+    let mut used = vec![false; constant_count];
+    for (block, contents) in graph.iter() {
+        if !reachable[block.index()] {
+            continue;
+        }
+        for item in contents.items() {
             let Item::Instruction(instruction) = item else {
-                return None;
+                continue;
             };
-            if reachable[position]
-                && instruction.opcode == load_const
+            if instruction.opcode == load_const
                 && let Operand::Value(index) = instruction.operand
+                && let Some(used) = used.get_mut(index as usize)
             {
-                Some(index)
-            } else {
-                None
+                *used = true;
             }
-        })
-        .collect()
+        }
+    }
+    used
 }
 
 impl Assembler {
@@ -969,12 +971,21 @@ impl Assembler {
         Ok(())
     }
 
-    pub(crate) fn used_constant_indices(&mut self, load_const: Opcode) -> FxHashSet<u32> {
+    pub(crate) fn used_constant_indices(
+        &mut self,
+        load_const: Opcode,
+        constant_count: usize,
+    ) -> Vec<bool> {
         if let UnoptimizedCode::Prepared(graph) = &self.code {
-            return reachable_constant_indices(graph, &self.exception_regions, load_const);
+            return reachable_constant_indices(
+                graph,
+                &self.exception_regions,
+                load_const,
+                constant_count,
+            );
         }
 
-        let mut used = FxHashSet::default();
+        let mut used = vec![false; constant_count];
         let mut ended_scope = false;
         let mut straight_line = true;
         for item in self.linear_items() {
@@ -987,8 +998,9 @@ impl Assembler {
             }
             if instruction.opcode == load_const
                 && let Operand::Value(index) = instruction.operand
+                && let Some(used) = used.get_mut(index as usize)
             {
-                used.insert(index);
+                *used = true;
             }
             ended_scope = ends_scope(instruction.opcode);
         }
@@ -1008,7 +1020,7 @@ impl Assembler {
         let UnoptimizedCode::Prepared(graph) = &self.code else {
             unreachable!();
         };
-        reachable_constant_indices(graph, &self.exception_regions, load_const)
+        reachable_constant_indices(graph, &self.exception_regions, load_const, constant_count)
     }
 
     pub(crate) fn remap_constant_indices(&mut self, load_const: Opcode, index_map: &[Option<u32>]) {

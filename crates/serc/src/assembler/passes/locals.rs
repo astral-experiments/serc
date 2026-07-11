@@ -13,7 +13,6 @@ use super::super::{
     block_jump_target, ends_scope, opcode_num_popped, opcode_num_pushed, opcode_stack_effect,
 };
 use crate::assembler::OptimizationPipeline;
-use crate::assembler::block_graph::ItemPosition;
 
 impl OptimizationPipeline {
     /// Converts potentially uninitialized local loads to checked loads.
@@ -317,7 +316,7 @@ impl OptimizationPipeline {
     pub(in crate::assembler) fn optimize_load_fast(&mut self) {
         #[derive(Clone, Copy)]
         struct Reference {
-            producer: Option<ItemPosition>,
+            producer: Option<usize>,
             local: Option<u32>,
         }
 
@@ -328,25 +327,25 @@ impl OptimizationPipeline {
             })
         }
 
-        fn kill_local(unsafe_loads: &mut FxHashSet<ItemPosition>, stack: &[Reference], local: u32) {
+        fn kill_local(unsafe_loads: &mut [bool], stack: &[Reference], local: u32) {
             for reference in stack {
                 if reference.local == Some(local)
                     && let Some(producer) = reference.producer
                 {
-                    unsafe_loads.insert(producer);
+                    unsafe_loads[producer] = true;
                 }
             }
         }
 
         fn store_local(
-            unsafe_loads: &mut FxHashSet<ItemPosition>,
+            unsafe_loads: &mut [bool],
             stack: &[Reference],
             local: u32,
             reference: Reference,
         ) {
             kill_local(unsafe_loads, stack, local);
             if let Some(producer) = reference.producer {
-                unsafe_loads.insert(producer);
+                unsafe_loads[producer] = true;
             }
         }
 
@@ -455,16 +454,11 @@ impl OptimizationPipeline {
             if !reachable[block.index()] {
                 continue;
             }
-            let instruction_positions = graph
-                .block_item_positions(block)
-                .into_iter()
-                .filter(|position| matches!(graph.item(*position), Item::Instruction(_)))
-                .collect::<Vec<_>>();
             let mut cumulative_effect = 0_i64;
             let mut start_depth = None;
-            for position in &instruction_positions {
-                let Item::Instruction(instruction) = *graph.item(*position) else {
-                    unreachable!();
+            for item in graph[block].items() {
+                let Item::Instruction(instruction) = *item else {
+                    continue;
                 };
                 let Operand::Value(argument) = instruction.operand else {
                     cumulative_effect += opcode_stack_effect(instruction.opcode, 0);
@@ -487,11 +481,11 @@ impl OptimizationPipeline {
                 };
                 usize::try_from(start_depth.unwrap_or(0).max(0)).unwrap()
             ];
-            let mut unsafe_loads = FxHashSet::default();
+            let mut unsafe_loads = vec![false; graph[block].items().len()];
 
-            for position in &instruction_positions {
-                let Item::Instruction(instruction) = *graph.item(*position) else {
-                    unreachable!();
+            for (offset, item) in graph[block].items().iter().enumerate() {
+                let Item::Instruction(instruction) = *item else {
+                    continue;
                 };
                 let argument = match instruction.operand {
                     Operand::Value(argument) => argument,
@@ -503,23 +497,23 @@ impl OptimizationPipeline {
                 match instruction.opcode {
                     DELETE_FAST => kill_local(&mut unsafe_loads, &stack, argument),
                     LOAD_FAST => stack.push(Reference {
-                        producer: Some(*position),
+                        producer: Some(offset),
                         local: Some(argument),
                     }),
                     LOAD_FAST_AND_CLEAR => {
                         kill_local(&mut unsafe_loads, &stack, argument);
                         stack.push(Reference {
-                            producer: Some(*position),
+                            producer: Some(offset),
                             local: Some(argument),
                         });
                     }
                     LOAD_FAST_LOAD_FAST => {
                         stack.push(Reference {
-                            producer: Some(*position),
+                            producer: Some(offset),
                             local: Some(argument >> 4),
                         });
                         stack.push(Reference {
-                            producer: Some(*position),
+                            producer: Some(offset),
                             local: Some(argument & 15),
                         });
                     }
@@ -531,7 +525,7 @@ impl OptimizationPipeline {
                         let reference = pop_reference(&mut stack);
                         store_local(&mut unsafe_loads, &stack, argument >> 4, reference);
                         stack.push(Reference {
-                            producer: Some(*position),
+                            producer: Some(offset),
                             local: Some(argument & 15),
                         });
                     }
@@ -571,9 +565,11 @@ impl OptimizationPipeline {
                         // CPython's inner loop shadows the instruction index,
                         // attributing these references to the first
                         // instructions in the block.
-                        for producer in instruction_positions
+                        for (producer, _) in graph[block]
+                            .items()
                             .iter()
-                            .copied()
+                            .enumerate()
+                            .filter(|(_, item)| matches!(item, Item::Instruction(_)))
                             .take(pushed.saturating_sub(popped))
                         {
                             stack.push(Reference {
@@ -653,46 +649,48 @@ impl OptimizationPipeline {
 
             for reference in &stack {
                 if let Some(producer) = reference.producer {
-                    unsafe_loads.insert(producer);
+                    unsafe_loads[producer] = true;
                 }
             }
-            for (index, position) in instruction_positions.iter().copied().enumerate() {
-                if unsafe_loads.contains(&position) {
+            for (offset, unsafe_load) in unsafe_loads.iter().copied().enumerate() {
+                if unsafe_load {
                     continue;
                 }
-                let local_policy = match *graph.item(position) {
-                    Item::Instruction(instruction) => instruction.local_policy,
-                    Item::Label(_) => unreachable!(),
+                let Item::Instruction(instruction) = graph[block].items()[offset] else {
+                    continue;
                 };
+                let local_policy = instruction.local_policy;
                 if local_policy.strict_owned_load() {
                     continue;
                 }
                 if local_policy.force_owned_load() {
-                    let following = instruction_positions[index + 1..]
-                        .iter()
-                        .filter_map(|position| match *graph.item(*position) {
-                            Item::Instruction(instruction) if instruction.opcode != NOP => {
-                                Some(instruction.opcode)
-                            }
-                            _ => None,
-                        })
-                        .take(2)
-                        .collect::<Vec<_>>();
-                    let directly_consumed = following.first().is_some_and(|opcode| {
-                        matches!(*opcode, RETURN_VALUE | STORE_DEREF | STORE_GLOBAL)
-                    }) || matches!(following.as_slice(), [POP_TOP, next] if *next != POP_EXCEPT)
+                    let mut following =
+                        graph[block].items()[offset + 1..]
+                            .iter()
+                            .filter_map(|item| match *item {
+                                Item::Instruction(instruction) if instruction.opcode != NOP => {
+                                    Some(instruction.opcode)
+                                }
+                                _ => None,
+                            });
+                    let first = following.next();
+                    let second = following.next();
+                    let directly_consumed = matches!(
+                        first,
+                        Some(RETURN_VALUE | STORE_DEREF | STORE_GLOBAL)
+                    ) || matches!((first, second), (Some(POP_TOP), Some(next)) if next != POP_EXCEPT)
                         || matches!(
-                            following.as_slice(),
-                            [
-                                LOAD_COMMON_CONSTANT | LOAD_CONST | LOAD_SMALL_INT,
-                                COMPARE_OP
-                            ]
+                            (first, second),
+                            (
+                                Some(LOAD_COMMON_CONSTANT | LOAD_CONST | LOAD_SMALL_INT),
+                                Some(COMPARE_OP)
+                            )
                         );
                     if !directly_consumed {
                         continue;
                     }
                 }
-                let Some(instruction) = graph.instruction_mut(position) else {
+                let Some(instruction) = graph.instruction_at_mut(block, offset) else {
                     unreachable!();
                 };
                 match instruction.opcode {
