@@ -1233,6 +1233,38 @@ def simple_assignment_control(flag):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_terminal_conditional_assignment_copy_threshold() {
+        let source = r#"def direct_name(flag, left, right):
+    value = left if flag else right
+
+
+def direct_attribute(flag, left, right, target):
+    target.value = left if flag else right
+
+
+def subscript(flag, left, right, target):
+    target["value"] = left if flag else right
+
+
+def unpack(flag, left, right):
+    first, second = left if flag else right
+
+
+def chained(flag, left, right):
+    first = second = left if flag else right
+
+
+def complex_attribute(flag, left, right, target):
+    target.child.value = left if flag else right
+
+
+def nested_unpack(flag, left, right):
+    [(value,)] = left if flag else right
+"#;
+        assert_matches_cpython_marshal(source, "terminal_conditional_assignment_threshold.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_nested_terminal_try_condition_ownership() {
         let source = r"def nested_try(a, b):
     try:

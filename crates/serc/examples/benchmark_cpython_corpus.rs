@@ -84,7 +84,7 @@ while True:
                     dont_inherit=True,
                     optimize=0,
                 )
-            except (SyntaxError, UnicodeError, ValueError):
+            except Exception:
                 rejected += 1
                 continue
             accepted.append((filename, source))
@@ -1602,12 +1602,19 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        BOOTSTRAP_SEED, BlockSample, Engine, Metric, Options, Phase, RawRow, SourceFile, Timings,
-        block_order, block_order_label, block_samples, bootstrap_median_ci, cooldown_metadata,
-        discover, expected_row_count, parse_options_from, parse_sample_response,
+        BOOTSTRAP_SEED, BlockSample, Engine, Metric, Options, PYTHON_HELPER, Phase, RawRow,
+        SourceFile, Timings, block_order, block_order_label, block_samples, bootstrap_median_ci,
+        cooldown_metadata, discover, expected_row_count, parse_options_from, parse_sample_response,
         process_timer_result, profile_from_executable, ratio_statistics, summarize,
         verify_exact_marshal, write_raw,
     };
+
+    #[test]
+    fn python_helper_classifies_compile_exceptions_as_rejected() {
+        assert!(
+            PYTHON_HELPER.contains("            except Exception:\n                rejected += 1")
+        );
+    }
 
     fn raw_row(
         block: usize,

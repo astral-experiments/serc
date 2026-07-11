@@ -927,7 +927,10 @@ impl Compiler {
                         continue;
                     }
                     Stmt::Assign(assignment)
-                        if matches!(assignment.value.as_ref(), Expr::If(_)) =>
+                        if matches!(assignment.value.as_ref(), Expr::If(_))
+                            && Self::terminal_assignment_if_expression_requires_specialization(
+                                assignment,
+                            ) =>
                     {
                         let Expr::If(expression) = assignment.value.as_ref() else {
                             unreachable!();
@@ -1925,6 +1928,22 @@ impl Compiler {
         self.emit_implicit_return()?;
         self.set_depth(base_depth);
         Ok(())
+    }
+
+    fn terminal_assignment_if_expression_requires_specialization(
+        assignment: &ruff_python_ast::StmtAssign,
+    ) -> bool {
+        // CPython only copies terminal exit blocks with at most four pre-fusion instructions.
+        // Compound targets therefore need the ordinary joined lowering so the assembler can
+        // apply that threshold. Keep the direct forms specialized to preserve nested-conditional
+        // behavior and the load fusion before a simple attribute store.
+        match assignment.targets.as_slice() {
+            [Expr::Name(_)] => true,
+            [Expr::Attribute(attribute)] => {
+                matches!(attribute.value.as_ref(), Expr::Name(_))
+            }
+            _ => false,
+        }
     }
 
     fn compile_terminal_assignment_if_expression(
