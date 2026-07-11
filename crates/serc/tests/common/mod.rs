@@ -7,6 +7,37 @@ use tempfile::tempdir;
 
 const CPYTHON_MARSHAL: &str = "import marshal, sys; code = compile(sys.stdin.read(), sys.argv[1], 'exec', dont_inherit=True, optimize=0); sys.stdout.buffer.write(marshal.dumps(code))";
 const CPYTHON_MARSHAL_BYTES: &str = "import marshal, sys; code = compile(sys.stdin.buffer.read(), sys.argv[1], 'exec', dont_inherit=True, optimize=0); sys.stdout.buffer.write(marshal.dumps(code))";
+const CPYTHON_POP_EXCEPT_POSITIONS: &str = r#"
+import dis, marshal, sys, types
+if sys.argv[1] == "source":
+    root = compile(sys.stdin.buffer.read(), sys.argv[2], "exec", dont_inherit=True, optimize=0)
+else:
+    root = marshal.loads(sys.stdin.buffer.read())
+
+def walk(code):
+    yield code
+    for value in code.co_consts:
+        if isinstance(value, types.CodeType):
+            yield from walk(value)
+
+target = sys.argv[3:]
+for code in walk(root):
+    positions = [
+        (
+            instruction.positions.lineno,
+            instruction.positions.end_lineno,
+            instruction.positions.col_offset,
+            instruction.positions.end_col_offset,
+        )
+        for instruction in dis.get_instructions(code, show_caches=True)
+        if instruction.opname == "POP_EXCEPT"
+    ]
+    if target:
+        if code.co_qualname == target[0]:
+            print(any(position[0] == int(target[1]) for position in positions))
+    elif positions:
+        print(code.co_qualname, positions)
+"#;
 
 static PYTHON_3145: OnceLock<Result<String, String>> = OnceLock::new();
 
@@ -56,6 +87,97 @@ pub(crate) fn python_3145_command() -> Command {
     let mut command = Command::new(python_3145());
     command.args(["-I", "-S"]);
     command
+}
+
+fn cpython_pop_except_positions(input: &[u8], mode: &str, filename: &str) -> std::process::Output {
+    python_3145_command()
+        .args(["-c", CPYTHON_POP_EXCEPT_POSITIONS, mode, filename])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            child.stdin.take().unwrap().write_all(input)?;
+            child.wait_with_output()
+        })
+        .unwrap()
+}
+
+pub(crate) fn assert_matches_cpython_pop_except_positions(source: &str, filename: &str) {
+    let expected = cpython_pop_except_positions(source.as_bytes(), "source", filename);
+    assert!(
+        expected.status.success(),
+        "CPython POP_EXCEPT position oracle failed for {filename}: {}",
+        String::from_utf8_lossy(&expected.stderr)
+    );
+
+    let marshal = compile(source, filename).unwrap().marshal();
+    let actual = cpython_pop_except_positions(&marshal, "marshal", filename);
+    assert!(
+        actual.status.success(),
+        "CPython failed to decode Serc marshal for {filename}: {}",
+        String::from_utf8_lossy(&actual.stderr)
+    );
+
+    assert_eq!(
+        actual.stdout, expected.stdout,
+        "POP_EXCEPT positions differ for {filename}",
+    );
+}
+fn cpython_has_pop_except_at(
+    input: &[u8],
+    mode: &str,
+    filename: &str,
+    qualified_name: &str,
+    line: u32,
+) -> std::process::Output {
+    let line = line.to_string();
+    python_3145_command()
+        .args([
+            "-c",
+            CPYTHON_POP_EXCEPT_POSITIONS,
+            mode,
+            filename,
+            qualified_name,
+            line.as_str(),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            child.stdin.take().unwrap().write_all(input)?;
+            child.wait_with_output()
+        })
+        .unwrap()
+}
+
+pub(crate) fn assert_cpython_and_serc_have_pop_except_at(
+    source: &str,
+    filename: &str,
+    qualified_name: &str,
+    line: u32,
+) {
+    let expected =
+        cpython_has_pop_except_at(source.as_bytes(), "source", filename, qualified_name, line);
+    assert!(
+        expected.status.success(),
+        "CPython POP_EXCEPT position oracle failed for {filename}: {}",
+        String::from_utf8_lossy(&expected.stderr)
+    );
+    assert_eq!(expected.stdout, b"True\n", "CPython control shape changed");
+
+    let marshal = compile(source, filename).unwrap().marshal();
+    let actual = cpython_has_pop_except_at(&marshal, "marshal", filename, qualified_name, line);
+    assert!(
+        actual.status.success(),
+        "CPython failed to decode Serc marshal for {filename}: {}",
+        String::from_utf8_lossy(&actual.stderr)
+    );
+    assert_eq!(
+        actual.stdout, expected.stdout,
+        "Serc lost the located POP_EXCEPT in {qualified_name}",
+    );
 }
 
 pub(crate) fn assert_matches_cpython_marshal(source: &str, filename: &str) {

@@ -291,6 +291,10 @@ pub(super) struct ControlFlowState {
     pub(super) same_line_try_body: bool,
     // Whether the statement currently entered by `compile_suite` has a sibling successor.
     pub(super) current_statement_has_following: bool,
+    // Whether an enclosing statement has a sibling successor after its nested suite.
+    inherited_statement_has_following: bool,
+    // Only conditional and with statements carry that continuation into their nested suites.
+    current_statement_propagates_following_to_suites: bool,
     // The first non-terminal assertion in the innermost iterator-loop body.
     first_iterator_loop_assertion: Option<TextRange>,
     // Set while that assertion's condition is lowered so its marker can inspect the final slot.
@@ -888,6 +892,11 @@ impl Compiler {
         body: &[Stmt],
         final_expression_becomes_return: bool,
     ) -> Result<(), CompileError> {
+        let inherited_statement_has_following = self
+            .control
+            .current_statement_propagates_following_to_suites
+            && (self.control.current_statement_has_following
+                || self.control.inherited_statement_has_following);
         for (index, statement) in body.iter().enumerate() {
             let is_final = index + 1 == body.len();
             if is_final && final_expression_becomes_return {
@@ -1145,6 +1154,16 @@ impl Compiler {
                     &mut self.control.copied_nested_handler_join_successor,
                     preceded_by_copied_nested_handler_join,
                 );
+                let previous_inherited_statement_has_following = std::mem::replace(
+                    &mut self.control.inherited_statement_has_following,
+                    inherited_statement_has_following,
+                );
+                let previous_statement_propagates_following = std::mem::replace(
+                    &mut self
+                        .control
+                        .current_statement_propagates_following_to_suites,
+                    matches!(statement, Stmt::If(_) | Stmt::With(_)),
+                );
                 let result = self.with_control_override(
                     |control| &mut control.emit_protected_async_for_end_nop,
                     emit_protected_async_for_end_nop,
@@ -1229,6 +1248,11 @@ impl Compiler {
                         )
                     },
                 );
+                self.control.inherited_statement_has_following =
+                    previous_inherited_statement_has_following;
+                self.control
+                    .current_statement_propagates_following_to_suites =
+                    previous_statement_propagates_following;
                 self.control.copied_nested_handler_join_successor =
                     previous_copied_nested_handler_join_successor;
                 self.control.direct_comprehension_assignment_results =
@@ -6660,7 +6684,8 @@ impl Compiler {
             // CPython keeps this simple conditional handler cleanup source-less before copying
             // its exit, rather than inheriting the call location from the taken branch.
             let handler_ends_with_simple_unlocated_if_cleanup =
-                self.control.current_statement_has_following
+                (self.control.current_statement_has_following
+                    || self.control.inherited_statement_has_following)
                     && matches!(
                         handler.body.last(),
                         Some(Stmt::If(tail))
@@ -6678,7 +6703,8 @@ impl Compiler {
                 handler.body.last(),
                 Some(Stmt::If(tail))
                     if loop_tail.is_none()
-                        && self.control.current_statement_has_following
+                        && (self.control.current_statement_has_following
+                            || self.control.inherited_statement_has_following)
                         && tail.elif_else_clauses.is_empty()
                         && if_normal_exit_count(tail) >= 2
                         && !matches!(tail.body.as_slice(), [Stmt::Assert(_)])
