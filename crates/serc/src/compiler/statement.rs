@@ -5114,7 +5114,7 @@ impl Compiler {
                     .set_location(self.source_location(assignment.range));
                 let cell = self.closure_index("__conditional_annotations__")?;
                 self.emit(LOAD_DEREF, cell, 1)?;
-                self.emit(LOAD_SMALL_INT, index, 1)?;
+                self.emit_annotation_index(index)?;
                 self.emit(SET_ADD, 1, -1)?;
                 self.emit(POP_TOP, 0, -1)?;
             }
@@ -5152,7 +5152,7 @@ impl Compiler {
                 self.assembler
                     .set_location(self.source_location(assignment.range));
                 self.load_name("__conditional_annotations__")?;
-                self.emit(LOAD_SMALL_INT, index, 1)?;
+                self.emit_annotation_index(index)?;
                 self.emit(SET_ADD, 1, -1)?;
                 self.emit(POP_TOP, 0, -1)?;
             }
