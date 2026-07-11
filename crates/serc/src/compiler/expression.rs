@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use ruff_python_ast::visitor::{Visitor, walk_expr};
 use ruff_python_ast::{
-    BoolOp, CmpOp, ConversionFlag, Expr, ExprBinOp, ExprContext, FStringPart, Identifier,
+    BoolOp, CmpOp, ConversionFlag, Expr, ExprBinOp, ExprContext, ExprIf, FStringPart, Identifier,
     InterpolatedStringElement, Keyword, Number, Operator, Pattern, Singleton, Stmt, UnaryOp,
 };
 use ruff_text_size::Ranged;
@@ -344,12 +344,26 @@ impl Compiler {
                             && body_previous_location.is_some_and(|location| {
                                 location.line == self.assembler.location().line
                             });
-                        if irrefutable_true_guard
-                            || (self.assembler.instruction_count() == body_start + 1
-                                && !previous_instruction_covers_branch
-                                && !matches!(self.unit.scope, Scope::Class { .. }))
+                        if irrefutable_true_guard {
+                            self.assembler.preserve_last_inlined_jump_nop();
+                        } else if self.assembler.instruction_count() == body_start + 1
+                            && !previous_instruction_covers_branch
+                            && !matches!(self.unit.scope, Scope::Class { .. })
                         {
                             self.assembler.preserve_last_inlined_jump_nop();
+                            // CPython keeps this retained success-exit NOP on the physical
+                            // fallthrough for irrefutable explicit-global captures. Refutable
+                            // and local captures keep the ordinary borrowed-load barrier.
+                            if context.fail_pop.is_empty()
+                                && !context.stores.is_empty()
+                                && matches!(
+                                    &self.unit.scope,
+                                    Scope::Function { globals, .. }
+                                        if context.stores.iter().all(|name| globals.contains(*name))
+                                )
+                            {
+                                self.assembler.mark_last_retained_nop_borrow_fallthrough();
+                            }
                         }
                     }
                 }
@@ -4320,16 +4334,21 @@ impl Compiler {
         // CPython emits the conditional-expression join without a location. Its later
         // propagation pass inherits the body location only when the join remains in the same
         // basic block; short-circuit bodies can leave it deliberately unlocated.
-        if matches!(expression.body.as_ref(), Expr::If(_)) {
-            // Keep the provisional range until Serc models CPython's propagation across the
-            // nested conditional's join block.
-            self.assembler
-                .set_location(self.source_location(expression.body.range()));
+        // A nested conditional leaves its own join immediately before this one, so propagate
+        // that conditional's actual fallthrough leaf rather than its whole source range.
+        let preserve_nested_no_location = if let Expr::If(nested) = expression.body.as_ref() {
+            let fallthrough = conditional_expression_fallthrough(nested);
+            let location = fallthrough.map_or(SourceLocation::NONE, |fallthrough| {
+                self.source_location(fallthrough.range())
+            });
+            self.assembler.set_location(location);
+            fallthrough.is_none()
         } else {
             self.assembler.set_location(SourceLocation::NONE);
-        }
+            false
+        };
         self.emit_jump_forward(JUMP_FORWARD, end, 0)?;
-        if matches!(expression.body.as_ref(), Expr::BoolOp(_)) {
+        if matches!(expression.body.as_ref(), Expr::BoolOp(_)) || preserve_nested_no_location {
             self.assembler.preserve_last_no_location();
         }
         self.assembler.mark(else_label);
@@ -5479,6 +5498,21 @@ pub(super) fn early_condition_truthiness(expression: &Expr) -> Option<bool> {
         None
     } else {
         literal_truthiness(expression)
+    }
+}
+
+// Returns the leaf that reaches a nested conditional expression's join by fallthrough.
+// A short-circuit leaf has multiple predecessors, so CPython keeps the join source-less.
+fn conditional_expression_fallthrough(expression: &ExprIf) -> Option<&Expr> {
+    let branch = if early_condition_truthiness(&expression.test) == Some(true) {
+        expression.body.as_ref()
+    } else {
+        expression.orelse.as_ref()
+    };
+    match branch {
+        Expr::If(nested) => conditional_expression_fallthrough(nested),
+        Expr::BoolOp(_) => None,
+        _ => Some(branch),
     }
 }
 

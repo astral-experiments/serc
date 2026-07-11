@@ -8031,7 +8031,16 @@ impl Compiler {
             },
         )?;
         self.assembler.mark(protected_end);
-        if !remaining.is_empty() && suite_terminates(body) {
+        let nested_manager_has_distinct_line = remaining.first().is_some_and(|next| {
+            self.source_location(item.context_expr.range()).line
+                != self.source_location(next.context_expr.range()).line
+        });
+        if !remaining.is_empty()
+            && (suite_terminates(body)
+                || (self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                    && nested_manager_has_distinct_line
+                    && with_body_ends_in_terminal_try(body)))
+        {
             // A nested manager can suppress the terminal body's exception. CPython keeps the
             // nested item's line marker before running this outer manager's normal exit.
             self.assembler
@@ -8808,6 +8817,23 @@ fn try_normal_exit_predecessors(statement: &ruff_python_ast::StmtTry) -> usize {
                     .is_some_and(|handler| !suite_terminates(&handler.body))
             })
             .count()
+}
+
+fn with_body_ends_in_terminal_try(body: &[Stmt]) -> bool {
+    let Some(Stmt::Try(statement)) = body.last() else {
+        return false;
+    };
+    if statement.is_star || suite_terminates(&statement.finalbody) {
+        return false;
+    }
+    let normal_exit_terminates = suite_terminates(&statement.body)
+        || (!statement.orelse.is_empty() && suite_terminates(&statement.orelse));
+    normal_exit_terminates
+        && statement.handlers.iter().all(|handler| {
+            handler
+                .as_except_handler()
+                .is_some_and(|handler| suite_terminates(&handler.body))
+        })
 }
 
 // A converted `POP_BLOCK` after a final try normally inherits its location from a sole jump

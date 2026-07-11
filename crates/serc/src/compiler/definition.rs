@@ -704,10 +704,7 @@ impl Compiler {
             0,
             wrapper_flags,
         )?;
-        wrapper
-            .unit
-            .private_name
-            .clone_from(&self.unit.private_name);
+        wrapper.unit.private_name = Some(definition.name.as_str().to_string());
         wrapper
             .symbols
             .imported_scope_names

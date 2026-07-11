@@ -205,6 +205,47 @@ mod tests {
     }
 
     #[test]
+    fn matches_cpython_marshal_for_global_capture_match_exit_borrowing() {
+        let source = r"def capture(subject):
+    global captured
+    match subject:
+        case captured:
+            pass
+    consume(subject)
+
+
+def capture_as(subject):
+    global captured_as
+    match subject:
+        case _ as captured_as:
+            pass
+    consume(subject)
+";
+        assert_matches_cpython_marshal(source, "global_capture_match_exit.py");
+    }
+
+    #[test]
+    fn keeps_refutable_and_local_match_exit_borrow_controls() {
+        let source = r"def refutable_global_capture(subject):
+    global captured
+    match (None, subject):
+        case (_, captured):
+            pass
+    consume(subject)
+
+
+def nested_local_capture(subject):
+    match subject:
+        case outer:
+            match subject:
+                case inner:
+                    pass
+    consume(subject, outer, inner)
+";
+        assert_matches_cpython_marshal(source, "match_exit_borrow_controls.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_match_success_next_locations() {
         let source = r"def tuple_result(subject):
     match subject:
@@ -329,6 +370,34 @@ def nested_match(subject, nested):
     fn matches_cpython_marshal_for_nested_generic_class_scopes() {
         let source = "class Outer[T]:\n    class Inner:\n        function = lambda: None\n        values = (value for value in ())\n\n        def method(self, value: T) -> T:\n            return value\n\n        def generic[U](self, value: U) -> U:\n            return value\n";
         assert_matches_cpython_marshal(source, "nested_generic.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_generic_class_private_name_contexts() {
+        let source = r"class Outer:
+    def define():
+        class Child[__T]:
+            value = __T
+
+        return Child
+
+
+class ModuleLevel[__V]:
+    value = __V
+";
+        assert_matches_cpython_marshal(source, "generic_class_private_names.py");
+    }
+
+    #[test]
+    fn preserves_enclosing_private_name_context_for_generic_functions() {
+        let source = r"class Outer:
+    def define():
+        def function[__U]():
+            return __U
+
+        return function
+";
+        assert_matches_cpython_marshal(source, "generic_function_private_names.py");
     }
 
     #[test]
@@ -2187,6 +2256,52 @@ def enclosing_try_control(manager):
         return recover()
 ";
         assert_matches_cpython_marshal(source, "with_direct_handler_returns.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_multiline_nested_with_terminal_try_exits() {
+        let source = r"def else_path(outer):
+    with (
+        outer() as value,
+        value.span,
+    ):
+        try:
+            result = action()
+        except Error:
+            raise
+        else:
+            return result
+
+
+def fallthrough_handler(outer):
+    with (
+        outer() as value,
+        value.span,
+    ):
+        try:
+            action()
+        except Error:
+            recover()
+
+
+def same_line_terminal(outer):
+    with outer() as value, value.span:
+        try:
+            result = action()
+        except Error:
+            raise
+        else:
+            return result
+
+
+def direct_return(outer):
+    with (
+        outer() as value,
+        value.span,
+    ):
+        return action()
+";
+        assert_matches_cpython_marshal(source, "nested_with_terminal_try_exit.py");
     }
 
     #[test]
@@ -5679,6 +5794,40 @@ def two_terminal_arms_control(value, flag):
         value, 'items') else []
     manager.second = (value.other or []) if has_value(
         value, 'other') else []
+
+
+def nested_body(outer, inner, first, second, third):
+    value = (first if inner else second) if outer else third
+    consume(value)
+
+
+def recursive_nested_body(outer, middle, inner, first, second, third, fourth):
+    value = ((first if inner else second) if middle else third) if outer else fourth
+    consume(value)
+
+
+def folded_true_nested_body(outer, first, second, third):
+    value = (first if True else second) if outer else third
+    consume(value)
+
+
+def folded_false_nested_body(outer, first, second, third):
+    value = (first if False else second) if outer else third
+    consume(value)
+
+
+def nested_short_circuit_fallthrough(outer, inner, first, second, third, fourth):
+    value = (first if inner else (second or third)) if outer else fourth
+    consume(value)
+
+
+def nested_else_control(outer, inner, first, second, third):
+    value = first if outer else (second if inner else third)
+    consume(value)
+
+
+def return_control(outer, inner, first, second, third):
+    return (first if inner else second) if outer else third
 
 
 def same_block_control(condition, body, otherwise):
