@@ -5068,6 +5068,11 @@ impl Compiler {
                     && self.control.active_with_region_exclusions.is_empty()
                     && self.control.active_exception_region_exclusions.is_empty()
                     && self.control.active_normal_finally_bodies == 0;
+            // CPython specializes this condition by removing LOAD_CONST(None), IS_OP, and
+            // TO_BOOL before appending NOT_TAKEN. Preserve the owner only when optimization can
+            // reuse a stale protected slot in the current block.
+            let marker_reuses_exception_owner =
+                self.assembler.current_block_has_dynamic_exception_owner();
             let policy = ConditionMarkerPolicy {
                 excluded: ExceptionPolicy::default(),
                 ordinary: ExceptionPolicy::normalized_owner(
@@ -5081,7 +5086,8 @@ impl Compiler {
                             .control
                             .finally_try_body_preserves_none_condition_owner()
                         || self.control.in_first_unnamed_exception_handler()
-                        || self.control.active_normal_finally_bodies > 0,
+                        || self.control.active_normal_finally_bodies > 0
+                        || marker_reuses_exception_owner,
                 ),
             };
             return if preserve_generator_stop_iteration_owner {
