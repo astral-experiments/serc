@@ -3400,6 +3400,26 @@ def direct_assertion_control(items):
                 "generator_nested_scope_boundary.py",
                 "async def f(items):\n    return ((await transform(value) for value in expand(item)) for item in items)\n",
             ),
+            (
+                "generator_later_iterable_inlined_comprehension.py",
+                "def f(items, values):\n    return (result for item in items for result in expand(item, [inner for inner in values]))\n",
+            ),
+            (
+                "generator_filter_inlined_comprehension_control.py",
+                "def f(items, values):\n    return (item for item in items if accept([inner for inner in values]))\n",
+            ),
+            (
+                "generator_element_inlined_comprehension_control.py",
+                "def f(items, values):\n    return ([inner for inner in values] for item in items)\n",
+            ),
+            (
+                "generator_later_iterable_nested_generator_control.py",
+                "def f(items, values):\n    return (result for item in items for result in (inner for inner in values))\n",
+            ),
+            (
+                "generator_later_iterable_reused_target_control.py",
+                "def f(items, values):\n    return (result for item in items for result in expand([item for item in values]))\n",
+            ),
         ];
         for (filename, source) in cases {
             assert_matches_cpython_marshal(source, filename);

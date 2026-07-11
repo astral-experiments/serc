@@ -2900,7 +2900,13 @@ impl Compiler {
             || expression_suspends_current_scope(&generator.elt);
 
         let mut locals = vec![".0".to_string()];
-        for comprehension in &generator.generators {
+        for (index, comprehension) in generator.generators.iter().enumerate() {
+            if index > 0 {
+                // A later iterable executes before its target is stored. Inlined
+                // comprehensions in that iterable therefore reserve their temporary fast
+                // locals before the generator target.
+                collect_nested_comprehension_target_names(&comprehension.iter, &mut locals);
+            }
             collect_target_names(&comprehension.target, &mut locals);
         }
         collect_nested_comprehension_target_names(&generator.elt, &mut locals);
