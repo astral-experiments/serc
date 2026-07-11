@@ -37,9 +37,9 @@ use crate::target::operands::{
 };
 
 use super::constant::{
-    PercentFormatPart, big_integer_digits, constant_slice, first_literal_constant, fold_constant,
-    folded_bool_operand, folded_constant_owner_slots, optimized_percent_format,
-    python_constant_values_equal, two_element_slice_optimization,
+    PercentFormatPart, big_integer_digits, constant_slice, explicit_surrogate_string,
+    first_literal_constant, fold_constant, folded_bool_operand, folded_constant_owner_slots,
+    optimized_percent_format, python_constant_values_equal, two_element_slice_optimization,
 };
 use super::scope::{
     LoweringFunctionPlan, NameId, NameSet, analyze_lambda_scope,
@@ -67,6 +67,61 @@ struct MatchContext {
     on_top: usize,
     ownerless_markers_after_specialized_none: bool,
     in_class_keyword: bool,
+}
+
+struct PendingInterpolatedLiteral {
+    value: String,
+    surrogate_value: Option<Vec<u8>>,
+    range: ruff_text_size::TextRange,
+}
+
+impl PendingInterpolatedLiteral {
+    fn append(
+        pending: &mut Option<Self>,
+        source: &str,
+        value: &str,
+        source_range: ruff_text_size::TextRange,
+        range: ruff_text_size::TextRange,
+        is_raw: bool,
+    ) {
+        let surrogate_value = (!is_raw && value.contains('\u{fffd}'))
+            .then(|| {
+                let start = usize::from(source_range.start());
+                let end = usize::from(source_range.end());
+                explicit_surrogate_string(value, &source[start..end])
+            })
+            .flatten();
+        if let Some(pending) = pending {
+            if let Some(surrogate_value) = surrogate_value {
+                pending
+                    .surrogate_value
+                    .get_or_insert_with(|| pending.value.as_bytes().to_vec())
+                    .extend(surrogate_value);
+            } else if let Some(pending_value) = &mut pending.surrogate_value {
+                pending_value.extend_from_slice(value.as_bytes());
+            }
+            pending.value.push_str(value);
+            pending.range = ruff_text_size::TextRange::new(pending.range.start(), range.end());
+        } else {
+            *pending = Some(Self {
+                value: value.to_string(),
+                surrogate_value,
+                range,
+            });
+        }
+    }
+
+    fn load(self, compiler: &mut Compiler) -> Result<(), CompileError> {
+        compiler
+            .assembler
+            .set_location(compiler.source_location(self.range));
+        if let Some(value) = self.surrogate_value {
+            let constant = compiler.add_constant(Constant::SurrogateString(value))?;
+            compiler.emit(LOAD_CONST, constant, 1)
+        } else {
+            compiler.load_string_constant(&self.value)
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1279,36 +1334,20 @@ impl Compiler {
         &mut self,
         fstring: &ruff_python_ast::ExprFString,
     ) -> Result<(), CompileError> {
-        fn append_literal(
-            pending: &mut Option<(String, ruff_text_size::TextRange)>,
-            value: &str,
-            range: ruff_text_size::TextRange,
-        ) {
-            if let Some((pending_value, pending_range)) = pending {
-                pending_value.push_str(value);
-                *pending_range = ruff_text_size::TextRange::new(pending_range.start(), range.end());
-            } else {
-                *pending = Some((value.to_string(), range));
-            }
-        }
-
         fn flush_literal(
             compiler: &mut Compiler,
-            pending: &mut Option<(String, ruff_text_size::TextRange)>,
+            pending: &mut Option<PendingInterpolatedLiteral>,
             value_count: &mut usize,
             large: bool,
             outer_location: SourceLocation,
         ) -> Result<(), CompileError> {
-            let Some((value, range)) = pending.take() else {
+            let Some(value) = pending.take() else {
                 return Ok(());
             };
-            if value.is_empty() {
+            if value.value.is_empty() {
                 return Ok(());
             }
-            compiler
-                .assembler
-                .set_location(compiler.source_location(range));
-            compiler.load_string_constant(&value)?;
+            value.load(compiler)?;
             *value_count += 1;
             if large {
                 compiler.assembler.set_location(outer_location);
@@ -1367,29 +1406,38 @@ impl Compiler {
         for part in &fstring.value {
             match part {
                 FStringPart::Literal(literal) => {
-                    append_literal(
+                    PendingInterpolatedLiteral::append(
                         &mut pending_literal,
+                        &self.context.source,
                         &literal.value,
+                        literal.range,
                         single_literal_range.unwrap_or(literal.range),
+                        literal.flags.prefix().is_raw(),
                     );
                 }
                 FStringPart::FString(fstring) => {
                     for element in &fstring.elements {
                         match element {
                             InterpolatedStringElement::Literal(literal) => {
-                                append_literal(
+                                PendingInterpolatedLiteral::append(
                                     &mut pending_literal,
+                                    &self.context.source,
                                     &literal.value,
+                                    literal.range,
                                     single_literal_range.unwrap_or(literal.range),
+                                    fstring.flags.prefix().is_raw(),
                                 );
                             }
                             InterpolatedStringElement::Interpolation(interpolation) => {
                                 if let Some(debug) = &interpolation.debug_text {
                                     let debug_text = strip_expression_comments(debug.as_str());
-                                    append_literal(
+                                    PendingInterpolatedLiteral::append(
                                         &mut pending_literal,
+                                        &self.context.source,
                                         &debug_text,
                                         debug_text_range(interpolation),
+                                        debug_text_range(interpolation),
+                                        true,
                                     );
                                 }
                                 flush_literal(
@@ -1399,7 +1447,10 @@ impl Compiler {
                                     large,
                                     outer_location,
                                 )?;
-                                self.compile_interpolation(interpolation)?;
+                                self.compile_interpolation(
+                                    interpolation,
+                                    fstring.flags.prefix().is_raw(),
+                                )?;
                                 value_count += 1;
                                 if large {
                                     self.assembler.set_location(outer_location);
@@ -1480,7 +1531,7 @@ impl Compiler {
                 ConversionFlag::Ascii => 12,
             };
             let effect = if let Some(format_spec) = &interpolation.format_spec {
-                self.compile_interpolated_elements(&format_spec.elements, format_spec.range)?;
+                self.compile_interpolated_elements(&format_spec.elements, format_spec.range, true)?;
                 argument |= 1;
                 -2
             } else {
@@ -1543,32 +1594,17 @@ impl Compiler {
         &mut self,
         elements: &ruff_python_ast::InterpolatedStringElements,
         range: ruff_text_size::TextRange,
+        is_raw: bool,
     ) -> Result<(), CompileError> {
-        fn append_literal(
-            pending: &mut Option<(String, ruff_text_size::TextRange)>,
-            value: &str,
-            range: ruff_text_size::TextRange,
-        ) {
-            if let Some((pending_value, pending_range)) = pending {
-                pending_value.push_str(value);
-                *pending_range = ruff_text_size::TextRange::new(pending_range.start(), range.end());
-            } else {
-                *pending = Some((value.to_string(), range));
-            }
-        }
-
         fn flush_literal(
             compiler: &mut Compiler,
-            pending: &mut Option<(String, ruff_text_size::TextRange)>,
+            pending: &mut Option<PendingInterpolatedLiteral>,
             value_count: &mut usize,
         ) -> Result<(), CompileError> {
-            let Some((value, range)) = pending.take() else {
+            let Some(value) = pending.take() else {
                 return Ok(());
             };
-            compiler
-                .assembler
-                .set_location(compiler.source_location(range));
-            compiler.load_string_constant(&value)?;
+            value.load(compiler)?;
             *value_count += 1;
             Ok(())
         }
@@ -1578,19 +1614,29 @@ impl Compiler {
         for element in elements {
             match element {
                 InterpolatedStringElement::Literal(literal) => {
-                    append_literal(&mut pending_literal, &literal.value, literal.range);
+                    PendingInterpolatedLiteral::append(
+                        &mut pending_literal,
+                        &self.context.source,
+                        &literal.value,
+                        literal.range,
+                        literal.range,
+                        is_raw,
+                    );
                 }
                 InterpolatedStringElement::Interpolation(interpolation) => {
                     if let Some(debug) = &interpolation.debug_text {
                         let debug_text = strip_expression_comments(debug.as_str());
-                        append_literal(
+                        PendingInterpolatedLiteral::append(
                             &mut pending_literal,
+                            &self.context.source,
                             &debug_text,
                             debug_text_range(interpolation),
+                            debug_text_range(interpolation),
+                            true,
                         );
                     }
                     flush_literal(self, &mut pending_literal, &mut value_count)?;
-                    self.compile_interpolation(interpolation)?;
+                    self.compile_interpolation(interpolation, is_raw)?;
                     value_count += 1;
                 }
             }
@@ -1607,6 +1653,7 @@ impl Compiler {
     fn compile_interpolation(
         &mut self,
         interpolation: &ruff_python_ast::InterpolatedElement,
+        is_raw: bool,
     ) -> Result<(), CompileError> {
         self.compile_expression(&interpolation.expression)?;
         self.assembler
@@ -1623,7 +1670,7 @@ impl Compiler {
             ConversionFlag::Ascii => self.emit_conversion(Conversion::ASCII)?,
         }
         if let Some(format_spec) = &interpolation.format_spec {
-            self.compile_interpolated_elements(&format_spec.elements, format_spec.range)?;
+            self.compile_interpolated_elements(&format_spec.elements, format_spec.range, is_raw)?;
             self.assembler
                 .set_location(self.source_location(interpolation.range));
             self.emit(FORMAT_WITH_SPEC, 0, -1)
