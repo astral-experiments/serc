@@ -2544,7 +2544,7 @@ def terminal_loop(manager):
     }
 
     #[test]
-    fn matches_cpython_marshal_for_direct_handler_returns_inside_synchronous_with() {
+    fn matches_cpython_marshal_for_handler_returns_inside_synchronous_with() {
         let source = r"def direct(manager):
     with manager:
         try:
@@ -2575,6 +2575,25 @@ def enclosing_try_control(manager):
             return produce()
     except Error:
         return recover()
+
+
+def fallthrough(manager):
+    with manager:
+        try:
+            produce()
+        except Error:
+            return False
+        return True
+
+
+def recovery_then_return(manager):
+    with manager:
+        try:
+            produce()
+        except Error:
+            recover()
+            return False
+        return True
 ";
         assert_matches_cpython_marshal(source, "with_direct_handler_returns.py");
     }
