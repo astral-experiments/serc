@@ -17,6 +17,7 @@ workspace = true
 [dependencies]
 clap = { workspace = true }
 fs-err = { workspace = true }
+mimalloc = { workspace = true }
 serc = { path = "../serc" }
 tempfile = { workspace = true }
 walkdir = { workspace = true }

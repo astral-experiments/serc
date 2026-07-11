@@ -1,5 +1,8 @@
 use std::hint::black_box;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use serc_benchmark::criterion::{
     BatchSize, Criterion, Throughput, criterion_group, criterion_main,
 };

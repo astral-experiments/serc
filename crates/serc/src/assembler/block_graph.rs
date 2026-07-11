@@ -707,12 +707,6 @@ impl BlockGraph {
         positions
     }
 
-    pub(super) fn block_item_positions(&self, block: BasicBlockId) -> Vec<ItemPosition> {
-        (0..self[block].items().len())
-            .map(|offset| ItemPosition { block, offset })
-            .collect()
-    }
-
     /// Builds a pass-local ordered view of block contents without moving the
     /// graph's owned items or changing stable block identities.
     pub(super) fn partition_positions(

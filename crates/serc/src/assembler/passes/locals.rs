@@ -148,34 +148,26 @@ impl OptimizationPipeline {
             }
         }
 
-        let mut unsafe_at_entry = vec![vec![false; local_count]; order.len()];
-        for unsafe_local in unsafe_at_entry[0]
-            .iter_mut()
-            .take(local_count)
-            .skip(parameter_count.min(local_count))
-        {
-            *unsafe_local = true;
-        }
-        let mut needs_check = FxHashSet::default();
-        let mut checked_loads_needing_check = FxHashSet::default();
+        let initialized = parameter_count.min(local_count).min(64);
+        let mut unsafe_at_entry = vec![0_u64; order.len()];
+        unsafe_at_entry[0] = u64::MAX
+            .checked_shl(u32::try_from(initialized).unwrap())
+            .unwrap_or(0);
+        let mut unsafe_high_locals = vec![true; local_count.saturating_sub(64)];
+        let mut needs_check = vec![false; item_count];
+        let mut checked_loads_needing_check = vec![false; item_count];
         let mut pending = (0..order.len()).collect::<Vec<_>>();
         let mut queued = vec![true; order.len()];
 
         while let Some(block_index) = pending.pop() {
             queued[block_index] = false;
-            let mut unsafe_locals = unsafe_at_entry[block_index].clone();
-            for unsafe_local in unsafe_locals.iter_mut().take(local_count).skip(64) {
-                *unsafe_local = true;
-            }
+            let mut unsafe_locals = unsafe_at_entry[block_index];
+            unsafe_high_locals.fill(true);
 
-            let mut propagate = |target: usize, state: &[bool]| {
-                let mut changed = false;
-                for (current, incoming) in unsafe_at_entry[target].iter_mut().zip(state) {
-                    if *incoming && !*current {
-                        *current = true;
-                        changed = true;
-                    }
-                }
+            let mut propagate = |target: usize, state: u64| {
+                let current = &mut unsafe_at_entry[target];
+                let changed = state & !*current != 0;
+                *current |= state;
                 if changed && !queued[target] {
                     queued[target] = true;
                     pending.push(target);
@@ -183,8 +175,8 @@ impl OptimizationPipeline {
             };
 
             let block = order[block_index];
-            for (offset, position) in graph.block_item_positions(block).into_iter().enumerate() {
-                let Item::Instruction(instruction) = graph.item(position) else {
+            for (offset, item) in graph[block].items().iter().enumerate() {
+                let Item::Instruction(instruction) = item else {
                     continue;
                 };
                 if instruction.local_policy.is_post_analysis_closure_load()
@@ -193,7 +185,7 @@ impl OptimizationPipeline {
                     continue;
                 }
                 if let Some(target) = exception_successors[block_starts[block.index()] + offset] {
-                    propagate(target, &unsafe_locals);
+                    propagate(target, unsafe_locals);
                 }
                 let Operand::Value(argument) = instruction.operand else {
                     continue;
@@ -205,28 +197,62 @@ impl OptimizationPipeline {
                     continue;
                 }
                 match instruction.opcode {
-                    DELETE_FAST | LOAD_FAST_AND_CLEAR => unsafe_locals[local] = true,
+                    DELETE_FAST | LOAD_FAST_AND_CLEAR => {
+                        if local < 64 {
+                            unsafe_locals |= 1 << local;
+                        } else {
+                            unsafe_high_locals[local - 64] = true;
+                        }
+                    }
                     STORE_FAST => {
-                        unsafe_locals[local] = instruction.local_policy.may_store_null();
+                        if local < 64 {
+                            if instruction.local_policy.may_store_null() {
+                                unsafe_locals |= 1 << local;
+                            } else {
+                                unsafe_locals &= !(1 << local);
+                            }
+                        } else {
+                            unsafe_high_locals[local - 64] =
+                                instruction.local_policy.may_store_null();
+                        }
                     }
                     LOAD_FAST_CHECK => {
-                        if unsafe_locals[local] {
-                            checked_loads_needing_check.insert(position);
+                        let is_unsafe = if local < 64 {
+                            unsafe_locals & (1 << local) != 0
+                        } else {
+                            unsafe_high_locals[local - 64]
+                        };
+                        if is_unsafe {
+                            checked_loads_needing_check[block_starts[block.index()] + offset] =
+                                true;
                         }
-                        unsafe_locals[local] = false;
+                        if local < 64 {
+                            unsafe_locals &= !(1 << local);
+                        } else {
+                            unsafe_high_locals[local - 64] = false;
+                        }
                     }
                     LOAD_FAST => {
-                        if unsafe_locals[local] {
-                            needs_check.insert(position);
+                        let is_unsafe = if local < 64 {
+                            unsafe_locals & (1 << local) != 0
+                        } else {
+                            unsafe_high_locals[local - 64]
+                        };
+                        if is_unsafe {
+                            needs_check[block_starts[block.index()] + offset] = true;
                         }
-                        unsafe_locals[local] = false;
+                        if local < 64 {
+                            unsafe_locals &= !(1 << local);
+                        } else {
+                            unsafe_high_locals[local - 64] = false;
+                        }
                     }
                     _ => {}
                 }
             }
 
             if block_has_fallthrough(graph[block].items()) && block_index + 1 < order.len() {
-                propagate(block_index + 1, &unsafe_locals);
+                propagate(block_index + 1, unsafe_locals);
             }
             if let Some(target) = block_jump_target(graph[block].items())
                 && let Some(target) = graph.label_block(target)
@@ -236,21 +262,21 @@ impl OptimizationPipeline {
                     .copied()
                     .filter(|target| *target != usize::MAX)
                 {
-                    propagate(target, &unsafe_locals);
+                    propagate(target, unsafe_locals);
                 }
             }
         }
 
         let graph = &mut self.graph;
-        for position in positions {
+        for (index, position) in positions.into_iter().enumerate() {
             let Some(instruction) = graph.instruction_mut(position) else {
                 continue;
             };
             match instruction.opcode {
-                LOAD_FAST_CHECK if !checked_loads_needing_check.contains(&position) => {
+                LOAD_FAST_CHECK if !checked_loads_needing_check[index] => {
                     instruction.opcode = LOAD_FAST;
                 }
-                LOAD_FAST if needs_check.contains(&position) => {
+                LOAD_FAST if needs_check[index] => {
                     instruction.opcode = LOAD_FAST_CHECK;
                 }
                 _ => {}

@@ -1093,6 +1093,39 @@ fn uninitialized_load_analysis_follows_single_block_backedges() {
 }
 
 #[test]
+fn uninitialized_load_analysis_resets_locals_above_the_fast_mask_at_block_entry() {
+    let target = super::Label(0);
+    let mut assembler = optimization_pipeline(vec![
+        pass_instruction(STORE_FAST, 63, 1),
+        pass_instruction(STORE_FAST, 64, 1),
+        Item::Instruction(Instruction::new(
+            JUMP_FORWARD,
+            Operand::Forward(target),
+            SourceLocation::new(1, 1, 0, 0),
+            None,
+        )),
+        Item::Label(target),
+        pass_instruction(LOAD_FAST, 63, 2),
+        pass_instruction(LOAD_FAST, 64, 2),
+        pass_instruction(LOAD_FAST, 64, 2),
+    ]);
+
+    assembler.add_checks_for_uninitialized_loads(65, 0);
+
+    assert_eq!(
+        graph_opcodes(&assembler),
+        [
+            STORE_FAST,
+            STORE_FAST,
+            JUMP_FORWARD,
+            LOAD_FAST,
+            LOAD_FAST_CHECK,
+            LOAD_FAST
+        ]
+    );
+}
+
+#[test]
 fn maybe_null_comprehension_restore_checks_only_the_first_later_load() {
     let mut restore = Instruction::new(STORE_FAST, Operand::Value(0), SourceLocation::NONE, None);
     restore.local_policy.mark_maybe_null_comprehension_restore();
