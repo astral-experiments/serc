@@ -647,7 +647,11 @@ impl Compiler {
         }
     }
 
-    pub(super) fn child_qualified_name(&self, name: &str) -> String {
+    fn child_qualified_name_with_global_scope(
+        &self,
+        name: &str,
+        honor_explicit_global: bool,
+    ) -> String {
         if let Some(parent) = &self.unit.child_qualified_name_parent {
             return if parent.is_empty() {
                 name.to_string()
@@ -663,11 +667,21 @@ impl Compiler {
         match &self.unit.scope {
             Scope::Module => name.to_string(),
             Scope::Class { .. } => format!("{}.{}", self.unit.qualified_name, name),
-            Scope::Function { globals, .. } if self.contains_name(globals, name) => {
+            Scope::Function { globals, .. }
+                if honor_explicit_global && self.contains_name(globals, name) =>
+            {
                 name.to_string()
             }
             Scope::Function { .. } => format!("{}.<locals>.{name}", self.unit.qualified_name),
         }
+    }
+
+    pub(super) fn child_qualified_name(&self, name: &str) -> String {
+        self.child_qualified_name_with_global_scope(name, true)
+    }
+
+    pub(super) fn annotation_child_qualified_name(&self, name: &str) -> String {
+        self.child_qualified_name_with_global_scope(name, false)
     }
 
     fn annotation_mangled_name(&self, name: &str) -> String {
