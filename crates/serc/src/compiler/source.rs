@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use ruff_python_ast::token::{TokenKind, Tokens};
-use ruff_python_ast::{Expr, ExprContext, FStringPart, InterpolatedStringElement, Stmt, Suite};
+use ruff_python_ast::{
+    Expr, ExprContext, FStringPart, InterpolatedStringElement, Operator, Stmt, Suite,
+};
 use ruff_python_codegen::{Generator, Indentation, Mode as CodegenMode};
 use ruff_source_file::{LineEnding, LineIndex};
 use ruff_text_size::{Ranged, TextLen, TextSize};
@@ -196,6 +198,24 @@ impl Compiler {
                 .map(|element| self.source_aware_fold_constant(element))
                 .collect::<Option<Vec<_>>>()
                 .map(Constant::Tuple),
+            Expr::BinOp(binary) if binary.op == Operator::Mult => {
+                let folded = fold_constant(expression)?;
+                if !matches!(&folded, Constant::String(value) if value.contains('\u{fffd}')) {
+                    return Some(folded);
+                }
+                let left = self.source_aware_fold_constant(&binary.left)?;
+                let right = self.source_aware_fold_constant(&binary.right)?;
+                match (left, right) {
+                    (Constant::SurrogateString(value), Constant::Int(times))
+                    | (Constant::Int(times), Constant::SurrogateString(value)) => {
+                        let length = value.iter().filter(|byte| **byte & 0xc0 != 0x80).count();
+                        let max_times = 4096_usize.checked_div(length).unwrap_or(usize::MAX);
+                        let times = usize::try_from(times).ok()?;
+                        (times <= max_times).then(|| Constant::SurrogateString(value.repeat(times)))
+                    }
+                    _ => Some(folded),
+                }
+            }
             _ => fold_constant(expression),
         }
     }
