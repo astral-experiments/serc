@@ -8397,13 +8397,26 @@ impl Compiler {
                     unreachable!("terminal with condition must be an if statement");
                 };
                 self.compile_suite(leading)?;
+                let include_terminal_with_and_markers = terminal_if
+                    && self.control.loops.is_empty()
+                    && matches!(statement.body.last(), Some(Stmt::Return(_)))
+                    && matches!(statement.test.as_ref(), Expr::BoolOp(boolean)
+                        if boolean.op == BoolOp::And
+                            && boolean.values.len() == 2
+                            && !(matches!(body.first(), Some(Stmt::Import(_) | Stmt::ImportFrom(_)))
+                                && matches!(boolean.values.as_slice(), [Expr::Compare(comparison), Expr::Call(_)]
+                                    if comparison.ops.len() == 1
+                                        && matches!(comparison.ops[0], CmpOp::Is | CmpOp::IsNot)
+                                        && matches!(comparison.comparators[0], Expr::NoneLiteral(_))))
+                            && !matches!(&boolean.values[0], Expr::UnaryOp(unary)
+                                if matches!(unary.operand.as_ref(), Expr::Attribute(_))));
                 self.with_control_override(
                     |control| &mut control.terminal_with_condition,
                     Some(statement.test.range()),
                     |compiler| {
                         compiler.with_control_override(
                             |control| &mut control.exclude_terminal_if_not_taken,
-                            true,
+                            !include_terminal_with_and_markers,
                             |compiler| compiler.compile_statement(last),
                         )
                     },
@@ -8540,8 +8553,9 @@ impl Compiler {
             self.source_location(item.context_expr.range()).line
                 != self.source_location(next.context_expr.range()).line
         });
+        let nested_terminal_body = remaining.len() == 1 && suite_terminates(body);
         if !remaining.is_empty()
-            && ((remaining.len() == 1 && suite_terminates(body))
+            && (nested_terminal_body
                 || (self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
                     && nested_manager_has_distinct_line
                     && with_body_ends_in_terminal_try(body)))
@@ -8550,7 +8564,16 @@ impl Compiler {
             // nested item's line marker before running this outer manager's normal exit.
             self.assembler
                 .set_location(self.source_location(remaining[0].context_expr.range()));
-            self.emit(NOP, 0, 0)?;
+            self.emit_with_exception_policy(
+                NOP,
+                0,
+                0,
+                if nested_terminal_body {
+                    ExceptionPolicy::EXCLUDE_ALWAYS
+                } else {
+                    ExceptionPolicy::default()
+                },
+            )?;
         }
         let body_noop = body_noop.or_else(|| {
             remaining
