@@ -18,9 +18,10 @@ import pathlib
 import sys
 
 path = pathlib.Path(sys.argv[1])
+source = path.read_bytes()
 try:
-    code = compile(path.read_bytes(), str(path), "exec", dont_inherit=True, optimize=0)
-except (SyntaxError, UnicodeError, ValueError) as error:
+    code = compile(source, str(path), "exec", dont_inherit=True, optimize=0)
+except Exception as error:
     print(f"{type(error).__name__}: {error}", file=sys.stderr)
     raise SystemExit(2)
 sys.stdout.buffer.write(marshal.dumps(code))
@@ -635,7 +636,7 @@ fn one_line(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{OutcomeKind, discover, validate_outcome_counts};
+    use super::{ORACLE, OutcomeKind, discover, validate_outcome_counts};
     use std::collections::BTreeMap;
     use std::fs;
 
@@ -650,6 +651,20 @@ mod tests {
                 .iter()
                 .any(|failure| failure == "no files matched CPython exactly")
         );
+    }
+
+    #[test]
+    fn oracle_classifies_only_compile_exceptions_as_rejected() {
+        let read = ORACLE.find("source = path.read_bytes()").unwrap();
+        let try_compile = ORACLE.find("try:\n    code = compile(source").unwrap();
+        let compile_exception = ORACLE.find("except Exception as error:").unwrap();
+        let marshal = ORACLE
+            .find("sys.stdout.buffer.write(marshal.dumps(code))")
+            .unwrap();
+
+        assert!(read < try_compile);
+        assert!(try_compile < compile_exception);
+        assert!(compile_exception < marshal);
     }
 
     #[test]
