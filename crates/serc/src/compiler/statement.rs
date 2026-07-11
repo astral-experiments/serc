@@ -47,6 +47,7 @@ struct LoopContext {
     continue_label: Label,
     break_label: Label,
     iterator_cleanup: IteratorCleanup,
+    has_orelse: bool,
     protect_boolean_return_cleanup: bool,
     prevent_break_exit_inlining: bool,
     with_depth: usize,
@@ -433,6 +434,16 @@ impl ControlFlowState {
             .is_some_and(|context| context.iterator_cleanup != IteratorCleanup::None)
     }
 
+    fn in_unprotected_iterator_loop_tail(&self) -> bool {
+        self.loops.last().is_some_and(|context| {
+            context.iterator_cleanup != IteratorCleanup::None
+                && !context.has_orelse
+                && context.with_depth == self.active_with_exits.len()
+                && context.finally_end_depth == self.active_finally_end_blocks
+                && context.exception_region_depth == self.active_exception_region_exclusions.len()
+        })
+    }
+
     pub(super) fn in_while_loop(&self) -> bool {
         self.loops
             .last()
@@ -505,6 +516,7 @@ impl Compiler {
             continue_label,
             break_label,
             iterator_cleanup,
+            has_orelse: false,
             protect_boolean_return_cleanup: false,
             prevent_break_exit_inlining: iterator_cleanup != IteratorCleanup::None
                 && self.control.current_statement_followed_by_tuple_return,
@@ -4305,15 +4317,21 @@ impl Compiler {
                 && self.control.generator_region_start.is_none()
                 && self.control.active_with_region_exclusions.is_empty()
                 && !self.control.active_exception_region_exclusions.is_empty();
+            let copied_iterator_branch_exit = non_final_branch
+                && !self.has_active_control_flow_region()
+                && self.control.in_unprotected_iterator_loop_tail();
+            let copied_iterator_branch_exit = copied_iterator_branch_exit
+                && !expression_contains_chained_comparison(&statement.test);
             // CPython keeps a non-final branch's nested condition body before the fallback
             // backedge even when that body exits the enclosing loop or function.
-            if non_final_branch
-                && !split_short_circuit
-                && (!self.has_active_control_flow_region() || protected_try_normal_exit)
-                && condition_jump_target_count(&statement.test, false) == 1
-                && (condition_jump_target_count(&statement.test, true) == 1
-                    || (statement.body.len() == 1
-                        && matches!(statement.body.first(), Some(Stmt::Assign(_)))))
+            if copied_iterator_branch_exit
+                || (non_final_branch
+                    && !split_short_circuit
+                    && (!self.has_active_control_flow_region() || protected_try_normal_exit)
+                    && condition_jump_target_count(&statement.test, false) == 1
+                    && (condition_jump_target_count(&statement.test, true) == 1
+                        || (statement.body.len() == 1
+                            && matches!(statement.body.first(), Some(Stmt::Assign(_))))))
             {
                 let body = statement.body.as_slice();
                 let fallback = self.assembler.label();
@@ -4340,10 +4358,19 @@ impl Compiler {
 
                 self.assembler.mark(fallback);
                 self.set_depth(base_depth);
-                self.assembler.set_location(
-                    self.source_location(condition_fallthrough_range(&statement.test)),
-                );
+                let copy_iterator_branch_exit = copied_iterator_branch_exit
+                    && condition_jump_target_count(&statement.test, false) > 1;
+                if copy_iterator_branch_exit {
+                    self.assembler.set_location(SourceLocation::NONE);
+                } else {
+                    self.assembler.set_location(
+                        self.source_location(condition_fallthrough_range(&statement.test)),
+                    );
+                }
                 self.emit_loop_tail_backedge(restart, protected_try_normal_exit)?;
+                if copy_iterator_branch_exit {
+                    self.assembler.mark_last_as_artificial_eval_break();
+                }
                 return Ok(());
             }
             if !try_body_normal_exit {
@@ -4928,6 +4955,7 @@ impl Compiler {
             IteratorCleanup::Sync,
             self.loop_break_policy(statement.range),
         );
+        context.has_orelse = !statement.orelse.is_empty();
         context.protect_boolean_return_cleanup = matches!(
             statement.body.as_slice(),
             [Stmt::If(branch)]
@@ -5071,12 +5099,13 @@ impl Compiler {
         self.emit(NOT_TAKEN, 0, 0)?;
         self.compile_store_target(&statement.target)?;
 
-        let context = self.loop_context(
+        let mut context = self.loop_context(
             start,
             end,
             IteratorCleanup::Async,
             self.loop_break_policy(statement.range),
         );
+        context.has_orelse = !statement.orelse.is_empty();
         let body_start = self.assembler.instruction_count();
         let first_iterator_loop_assertion = match statement.body.as_slice() {
             [Stmt::Assert(assertion), following, ..]
