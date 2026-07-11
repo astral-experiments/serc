@@ -1372,6 +1372,18 @@ fn parameter_default_expressions(
                 .filter_map(|parameter| parameter.default.as_deref()),
         )
 }
+
+fn visit_lambda_defaults<'ast>(
+    visitor: &mut impl Visitor<'ast>,
+    lambda: &'ast ruff_python_ast::ExprLambda,
+) {
+    if let Some(parameters) = lambda.parameters.as_deref() {
+        for default in parameter_default_expressions(parameters) {
+            visitor.visit_expr(default);
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct LocalCollector {
     names: Vec<String>,
@@ -1842,11 +1854,7 @@ struct NamedExpressionCollector<'a> {
 impl<'ast> Visitor<'ast> for NamedExpressionCollector<'_> {
     fn visit_expr(&mut self, expression: &'ast Expr) {
         if let Expr::Lambda(lambda) = expression {
-            if let Some(parameters) = lambda.parameters.as_deref() {
-                for default in parameter_default_expressions(parameters) {
-                    self.visit_expr(default);
-                }
-            }
+            visit_lambda_defaults(self, lambda);
             return;
         }
         if let Expr::Generator(generator) = expression {
@@ -2139,6 +2147,7 @@ impl<'ast> Visitor<'ast> for ScopeBodyFactsCollector {
 
     fn visit_expr(&mut self, expression: &'ast Expr) {
         if let Expr::Lambda(lambda) = expression {
+            visit_lambda_defaults(self, lambda);
             self.facts
                 .nested_lambda_requirements
                 .extend(analyze_lambda_scope(lambda).required);
@@ -2237,7 +2246,8 @@ impl<'ast> Visitor<'ast> for ReferenceCollector {
     }
 
     fn visit_expr(&mut self, expression: &'ast Expr) {
-        if matches!(expression, Expr::Lambda(_)) {
+        if let Expr::Lambda(lambda) = expression {
+            visit_lambda_defaults(self, lambda);
             return;
         }
         if self.skip_generator_bodies
@@ -2386,6 +2396,7 @@ fn nested_lambda_required_names_in_expression(expression: &Expr) -> BTreeSet<Str
     impl<'ast> Visitor<'ast> for Collector {
         fn visit_expr(&mut self, expression: &'ast Expr) {
             if let Expr::Lambda(lambda) = expression {
+                visit_lambda_defaults(self, lambda);
                 self.required.extend(analyze_lambda_scope(lambda).required);
                 return;
             }
@@ -2410,7 +2421,8 @@ fn nested_generator_required_names_in_expression(expression: &Expr) -> BTreeSet<
                 self.required.extend(generator_required_names(generator));
                 return;
             }
-            if matches!(expression, Expr::Lambda(_)) {
+            if let Expr::Lambda(lambda) = expression {
+                visit_lambda_defaults(self, lambda);
                 return;
             }
             walk_expr(self, expression);
