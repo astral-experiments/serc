@@ -3152,6 +3152,26 @@ impl Compiler {
         Ok(())
     }
 
+    fn emit_multiline_none_filter_nops(
+        &mut self,
+        comparison: &ruff_python_ast::ExprCompare,
+    ) -> Result<(), CompileError> {
+        let left_location = self.source_location(comparison.left.range());
+        let none_location = self.source_location(comparison.comparators[0].range());
+        if left_location.line == none_location.line {
+            return Ok(());
+        }
+
+        // The filter jump carries the element's location. Preserve the two source transitions
+        // that CPython emits while specializing a multiline `is [not] None` comparison before
+        // that jump: first the `None` operand and then the whole comparison.
+        self.assembler.set_location(none_location);
+        self.emit(NOP, 0, 0)?;
+        self.assembler
+            .set_location(self.source_location(comparison.range));
+        self.emit(NOP, 0, 0)
+    }
+
     fn compile_generator_filter(
         &mut self,
         condition: &Expr,
@@ -3220,6 +3240,7 @@ impl Compiler {
         {
             self.compile_expression(&comparison.left)?;
             self.add_constant(Constant::None)?;
+            self.emit_multiline_none_filter_nops(comparison)?;
             let exclusion_start = self.assembler.label();
             self.assembler.mark(exclusion_start);
             self.assembler
@@ -3503,6 +3524,7 @@ impl Compiler {
         {
             self.compile_expression(&comparison.left)?;
             self.add_constant(Constant::None)?;
+            self.emit_multiline_none_filter_nops(comparison)?;
             let exclusion_start = self.assembler.label();
             self.assembler.mark(exclusion_start);
             self.assembler.set_location(element_location);
