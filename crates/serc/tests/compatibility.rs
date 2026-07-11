@@ -2811,6 +2811,42 @@ async def synchronous_outside_async(sync_manager, async_manager):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_conditional_finally_exits_in_synchronous_with_bodies() {
+        let expression_source = r"def expression_fallthrough(manager, condition):
+    with manager:
+        try:
+            assert body()
+        finally:
+            if condition:
+                cleanup()
+";
+        assert_matches_cpython_marshal(expression_source, "with_conditional_finally_exit.py");
+
+        let direct_termination_source = r"def terminating_body(manager, condition):
+    with manager:
+        try:
+            raise Error()
+        finally:
+            if condition:
+                cleanup()
+";
+        assert_matches_cpython_marshal(direct_termination_source, "with_finally_direct_raise.py");
+
+        let leading_termination_source = r"def leading_terminating_body(manager, condition):
+    with manager:
+        before()
+        try:
+            if condition:
+                raise Error()
+            raise OtherError()
+        finally:
+            if condition:
+                cleanup()
+";
+        assert_matches_cpython_marshal(leading_termination_source, "with_finally_leading_raise.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_tail_assert_finally_pop_block_ownership() {
         let source = r"def with_owner(manager, condition):
     with manager:

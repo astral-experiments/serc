@@ -7508,6 +7508,14 @@ impl Compiler {
         terminal: bool,
     ) -> Result<(), CompileError> {
         let preserve_exit_nop = std::mem::take(&mut self.control.preserve_next_finally_exit_nop);
+        let drop_expression_if_exit_nop = preserve_exit_nop
+            && matches!(statement.body.last(), Some(Stmt::Assert(_)))
+            && matches!(
+                statement.finalbody.last(),
+                Some(Stmt::If(tail))
+                    if tail.elif_else_clauses.is_empty()
+                        && matches!(tail.body.as_slice(), [Stmt::Expr(_)])
+            );
 
         if statement.handlers.is_empty()
             && statement.orelse.is_empty()
@@ -7872,7 +7880,11 @@ impl Compiler {
                 start
             });
             self.emit_jump_forward_with_exception_policy(JUMP_FORWARD, end, 0, exception_policy)?;
-            if preserve_exit_nop {
+            if drop_expression_if_exit_nop {
+                // Keep the normal-finally exit through CPython's exit-copy pass, then remove it
+                // instead of retaining the redundant jump as a source-position NOP.
+                self.assembler.defer_last_jump_removal();
+            } else if preserve_exit_nop {
                 self.assembler
                     .preserve_last_redundant_jump_nop_after_threading();
             }
