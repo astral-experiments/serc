@@ -9404,7 +9404,19 @@ fn with_body_ends_in_retained_pop_block(body: &[Stmt]) -> bool {
 }
 
 fn suite_ends_in_retained_try_exit_join(body: &[Stmt]) -> bool {
-    let Some(Stmt::If(statement)) = body.last() else {
+    let Some(last) = body.last() else {
+        return false;
+    };
+    if let Stmt::Assert(statement) = last {
+        // A final name or specialized None assertion has one successful edge through the normal
+        // try exit. CPython retains that exit jump as a source-position NOP after threading.
+        return matches!(statement.test.as_ref(), Expr::Name(_))
+            || matches!(statement.test.as_ref(), Expr::Compare(comparison)
+                if comparison.ops.len() == 1
+                    && matches!(comparison.ops[0], CmpOp::Is | CmpOp::IsNot)
+                    && matches!(comparison.comparators[0], Expr::NoneLiteral(_)));
+    }
+    let Stmt::If(statement) = last else {
         return false;
     };
     if let Some(truthiness) = early_condition_truthiness(&statement.test)
