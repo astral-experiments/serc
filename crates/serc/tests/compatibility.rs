@@ -6,7 +6,9 @@ mod tests {
     use std::fmt::Write as _;
 
     use super::common::{
-        assert_executes, assert_matches_cpython_marshal, assert_matches_cpython_marshal_bytes,
+        assert_cpython_and_serc_have_pop_except_at, assert_executes,
+        assert_matches_cpython_marshal, assert_matches_cpython_marshal_bytes,
+        assert_matches_cpython_pop_except_positions,
     };
     use serc::{
         CPYTHON_TARGET, CompileError, compile, compile_bytes_to_pyc, compile_to_pyc, decode_source,
@@ -4215,6 +4217,87 @@ def nontrailing_control(mapping, key):
     value = key
 ";
         assert_matches_cpython_marshal(source, "trailing_if_handler_cleanup.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_inherited_trailing_if_handler_cleanup() {
+        let source = r"def inherited_from_if(flag, mapping, key):
+    if flag:
+        try:
+            value = mapping[key]
+        except KeyError:
+            if key not in mapping.values():
+                value = key
+    after()
+
+
+def inherited_through_nested_if(outer, inner, mapping, key):
+    if outer:
+        if inner:
+            try:
+                value = mapping[key]
+            except KeyError as error:
+                if key not in mapping.values():
+                    value = error
+    after()
+
+
+def inherited_from_with(manager, mapping, key):
+    with manager:
+        try:
+            value = mapping[key]
+        except KeyError:
+            if key not in mapping.values():
+                value = key
+    after()
+
+
+async def inherited_from_async_with(manager, mapping, key):
+    async with manager:
+        try:
+            value = mapping[key]
+        except KeyError:
+            if condition(key):
+                recover(key)
+    await after()
+";
+        assert_matches_cpython_pop_except_positions(
+            source,
+            "inherited_trailing_if_handler_cleanup.py",
+        );
+    }
+
+    #[test]
+    fn preserves_located_handler_cleanup_across_loop_barriers() {
+        let source = r"def for_barrier(keys, mapping):
+    for key in keys:
+        try:
+            value = mapping[key]
+        except KeyError:
+            if key not in mapping.values():
+                value = key
+    after()
+
+
+def nested_for_barrier(flag, manager, keys, mapping):
+    if flag:
+        with manager:
+            for key in keys:
+                try:
+                    value = mapping[key]
+                except KeyError:
+                    if key not in mapping.values():
+                        value = key
+    after()
+";
+        for (qualified_name, line) in [("for_barrier", 7), ("nested_for_barrier", 19)] {
+            assert_cpython_and_serc_have_pop_except_at(
+                source,
+                "inherited_handler_loop_barriers.py",
+                qualified_name,
+                line,
+            );
+        }
     }
 
     #[test]
