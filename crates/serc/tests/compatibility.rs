@@ -4140,6 +4140,40 @@ print(" ".join(
     }
 
     #[test]
+    fn matches_cpython_marshal_for_post_yield_empty_block_borrow_boundaries() {
+        let source = r"def nested_try_exit(value):
+    try:
+        action()
+    except Error:
+        recover()
+    else:
+        begin()
+        try:
+            yield
+        finally:
+            finish()
+    consume(value)
+    return value
+
+
+async def simple_async_break(items, value):
+    async for item in items:
+        break
+    consume(value)
+    return value
+
+
+async def tail_conditional_async_break(items, value):
+    async for item in items:
+        if item:
+            break
+    consume(value)
+    return value
+";
+        assert_matches_cpython_marshal(source, "post_yield_borrow_edges.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_terminal_async_for_in_with_bodies() {
         let source = "async def sync_with_direct(manager, items):\n    with manager:\n        async for item in items:\n            consume(item)\n\nasync def async_with_direct(manager, items):\n    async with manager:\n        async for item in items:\n            consume(item)\n\nasync def sync_then_async_with(sync_manager, async_manager, items):\n    with sync_manager:\n        async with async_manager:\n            async for item in items:\n                consume(item)\n\nasync def async_then_sync_with(async_manager, sync_manager, items):\n    async with async_manager:\n        with sync_manager:\n            async for item in items:\n                consume(item)\n\nasync def async_with_two_items(first, second, items):\n    async with first, second:\n        async for item in items:\n            consume(item)\n\nasync def async_with_inner_finally(manager, items):\n    async with manager:\n        try:\n            async for item in items:\n                consume(item)\n        finally:\n            cleanup()\n\nasync def async_with_nonfinal(manager, items):\n    async with manager:\n        async for item in items:\n            consume(item)\n        after()\n";
         assert_matches_cpython_marshal(source, "async_with_terminal_async_for.py");
