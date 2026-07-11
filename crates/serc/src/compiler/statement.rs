@@ -351,8 +351,8 @@ pub(super) struct ControlFlowState {
     direct_try_body_has_successor: bool,
     // Normal exits from a trailing if chain cross the innermost handler boundary.
     direct_try_if_exit: bool,
-    // A one-return try/handler nested directly in a synchronous with unwinds that try before
-    // running the surrounding manager exit.
+    // A try with a returning handler nested directly in a synchronous with unwinds that handler
+    // before running the surrounding manager exit.
     direct_return_handler_try_inside_sync_with: bool,
     // Conditions nested within a fully terminating synchronous-with return chain retain the
     // manager's normalized exception owner.
@@ -5478,6 +5478,7 @@ impl Compiler {
                     .last()
                     .is_some_and(|context| !context.is_async)
                 && (is_direct_return_handler_try(statement)
+                    || try_has_trailing_unnamed_literal_return_handler(statement)
                     || is_direct_return_raise_handler_try(statement));
         let nested_in_final_outer_try_statement =
             !self.control.active_exception_region_exclusions.is_empty()
@@ -8901,6 +8902,22 @@ fn is_direct_return_handler_try(statement: &ruff_python_ast::StmtTry) -> bool {
                     matches!(handler.body.as_slice(), [Stmt::Return(_)])
                 })
         )
+}
+
+fn try_has_trailing_unnamed_literal_return_handler(statement: &ruff_python_ast::StmtTry) -> bool {
+    !statement.is_star
+        && statement.orelse.is_empty()
+        && statement.finalbody.is_empty()
+        && statement.handlers.iter().any(|handler| {
+            handler.as_except_handler().is_some_and(|handler| {
+                handler.name.is_none()
+                    && matches!(
+                        handler.body.last(),
+                        Some(Stmt::Return(statement))
+                            if statement.value.as_deref().is_none_or(is_literal_constant)
+                    )
+            })
+        })
 }
 
 fn is_direct_return_raise_handler_try(statement: &ruff_python_ast::StmtTry) -> bool {
