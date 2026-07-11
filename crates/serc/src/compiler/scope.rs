@@ -633,13 +633,11 @@ impl ClassPlan {
         nested_class_requirements: &FxHashSet<NameId>,
         child_needs_class_closure: bool,
     ) -> Self {
-        let has_conditional_annotations = if future_annotations {
-            false
-        } else {
-            let mut annotations = Vec::new();
-            collect_conditional_simple_annotations(&definition.body, &mut annotations);
-            !annotations.is_empty()
-        };
+        // CPython retains this synthetic cell under future annotations even though
+        // the annotation thunk does not capture it in that mode.
+        let mut conditional_annotations = Vec::new();
+        collect_conditional_simple_annotations(&definition.body, &mut conditional_annotations);
+        let has_conditional_annotations = !conditional_annotations.is_empty();
         let ScopeBodyFacts {
             globals,
             nonlocals,

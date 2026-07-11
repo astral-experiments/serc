@@ -5160,6 +5160,33 @@ class WithClassCell:
     }
 
     #[test]
+    fn matches_cpython_marshal_for_future_conditional_class_annotation_cells() {
+        let source = r"from __future__ import annotations
+
+flag = True
+
+class Conditional:
+    if flag:
+        enabled: int
+    else:
+        disabled: bytes = b''
+
+class NestedConditional:
+    if flag:
+        while flag:
+            nested: str
+
+class Unconditional:
+    direct: int
+
+class ConditionalWithoutAnnotation:
+    if flag:
+        direct = 1
+";
+        assert_matches_cpython_marshal(source, "future_conditional_class_annotation_cells.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_negated_generator_filters() {
         let source =
             "def filtered(items):\n    return (item for item in items if not predicate(item))\n";
