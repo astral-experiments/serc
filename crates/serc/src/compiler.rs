@@ -36,6 +36,9 @@ use self::{
 // shape. The assembler mirrors that dataflow pass.
 const SUPPORTED_FUTURE_FLAGS: u32 = CO_FUTURE_BARRY_AS_BDFL | CO_FUTURE_ANNOTATIONS;
 const SHADOWED_SUPER_SENTINEL: &str = "\0shadowed super";
+// CPython's flowgraph optimizer folds constant sequences only up to
+// `_PY_STACK_USE_GUIDELINE` elements.
+const CPYTHON_STACK_USE_GUIDELINE: usize = 30;
 
 #[derive(Debug)]
 enum Scope {
