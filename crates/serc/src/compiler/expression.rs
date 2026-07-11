@@ -5164,6 +5164,8 @@ impl Compiler {
         } else {
             ExceptionPolicy::normalized_owner(true)
         };
+        let preserve_iterator_loop_assertion_owner =
+            self.control.preserve_first_iterator_loop_assertion_owner;
         let policy = ConditionMarkerPolicy {
             excluded: if comparison_is_boolean {
                 comparison_marker_owner
@@ -5173,7 +5175,10 @@ impl Compiler {
             ordinary: if comparison_is_boolean {
                 comparison_marker_owner
             } else {
-                ExceptionPolicy::normalized_owner(self.control.active_normal_finally_bodies > 0)
+                ExceptionPolicy::normalized_owner(
+                    self.control.active_normal_finally_bodies > 0
+                        || preserve_iterator_loop_assertion_owner,
+                )
             },
         };
         let preserve_terminal_try_owner = comparison_is_boolean
