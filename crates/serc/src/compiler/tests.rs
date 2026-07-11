@@ -1220,6 +1220,89 @@ async def owned(self):
 }
 
 #[test]
+fn coroutine_boolean_value_markers_follow_current_cfg_slot_history() {
+    fn read_exception_varint(table: &[u8], index: &mut usize) -> u32 {
+        let mut byte = table[*index];
+        *index += 1;
+        let mut value = u32::from(byte & 0x3f);
+        while byte & 0x40 != 0 {
+            byte = table[*index];
+            *index += 1;
+            value = (value << 6) | u32::from(byte & 0x3f);
+        }
+        value
+    }
+
+    let source = r#"async def later_value_marker(func, instance, args, kwargs):
+    tool_call = get_argument_value(args, kwargs, 0, "tool_call", True)
+    tool_name = getattr(tool_call, "tool_name", None) or "Pydantic Tool"
+    tool_manager_tools = getattr(instance, "tools", {}) or {}
+    tool_instance = tool_manager_tools.get(tool_name) or None
+    return await traced_tool_run(func, tool_instance, args, kwargs, tool_name)
+
+async def first_value_marker(value, run):
+    selected = value or None
+    return await run(selected)
+
+async def nested_region(value, run):
+    try:
+        selected = value or None
+    except LookupError:
+        selected = None
+    return await run(selected)
+
+async def after_suspension(value, run):
+    await run(None)
+    selected = value or None
+    return selected
+"#;
+    let parsed = parse_module(source).unwrap();
+    let module = module_compiler(source, &parsed)
+        .compile_module(parsed.suite())
+        .unwrap();
+
+    for (name, expected) in [
+        ("later_value_marker", &[true, false, false][..]),
+        ("first_value_marker", &[true][..]),
+        ("nested_region", &[true, true][..]),
+        ("after_suspension", &[false][..]),
+    ] {
+        let function = module
+            .constants
+            .iter()
+            .find_map(|constant| match constant {
+                Constant::Code(code) if code.name == name => Some(code),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("module should contain {name}"));
+        let mut ranges = Vec::new();
+        let mut index = 0;
+        while index < function.exception_table.len() {
+            let start = read_exception_varint(&function.exception_table, &mut index);
+            let length = read_exception_varint(&function.exception_table, &mut index);
+            read_exception_varint(&function.exception_table, &mut index);
+            read_exception_varint(&function.exception_table, &mut index);
+            ranges.push(start..start + length);
+        }
+        let marker_owners = function
+            .bytecode
+            .chunks_exact(2)
+            .enumerate()
+            .filter(|(_, instruction)| instruction[0] == NOT_TAKEN.code())
+            .map(|(offset, _)| {
+                let offset = u32::try_from(offset).unwrap();
+                ranges.iter().any(|range| range.contains(&offset))
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            marker_owners, expected,
+            "unexpected marker owners for {name}"
+        );
+    }
+}
+
+#[test]
 fn comparison_markers_distinguish_forward_and_threaded_loop_fallthroughs() {
     fn read_exception_varint(table: &[u8], index: &mut usize) -> u32 {
         let mut byte = table[*index];
