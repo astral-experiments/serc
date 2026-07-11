@@ -53,6 +53,7 @@ struct LoopContext {
     finally_end_depth: usize,
     exception_region_depth: usize,
     break_target_keeps_exception_owner: bool,
+    protected_finally_break_owner: bool,
     break_policy: LoopBreakPolicy,
 }
 
@@ -247,6 +248,9 @@ pub(super) struct ControlFlowState {
     active_pass_finally_locations: Vec<SourceLocation>,
     active_overriding_finally_returns: usize,
     preserve_finally_break_exit_loop_range: Option<ruff_text_size::TextRange>,
+    // A while-break directly followed by a single-name finally deletion and local return keeps
+    // the authored break slot inside the protected region after its jump becomes a NOP.
+    protected_finally_break_owner: bool,
     // The final synchronous-with `if` test whose converted POP_BLOCK exclusion can be
     // routed across a short-circuit condition without affecting nested body expressions.
     pub(super) terminal_with_condition: Option<ruff_text_size::TextRange>,
@@ -504,6 +508,7 @@ impl Compiler {
             finally_end_depth: self.control.active_finally_end_blocks,
             exception_region_depth: self.control.active_exception_region_exclusions.len(),
             break_target_keeps_exception_owner: self.control.current_statement_followed_by_try,
+            protected_finally_break_owner: self.control.protected_finally_break_owner,
             break_policy,
         }
     }
@@ -2422,6 +2427,7 @@ impl Compiler {
                             && context.exception_region_depth > 0
                             && context.finally_end_depth == 0
                             && !context.break_target_keeps_exception_owner
+                            && !context.protected_finally_break_owner
                             && break_jump_needs_exception_region_exclusion(
                                 self.control.active_finally_try_bodies,
                                 context.iterator_cleanup,
@@ -7488,6 +7494,20 @@ impl Compiler {
         } else {
             self.control.preserve_finally_break_exit_loop_range
         };
+        let protected_finally_break_owner = statement.handlers.is_empty()
+            && statement.orelse.is_empty()
+            && self.control.current_statement_followed_by_name_return
+            && matches!(
+                statement.body.as_slice(),
+                [Stmt::While(loop_statement)]
+                    | [Stmt::Assign(_), Stmt::While(loop_statement)]
+                    if loop_statement.orelse.is_empty()
+                        && suite_contains_loop_break(&loop_statement.body)
+            )
+            && matches!(
+                statement.finalbody.as_slice(),
+                [Stmt::Delete(delete)] if matches!(delete.targets.as_slice(), [Expr::Name(_)])
+            );
         let copy_finally_on_return = pass_finally_location.is_none()
             && !suite_terminates(&statement.finalbody)
             && self.control.active_exception_handlers.is_empty();
@@ -7517,9 +7537,15 @@ impl Compiler {
                                 .set_location(compiler.source_location(pass.range));
                             compiler.emit(NOP, 0, 0)?;
                         }
-                        compiler.with_try_body_context(statement, |compiler| {
-                            compiler.compile_suite(&statement.body)
-                        })?;
+                        compiler.with_control_override(
+                            |control| &mut control.protected_finally_break_owner,
+                            protected_finally_break_owner,
+                            |compiler| {
+                                compiler.with_try_body_context(statement, |compiler| {
+                                    compiler.compile_suite(&statement.body)
+                                })
+                            },
+                        )?;
                         let has_instructions =
                             compiler.assembler.instruction_count() > instruction_count;
                         if !has_instructions {
