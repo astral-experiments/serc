@@ -3264,7 +3264,16 @@ def explicit_else(flag):
 
     #[test]
     fn matches_cpython_marshal_for_trailing_if_handler_cleanup() {
-        let source = r"def call_body(mapping, key):
+        let source = r"def unknown_name_test(flag):
+    try:
+        action()
+    except Error:
+        if flag:
+            recover()
+    after()
+
+
+def compare_test(mapping, key):
     try:
         value = mapping[key]
     except KeyError:
@@ -3291,6 +3300,16 @@ def bare_call_body(mapping, key):
     value = key
 
 
+def explicit_else_control(flag):
+    try:
+        action()
+    except Error as error:
+        if flag:
+            consume(error)
+        else:
+            finish()
+
+
 def direct_tail(mapping, key):
     try:
         value = mapping[key]
@@ -3299,7 +3318,7 @@ def direct_tail(mapping, key):
     value = key
 
 
-def terminating_if(mapping, key):
+def noncall_control(mapping, key):
     try:
         value = mapping[key]
     except KeyError:
@@ -3308,7 +3327,18 @@ def terminating_if(mapping, key):
     value = key
 
 
-def followed_statement(mapping, key):
+def multiple_statement_control(mapping, key):
+    try:
+        value = mapping[key]
+    except KeyError:
+        prepare()
+        if key not in mapping.values():
+            print(key)
+        finish()
+    value = key
+
+
+def nontrailing_control(mapping, key):
     try:
         value = mapping[key]
     except KeyError:

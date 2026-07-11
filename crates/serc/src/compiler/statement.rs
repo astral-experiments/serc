@@ -6461,7 +6461,8 @@ impl Compiler {
                         Some(Stmt::If(tail))
                             if handler.body.len() == 1
                                 && tail.elif_else_clauses.is_empty()
-                                && matches!(tail.test.as_ref(), Expr::Compare(_))
+                                && (matches!(tail.test.as_ref(), Expr::Compare(_))
+                                    || early_condition_truthiness(&tail.test).is_none())
                                 && matches!(
                                     tail.body.as_slice(),
                                     [Stmt::Expr(expression)]
