@@ -65,6 +65,8 @@ struct MatchContext {
     stores: Vec<NameId>,
     fail_pop: Vec<Label>,
     on_top: usize,
+    ownerless_markers_after_specialized_none: bool,
+    in_class_keyword: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -230,6 +232,7 @@ impl Compiler {
                 .is_some_and(|case| is_wildcard_pattern(&case.pattern));
         let matched_cases = statement.cases.len() - usize::from(has_default);
         let mut failure_reaches_end = false;
+        let mut specialized_none_seen = false;
 
         for (index, case) in statement.cases[..matched_cases].iter().enumerate() {
             let copied_subject = index + 1 != matched_cases;
@@ -243,8 +246,11 @@ impl Compiler {
                 stores: Vec::new(),
                 fail_pop: Vec::new(),
                 on_top: 0,
+                ownerless_markers_after_specialized_none: specialized_none_seen,
+                in_class_keyword: false,
             };
             self.compile_stack_pattern(&case.pattern, &mut context)?;
+            specialized_none_seen = context.ownerless_markers_after_specialized_none;
             for &name in &context.stores {
                 self.assembler
                     .set_location(self.source_location(case.pattern.range()));
@@ -472,6 +478,21 @@ impl Compiler {
         opcode: Opcode,
         effect: i32,
     ) -> Result<(), CompileError> {
+        self.jump_to_match_fail_with_marker_policy(
+            context,
+            opcode,
+            effect,
+            ExceptionPolicy::default(),
+        )
+    }
+
+    fn jump_to_match_fail_with_marker_policy(
+        &mut self,
+        context: &mut MatchContext,
+        opcode: Opcode,
+        effect: i32,
+        marker_policy: ExceptionPolicy,
+    ) -> Result<(), CompileError> {
         let pops = context.on_top + context.stores.len();
         self.ensure_match_fail_pop(context, pops);
         self.emit_jump_forward(opcode, context.fail_pop[pops], effect)?;
@@ -479,7 +500,9 @@ impl Compiler {
             opcode,
             POP_JUMP_IF_FALSE | POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE | POP_JUMP_IF_TRUE
         ) {
-            self.emit(NOT_TAKEN, 0, 0)?;
+            // CPython appends forward-jump markers after exception owners have been labeled;
+            // callers select the stale owner left by any earlier optimization.
+            self.emit_with_exception_policy(NOT_TAKEN, 0, 0, marker_policy)?;
         }
         Ok(())
     }
@@ -526,9 +549,44 @@ impl Compiler {
                     Singleton::True => Constant::Bool(true),
                     Singleton::False => Constant::Bool(false),
                 })?;
-                self.emit(LOAD_CONST, constant, 1)?;
-                self.emit(IS_OP, 0, -1)?;
-                self.jump_to_match_fail(context, POP_JUMP_IF_FALSE, -1)
+                // Earlier exception ranges and class-keyword subpatterns still have independent
+                // CFG/location deltas. Shortening their sequence would move those deltas before
+                // it can make the whole object closer to CPython, so defer those shapes until
+                // their surrounding layout is exact.
+                if matches!(pattern.value, Singleton::None)
+                    && !self.assembler.has_exception_regions()
+                    && !context.in_class_keyword
+                    && !self.context.has_lazy_imports
+                {
+                    // CPython specializes the identity comparison and failure jump into a
+                    // consuming None jump. Register the constant before the specialization so
+                    // its pool ordering follows the same source traversal. The removed
+                    // LOAD_CONST and IS_OP leave a protected slot for the late NOT_TAKEN marker.
+                    let result = self.jump_to_match_fail_with_marker_policy(
+                        context,
+                        POP_JUMP_IF_NOT_NONE,
+                        -1,
+                        ExceptionPolicy::normalized_owner(true),
+                    );
+                    context.ownerless_markers_after_specialized_none = true;
+                    result
+                } else {
+                    self.emit(LOAD_CONST, constant, 1)?;
+                    self.emit(IS_OP, 0, -1)?;
+                    let marker_policy = if context.ownerless_markers_after_specialized_none {
+                        // Unlike value and structural patterns, a following boolean singleton
+                        // does not leave another protected slot for its late marker.
+                        ExceptionPolicy::normalized_owner(false)
+                    } else {
+                        ExceptionPolicy::default()
+                    };
+                    self.jump_to_match_fail_with_marker_policy(
+                        context,
+                        POP_JUMP_IF_FALSE,
+                        -1,
+                        marker_policy,
+                    )
+                }
             }
             Pattern::MatchAs(pattern) => {
                 if let Some(inner) = &pattern.pattern {
@@ -596,8 +654,13 @@ impl Compiler {
                 stores: Vec::new(),
                 fail_pop: Vec::new(),
                 on_top: 0,
+                ownerless_markers_after_specialized_none: context
+                    .ownerless_markers_after_specialized_none,
+                in_class_keyword: context.in_class_keyword,
             };
             self.compile_stack_pattern(alternative, &mut alternative_context)?;
+            context.ownerless_markers_after_specialized_none |=
+                alternative_context.ownerless_markers_after_specialized_none;
 
             if index != 0 {
                 let control = control.as_ref().unwrap();
@@ -884,29 +947,25 @@ impl Compiler {
         self.add_constant(Constant::None)?;
         context.on_top += 1;
         self.jump_to_match_fail(context, POP_JUMP_IF_NONE, -1)?;
-        let subpatterns = pattern
-            .arguments
-            .patterns
-            .iter()
-            .chain(
-                pattern
-                    .arguments
-                    .keywords
-                    .iter()
-                    .map(|keyword| &keyword.pattern),
-            )
-            .collect::<Vec<_>>();
+        let subpattern_count = pattern.arguments.patterns.len() + pattern.arguments.keywords.len();
         self.emit(
             UNPACK_SEQUENCE,
-            to_u32(subpatterns.len(), "class pattern count")?,
-            i32::try_from(subpatterns.len()).unwrap() - 1,
+            to_u32(subpattern_count, "class pattern count")?,
+            i32::try_from(subpattern_count).unwrap() - 1,
         )?;
-        context.on_top += subpatterns.len();
+        context.on_top += subpattern_count;
         context.on_top -= 1;
-        for subpattern in subpatterns {
+        for subpattern in &pattern.arguments.patterns {
             context.on_top -= 1;
             self.compile_stack_pattern(subpattern, context)?;
         }
+        let previous_in_class_keyword = context.in_class_keyword;
+        context.in_class_keyword = true;
+        for keyword in &pattern.arguments.keywords {
+            context.on_top -= 1;
+            self.compile_stack_pattern(&keyword.pattern, context)?;
+        }
+        context.in_class_keyword = previous_in_class_keyword;
         Ok(())
     }
 

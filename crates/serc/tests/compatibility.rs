@@ -293,6 +293,49 @@ def nested_match(subject, nested):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_specialized_none_patterns() {
+        let source = r"class Wrapper:
+    __match_args__ = ('value',)
+
+def singleton(value):
+    match value:
+        case None:
+            return 0
+        case True:
+            return 1
+        case False:
+            return 2
+        case 0:
+            return 3
+
+def nested(value):
+    match value:
+        case (None, item):
+            return item
+        case Wrapper(None):
+            return 1
+        case None | False:
+            return 2
+
+def generator(values):
+    for value in values:
+        match value:
+            case None:
+                continue
+            case _:
+                yield value
+
+async def coroutine(value):
+    match value:
+        case None:
+            return 0
+        case True:
+            return 1
+";
+        assert_matches_cpython_marshal(source, "specialized_none_patterns.py");
+    }
+
+    #[test]
     fn reports_the_original_duplicate_pattern_binding_name() {
         let source = "class Container:\n    match value:\n        case [__captured, [__captured] | [__captured]]:\n            pass\n";
         let error = compile(source, "duplicate_pattern.py").unwrap_err();

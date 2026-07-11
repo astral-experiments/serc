@@ -22,11 +22,15 @@ pub(super) struct CompilationContext {
     line_index: LineIndex,
     pub(super) module_plan: ModulePlan,
     pub(super) scopes: ScopeArena,
+    // The pinned 3.14 target rejects 3.15 lazy-import modules, so compatibility-only lowering
+    // must leave their otherwise accepted Ruff ASTs unchanged.
+    pub(super) has_lazy_imports: bool,
 }
 
 impl CompilationContext {
     pub(super) fn new(filename: &str, source: &str, tokens: Tokens, body: &Suite) -> Self {
         let (scopes, module_plan) = ScopeArena::analyze(body);
+        let has_lazy_imports = suite_has_lazy_imports(body);
         Self {
             filename: filename.to_string(),
             source: Arc::from(source),
@@ -34,8 +38,16 @@ impl CompilationContext {
             line_index: LineIndex::from_source_text(source),
             module_plan,
             scopes,
+            has_lazy_imports,
         }
     }
+}
+
+fn suite_has_lazy_imports(body: &Suite) -> bool {
+    body.iter().any(|statement| {
+        matches!(statement, Stmt::Import(import) if import.is_lazy)
+            || matches!(statement, Stmt::ImportFrom(import) if import.is_lazy)
+    })
 }
 
 impl Compiler {
