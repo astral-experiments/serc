@@ -171,7 +171,11 @@ impl Compiler {
     }
 
     pub(super) fn record_folded_value(&mut self, expression: &Expr) -> Result<(), CompileError> {
-        if let Some(constant) = literal_constant(expression) {
+        let literal = match expression {
+            Expr::StringLiteral(string) => Some(self.string_literal_constant(string)),
+            _ => literal_constant(expression),
+        };
+        if let Some(constant) = literal {
             self.add_constant(constant)?;
             return Ok(());
         }

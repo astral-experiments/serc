@@ -2811,6 +2811,58 @@ async def synchronous_outside_async(sync_manager, async_manager):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_conditional_finally_exits_in_synchronous_with_bodies() {
+        let expression_source = r"def expression_fallthrough(manager, condition):
+    with manager:
+        try:
+            assert body()
+        finally:
+            if condition:
+                cleanup()
+
+def attribute_fallthrough(manager, resource):
+    with manager:
+        try:
+            assert body()
+        finally:
+            if resource.enabled:
+                cleanup()
+
+def call_fallthrough(manager, resource):
+    with manager:
+        try:
+            assert body()
+        finally:
+            if resource.enabled():
+                cleanup()
+";
+        assert_matches_cpython_marshal(expression_source, "with_conditional_finally_exit.py");
+
+        let direct_termination_source = r"def terminating_body(manager, condition):
+    with manager:
+        try:
+            raise Error()
+        finally:
+            if condition:
+                cleanup()
+";
+        assert_matches_cpython_marshal(direct_termination_source, "with_finally_direct_raise.py");
+
+        let leading_termination_source = r"def leading_terminating_body(manager, condition):
+    with manager:
+        before()
+        try:
+            if condition:
+                raise Error()
+            raise OtherError()
+        finally:
+            if condition:
+                cleanup()
+";
+        assert_matches_cpython_marshal(leading_termination_source, "with_finally_leading_raise.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_tail_assert_finally_pop_block_ownership() {
         let source = r"def with_owner(manager, condition):
     with manager:
@@ -5142,6 +5194,23 @@ def generator(value):
         value -= 1
 ";
         assert_matches_cpython_marshal(source, "normalized_comparison_owners.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_genexpr_chained_comparison_marker_slots() {
+        let source = r"def slot_zero_small_int(items):
+    return (0 < item < 10 for item in items)
+
+def slot_zero_float(items):
+    return (0.0 < item < 10 for item in items)
+
+def slot_one_null_global(items):
+    return (lower() < item < upper for item in items)
+
+def slot_one_fused_store(items):
+    return (0 < left < right for left, right in items)
+";
+        assert_matches_cpython_marshal(source, "genexpr_chained_comparison_marker_slots.py");
     }
 
     #[test]
@@ -9467,6 +9536,18 @@ def nested_fallthrough(action):
     fn matches_cpython_marshal_for_a_percent_formatted_fstring() {
         let source = "f\"hello %s %s\" % (1, 2)\n\"%s %s\" % (1, 2)\n";
         assert_matches_cpython_marshal(source, "example.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_surrogates_in_folded_containers() {
+        let source = r#"def tuple_argument(function):
+    return function(("\uddf8",))
+
+def iterated_values():
+    for value in ["\ud800", ("\udfff",), "\ufffd"]:
+        consume(value)
+"#;
+        assert_matches_cpython_marshal(source, "nested_surrogates.py");
     }
 
     #[test]

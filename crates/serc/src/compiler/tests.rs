@@ -1346,6 +1346,127 @@ async def after_suspension(value, run):
 }
 
 #[test]
+fn chained_generator_filters_keep_their_first_comparison_marker_owned() {
+    fn read_exception_varint(table: &[u8], index: &mut usize) -> u32 {
+        let mut byte = table[*index];
+        *index += 1;
+        let mut value = u32::from(byte & 0x3f);
+        while byte & 0x40 != 0 {
+            byte = table[*index];
+            *index += 1;
+            value = (value << 6) | u32::from(byte & 0x3f);
+        }
+        value
+    }
+
+    let source = r"def integer_filter(items):
+    return (item for item in items if not (0 < item < 10))
+
+def surrogate_filter(items):
+    return (item for item in items if not ('\ud800' <= item <= '\udfff'))
+";
+    let parsed = parse_module(source).unwrap();
+    let module = module_compiler(source, &parsed)
+        .compile_module(parsed.suite())
+        .unwrap();
+
+    for name in ["integer_filter", "surrogate_filter"] {
+        let function = module
+            .constants
+            .iter()
+            .find_map(|constant| match constant {
+                Constant::Code(code) if code.name == name => Some(code),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("module should contain {name}"));
+        let generator = function
+            .constants
+            .iter()
+            .find_map(|constant| match constant {
+                Constant::Code(code) if code.name == "<genexpr>" => Some(code),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{name} should contain a generator expression"));
+
+        let mut ranges = Vec::new();
+        let mut index = 0;
+        while index < generator.exception_table.len() {
+            let start = read_exception_varint(&generator.exception_table, &mut index);
+            let length = read_exception_varint(&generator.exception_table, &mut index);
+            read_exception_varint(&generator.exception_table, &mut index);
+            read_exception_varint(&generator.exception_table, &mut index);
+            ranges.push(start..start + length);
+        }
+        let marker_owners = generator
+            .bytecode
+            .chunks_exact(2)
+            .enumerate()
+            .filter(|(_, instruction)| instruction[0] == NOT_TAKEN.code())
+            .map(|(offset, _)| {
+                let offset = u32::try_from(offset).unwrap();
+                ranges.iter().any(|range| range.contains(&offset))
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(marker_owners, [true, false], "unexpected owners for {name}");
+    }
+}
+
+#[test]
+fn copied_finally_exits_keep_multi_edge_condition_nops() {
+    let source = r"def boolean_condition(manager, left, right):
+    with manager:
+        try:
+            assert body()
+        finally:
+            if left and right:
+                cleanup()
+
+def conditional_expression(manager, condition, left, right):
+    with manager:
+        try:
+            assert body()
+        finally:
+            if left if condition else right:
+                cleanup()
+
+def negated_boolean_condition(manager, left, right):
+    with manager:
+        try:
+            assert body()
+        finally:
+            if not (left or right):
+                cleanup()
+";
+    let parsed = parse_module(source).unwrap();
+    let module = module_compiler(source, &parsed)
+        .compile_module(parsed.suite())
+        .unwrap();
+
+    for name in [
+        "boolean_condition",
+        "conditional_expression",
+        "negated_boolean_condition",
+    ] {
+        let function = module
+            .constants
+            .iter()
+            .find_map(|constant| match constant {
+                Constant::Code(code) if code.name == name => Some(code),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("module should contain {name}"));
+        let nops = function
+            .bytecode
+            .chunks_exact(2)
+            .filter(|instruction| instruction[0] == NOP.code())
+            .count();
+
+        assert_eq!(nops, 3, "unexpected NOP count for {name}");
+    }
+}
+
+#[test]
 fn comparison_markers_distinguish_forward_and_threaded_loop_fallthroughs() {
     fn read_exception_varint(table: &[u8], index: &mut usize) -> u32 {
         let mut byte = table[*index];

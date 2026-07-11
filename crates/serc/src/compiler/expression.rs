@@ -991,13 +991,14 @@ impl Compiler {
                 self.emit(NOP, 0, 0)?;
             }
             self.assembler.set_location(origin_location);
+            let constant = self.source_aware_fold_constant(origin).unwrap_or(constant);
             self.emit_folded_constant(origin, constant)?;
             return Ok(());
         }
         if matches!(
             expression,
             Expr::BinOp(_) | Expr::Name(_) | Expr::Subscript(_) | Expr::UnaryOp(_) | Expr::Tuple(_)
-        ) && let Some(constant) = fold_constant(expression)
+        ) && let Some(constant) = self.source_aware_fold_constant(expression)
         {
             self.emit_folded_constant(expression, constant)?;
             return Ok(());
@@ -3328,7 +3329,11 @@ impl Compiler {
                 .push((exclusion_start, exclusion_end));
             return Ok(());
         }
-        self.compile_expression(condition)?;
+        self.with_control_override(
+            |control| &mut control.generator_filter_expression,
+            true,
+            |compiler| compiler.compile_expression(condition),
+        )?;
         self.assembler
             .set_location(self.source_location(condition.range()));
         self.emit(TO_BOOL, 0, 0)?;
@@ -3391,7 +3396,11 @@ impl Compiler {
         restart: Label,
         include_comprehension_cleanup: bool,
     ) -> Result<(), CompileError> {
-        self.compile_expression(operand)?;
+        self.with_control_override(
+            |control| &mut control.generator_filter_expression,
+            true,
+            |compiler| compiler.compile_expression(operand),
+        )?;
         self.assembler
             .set_location(self.source_location(operand.range()));
         self.emit(TO_BOOL, 0, 0)?;
@@ -4011,7 +4020,7 @@ impl Compiler {
             if kind == CollectionKind::Tuple
                 && let Some(constants) = elements
                     .iter()
-                    .map(fold_constant)
+                    .map(|element| self.source_aware_fold_constant(element))
                     .collect::<Option<Vec<_>>>()
             {
                 for element in elements {
@@ -4044,7 +4053,7 @@ impl Compiler {
                 && elements.len() >= 3
                 && let Some(constants) = elements
                     .iter()
-                    .map(fold_constant)
+                    .map(|element| self.source_aware_fold_constant(element))
                     .collect::<Option<Vec<_>>>()
             {
                 for element in elements {
@@ -4099,7 +4108,7 @@ impl Compiler {
         if unpacking_start >= 3
             && let Some(constants) = elements[..unpacking_start]
                 .iter()
-                .map(fold_constant)
+                .map(|element| self.source_aware_fold_constant(element))
                 .collect::<Option<Vec<_>>>()
         {
             for element in &elements[..unpacking_start] {
@@ -4176,7 +4185,7 @@ impl Compiler {
                     && let Some(constants) = list
                         .elts
                         .iter()
-                        .map(fold_constant)
+                        .map(|element| self.source_aware_fold_constant(element))
                         .collect::<Option<Vec<_>>>()
                 {
                     for element in &list.elts {
@@ -4214,12 +4223,12 @@ impl Compiler {
                     && set
                         .elts
                         .iter()
-                        .all(|element| fold_constant(element).is_some()) =>
+                        .all(|element| self.source_aware_fold_constant(element).is_some()) =>
             {
                 let mut unique = Vec::with_capacity(set.elts.len());
                 for element in &set.elts {
                     self.record_folded_value(element)?;
-                    let constant = fold_constant(element).unwrap();
+                    let constant = self.source_aware_fold_constant(element).unwrap();
                     if !unique
                         .iter()
                         .any(|existing| python_constant_values_equal(existing, &constant))
@@ -4778,7 +4787,26 @@ impl Compiler {
             self.emit(COPY, 1, 1)?;
             self.emit(TO_BOOL, 0, 0)?;
             self.emit_jump_forward(POP_JUMP_IF_FALSE, cleanup, -1)?;
+            // CPython appends the chained-comparison marker after compacting the CFG. The
+            // generator's stop-iteration owner survives only when this block offers a stale
+            // instruction slot for the marker to reuse.
+            let exclude_generator_owner = self.control.generator_expression
+                && self.control.generator_region_start.is_some()
+                && !self.control.generator_filter_expression
+                && !self.assembler.current_block_has_dynamic_exception_owner();
+            let marker_start = exclude_generator_owner.then(|| {
+                let start = self.assembler.label();
+                self.assembler.mark(start);
+                start
+            });
             self.emit(NOT_TAKEN, 0, 0)?;
+            if let Some(marker_start) = marker_start {
+                let marker_end = self.assembler.label();
+                self.assembler.mark(marker_end);
+                self.control
+                    .generator_region_exclusions
+                    .push((marker_start, marker_end));
+            }
             self.emit(POP_TOP, 0, -1)?;
         }
         self.compile_expression(expression.comparators.last().unwrap())?;
