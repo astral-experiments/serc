@@ -678,6 +678,7 @@ impl ClassPlan {
         let body_requires_dunder_class =
             body_explicitly_references_dunder_class && required.contains("__class__");
 
+        required.extend(nested_lambda_requirements.iter().cloned());
         required.extend(
             method_requirements
                 .iter()
