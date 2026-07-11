@@ -4275,6 +4275,64 @@ async def tail_conditional_async_break(items, value):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_constant_false_assertions_after_if_joins() {
+        let source = r"def after_if_pass(flag, message):
+    if flag:
+        pass
+    assert False, message
+
+
+def after_if_return(flag, message):
+    if flag:
+        return
+    assert False, message
+
+
+def after_if_raise(flag, error, message):
+    if flag:
+        raise error
+    assert False, message
+
+
+def after_if_else(flag, message):
+    if flag:
+        first()
+    else:
+        second()
+    assert False, message
+
+
+def after_if_chain(first, second, message):
+    if first:
+        one()
+    elif second:
+        two()
+    assert False, message
+
+
+def assert_alone(message):
+    assert False, message
+
+
+def after_expression(message):
+    consume()
+    assert False, message
+
+
+def after_assignment(message):
+    value = produce()
+    assert False, message
+
+
+def dynamic_after_if(flag, condition, message):
+    if flag:
+        consume()
+    assert condition, message
+";
+        assert_matches_cpython_marshal(source, "assert_after_if_join.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_terminal_async_for_in_with_bodies() {
         let source = "async def sync_with_direct(manager, items):\n    with manager:\n        async for item in items:\n            consume(item)\n\nasync def async_with_direct(manager, items):\n    async with manager:\n        async for item in items:\n            consume(item)\n\nasync def sync_then_async_with(sync_manager, async_manager, items):\n    with sync_manager:\n        async with async_manager:\n            async for item in items:\n                consume(item)\n\nasync def async_then_sync_with(async_manager, sync_manager, items):\n    async with async_manager:\n        with sync_manager:\n            async for item in items:\n                consume(item)\n\nasync def async_with_two_items(first, second, items):\n    async with first, second:\n        async for item in items:\n            consume(item)\n\nasync def async_with_inner_finally(manager, items):\n    async with manager:\n        try:\n            async for item in items:\n                consume(item)\n        finally:\n            cleanup()\n\nasync def async_with_nonfinal(manager, items):\n    async with manager:\n        async for item in items:\n            consume(item)\n        after()\n";
         assert_matches_cpython_marshal(source, "async_with_terminal_async_for.py");
