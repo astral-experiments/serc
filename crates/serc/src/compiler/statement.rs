@@ -5369,6 +5369,11 @@ impl Compiler {
                 .as_except_handler()
                 .is_some_and(|handler| matches!(handler.body.as_slice(), [Stmt::Pass(_)]))
         });
+        let has_bare_handler = statement.handlers.last().is_some_and(|handler| {
+            handler
+                .as_except_handler()
+                .is_some_and(|handler| handler.type_.is_none())
+        });
         // CPython folds every successful arm of a trailing nested conversion chain directly onto
         // the iterator backedge. Restrict that layout to recursive one-call try/except/else arms
         // so ordinary nested handlers keep their shared joins.
@@ -5967,7 +5972,9 @@ impl Compiler {
             if normal_exit_starts_in_empty_block {
                 self.assembler.mark_last_borrow_empty_block();
             }
-            if handlers_terminate && !self.control.current_statement_followed_by_name_return {
+            if (handlers_terminate && !self.control.current_statement_followed_by_name_return)
+                || (has_bare_handler && self.control.current_statement_has_following)
+            {
                 // CPython removes this normal-exit edge before borrowed-load traversal. Keep
                 // the barrier on the source edge so a shared target can still be reached from
                 // an enclosing branch or loop. A direct following name return is copied onto
