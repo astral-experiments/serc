@@ -5076,6 +5076,23 @@ class WithClassCell:
     }
 
     #[test]
+    fn matches_cpython_marshal_for_large_annotation_indices() {
+        let mut source = String::from("flag = True\n");
+        for index in 0..=256 {
+            writeln!(&mut source, "module_{index}: int").unwrap();
+        }
+        source.push_str("\nclass Conditional:\n    if flag:\n");
+        for index in 0..=256 {
+            writeln!(&mut source, "        class_{index}: int").unwrap();
+        }
+
+        // Index 255 remains a LOAD_SMALL_INT; index 256 becomes a LOAD_CONST. Exercise the
+        // transition in both the executable marker and deferred annotation thunk for modules
+        // and conditional class annotations.
+        assert_matches_cpython_marshal(&source, "large_annotation_indices.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_negated_generator_filters() {
         let source =
             "def filtered(items):\n    return (item for item in items if not predicate(item))\n";
