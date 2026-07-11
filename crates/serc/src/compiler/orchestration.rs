@@ -445,7 +445,7 @@ impl Compiler {
         let has_classdict_cell = self.is_cell("__classdict__");
         let has_class_cell = self.is_cell("__class__");
         let has_conditional_annotations = self.is_cell("__conditional_annotations__");
-        if has_conditional_annotations {
+        if has_conditional_annotations && self.unit.flags & CO_FUTURE_ANNOTATIONS == 0 {
             let mut annotations = Vec::new();
             collect_conditional_simple_annotations(body, &mut annotations);
             self.unit.class_conditional_annotations = annotations
