@@ -344,12 +344,26 @@ impl Compiler {
                             && body_previous_location.is_some_and(|location| {
                                 location.line == self.assembler.location().line
                             });
-                        if irrefutable_true_guard
-                            || (self.assembler.instruction_count() == body_start + 1
-                                && !previous_instruction_covers_branch
-                                && !matches!(self.unit.scope, Scope::Class { .. }))
+                        if irrefutable_true_guard {
+                            self.assembler.preserve_last_inlined_jump_nop();
+                        } else if self.assembler.instruction_count() == body_start + 1
+                            && !previous_instruction_covers_branch
+                            && !matches!(self.unit.scope, Scope::Class { .. })
                         {
                             self.assembler.preserve_last_inlined_jump_nop();
+                            // CPython keeps this retained success-exit NOP on the physical
+                            // fallthrough for irrefutable explicit-global captures. Refutable
+                            // and local captures keep the ordinary borrowed-load barrier.
+                            if context.fail_pop.is_empty()
+                                && !context.stores.is_empty()
+                                && matches!(
+                                    &self.unit.scope,
+                                    Scope::Function { globals, .. }
+                                        if context.stores.iter().all(|name| globals.contains(*name))
+                                )
+                            {
+                                self.assembler.mark_last_retained_nop_borrow_fallthrough();
+                            }
                         }
                     }
                 }

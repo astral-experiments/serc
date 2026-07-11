@@ -205,6 +205,47 @@ mod tests {
     }
 
     #[test]
+    fn matches_cpython_marshal_for_global_capture_match_exit_borrowing() {
+        let source = r"def capture(subject):
+    global captured
+    match subject:
+        case captured:
+            pass
+    consume(subject)
+
+
+def capture_as(subject):
+    global captured_as
+    match subject:
+        case _ as captured_as:
+            pass
+    consume(subject)
+";
+        assert_matches_cpython_marshal(source, "global_capture_match_exit.py");
+    }
+
+    #[test]
+    fn keeps_refutable_and_local_match_exit_borrow_controls() {
+        let source = r"def refutable_global_capture(subject):
+    global captured
+    match (None, subject):
+        case (_, captured):
+            pass
+    consume(subject)
+
+
+def nested_local_capture(subject):
+    match subject:
+        case outer:
+            match subject:
+                case inner:
+                    pass
+    consume(subject, outer, inner)
+";
+        assert_matches_cpython_marshal(source, "match_exit_borrow_controls.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_match_success_next_locations() {
         let source = r"def tuple_result(subject):
     match subject:
