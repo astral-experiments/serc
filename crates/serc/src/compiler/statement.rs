@@ -289,6 +289,10 @@ pub(super) struct ControlFlowState {
     prevent_try_exit_inlining: bool,
     pub(super) coroutine_suspension_epoch: usize,
     pub(super) generator_expression: bool,
+    // Whether an expression is being evaluated as a generator-expression filter. CPython lowers
+    // filter conditions before the generator element, so their internal markers do not use the
+    // element expression's post-compaction stop-iteration owner rule.
+    pub(super) generator_filter_expression: bool,
     pub(super) same_line_try_body: bool,
     // Whether the statement currently entered by `compile_suite` has a sibling successor.
     pub(super) current_statement_has_following: bool,

@@ -3328,7 +3328,11 @@ impl Compiler {
                 .push((exclusion_start, exclusion_end));
             return Ok(());
         }
-        self.compile_expression(condition)?;
+        self.with_control_override(
+            |control| &mut control.generator_filter_expression,
+            true,
+            |compiler| compiler.compile_expression(condition),
+        )?;
         self.assembler
             .set_location(self.source_location(condition.range()));
         self.emit(TO_BOOL, 0, 0)?;
@@ -3391,7 +3395,11 @@ impl Compiler {
         restart: Label,
         include_comprehension_cleanup: bool,
     ) -> Result<(), CompileError> {
-        self.compile_expression(operand)?;
+        self.with_control_override(
+            |control| &mut control.generator_filter_expression,
+            true,
+            |compiler| compiler.compile_expression(operand),
+        )?;
         self.assembler
             .set_location(self.source_location(operand.range()));
         self.emit(TO_BOOL, 0, 0)?;
@@ -4778,7 +4786,26 @@ impl Compiler {
             self.emit(COPY, 1, 1)?;
             self.emit(TO_BOOL, 0, 0)?;
             self.emit_jump_forward(POP_JUMP_IF_FALSE, cleanup, -1)?;
+            // CPython appends the chained-comparison marker after compacting the CFG. The
+            // generator's stop-iteration owner survives only when this block offers a stale
+            // instruction slot for the marker to reuse.
+            let exclude_generator_owner = self.control.generator_expression
+                && self.control.generator_region_start.is_some()
+                && !self.control.generator_filter_expression
+                && !self.assembler.current_block_has_dynamic_exception_owner();
+            let marker_start = exclude_generator_owner.then(|| {
+                let start = self.assembler.label();
+                self.assembler.mark(start);
+                start
+            });
             self.emit(NOT_TAKEN, 0, 0)?;
+            if let Some(marker_start) = marker_start {
+                let marker_end = self.assembler.label();
+                self.assembler.mark(marker_end);
+                self.control
+                    .generator_region_exclusions
+                    .push((marker_start, marker_end));
+            }
             self.emit(POP_TOP, 0, -1)?;
         }
         self.compile_expression(expression.comparators.last().unwrap())?;

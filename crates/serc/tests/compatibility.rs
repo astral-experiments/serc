@@ -5181,6 +5181,23 @@ def generator(value):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_genexpr_chained_comparison_marker_slots() {
+        let source = r"def slot_zero_small_int(items):
+    return (0 < item < 10 for item in items)
+
+def slot_zero_float(items):
+    return (0.0 < item < 10 for item in items)
+
+def slot_one_null_global(items):
+    return (lower() < item < upper for item in items)
+
+def slot_one_fused_store(items):
+    return (0 < left < right for left, right in items)
+";
+        assert_matches_cpython_marshal(source, "genexpr_chained_comparison_marker_slots.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_boolean_value_marker_owners() {
         let source = "def generator_expression(items):\n    return (item or fallback for item in items)\n\ndef generator_value(value):\n    yield value\n    result = value and fallback\n    consume(result)\n\ndef generator_try(value):\n    yield value\n    try:\n        result = value or fallback\n        consume(result)\n    finally:\n        cleanup()\n\ndef ordinary_try(value):\n    try:\n        result = value or fallback\n        consume(result)\n    finally:\n        cleanup()\n\ndef nested_try(value):\n    try:\n        try:\n            result = value and fallback\n            consume(result)\n        finally:\n            inner_cleanup()\n    finally:\n        outer_cleanup()\n\ndef with_only(manager, value):\n    with manager:\n        result = value or fallback\n        consume(result)\n\ndef try_inside_with(manager, value):\n    with manager:\n        try:\n            result = value and fallback\n            consume(result)\n        finally:\n            cleanup()\n\ndef with_inside_try(manager, value):\n    try:\n        with manager:\n            result = value or fallback\n            consume(result)\n    finally:\n        cleanup()\n\ndef comprehension(items):\n    return [item and fallback for item in items]\n\ndef protected_comprehensions(manager, items):\n    try:\n        left = [item or fallback for item in items]\n        with manager:\n            right = {item and fallback for item in items}\n        return left, right\n    finally:\n        cleanup()\n\ndef generator_comprehension(items):\n    yield [item or fallback for item in items]\n\nasync def coroutine_before(value):\n    result = value or fallback\n    await source\n    consume(result)\n\nasync def coroutine_after(value):\n    await source\n    result = value and fallback\n    consume(result)\n\nasync def coroutine_try(value):\n    await source\n    try:\n        result = value or fallback\n        consume(result)\n    finally:\n        cleanup()\n\nasync def coroutine_with(manager, value):\n    await source\n    with manager:\n        result = value and fallback\n        consume(result)\n\nasync def async_generator(value):\n    yield value\n    result = value or fallback\n    consume(result)\n\nasync def async_generator_try(value):\n    yield value\n    try:\n        result = value and fallback\n        consume(result)\n    finally:\n        cleanup()\n";
         assert_matches_cpython_marshal(source, "boolean_value_marker_owners.py");
