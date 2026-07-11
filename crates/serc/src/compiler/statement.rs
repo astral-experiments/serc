@@ -216,6 +216,9 @@ pub(super) struct ControlFlowState {
     pub(super) active_with_suspension_epochs: Vec<usize>,
     pub(super) active_with_region_exclusions: Vec<Vec<(Label, Label)>>,
     active_terminal_withs: usize,
+    // The final while statement in the innermost async-with body. Nested branch tails still
+    // supply the location of their redundant exit jump to CPython's line table.
+    direct_final_async_with_while: Option<ruff_text_size::TextRange>,
     // CPython retains the empty end block when an async for ends a protected suite.
     emit_protected_async_for_end_nop: bool,
     // CPython retains the normal finally exit when it directly ends a synchronous with body.
@@ -4895,10 +4898,22 @@ impl Compiler {
 
         self.assembler.mark(else_label);
         self.set_depth(base_depth);
+        let innermost_async_with = self
+            .control
+            .active_with_exits
+            .last()
+            .is_some_and(|context| {
+                context.is_async
+                    && self.control.active_exception_region_exclusions.len()
+                        == context.exception_region_depth
+                    && self.control.direct_final_async_with_while == Some(statement.range)
+            });
         // CPython keeps the converted protected-region POP_BLOCK marker only when the while
-        // condition contributes one edge to the normal exit.
+        // condition contributes one edge to the normal exit. An innermost async-with drops that
+        // marker unless an intervening exception region owns the loop exit.
         if statement.orelse.is_empty()
             && !self.control.current_statement_has_following
+            && !innermost_async_with
             && (!self.control.active_with_region_exclusions.is_empty()
                 || (!self.control.active_exception_region_exclusions.is_empty()
                     && self.control.active_finally_try_bodies == 0
@@ -8646,7 +8661,15 @@ impl Compiler {
                     let body_start = compiler.assembler.instruction_count();
                     if remaining.is_empty() {
                         if !matches!(body, [Stmt::Pass(_)]) {
-                            compiler.compile_suite(body)?;
+                            if let Some(Stmt::While(statement)) = body.last() {
+                                compiler.with_control_override(
+                                    |control| &mut control.direct_final_async_with_while,
+                                    Some(statement.range),
+                                    |compiler| compiler.compile_suite(body),
+                                )?;
+                            } else {
+                                compiler.compile_suite(body)?;
+                            }
                         }
                     } else {
                         compiler.compile_async_with_items(remaining, body, false)?;

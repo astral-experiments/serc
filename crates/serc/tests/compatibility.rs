@@ -1267,6 +1267,67 @@ def conditional_expression(manager, condition, first, second):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_terminal_while_exit_markers_in_async_with_bodies() {
+        let source = r"async def direct_name(manager, flag):
+    async with manager:
+        while flag:
+            step()
+    outside()
+
+async def direct_attribute(manager, resource):
+    async with manager:
+        while resource.enabled:
+            step()
+    outside()
+
+async def direct_call(manager, resource):
+    async with manager:
+        while resource.enabled():
+            step()
+    outside()
+
+async def multi_edge(manager, first, second):
+    async with manager:
+        while first and second:
+            step()
+    outside()
+
+async def sync_then_async_with(sync_manager, async_manager, flag):
+    with sync_manager:
+        async with async_manager:
+            while flag:
+                step()
+    outside()
+
+async def async_then_sync_with(async_manager, sync_manager, flag):
+    async with async_manager:
+        with sync_manager:
+            while flag:
+                step()
+    outside()
+
+async def async_with_inner_finally(manager, flag):
+    async with manager:
+        try:
+            while flag:
+                step()
+        finally:
+            cleanup()
+    outside()
+
+async def async_with_inner_except(manager, flag):
+    async with manager:
+        try:
+            while flag:
+                step()
+        except Error:
+            cleanup()
+    outside()
+";
+        assert_matches_cpython_marshal(source, "async_with_terminal_while.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_final_while_exit_markers_in_try_bodies() {
         let source = r"def direct(flag):
     try:
