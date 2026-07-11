@@ -3343,6 +3343,54 @@ def named_tuple_control(items):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_multi_exit_nested_if_branch_locations() {
+        let source = r"def raised(outer, first, second):
+    if outer:
+        if first and second:
+            raise Error
+    else:
+        fallback()
+    after()
+
+def returned(outer, errors, value):
+    if outer:
+        if not errors and value is not None:
+            return value
+    elif value:
+        fallback()
+    after()
+
+def multiline(outer, first, second):
+    if outer:
+        if (
+            first
+            and second
+        ):
+            raise Error
+    else:
+        fallback()
+    after()
+
+def unique_false_control(outer, first, second):
+    if outer:
+        if first or second:
+            raise Error
+    else:
+        fallback()
+    after()
+
+def simple_control(outer, inner):
+    if outer:
+        if inner:
+            raise Error
+    else:
+        fallback()
+    after()
+";
+        assert_matches_cpython_marshal(source, "multi_exit_nested_if_branch.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_chained_return_exit_sharing() {
         let source = r#"def direct(first, second, third):
     if first <= second <= third:

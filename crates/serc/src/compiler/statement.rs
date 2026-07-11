@@ -9825,9 +9825,15 @@ pub(super) fn nested_if_exit_location(
     if early_condition_truthiness(test).is_some() {
         return None;
     }
+    // Multiple false edges from a clause-free nested `and` meet at the surrounding branch exit.
+    // CPython leaves that shared exit unlocated instead of assigning the whole condition range.
+    let unlocated_multi_exit_boolean = statement.elif_else_clauses.is_empty()
+        && matches!(test, Expr::BoolOp(boolean) if boolean.op == BoolOp::And)
+        && unique_condition_jump_target(test, false).is_none();
     Some(
-        if suite_terminates(body)
-            || matches!(body.last(), Some(Stmt::Try(statement)) if statement.finalbody.is_empty())
+        if (suite_terminates(body)
+            || matches!(body.last(), Some(Stmt::Try(statement)) if statement.finalbody.is_empty()))
+            && !unlocated_multi_exit_boolean
         {
             NestedIfExitLocation::Located(test)
         } else {
