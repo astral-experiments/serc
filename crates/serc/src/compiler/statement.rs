@@ -6112,6 +6112,24 @@ impl Compiler {
             let direct_exit_location = (statement.orelse.is_empty() && !unlocated_conditional_exit)
                 .then(|| direct_try_body_exit_location(&statement.body))
                 .flatten();
+            let drop_multi_condition_exit_nop = statement.orelse.is_empty()
+                && self.control.loops.is_empty()
+                && matches!(
+                    statement.body.last(),
+                    Some(Stmt::If(nested))
+                        if nested.elif_else_clauses.is_empty()
+                            && matches!(nested.body.last(), Some(Stmt::Return(_) | Stmt::Raise(_)))
+                            && !nested
+                                .body
+                                .iter()
+                                .any(|statement| matches!(statement, Stmt::Try(_)))
+                            && matches!(
+                                nested.test.as_ref(),
+                                Expr::BoolOp(boolean) if boolean.op == BoolOp::And
+                            )
+                            && condition_jump_target_count(&nested.test, false) > 1
+                            && !expression_contains_chained_comparison(&nested.test)
+                );
             let unlocated_direct_exit_before_break =
                 self.control.current_statement_followed_by_break
                     && statement.orelse.is_empty()
@@ -6215,6 +6233,11 @@ impl Compiler {
                 ExceptionPolicy::default()
             };
             self.emit_jump_forward_with_exception_policy(JUMP_FORWARD, end, 0, exception_policy)?;
+            if drop_multi_condition_exit_nop {
+                // CPython removes the normal try exit fed by multiple condition fallthroughs.
+                self.assembler.defer_last_jump_removal();
+                self.assembler.mark_last_borrow_empty_block();
+            }
             if self.control.copied_split_return_try == Some(statement.range) {
                 self.assembler.allow_last_split_return_copy();
             }
