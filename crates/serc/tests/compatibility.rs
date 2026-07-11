@@ -332,6 +332,34 @@ def nested_match(subject, nested):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_generic_class_private_name_contexts() {
+        let source = r"class Outer:
+    def define():
+        class Child[__T]:
+            value = __T
+
+        return Child
+
+
+class ModuleLevel[__V]:
+    value = __V
+";
+        assert_matches_cpython_marshal(source, "generic_class_private_names.py");
+    }
+
+    #[test]
+    fn preserves_enclosing_private_name_context_for_generic_functions() {
+        let source = r"class Outer:
+    def define():
+        def function[__U]():
+            return __U
+
+        return function
+";
+        assert_matches_cpython_marshal(source, "generic_function_private_names.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_generic_wrapper_closures() {
         let source = r"def outer():
     value = int
