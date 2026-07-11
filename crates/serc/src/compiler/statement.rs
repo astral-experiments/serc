@@ -4394,6 +4394,7 @@ impl Compiler {
                         restart,
                         split_short_circuit,
                         true,
+                        !non_final_branch,
                     );
                 }
                 if self.control.generator_region_start.is_none()
@@ -4406,6 +4407,7 @@ impl Compiler {
                         restart,
                         split_short_circuit,
                         false,
+                        !non_final_branch,
                     );
                 }
                 let body = statement.body.as_slice();
@@ -4703,6 +4705,7 @@ impl Compiler {
         restart: Label,
         split_short_circuit: bool,
         negated: bool,
+        preserve_return_nop: bool,
     ) -> Result<(), CompileError> {
         let base_depth = self.control.depth;
         let cleanup = self.assembler.label();
@@ -4749,7 +4752,11 @@ impl Compiler {
         self.assembler
             .set_location(self.source_location(comparison.range));
         self.emit_jump_forward(JUMP_FORWARD, body, 0)?;
-        if negated {
+        if negated
+            || (preserve_return_nop && matches!(statement.body.as_slice(), [Stmt::Return(_)]))
+        {
+            // CPython retains the successful chained-comparison edge when a terminal return is
+            // copied onto it; a non-final loop branch has a separate fallback layout.
             self.assembler.preserve_last_inlined_jump_nop();
         }
 
