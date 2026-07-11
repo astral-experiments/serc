@@ -155,7 +155,8 @@ impl Compiler {
             .clone_from(&self.symbols.imported_scope_names);
         let type_parameter_names = type_names.iter().copied().collect();
         wrapper.symbols.type_parameter_names = type_parameter_names;
-        wrapper.unit.generic_target_qualified_name = Some(self.child_qualified_name(name));
+        wrapper.unit.generic_target_qualified_name =
+            Some(self.annotation_child_qualified_name(name));
         if matches!(self.unit.scope, Scope::Class { .. }) {
             wrapper.unit.annotation_classdict_index = Some(wrapper.closure_index("__classdict__")?);
         }
@@ -1134,18 +1135,14 @@ impl Compiler {
         let mut child = Self::function(
             Arc::clone(&self.context),
             name,
-            self.unit
-                .generic_target_qualified_name
-                .as_ref()
-                .map_or_else(
-                    || self.child_qualified_name(name),
-                    |qualified_name| {
-                        qualified_name.rsplit_once('.').map_or_else(
-                            || name.to_string(),
-                            |(parent, _)| format!("{parent}.{name}"),
-                        )
-                    },
-                ),
+            if self.unit.generic_target_qualified_name.is_some() {
+                self.unit.qualified_name.rsplit_once('.').map_or_else(
+                    || name.to_string(),
+                    |(parent, _)| format!("{parent}.{name}"),
+                )
+            } else {
+                self.annotation_child_qualified_name(name)
+            },
             self.line_number(u32::from(setup_range.start())),
             &plan,
             self.unit.scope_id,

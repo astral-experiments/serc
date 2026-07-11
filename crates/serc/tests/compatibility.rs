@@ -603,6 +603,23 @@ def parent():
     }
 
     #[test]
+    fn matches_cpython_marshal_for_global_annotation_scope_qualnames() {
+        let source = r"def outer():
+    global PlainAlias, GenericAlias, GenericFunction, GenericClass
+
+    type PlainAlias = int
+    type GenericAlias[T: int] = tuple[T, T]
+
+    def GenericFunction[T: int]():
+        pass
+
+    class GenericClass[T: int]:
+        pass
+";
+        assert_matches_cpython_marshal(source, "global_annotation_qualnames.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_string_slice_constants() {
         let source = "subject[\"fine\":\"fine\"]\nsubject[\"x\":\"x\"]\n";
         assert_matches_cpython_marshal(source, "slice.py");
