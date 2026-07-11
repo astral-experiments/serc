@@ -756,6 +756,17 @@ impl BlockGraph {
         }
     }
 
+    pub(super) fn instruction_at_mut(
+        &mut self,
+        block: BasicBlockId,
+        offset: usize,
+    ) -> Option<&mut Instruction> {
+        match &mut self.blocks[block.index()].items[offset] {
+            Item::Instruction(instruction) => Some(instruction),
+            Item::Label(_) => None,
+        }
+    }
+
     pub(super) fn insert_item(&mut self, position: ItemPosition, item: Item) {
         debug_assert!(self.order.contains(&position.block));
         if let Item::Label(label) = item {
@@ -821,6 +832,7 @@ impl BlockGraph {
         reachable
     }
 
+    #[cfg(any(test, debug_assertions))]
     pub(super) fn item_reachability(&self, exception_regions: &[ExceptionRegion]) -> Vec<bool> {
         let reachable = self.reachable_blocks(exception_regions);
         self.iter()

@@ -13,7 +13,7 @@ use super::plan::{MarshalVisitor, ObjectId, ReferenceMode, traverse_code};
 
 #[derive(Debug)]
 struct Object {
-    count: usize,
+    shared: bool,
     cached: bool,
     interned: bool,
 }
@@ -89,19 +89,63 @@ fn mismatched_occurrence(index: usize, expected: OccurrenceKind, recorded: Occur
 }
 
 const CODE_OBJECT_CHILDREN: usize = 10;
+const CACHED_INT_SLOTS: usize = 257;
+const CACHED_SIGNED_INT_SLOTS: usize = 262;
+const CACHED_BYTE_SLOTS: usize = 256;
+const CACHED_CHARACTER_SLOTS: usize = 256;
+const CACHED_SCALAR_SLOTS: usize =
+    CACHED_INT_SLOTS + CACHED_SIGNED_INT_SLOTS + CACHED_BYTE_SLOTS + CACHED_CHARACTER_SLOTS;
+const UNSEEN_CACHED_OBJECT: u32 = u32::MAX;
+const MIN_CACHED_SCALAR_CONSTANTS: usize = 32;
 
 #[derive(Clone, Copy, Debug)]
 enum CachedObject {
     EmptyBytes,
     EmptyTuple,
+    Int(u16),
+    SignedInt(u16),
+    Byte(u8),
+    Character(u8),
 }
 
 impl CachedObject {
+    fn character(value: &str) -> Option<Self> {
+        match value.as_bytes() {
+            [character @ ..=0x7f] => Some(Self::Character(*character)),
+            [lead @ 0xc2..=0xc3, continuation @ 0x80..=0xbf] => Some(Self::Character(
+                ((*lead & 0x1f) << 6) | (*continuation & 0x3f),
+            )),
+            _ => None,
+        }
+    }
+
+    fn scalar_index(self) -> usize {
+        match self {
+            Self::EmptyBytes | Self::EmptyTuple => {
+                unreachable!("empty cached object does not have a scalar index")
+            }
+            Self::Int(value) => usize::from(value),
+            Self::SignedInt(value) => CACHED_INT_SLOTS + usize::from(value),
+            Self::Byte(value) => CACHED_INT_SLOTS + CACHED_SIGNED_INT_SLOTS + usize::from(value),
+            Self::Character(value) => {
+                CACHED_INT_SLOTS + CACHED_SIGNED_INT_SLOTS + CACHED_BYTE_SLOTS + usize::from(value)
+            }
+        }
+    }
+
     #[cfg(test)]
     fn for_key(key: &ObjectKey<'_>) -> Option<Self> {
         match key {
             ObjectKey::Bytes([]) => Some(Self::EmptyBytes),
+            ObjectKey::Bytes([value]) => Some(Self::Byte(*value)),
             ObjectKey::EmptyTuple => Some(Self::EmptyTuple),
+            ObjectKey::Int(value) if *value <= 256 => {
+                Some(Self::Int(u16::try_from(*value).expect("cached int fits")))
+            }
+            ObjectKey::SignedInt(value) if (-5..=256).contains(value) => Some(Self::SignedInt(
+                u16::try_from(*value + 5).expect("cached signed int index fits"),
+            )),
+            ObjectKey::String(value) => Self::character(value),
             _ => None,
         }
     }
@@ -112,6 +156,8 @@ pub(super) struct ObjectGraph<'a> {
     objects: FxHashMap<HashedObjectKey<'a>, ObjectId>,
     cached_empty_bytes: Option<ObjectId>,
     cached_empty_tuple: Option<ObjectId>,
+    cached_scalar_ids: Option<Box<[u32]>>,
+    cache_scalars: bool,
     objects_by_id: Vec<Object>,
     occurrences: Vec<Occurrence>,
     #[cfg(debug_assertions)]
@@ -127,7 +173,10 @@ impl<'a> ObjectGraph<'a> {
         let explicitly_interned = (!explicitly_interned.is_empty()).then_some(&explicitly_interned);
         let recreated_frozensets =
             (!recreated_frozensets.is_empty()).then_some(&recreated_frozensets);
-        let mut graph = Self::default();
+        let mut graph = Self {
+            cache_scalars: code.constants.len() >= MIN_CACHED_SCALAR_CONSTANTS,
+            ..Self::default()
+        };
         traverse_code(
             code,
             &mut GraphVisitor {
@@ -195,7 +244,7 @@ impl<'a> ObjectGraph<'a> {
 
         let id = ObjectId::from_index(self.objects_by_id.len());
         self.objects_by_id.push(Object {
-            count: 1,
+            shared: false,
             cached: false,
             interned: false,
         });
@@ -203,24 +252,43 @@ impl<'a> ObjectGraph<'a> {
     }
 
     fn record_cached(&mut self, cached: CachedObject) -> (ObjectId, bool) {
-        let slot = match cached {
-            CachedObject::EmptyBytes => &mut self.cached_empty_bytes,
-            CachedObject::EmptyTuple => &mut self.cached_empty_tuple,
+        let empty_slot = match cached {
+            CachedObject::EmptyBytes => Some(&mut self.cached_empty_bytes),
+            CachedObject::EmptyTuple => Some(&mut self.cached_empty_tuple),
+            _ => None,
         };
-        if let Some(id) = *slot {
-            let object = &mut self.objects_by_id[id.index()];
-            object.count += 1;
+        if let Some(slot) = empty_slot {
+            if let Some(id) = *slot {
+                self.objects_by_id[id.index()].shared = true;
+                return (id, false);
+            }
+            let id = ObjectId::from_index(self.objects_by_id.len());
+            self.objects_by_id.push(Object {
+                shared: false,
+                cached: true,
+                interned: false,
+            });
+            *slot = Some(id);
+            return (id, true);
+        }
+
+        let slot = &mut self.cached_scalar_ids.get_or_insert_with(|| {
+            vec![UNSEEN_CACHED_OBJECT; CACHED_SCALAR_SLOTS].into_boxed_slice()
+        })[cached.scalar_index()];
+        if *slot != UNSEEN_CACHED_OBJECT {
+            let id = ObjectId::from_index(*slot as usize);
+            self.objects_by_id[id.index()].shared = true;
             return (id, false);
         }
 
-        let id = ObjectId::from_index(self.objects_by_id.len());
+        let index = self.objects_by_id.len();
+        let id = ObjectId::from_index(index);
         self.objects_by_id.push(Object {
-            count: 1,
+            shared: false,
             cached: true,
-            interned: false,
+            interned: matches!(cached, CachedObject::Character(_)),
         });
-        debug_assert!(slot.is_none());
-        *slot = Some(id);
+        *slot = u32::try_from(index).expect("marshal object limit exceeded");
         (id, true)
     }
 
@@ -231,7 +299,7 @@ impl<'a> ObjectGraph<'a> {
                 let cached = interned || Self::is_cached(entry.key().key());
                 let id = *entry.get();
                 let object = &mut self.objects_by_id[id.index()];
-                object.count += 1;
+                object.shared = true;
                 object.cached |= cached;
                 object.interned |= interned;
                 (id, false)
@@ -240,7 +308,7 @@ impl<'a> ObjectGraph<'a> {
                 let cached = interned || Self::is_cached(entry.key().key());
                 entry.insert(next_id);
                 self.objects_by_id.push(Object {
-                    count: 1,
+                    shared: false,
                     cached,
                     interned,
                 });
@@ -255,7 +323,7 @@ impl<'a> ObjectGraph<'a> {
             || self
                 .objects
                 .get(&HashedObjectKey::from(key.clone()))
-                .is_some_and(|id| self.objects_by_id[id.index()].count > 1)
+                .is_some_and(|id| self.objects_by_id[id.index()].shared)
         {
             return true;
         }
@@ -267,6 +335,7 @@ impl<'a> ObjectGraph<'a> {
             ObjectKey::Int(value) => *value <= 256,
             ObjectKey::SignedInt(value) => (-5..=256).contains(value),
             ObjectKey::Bytes(value) => value.len() <= 1,
+            ObjectKey::String(value) => is_cached_character(value),
             ObjectKey::EmptyTuple => true,
             _ => false,
         }
@@ -274,7 +343,7 @@ impl<'a> ObjectGraph<'a> {
 
     pub(super) fn is_shared_object(&self, id: ObjectId) -> bool {
         let object = &self.objects_by_id[id.index()];
-        object.count > 1 || object.cached
+        object.shared || object.cached
     }
 
     pub(super) fn object_count(&self) -> usize {
@@ -286,6 +355,12 @@ impl<'a> ObjectGraph<'a> {
         self.objects.len()
             + usize::from(self.cached_empty_bytes.is_some())
             + usize::from(self.cached_empty_tuple.is_some())
+            + self.cached_scalar_ids.as_deref().map_or(0, |slots| {
+                slots
+                    .iter()
+                    .filter(|id| **id != UNSEEN_CACHED_OBJECT)
+                    .count()
+            })
     }
 
     #[cfg(test)]
@@ -306,6 +381,16 @@ impl<'a> ObjectGraph<'a> {
 
     #[cfg(test)]
     pub(super) fn is_interned(&self, value: &str) -> bool {
+        if CachedObject::character(value)
+            .map(CachedObject::scalar_index)
+            .is_some_and(|index| {
+                self.cached_scalar_ids
+                    .as_deref()
+                    .is_some_and(|slots| slots[index] != UNSEEN_CACHED_OBJECT)
+            })
+        {
+            return true;
+        }
         self.objects
             .iter()
             .find_map(|(key, id)| match key.key() {
@@ -317,8 +402,7 @@ impl<'a> ObjectGraph<'a> {
 }
 
 fn collect_explicitly_interned<'a>(code: &'a CodeObject, values: &mut FxHashSet<&'a str>) {
-    collect_explicit_intern_hints(code, values);
-    if !has_qualified_name_constant(code) {
+    if !collect_explicit_intern_hints(code, values) {
         return;
     }
 
@@ -344,26 +428,24 @@ fn collect_explicitly_interned<'a>(code: &'a CodeObject, values: &mut FxHashSet<
     values.extend(qualified_name_values.difference(&ordinary_first).copied());
 }
 
-fn has_qualified_name_constant(code: &CodeObject) -> bool {
-    code.marshal_hints.qualified_name_constant_index.is_some()
-        || code.constants.iter().any(|constant| match constant {
-            Constant::Code(code) => has_qualified_name_constant(code),
-            _ => false,
-        })
-}
-
-fn collect_explicit_intern_hints<'a>(code: &'a CodeObject, values: &mut FxHashSet<&'a str>) {
+fn collect_explicit_intern_hints<'a>(
+    code: &'a CodeObject,
+    values: &mut FxHashSet<&'a str>,
+) -> bool {
     values.extend(
         code.marshal_hints
             .explicitly_interned_strings
             .iter()
             .map(String::as_str),
     );
+    let mut has_qualified_name_constant =
+        code.marshal_hints.qualified_name_constant_index.is_some();
     for constant in &code.constants {
         if let Constant::Code(code) = constant {
-            collect_explicit_intern_hints(code, values);
+            has_qualified_name_constant |= collect_explicit_intern_hints(code, values);
         }
     }
+    has_qualified_name_constant
 }
 
 fn collect_qualified_name_constants<'a>(
@@ -946,11 +1028,18 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
 
     #[inline]
     fn metadata_string(&mut self, value: &'code str) {
-        self.graph.record_keyed(
-            OccurrenceKind::MetadataString,
-            ObjectKey::String(value),
-            true,
-        );
+        if self.graph.cache_scalars
+            && let Some(character) = CachedObject::character(value)
+        {
+            self.graph
+                .record_cached_value(OccurrenceKind::MetadataString, character);
+        } else {
+            self.graph.record_keyed(
+                OccurrenceKind::MetadataString,
+                ObjectKey::String(value),
+                true,
+            );
+        }
     }
 
     #[inline]
@@ -958,12 +1047,19 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
 
     #[inline]
     fn bytes(&mut self, value: &'code [u8]) {
-        if value.is_empty() {
-            self.graph
-                .record_cached_value(OccurrenceKind::Bytes, CachedObject::EmptyBytes);
-        } else {
-            self.graph
-                .record_keyed(OccurrenceKind::Bytes, ObjectKey::Bytes(value), false);
+        match value {
+            [] => {
+                self.graph
+                    .record_cached_value(OccurrenceKind::Bytes, CachedObject::EmptyBytes);
+            }
+            [value] if self.graph.cache_scalars => {
+                self.graph
+                    .record_cached_value(OccurrenceKind::Bytes, CachedObject::Byte(*value));
+            }
+            _ => {
+                self.graph
+                    .record_keyed(OccurrenceKind::Bytes, ObjectKey::Bytes(value), false);
+            }
         }
     }
 
@@ -975,6 +1071,13 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
                 unreachable!("tuple and code constants have dedicated traversal methods")
             }
             Constant::String(value) => {
+                if self.graph.cache_scalars
+                    && let Some(character) = CachedObject::character(value)
+                {
+                    return self
+                        .graph
+                        .record_cached_value(OccurrenceKind::Constant, character);
+                }
                 let interned = should_intern(value)
                     || self
                         .explicitly_interned
@@ -1000,9 +1103,35 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
                     ObjectKey::RecreatedFrozenSet(address),
                 )
             }
-            Constant::Bytes(value) if value.is_empty() => self
-                .graph
-                .record_cached_value(OccurrenceKind::Constant, CachedObject::EmptyBytes),
+            Constant::Int(value) if self.graph.cache_scalars && *value <= 256 => {
+                self.graph.record_cached_value(
+                    OccurrenceKind::Constant,
+                    CachedObject::Int(u16::try_from(*value).expect("cached int fits")),
+                )
+            }
+            Constant::SignedInt(value)
+                if self.graph.cache_scalars && (-5..=256).contains(value) =>
+            {
+                self.graph.record_cached_value(
+                    OccurrenceKind::Constant,
+                    CachedObject::SignedInt(
+                        u16::try_from(*value + 5).expect("cached signed int index fits"),
+                    ),
+                )
+            }
+            Constant::Bytes(value) => match value.as_slice() {
+                [] => self
+                    .graph
+                    .record_cached_value(OccurrenceKind::Constant, CachedObject::EmptyBytes),
+                [value] if self.graph.cache_scalars => self
+                    .graph
+                    .record_cached_value(OccurrenceKind::Constant, CachedObject::Byte(*value)),
+                _ => self.graph.record_keyed(
+                    OccurrenceKind::Constant,
+                    ObjectKey::Bytes(value),
+                    false,
+                ),
+            },
             _ => self
                 .graph
                 .record_keyed(OccurrenceKind::Constant, constant_key(value), false),

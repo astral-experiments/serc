@@ -179,136 +179,155 @@ impl OptimizationPipeline {
         // inner jump skips the redundant outer test and enters its POP_TOP
         // fallthrough path directly.
         let graph = &self.graph;
-        if !graph.iter_items().any(|item| {
-            matches!(
-                item,
-                Item::Instruction(instruction)
-                    if matches!(
-                        instruction.opcode,
-                        JUMP_FORWARD | POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE
-                    )
-                        && matches!(instruction.operand, Operand::Forward(_))
-            )
-        }) {
+        let mut has_forward_jump = false;
+        let mut has_forward_conditional = false;
+        for item in graph.iter_items() {
+            let Item::Instruction(instruction) = item else {
+                continue;
+            };
+            if !matches!(instruction.operand, Operand::Forward(_)) {
+                continue;
+            }
+            match instruction.opcode {
+                JUMP_FORWARD => has_forward_jump = true,
+                POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE => has_forward_conditional = true,
+                _ => continue,
+            }
+            if has_forward_jump && has_forward_conditional {
+                break;
+            }
+        }
+        if !has_forward_jump && !has_forward_conditional {
             return;
         }
-        let mut positions = graph.item_positions();
-        let mut conditional_targets = FxHashMap::default();
-        for (index, position) in positions.iter().copied().enumerate() {
-            let Item::Label(label) = *graph.item(position) else {
-                continue;
-            };
-            let mut following = positions[index + 1..]
-                .iter()
-                .copied()
-                .enumerate()
-                .filter_map(|(offset, position)| {
-                    let Item::Instruction(instruction) = *graph.item(position) else {
-                        return None;
-                    };
-                    (instruction.opcode != NOP).then_some((index + 1 + offset, instruction))
-                });
-            let Some((_, copy)) = following.next() else {
-                continue;
-            };
-            let Some((_, to_bool)) = following.next() else {
-                continue;
-            };
-            let Some((_, jump)) = following.next() else {
-                continue;
-            };
-            let Some((_, not_taken)) = following.next() else {
-                continue;
-            };
-            let Some((fallthrough_index, pop)) = following.next() else {
-                continue;
-            };
-            if copy.opcode != COPY
-                || !matches!(copy.operand, Operand::Value(1))
-                || to_bool.opcode != TO_BOOL
-                || !matches!(jump.opcode, POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE)
-                || !matches!(jump.operand, Operand::Forward(_))
-                || not_taken.opcode != NOT_TAKEN
-                || pop.opcode != POP_TOP
-            {
-                continue;
-            }
-            conditional_targets.insert(
-                label,
-                ConditionalTarget {
-                    opcode: jump.opcode,
-                    operand: jump.operand,
-                    fallthrough_index,
-                },
-            );
-        }
 
-        let mut fallthrough_indices = positions
-            .iter()
-            .copied()
-            .enumerate()
-            .filter_map(|(index, position)| {
-                let Item::Instruction(instruction) = *graph.item(position) else {
-                    return None;
+        if has_forward_conditional {
+            let mut positions = graph.item_positions();
+            let mut conditional_targets = FxHashMap::default();
+            for (index, position) in positions.iter().copied().enumerate() {
+                let Item::Label(label) = *graph.item(position) else {
+                    continue;
                 };
-                if !is_value_preserving_jump(graph, &positions, index) {
-                    return None;
+                let mut following = positions[index + 1..]
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .filter_map(|(offset, position)| {
+                        let Item::Instruction(instruction) = *graph.item(position) else {
+                            return None;
+                        };
+                        (instruction.opcode != NOP).then_some((index + 1 + offset, instruction))
+                    });
+                let Some((_, copy)) = following.next() else {
+                    continue;
+                };
+                let Some((_, to_bool)) = following.next() else {
+                    continue;
+                };
+                let Some((_, jump)) = following.next() else {
+                    continue;
+                };
+                let Some((_, not_taken)) = following.next() else {
+                    continue;
+                };
+                let Some((fallthrough_index, pop)) = following.next() else {
+                    continue;
+                };
+                if copy.opcode != COPY
+                    || !matches!(copy.operand, Operand::Value(1))
+                    || to_bool.opcode != TO_BOOL
+                    || !matches!(jump.opcode, POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE)
+                    || !matches!(jump.operand, Operand::Forward(_))
+                    || not_taken.opcode != NOT_TAKEN
+                    || pop.opcode != POP_TOP
+                {
+                    continue;
                 }
-                let Operand::Forward(target) = instruction.operand else {
-                    return None;
-                };
-                let target = conditional_targets.get(&target)?;
-                (instruction.opcode != target.opcode).then_some(target.fallthrough_index)
-            })
-            .collect::<Vec<_>>();
-        fallthrough_indices.sort_unstable();
-        fallthrough_indices.dedup();
-        let fallthrough_labels = fallthrough_indices
-            .iter()
-            .map(|index| (*index, self.label()))
-            .collect::<FxHashMap<_, _>>();
-        if !fallthrough_indices.is_empty() {
-            let graph = &mut self.graph;
-            for index in fallthrough_indices.iter().rev().copied() {
-                graph.insert_item(positions[index], Item::Label(fallthrough_labels[&index]));
+                conditional_targets.insert(
+                    label,
+                    ConditionalTarget {
+                        opcode: jump.opcode,
+                        operand: jump.operand,
+                        fallthrough_index,
+                    },
+                );
             }
-            positions = graph.item_positions();
-        }
 
-        for (index, position) in positions.iter().copied().enumerate() {
-            if !is_value_preserving_jump(&self.graph, &positions, index) {
-                continue;
-            }
-            let Some(instruction) = self.graph.instruction_mut(position) else {
-                continue;
-            };
-            if !matches!(instruction.opcode, POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE) {
-                continue;
-            }
-            let Operand::Forward(mut target) = instruction.operand else {
-                continue;
-            };
-            for _ in 0..conditional_targets.len() {
-                let Some(next) = conditional_targets.get(&target) else {
-                    break;
-                };
-                if instruction.opcode == next.opcode {
-                    instruction.retarget(next.operand);
-                    let Operand::Forward(next_target) = next.operand else {
-                        break;
-                    };
-                    if next_target == target {
-                        break;
+            if !conditional_targets.is_empty() {
+                let mut fallthrough_indices = positions
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .filter_map(|(index, position)| {
+                        let Item::Instruction(instruction) = *graph.item(position) else {
+                            return None;
+                        };
+                        if !is_value_preserving_jump(graph, &positions, index) {
+                            return None;
+                        }
+                        let Operand::Forward(target) = instruction.operand else {
+                            return None;
+                        };
+                        let target = conditional_targets.get(&target)?;
+                        (instruction.opcode != target.opcode).then_some(target.fallthrough_index)
+                    })
+                    .collect::<Vec<_>>();
+                fallthrough_indices.sort_unstable();
+                fallthrough_indices.dedup();
+                let fallthrough_labels = fallthrough_indices
+                    .iter()
+                    .map(|index| (*index, self.label()))
+                    .collect::<FxHashMap<_, _>>();
+                if !fallthrough_indices.is_empty() {
+                    let graph = &mut self.graph;
+                    for index in fallthrough_indices.iter().rev().copied() {
+                        graph
+                            .insert_item(positions[index], Item::Label(fallthrough_labels[&index]));
                     }
-                    target = next_target;
-                } else {
-                    let Some(fallthrough) = fallthrough_labels.get(&next.fallthrough_index) else {
-                        break;
+                    positions = graph.item_positions();
+                }
+
+                for (index, position) in positions.iter().copied().enumerate() {
+                    if !is_value_preserving_jump(&self.graph, &positions, index) {
+                        continue;
+                    }
+                    let Some(instruction) = self.graph.instruction_mut(position) else {
+                        continue;
                     };
-                    instruction.retarget(Operand::Forward(*fallthrough));
-                    break;
+                    if !matches!(instruction.opcode, POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE) {
+                        continue;
+                    }
+                    let Operand::Forward(mut target) = instruction.operand else {
+                        continue;
+                    };
+                    for _ in 0..conditional_targets.len() {
+                        let Some(next) = conditional_targets.get(&target) else {
+                            break;
+                        };
+                        if instruction.opcode == next.opcode {
+                            instruction.retarget(next.operand);
+                            let Operand::Forward(next_target) = next.operand else {
+                                break;
+                            };
+                            if next_target == target {
+                                break;
+                            }
+                            target = next_target;
+                        } else {
+                            let Some(fallthrough) = fallthrough_labels.get(&next.fallthrough_index)
+                            else {
+                                break;
+                            };
+                            instruction.retarget(Operand::Forward(*fallthrough));
+                            break;
+                        }
+                    }
                 }
             }
+        }
+
+        if !has_forward_jump {
+            return;
         }
 
         let graph = &self.graph;

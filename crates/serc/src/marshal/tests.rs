@@ -77,6 +77,10 @@ fn uses_cpython_reference_cache_boundaries() {
         ObjectKey::SignedInt(-5),
         ObjectKey::Bytes(&[]),
         ObjectKey::Bytes(&[0]),
+        ObjectKey::String("x"),
+        ObjectKey::String("\u{80}"),
+        ObjectKey::String("é"),
+        ObjectKey::String("ÿ"),
         ObjectKey::EmptyTuple,
     ] {
         assert!(graph.is_shared(&key, false), "expected cached key {key:?}");
@@ -85,6 +89,8 @@ fn uses_cpython_reference_cache_boundaries() {
         ObjectKey::Int(257),
         ObjectKey::SignedInt(-6),
         ObjectKey::Bytes(&[0, 1]),
+        ObjectKey::String("éx"),
+        ObjectKey::String("Ā"),
         ObjectKey::Float(1.0_f64.to_bits()),
     ] {
         assert!(
@@ -98,14 +104,63 @@ fn uses_cpython_reference_cache_boundaries() {
 #[test]
 fn bypasses_value_lookup_for_common_cpython_cached_objects() {
     let mut graph = ObjectGraph::default();
-    for key in [ObjectKey::Bytes(&[]), ObjectKey::EmptyTuple] {
+    for key in [
+        ObjectKey::Bytes(&[]),
+        ObjectKey::EmptyTuple,
+        ObjectKey::Int(256),
+        ObjectKey::SignedInt(-5),
+        ObjectKey::Bytes(&[0]),
+        ObjectKey::String("é"),
+    ] {
         assert!(graph.record(key.clone()));
         assert!(!graph.record(key));
     }
 
-    assert_eq!(graph.object_count(), 2);
-    assert_eq!(graph.keyed_object_count(), 2);
+    assert_eq!(graph.object_count(), 6);
+    assert_eq!(graph.keyed_object_count(), 6);
     assert_eq!(graph.hashed_object_count(), 0);
+}
+
+#[test]
+fn cached_scalar_slots_preserve_domains_and_cross_source_identity() {
+    let mut graph = ObjectGraph::default();
+    let first_character = String::from("é");
+    let second_character = String::from("é");
+    let first_byte = [0];
+    let second_byte = [0];
+
+    assert!(graph.record(ObjectKey::Int(1)));
+    assert!(graph.record(ObjectKey::SignedInt(1)));
+    assert!(!graph.record(ObjectKey::Int(1)));
+    assert!(!graph.record(ObjectKey::SignedInt(1)));
+    assert!(graph.record(ObjectKey::Bytes(&first_byte)));
+    assert!(!graph.record(ObjectKey::Bytes(&second_byte)));
+    assert!(graph.record(ObjectKey::String(&first_character)));
+    assert!(!graph.record(ObjectKey::String(&second_character)));
+    assert_eq!(graph.object_count(), 4);
+    assert_eq!(graph.keyed_object_count(), 4);
+    assert_eq!(graph.hashed_object_count(), 0);
+}
+
+#[test]
+fn cached_scalar_graph_routes_constants_metadata_and_structural_bytes() {
+    let mut code = code_object(vec![
+        Constant::Int(256),
+        Constant::SignedInt(-5),
+        Constant::Bytes(vec![0]),
+        Constant::String("é".to_string()),
+    ]);
+    code.constants.resize(32, Constant::None);
+    code.names.push("é".to_string());
+    code.line_table.push(0);
+    code.exception_table.push(0);
+    let graph = ObjectGraph::for_code(&code);
+
+    assert!(graph.is_interned("é"));
+    assert!(graph.is_shared(&ObjectKey::Int(256), false));
+    assert!(graph.is_shared(&ObjectKey::SignedInt(-5), false));
+    assert!(graph.is_shared(&ObjectKey::Bytes(&[0]), false));
+    assert!(graph.is_shared(&ObjectKey::String("é"), false));
 }
 
 #[test]

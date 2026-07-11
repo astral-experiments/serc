@@ -252,6 +252,7 @@ pub(super) struct ScopeBodyFacts {
     pub(super) has_generic_definition: bool,
     pub(super) has_type_alias: bool,
     pub(super) has_simple_annotations: bool,
+    has_inlined_comprehension: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -348,6 +349,7 @@ impl FunctionPlan {
             nested_annotation_scope_requirements: annotation_scope_requirements,
             generator_named_targets,
             inlined_comprehension_cellvars,
+            has_inlined_comprehension,
             ..
         } = facts;
 
@@ -357,6 +359,7 @@ impl FunctionPlan {
         let mut locals = LocalCollector {
             candidate_bindings: Some(FxHashMap::default()),
             globals,
+            has_inlined_comprehension,
             ignore_generator_body_comprehension_targets: generator_named_targets.is_empty(),
             nonlocals,
             ..LocalCollector::default()
@@ -1400,6 +1403,7 @@ struct LocalCollector {
     annotation_only: FxHashSet<String>,
     globals: FxHashSet<String>,
     nonlocals: FxHashSet<String>,
+    has_inlined_comprehension: bool,
     ignore_generator_body_comprehension_targets: bool,
 }
 
@@ -1537,13 +1541,17 @@ impl LocalCollector {
         for statement in body {
             match statement {
                 Stmt::Assign(assignment) => {
-                    let mut bindings = FxHashSet::default();
-                    for target in &assignment.targets {
-                        let mut names = Vec::new();
-                        collect_target_names(target, &mut names);
-                        bindings.extend(names);
+                    if self.candidate_bindings.is_none() || !self.has_inlined_comprehension {
+                        self.collect_expression(&assignment.value);
+                    } else {
+                        let mut bindings = FxHashSet::default();
+                        for target in &assignment.targets {
+                            let mut names = Vec::new();
+                            collect_target_names(target, &mut names);
+                            bindings.extend(names);
+                        }
+                        self.collect_assignment_expression(&assignment.value, bindings);
                     }
-                    self.collect_assignment_expression(&assignment.value, bindings);
                     for target in &assignment.targets {
                         self.collect_target(target);
                     }
@@ -1554,9 +1562,13 @@ impl LocalCollector {
                 }
                 Stmt::AnnAssign(assignment) => {
                     if let Some(value) = &assignment.value {
-                        let mut names = Vec::new();
-                        collect_target_names(&assignment.target, &mut names);
-                        self.collect_assignment_expression(value, names.into_iter().collect());
+                        if self.candidate_bindings.is_none() || !self.has_inlined_comprehension {
+                            self.collect_expression(value);
+                        } else {
+                            let mut names = Vec::new();
+                            collect_target_names(&assignment.target, &mut names);
+                            self.collect_assignment_expression(value, names.into_iter().collect());
+                        }
                         self.collect_target(&assignment.target);
                     } else {
                         match assignment.target.as_ref() {
@@ -1986,22 +1998,26 @@ impl ScopeBodyFacts {
     }
 }
 
-struct ScopeBodyFactsCollector {
+struct ScopeBodyFactsCollector<'ast> {
     facts: ScopeBodyFacts,
+    references: FxHashSet<&'ast str>,
+    outside_inlined_comprehension_references: Option<FxHashSet<&'ast str>>,
     skip_annotations: bool,
     collect_function_scope_facts: bool,
     generator_depth: usize,
     inlined_comprehension_depth: usize,
 }
 
-impl ScopeBodyFactsCollector {
+impl<'ast> ScopeBodyFactsCollector<'ast> {
     fn collect(
-        body: &[Stmt],
+        body: &'ast [Stmt],
         skip_annotations: bool,
         collect_function_scope_facts: bool,
     ) -> ScopeBodyFacts {
         let mut collector = Self {
             facts: ScopeBodyFacts::default(),
+            references: FxHashSet::default(),
+            outside_inlined_comprehension_references: None,
             skip_annotations,
             collect_function_scope_facts,
             generator_depth: 0,
@@ -2010,10 +2026,21 @@ impl ScopeBodyFactsCollector {
         for statement in body {
             collector.visit_stmt(statement);
         }
+        collector.facts.references = collector
+            .references
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        collector.facts.outside_inlined_comprehension_references = collector
+            .outside_inlined_comprehension_references
+            .unwrap_or_default()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
         collector.facts
     }
 
-    fn collect_function_header(&mut self, definition: &StmtFunctionDef) {
+    fn collect_function_header(&mut self, definition: &'ast StmtFunctionDef) {
         self.facts.has_function_definition = true;
         // A nested function's decorators execute in the current scope and may be that scope's
         // only reference to an enclosing binding.
@@ -2038,7 +2065,7 @@ impl ScopeBodyFactsCollector {
         );
     }
 
-    fn collect_class_header(&mut self, definition: &StmtClassDef) {
+    fn collect_class_header(&mut self, definition: &'ast StmtClassDef) {
         for decorator in &definition.decorator_list {
             self.visit_expr(&decorator.expression);
         }
@@ -2074,7 +2101,7 @@ impl ScopeBodyFactsCollector {
             .extend(required.difference(&type_names).cloned());
     }
 
-    fn collect_type_alias(&mut self, statement: &ruff_python_ast::StmtTypeAlias) {
+    fn collect_type_alias(&mut self, statement: &'ast ruff_python_ast::StmtTypeAlias) {
         self.facts.has_type_alias = true;
         let mut required = expression_required_names(&statement.value);
         if let Some(type_params) = statement.type_params.as_deref() {
@@ -2093,22 +2120,22 @@ impl ScopeBodyFactsCollector {
         }
     }
 
-    fn insert_reference(&mut self, name: &str) {
-        self.facts.references.insert(name.to_string());
-        if self.inlined_comprehension_depth == 0 {
-            self.facts
-                .outside_inlined_comprehension_references
-                .insert(name.to_string());
+    fn insert_reference(&mut self, name: &'ast str) {
+        self.references.insert(name);
+        if self.inlined_comprehension_depth == 0
+            && let Some(references) = &mut self.outside_inlined_comprehension_references
+        {
+            references.insert(name);
         }
         if name == "super" {
-            self.facts.references.insert("__class__".to_string());
+            self.references.insert("__class__");
         } else if name == "__class__" {
             self.facts.explicit_dunder_class_reference = true;
         }
     }
 }
 
-impl<'ast> Visitor<'ast> for ScopeBodyFactsCollector {
+impl<'ast> Visitor<'ast> for ScopeBodyFactsCollector<'ast> {
     fn visit_stmt(&mut self, statement: &'ast Stmt) {
         match statement {
             Stmt::FunctionDef(definition) => {
@@ -2188,6 +2215,14 @@ impl<'ast> Visitor<'ast> for ScopeBodyFactsCollector {
                 _ => None,
             };
             if let Some((generators, key, value)) = comprehension {
+                if !self.facts.has_inlined_comprehension {
+                    let mut references = self.references.clone();
+                    if !self.facts.explicit_dunder_class_reference {
+                        references.remove("__class__");
+                    }
+                    self.outside_inlined_comprehension_references = Some(references);
+                }
+                self.facts.has_inlined_comprehension = true;
                 self.facts
                     .inlined_comprehension_cellvars
                     .extend(comprehension_cell_names(generators, key, value));

@@ -9,6 +9,8 @@ use super::v5::{
     TYPE_STRING, TYPE_TRUE, TYPE_TUPLE, TYPE_UNICODE,
 };
 
+const UNSEEN_REFERENCE: u32 = u32::MAX;
+
 pub(crate) fn encode_code(code: &CodeObject) -> Vec<u8> {
     let mut output = Vec::new();
     encode_code_into(code, &mut output);
@@ -20,7 +22,7 @@ pub(crate) fn encode_code_into(code: &CodeObject, output: &mut Vec<u8>) {
     let mut writer = Writer {
         graph: &graph,
         output,
-        references: vec![None; graph.object_count()],
+        references: vec![UNSEEN_REFERENCE; graph.object_count()],
         reference_count: 0,
         occurrences: graph.occurrence_cursor(),
     };
@@ -31,7 +33,7 @@ pub(crate) fn encode_code_into(code: &CodeObject, output: &mut Vec<u8>) {
 struct Writer<'output, 'graph, 'code> {
     graph: &'graph ObjectGraph<'code>,
     output: &'output mut Vec<u8>,
-    references: Vec<Option<u32>>,
+    references: Vec<u32>,
     reference_count: usize,
     occurrences: OccurrenceCursor<'graph>,
 }
@@ -57,14 +59,15 @@ impl Writer<'_, '_, '_> {
         if reference_mode == ReferenceMode::IfShared && !self.graph.is_shared_object(object) {
             return Some(0);
         }
-        if let Some(index) = self.references[object.index()] {
+        let index = self.references[object.index()];
+        if index != UNSEEN_REFERENCE {
             self.byte(TYPE_REF);
             self.long(index);
             return None;
         }
         let index = u32::try_from(self.reference_count).expect("marshal reference limit exceeded");
         self.reference_count += 1;
-        self.references[object.index()] = Some(index);
+        self.references[object.index()] = index;
         Some(FLAG_REF)
     }
 

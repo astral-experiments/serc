@@ -29,6 +29,10 @@ impl ConstantPool {
         self.values.is_empty()
     }
 
+    pub(super) fn len(&self) -> usize {
+        self.values.len()
+    }
+
     pub(super) fn intern(&mut self, constant: Constant) -> Result<u32, CompileError> {
         if let Some(index) = self
             .values
@@ -42,15 +46,11 @@ impl ConstantPool {
         Ok(index)
     }
 
-    pub(super) fn retain_used(
-        &mut self,
-        used: &FxHashSet<u32>,
-    ) -> Result<Vec<Option<u32>>, CompileError> {
+    pub(super) fn retain_used(&mut self, used: &[bool]) -> Result<Vec<Option<u32>>, CompileError> {
         let mut index_map = vec![None; self.values.len()];
         let mut retained = Vec::with_capacity(self.values.len());
         for (old_index, constant) in std::mem::take(&mut self.values).into_iter().enumerate() {
-            let old_index_u32 = to_u32(old_index, "constant index")?;
-            if old_index == 0 || used.contains(&old_index_u32) {
+            if old_index == 0 || used.get(old_index).copied().unwrap_or(false) {
                 let new_index = to_u32(retained.len(), "constant count")?;
                 index_map[old_index] = Some(new_index);
                 retained.push(constant);
@@ -274,7 +274,9 @@ impl Compiler {
     }
 
     pub(super) fn remove_unused_constants(&mut self) -> Result<(), CompileError> {
-        let used = self.assembler.used_constant_indices(LOAD_CONST);
+        let used = self
+            .assembler
+            .used_constant_indices(LOAD_CONST, self.output.constants.len());
         let index_map = self.output.constants.retain_used(&used)?;
         self.assembler
             .remap_constant_indices(LOAD_CONST, &index_map);
@@ -662,7 +664,10 @@ fn float_integer_numeric_real(value: f64) -> Option<NumericReal> {
 }
 
 fn code_objects_equal(left: &CodeObject, right: &CodeObject) -> bool {
-    left.arg_count == right.arg_count
+    left.first_line_number == right.first_line_number
+        && left.name == right.name
+        && left.qualified_name == right.qualified_name
+        && left.arg_count == right.arg_count
         && left.positional_only_arg_count == right.positional_only_arg_count
         && left.keyword_only_arg_count == right.keyword_only_arg_count
         && left.stack_size == right.stack_size
@@ -678,9 +683,6 @@ fn code_objects_equal(left: &CodeObject, right: &CodeObject) -> bool {
         && left.locals == right.locals
         && left.local_kinds == right.local_kinds
         && left.filename == right.filename
-        && left.name == right.name
-        && left.qualified_name == right.qualified_name
-        && left.first_line_number == right.first_line_number
         && left.line_table == right.line_table
         && left.exception_table == right.exception_table
         && left
@@ -1888,8 +1890,6 @@ pub(super) fn big_integer_digits(token: &str) -> Vec<u16> {
 
 #[cfg(test)]
 mod tests {
-    use rustc_hash::FxHashSet;
-
     use super::{ConstantEquality, ConstantPool};
     use crate::code_object::{CodeObject, Constant, LocalsIdentity, MarshalHints};
 
@@ -1935,7 +1935,7 @@ mod tests {
             2
         );
 
-        let index_map = pool.retain_used(&FxHashSet::from_iter([2])).unwrap();
+        let index_map = pool.retain_used(&[false, false, true]).unwrap();
 
         assert_eq!(index_map, [Some(0), None, Some(1)]);
         assert!(matches!(

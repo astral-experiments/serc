@@ -779,6 +779,49 @@ fn scope_body_facts_preserve_named_scope_and_annotation_boundaries() {
 }
 
 #[test]
+fn comprehension_shadowing_distinguishes_explicit_and_synthetic_dunder_class_references() {
+    let source = r"def synthetic(values):
+    super()
+    return [__class__ for __class__ in values]
+
+def explicit_before(values):
+    __class__
+    return [__class__ for __class__ in values]
+
+def explicit_after(values):
+    result = [__class__ for __class__ in values]
+    __class__
+    return result
+";
+    let parsed = parse_module(source).unwrap();
+    let compiler = module_compiler(source, &parsed);
+    let arena = compiler.scope_arena();
+    let dunder_class = arena.names.get("__class__").unwrap();
+    let shadowed = |name: &str| {
+        let definition = parsed
+            .suite()
+            .iter()
+            .find_map(|statement| match statement {
+                Stmt::FunctionDef(definition) if definition.name.as_str() == name => {
+                    Some(definition)
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("expected function {name}"));
+        let id = compiler.function_scope_id(definition).unwrap();
+        arena
+            .function(id)
+            .unwrap()
+            .comprehension_shadowed_targets
+            .contains(&dunder_class)
+    };
+
+    assert!(!shadowed("synthetic"));
+    assert!(shadowed("explicit_before"));
+    assert!(shadowed("explicit_after"));
+}
+
+#[test]
 fn compiles_a_simple_module() {
     let source = "answer = 6 * 7\nprint(answer)\n";
     let parsed = parse_module(source).unwrap();
