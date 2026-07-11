@@ -6377,6 +6377,124 @@ def non_assertion_chain(first, middle, last):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_multiline_assertion_conditional_expression_exit_nops() {
+        let source = r#"def direct(condition, first, second):
+    assert (
+        first == 1 if condition else second == 2
+    )
+
+
+def split(condition, first, second):
+    assert (
+        first == 1
+        if condition
+        else second == 2
+    )
+    consume(first)
+
+
+def message(condition, first, second):
+    assert (
+        first == 1
+        if condition
+        else second == 2
+    ), "message"
+
+
+async def asynchronous(condition, first, second):
+    assert (
+        first == 1 if condition else second == 2
+    )
+
+
+def try_finally(condition, first, second):
+    try:
+        assert (
+            first == 1 if condition else second == 2
+        )
+    finally:
+        cleanup()
+
+
+def same_line_control(condition, first, second):
+    assert first == 1 if condition else second == 2
+
+
+def same_start_multiline_control(condition, first, second):
+    assert (first == 1
+            if condition
+            else second == 2)
+
+
+def ordinary_assert_control(first, second):
+    assert (
+        first == second
+    )
+
+
+def ordinary_if_control(condition, first, second):
+    if (
+        first == 1 if condition else second == 2
+    ):
+        consume(first)
+"#;
+        assert_matches_cpython_marshal(source, "assert_multiline_ifexp_exit_nops.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_loop_tail_assertion_conditional_expression_copies() {
+        let source = r"def sync_split(items, expected, first, second):
+    for item in items:
+        assert (
+            first(item)
+            if item == expected
+            else second(item)
+        )
+
+
+def sync_same_line(items, condition, first, second):
+    for item in items:
+        assert first(item) if condition else second(item)
+
+
+async def coroutine_split(wait, items, expected, first, second):
+    await wait()
+    for item in items:
+        assert (
+            first(item)
+            if item == expected
+            else second(item)
+        )
+
+
+def generator_split(items, expected, first, second):
+    yield first
+    for item in items:
+        assert (
+            first(item)
+            if item == expected
+            else second(item)
+        )
+
+
+def call_selector_non_tail_control(items, condition, first, second):
+    for item in items:
+        assert first(item) if condition(item) else second(item)
+        consume(item)
+
+
+def non_final_position_control(items, selected, expected, first, second):
+    for item in items:
+        if selected(item):
+            assert first(item) if item == expected else second(item)
+            consume(item)
+        else:
+            reject(item)
+";
+        assert_matches_cpython_marshal(source, "assert_loop_tail_ifexp_copies.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_terminal_negated_chained_comparison_exit_nops() {
         let source = r#"def direct_raise(low, value, high):
     if not (low <= value < high):

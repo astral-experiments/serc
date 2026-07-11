@@ -261,6 +261,10 @@ pub(super) struct ControlFlowState {
     pub(super) include_scoped_none_condition_owner: bool,
     // The final chained comparison whose fallthrough jump survives small-exit inlining as a NOP.
     pub(super) retained_chained_comparison_exit: Option<TextRange>,
+    // A direct conditional-expression assertion outside an iterator loop that begins below the
+    // `assert` keyword. CPython retains its first arm's fallthrough jump as a NOP when the
+    // assertion exit is inlined; iterator loops instead copy the complete failure block.
+    pub(super) retained_multiline_assert_ifexp_exit: Option<TextRange>,
     pub(super) exclude_condition_not_taken_from_all_exception_regions: bool,
     // CPython normalizes a loop-tail while condition through a fresh backward-jump block. Its
     // `NOT_TAKEN` slot therefore cannot inherit the compacted condition block's stale owner.
@@ -4071,6 +4075,59 @@ impl Compiler {
         Ok(())
     }
 
+    fn emit_assertion_failure(
+        &mut self,
+        statement: &ruff_python_ast::StmtAssert,
+    ) -> Result<(), CompileError> {
+        self.assembler
+            .set_location(self.source_location(statement.range));
+        self.emit_common_constant(CommonConstant::ASSERTIONERROR)?;
+        if let Some(message) = &statement.msg {
+            self.compile_expression(message)?;
+            self.assembler
+                .set_location(self.source_location(statement.range));
+            self.emit(CALL, 0, -1)?;
+        }
+        self.assembler
+            .set_location(self.source_location(statement.test.range()));
+        self.emit(RAISE_VARARGS, 1, -1)
+    }
+
+    fn compile_loop_tail_ifexp_assert(
+        &mut self,
+        statement: &ruff_python_ast::StmtAssert,
+        conditional: &ruff_python_ast::ExprIf,
+        restart: Label,
+    ) -> Result<(), CompileError> {
+        let base_depth = self.control.depth;
+        let copied_failure = self.assembler.label();
+        let otherwise = self.assembler.label();
+        let failure = self.assembler.label();
+
+        self.compile_jump_if(&conditional.test, false, otherwise)?;
+        self.compile_loop_tail_condition(&conditional.body, false, copied_failure, restart)?;
+
+        self.assembler.mark(copied_failure);
+        self.set_depth(base_depth);
+        if self.source_location(statement.range).line
+            != self.source_location(conditional.range).line
+        {
+            self.assembler
+                .set_location(self.source_location(conditional.body.range()));
+            self.emit(NOP, 0, 0)?;
+            self.assembler.preserve_last_nop();
+        }
+        self.emit_assertion_failure(statement)?;
+
+        self.assembler.mark(otherwise);
+        self.set_depth(base_depth);
+        self.compile_loop_tail_condition(&conditional.orelse, false, failure, restart)?;
+
+        self.assembler.mark(failure);
+        self.set_depth(base_depth);
+        self.emit_assertion_failure(statement)
+    }
+
     fn compile_loop_tail_assert(
         &mut self,
         statement: &ruff_python_ast::StmtAssert,
@@ -4078,6 +4135,25 @@ impl Compiler {
         non_final_branch: bool,
     ) -> Result<(), CompileError> {
         let base_depth = self.control.depth;
+        // CPython copies the failure block for these direct final loop branches. Keep call
+        // selectors and non-final branches on the generic lowering until their distinct layouts
+        // are modeled.
+        if !non_final_branch
+            && statement.msg.is_none()
+            && let Expr::If(conditional) = statement.test.as_ref()
+            && (matches!(conditional.test.as_ref(), Expr::Name(_))
+                || matches!(
+                    conditional.test.as_ref(),
+                    Expr::Compare(comparison) if comparison.ops.len() == 1
+                ))
+            && early_condition_truthiness(&conditional.test).is_none()
+            && early_condition_truthiness(&conditional.body).is_none()
+            && early_condition_truthiness(&conditional.orelse).is_none()
+            && condition_jump_target_count(&conditional.body, false) == 1
+            && condition_jump_target_count(&conditional.orelse, false) == 1
+        {
+            return self.compile_loop_tail_ifexp_assert(statement, conditional, restart);
+        }
         if non_final_branch
             && !self.has_active_control_flow_region()
             && condition_jump_target_count(&statement.test, false) == 1
@@ -5279,6 +5355,16 @@ impl Compiler {
         let preserve_iterator_loop_owner =
             self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) != 0
                 && self.control.first_iterator_loop_assertion == Some(statement.range);
+        let retained_multiline_assert_ifexp_exit = match statement.test.as_ref() {
+            Expr::If(conditional)
+                if !self.control.in_iterator_loop()
+                    && self.source_location(statement.range).line
+                        != self.source_location(conditional.range).line =>
+            {
+                Some(conditional.range)
+            }
+            _ => None,
+        };
         self.with_control_override(
             |control| &mut control.include_assert_none_condition_owner,
             include_none_owner,
@@ -5290,7 +5376,13 @@ impl Compiler {
                         compiler.with_control_override(
                             |control| &mut control.preserve_first_iterator_loop_assertion_owner,
                             preserve_iterator_loop_owner,
-                            |compiler| compiler.compile_jump_if(&statement.test, true, end),
+                            |compiler| {
+                                compiler.with_control_override(
+                                    |control| &mut control.retained_multiline_assert_ifexp_exit,
+                                    retained_multiline_assert_ifexp_exit,
+                                    |compiler| compiler.compile_jump_if(&statement.test, true, end),
+                                )
+                            },
                         )
                     },
                 )
