@@ -3686,6 +3686,64 @@ def nontrailing_control(mapping, key):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_multi_exit_handler_cleanup_boundaries() {
+        let cases = [
+            (
+                r"def following_continuation(var):
+    try:
+        return 1 / var.some_other_func()
+    except AttributeError:
+        if (message := var.get_message()):
+            pass
+    except ZeroDivisionError:
+        message = 'division by zero'
+    print(message)
+",
+                "following_handler_cleanup.py",
+            ),
+            (
+                r"def loop_tail_control(value, items):
+    for item in items:
+        try:
+            action(item)
+        except:
+            if True:
+                pass
+    consume(value)
+",
+                "loop_tail_handler_cleanup.py",
+            ),
+            (
+                r"def compound_arm_control(value, items):
+    try:
+        pass
+    except:
+        if True:
+            for item in items:
+                pass
+    value = None
+",
+                "compound_handler_cleanup.py",
+            ),
+            (
+                r"def assert_only_control(value):
+    try:
+        pass
+    except:
+        if True:
+            assert False
+    value = None
+",
+                "assert_handler_cleanup.py",
+            ),
+        ];
+
+        for (source, filename) in cases {
+            assert_matches_cpython_marshal(source, filename);
+        }
+    }
+
+    #[test]
     fn matches_cpython_none_condition_marker_owners_in_exception_handlers() {
         let source = r"def is_none(value):
     try:
