@@ -4892,7 +4892,10 @@ impl Compiler {
             .terminal_try_condition_exception_exclusion_depth;
         let exclude_normal_finally_not_taken_from_with = self.control.active_normal_finally_bodies
             > 0
-            && !self.control.active_with_region_exclusions.is_empty();
+            && !self.control.active_with_region_exclusions.is_empty()
+            && !self
+                .control
+                .include_simple_normal_finally_not_taken_from_with;
         if !self.control.exclude_terminal_if_not_taken
             && !self.control.exclude_condition_not_taken_from_exception
             && terminal_try_depth.is_none()
