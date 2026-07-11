@@ -2771,6 +2771,74 @@ def direct_return(outer):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_terminal_multi_with_exit_markers() {
+        let source = r"import dis
+
+def three_item_return(first, second, third):
+    with (
+        first,
+        second,
+        third,
+    ):
+        return action()
+
+def three_item_raise(first, second, third):
+    with (
+        first,
+        second,
+        third,
+    ):
+        raise Error
+
+def nested_multi(outer, first, second):
+    with outer:
+        with (
+            first,
+            second,
+        ):
+            return action()
+
+def nested_single(outer, inner):
+    with outer:
+        with inner:
+            return action()
+
+def nonterminal(first, second, third):
+    with (
+        first,
+        second,
+        third,
+    ):
+        action()
+    after()
+
+async def asynchronous_scope(first, second, third):
+    with (
+        first,
+        second,
+        third,
+    ):
+        return await action()
+
+def same_line(first, second):
+    with first, second:
+        return action()
+
+for function in (
+    three_item_return,
+    three_item_raise,
+    nested_multi,
+    nested_single,
+    nonterminal,
+    asynchronous_scope,
+    same_line,
+):
+    print(sum(instruction.opname == 'NOP' for instruction in dis.get_instructions(function)))
+";
+        assert_executes(source, "1\n1\n1\n1\n0\n1\n0\n");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_trailing_finally_exits_in_synchronous_with_bodies() {
         let source = r"def direct(manager):
     with manager:
