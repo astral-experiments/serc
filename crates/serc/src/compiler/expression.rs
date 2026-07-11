@@ -1929,6 +1929,23 @@ impl Compiler {
                         && !self.control.current_statement_has_following
                     {
                         ExceptionPolicy::normalized_owner(false)
+                    } else if !collect_tuple
+                        && in_inlined_comprehension
+                        && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                    {
+                        // CPython adds the optimized all()/any() dispatch guard's
+                        // NOT_TAKEN after exception owners are labeled. It keeps an
+                        // owner only when an earlier optimization in this exact CFG
+                        // block leaves a stale protected instruction slot for it to
+                        // reuse. Snapshot the emitted block here so a preceding
+                        // normalized branch cannot leak its vacancy into this guard.
+                        // Coroutine stop-iteration ownership follows a separate layout
+                        // path and remains on the default branch.
+                        if self.assembler.current_block_has_dynamic_exception_owner() {
+                            ExceptionPolicy::normalized_owner(true)
+                        } else {
+                            ExceptionPolicy::EXCLUDE_ALWAYS
+                        }
                     } else {
                         ExceptionPolicy::default()
                     }
