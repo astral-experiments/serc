@@ -3,8 +3,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use super::super::{
     BorrowFallthrough, COMPARE_OP, CONTAINS_OP, COPY, ExceptionExclusion, IS_OP, Instruction, Item,
     JUMP_BACKWARD, JUMP_BACKWARD_NO_INTERRUPT, JUMP_FORWARD, NOP, NOT_TAKEN, Operand,
-    POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE, POP_TOP, STORE_FAST, TO_BOOL, UNARY_NOT, ends_scope,
-    is_unconditional_jump,
+    POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE, POP_TOP, STORE_FAST, STORE_FAST_STORE_FAST, TO_BOOL,
+    UNARY_NOT, UNPACK_SEQUENCE, ends_scope, is_unconditional_jump,
 };
 use crate::assembler::OptimizationPipeline;
 use crate::assembler::block_graph::{BlockGraph, ItemMut, ItemPosition};
@@ -601,7 +601,14 @@ impl OptimizationPipeline {
                         }))
                     || instructions
                         .get(index + 1)
-                        .is_some_and(|(_, next)| next.location.line == instruction.location.line));
+                        .is_some_and(|(_, next)| next.location.line == instruction.location.line)
+                    // CPython deletes this traced rotation slot after applying an unpacked
+                    // pattern's stack permutation to its local capture stores.
+                    || (previous.is_some_and(|previous: Instruction| {
+                        previous.opcode == UNPACK_SEQUENCE
+                    }) && instructions.get(index + 1).is_some_and(|(_, next)| {
+                        matches!(next.opcode, STORE_FAST | STORE_FAST_STORE_FAST)
+                    })));
             if remove {
                 redundant.push(position);
             } else {

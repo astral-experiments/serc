@@ -246,6 +246,26 @@ def nested_local_capture(subject):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_unpacked_match_capture_swaps() {
+        let source = r"def nested_class(value):
+    match value:
+        case Attribute(value=Name(identifier), attribute=attribute):
+            return identifier, attribute
+        case _:
+            return None
+
+
+def paired_classes(value):
+    match value:
+        case (Left() as left, Right() as right):
+            return left, right
+        case _:
+            return None
+";
+        assert_matches_cpython_marshal(source, "unpacked_match_capture_swaps.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_match_success_next_locations() {
         let source = r"def tuple_result(subject):
     match subject:
