@@ -1467,6 +1467,81 @@ def negated_boolean_condition(manager, left, right):
 }
 
 #[test]
+fn copied_finally_exits_drop_simple_condition_nops() {
+    let source = r"def expression_compare(manager, flag):
+    with manager:
+        try:
+            work()
+        finally:
+            if flag is True:
+                cleanup()
+
+def assignment_compare(manager, flag):
+    with manager:
+        try:
+            value = work()
+        finally:
+            if flag is None:
+                cleanup()
+
+def assert_two_cleanups(manager, value):
+    with manager:
+        try:
+            assert value
+        finally:
+            if value is not None:
+                stop()
+                cleanup()
+
+def conditional_name(manager, flag, other):
+    with manager:
+        try:
+            if other:
+                work()
+        finally:
+            if flag:
+                cleanup()
+
+def loop_name(manager, flag, items):
+    with manager:
+        try:
+            for item in items:
+                work(item)
+        finally:
+            if flag:
+                cleanup()
+";
+    let parsed = parse_module(source).unwrap();
+    let module = module_compiler(source, &parsed)
+        .compile_module(parsed.suite())
+        .unwrap();
+
+    for (name, expected_nops) in [
+        ("expression_compare", 1),
+        ("assignment_compare", 1),
+        ("assert_two_cleanups", 2),
+        ("conditional_name", 1),
+        ("loop_name", 1),
+    ] {
+        let function = module
+            .constants
+            .iter()
+            .find_map(|constant| match constant {
+                Constant::Code(code) if code.name == name => Some(code),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("module should contain {name}"));
+        let nops = function
+            .bytecode
+            .chunks_exact(2)
+            .filter(|instruction| instruction[0] == NOP.code())
+            .count();
+
+        assert_eq!(nops, expected_nops, "unexpected NOP count for {name}");
+    }
+}
+
+#[test]
 fn comparison_markers_distinguish_forward_and_threaded_loop_fallthroughs() {
     fn read_exception_varint(table: &[u8], index: &mut usize) -> u32 {
         let mut byte = table[*index];

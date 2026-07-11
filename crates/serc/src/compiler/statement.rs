@@ -7528,16 +7528,28 @@ impl Compiler {
     ) -> Result<(), CompileError> {
         let preserve_exit_nop = std::mem::take(&mut self.control.preserve_next_finally_exit_nop);
         let drop_expression_if_exit_nop = preserve_exit_nop
-            && matches!(statement.body.last(), Some(Stmt::Assert(_)))
+            && statement.handlers.is_empty()
+            && !matches!(statement.body.last(), Some(Stmt::While(_)))
+            && statement
+                .body
+                .last()
+                .is_none_or(|statement| match statement {
+                    Stmt::Try(nested) => {
+                        !nested.handlers.is_empty()
+                            && nested.handlers.iter().all(|handler| {
+                                handler.as_except_handler().is_some_and(|handler| {
+                                    matches!(handler.body.as_slice(), [Stmt::Pass(_)])
+                                })
+                            })
+                    }
+                    _ => true,
+                })
             && matches!(
                 statement.finalbody.last(),
                 Some(Stmt::If(tail))
                     if tail.elif_else_clauses.is_empty()
-                        && matches!(
-                            tail.test.as_ref(),
-                            Expr::Name(_) | Expr::Attribute(_) | Expr::Call(_)
-                        )
-                        && matches!(tail.body.as_slice(), [Stmt::Expr(_)])
+                        && condition_jump_target_count(&tail.test, false) == 1
+                        && matches!(tail.body.last(), Some(Stmt::Expr(_)))
             );
 
         if statement.handlers.is_empty()
@@ -7907,6 +7919,7 @@ impl Compiler {
                 // Keep the normal-finally exit through CPython's exit-copy pass, then remove it
                 // instead of retaining the redundant jump as a source-position NOP.
                 self.assembler.defer_last_jump_removal();
+                self.assembler.mark_last_borrow_empty_block();
             } else if preserve_exit_nop {
                 self.assembler
                     .preserve_last_redundant_jump_nop_after_threading();

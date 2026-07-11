@@ -2924,6 +2924,26 @@ def call_fallthrough(manager, resource):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_copied_expression_finally_exits() {
+        let source = r"def expression_compare(manager, flag):
+    with manager:
+        try:
+            work()
+        finally:
+            if flag is True:
+                cleanup()
+
+def retained_unconditional(manager):
+    with manager:
+        try:
+            work()
+        finally:
+            cleanup()
+";
+        assert_matches_cpython_marshal(source, "with_copied_expression_finally.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_tail_assert_finally_pop_block_ownership() {
         let source = r"def with_owner(manager, condition):
     with manager:
