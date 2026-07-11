@@ -244,6 +244,7 @@ pub(super) struct ControlFlowState {
     // CPython's normalized `NOT_TAKEN` can reuse a normal-finally CFG slot that still owns the
     // coroutine stop-iteration handler.
     pub(super) active_normal_finally_bodies: usize,
+    pub(super) include_simple_normal_finally_not_taken_from_with: bool,
     pub(super) active_finally_end_blocks: usize,
     // Set while compiling a condition introduced by exceptional-finally lowering.
     pub(super) exceptional_finally_condition: bool,
@@ -3671,6 +3672,11 @@ impl Compiler {
                                     .elif_else_clauses
                                     .last()
                                     .is_some_and(|clause| clause.test.is_none()))
+                            || (!self.control.active_exception_region_exclusions.is_empty()
+                                && matches!(nested.body.last(), Some(Stmt::Assign(_)))
+                                && nested.elif_else_clauses.iter().all(|clause| {
+                                    matches!(clause.body.last(), Some(Stmt::Assign(_)))
+                                }))
                         {
                             self.assembler
                                 .preserve_last_redundant_jump_nop_after_threading();
@@ -7930,9 +7936,24 @@ impl Compiler {
                     }
                 }
             } else {
-                compiler.with_control_counter(
-                    |control| &mut control.active_normal_finally_bodies,
-                    |compiler| compiler.compile_suite_inner(&statement.finalbody, terminal),
+                let include_simple_normal_finally_not_taken_from_with = matches!(
+                    statement.finalbody.as_slice(),
+                    [Stmt::If(tail)]
+                        if tail.elif_else_clauses.is_empty()
+                            && statement.handlers.is_empty()
+                            && matches!(tail.test.as_ref(), Expr::Name(_))
+                            && matches!(tail.body.as_slice(), [Stmt::Expr(_)])
+                            && !matches!(statement.body.last(), Some(Stmt::Assert(_)))
+                );
+                compiler.with_control_override(
+                    |control| &mut control.include_simple_normal_finally_not_taken_from_with,
+                    include_simple_normal_finally_not_taken_from_with,
+                    |compiler| {
+                        compiler.with_control_counter(
+                            |control| &mut control.active_normal_finally_bodies,
+                            |compiler| compiler.compile_suite_inner(&statement.finalbody, terminal),
+                        )
+                    },
                 )?;
             }
             Ok(())
