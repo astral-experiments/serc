@@ -4832,6 +4832,78 @@ def outside_comprehension(values):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_optimized_boolean_dispatch_guard_owners() {
+        let cases = [
+            (
+                "optimized_boolean_guard_store_fusion.py",
+                r"def protected_by_target_store_fusion(items):
+    return [
+        (left, right)
+        for left, right in items
+        if any(value for value in right)
+    ]
+",
+            ),
+            (
+                "optimized_boolean_guard_prior_call.py",
+                r"def protected_by_prior_call(groups):
+    return [
+        (probe(group), any(value for value in group))
+        for group in groups
+    ]
+",
+            ),
+            (
+                "optimized_boolean_guard_filter.py",
+                r"def simple_filter(groups):
+    return [group for group in groups if any(value for value in group)]
+",
+            ),
+            (
+                "optimized_boolean_guard_captured_target.py",
+                r"def captured_target(items, predicate):
+    return [
+        (left, right)
+        for left, right in items
+        if all(predicate(right, value) for value in right)
+    ]
+",
+            ),
+            (
+                "optimized_boolean_guard_element.py",
+                r"def comprehension_element(groups):
+    return [any(value for value in group) for group in groups]
+",
+            ),
+            (
+                "optimized_boolean_guard_later_iterable.py",
+                r"def later_iterable(groups):
+    return [
+        value
+        for group in groups
+        for value in any(item for item in group)
+    ]
+",
+            ),
+            (
+                "optimized_boolean_guard_after_condition.py",
+                r"def after_condition(groups):
+    return [
+        group
+        for group in groups
+        if probe(group)
+        if any(value for value in group)
+    ]
+",
+            ),
+        ];
+
+        for (filename, source) in cases {
+            assert_matches_cpython_marshal(source, filename);
+        }
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_optimized_tuple_calls_in_comprehension_and_branch_exits() {
         let source = r"def comprehension_result(prefix, sizes, dimensions):
     return [prefix + tuple(sizes[dimension] for dimension in core_dimensions)
