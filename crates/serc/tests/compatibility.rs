@@ -2259,6 +2259,52 @@ def enclosing_try_control(manager):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_multiline_nested_with_terminal_try_exits() {
+        let source = r"def else_path(outer):
+    with (
+        outer() as value,
+        value.span,
+    ):
+        try:
+            result = action()
+        except Error:
+            raise
+        else:
+            return result
+
+
+def fallthrough_handler(outer):
+    with (
+        outer() as value,
+        value.span,
+    ):
+        try:
+            action()
+        except Error:
+            recover()
+
+
+def same_line_terminal(outer):
+    with outer() as value, value.span:
+        try:
+            result = action()
+        except Error:
+            raise
+        else:
+            return result
+
+
+def direct_return(outer):
+    with (
+        outer() as value,
+        value.span,
+    ):
+        return action()
+";
+        assert_matches_cpython_marshal(source, "nested_with_terminal_try_exit.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_trailing_finally_exits_in_synchronous_with_bodies() {
         let source = r"def direct(manager):
     with manager:
