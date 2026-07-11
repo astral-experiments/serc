@@ -281,6 +281,51 @@ def nested_match(subject, nested):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_constant_default_tuple_folding_boundary() {
+        fn defaults(count: usize, dynamic_last: bool) -> String {
+            (0..count)
+                .map(|index| {
+                    let value = if dynamic_last && index + 1 == count {
+                        "dynamic"
+                    } else {
+                        "None"
+                    };
+                    format!("arg{index}={value}")
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+
+        let mut source = String::new();
+        for (name, count, dynamic_last) in [
+            ("folded_function", 30, false),
+            ("unfolded_function", 31, false),
+            ("mixed_function", 30, true),
+        ] {
+            writeln!(
+                source,
+                "def {name}({}):\n    return None\n",
+                defaults(count, dynamic_last)
+            )
+            .unwrap();
+        }
+        for (name, count, dynamic_last) in [
+            ("folded_lambda", 30, false),
+            ("unfolded_lambda", 31, false),
+            ("mixed_lambda", 31, true),
+        ] {
+            writeln!(
+                source,
+                "{name} = lambda {}: None",
+                defaults(count, dynamic_last)
+            )
+            .unwrap();
+        }
+
+        assert_matches_cpython_marshal(&source, "large_constant_defaults.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_nested_generic_class_scopes() {
         let source = "class Outer[T]:\n    class Inner:\n        function = lambda: None\n        values = (value for value in ())\n\n        def method(self, value: T) -> T:\n            return value\n\n        def generic[U](self, value: U) -> U:\n            return value\n";
         assert_matches_cpython_marshal(source, "nested_generic.py");

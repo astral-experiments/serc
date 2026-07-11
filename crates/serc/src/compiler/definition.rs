@@ -33,7 +33,7 @@ use super::scope::{
 use super::source::unparse_annotation;
 use super::statement::suite_contains_yield;
 use super::symbol::{ComparisonMode, to_u32, unsupported};
-use super::{Compiler, SUPPORTED_FUTURE_FLAGS, Scope};
+use super::{CPYTHON_STACK_USE_GUIDELINE, Compiler, SUPPORTED_FUTURE_FLAGS, Scope};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DefinitionDecorators {
@@ -540,11 +540,15 @@ impl Compiler {
             .filter_map(|parameter| parameter.default.as_deref())
             .collect();
         if !positional_defaults.is_empty() {
-            if let Some(defaults) = positional_defaults
-                .iter()
-                .map(|default| fold_constant(default))
-                .collect::<Option<Vec<_>>>()
-            {
+            let folded_defaults = if positional_defaults.len() <= CPYTHON_STACK_USE_GUIDELINE {
+                positional_defaults
+                    .iter()
+                    .map(|default| fold_constant(default))
+                    .collect::<Option<Vec<_>>>()
+            } else {
+                None
+            };
+            if let Some(defaults) = folded_defaults {
                 let hidden_owner_slots = positional_defaults
                     .iter()
                     .fold(positional_defaults.len(), |slots, default| {
