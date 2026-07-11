@@ -777,6 +777,10 @@ impl Assembler {
         Some((instruction.location, exclusion))
     }
 
+    pub(crate) fn has_exception_regions(&self) -> bool {
+        !self.exception_regions.is_empty()
+    }
+
     pub(crate) fn add_exception_region(
         &mut self,
         start: Label,
