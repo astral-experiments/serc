@@ -75,5 +75,44 @@ class ReadInputsTest(unittest.TestCase):
             self.assertEqual(git(checkout, "status", "--short"), f" M {dirty_input}")
 
 
+class RenderPreinternedLookupTest(unittest.TestCase):
+    def test_escapes_rust_string_literals(self) -> None:
+        self.assertEqual(
+            generator.rust_string_literal('quote" slash\\ \n\r\t\0 ☃\x01\x7f'),
+            '"quote\\" slash\\\\ \\n\\r\\t\\0 ☃\\x01\\x7f"',
+        )
+
+    def test_renders_exact_prefix_ranges_and_startup_candidates(self) -> None:
+        self.assertEqual(
+            generator.render_preinterned_lookup(
+                ["", "a", "alpha", "alpine", "beta"],
+                ("500", "albatross", "ascii"),
+            ),
+            [
+                "pub(crate) fn is_preinterned_string(value: &str) -> bool {",
+                "    let prefix = match value.as_bytes() {",
+                "        [] => return true,",
+                "        [first] => u16::from(*first) << 8,",
+                "        [first, second, ..] => u16::from_be_bytes([*first, *second]),",
+                "    };",
+                "    let (start, end) = match prefix {",
+                '        0x3530 => return value == "500",',
+                "        0x6100 => (1, 2),",
+                "        0x616c => {",
+                '            if value == "albatross" {',
+                "                return true;",
+                "            }",
+                "            (2, 4)",
+                "        }",
+                '        0x6173 => return value == "ascii",',
+                "        0x6265 => (4, 5),",
+                "        _ => return false,",
+                "    };",
+                "    PREINTERNED_STRINGS[start..end].binary_search(&value).is_ok()",
+                "}",
+            ],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -35,6 +35,18 @@ MARSHAL_INPUTS = (
     "Include/marshal.h",
     "Python/marshal.c",
 )
+# These mortal strings enter the intern table during isolated CPython startup, before the
+# compatibility oracle calls compile(). They are not part of the pinned static metadata.
+STARTUP_INTERNED_STRINGS = (
+    "500",
+    "ascii",
+    "darwin",
+    "kwargs",
+    "l1",
+    "l2",
+    "update",
+    "win32",
+)
 CRATE_ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = CRATE_ROOT / "src" / "target" / "cpython_3_14_5.rs"
 MARSHAL_OUTPUT = CRATE_ROOT / "src" / "marshal" / "v5.rs"
@@ -132,6 +144,96 @@ def parse_preinterned_strings(source: str) -> list[str]:
     if not required.issubset(strings):
         raise ValueError("pre-interned string table is incomplete")
     return sorted(strings)
+
+
+def rust_string_literal(value: str) -> str:
+    escaped = []
+    for character in value:
+        match character:
+            case "\\":
+                escaped.append("\\\\")
+            case '"':
+                escaped.append('\\"')
+            case "\0":
+                escaped.append("\\0")
+            case "\n":
+                escaped.append("\\n")
+            case "\r":
+                escaped.append("\\r")
+            case "\t":
+                escaped.append("\\t")
+            case _ if ord(character) < 0x20 or ord(character) == 0x7F:
+                escaped.append(f"\\x{ord(character):02x}")
+            case _:
+                escaped.append(character)
+    return f'"{"".join(escaped)}"'
+
+
+def render_preinterned_lookup(
+    preinterned_strings: list[str], startup_strings: tuple[str, ...]
+) -> list[str]:
+    def prefix(value: str) -> int:
+        encoded = value.encode()
+        return (encoded[0] << 8) | (encoded[1] if len(encoded) > 1 else 0)
+
+    ranges: dict[int, tuple[int, int]] = {}
+    for index, value in enumerate(preinterned_strings):
+        if not value:
+            continue
+        key = prefix(value)
+        if key in ranges:
+            start, end = ranges[key]
+            if end != index:
+                raise ValueError("preinterned prefix ranges are not contiguous")
+            ranges[key] = (start, index + 1)
+        else:
+            ranges[key] = (index, index + 1)
+
+    startup: dict[int, list[str]] = {}
+    for value in startup_strings:
+        if value and value not in preinterned_strings:
+            startup.setdefault(prefix(value), []).append(value)
+
+    lines = [
+        "pub(crate) fn is_preinterned_string(value: &str) -> bool {",
+        "    let prefix = match value.as_bytes() {",
+        f"        [] => return {str('' in preinterned_strings or '' in startup_strings).lower()},",
+        "        [first] => u16::from(*first) << 8,",
+        "        [first, second, ..] => u16::from_be_bytes([*first, *second]),",
+        "    };",
+        "    let (start, end) = match prefix {",
+    ]
+    for key in sorted(ranges.keys() | startup.keys()):
+        candidates = startup.get(key, [])
+        condition = " || ".join(
+            f"value == {rust_string_literal(value)}" for value in candidates
+        )
+        if key not in ranges:
+            lines.append(f"        0x{key:04x} => return {condition},")
+            continue
+        start, end = ranges[key]
+        if not candidates:
+            lines.append(f"        0x{key:04x} => ({start}, {end}),")
+            continue
+        lines.extend(
+            [
+                f"        0x{key:04x} => {{",
+                f"            if {condition} {{",
+                "                return true;",
+                "            }",
+                f"            ({start}, {end})",
+                "        }",
+            ]
+        )
+    lines.extend(
+        [
+            "        _ => return false,",
+            "    };",
+            "    PREINTERNED_STRINGS[start..end].binary_search(&value).is_ok()",
+            "}",
+        ]
+    )
+    return lines
 
 
 def parse_opcodes(source: str) -> list[tuple[str, int]]:
@@ -598,19 +700,10 @@ def render(sources: dict[str, str]) -> str:
             f"    pub(crate) const {name}: Opcode = Opcode::new({code}, {caches.get(name, 0)});"
         )
     lines.extend(["}", "", "pub(crate) static PREINTERNED_STRINGS: &[&str] = &["])
-    lines.extend(f'    "{value}",' for value in preinterned_strings)
-    lines.extend(
-        [
-            "];",
-            "",
-            "pub(crate) fn is_preinterned_string(value: &str) -> bool {",
-            "    PREINTERNED_STRINGS.binary_search(&value).is_ok()",
-            "}",
-            "",
-            "#[allow(dead_code)]",
-            "impl Opcode {",
-        ]
-    )
+    lines.extend(f"    {rust_string_literal(value)}," for value in preinterned_strings)
+    lines.extend(["];", ""])
+    lines.extend(render_preinterned_lookup(preinterned_strings, STARTUP_INTERNED_STRINGS))
+    lines.extend(["", "#[allow(dead_code)]", "impl Opcode {"])
     for method, flag in (
         ("has_argument", "HAS_ARG_FLAG"),
         ("has_constant", "HAS_CONST_FLAG"),

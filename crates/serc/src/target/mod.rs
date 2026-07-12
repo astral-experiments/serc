@@ -8,19 +8,9 @@ pub(crate) use cpython_3_14_5::opcodes;
 pub(crate) use cpython_3_14_5::operands;
 pub(crate) use cpython_3_14_5::{
     TARGET_COMMIT, TARGET_IMPLEMENTATION, TARGET_MAGIC_NUMBER, TARGET_TAG, TARGET_VERSION,
-    is_conditional_jump, is_scope_exit, is_unconditional_jump, num_popped, num_pushed,
+    is_conditional_jump, is_preinterned_string, is_scope_exit, is_unconditional_jump, num_popped,
+    num_pushed,
 };
-
-// Unlike the generated static table, these mortal strings enter the intern table during
-// isolated CPython startup, before the compatibility oracle calls compile().
-const STARTUP_INTERNED_STRINGS: &[&str] = &[
-    "500", "ascii", "darwin", "kwargs", "l1", "l2", "update", "win32",
-];
-
-pub(crate) fn is_preinterned_string(value: &str) -> bool {
-    cpython_3_14_5::is_preinterned_string(value)
-        || STARTUP_INTERNED_STRINGS.binary_search(&value).is_ok()
-}
 
 /// An opcode and its inline-cache width for the selected CPython target.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -41,5 +31,52 @@ impl Opcode {
 
     pub(crate) const fn caches(self) -> u8 {
         self.caches
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cpython_3_14_5::PREINTERNED_STRINGS;
+    use super::is_preinterned_string;
+
+    #[test]
+    fn preinterned_lookup_preserves_exact_membership() {
+        assert!(
+            PREINTERNED_STRINGS
+                .windows(2)
+                .all(|values| values[0] < values[1])
+        );
+        for value in PREINTERNED_STRINGS {
+            assert!(
+                is_preinterned_string(value),
+                "missing preinterned string {value:?}"
+            );
+        }
+        for value in [
+            "500", "ascii", "darwin", "kwargs", "l1", "l2", "update", "win32",
+        ] {
+            assert!(
+                is_preinterned_string(value),
+                "missing startup string {value:?}"
+            );
+        }
+        for value in [
+            "a",
+            "5",
+            "50",
+            "5000",
+            "al",
+            "alpha",
+            "ascii_",
+            "identifier",
+            "sort0",
+            "__not_preinterned__",
+            "méthode",
+        ] {
+            assert!(
+                !is_preinterned_string(value),
+                "unexpected preinterned string {value:?}"
+            );
+        }
     }
 }
