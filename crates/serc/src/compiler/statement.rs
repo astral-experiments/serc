@@ -3549,6 +3549,30 @@ impl Compiler {
                                 && handler.name.is_none()
                                 && handler.leading_statement == Some(statement.range)
                         });
+                // The first return arm of a direct try inside a constant-true while leaves its
+                // condition marker outside the handler range, like the following return.
+                let exclude_direct_try_while_return_marker = branch_index == 0
+                    && branch_count == 1
+                    && matches!(self.unit.scope, Scope::Function { .. })
+                    && self.control.current_statement_followed_by_return_or_raise
+                    && self.control.loops.len() == 1
+                    && !self.control.in_iterator_loop()
+                    && self.control.active_exception_region_exclusions.len() == 1
+                    && self.control.active_with_region_exclusions.is_empty()
+                    && self.control.active_normal_finally_bodies == 0
+                    && self.control.active_finally_try_bodies == 0
+                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                    && !self.control.in_exception_handler()
+                    && matches!(test, Expr::Name(_))
+                    && matches!(
+                        body,
+                        [Stmt::Return(statement)]
+                            if matches!(statement.value.as_deref(), Some(Expr::Call(_)))
+                    )
+                    && self
+                        .control
+                        .direct_try_body_statements
+                        .contains(&statement.range);
                 let previous_forced_borrowed_loads = exclude_normal_finally_short_circuit
                     .then(|| self.assembler.set_forced_borrowed_loads(true));
                 let compile_condition = self.with_control_override(
@@ -3568,7 +3592,8 @@ impl Compiler {
                                             include_scoped_none_condition_owner,
                                             |compiler| {
                                                 let exclude_condition = compiler.control.exclude_condition_not_taken_from_exception
-                                                    || exclude_later_handler_leading_marker;
+                                                    || exclude_later_handler_leading_marker
+                                                    || exclude_direct_try_while_return_marker;
                                                 compiler.with_control_override(
                                                     |control| &mut control.exclude_condition_not_taken_from_exception,
                                                     exclude_condition,
@@ -4749,6 +4774,47 @@ impl Compiler {
                     },
                 )?;
                 if preserve_first_sync_iterator_owner {
+                    self.assembler.preserve_last_not_taken_exception_owner();
+                }
+                if branch_index == 0
+                    && matches!(self.unit.scope, Scope::Module)
+                    && branch_count == 2
+                    && has_else
+                    && leading.is_empty()
+                    && !try_body_normal_exit
+                    && !non_final_branch
+                    && self.control.in_first_unnamed_exception_handler()
+                    && self.control.in_iterator_loop()
+                    && self.control.active_with_region_exclusions.is_empty()
+                    && self.control.active_normal_finally_bodies == 0
+                    && matches!(
+                        test,
+                        Expr::Call(call)
+                            if call.arguments.args.is_empty()
+                                && call.arguments.keywords.is_empty()
+                                && matches!(
+                                    call.func.as_ref(),
+                                    Expr::Attribute(attribute)
+                                        if matches!(attribute.value.as_ref(), Expr::Name(_))
+                                )
+                    )
+                    && matches!(
+                        body,
+                        [Stmt::Expr(expression)]
+                            if matches!(expression.value.as_ref(), Expr::Call(_))
+                    )
+                    && matches!(
+                        statement.elif_else_clauses.as_slice(),
+                        [clause]
+                            if clause.test.is_none()
+                                && matches!(
+                                    clause.body.as_slice(),
+                                    [Stmt::Expr(expression)]
+                                        if matches!(expression.value.as_ref(), Expr::Call(_))
+                                )
+                    )
+                {
+                    // A module-level handler loop retains its owner on the first condition marker.
                     self.assembler.preserve_last_not_taken_exception_owner();
                 }
                 if branch_index == 0
