@@ -6062,8 +6062,14 @@ impl Compiler {
                         condition_jump_target_count(test, false) > 1
                     })
             );
-        let include_try_none_condition_owner =
-            self.control.include_assert_none_condition_owner || unlocated_conditional_exit;
+        let include_try_none_condition_owner = self.control.include_assert_none_condition_owner
+            || unlocated_conditional_exit
+            || (matches!(self.unit.scope, Scope::Function { .. })
+                && self.control.generator_region_start.is_none()
+                && self.control.loops.is_empty()
+                && self.control.active_with_region_exclusions.is_empty()
+                && self.control.active_exception_region_exclusions.len() == 1
+                && try_body_preserves_attribute_none_condition_owner(statement));
         let ownerless_handler_assignment_branch = if statement.orelse.is_empty()
             && let [Stmt::If(branch)] = statement.body.as_slice()
             && is_assignment_pair_branch(branch)
@@ -6132,12 +6138,18 @@ impl Compiler {
                 let exception_region_depth = self.control.active_exception_region_exclusions.len();
                 let ((), emitted) = self.with_try_body_context(statement, |compiler| {
                     compiler.with_control_override(
-                        |control| &mut control.implicit_return_exception_exclusion_depth,
-                        Some(exception_region_depth),
+                        |control| &mut control.include_assert_none_condition_owner,
+                        include_try_none_condition_owner,
                         |compiler| {
-                            compiler.with_fallthrough_tracking(|compiler| {
-                                compiler.compile_suite_inner(&statement.body, true)
-                            })
+                            compiler.with_control_override(
+                                |control| &mut control.implicit_return_exception_exclusion_depth,
+                                Some(exception_region_depth),
+                                |compiler| {
+                                    compiler.with_fallthrough_tracking(|compiler| {
+                                        compiler.compile_suite_inner(&statement.body, true)
+                                    })
+                                },
+                            )
                         },
                     )
                 })?;
@@ -10065,6 +10077,33 @@ fn is_specialized_none_condition(test: &Expr) -> bool {
                 && matches!(comparison.comparators[0], Expr::NoneLiteral(_))
                 && matches!(comparison.ops[0], CmpOp::Is | CmpOp::IsNot)
     )
+}
+
+fn try_body_preserves_attribute_none_condition_owner(statement: &ruff_python_ast::StmtTry) -> bool {
+    statement.orelse.is_empty()
+        && statement.finalbody.is_empty()
+        && matches!(statement.handlers.as_slice(), [handler]
+            if handler.as_except_handler().is_some_and(|handler| handler.name.is_none()))
+        && matches!(statement.body.as_slice(),
+            [Stmt::Assign(first), Stmt::Assign(second), Stmt::If(branch)]
+                if matches!(first.targets.as_slice(), [Expr::Name(_)])
+                    && matches!(first.value.as_ref(), Expr::If(conditional)
+                        if matches!(conditional.test.as_ref(), Expr::Call(_))
+                            && matches!(conditional.body.as_ref(), Expr::Name(_))
+                            && matches!(conditional.orelse.as_ref(), Expr::Name(_)))
+                    && matches!(second.targets.as_slice(), [Expr::Name(target)]
+                        if matches!(second.value.as_ref(), Expr::Call(call)
+                            if matches!(call.func.as_ref(), Expr::Attribute(_)))
+                            && matches!(branch.test.as_ref(), Expr::Compare(comparison)
+                                if comparison.ops.len() == 1
+                                    && comparison.ops[0] == CmpOp::IsNot
+                                    && matches!(comparison.left.as_ref(), Expr::Name(name)
+                                        if name.id == target.id)
+                                    && matches!(comparison.comparators.as_ref(), [Expr::NoneLiteral(_)])))
+                    && branch.elif_else_clauses.is_empty()
+                    && matches!(branch.body.as_slice(), [Stmt::Expr(expression)]
+                        if matches!(expression.value.as_ref(), Expr::Call(_)))
+        )
 }
 
 fn is_later_bare_raise_fallback_if(statement: &ruff_python_ast::StmtIf) -> bool {
