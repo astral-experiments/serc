@@ -4896,6 +4896,14 @@ impl Compiler {
             && !self
                 .control
                 .include_simple_normal_finally_not_taken_from_with;
+        if self.control.force_terminal_with_marker_ownerless {
+            return self.emit_with_exception_policy(
+                NOT_TAKEN,
+                0,
+                0,
+                ExceptionPolicy::EXCLUDE_ALWAYS,
+            );
+        }
         if !self.control.exclude_terminal_if_not_taken
             && !self.control.exclude_condition_not_taken_from_exception
             && terminal_try_depth.is_none()
