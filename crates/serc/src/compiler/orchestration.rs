@@ -635,6 +635,10 @@ impl Compiler {
             let index = self.add_constant(constant)?;
             self.assembler.patch_argument(instruction, index)?;
         }
+        if self.output.has_deferred_break_none {
+            let none = self.add_constant(Constant::None)?;
+            self.assembler.set_deferred_none_constant_index(none);
+        }
         if add_implicit_return {
             let none = self.add_constant(Constant::None)?;
             self.emit(LOAD_CONST, none, 1)?;

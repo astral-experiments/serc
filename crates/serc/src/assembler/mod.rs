@@ -1024,6 +1024,7 @@ impl Assembler {
     }
 
     pub(crate) fn remap_constant_indices(&mut self, load_const: Opcode, index_map: &[Option<u32>]) {
+        let deferred_none = self.deferred_none_constant_index;
         let remap = |instruction: &mut Instruction| {
             if instruction.opcode != load_const {
                 return;
@@ -1031,6 +1032,14 @@ impl Assembler {
             let Operand::Value(index) = &mut instruction.operand else {
                 unreachable!("LOAD_CONST has a jump operand");
             };
+            if *index == u32::MAX {
+                let old_index = usize::try_from(
+                    deferred_none.expect("deferred None constant should be resolved"),
+                )
+                .expect("constant index should fit in usize");
+                *index = index_map[old_index].expect("deferred None constant should be retained");
+                return;
+            }
             if let Some(new_index) = index_map[usize::try_from(*index).unwrap()] {
                 *index = new_index;
             }
@@ -1045,6 +1054,14 @@ impl Assembler {
             }
             UnoptimizedCode::Prepared(graph) => graph.for_each_instruction_mut(remap),
         }
+    }
+
+    pub(crate) const fn deferred_none_constant_index(&self) -> Option<u32> {
+        self.deferred_none_constant_index
+    }
+
+    pub(crate) fn set_deferred_none_constant_index(&mut self, index: u32) {
+        self.deferred_none_constant_index = Some(index);
     }
 
     /// Removes a side-effect-free constant whose value is immediately discarded.

@@ -2465,7 +2465,13 @@ impl Compiler {
                     IteratorCleanup::Async => self.emit(POP_TOP, 0, -1)?,
                 }
                 if context.break_policy.returns() {
-                    self.emit_implicit_return()?;
+                    if self.unit.flags & CO_GENERATOR != 0 {
+                        self.output.has_deferred_break_none = true;
+                        self.emit(LOAD_CONST, u32::MAX, 1)?;
+                        self.emit(RETURN_VALUE, 0, -1)?;
+                    } else {
+                        self.emit_implicit_return()?;
+                    }
                 } else {
                     let jump_exclusion_start =
                         (self.control.active_exception_region_exclusions.len()

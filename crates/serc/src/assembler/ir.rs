@@ -723,6 +723,7 @@ pub(super) enum UnoptimizedCode {
 pub(crate) struct Assembler {
     pub(super) code: UnoptimizedCode,
     pub(super) operand_patches: Vec<OperandPatch>,
+    pub(super) deferred_none_constant_index: Option<u32>,
     pub(super) next_label: u32,
     pub(super) location: SourceLocation,
     pub(super) exception_regions: Vec<ExceptionRegion>,
@@ -798,6 +799,7 @@ impl Default for Assembler {
         Self {
             code: UnoptimizedCode::Linear(Vec::new()),
             operand_patches: Vec::new(),
+            deferred_none_constant_index: None,
             next_label: 0,
             location: SourceLocation::NONE,
             exception_regions: Vec::new(),

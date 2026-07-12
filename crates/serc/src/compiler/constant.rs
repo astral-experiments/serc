@@ -68,6 +68,7 @@ impl ConstantPool {
 #[derive(Debug, Default)]
 pub(super) struct OutputState {
     pub(super) constants: ConstantPool,
+    pub(super) has_deferred_break_none: bool,
     pub(super) deferred_constants_before_return: Vec<(OperandPatchId, Constant)>,
     pub(super) deferred_constants: Vec<(Option<OperandPatchId>, Constant)>,
     pub(super) deferred_names: Vec<(OperandPatchId, String)>,
@@ -278,9 +279,12 @@ impl Compiler {
     }
 
     pub(super) fn remove_unused_constants(&mut self) -> Result<(), CompileError> {
-        let used = self
+        let mut used = self
             .assembler
             .used_constant_indices(LOAD_CONST, self.output.constants.len());
+        if let Some(index) = self.assembler.deferred_none_constant_index() {
+            used[usize::try_from(index).expect("constant index should fit in usize")] = true;
+        }
         let index_map = self.output.constants.retain_used(&used)?;
         self.assembler
             .remap_constant_indices(LOAD_CONST, &index_map);
