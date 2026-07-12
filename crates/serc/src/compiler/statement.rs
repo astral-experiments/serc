@@ -6291,7 +6291,55 @@ impl Compiler<'_> {
                                                     &mut control.ownerless_handler_assignment_branch
                                                 },
                                                 ownerless_handler_assignment_branch,
-                                                |compiler| compiler.compile_suite(&statement.body),
+                                                |compiler| {
+                                                    if pass_only_handlers
+                                                        && statement.handlers.len() == 1
+                                                        && statement.body.len() == 4
+                                                        && matches!(compiler.unit.scope, Scope::Function { .. })
+                                                        && compiler.control.active_exception_region_exclusions.len() == 1
+                                                        && compiler.control.active_with_region_exclusions.is_empty()
+                                                        && compiler.control.active_normal_finally_bodies == 0
+                                                        && compiler.control.active_finally_try_bodies == 0
+                                                        && compiler.control.loops.is_empty()
+                                                        && compiler.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                                                        && is_direct_try_tuple_unpack_return(statement)
+                                                    {
+                                                        // CPython leaves the first early-return condition marker
+                                                        // outside this handler range, but keeps the later one.
+                                                        let [first, condition, tail @ ..] = statement.body.as_slice() else {
+                                                            unreachable!();
+                                                        };
+                                                        compiler.with_control_override(
+                                                            |control| &mut control.current_statement_has_following,
+                                                            true,
+                                                            |compiler| compiler.compile_statement(first),
+                                                        )?;
+                                                        compiler.with_control_override(
+                                                            |control| &mut control.current_statement_has_following,
+                                                            true,
+                                                            |compiler| compiler.with_control_override(
+                                                                |control| &mut control.current_statement_followed_by_name_return,
+                                                                false,
+                                                                |compiler| compiler.with_control_override(
+                                                                    |control| &mut control.current_statement_followed_by_return_or_raise,
+                                                                    false,
+                                                                    |compiler| compiler.with_control_override(
+                                                                        |control| &mut control.current_statement_propagates_following_to_suites,
+                                                                        true,
+                                                                        |compiler| compiler.with_control_override(
+                                                                            |control| &mut control.exclude_condition_not_taken_from_exception,
+                                                                            true,
+                                                                            |compiler| compiler.compile_statement(condition),
+                                                                        ),
+                                                                    ),
+                                                                ),
+                                                            ),
+                                                        )?;
+                                                        compiler.compile_suite(tail)
+                                                    } else {
+                                                        compiler.compile_suite(&statement.body)
+                                                    }
+                                                },
                                             )
                                         },
                                     )
@@ -10177,6 +10225,46 @@ fn is_direct_try_assignment_branch(statement: &ruff_python_ast::StmtIf) -> bool 
                         [Stmt::Assign(_)] | [Stmt::Assign(_), Stmt::Assign(_)]
                     )
         )
+}
+
+fn is_direct_try_tuple_unpack_return(statement: &ruff_python_ast::StmtTry) -> bool {
+    if statement.is_star || !statement.orelse.is_empty() || !statement.finalbody.is_empty() {
+        return false;
+    }
+    let [handler] = statement.handlers.as_slice() else {
+        return false;
+    };
+    let Some(handler) = handler.as_except_handler() else {
+        return false;
+    };
+    if handler.name.is_some() || !matches!(handler.body.as_slice(), [Stmt::Pass(_)]) {
+        return false;
+    }
+    let [Stmt::Assign(assignment), Stmt::If(branch), ..] = statement.body.as_slice() else {
+        return false;
+    };
+    if !matches!(assignment.value.as_ref(), Expr::Call(_)) || !branch.elif_else_clauses.is_empty() {
+        return false;
+    }
+    let Expr::Name(test) = branch.test.as_ref() else {
+        return false;
+    };
+    let [Stmt::Return(statement)] = branch.body.as_slice() else {
+        return false;
+    };
+    if !matches!(statement.value.as_deref(), Some(Expr::Name(value)) if value.id == test.id) {
+        return false;
+    }
+    let [target] = assignment.targets.as_slice() else {
+        return false;
+    };
+    let Expr::Tuple(tuple) = target else {
+        return false;
+    };
+    let [Expr::Name(first), Expr::Name(_), Expr::Name(_)] = tuple.elts.as_slice() else {
+        return false;
+    };
+    first.id == test.id
 }
 
 fn is_simple_none_default_assignment(test: &Expr, body: &[Stmt]) -> bool {
