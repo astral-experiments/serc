@@ -241,7 +241,11 @@ impl Assembler {
     /// insertions can reuse those stale slots, so normalized instructions may acquire an owner. A
     /// fallthrough scan crosses labels that only delimit exception regions, matching CPython's
     /// pseudo-instruction representation of those boundaries.
-    fn dynamic_exception_owner_slots(&self, cross_labels: bool) -> usize {
+    fn dynamic_exception_owner_slots(
+        &self,
+        cross_labels: bool,
+        include_conservative_region_vacancy: bool,
+    ) -> usize {
         fn will_fuse(first: Instruction, second: Instruction) -> bool {
             if first.fusion_policy.prevent_with_next
                 || first.borrow_fallthrough == BorrowFallthrough::Barrier
@@ -392,7 +396,7 @@ impl Assembler {
         // Late prologue insertions consume stale slots instead of creating them.
         // COPY_FREE_VARS and MAKE_CELL are the two such insertions relevant here.
         let slots = slots.saturating_sub(late_inserted_slots);
-        if cross_labels && nop_count >= 2 {
+        if cross_labels && include_conservative_region_vacancy && nop_count >= 2 {
             // Consecutive protected regions can leave a stale slot even when their removed pseudo
             // instructions are absent from our IR.
             slots.max(1)
@@ -402,7 +406,7 @@ impl Assembler {
     }
 
     pub(crate) fn current_block_dynamic_exception_owner_slots(&self) -> usize {
-        self.dynamic_exception_owner_slots(false)
+        self.dynamic_exception_owner_slots(false, false)
     }
 
     /// Returns whether optimization can leave a dynamic exception owner in the current block.
@@ -412,7 +416,15 @@ impl Assembler {
 
     /// Returns how many stale exception-owner slots can cross labels that only delimit regions.
     pub(crate) fn fallthrough_dynamic_exception_owner_slots(&self) -> usize {
-        self.dynamic_exception_owner_slots(true)
+        self.dynamic_exception_owner_slots(true, true)
+    }
+
+    /// Returns whether a concrete stale owner slot crosses only exception-region labels.
+    ///
+    /// Unlike the ordinary fallthrough query, this ignores vacancies inferred solely from
+    /// consecutive protected regions whose removed pseudo instructions are absent from our IR.
+    pub(crate) fn fallthrough_has_concrete_dynamic_exception_owner(&self) -> bool {
+        self.dynamic_exception_owner_slots(true, false) > 0
     }
 
     /// Returns whether optimization can leave a dynamic exception owner before a normalized

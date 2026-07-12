@@ -410,6 +410,7 @@ fn fallthrough_dynamic_exception_owner_crosses_exception_region_labels() {
     hidden_slot.mark(boundary);
     assert!(!hidden_slot.current_block_has_dynamic_exception_owner());
     assert!(hidden_slot.fallthrough_has_dynamic_exception_owner());
+    assert!(hidden_slot.fallthrough_has_concrete_dynamic_exception_owner());
 
     let mut consumed_by_prologue = Assembler::default();
     consumed_by_prologue.emit(LOAD_CONST, 0);
@@ -444,6 +445,17 @@ fn fallthrough_dynamic_exception_owner_preserves_conservative_vacancies() {
     protected_nops.mark(boundary);
     protected_nops.emit(NOP, 0);
     assert!(protected_nops.fallthrough_has_dynamic_exception_owner());
+    assert!(protected_nops.fallthrough_has_concrete_dynamic_exception_owner());
+
+    let mut conservative_only = Assembler::default();
+    conservative_only.set_location(SourceLocation::new(1, 1, 0, 1));
+    conservative_only.emit(NOP, 0);
+    let boundary = conservative_only.label();
+    conservative_only.mark(boundary);
+    conservative_only.set_location(SourceLocation::new(2, 2, 0, 1));
+    conservative_only.emit(NOP, 0);
+    assert!(conservative_only.fallthrough_has_dynamic_exception_owner());
+    assert!(!conservative_only.fallthrough_has_concrete_dynamic_exception_owner());
 }
 
 #[test]
