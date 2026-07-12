@@ -29,6 +29,14 @@ pub(super) struct CompilationContext {
     pub(super) has_lazy_imports: bool,
 }
 
+pub(super) struct CallShape<'a> {
+    pub(super) positional_count: usize,
+    pub(super) keyword_count: usize,
+    pub(super) has_starred: bool,
+    pub(super) has_keyword_unpack: bool,
+    pub(super) direct_method: Option<&'a ruff_python_ast::ExprAttribute>,
+}
+
 impl CompilationContext {
     pub(super) fn new(filename: &str, source: &str, tokens: Tokens, body: &Suite) -> Self {
         let (scopes, module_plan) = ScopeArena::analyze(body);
@@ -318,7 +326,15 @@ impl Compiler {
         &self,
         call: &ruff_python_ast::ExprCall,
     ) -> ruff_text_size::TextRange {
-        if let Some(attribute) = self.direct_method_attribute(call) {
+        self.call_opcode_range_with_method(call, self.call_shape(call).direct_method)
+    }
+
+    pub(super) fn call_opcode_range_with_method(
+        &self,
+        call: &ruff_python_ast::ExprCall,
+        direct_method: Option<&ruff_python_ast::ExprAttribute>,
+    ) -> ruff_text_size::TextRange {
+        if let Some(attribute) = direct_method {
             let attribute_location = self.source_location(attribute.range);
             if attribute_location.line != attribute_location.end_line {
                 return ruff_text_size::TextRange::new(
@@ -330,26 +346,32 @@ impl Compiler {
         call.range
     }
 
-    pub(super) fn direct_method_attribute<'a>(
-        &self,
-        call: &'a ruff_python_ast::ExprCall,
-    ) -> Option<&'a ruff_python_ast::ExprAttribute> {
+    pub(super) fn call_shape<'a>(&self, call: &'a ruff_python_ast::ExprCall) -> CallShape<'a> {
         let positional_count = call.arguments.args.len();
         let keyword_count = call.arguments.keywords.len();
-        if call.arguments.args.iter().any(Expr::is_starred_expr)
-            || call
-                .arguments
-                .keywords
-                .iter()
-                .any(|keyword| keyword.arg.is_none())
-            || positional_count + keyword_count + usize::from(keyword_count > 0) >= 30
+        let has_starred = call.arguments.args.iter().any(Expr::is_starred_expr);
+        let has_keyword_unpack = call
+            .arguments
+            .keywords
+            .iter()
+            .any(|keyword| keyword.arg.is_none());
+        let direct_method = if !has_starred
+            && !has_keyword_unpack
+            && positional_count + keyword_count + usize::from(keyword_count > 0) < 30
+            && let Expr::Attribute(attribute) = call.func.as_ref()
+            && !self.imported_module_attribute(attribute)
         {
-            return None;
-        }
-        let Expr::Attribute(attribute) = call.func.as_ref() else {
-            return None;
+            Some(attribute)
+        } else {
+            None
         };
-        (!self.imported_module_attribute(attribute)).then_some(attribute)
+        CallShape {
+            positional_count,
+            keyword_count,
+            has_starred,
+            has_keyword_unpack,
+            direct_method,
+        }
     }
 }
 

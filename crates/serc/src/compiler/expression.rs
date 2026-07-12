@@ -1852,13 +1852,8 @@ impl Compiler {
             return self.compile_optimized_generator_call(call, callable);
         }
 
-        let has_starred = call.arguments.args.iter().any(Expr::is_starred_expr);
-        let has_keyword_unpack = call
-            .arguments
-            .keywords
-            .iter()
-            .any(|keyword| keyword.arg.is_none());
-        let direct_method = if let Some(attribute) = self.direct_method_attribute(call) {
+        let shape = self.call_shape(call);
+        let direct_method = if let Some(attribute) = shape.direct_method {
             if self.compile_super_attribute(attribute, SuperAttributeKind::Method)?
                 == SpecializedLowering::NotApplicable
             {
@@ -1898,13 +1893,13 @@ impl Compiler {
                 .set_location(self.source_location(call.func.range()));
             self.emit(PUSH_NULL, 0, 1)?;
         }
-        self.assembler
-            .set_location(self.source_location(self.call_opcode_range(call)));
+        let call_location =
+            self.source_location(self.call_opcode_range_with_method(call, shape.direct_method));
+        self.assembler.set_location(call_location);
 
-        if !has_starred
-            && !has_keyword_unpack
-            && (direct_method
-                || call.arguments.args.len() + call.arguments.keywords.len() * 2 <= 30)
+        if !shape.has_starred
+            && !shape.has_keyword_unpack
+            && (direct_method || shape.positional_count + shape.keyword_count * 2 <= 30)
         {
             for argument in &call.arguments.args {
                 self.compile_expression(argument)?;
@@ -1938,8 +1933,7 @@ impl Compiler {
                 self.assembler.set_location(self.source_location(range));
             }
             self.emit(LOAD_CONST, names, 1)?;
-            self.assembler
-                .set_location(self.source_location(self.call_opcode_range(call)));
+            self.assembler.set_location(call_location);
             return self.emit(
                 CALL_KW,
                 argument_count,
@@ -1977,7 +1971,10 @@ impl Compiler {
                     continue;
                 }
                 if named_start < index {
-                    self.compile_keyword_map(call, &call.arguments.keywords[named_start..index])?;
+                    self.compile_keyword_map(
+                        call_location,
+                        &call.arguments.keywords[named_start..index],
+                    )?;
                     if have_dict {
                         self.emit(DICT_MERGE, 1, -1)?;
                     }
@@ -1988,21 +1985,19 @@ impl Compiler {
                     have_dict = true;
                 }
                 self.compile_expression(&keyword.value)?;
-                self.assembler
-                    .set_location(self.source_location(self.call_opcode_range(call)));
+                self.assembler.set_location(call_location);
                 self.emit(DICT_MERGE, 1, -1)?;
                 named_start = index + 1;
             }
             if named_start < call.arguments.keywords.len() {
-                self.compile_keyword_map(call, &call.arguments.keywords[named_start..])?;
+                self.compile_keyword_map(call_location, &call.arguments.keywords[named_start..])?;
                 if have_dict {
                     self.emit(DICT_MERGE, 1, -1)?;
                 }
             }
         }
-        if (!has_starred && !has_keyword_unpack) || starred_argument_pushed_null {
-            self.assembler
-                .set_location(self.source_location(self.call_opcode_range(call)));
+        if (!shape.has_starred && !shape.has_keyword_unpack) || starred_argument_pushed_null {
+            self.assembler.set_location(call_location);
         }
         self.emit(CALL_FUNCTION_EX, 0, -3)
     }
@@ -2224,11 +2219,10 @@ impl Compiler {
 
     fn compile_keyword_map(
         &mut self,
-        call: &ruff_python_ast::ExprCall,
+        call_location: SourceLocation,
         keywords: &[Keyword],
     ) -> Result<(), CompileError> {
         debug_assert!(!keywords.is_empty() && keywords.iter().all(|keyword| keyword.arg.is_some()));
-        let call_location = self.source_location(self.call_opcode_range(call));
         if keywords.len() * 2 > 30 {
             self.assembler.set_location(SourceLocation::NONE);
             self.emit(BUILD_MAP, 0, 1)?;
@@ -2475,11 +2469,14 @@ impl Compiler {
                 None
             };
             if let Some(defaults) = folded_defaults {
-                let hidden_owner_slots = positional_defaults
-                    .iter()
-                    .fold(positional_defaults.len(), |slots, default| {
-                        slots.saturating_add(folded_constant_owner_slots(default))
-                    });
+                let mut hidden_owner_slots = positional_defaults.len().min(3);
+                for default in &positional_defaults {
+                    if hidden_owner_slots == 3 {
+                        break;
+                    }
+                    hidden_owner_slots =
+                        (hidden_owner_slots + folded_constant_owner_slots(default)).min(3);
+                }
                 for default in &positional_defaults {
                     self.record_folded_value(default)?;
                 }
@@ -5715,11 +5712,17 @@ pub(super) fn literal_truthiness(expression: &Expr) -> Option<bool> {
 }
 
 fn folded_elements_owner_slots(elements: &[Expr], structural_slots: usize) -> usize {
-    elements.iter().fold(structural_slots, |slots, element| {
-        slots
-            .saturating_add(folded_constant_owner_slots(element))
-            .min(3)
-    })
+    if structural_slots >= 3 {
+        return 3;
+    }
+    let mut slots = structural_slots;
+    for element in elements {
+        slots = (slots + folded_constant_owner_slots(element)).min(3);
+        if slots == 3 {
+            break;
+        }
+    }
+    slots
 }
 
 pub(super) fn jump_constant_truthiness(expression: &Expr) -> Option<bool> {

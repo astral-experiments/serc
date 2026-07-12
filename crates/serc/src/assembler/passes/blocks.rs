@@ -497,7 +497,12 @@ impl OptimizationPipeline {
         }
 
         let order = graph.order().to_vec();
-        let mut block_labels = FxHashMap::default();
+        let block_slot_count = order
+            .iter()
+            .map(|block| block.index())
+            .max()
+            .map_or(0, |index| index + 1);
+        let mut block_labels = vec![None; block_slot_count];
         for block in order.iter().copied() {
             let label = if let Some(label) = graph[block].first_label() {
                 label
@@ -507,42 +512,38 @@ impl OptimizationPipeline {
                 graph.insert_label(block, 0, label);
                 label
             };
-            block_labels.insert(block, label);
+            block_labels[block.index()] = Some(label);
         }
 
-        let positions = order
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(position, block)| (block, position))
-            .collect::<FxHashMap<_, _>>();
-        let region_memberships = self
+        let mut positions = vec![usize::MAX; block_slot_count];
+        for (position, block) in order.iter().copied().enumerate() {
+            positions[block.index()] = position;
+        }
+        let region_ranges = self
             .exception_regions
             .iter()
             .map(|region| {
                 let start = graph
                     .label_block(region.start)
-                    .and_then(|block| positions.get(&block).copied())
+                    .and_then(|block| positions.get(block.index()).copied())
+                    .filter(|position| *position != usize::MAX)
                     .unwrap_or(0);
                 let end = graph
                     .label_block(region.end)
-                    .and_then(|block| positions.get(&block).copied())
+                    .and_then(|block| positions.get(block.index()).copied())
+                    .filter(|position| *position != usize::MAX)
                     .unwrap_or(order.len());
-                if start <= end {
-                    order[start..end].iter().copied().collect::<FxHashSet<_>>()
-                } else {
-                    FxHashSet::default()
-                }
+                if start <= end { (start, end) } else { (0, 0) }
             })
             .collect::<Vec<_>>();
 
-        let mut warm = FxHashSet::default();
+        let mut warm = vec![false; block_slot_count];
         let mut stack = vec![order[0]];
         while let Some(block) = stack.pop() {
-            if !warm.insert(block) {
+            if std::mem::replace(&mut warm[block.index()], true) {
                 continue;
             }
-            let position = positions[&block];
+            let position = positions[block.index()];
             if block_has_fallthrough(graph[block].items())
                 && let Some(next) = order.get(position + 1)
             {
@@ -555,18 +556,18 @@ impl OptimizationPipeline {
             }
         }
 
-        let mut cold = FxHashSet::default();
+        let mut cold = vec![false; block_slot_count];
         let mut stack = self
             .exception_regions
             .iter()
             .filter_map(|region| graph.label_block(region.target))
-            .filter(|block| !warm.contains(block))
+            .filter(|block| !warm[block.index()])
             .collect::<Vec<_>>();
         while let Some(block) = stack.pop() {
-            if warm.contains(&block) || !cold.insert(block) {
+            if warm[block.index()] || std::mem::replace(&mut cold[block.index()], true) {
                 continue;
             }
-            let position = positions[&block];
+            let position = positions[block.index()];
             if block_has_fallthrough(graph[block].items())
                 && let Some(next) = order.get(position + 1)
             {
@@ -578,15 +579,15 @@ impl OptimizationPipeline {
                 stack.push(target);
             }
         }
-        if cold.is_empty() {
+        if !cold.iter().any(|cold| *cold) {
             return;
         }
 
         let explicit_jumps = (0..order.len().saturating_sub(1))
             .filter(|position| {
-                cold.contains(&order[*position])
+                cold[order[*position].index()]
                     && block_has_fallthrough(graph[order[*position]].items())
-                    && warm.contains(&order[*position + 1])
+                    && warm[order[*position + 1].index()]
             })
             .collect::<Vec<_>>();
         for position in explicit_jumps.into_iter().rev() {
@@ -597,7 +598,7 @@ impl OptimizationPipeline {
                 let label = Label(self.next_label);
                 self.next_label += 1;
                 graph.insert_label(next, 0, label);
-                block_labels.insert(next, label);
+                block_labels[next.index()] = Some(label);
                 label
             };
             let current = graph.block_at(position);
@@ -632,15 +633,18 @@ impl OptimizationPipeline {
                     }),
                 ],
             );
-            block_labels.insert(block, label);
-            cold.insert(block);
+            let index = block.index();
+            block_labels.resize(index + 1, None);
+            warm.resize(index + 1, false);
+            cold.resize(index + 1, false);
+            block_labels[index] = Some(label);
+            cold[index] = true;
         }
 
         let mut order = Vec::with_capacity(graph.len());
         for expected_cold in [false, true] {
             for block in graph.order().iter().copied() {
-                if (expected_cold && cold.contains(&block))
-                    || (!expected_cold && warm.contains(&block))
+                if (expected_cold && cold[block.index()]) || (!expected_cold && warm[block.index()])
                 {
                     order.push(block);
                 }
@@ -667,17 +671,17 @@ impl OptimizationPipeline {
             cleanup_block_creation_order(graph[order[positions[0]]].items())
                 > cleanup_block_creation_order(graph[order[positions[1]]].items())
         }) {
-            let cleanup_throw_blocks = cleanup_throw_positions
-                .iter()
-                .map(|position| order[*position])
-                .collect::<FxHashSet<_>>();
+            let mut cleanup_throw_blocks = vec![false; cold.len()];
+            for position in &cleanup_throw_positions {
+                cleanup_throw_blocks[order[*position].index()] = true;
+            }
             // Move each cleanup and its continuation as a pair. Intervening cold handler blocks
             // retain their relative position, as they do in CPython's block list.
             loop {
                 let ordered_cleanup_blocks = order
                     .iter()
                     .enumerate()
-                    .filter(|(_, block)| cleanup_throw_blocks.contains(block))
+                    .filter(|(_, block)| cleanup_throw_blocks[block.index()])
                     .collect::<Vec<_>>();
                 let Some(inversion) = ordered_cleanup_blocks.windows(2).find(|blocks_in_order| {
                     cleanup_block_creation_order(graph[*blocks_in_order[0].1].items())
@@ -733,21 +737,31 @@ impl OptimizationPipeline {
         let mut final_label = None;
         let mut rebuilt_regions = Vec::new();
         let original_regions = std::mem::take(&mut self.exception_regions);
-        for (region, members) in original_regions.into_iter().zip(&region_memberships) {
+        for (region, (original_start, original_end)) in
+            original_regions.into_iter().zip(region_ranges)
+        {
+            let is_member = |block: BasicBlockId| {
+                positions
+                    .get(block.index())
+                    .copied()
+                    .is_some_and(|position| original_start <= position && position < original_end)
+            };
             let mut index = 0;
             while index < order.len() {
-                while index < order.len() && !members.contains(&order[index]) {
+                while index < order.len() && !is_member(order[index]) {
                     index += 1;
                 }
                 if index == order.len() {
                     break;
                 }
-                let start = block_labels[&order[index]];
-                while index < order.len() && members.contains(&order[index]) {
+                let start = block_labels[order[index].index()]
+                    .expect("cold-block pass should label every ordered block");
+                while index < order.len() && is_member(order[index]) {
                     index += 1;
                 }
                 let end = if index < order.len() {
-                    block_labels[&order[index]]
+                    block_labels[order[index].index()]
+                        .expect("cold-block pass should label every ordered block")
                 } else if let Some(label) = final_label {
                     label
                 } else {
@@ -767,33 +781,30 @@ impl OptimizationPipeline {
         }
         self.exception_regions = rebuilt_regions;
 
-        graph
-            .replace_order(order)
-            .expect("cold-block pass produced an invalid emission order");
-        let item_positions = graph.item_positions();
-        let label_positions = item_positions
-            .iter()
-            .enumerate()
-            .filter_map(|(index, position)| match graph.item(*position) {
-                Item::Label(label) => Some((*label, index)),
-                Item::Instruction(_) => None,
-            })
-            .collect::<FxHashMap<_, _>>();
-        for (index, position) in item_positions.into_iter().enumerate() {
-            let Some(instruction) = graph.instruction_mut(position) else {
+        positions.resize(cold.len(), usize::MAX);
+        positions.fill(usize::MAX);
+        for (position, block) in order.iter().copied().enumerate() {
+            positions[block.index()] = position;
+        }
+        for (source_position, source) in order.iter().copied().enumerate() {
+            let Some(target) = block_jump_target(graph[source].items()) else {
                 continue;
             };
-            let target = match instruction.operand {
-                Operand::Forward(target) | Operand::Backward(target) => target,
-                Operand::Value(_) => continue,
-                Operand::Deferred(_) => {
-                    unreachable!("operand patches are resolved before assembler passes")
-                }
-            };
-            let Some(target_position) = label_positions.get(&target).copied() else {
+            let Some(target_block) = graph.label_block(target) else {
                 continue;
             };
-            if target_position < index {
+            let Some(target_position) = positions
+                .get(target_block.index())
+                .copied()
+                .filter(|position| *position != usize::MAX)
+            else {
+                continue;
+            };
+            let instruction = graph
+                .instructions_mut(source)
+                .next_back()
+                .expect("a block jump target must have a terminal instruction");
+            if target_position <= source_position {
                 instruction.retarget(Operand::Backward(target));
                 if instruction.opcode == JUMP_FORWARD {
                     instruction.opcode = if instruction.jump_provenance.is_authored_break() {
@@ -812,6 +823,9 @@ impl OptimizationPipeline {
                 }
             }
         }
+        graph
+            .replace_order(order)
+            .expect("cold-block pass produced an invalid emission order");
         if let Some(final_label) = final_label {
             graph.push_block(vec![Item::Label(final_label)]);
         }

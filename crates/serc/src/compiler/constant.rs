@@ -341,26 +341,47 @@ impl Compiler {
 /// The count is attached to the emitted folded result so labels and other control-flow
 /// boundaries naturally constrain which later boolean marker can reuse the stale slots.
 pub(super) fn folded_constant_owner_slots(expression: &Expr) -> usize {
-    fn direct(expression: &Expr) -> Option<usize> {
-        fold_constant(expression)?;
-        let nested = |expression| direct(expression).unwrap_or(0);
-        Some(match expression {
-            Expr::BinOp(binary) => 2_usize
-                .saturating_add(nested(&binary.left))
-                .saturating_add(nested(&binary.right)),
-            Expr::Tuple(tuple) => tuple.elts.iter().fold(tuple.elts.len(), |slots, element| {
-                slots.saturating_add(nested(element))
-            }),
-            Expr::UnaryOp(unary) => 1_usize.saturating_add(nested(&unary.operand)),
-            Expr::Subscript(subscript) => 2_usize
-                .saturating_add(nested(&subscript.value))
-                .saturating_add(nested(&subscript.slice)),
-            Expr::Name(_) => 0,
+    fn direct(expression: &Expr) -> usize {
+        match expression {
+            Expr::BinOp(binary) => {
+                let left = direct(&binary.left);
+                if left > 0 {
+                    3
+                } else {
+                    2 + direct(&binary.right).min(1)
+                }
+            }
+            Expr::Tuple(tuple) => {
+                if tuple.elts.len() >= 3 {
+                    return 3;
+                }
+                tuple.elts.iter().fold(tuple.elts.len(), |slots, element| {
+                    (slots + direct(element)).min(3)
+                })
+            }
+            Expr::UnaryOp(unary) => {
+                if unary.op == UnaryOp::Not
+                    && matches!(unary.operand.as_ref(), Expr::Tuple(_))
+                    && fold_constant(&unary.operand).is_none()
+                {
+                    1
+                } else {
+                    (1 + direct(&unary.operand)).min(3)
+                }
+            }
+            Expr::Subscript(subscript) => {
+                let value = direct(&subscript.value);
+                if value > 0 {
+                    3
+                } else {
+                    2 + direct(&subscript.slice).min(1)
+                }
+            }
             _ => 0,
-        })
+        }
     }
 
-    direct(expression).unwrap_or(0).min(3)
+    direct(expression)
 }
 
 pub(super) fn explicit_surrogate_string(value: &str, source: &str) -> Option<Vec<u8>> {
