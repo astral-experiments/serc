@@ -944,9 +944,31 @@ impl Compiler {
         )?;
         context.on_top += pattern.patterns.len();
         context.on_top -= 1;
-        for subpattern in &pattern.patterns {
+        for (index, subpattern) in pattern.patterns.iter().enumerate() {
             context.on_top -= 1;
-            self.compile_stack_pattern(subpattern, context)?;
+            if pattern.rest.is_none()
+                && pattern.keys.len() == 1
+                && index + 1 == pattern.patterns.len()
+                && let Pattern::MatchAs(capture) = subpattern
+                && let Some(name) = &capture.name
+                && let Some(inner @ Pattern::MatchClass(class)) = capture.pattern.as_deref()
+                && class.arguments.patterns.is_empty()
+                && class.arguments.keywords.is_empty()
+            {
+                self.assembler
+                    .set_location(self.source_location(capture.range));
+                context.on_top += 1;
+                self.emit(COPY, 1, 1)?;
+                self.compile_stack_pattern(inner, context)?;
+                context.on_top -= 1;
+                // The last mapping value cannot fail after its inner pattern succeeds. CPython's
+                // static-swap pass moves this capture ahead of the mapping cleanup pops.
+                self.assembler
+                    .set_location(self.source_location(pattern.range));
+                self.store_name(name.as_str())?;
+            } else {
+                self.compile_stack_pattern(subpattern, context)?;
+            }
         }
         context.on_top -= 2;
         if let Some(rest) = &pattern.rest {

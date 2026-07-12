@@ -3535,6 +3535,19 @@ impl Compiler {
                         _ => None,
                     })
                     .flatten();
+                let include_finally_assignment_assert_none_owner = self
+                    .control
+                    .active_finally_try_bodies
+                    > 0
+                    && matches!(
+                        body,
+                        [Stmt::Assign(_), Stmt::Assert(assertion), Stmt::Expr(_)]
+                            if matches!(assertion.test.as_ref(), Expr::Compare(comparison)
+                                if comparison.ops.len() == 1
+                                    && matches!(comparison.ops[0], CmpOp::IsNot)
+                                    && matches!(comparison.left.as_ref(), Expr::Name(_))
+                                    && matches!(comparison.comparators[0], Expr::NoneLiteral(_)))
+                    );
                 self.with_control_override(
                     |control| &mut control.copy_optimized_tuple_branch_exit,
                     copy_optimized_tuple_branch_exit,
@@ -3553,7 +3566,17 @@ impl Compiler {
                                                 compiler.with_control_override(
                                                     |control| &mut control.direct_try_if_exit,
                                                     direct_try_if_exit,
-                                                    |compiler| compiler.compile_suite(body),
+                                                    |compiler| {
+                                                        let include_assert_none_condition_owner = compiler
+                                                            .control
+                                                            .include_assert_none_condition_owner
+                                                            || include_finally_assignment_assert_none_owner;
+                                                        compiler.with_control_override(
+                                                            |control| &mut control.include_assert_none_condition_owner,
+                                                            include_assert_none_condition_owner,
+                                                            |compiler| compiler.compile_suite(body),
+                                                        )
+                                                    },
                                                 )
                                             },
                                         )
@@ -5501,7 +5524,8 @@ impl Compiler {
         }
         let base_depth = self.control.depth;
         let end = self.assembler.label();
-        let include_none_owner = !self.control.active_with_region_exclusions.is_empty();
+        let include_none_owner = self.control.include_assert_none_condition_owner
+            || !self.control.active_with_region_exclusions.is_empty();
         let retained_chained_comparison_exit = match statement.test.as_ref() {
             Expr::Compare(comparison) if comparison.ops.len() > 1 => Some(comparison.range),
             _ => None,
@@ -7985,7 +8009,17 @@ impl Compiler {
                                                     && matches!(comparison.ops[0], CmpOp::Is | CmpOp::IsNot)
                                                     && matches!(comparison.comparators[0], Expr::NoneLiteral(_))))
                                 })
-                        }));
+                        })) || (compiler.unit.flags & CO_COROUTINE != 0
+                    && statement.handlers.is_empty()
+                    && matches!(statement.body.last(), Some(Stmt::Assign(assignment))
+                        if matches!(assignment.value.as_ref(), Expr::Await(_)))
+                    && matches!(statement.finalbody.as_slice(), [Stmt::If(tail)]
+                        if tail.elif_else_clauses.is_empty()
+                            && matches!(tail.test.as_ref(), Expr::Compare(comparison)
+                                if comparison.ops.len() == 1)
+                            && matches!(tail.body.as_slice(), [Stmt::Expr(_)] | [Stmt::Expr(_), Stmt::Expr(_)])
+                            && tail.body.iter().all(|statement| matches!(statement, Stmt::Expr(expression)
+                                if matches!(expression.value.as_ref(), Expr::Call(_))))));
                 compiler.with_control_override(
                     |control| &mut control.include_simple_normal_finally_not_taken_from_with,
                     include_simple_normal_finally_not_taken_from_with,
