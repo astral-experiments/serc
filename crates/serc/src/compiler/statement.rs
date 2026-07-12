@@ -580,7 +580,8 @@ impl Compiler {
                     matches!(handler.body.as_slice(), [Stmt::Raise(_)])
                 })
         );
-        let direct_try_assignment_branch_exit = if self.control.current_statement_has_following
+        let direct_try_assignment_branch_exit = if (self.control.current_statement_has_following
+            || self.control.in_iterator_loop())
             && statement.orelse.is_empty()
             && statement.finalbody.is_empty()
             && !statement.handlers.is_empty()
@@ -3645,20 +3646,34 @@ impl Compiler {
                     } else {
                         self.set_branch_end_location(body, body_start);
                     }
-                    let direct_try_body_exit_start = direct_try_body_exit.then(|| {
-                        let start = self.assembler.label();
-                        self.assembler.mark(start);
-                        start
-                    });
-                    self.emit_jump_forward(JUMP_FORWARD, end, 0)?;
-                    if let Some(start) = direct_try_body_exit_start {
-                        let exclusion_end = self.assembler.label();
-                        self.assembler.mark(exclusion_end);
-                        self.control
-                            .active_exception_region_exclusions
-                            .last_mut()
-                            .expect("direct try-body branch exit requires an active try")
-                            .push((start, exclusion_end));
+                    if direct_try_body_exit
+                        && self.control.in_iterator_loop()
+                        && self.control.active_exception_region_exclusions.len() == 1
+                        && self.control.generator_region_start.is_none()
+                        && self.control.active_with_region_exclusions.is_empty()
+                    {
+                        self.emit_jump_forward_with_exception_policy(
+                            JUMP_FORWARD,
+                            end,
+                            0,
+                            ExceptionPolicy::EXCLUDE_ALWAYS,
+                        )?;
+                    } else {
+                        let direct_try_body_exit_start = direct_try_body_exit.then(|| {
+                            let start = self.assembler.label();
+                            self.assembler.mark(start);
+                            start
+                        });
+                        self.emit_jump_forward(JUMP_FORWARD, end, 0)?;
+                        if let Some(start) = direct_try_body_exit_start {
+                            let exclusion_end = self.assembler.label();
+                            self.assembler.mark(exclusion_end);
+                            self.control
+                                .active_exception_region_exclusions
+                                .last_mut()
+                                .expect("direct try-body branch exit requires an active try")
+                                .push((start, exclusion_end));
+                        }
                     }
                     // CPython retains the first assertion branch's source jump when it copies a
                     // nonterminal join onto that edge. A directly following return or raise
@@ -8012,7 +8027,11 @@ impl Compiler {
                         })) || (compiler.unit.flags & CO_COROUTINE != 0
                     && statement.handlers.is_empty()
                     && matches!(statement.body.last(), Some(Stmt::Assign(assignment))
-                        if matches!(assignment.value.as_ref(), Expr::Await(_)))
+                        if matches!(assignment.value.as_ref(), Expr::Await(_))
+                            || matches!(assignment.value.as_ref(), Expr::Call(call)
+                                if matches!(call.func.as_ref(), Expr::Name(name) if name.id.as_str() == "cast")
+                                    && matches!(call.arguments.args.as_ref(), [_, Expr::Await(_)])
+                                    && call.arguments.keywords.is_empty()))
                     && matches!(statement.finalbody.as_slice(), [Stmt::If(tail)]
                         if tail.elif_else_clauses.is_empty()
                             && matches!(tail.test.as_ref(), Expr::Compare(comparison)
