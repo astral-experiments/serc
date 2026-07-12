@@ -5456,9 +5456,16 @@ impl Compiler<'_> {
                     expression.range(),
                 );
         let exclude_plain_try_marker = !comparison_is_boolean
-            && (shifted_plain_try_marker
-                || (!self.assembler.fallthrough_has_dynamic_exception_owner()
-                    && self.control.generator_region_start.is_none()
+            && (shifted_plain_try_marker || {
+                let nested_try_ifexp_marker = self
+                    .control
+                    .current_try_marker_uses_concrete_owner_slots(expression.range());
+                !(if nested_try_ifexp_marker {
+                    self.assembler
+                        .fallthrough_has_concrete_dynamic_exception_owner()
+                } else {
+                    self.assembler.fallthrough_has_dynamic_exception_owner()
+                }) && self.control.generator_region_start.is_none()
                     && !self.control.in_iterator_loop()
                     && !self.control.exceptional_finally_condition
                     && self
@@ -5472,7 +5479,9 @@ impl Compiler<'_> {
                     && !self.control.same_line_try_body
                     && !self.control.current_exception_handler_binds_name()
                     && !self.control.in_exception_handler()
-                    && self.control.active_exception_region_exclusions.len() == 1));
+                    && (self.control.active_exception_region_exclusions.len() == 1
+                        || nested_try_ifexp_marker)
+            });
         if exclude_plain_try_marker {
             // CPython appends normalized markers after exception targets are labeled. Force the
             // plain try marker ownerless only when no optimized CFG slot can carry an owner.

@@ -114,10 +114,17 @@ impl ExceptionTypeBoolMarkerState {
 }
 
 #[derive(Clone, Copy, Debug)]
+enum TryMarkerDirectCondition {
+    None,
+    Ownerless(TextRange),
+    ConcreteOwner(TextRange),
+}
+
+#[derive(Clone, Copy, Debug)]
 struct TryMarkerSlotContext {
     ownerless_prefix_slots: usize,
     protected_start_instruction: usize,
-    ownerless_direct_condition: Option<TextRange>,
+    direct_condition: TryMarkerDirectCondition,
     handler_starts_with_optimized_boolean_generator: bool,
 }
 
@@ -471,9 +478,27 @@ impl ControlFlowState {
             .copied()
             .flatten()
             .is_some_and(|context| {
-                context.ownerless_direct_condition == Some(condition)
-                    || context.ownerless_prefix_slots
-                        >= current_instruction.saturating_sub(context.protected_start_instruction)
+                matches!(
+                    context.direct_condition,
+                    TryMarkerDirectCondition::Ownerless(ownerless) if ownerless == condition
+                ) || context.ownerless_prefix_slots
+                    >= current_instruction.saturating_sub(context.protected_start_instruction)
+            })
+    }
+
+    pub(super) fn current_try_marker_uses_concrete_owner_slots(
+        &self,
+        condition: TextRange,
+    ) -> bool {
+        self.active_try_marker_slots
+            .last()
+            .copied()
+            .flatten()
+            .is_some_and(|context| {
+                matches!(
+                    context.direct_condition,
+                    TryMarkerDirectCondition::ConcreteOwner(concrete) if concrete == condition
+                )
             })
     }
 
@@ -5925,8 +5950,31 @@ impl Compiler<'_> {
                 && (is_direct_return_handler_try(statement)
                     || try_has_trailing_unnamed_literal_return_handler(statement)
                     || is_direct_return_raise_handler_try(statement));
+        let nested_named_handler_ifexp_call_test =
+            if self.control.active_exception_region_exclusions.len() == 1 {
+                trailing_named_handler_ifexp_call_test(statement).filter(|_| {
+                    self.control.active_exception_handlers.is_empty()
+                        && self.control.direct_try_body_has_successor
+                        && !self.control.direct_try_body_has_else
+                        && self.control.generator_region_start.is_none()
+                        && self.control.loops.is_empty()
+                        && self.control.active_with_region_exclusions.is_empty()
+                        && self.control.active_normal_finally_bodies == 0
+                        && self.control.active_finally_try_bodies == 0
+                        && self.control.active_exception_group_handlers == 0
+                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                        && self
+                            .control
+                            .direct_try_body_statements
+                            .contains(&statement.range)
+                })
+            } else {
+                None
+            };
+        let nested_final_named_assignment_try = nested_named_handler_ifexp_call_test.is_some()
+            && self.control.direct_try_body_statements.last() == Some(&statement.range);
         let nested_in_final_outer_try_statement =
-            !self.control.active_exception_region_exclusions.is_empty()
+            (!self.control.active_exception_region_exclusions.is_empty()
                 && self
                     .control
                     .direct_try_body_statements
@@ -5938,7 +5986,8 @@ impl Compiler<'_> {
                 && !self.control.direct_try_body_has_else
                 && self.control.active_finally_try_bodies == 0
                 && !self.control.in_iterator_loop()
-                && try_has_named_pair_exception_handler(statement);
+                && try_has_named_pair_exception_handler(statement))
+                || nested_final_named_assignment_try;
         let try_start = self.assembler.label();
         let try_end = self.assembler.label();
         let handler_start = self.assembler.label();
@@ -6127,9 +6176,20 @@ impl Compiler<'_> {
                 0
             },
             protected_start_instruction: self.assembler.instruction_count(),
-            ownerless_direct_condition,
+            direct_condition: ownerless_direct_condition.map_or(
+                TryMarkerDirectCondition::None,
+                TryMarkerDirectCondition::Ownerless,
+            ),
             handler_starts_with_optimized_boolean_generator:
                 try_handler_starts_with_optimized_boolean_generator(statement),
+        })
+        .or_else(|| {
+            nested_named_handler_ifexp_call_test.map(|test| TryMarkerSlotContext {
+                ownerless_prefix_slots: 0,
+                protected_start_instruction: self.assembler.instruction_count(),
+                direct_condition: TryMarkerDirectCondition::ConcreteOwner(test),
+                handler_starts_with_optimized_boolean_generator: false,
+            })
         });
         self.assembler.mark(try_start);
         self.control
@@ -10703,6 +10763,7 @@ fn suite_contains_nested_handler_cold_join(body: &[Stmt]) -> bool {
 // try-exit block empty after redundant jumps are removed.
 fn suite_ends_in_empty_try_exit_block(body: &[Stmt]) -> bool {
     match body.last() {
+        Some(Stmt::Try(tail)) if try_ends_with_named_handler_ifexp_name_assignment(tail) => true,
         Some(Stmt::Try(_)) => !body[..body.len() - 1].iter().any(|statement| {
             let Stmt::If(statement) = statement else {
                 return false;
@@ -11329,6 +11390,39 @@ fn try_has_named_pair_exception_handler(statement: &ruff_python_ast::StmtTry) ->
                     && matches!(handler.body.as_slice(), [Stmt::Expr(_), Stmt::Expr(_)])
             })
     )
+}
+
+fn trailing_named_handler_ifexp_call_test(
+    statement: &ruff_python_ast::StmtTry,
+) -> Option<TextRange> {
+    if statement.is_star || !statement.orelse.is_empty() || !statement.finalbody.is_empty() {
+        return None;
+    }
+    if !matches!(
+        statement.handlers.as_slice(),
+        [handler]
+            if handler.as_except_handler().is_some_and(|handler| {
+                handler.name.is_some() && matches!(handler.body.as_slice(), [Stmt::Assign(_)])
+            })
+    ) {
+        return None;
+    }
+    let Some(Stmt::Assign(assignment)) = statement.body.last() else {
+        return None;
+    };
+    let Expr::If(conditional) = assignment.value.as_ref() else {
+        return None;
+    };
+    matches!(conditional.test.as_ref(), Expr::Call(_)).then(|| conditional.test.range())
+}
+
+fn try_ends_with_named_handler_ifexp_name_assignment(statement: &ruff_python_ast::StmtTry) -> bool {
+    trailing_named_handler_ifexp_call_test(statement).is_some()
+        && matches!(
+            statement.body.last(),
+            Some(Stmt::Assign(assignment))
+                if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+        )
 }
 
 fn try_has_conditional_shared_loop_exit(statement: &Stmt) -> bool {
