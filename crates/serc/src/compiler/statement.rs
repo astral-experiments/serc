@@ -260,6 +260,7 @@ pub(super) struct ControlFlowState {
     // routed across a short-circuit condition without affecting nested body expressions.
     pub(super) terminal_with_condition: Option<ruff_text_size::TextRange>,
     pub(super) exclude_terminal_if_not_taken: bool,
+    pub(super) force_terminal_with_marker_ownerless: bool,
     // A leading `not` around a two-operand Boolean condition routes the synchronous-with
     // terminal marker exclusion to the inner condition's final operand.
     pub(super) defer_terminal_with_exclusion_through_negation: bool,
@@ -7960,7 +7961,31 @@ impl Compiler {
                                             && matches!(comparison.comparators[0], Expr::NoneLiteral(_)))
                                     && matches!(tail.body.as_slice(), [Stmt::Expr(_), Stmt::Expr(_)])
                                     && matches!(statement.body.last(), Some(Stmt::Assert(_)))))
-                );
+                ) || (compiler.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) != 0
+                    && statement.handlers.is_empty()
+                    && matches!(statement.body.last(), Some(Stmt::Expr(expression))
+                        if matches!(expression.value.as_ref(), Expr::Yield(_)))
+                    && !statement.finalbody.is_empty()
+                    && statement.finalbody.len() <= 4
+                    && statement
+                        .finalbody
+                        .iter()
+                        .position(|statement| !matches!(statement, Stmt::Expr(_)))
+                        .is_some_and(|first_condition| {
+                            first_condition <= 2
+                                && statement.finalbody[first_condition..].iter().all(|statement| {
+                                    let Stmt::If(tail) = statement else {
+                                        return false;
+                                    };
+                                    tail.elif_else_clauses.is_empty()
+                                        && matches!(tail.body.as_slice(), [Stmt::Expr(_)] | [Stmt::Expr(_), Stmt::Expr(_)])
+                                        && (matches!(tail.test.as_ref(), Expr::Name(_) | Expr::Attribute(_))
+                                            || matches!(tail.test.as_ref(), Expr::Compare(comparison)
+                                                if comparison.ops.len() == 1
+                                                    && matches!(comparison.ops[0], CmpOp::Is | CmpOp::IsNot)
+                                                    && matches!(comparison.comparators[0], Expr::NoneLiteral(_))))
+                                })
+                        }));
                 compiler.with_control_override(
                     |control| &mut control.include_simple_normal_finally_not_taken_from_with,
                     include_simple_normal_finally_not_taken_from_with,
@@ -8441,6 +8466,21 @@ impl Compiler {
                                                 && matches!(second.ops[0], CmpOp::Is | CmpOp::IsNot)
                                                 && matches!(first.comparators[0], Expr::NoneLiteral(_))
                                                 && matches!(second.comparators[0], Expr::NoneLiteral(_)))))));
+                let exclude_terminal_coroutine_with_markers = self.unit.flags & CO_COROUTINE != 0
+                    && self.control.loops.is_empty()
+                    && self
+                        .control
+                        .active_with_suspension_epochs
+                        .last()
+                        .is_some_and(|epoch| self.control.coroutine_suspension_epoch > *epoch);
+                let exclude_terminal_try_with_markers = terminal_if
+                    && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR | CO_GENERATOR) == 0
+                    && self.control.loops.is_empty()
+                    && matches!(statement.body.last(), Some(Stmt::Raise(_)))
+                    && matches!(statement.test.as_ref(), Expr::BoolOp(_))
+                    && leading
+                        .iter()
+                        .any(|statement| matches!(statement, Stmt::Try(_)));
                 self.with_control_override(
                     |control| &mut control.terminal_with_condition,
                     Some(statement.test.range()),
@@ -8448,7 +8488,17 @@ impl Compiler {
                         compiler.with_control_override(
                             |control| &mut control.exclude_terminal_if_not_taken,
                             !include_terminal_with_and_markers,
-                            |compiler| compiler.compile_statement(last),
+                            |compiler| {
+                                let force_terminal_with_marker_ownerless =
+                                    compiler.control.force_terminal_with_marker_ownerless
+                                        || exclude_terminal_coroutine_with_markers
+                                        || exclude_terminal_try_with_markers;
+                                compiler.with_control_override(
+                                    |control| &mut control.force_terminal_with_marker_ownerless,
+                                    force_terminal_with_marker_ownerless,
+                                    |compiler| compiler.compile_statement(last),
+                                )
+                            },
                         )
                     },
                 )?;
