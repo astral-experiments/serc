@@ -316,6 +316,8 @@ pub(super) struct ControlFlowState {
     branch_join_successor: Option<TextRange>,
     // Whether the current statement is nested directly in a terminal if branch suite.
     pub(super) in_terminal_if_branch_suite: bool,
+    // A terminal-if expression statement whose call suffix must remain shared across an ifexp.
+    pub(super) terminal_if_call_expression: bool,
     copied_nested_handler_join_successor: bool,
     // Whether that successor is a direct loop break.
     current_statement_followed_by_break: bool,
@@ -1866,6 +1868,35 @@ impl Compiler {
             self.emit_jump_forward(POP_JUMP_IF_FALSE, condition_false, -1)?;
         }
         self.emit(NOT_TAKEN, 0, 0)?;
+        if matches!(
+            statement.body.last(),
+            Some(Stmt::Return(return_statement))
+                if return_statement.value.as_deref().is_none_or(|value| {
+                    matches!(value, Expr::Name(_)) || is_literal_constant(value)
+                })
+        ) {
+            self.emit(NOP, 0, 0)?;
+            self.assembler.preserve_last_nop();
+
+            self.assembler.mark(body);
+            self.set_depth(base_depth);
+            self.compile_suite(&statement.body)?;
+
+            self.assembler.mark(cleanup);
+            self.set_depth(base_depth + 1);
+            self.assembler
+                .set_location(self.source_location(comparison.range));
+            self.emit(POP_TOP, 0, -1)?;
+            self.emit_deferred_implicit_return()?;
+
+            self.assembler.mark(condition_false);
+            self.set_depth(base_depth);
+            self.assembler
+                .set_location(self.source_location(comparison.range));
+            self.emit_deferred_implicit_return()?;
+            self.set_depth(base_depth);
+            return Ok(());
+        }
         self.emit_jump_forward(JUMP_FORWARD, body, 0)?;
         self.assembler.prevent_last_jump_inlining();
 
@@ -2405,7 +2436,20 @@ impl Compiler {
                         true
                     }
                     _ => {
-                        self.compile_expression(&expression.value)?;
+                        if self.control.in_terminal_if_branch_suite
+                            && self.control.generator_region_start.is_none()
+                            && !self.control.current_statement_has_following
+                            && !self.assembler.has_exception_regions()
+                            && matches!(expression.value.as_ref(), Expr::Call(_))
+                        {
+                            self.with_control_override(
+                                |control| &mut control.terminal_if_call_expression,
+                                true,
+                                |compiler| compiler.compile_expression(&expression.value),
+                            )?;
+                        } else {
+                            self.compile_expression(&expression.value)?;
+                        }
                         false
                     }
                 };
@@ -5762,7 +5806,11 @@ impl Compiler {
             self.control.active_exception_region_exclusions.is_empty()
                 && self.control.active_with_region_exclusions.len() == 1
                 && self.control.active_with_exits.len() == 1
-                && self.control.loops.is_empty()
+                && self
+                    .control
+                    .loops
+                    .iter()
+                    .all(|context| context.iterator_cleanup == IteratorCleanup::None)
                 && self.control.active_finally_try_bodies == 0
                 && self
                     .control
