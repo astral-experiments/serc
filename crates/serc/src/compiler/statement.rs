@@ -6015,7 +6015,15 @@ impl Compiler {
                     .expect("retained assertion exit has a unique successful edge");
                 self.assembler
                     .set_location(self.source_location(exit_test.range()));
-                self.emit(NOP, 0, 0)?;
+                let exception_policy = if self.unit.flags & CO_COROUTINE != 0
+                    && !statement.handlers.is_empty()
+                    && !statement.orelse.is_empty()
+                {
+                    ExceptionPolicy::EXCLUDE_ALWAYS
+                } else {
+                    ExceptionPolicy::default()
+                };
+                self.emit_with_exception_policy(NOP, 0, 0, exception_policy)?;
                 self.assembler.mark_last_as_converted_pop_block();
                 self.assembler.preserve_last_nop();
                 if early_condition_truthiness(&assertion.test) == Some(true) {
@@ -8399,17 +8407,25 @@ impl Compiler {
                 self.compile_suite(leading)?;
                 let include_terminal_with_and_markers = terminal_if
                     && self.control.loops.is_empty()
-                    && matches!(statement.body.last(), Some(Stmt::Return(_)))
                     && matches!(statement.test.as_ref(), Expr::BoolOp(boolean)
                         if boolean.op == BoolOp::And
-                            && boolean.values.len() == 2
-                            && !(matches!(body.first(), Some(Stmt::Import(_) | Stmt::ImportFrom(_)))
-                                && matches!(boolean.values.as_slice(), [Expr::Compare(comparison), Expr::Call(_)]
-                                    if comparison.ops.len() == 1
-                                        && matches!(comparison.ops[0], CmpOp::Is | CmpOp::IsNot)
-                                        && matches!(comparison.comparators[0], Expr::NoneLiteral(_))))
-                            && !matches!(&boolean.values[0], Expr::UnaryOp(unary)
-                                if matches!(unary.operand.as_ref(), Expr::Attribute(_))));
+                            && ((matches!(statement.body.last(), Some(Stmt::Return(_)))
+                                && boolean.values.len() == 2
+                                && !(matches!(body.first(), Some(Stmt::Import(_) | Stmt::ImportFrom(_)))
+                                    && matches!(boolean.values.as_slice(), [Expr::Compare(comparison), Expr::Call(_)]
+                                        if comparison.ops.len() == 1
+                                            && matches!(comparison.ops[0], CmpOp::Is | CmpOp::IsNot)
+                                            && matches!(comparison.comparators[0], Expr::NoneLiteral(_))))
+                                && !matches!(&boolean.values[0], Expr::UnaryOp(unary)
+                                    if matches!(unary.operand.as_ref(), Expr::Attribute(_))))
+                                || (matches!(statement.body.last(), Some(Stmt::Raise(_)))
+                                    && (matches!(boolean.values.as_slice(), [Expr::UnaryOp(first), Expr::UnaryOp(second)]
+                                        if matches!(first.operand.as_ref(), Expr::Name(_))
+                                            && matches!(second.operand.as_ref(), Expr::Call(_)))
+                                        || matches!(boolean.values.as_slice(), [Expr::UnaryOp(first), Expr::UnaryOp(second), Expr::BoolOp(_)]
+                                            if matches!(first.operand.as_ref(), Expr::Name(_))
+                                                && matches!(second.operand.as_ref(), Expr::Attribute(_)))
+                                        || matches!(boolean.values.as_slice(), [Expr::Name(_), Expr::Compare(_), Expr::Compare(_)])))));
                 self.with_control_override(
                     |control| &mut control.terminal_with_condition,
                     Some(statement.test.range()),
