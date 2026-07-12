@@ -1427,7 +1427,7 @@ fn add_magnitudes(left: &[u16], right: &[u16]) -> Vec<u16> {
 }
 
 fn subtract_magnitudes(left: &[u16], right: &[u16]) -> Vec<u16> {
-    debug_assert!(compare_magnitudes(left, right) != std::cmp::Ordering::Less);
+    debug_assert_ne!(compare_magnitudes(left, right), std::cmp::Ordering::Less);
     let mut digits = Vec::with_capacity(left.len());
     let mut borrow = 0_i32;
     for (index, left) in left.iter().copied().enumerate() {
