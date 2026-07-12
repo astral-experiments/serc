@@ -599,13 +599,13 @@ impl BlockGraph {
     }
 
     fn validate_order(&self, order: &[BasicBlockId]) -> Result<(), String> {
-        let mut seen_blocks = FxHashSet::default();
+        let mut seen_blocks = vec![false; self.blocks.len()];
         for block in order.iter().copied() {
-            if !seen_blocks.insert(block) {
-                return Err(format!("block {} appears more than once", block.index()));
-            }
-            if self.blocks.get(block.index()).is_none() {
+            let Some(seen) = seen_blocks.get_mut(block.index()) else {
                 return Err(format!("block {} is outside the arena", block.index()));
+            };
+            if std::mem::replace(seen, true) {
+                return Err(format!("block {} appears more than once", block.index()));
             }
         }
         Ok(())
@@ -784,7 +784,7 @@ impl BlockGraph {
         for (position, block) in self.order.iter().copied().enumerate() {
             order_positions[block.index()] = position;
         }
-        let region_blocks = exception_regions
+        let mut region_blocks = exception_regions
             .iter()
             .filter_map(|region| {
                 Some((
@@ -795,32 +795,81 @@ impl BlockGraph {
             })
             .collect::<Vec<_>>();
         let mut pending = vec![entry];
-        pending.extend(
-            region_blocks
-                .iter()
-                .filter_map(|(start, end, handler)| (start == end).then_some(*handler)),
-        );
-        while let Some(block) = pending.pop() {
-            if std::mem::replace(&mut reachable[block.index()], true) {
-                continue;
+        region_blocks.retain(|(start, end, handler)| {
+            if start == end {
+                pending.push(*handler);
+                false
+            } else {
+                true
             }
-            let position = order_positions[block.index()];
-            if block_has_fallthrough(self[block].items())
-                && let Some(next) = self.order.get(position + 1)
-            {
-                pending.push(*next);
-            }
-            if let Some(target) = block_jump_target(self[block].items())
-                && let Some(target) = self.label_block(target)
-            {
-                pending.push(target);
-            }
-            for (start, end, handler) in &region_blocks {
-                if order_positions[start.index()] <= position
-                    && position < order_positions[end.index()]
-                {
-                    pending.push(*handler);
+        });
+        if region_blocks.len() <= 4 {
+            while let Some(block) = pending.pop() {
+                if std::mem::replace(&mut reachable[block.index()], true) {
+                    continue;
                 }
+                let position = order_positions[block.index()];
+                if block_has_fallthrough(self[block].items())
+                    && let Some(next) = self.order.get(position + 1)
+                {
+                    pending.push(*next);
+                }
+                if let Some(target) = block_jump_target(self[block].items())
+                    && let Some(target) = self.label_block(target)
+                {
+                    pending.push(target);
+                }
+                for (start, end, handler) in &region_blocks {
+                    if order_positions[start.index()] <= position
+                        && position < order_positions[end.index()]
+                    {
+                        pending.push(*handler);
+                    }
+                }
+            }
+            return reachable;
+        }
+        let mut reachable_prefix = Vec::new();
+        loop {
+            while let Some(block) = pending.pop() {
+                if std::mem::replace(&mut reachable[block.index()], true) {
+                    continue;
+                }
+                let position = order_positions[block.index()];
+                if block_has_fallthrough(self[block].items())
+                    && let Some(next) = self.order.get(position + 1)
+                {
+                    pending.push(*next);
+                }
+                if let Some(target) = block_jump_target(self[block].items())
+                    && let Some(target) = self.label_block(target)
+                {
+                    pending.push(target);
+                }
+            }
+
+            if region_blocks.is_empty() {
+                break;
+            }
+            if reachable_prefix.is_empty() {
+                reachable_prefix.resize(self.order.len() + 1, 0);
+            }
+            for (position, block) in self.order.iter().copied().enumerate() {
+                reachable_prefix[position + 1] =
+                    reachable_prefix[position] + usize::from(reachable[block.index()]);
+            }
+            region_blocks.retain(|(start, end, handler)| {
+                let start = order_positions[start.index()];
+                let end = order_positions[end.index()];
+                if start < end && reachable_prefix[start] < reachable_prefix[end] {
+                    pending.push(*handler);
+                    false
+                } else {
+                    true
+                }
+            });
+            if pending.is_empty() {
+                break;
             }
         }
         reachable

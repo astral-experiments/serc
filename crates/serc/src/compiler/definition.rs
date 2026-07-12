@@ -550,11 +550,14 @@ impl Compiler {
                 None
             };
             if let Some(defaults) = folded_defaults {
-                let hidden_owner_slots = positional_defaults
-                    .iter()
-                    .fold(positional_defaults.len(), |slots, default| {
-                        slots.saturating_add(folded_constant_owner_slots(default))
-                    });
+                let mut hidden_owner_slots = positional_defaults.len().min(3);
+                for default in &positional_defaults {
+                    if hidden_owner_slots == 3 {
+                        break;
+                    }
+                    hidden_owner_slots =
+                        (hidden_owner_slots + folded_constant_owner_slots(default)).min(3);
+                }
                 for default in &positional_defaults {
                     self.record_folded_value(default)?;
                 }
