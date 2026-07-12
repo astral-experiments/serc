@@ -797,6 +797,7 @@ pub(super) struct ScopeArena {
     pub(super) names: NameInterner,
     nodes: Vec<ScopeNode>,
     by_parent_and_origin: FxHashMap<(ScopeId, ScopeOrigin), ScopeId>,
+    flat_functions: FxHashMap<u32, FlatFunctionInputs>,
 }
 
 #[derive(Debug)]
@@ -873,6 +874,7 @@ impl Default for ScopeArena {
                 children: Vec::new(),
             }],
             by_parent_and_origin: FxHashMap::default(),
+            flat_functions: FxHashMap::default(),
         }
     }
 }
@@ -914,7 +916,8 @@ impl ScopeArena {
         }
         // Unordered module facts share the existing name walk. The separate local collector is
         // retained only for its CPython-sensitive comprehension-target ordering.
-        let facts = ModuleNameCollector::collect(&mut arena.names, body);
+        let (facts, flat_functions) = ModuleNameCollector::collect(&mut arena.names, body);
+        arena.flat_functions = flat_functions;
         let mut bindings = LocalCollector::default();
         bindings.collect_suite(body);
         arena.build_suite(ScopeId::MODULE, body, future_annotations);
@@ -985,6 +988,34 @@ impl ScopeArena {
         definition: &StmtFunctionDef,
         future_annotations: bool,
     ) {
+        // Flat functions have no closure, annotation, or evaluation-order edge cases. Their
+        // bindings and references were already collected during the module-wide name walk.
+        if let Some(inputs) = self
+            .flat_functions
+            .remove(&u32::from(definition.range.start()))
+        {
+            let mut locals = Vec::with_capacity(inputs.names.len());
+            let mut required = FxHashSet::default();
+            required.reserve(inputs.names.len());
+            for (name, bound) in inputs.names {
+                if bound {
+                    locals.push(name);
+                } else {
+                    required.insert(name);
+                }
+            }
+            self.add_scope(
+                parent,
+                ScopeOrigin::function(definition),
+                ScopePlan::Function(FunctionPlan {
+                    locals,
+                    required,
+                    ..FunctionPlan::default()
+                }),
+            );
+            return;
+        }
+
         let facts = ScopeBodyFacts::for_function(&definition.body);
         let id = self.add_scope(
             parent,
@@ -1109,10 +1140,37 @@ struct ModuleNameCollector<'a> {
     nested_scope_depth: usize,
     comprehension_depth: usize,
     generator_depth: usize,
+    flat_function: Option<FlatFunctionInputs>,
+    flat_functions: FxHashMap<u32, FlatFunctionInputs>,
+}
+
+#[derive(Debug)]
+struct FlatFunctionInputs {
+    // Preserve the first runtime occurrence of each name; a later store upgrades the existing
+    // entry without moving it, matching CPython's load-before-store local ordering.
+    names: Vec<(NameId, bool)>,
+    complex: bool,
+}
+
+impl FlatFunctionInputs {
+    fn record(&mut self, name: NameId, bound: bool) {
+        if let Some((_, was_bound)) = self
+            .names
+            .iter_mut()
+            .find(|(existing, _)| *existing == name)
+        {
+            *was_bound |= bound;
+        } else {
+            self.names.push((name, bound));
+        }
+    }
 }
 
 impl<'a> ModuleNameCollector<'a> {
-    fn collect(names: &'a mut NameInterner, body: &[Stmt]) -> ModulePlanBuilder {
+    fn collect(
+        names: &'a mut NameInterner,
+        body: &[Stmt],
+    ) -> (ModulePlanBuilder, FxHashMap<u32, FlatFunctionInputs>) {
         let mut collector = Self {
             names,
             private_name: None,
@@ -1120,16 +1178,31 @@ impl<'a> ModuleNameCollector<'a> {
             nested_scope_depth: 0,
             comprehension_depth: 0,
             generator_depth: 0,
+            flat_function: None,
+            flat_functions: FxHashMap::default(),
         };
         collector.collect_suite(body);
-        collector.facts
+        (collector.facts, collector.flat_functions)
     }
 
-    fn intern(&mut self, name: &str) {
+    fn intern(&mut self, name: &str) -> NameId {
         let mangled = mangle_name(name, self.private_name.as_deref());
-        self.names.intern(name);
+        let id = self.names.intern(name);
         if let Cow::Owned(mangled) = mangled {
             self.names.intern_owned(mangled);
+        }
+        id
+    }
+
+    fn record_flat(&mut self, name: NameId, bound: bool) {
+        if let Some(flat) = &mut self.flat_function {
+            flat.record(name, bound);
+        }
+    }
+
+    fn mark_flat_complex(&mut self) {
+        if let Some(flat) = &mut self.flat_function {
+            flat.complex = true;
         }
     }
 
@@ -1168,14 +1241,72 @@ impl<'a> ModuleNameCollector<'a> {
 impl<'ast> Visitor<'ast> for ModuleNameCollector<'_> {
     fn visit_stmt(&mut self, statement: &'ast Stmt) {
         let at_module_scope = self.nested_scope_depth == 0;
+        if matches!(
+            statement,
+            Stmt::AugAssign(_)
+                | Stmt::AnnAssign(_)
+                | Stmt::Try(_)
+                | Stmt::Match(_)
+                | Stmt::Global(_)
+                | Stmt::Nonlocal(_)
+                | Stmt::TypeAlias(_)
+                | Stmt::ClassDef(_)
+        ) {
+            self.mark_flat_complex();
+        }
         match statement {
             Stmt::FunctionDef(definition) => {
+                self.mark_flat_complex();
                 self.intern(definition.name.as_str());
-                self.collect_parameters(&definition.parameters);
+                let outer_flat = self.flat_function.take();
+                let mut flat = FlatFunctionInputs {
+                    names: Vec::with_capacity(8),
+                    complex: definition.type_params.is_some()
+                        || definition.returns.is_some()
+                        || definition
+                            .parameters
+                            .iter()
+                            .any(|parameter| parameter.annotation().is_some()),
+                };
+                for parameter in definition
+                    .parameters
+                    .posonlyargs
+                    .iter()
+                    .chain(&definition.parameters.args)
+                    .chain(&definition.parameters.kwonlyargs)
+                {
+                    flat.record(self.intern(parameter.name().as_str()), true);
+                }
+                if let Some(parameter) = &definition.parameters.vararg {
+                    flat.record(self.intern(parameter.name.as_str()), true);
+                }
+                if let Some(parameter) = &definition.parameters.kwarg {
+                    flat.record(self.intern(parameter.name.as_str()), true);
+                }
                 self.collect_type_parameters(definition.type_params.as_deref());
                 self.nested_scope_depth += 1;
-                walk_stmt(self, statement);
+                for decorator in &definition.decorator_list {
+                    self.visit_decorator(decorator);
+                }
+                if let Some(type_params) = definition.type_params.as_deref() {
+                    self.visit_type_params(type_params);
+                }
+                self.visit_parameters(&definition.parameters);
+                if let Some(returns) = definition.returns.as_deref() {
+                    self.visit_annotation(returns);
+                }
+                self.flat_function = Some(flat);
+                self.collect_suite(&definition.body);
                 self.nested_scope_depth -= 1;
+                let flat = self
+                    .flat_function
+                    .take()
+                    .expect("function name collection should retain its flat inputs");
+                if !flat.complex {
+                    self.flat_functions
+                        .insert(u32::from(definition.range.start()), flat);
+                }
+                self.flat_function = outer_flat;
                 return;
             }
             Stmt::ClassDef(definition) => {
@@ -1228,7 +1359,8 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_> {
                         || alias.name.as_str().split('.').next().unwrap_or(""),
                         |name| name.as_str(),
                     );
-                    self.intern(bound_name);
+                    let id = self.intern(bound_name);
+                    self.record_flat(id, true);
                     if at_module_scope {
                         self.facts
                             .imported_scope_names
@@ -1250,7 +1382,8 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_> {
                             .asname
                             .as_ref()
                             .map_or(alias.name.as_str(), |name| name.as_str());
-                        self.intern(bound_name);
+                        let id = self.intern(bound_name);
+                        self.record_flat(id, true);
                         // CPython's method-call optimization queries DEF_IMPORT on the module
                         // symbol table, where future feature names and aliases remain imports.
                         if at_module_scope {
@@ -1276,9 +1409,24 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_> {
     }
 
     fn visit_expr(&mut self, expression: &'ast Expr) {
+        if matches!(
+            expression,
+            Expr::Lambda(_)
+                | Expr::Generator(_)
+                | Expr::ListComp(_)
+                | Expr::SetComp(_)
+                | Expr::DictComp(_)
+                | Expr::Named(_)
+        ) {
+            self.mark_flat_complex();
+        }
         match expression {
             Expr::Name(name) => {
-                self.intern(name.id.as_str());
+                let id = self.intern(name.id.as_str());
+                if name.id.as_str() == "super" {
+                    self.mark_flat_complex();
+                }
+                self.record_flat(id, name.ctx != ExprContext::Load);
             }
             Expr::Attribute(attribute) => {
                 self.intern(attribute.attr.as_str());
