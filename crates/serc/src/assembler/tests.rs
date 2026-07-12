@@ -1023,6 +1023,39 @@ fn redundant_jump_removal_preserves_borrow_traversal_barrier() {
 }
 
 #[test]
+fn deferred_nonadjacent_forward_jump_is_still_resolved() {
+    let target = super::Label(0);
+    let mut jump = Instruction::new(
+        JUMP_FORWARD,
+        Operand::Forward(target),
+        SourceLocation::NONE,
+        None,
+    );
+    jump.jump_policy.defer_removal();
+    let mut assembler = optimization_pipeline(vec![
+        Item::Instruction(jump),
+        pass_instruction(LOAD_CONST, 0, 1),
+        Item::Label(target),
+        pass_instruction(RETURN_VALUE, 0, 1),
+    ]);
+
+    assembler.remove_redundant_forward_jumps(false);
+
+    let jump = assembler
+        .graph
+        .iter_items()
+        .find_map(|item| match item {
+            Item::Instruction(instruction) if instruction.opcode == JUMP_FORWARD => {
+                Some(instruction)
+            }
+            Item::Instruction(_) | Item::Label(_) => None,
+        })
+        .unwrap();
+    assert_eq!(jump.operand, Operand::Forward(target));
+    assert!(!jump.jump_policy.defers_redundant_removal());
+}
+
+#[test]
 fn borrow_empty_block_marker_survives_until_local_analysis() {
     let target = super::Label(0);
     let mut jump = Instruction::new(

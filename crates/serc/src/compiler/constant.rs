@@ -269,12 +269,18 @@ impl Compiler {
         &mut self,
         values: Vec<Constant>,
     ) -> Result<u32, CompileError> {
-        self.output
-            .interned_constant_strings
-            .extend(values.iter().filter_map(|value| match value {
-                Constant::String(value) => Some(value.clone()),
-                _ => None,
-            }));
+        for value in values.iter().filter_map(|value| match value {
+            Constant::String(value) => Some(value),
+            _ => None,
+        }) {
+            if !self
+                .output
+                .interned_constant_strings
+                .contains(value.as_str())
+            {
+                self.output.interned_constant_strings.insert(value.clone());
+            }
+        }
         self.add_constant(Constant::Tuple(values))
     }
 
@@ -282,8 +288,12 @@ impl Compiler {
         let mut used = self
             .assembler
             .used_constant_indices(LOAD_CONST, self.output.constants.len());
-        if let Some(index) = self.assembler.deferred_none_constant_index() {
+        let deferred_none = self.assembler.deferred_none_constant_index();
+        if let Some(index) = deferred_none {
             used[usize::try_from(index).expect("constant index should fit in usize")] = true;
+        }
+        if deferred_none.is_none() && used.iter().skip(1).all(|used| *used) {
+            return Ok(());
         }
         let index_map = self.output.constants.retain_used(&used)?;
         self.assembler

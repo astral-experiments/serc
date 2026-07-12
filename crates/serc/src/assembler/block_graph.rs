@@ -787,16 +787,20 @@ impl BlockGraph {
         let mut region_blocks = exception_regions
             .iter()
             .filter_map(|region| {
+                let start = self.label_block(region.start)?;
+                let end = self.label_block(region.end)?;
                 Some((
-                    self.label_block(region.start)?,
-                    self.label_block(region.end)?,
+                    order_positions[start.index()],
+                    order_positions[end.index()],
                     self.label_block(region.target)?,
+                    start == end,
                 ))
             })
             .collect::<Vec<_>>();
-        let mut pending = vec![entry];
-        region_blocks.retain(|(start, end, handler)| {
-            if start == end {
+        let mut pending = Vec::with_capacity(region_blocks.len().saturating_add(1));
+        pending.push(entry);
+        region_blocks.retain(|(_, _, handler, empty)| {
+            if *empty {
                 pending.push(*handler);
                 false
             } else {
@@ -819,13 +823,13 @@ impl BlockGraph {
                 {
                     pending.push(target);
                 }
-                for (start, end, handler) in &region_blocks {
-                    if order_positions[start.index()] <= position
-                        && position < order_positions[end.index()]
-                    {
+                region_blocks.retain(|(start, end, handler, _)| {
+                    let is_protected = *start <= position && position < *end;
+                    if is_protected {
                         pending.push(*handler);
                     }
-                }
+                    !is_protected
+                });
             }
             return reachable;
         }
@@ -858,10 +862,8 @@ impl BlockGraph {
                 reachable_prefix[position + 1] =
                     reachable_prefix[position] + usize::from(reachable[block.index()]);
             }
-            region_blocks.retain(|(start, end, handler)| {
-                let start = order_positions[start.index()];
-                let end = order_positions[end.index()];
-                if start < end && reachable_prefix[start] < reachable_prefix[end] {
+            region_blocks.retain(|(start, end, handler, _)| {
+                if *start < *end && reachable_prefix[*start] < reachable_prefix[*end] {
                     pending.push(*handler);
                     false
                 } else {

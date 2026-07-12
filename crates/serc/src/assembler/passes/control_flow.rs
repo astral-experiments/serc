@@ -414,26 +414,45 @@ impl OptimizationPipeline {
         finalize_borrow_empty_blocks: bool,
     ) {
         let graph = &mut self.graph;
-        if !graph.iter_items().any(|item| {
-            matches!(
-                item,
-                Item::Instruction(instruction)
-                    if instruction.opcode == JUMP_FORWARD
-                        && matches!(instruction.operand, Operand::Forward(_))
-            )
-        }) {
+        let mut target = None;
+        let mut has_work = false;
+        for item in graph.iter_items() {
+            match item {
+                Item::Label(label) if target == Some(*label) => {
+                    has_work = true;
+                    break;
+                }
+                Item::Label(_) => {}
+                Item::Instruction(instruction) => {
+                    target = None;
+                    if instruction.opcode != JUMP_FORWARD {
+                        continue;
+                    }
+                    let Operand::Forward(jump_target) = instruction.operand else {
+                        continue;
+                    };
+                    if instruction.jump_policy.defers_redundant_removal() {
+                        has_work = true;
+                        break;
+                    }
+                    if !instruction.jump_policy.borrow_empty_block() || finalize_borrow_empty_blocks
+                    {
+                        target = Some(jump_target);
+                    }
+                }
+            }
+        }
+        if !has_work {
             return;
         }
-        let mut items = graph
+        let item_count = graph
             .iter()
-            .flat_map(|(block, contents)| {
-                contents
-                    .items()
-                    .iter()
-                    .copied()
-                    .map(move |item| (block, item))
-            })
-            .collect::<Vec<_>>();
+            .map(|(_, contents)| contents.items().len())
+            .sum();
+        let mut items = Vec::with_capacity(item_count);
+        for (block, contents) in graph.iter() {
+            items.extend(contents.items().iter().copied().map(|item| (block, item)));
+        }
         let mut index = 0;
         while index < items.len() {
             let Item::Instruction(instruction) = items[index].1 else {
