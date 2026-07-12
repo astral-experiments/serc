@@ -146,13 +146,11 @@ fn compiler_stack_effect_validation_rejects_stale_lowering_metadata() {
     );
 }
 
-fn module_compiler(source: &str, parsed: &Parsed<ModModule>) -> Compiler {
-    Compiler::module(
-        "example.py",
-        source,
-        parsed.tokens().clone(),
-        parsed.suite(),
-    )
+fn module_compiler<'source>(
+    source: &'source str,
+    parsed: &'source Parsed<ModModule>,
+) -> Compiler<'source> {
+    Compiler::module("example.py", source, parsed.tokens(), parsed.suite())
 }
 
 #[test]
@@ -882,10 +880,9 @@ fn compiles_type_alias() {
 fn retains_parser_tokens_in_the_shared_compilation_context() {
     let source = "value = (\n    1  # comment\n)\n";
     let parsed = parse_module(source).unwrap();
-    let expected = parsed.tokens().clone();
     let compiler = module_compiler(source, &parsed);
 
-    assert_eq!(compiler.context.tokens, expected);
+    assert_eq!(compiler.context.tokens, parsed.tokens());
 }
 
 #[test]

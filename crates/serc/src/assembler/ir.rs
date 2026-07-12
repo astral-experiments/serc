@@ -733,6 +733,7 @@ pub(crate) struct Assembler {
     pub(super) strict_owned_loads: bool,
     pub(super) forced_borrowed_loads: bool,
     pub(super) has_synthesized_percent_target_locations: bool,
+    pub(super) has_next_location: bool,
 }
 
 /// The block-aware assembler state used by CFG optimization passes.
@@ -747,6 +748,7 @@ pub(super) struct OptimizationPipeline {
     pub(super) preserved_block_boundaries: FxHashSet<Label>,
     pub(super) borrow_unreachable_blocks: FxHashSet<Label>,
     pub(super) has_synthesized_percent_target_locations: bool,
+    pub(super) has_next_location: bool,
 }
 
 /// The linear assembler state used after CFG optimization is complete.
@@ -757,6 +759,7 @@ pub(super) struct LayoutAssembler {
     pub(super) preserved_block_boundaries: FxHashSet<Label>,
     pub(super) removed_max_depth: Option<u32>,
     pub(super) next_label: u32,
+    pub(super) has_next_location: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -809,6 +812,7 @@ impl Default for Assembler {
             strict_owned_loads: false,
             forced_borrowed_loads: false,
             has_synthesized_percent_target_locations: false,
+            has_next_location: false,
         }
     }
 }

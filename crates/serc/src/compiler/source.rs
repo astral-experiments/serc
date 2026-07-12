@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use ruff_python_ast::token::{TokenKind, Tokens};
 use ruff_python_ast::{
     Expr, ExprContext, FStringPart, InterpolatedStringElement, Operator, Stmt, Suite,
@@ -17,10 +15,10 @@ use super::scope::{ModulePlan, ScopeArena};
 use super::{CachedSourceLine, Compiler};
 
 #[derive(Debug)]
-pub(super) struct CompilationContext {
+pub(super) struct CompilationContext<'source> {
     pub(super) filename: String,
-    pub(super) source: Arc<str>,
-    pub(super) tokens: Tokens,
+    pub(super) source: &'source str,
+    pub(super) tokens: &'source Tokens,
     line_index: LineIndex,
     pub(super) module_plan: ModulePlan,
     pub(super) scopes: ScopeArena,
@@ -37,13 +35,18 @@ pub(super) struct CallShape<'a> {
     pub(super) direct_method: Option<&'a ruff_python_ast::ExprAttribute>,
 }
 
-impl CompilationContext {
-    pub(super) fn new(filename: &str, source: &str, tokens: Tokens, body: &Suite) -> Self {
+impl<'source> CompilationContext<'source> {
+    pub(super) fn new(
+        filename: &str,
+        source: &'source str,
+        tokens: &'source Tokens,
+        body: &Suite,
+    ) -> Self {
         let (scopes, module_plan) = ScopeArena::analyze(body);
         let has_lazy_imports = suite_has_lazy_imports(body);
         Self {
             filename: filename.to_string(),
-            source: Arc::from(source),
+            source,
             tokens,
             line_index: LineIndex::from_source_text(source),
             module_plan,
@@ -60,7 +63,7 @@ fn suite_has_lazy_imports(body: &Suite) -> bool {
     })
 }
 
-impl Compiler {
+impl Compiler<'_> {
     pub(super) fn line_number(&self, offset: u32) -> u32 {
         self.source_line(self.source_offset(offset)).number
     }
@@ -236,7 +239,7 @@ impl Compiler {
             return generator.range;
         }
 
-        ruff_python_ast::token::parentheses_iterator(generator.into(), None, &self.context.tokens)
+        ruff_python_ast::token::parentheses_iterator(generator.into(), None, self.context.tokens)
             .next()
             .unwrap_or(generator.range)
     }
@@ -458,7 +461,7 @@ pub(super) fn strip_expression_comments(source: &str) -> String {
     output
 }
 pub(super) fn implicit_return_range(
-    compiler: &Compiler,
+    compiler: &Compiler<'_>,
     statement: &Stmt,
 ) -> ruff_text_size::TextRange {
     match statement {
@@ -521,7 +524,10 @@ pub(super) fn synthetic_condition_exit_range(expression: &Expr) -> ruff_text_siz
     unary_not_condition_exit_range(expression).unwrap_or(expression.range())
 }
 
-fn last_store_target_range(compiler: &Compiler, expression: &Expr) -> ruff_text_size::TextRange {
+fn last_store_target_range(
+    compiler: &Compiler<'_>,
+    expression: &Expr,
+) -> ruff_text_size::TextRange {
     match expression {
         Expr::List(list) => list.elts.last().map_or(expression.range(), |target| {
             last_store_target_range(compiler, target)

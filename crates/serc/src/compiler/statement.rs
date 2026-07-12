@@ -514,7 +514,7 @@ impl ControlFlowState {
     }
 }
 
-impl Compiler {
+impl Compiler<'_> {
     fn loop_context(
         &self,
         continue_label: Label,

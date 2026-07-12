@@ -73,8 +73,12 @@ struct CodeUnitSpec {
     first_line_number: u32,
 }
 
-impl Compiler {
-    fn new(context: Arc<CompilationContext>, unit: CodeUnit, symbols: SymbolState) -> Self {
+impl<'source> Compiler<'source> {
+    fn new(
+        context: Arc<CompilationContext<'source>>,
+        unit: CodeUnit,
+        symbols: SymbolState,
+    ) -> Self {
         Self {
             context,
             cached_source_line: Cell::new(None),
@@ -86,7 +90,12 @@ impl Compiler {
         }
     }
 
-    pub(crate) fn module(filename: &str, source: &str, tokens: Tokens, body: &Suite) -> Self {
+    pub(crate) fn module(
+        filename: &str,
+        source: &'source str,
+        tokens: &'source Tokens,
+        body: &Suite,
+    ) -> Self {
         let context = Arc::new(CompilationContext::new(filename, source, tokens, body));
         let future_flags = context.module_plan.future_flags;
         let unit = CodeUnit::from_spec(CodeUnitSpec {
@@ -105,7 +114,7 @@ impl Compiler {
     }
 
     pub(super) fn function(
-        context: Arc<CompilationContext>,
+        context: Arc<CompilationContext<'source>>,
         name: &str,
         qualified_name: String,
         first_line_number: u32,
@@ -197,7 +206,7 @@ impl Compiler {
     }
 
     pub(super) fn class(
-        context: Arc<CompilationContext>,
+        context: Arc<CompilationContext<'source>>,
         name: &str,
         qualified_name: String,
         first_line_number: u32,

@@ -58,14 +58,14 @@ impl OptimizationPipeline {
     /// This is the first half of CPython's `swaptimize` pass. Reconstructing the
     /// permutation from the end of the run guarantees that the replacement fits
     /// in the original instruction slots.
-    pub(in crate::assembler) fn optimize_swap_runs(&mut self) {
+    pub(in crate::assembler) fn optimize_swap_runs(&mut self) -> Vec<Vec<ItemPosition>> {
         const VISITED: usize = usize::MAX;
 
         let graph = &self.graph;
         if !graph.iter_items().any(
             |item| matches!(item, Item::Instruction(instruction) if instruction.opcode == SWAP),
         ) {
-            return;
+            return Vec::new();
         }
         let mut block_labels = FxHashSet::default();
         for item in graph.iter_items() {
@@ -85,9 +85,10 @@ impl OptimizationPipeline {
             !matches!(instruction.operand, Operand::Value(_)) || ends_scope(instruction.opcode)
         });
         let graph = &mut self.graph;
-        for block in blocks {
+        for block in &blocks {
             let instruction_positions = block
-                .into_iter()
+                .iter()
+                .copied()
                 .filter(|position| matches!(graph.item(*position), Item::Instruction(_)))
                 .collect::<Vec<_>>();
             let mut position = 0;
@@ -179,6 +180,7 @@ impl OptimizationPipeline {
                 position = run_end;
             }
         }
+        blocks
     }
 
     /// Applies stack swaps statically by reordering local stores and pops.
@@ -186,7 +188,7 @@ impl OptimizationPipeline {
     /// This is the `apply_static_swaps` half of CPython's `swaptimize` pass and
     /// must run before adjacent local stores are fused. Reverse traversal applies
     /// consecutive swaps from right to left, matching CPython's per-run handoff.
-    pub(in crate::assembler) fn apply_static_swaps(&mut self) {
+    pub(in crate::assembler) fn apply_static_swaps(&mut self, blocks: Vec<Vec<ItemPosition>>) {
         fn swappable(instruction: &Instruction) -> bool {
             matches!(instruction.opcode, POP_TOP | STORE_FAST)
         }
@@ -224,29 +226,6 @@ impl OptimizationPipeline {
             None
         }
 
-        let graph = &self.graph;
-        if !graph.iter_items().any(
-            |item| matches!(item, Item::Instruction(instruction) if instruction.opcode == SWAP),
-        ) {
-            return;
-        }
-        let mut block_labels = FxHashSet::default();
-        for item in graph.iter_items() {
-            if let Item::Instruction(Instruction {
-                operand: Operand::Forward(label) | Operand::Backward(label),
-                ..
-            }) = item
-            {
-                block_labels.insert(*label);
-            }
-        }
-        for region in &self.exception_regions {
-            block_labels.extend([region.start, region.end, region.target]);
-        }
-        block_labels.extend(self.preserved_block_boundaries.iter().copied());
-        let blocks = graph.partition_positions(&block_labels, |instruction| {
-            !matches!(instruction.operand, Operand::Value(_)) || ends_scope(instruction.opcode)
-        });
         let graph = &mut self.graph;
         for positions in blocks {
             let mut index = positions.len();

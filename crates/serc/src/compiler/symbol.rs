@@ -96,7 +96,7 @@ impl ReraiseStackState {
     }
 }
 
-impl Compiler {
+impl Compiler<'_> {
     fn name_id(&self, name: &str) -> Option<NameId> {
         self.context.scopes.names.get(name)
     }

@@ -13,6 +13,7 @@ use super::super::{
     block_jump_target, ends_scope, opcode_num_popped, opcode_num_pushed, opcode_stack_effect,
 };
 use crate::assembler::OptimizationPipeline;
+use crate::assembler::block_graph::ItemMut;
 
 impl OptimizationPipeline {
     /// Converts potentially uninitialized local loads to checked loads.
@@ -100,52 +101,49 @@ impl OptimizationPipeline {
             block_starts[block.index()] = item_count;
             item_count += graph[block].items().len();
         }
-        let positions = graph.item_positions();
-        debug_assert_eq!(positions.len(), item_count);
         let mut label_positions = vec![None; usize::try_from(self.next_label).unwrap()];
-        for (index, position) in positions.iter().enumerate() {
-            if let Item::Label(label) = graph.item(*position) {
+        for (index, item) in graph.iter_items().enumerate() {
+            if let Item::Label(label) = item {
                 label_positions[usize::try_from(label.0).unwrap()] = Some(index);
             }
         }
 
-        let mut exception_successors = vec![None; positions.len()];
-        for (index, position) in positions.iter().copied().enumerate() {
-            if !matches!(graph.item(position), Item::Instruction(_)) {
-                continue;
-            }
-            let mut innermost = None::<(usize, usize, usize)>;
-            for region in &self.exception_regions {
-                let (Some(start), Some(end), Some(target)) = (
-                    label_positions
-                        .get(usize::try_from(region.start.0).unwrap())
-                        .copied()
-                        .flatten(),
-                    label_positions
-                        .get(usize::try_from(region.end.0).unwrap())
-                        .copied()
-                        .flatten(),
-                    graph.label_block(region.target).and_then(|block| {
-                        block_indices
-                            .get(block.index())
-                            .copied()
-                            .filter(|index| *index != usize::MAX)
-                    }),
-                ) else {
-                    continue;
-                };
-                if start <= index && index < end {
-                    let span = end - start;
-                    if innermost.is_none_or(|(best_start, best_span, _)| {
-                        start > best_start || (start == best_start && span < best_span)
-                    }) {
-                        innermost = Some((start, span, target));
-                    }
+        let mut exception_regions = self
+            .exception_regions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, region)| {
+                let start = label_positions
+                    .get(usize::try_from(region.start.0).unwrap())
+                    .copied()
+                    .flatten()?;
+                let end = label_positions
+                    .get(usize::try_from(region.end.0).unwrap())
+                    .copied()
+                    .flatten()?;
+                if end <= start {
+                    return None;
                 }
-            }
-            if let Some((_, _, target)) = innermost {
-                exception_successors[index] = Some(target);
-            }
+                let target = graph.label_block(region.target).and_then(|block| {
+                    block_indices
+                        .get(block.index())
+                        .copied()
+                        .filter(|index| *index != usize::MAX)
+                })?;
+                Some((start, end - start, target, index))
+            })
+            .collect::<Vec<_>>();
+        exception_regions.sort_unstable_by(
+            |(left_start, left_span, _, left_index), (right_start, right_span, _, right_index)| {
+                left_start
+                    .cmp(right_start)
+                    .then_with(|| right_span.cmp(left_span))
+                    .then_with(|| right_index.cmp(left_index))
+            },
+        );
+        let mut exception_successors = vec![None; item_count];
+        for (start, span, target, _) in exception_regions {
+            exception_successors[start..start + span].fill(Some(target));
         }
 
         let initialized = parameter_count.min(local_count).min(64);
@@ -268,18 +266,21 @@ impl OptimizationPipeline {
         }
 
         let graph = &mut self.graph;
-        for (index, position) in positions.into_iter().enumerate() {
-            let Some(instruction) = graph.instruction_mut(position) else {
-                continue;
-            };
-            match instruction.opcode {
-                LOAD_FAST_CHECK if !checked_loads_needing_check[index] => {
-                    instruction.opcode = LOAD_FAST;
+        for block in order {
+            for (offset, item) in graph.iter_items_mut(block).enumerate() {
+                let ItemMut::Instruction(instruction) = item else {
+                    continue;
+                };
+                let index = block_starts[block.index()] + offset;
+                match instruction.opcode {
+                    LOAD_FAST_CHECK if !checked_loads_needing_check[index] => {
+                        instruction.opcode = LOAD_FAST;
+                    }
+                    LOAD_FAST if needs_check[index] => {
+                        instruction.opcode = LOAD_FAST_CHECK;
+                    }
+                    _ => {}
                 }
-                LOAD_FAST if needs_check[index] => {
-                    instruction.opcode = LOAD_FAST_CHECK;
-                }
-                _ => {}
             }
         }
     }
@@ -290,13 +291,20 @@ impl OptimizationPipeline {
     /// that local as initialized for subsequent instructions on the same path.
     pub(in crate::assembler) fn remove_redundant_checked_loads(&mut self) {
         let graph = &mut self.graph;
-        if !graph.iter_items().any(|item| {
-            matches!(item, Item::Instruction(instruction) if instruction.opcode == LOAD_FAST_CHECK)
-        }) {
+        let checked_blocks = graph
+            .order()
+            .iter()
+            .copied()
+            .filter(|block| {
+                graph[*block].items().iter().any(|item| {
+                    matches!(item, Item::Instruction(instruction) if instruction.opcode == LOAD_FAST_CHECK)
+                })
+            })
+            .collect::<Vec<_>>();
+        if checked_blocks.is_empty() {
             return;
         }
-        let order = graph.order().to_vec();
-        for block in order {
+        for block in checked_blocks {
             let mut initialized = FxHashSet::default();
             for instruction in graph.instructions_mut(block) {
                 let Operand::Value(argument) = instruction.operand else {
@@ -340,21 +348,108 @@ impl OptimizationPipeline {
     /// consumed in the same basic block, is not stored into another local, and
     /// remains supported by the original local until it is consumed.
     pub(in crate::assembler) fn optimize_load_fast(&mut self) {
-        #[derive(Clone, Copy)]
+        #[derive(Clone, Copy, Default)]
         struct Reference {
             producer: Option<usize>,
             local: Option<u32>,
         }
 
-        fn pop_reference(stack: &mut Vec<Reference>) -> Reference {
-            stack.pop().unwrap_or(Reference {
-                producer: None,
-                local: None,
-            })
+        #[derive(Default)]
+        struct ReferenceStack {
+            depth: usize,
+            references: Vec<(usize, Reference)>,
         }
 
-        fn kill_local(unsafe_loads: &mut [bool], stack: &[Reference], local: u32) {
-            for reference in stack {
+        impl ReferenceStack {
+            fn reset(&mut self, depth: usize) {
+                self.depth = depth;
+                self.references.clear();
+            }
+
+            fn push(&mut self, reference: Reference) {
+                if reference.producer.is_some() || reference.local.is_some() {
+                    self.references.push((self.depth, reference));
+                }
+                self.depth += 1;
+            }
+
+            fn push_unknown(&mut self, count: usize) {
+                self.depth += count;
+            }
+
+            fn pop(&mut self) -> Reference {
+                if self.depth == 0 {
+                    return Reference::default();
+                }
+                self.depth -= 1;
+                if self
+                    .references
+                    .last()
+                    .is_some_and(|(slot, _)| *slot == self.depth)
+                {
+                    self.references.pop().unwrap().1
+                } else {
+                    Reference::default()
+                }
+            }
+
+            fn pop_many(&mut self, count: usize) {
+                self.depth = self.depth.saturating_sub(count);
+                while self
+                    .references
+                    .last()
+                    .is_some_and(|(slot, _)| *slot >= self.depth)
+                {
+                    self.references.pop();
+                }
+            }
+
+            fn get(&self, slot: usize) -> Reference {
+                self.references
+                    .binary_search_by_key(&slot, |(candidate, _)| *candidate)
+                    .ok()
+                    .map_or_else(Reference::default, |index| self.references[index].1)
+            }
+
+            fn set(&mut self, slot: usize, reference: Reference) {
+                match self
+                    .references
+                    .binary_search_by_key(&slot, |(candidate, _)| *candidate)
+                {
+                    Ok(index) if reference.producer.is_none() && reference.local.is_none() => {
+                        self.references.remove(index);
+                    }
+                    Ok(index) => self.references[index].1 = reference,
+                    Err(index) if reference.producer.is_some() || reference.local.is_some() => {
+                        self.references.insert(index, (slot, reference));
+                    }
+                    Err(_) => {}
+                }
+            }
+
+            fn copy_from_top(&self, distance: u32) -> Reference {
+                self.depth
+                    .checked_sub(usize::try_from(distance).unwrap())
+                    .map_or_else(Reference::default, |slot| self.get(slot))
+            }
+
+            fn swap_from_top(&mut self, distance: u32) {
+                let Some(slot) = self.depth.checked_sub(usize::try_from(distance).unwrap()) else {
+                    return;
+                };
+                let top = self.depth.saturating_sub(1);
+                if slot >= self.depth {
+                    return;
+                }
+                let left = self.get(slot);
+                let right = self.get(top);
+                self.set(slot, right);
+                self.set(top, left);
+            }
+        }
+
+        fn kill_local(unsafe_loads: &mut [bool], stack: &ReferenceStack, local: u32) {
+            for (_, reference) in &stack.references {
                 if reference.local == Some(local)
                     && let Some(producer) = reference.producer
                 {
@@ -365,7 +460,7 @@ impl OptimizationPipeline {
 
         fn store_local(
             unsafe_loads: &mut [bool],
-            stack: &[Reference],
+            stack: &ReferenceStack,
             local: u32,
             reference: Reference,
         ) {
@@ -470,6 +565,8 @@ impl OptimizationPipeline {
             }
         }
 
+        let mut stack = ReferenceStack::default();
+        let mut unsafe_loads = Vec::new();
         for block in blocks {
             for instruction in graph.instructions_mut(block) {
                 if instruction.local_policy.force_borrowed_load() && instruction.opcode == LOAD_FAST
@@ -500,14 +597,9 @@ impl OptimizationPipeline {
                     break;
                 }
             }
-            let mut stack = vec![
-                Reference {
-                    producer: None,
-                    local: None,
-                };
-                usize::try_from(start_depth.unwrap_or(0).max(0)).unwrap()
-            ];
-            let mut unsafe_loads = vec![false; graph[block].items().len()];
+            stack.reset(usize::try_from(start_depth.unwrap_or(0).max(0)).unwrap());
+            unsafe_loads.clear();
+            unsafe_loads.resize(graph[block].items().len(), false);
 
             for (offset, item) in graph[block].items().iter().enumerate() {
                 let Item::Instruction(instruction) = *item else {
@@ -544,11 +636,11 @@ impl OptimizationPipeline {
                         });
                     }
                     STORE_FAST => {
-                        let reference = pop_reference(&mut stack);
+                        let reference = stack.pop();
                         store_local(&mut unsafe_loads, &stack, argument, reference);
                     }
                     STORE_FAST_LOAD_FAST => {
-                        let reference = pop_reference(&mut stack);
+                        let reference = stack.pop();
                         store_local(&mut unsafe_loads, &stack, argument >> 4, reference);
                         stack.push(Reference {
                             producer: Some(offset),
@@ -556,33 +648,13 @@ impl OptimizationPipeline {
                         });
                     }
                     STORE_FAST_STORE_FAST => {
-                        let reference = pop_reference(&mut stack);
+                        let reference = stack.pop();
                         store_local(&mut unsafe_loads, &stack, argument >> 4, reference);
-                        let reference = pop_reference(&mut stack);
+                        let reference = stack.pop();
                         store_local(&mut unsafe_loads, &stack, argument & 15, reference);
                     }
-                    COPY => {
-                        let reference = stack
-                            .len()
-                            .checked_sub(usize::try_from(argument).unwrap())
-                            .and_then(|index| stack.get(index))
-                            .copied()
-                            .unwrap_or(Reference {
-                                producer: None,
-                                local: None,
-                            });
-                        stack.push(reference);
-                    }
-                    SWAP => {
-                        if let Some(index) =
-                            stack.len().checked_sub(usize::try_from(argument).unwrap())
-                        {
-                            let top = stack.len().saturating_sub(1);
-                            if index < stack.len() {
-                                stack.swap(index, top);
-                            }
-                        }
-                    }
+                    COPY => stack.push(stack.copy_from_top(argument)),
+                    SWAP => stack.swap_from_top(argument),
                     // These instructions retain all their existing inputs.
                     FORMAT_SIMPLE | GET_ANEXT | GET_LEN | GET_YIELD_FROM_ITER | MATCH_KEYS
                     | MATCH_MAPPING | MATCH_SEQUENCE | WITH_EXCEPT_START | IMPORT_FROM => {
@@ -610,70 +682,45 @@ impl OptimizationPipeline {
                     | SET_ADD | SET_UPDATE => {
                         let popped = opcode_num_popped(instruction.opcode, argument);
                         let pushed = opcode_num_pushed(instruction.opcode, argument);
-                        for _ in 0..popped.saturating_sub(pushed) {
-                            pop_reference(&mut stack);
-                        }
+                        stack.pop_many(popped.saturating_sub(pushed));
                     }
                     END_SEND | SET_FUNCTION_ATTRIBUTE => {
-                        let top = pop_reference(&mut stack);
-                        pop_reference(&mut stack);
+                        let top = stack.pop();
+                        stack.pop();
                         stack.push(top);
                     }
                     CHECK_EXC_MATCH => {
-                        pop_reference(&mut stack);
-                        stack.push(Reference {
-                            producer: None,
-                            local: None,
-                        });
+                        stack.pop();
+                        stack.push_unknown(1);
                     }
-                    FOR_ITER => stack.push(Reference {
-                        producer: None,
-                        local: None,
-                    }),
+                    FOR_ITER => stack.push_unknown(1),
                     LOAD_ATTR | LOAD_SUPER_ATTR => {
-                        let receiver = pop_reference(&mut stack);
+                        let receiver = stack.pop();
                         if instruction.opcode == LOAD_SUPER_ATTR {
-                            pop_reference(&mut stack);
-                            pop_reference(&mut stack);
+                            stack.pop_many(2);
                         }
-                        stack.push(Reference {
-                            producer: None,
-                            local: None,
-                        });
+                        stack.push_unknown(1);
                         if argument & 1 != 0 {
                             stack.push(receiver);
                         }
                     }
                     PUSH_EXC_INFO | LOAD_SPECIAL => {
-                        let top = pop_reference(&mut stack);
-                        stack.push(Reference {
-                            producer: None,
-                            local: None,
-                        });
+                        let top = stack.pop();
+                        stack.push_unknown(1);
                         stack.push(top);
                     }
                     SEND => {
-                        pop_reference(&mut stack);
-                        stack.push(Reference {
-                            producer: None,
-                            local: None,
-                        });
+                        stack.pop();
+                        stack.push_unknown(1);
                     }
                     _ => {
-                        for _ in 0..opcode_num_popped(instruction.opcode, argument) {
-                            pop_reference(&mut stack);
-                        }
-                        for _ in 0..opcode_num_pushed(instruction.opcode, argument) {
-                            stack.push(Reference {
-                                producer: None,
-                                local: None,
-                            });
-                        }
+                        stack.pop_many(opcode_num_popped(instruction.opcode, argument));
+                        stack.push_unknown(opcode_num_pushed(instruction.opcode, argument));
                     }
                 }
             }
 
-            for reference in &stack {
+            for (_, reference) in &stack.references {
                 if let Some(producer) = reference.producer {
                     unsafe_loads[producer] = true;
                 }
@@ -734,6 +781,12 @@ impl OptimizationPipeline {
 
     pub(in crate::assembler) fn remove_borrow_empty_block_markers(&mut self) {
         let graph = &mut self.graph;
+        if !graph.iter_items().any(|item| {
+            matches!(item, Item::Instruction(instruction) if instruction.jump_policy.borrow_empty_block())
+        }) {
+            return;
+        }
+
         let blocks = graph.order().to_vec();
         for block in blocks {
             graph.retain_items(block, |item| {
@@ -751,7 +804,14 @@ impl OptimizationPipeline {
     }
 
     pub(in crate::assembler) fn fuse_superinstructions(&mut self) {
-        fn fuse_pair(first: Instruction, second: Instruction) -> Option<Instruction> {
+        fn fuse_pair(first: &Instruction, second: &Instruction) -> Option<Instruction> {
+            let opcode = match (first.opcode, second.opcode) {
+                (LOAD_FAST_BORROW, LOAD_FAST_BORROW) => LOAD_FAST_BORROW_LOAD_FAST_BORROW,
+                (LOAD_FAST, LOAD_FAST) => LOAD_FAST_LOAD_FAST,
+                (STORE_FAST, LOAD_FAST | LOAD_FAST_BORROW) => STORE_FAST_LOAD_FAST,
+                (STORE_FAST, STORE_FAST) => STORE_FAST_STORE_FAST,
+                _ => return None,
+            };
             if first.fusion_policy.prevent_with_next
                 || first.borrow_fallthrough == BorrowFallthrough::Barrier
                 || second.fusion_policy.prevent_with_previous
@@ -769,18 +829,11 @@ impl OptimizationPipeline {
             {
                 return None;
             }
-            let opcode = match (first.opcode, second.opcode) {
-                (LOAD_FAST_BORROW, LOAD_FAST_BORROW) => LOAD_FAST_BORROW_LOAD_FAST_BORROW,
-                (LOAD_FAST, LOAD_FAST) => LOAD_FAST_LOAD_FAST,
-                (STORE_FAST, LOAD_FAST | LOAD_FAST_BORROW) => STORE_FAST_LOAD_FAST,
-                (STORE_FAST, STORE_FAST) => STORE_FAST_STORE_FAST,
-                _ => return None,
-            };
             Some(Instruction::fused(
                 opcode,
                 Operand::Value((first_argument << 4) | second_argument),
-                first,
-                second,
+                *first,
+                *second,
             ))
         }
 

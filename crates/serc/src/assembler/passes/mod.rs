@@ -198,6 +198,7 @@ impl Assembler {
             preserved_block_boundaries: self.preserved_block_boundaries,
             borrow_unreachable_blocks: self.borrow_unreachable_blocks,
             has_synthesized_percent_target_locations: self.has_synthesized_percent_target_locations,
+            has_next_location: self.has_next_location,
         }
     }
 }
@@ -236,10 +237,10 @@ impl OptimizationPipeline {
         self.optimize_redundant_store_fast();
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::OptimizeRedundantStoreFast)?;
-        self.optimize_swap_runs();
+        let swap_blocks = self.optimize_swap_runs();
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::OptimizeSwapRuns)?;
-        self.apply_static_swaps();
+        self.apply_static_swaps(swap_blocks);
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::ApplyStaticSwaps)?;
         self.duplicate_exit_blocks();
@@ -280,6 +281,7 @@ impl OptimizationPipeline {
             preserved_block_boundaries: self.preserved_block_boundaries,
             removed_max_depth,
             next_label: self.next_label,
+            has_next_location: self.has_next_location,
         })
     }
 }
@@ -301,7 +303,9 @@ impl LayoutAssembler {
     }
 
     fn finish(mut self, first_line_number: u32) -> Result<AssembledCode, CompileError> {
-        self.resolve_next_locations();
+        if self.has_next_location {
+            self.resolve_next_locations();
+        }
         let instruction_count = self
             .items
             .iter()

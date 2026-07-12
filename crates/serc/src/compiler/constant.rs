@@ -78,7 +78,7 @@ pub(super) struct OutputState {
     pub(super) qualified_name_constant_index: Option<u32>,
 }
 
-impl Compiler {
+impl Compiler<'_> {
     pub(super) fn emit_folded_constant(
         &mut self,
         expression: &Expr,

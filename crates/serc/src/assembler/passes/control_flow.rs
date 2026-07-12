@@ -18,22 +18,19 @@ impl OptimizationPipeline {
     /// adjacent stores target the same local on the same traced line.
     pub(in crate::assembler) fn optimize_redundant_store_fast(&mut self) {
         let graph = &mut self.graph;
-        let order = graph.order().to_vec();
-        for block in order {
-            graph.for_each_adjacent_instruction_pair_mut(block, |first, second| {
-                if first.opcode == STORE_FAST
-                    && second.opcode == STORE_FAST
-                    && matches!(
-                        (first.operand, second.operand),
-                        (Operand::Value(first), Operand::Value(second)) if first == second
-                    )
-                    && first.location.line == second.location.line
-                {
-                    first.opcode = POP_TOP;
-                    first.operand = Operand::Value(0);
-                }
-            });
-        }
+        graph.for_each_adjacent_instruction_pair_mut(|first, second| {
+            if first.opcode == STORE_FAST
+                && second.opcode == STORE_FAST
+                && matches!(
+                    (first.operand, second.operand),
+                    (Operand::Value(first), Operand::Value(second)) if first == second
+                )
+                && first.location.line == second.location.line
+            {
+                first.opcode = POP_TOP;
+                first.operand = Operand::Value(0);
+            }
+        });
     }
 
     pub(in crate::assembler) fn remove_unreachable_instructions(&mut self) -> Option<u32> {
@@ -76,63 +73,60 @@ impl OptimizationPipeline {
 
     pub(in crate::assembler) fn optimize_boolean_conversions(&mut self) {
         let graph = &mut self.graph;
-        let order = graph.order().to_vec();
-        for block in order {
-            graph.for_each_adjacent_instruction_pair_mut(block, |current, next| {
-                match (current.opcode, next.opcode) {
-                    (TO_BOOL, TO_BOOL) => {
-                        current.opcode = NOP;
-                        current.operand = Operand::Value(0);
-                        return;
-                    }
-                    (UNARY_NOT, TO_BOOL) => {
-                        current.opcode = NOP;
-                        current.operand = Operand::Value(0);
-                        next.opcode = UNARY_NOT;
-                        next.operand = Operand::Value(0);
-                        return;
-                    }
-                    (UNARY_NOT, UNARY_NOT) => {
-                        current.opcode = NOP;
-                        current.operand = Operand::Value(0);
-                        next.opcode = NOP;
-                        next.operand = Operand::Value(0);
-                        return;
-                    }
-                    (CONTAINS_OP | IS_OP, UNARY_NOT) => {
-                        let Operand::Value(argument) = current.operand else {
-                            return;
-                        };
-                        let opcode = current.opcode;
-                        current.opcode = NOP;
-                        current.operand = Operand::Value(0);
-                        next.opcode = opcode;
-                        next.operand = Operand::Value(argument ^ 1);
-                        return;
-                    }
-                    _ => {}
-                }
-                if next.opcode != TO_BOOL {
+        graph.for_each_adjacent_instruction_pair_mut(|current, next| {
+            match (current.opcode, next.opcode) {
+                (TO_BOOL, TO_BOOL) => {
+                    current.opcode = NOP;
+                    current.operand = Operand::Value(0);
                     return;
                 }
-                let Operand::Value(argument) = current.operand else {
+                (UNARY_NOT, TO_BOOL) => {
+                    current.opcode = NOP;
+                    current.operand = Operand::Value(0);
+                    next.opcode = UNARY_NOT;
+                    next.operand = Operand::Value(0);
                     return;
-                };
-                let replacement = match current.opcode {
-                    COMPARE_OP => Some((COMPARE_OP, ComparisonOperation::force_boolean(argument))),
-                    CONTAINS_OP => Some((CONTAINS_OP, argument)),
-                    IS_OP => Some((IS_OP, argument)),
-                    _ => None,
-                };
-                let Some((opcode, argument)) = replacement else {
+                }
+                (UNARY_NOT, UNARY_NOT) => {
+                    current.opcode = NOP;
+                    current.operand = Operand::Value(0);
+                    next.opcode = NOP;
+                    next.operand = Operand::Value(0);
                     return;
-                };
-                current.opcode = NOP;
-                current.operand = Operand::Value(0);
-                next.opcode = opcode;
-                next.operand = Operand::Value(argument);
-            });
-        }
+                }
+                (CONTAINS_OP | IS_OP, UNARY_NOT) => {
+                    let Operand::Value(argument) = current.operand else {
+                        return;
+                    };
+                    let opcode = current.opcode;
+                    current.opcode = NOP;
+                    current.operand = Operand::Value(0);
+                    next.opcode = opcode;
+                    next.operand = Operand::Value(argument ^ 1);
+                    return;
+                }
+                _ => {}
+            }
+            if next.opcode != TO_BOOL {
+                return;
+            }
+            let Operand::Value(argument) = current.operand else {
+                return;
+            };
+            let replacement = match current.opcode {
+                COMPARE_OP => Some((COMPARE_OP, ComparisonOperation::force_boolean(argument))),
+                CONTAINS_OP => Some((CONTAINS_OP, argument)),
+                IS_OP => Some((IS_OP, argument)),
+                _ => None,
+            };
+            let Some((opcode, argument)) = replacement else {
+                return;
+            };
+            current.opcode = NOP;
+            current.operand = Operand::Value(0);
+            next.opcode = opcode;
+            next.operand = Operand::Value(argument);
+        });
     }
 
     pub(in crate::assembler) fn thread_forward_jumps(&mut self) {
@@ -363,50 +357,45 @@ impl OptimizationPipeline {
         }
 
         let graph = &mut self.graph;
-        let order = graph.order().to_vec();
-        for block in order {
-            for instruction in graph.instructions_mut(block) {
-                if instruction.opcode != JUMP_FORWARD
-                    || instruction.jump_policy.always_retains_nop()
-                {
-                    continue;
-                }
-                let Operand::Forward(mut target) = instruction.operand else {
-                    continue;
-                };
-                let mut operand = instruction.operand;
-                let mut opcode = instruction.opcode;
-                let mut artificial_eval_break =
-                    instruction.no_location_policy.is_artificial_eval_break();
-                for _ in 0..jump_targets.len() {
-                    let Some((next_operand, next_opcode, next_artificial_eval_break)) =
-                        jump_targets.get(&target).copied()
-                    else {
-                        break;
-                    };
-                    let next = match next_operand {
-                        Operand::Forward(next) | Operand::Backward(next) => next,
-                        Operand::Value(_) | Operand::Deferred(_) => unreachable!(),
-                    };
-                    if next == target {
-                        break;
-                    }
-                    operand = next_operand;
-                    if next_opcode == JUMP_BACKWARD {
-                        opcode = JUMP_BACKWARD;
-                        artificial_eval_break |= next_artificial_eval_break;
-                    } else if next_opcode == JUMP_BACKWARD_NO_INTERRUPT {
-                        opcode = JUMP_BACKWARD_NO_INTERRUPT;
-                    }
-                    target = next;
-                }
-                instruction.retarget(operand);
-                instruction.opcode = opcode;
-                if artificial_eval_break {
-                    instruction.no_location_policy.mark_artificial_eval_break();
-                }
+        graph.for_each_instruction_mut(|instruction| {
+            if instruction.opcode != JUMP_FORWARD || instruction.jump_policy.always_retains_nop() {
+                return;
             }
-        }
+            let Operand::Forward(mut target) = instruction.operand else {
+                return;
+            };
+            let mut operand = instruction.operand;
+            let mut opcode = instruction.opcode;
+            let mut artificial_eval_break =
+                instruction.no_location_policy.is_artificial_eval_break();
+            for _ in 0..jump_targets.len() {
+                let Some((next_operand, next_opcode, next_artificial_eval_break)) =
+                    jump_targets.get(&target).copied()
+                else {
+                    break;
+                };
+                let next = match next_operand {
+                    Operand::Forward(next) | Operand::Backward(next) => next,
+                    Operand::Value(_) | Operand::Deferred(_) => unreachable!(),
+                };
+                if next == target {
+                    break;
+                }
+                operand = next_operand;
+                if next_opcode == JUMP_BACKWARD {
+                    opcode = JUMP_BACKWARD;
+                    artificial_eval_break |= next_artificial_eval_break;
+                } else if next_opcode == JUMP_BACKWARD_NO_INTERRUPT {
+                    opcode = JUMP_BACKWARD_NO_INTERRUPT;
+                }
+                target = next;
+            }
+            instruction.retarget(operand);
+            instruction.opcode = opcode;
+            if artificial_eval_break {
+                instruction.no_location_policy.mark_artificial_eval_break();
+            }
+        });
     }
 
     pub(in crate::assembler) fn remove_redundant_forward_jumps(

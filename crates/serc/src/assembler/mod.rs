@@ -767,6 +767,7 @@ impl Assembler {
     /// Gives the last instruction its final successor's location after optimization.
     /// This mirrors CPython's `NEXT_LOCATION` pseudo-location.
     pub(crate) fn use_next_location_for_last_instruction(&mut self) {
+        self.has_next_location = true;
         self.required_last_instruction_mut("using the next instruction location")
             .location_from_next = true;
     }

@@ -557,23 +557,25 @@ impl BlockGraph {
     pub(super) fn fuse_adjacent_instructions(
         &mut self,
         block: BasicBlockId,
-        mut fuse: impl FnMut(Instruction, Instruction) -> Option<Instruction>,
+        mut fuse: impl FnMut(&Instruction, &Instruction) -> Option<Instruction>,
     ) {
         let items = &mut self.blocks[block.index()].items;
         let original_len = items.len();
         let mut read = 0;
         let mut write = 0;
         while read < original_len {
-            let fused = read
-                .checked_add(1)
-                .filter(|second| *second < original_len)
-                .and_then(|second| match (items[read], items[second]) {
+            let fused = if read + 1 < original_len {
+                match (&items[read], &items[read + 1]) {
                     (Item::Instruction(first), Item::Instruction(second)) => fuse(first, second),
                     (Item::Label(_), _) | (_, Item::Label(_)) => None,
-                });
+                }
+            } else {
+                None
+            };
             if let Some(instruction) = fused {
-                let Item::Instruction(second) = items[read + 1] else {
-                    unreachable!("a fused pair must contain two instructions");
+                let second_location = match &items[read + 1] {
+                    Item::Instruction(second) => second.location,
+                    Item::Label(_) => unreachable!("a fused pair must contain two instructions"),
                 };
                 // CPython resolves missing locations before replacing the second half of a
                 // superinstruction with a removable NOP. For a forward source-order pair,
@@ -582,15 +584,17 @@ impl BlockGraph {
                 if let Some(Item::Instruction(following)) = items.get_mut(read + 2)
                     && following.location.line < 0
                     && !following.no_location_policy.preserve
-                    && second.location.line == instruction.location.line
-                    && second.location.column > instruction.location.column
+                    && second_location.line == instruction.location.line
+                    && second_location.column > instruction.location.column
                 {
-                    following.location = second.location;
+                    following.location = second_location;
                 }
                 items[write] = Item::Instruction(instruction);
                 read += 2;
             } else {
-                items[write] = items[read];
+                if write != read {
+                    items[write] = items[read];
+                }
                 read += 1;
             }
             write += 1;
@@ -680,16 +684,18 @@ impl BlockGraph {
 
     pub(super) fn for_each_adjacent_instruction_pair_mut(
         &mut self,
-        block: BasicBlockId,
         mut visit: impl FnMut(&mut Instruction, &mut Instruction),
     ) {
-        let items = &mut self.blocks[block.index()].items;
-        for index in 0..items.len().saturating_sub(1) {
-            let (before, after) = items.split_at_mut(index + 1);
-            if let (Item::Instruction(first), Item::Instruction(second)) =
-                (&mut before[index], &mut after[0])
-            {
-                visit(first, second);
+        let blocks = &mut self.blocks;
+        for block in self.order.iter().copied() {
+            let items = &mut blocks[block.index()].items;
+            for index in 0..items.len().saturating_sub(1) {
+                let (before, after) = items.split_at_mut(index + 1);
+                if let (Item::Instruction(first), Item::Instruction(second)) =
+                    (&mut before[index], &mut after[0])
+                {
+                    visit(first, second);
+                }
             }
         }
     }

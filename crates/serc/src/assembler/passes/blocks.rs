@@ -476,18 +476,20 @@ impl OptimizationPipeline {
         &mut self,
         locations: &[SourceLocation],
     ) {
-        for block in self.graph.order().to_vec() {
-            for instruction in self.graph.instructions_mut(block) {
-                let id = instruction.no_location_policy.percent_target_location;
-                instruction.no_location_policy.percent_target_location = 0;
-                if id == 0 || id == u8::MAX || instruction.location.line >= 0 {
-                    continue;
-                }
-                if let Some(location) = locations.get(usize::from(id - 1)) {
-                    instruction.location = *location;
-                }
-            }
+        if !self.has_synthesized_percent_target_locations {
+            return;
         }
+
+        self.graph.for_each_instruction_mut(|instruction| {
+            let id = instruction.no_location_policy.percent_target_location;
+            instruction.no_location_policy.percent_target_location = 0;
+            if id == 0 || id == u8::MAX || instruction.location.line >= 0 {
+                return;
+            }
+            if let Some(location) = locations.get(usize::from(id - 1)) {
+                instruction.location = *location;
+            }
+        });
     }
 
     pub(in crate::assembler) fn push_cold_blocks_to_end(&mut self) {
