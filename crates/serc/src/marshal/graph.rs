@@ -154,6 +154,7 @@ impl CachedObject {
 #[derive(Debug, Default)]
 pub(super) struct ObjectGraph<'a> {
     objects: FxHashMap<HashedObjectKey<'a>, ObjectId>,
+    interned_strings: FxHashMap<&'a str, ObjectId>,
     cached_empty_bytes: Option<ObjectId>,
     cached_empty_tuple: Option<ObjectId>,
     cached_scalar_ids: Option<Box<[u32]>>,
@@ -200,15 +201,44 @@ impl<'a> ObjectGraph<'a> {
             .saturating_add(code.locals.len())
             .saturating_add(CODE_OBJECT_CHILDREN);
         let estimated_descendants = direct_children.saturating_mul(2);
-        self.objects.reserve(estimated_descendants);
+        let interned_strings = code
+            .names
+            .len()
+            .saturating_add(code.locals.len())
+            .saturating_add(3);
+        self.objects
+            .reserve(estimated_descendants.saturating_sub(interned_strings));
+        self.interned_strings.reserve(interned_strings);
         self.objects_by_id
             .reserve(estimated_descendants.saturating_add(1));
         self.occurrences
             .reserve(estimated_descendants.saturating_add(1));
     }
 
-    fn record_keyed(&mut self, kind: OccurrenceKind, key: ObjectKey<'a>, interned: bool) -> bool {
-        let (id, first) = self.record_object(key.into(), interned);
+    fn record_keyed(&mut self, kind: OccurrenceKind, key: ObjectKey<'a>) -> bool {
+        let (id, first) = self.record_object(key.into());
+        self.occurrences.push(Occurrence { object: id, kind });
+        first
+    }
+
+    fn record_interned_string(&mut self, kind: OccurrenceKind, value: &'a str) -> bool {
+        let next_id = ObjectId::from_index(self.objects_by_id.len());
+        let (id, first) = match self.interned_strings.entry(value) {
+            Entry::Occupied(entry) => {
+                let id = *entry.get();
+                self.objects_by_id[id.index()].shared = true;
+                (id, false)
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(next_id);
+                self.objects_by_id.push(Object {
+                    shared: false,
+                    cached: true,
+                    interned: true,
+                });
+                (next_id, true)
+            }
+        };
         self.occurrences.push(Occurrence { object: id, kind });
         first
     }
@@ -230,7 +260,7 @@ impl<'a> ObjectGraph<'a> {
         if let Some(cached) = CachedObject::for_key(&key) {
             self.record_cached(cached).1
         } else {
-            self.record_object(key.into(), false).1
+            self.record_object(key.into()).1
         }
     }
 
@@ -292,25 +322,24 @@ impl<'a> ObjectGraph<'a> {
         (id, true)
     }
 
-    fn record_object(&mut self, key: HashedObjectKey<'a>, interned: bool) -> (ObjectId, bool) {
+    fn record_object(&mut self, key: HashedObjectKey<'a>) -> (ObjectId, bool) {
         let next_id = ObjectId::from_index(self.objects_by_id.len());
         match self.objects.entry(key) {
             Entry::Occupied(entry) => {
-                let cached = interned || Self::is_cached(entry.key().key());
+                let cached = Self::is_cached(entry.key().key());
                 let id = *entry.get();
                 let object = &mut self.objects_by_id[id.index()];
                 object.shared = true;
                 object.cached |= cached;
-                object.interned |= interned;
                 (id, false)
             }
             Entry::Vacant(entry) => {
-                let cached = interned || Self::is_cached(entry.key().key());
+                let cached = Self::is_cached(entry.key().key());
                 entry.insert(next_id);
                 self.objects_by_id.push(Object {
                     shared: false,
                     cached,
-                    interned,
+                    interned: false,
                 });
                 (next_id, true)
             }
@@ -324,6 +353,14 @@ impl<'a> ObjectGraph<'a> {
                 .objects
                 .get(&HashedObjectKey::from(key.clone()))
                 .is_some_and(|id| self.objects_by_id[id.index()].shared)
+            || matches!(
+                key,
+                ObjectKey::String(value)
+                    if self
+                        .interned_strings
+                        .get(*value)
+                        .is_some_and(|id| self.is_shared_object(*id))
+            )
         {
             return true;
         }
@@ -353,6 +390,7 @@ impl<'a> ObjectGraph<'a> {
     #[cfg(test)]
     pub(super) fn keyed_object_count(&self) -> usize {
         self.objects.len()
+            + self.interned_strings.len()
             + usize::from(self.cached_empty_bytes.is_some())
             + usize::from(self.cached_empty_tuple.is_some())
             + self.cached_scalar_ids.as_deref().map_or(0, |slots| {
@@ -391,13 +429,7 @@ impl<'a> ObjectGraph<'a> {
         {
             return true;
         }
-        self.objects
-            .iter()
-            .find_map(|(key, id)| match key.key() {
-                ObjectKey::String(string) if *string == value => Some(*id),
-                _ => None,
-            })
-            .is_some_and(|id| self.objects_by_id[id.index()].interned)
+        self.interned_strings.contains_key(value)
     }
 }
 
@@ -984,8 +1016,7 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
             self.graph
                 .record_unique_value(OccurrenceKind::Constants, key)
         } else {
-            self.graph
-                .record_keyed(OccurrenceKind::Constants, key, false)
+            self.graph.record_keyed(OccurrenceKind::Constants, key)
         }
     }
 
@@ -997,7 +1028,7 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
                 .record_cached_value(OccurrenceKind::Strings, CachedObject::EmptyTuple);
         }
         self.graph
-            .record_keyed(OccurrenceKind::Strings, strings_tuple_key(values), false)
+            .record_keyed(OccurrenceKind::Strings, strings_tuple_key(values))
     }
 
     #[inline]
@@ -1011,7 +1042,7 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
         if matches!(&key, ObjectKey::AnnotationLocals(_)) {
             self.graph.record_unique_value(OccurrenceKind::Locals, key)
         } else {
-            self.graph.record_keyed(OccurrenceKind::Locals, key, false)
+            self.graph.record_keyed(OccurrenceKind::Locals, key)
         }
     }
 
@@ -1034,11 +1065,8 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
             self.graph
                 .record_cached_value(OccurrenceKind::MetadataString, character);
         } else {
-            self.graph.record_keyed(
-                OccurrenceKind::MetadataString,
-                ObjectKey::String(value),
-                true,
-            );
+            self.graph
+                .record_interned_string(OccurrenceKind::MetadataString, value);
         }
     }
 
@@ -1058,7 +1086,7 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
             }
             _ => {
                 self.graph
-                    .record_keyed(OccurrenceKind::Bytes, ObjectKey::Bytes(value), false);
+                    .record_keyed(OccurrenceKind::Bytes, ObjectKey::Bytes(value));
             }
         }
     }
@@ -1082,15 +1110,13 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
                     || self
                         .explicitly_interned
                         .is_some_and(|values| values.contains(value.as_str()));
-                self.graph.record_keyed(
-                    OccurrenceKind::Constant,
-                    if interned {
-                        ObjectKey::String(value)
-                    } else {
-                        ObjectKey::ConstantString(value)
-                    },
-                    interned,
-                )
+                if interned {
+                    self.graph
+                        .record_interned_string(OccurrenceKind::Constant, value)
+                } else {
+                    self.graph
+                        .record_keyed(OccurrenceKind::Constant, ObjectKey::ConstantString(value))
+                }
             }
             Constant::FrozenSet(_)
                 if self
@@ -1126,15 +1152,13 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
                 [value] if self.graph.cache_scalars => self
                     .graph
                     .record_cached_value(OccurrenceKind::Constant, CachedObject::Byte(*value)),
-                _ => self.graph.record_keyed(
-                    OccurrenceKind::Constant,
-                    ObjectKey::Bytes(value),
-                    false,
-                ),
+                _ => self
+                    .graph
+                    .record_keyed(OccurrenceKind::Constant, ObjectKey::Bytes(value)),
             },
             _ => self
                 .graph
-                .record_keyed(OccurrenceKind::Constant, constant_key(value), false),
+                .record_keyed(OccurrenceKind::Constant, constant_key(value)),
         }
     }
 
