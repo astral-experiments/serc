@@ -3708,7 +3708,15 @@ impl Compiler {
                     copy_optimized_tuple_branch_exit,
                     |compiler| {
                         compiler.compile_with_strict_owned_loads(
-                            matches!(test, Expr::If(_)),
+                            matches!(test, Expr::If(_))
+                                || matches!(
+                                    body,
+                                    [Stmt::Assert(assertion)]
+                                        if jump_constant_truthiness(&assertion.test) == Some(false)
+                                            && compiler.line_number(u32::from(assertion.range.start()))
+                                                == compiler
+                                                    .line_number(u32::from(assertion.test.range().start()))
+                                ),
                             |compiler| {
                                 compiler.with_control_override(
                                     |control| &mut control.sync_with_direct_return_chain,
