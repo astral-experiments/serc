@@ -9,7 +9,7 @@ use crate::assembler::block_graph::{BasicBlockId, BlockGraph};
 use crate::target::is_conditional_jump;
 use crate::target::opcodes::{
     BUILD_TUPLE, CALL, CLEANUP_THROW, END_ASYNC_FOR, END_SEND, LOAD_CONST, LOAD_FAST, LOAD_GLOBAL,
-    NOP, RAISE_VARARGS, RETURN_VALUE, STORE_FAST,
+    NOP, RAISE_VARARGS, RETURN_VALUE, STORE_ATTR, STORE_FAST,
 };
 
 struct NoExitCopyAnalysis {
@@ -1384,8 +1384,9 @@ impl OptimizationPipeline {
                 instruction.retarget(Operand::Forward(copied_label));
             }
             // CPython appends a small, unprotected exit to its predecessor before inserting
-            // superinstructions. Keeping the copied entry label would split two local loads and
-            // fuse the following pair instead.
+            // superinstructions. A tuple/call or attribute store followed by a direct name
+            // return can expose two local loads. Keeping the copied entry label would split them
+            // and fuse the following pair instead.
             let inline_borrowed_tuple_exit = inline_small_exit
                 && graph[source]
                     .last_instruction()
@@ -1397,13 +1398,19 @@ impl OptimizationPipeline {
                         Item::Label(_) => None,
                     })
                     .is_some_and(|opcode| opcode == LOAD_FAST)
-                && copied.iter().any(|item| {
+                && (copied.iter().any(|item| {
                     matches!(
                         item,
                         Item::Instruction(instruction)
                             if matches!(instruction.opcode, BUILD_TUPLE | CALL)
                     )
-                })
+                }) || matches!(
+                    copied.as_slice(),
+                    [.., Item::Instruction(store), Item::Instruction(load), Item::Instruction(return_value)]
+                        if store.opcode == STORE_ATTR
+                            && load.opcode == LOAD_FAST
+                            && return_value.opcode == RETURN_VALUE
+                ))
                 && region_memberships.iter().all(|membership| {
                     !membership.contains(&source) && !membership.contains(&target)
                 });
