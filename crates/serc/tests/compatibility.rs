@@ -7106,6 +7106,21 @@ def unrelated_name(receiver):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_a_terminal_try_for_break_exit() {
+        let source = r"def target():
+    try:
+        response = 42
+        for value in range(100):
+            if value == response:
+                break
+    except ValueError as error:
+        if not error.args:
+            raise
+";
+        assert_matches_cpython_marshal(source, "terminal_try_for_break_exit.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_later_assertion_branches_before_function_exits() {
         let source = r"def before_return(first, second):
     if first:

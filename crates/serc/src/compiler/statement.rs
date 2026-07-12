@@ -6472,6 +6472,10 @@ impl Compiler<'_> {
                 && let Some(range) = suite_assert_success_fallthrough_range(&statement.body)
             {
                 self.assembler.set_location(self.source_location(range));
+            } else if statement.orelse.is_empty()
+                && terminal_for_break_exit_inherits_predecessor(&statement.body)
+            {
+                self.assembler.set_location(SourceLocation::NONE);
             } else if let Some(location) = self.assembler.last_instruction_location() {
                 self.assembler.set_location(location);
             }
