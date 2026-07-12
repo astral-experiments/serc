@@ -4527,6 +4527,9 @@ impl Compiler {
             false
         };
         self.emit_jump_forward(JUMP_FORWARD, end, 0)?;
+        if self.control.terminal_if_call_expression {
+            self.assembler.prevent_last_jump_inlining();
+        }
         if matches!(expression.body.as_ref(), Expr::BoolOp(_)) || preserve_nested_no_location {
             self.assembler.preserve_last_no_location();
         }
