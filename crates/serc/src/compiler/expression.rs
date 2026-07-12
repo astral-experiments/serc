@@ -67,6 +67,7 @@ struct MatchContext {
     on_top: usize,
     ownerless_markers_after_specialized_none: bool,
     in_class_keyword: bool,
+    eager_final_mapping_capture: bool,
 }
 
 struct PendingInterpolatedLiteral {
@@ -303,6 +304,7 @@ impl Compiler {
                 on_top: 0,
                 ownerless_markers_after_specialized_none: specialized_none_seen,
                 in_class_keyword: false,
+                eager_final_mapping_capture: case.guard.is_some() && !copied_subject,
             };
             self.compile_stack_pattern(&case.pattern, &mut context)?;
             specialized_none_seen = context.ownerless_markers_after_specialized_none;
@@ -712,6 +714,7 @@ impl Compiler {
                 ownerless_markers_after_specialized_none: context
                     .ownerless_markers_after_specialized_none,
                 in_class_keyword: context.in_class_keyword,
+                eager_final_mapping_capture: context.eager_final_mapping_capture,
             };
             self.compile_stack_pattern(alternative, &mut alternative_context)?;
             context.ownerless_markers_after_specialized_none |=
@@ -947,6 +950,17 @@ impl Compiler {
         for (index, subpattern) in pattern.patterns.iter().enumerate() {
             context.on_top -= 1;
             if pattern.rest.is_none()
+                && pattern.keys.len() == 1
+                && index + 1 == pattern.patterns.len()
+                && let Pattern::MatchAs(capture) = subpattern
+                && let Some(name) = &capture.name
+                && capture.pattern.is_none()
+                && context.eager_final_mapping_capture
+            {
+                self.assembler
+                    .set_location(self.source_location(pattern.range));
+                self.store_name(name.as_str())?;
+            } else if pattern.rest.is_none()
                 && pattern.keys.len() == 1
                 && index + 1 == pattern.patterns.len()
                 && let Pattern::MatchAs(capture) = subpattern
