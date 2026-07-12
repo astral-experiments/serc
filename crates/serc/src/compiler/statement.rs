@@ -6453,26 +6453,41 @@ impl Compiler<'_> {
                     self.assembler.mark_last_borrow_fallthrough_barrier();
                 }
             }
-            if !statement.orelse.is_empty()
-                && let Some(location) = location
-            {
-                // If `try` and its pass body share a line, CPython retains the enclosing
-                // statement location on the synthetic body marker.
-                let location = self
-                    .assembler
-                    .last_instruction_location()
-                    .filter(|previous| previous.line == location.line)
-                    .unwrap_or(location);
-                self.assembler.set_location(location);
-                // The no-op body does not inherit an enclosing finally's exception owner.
-                let exception_policy = if self.control.prevent_try_exit_inlining
-                    && self.control.active_exception_region_exclusions.len() > 1
+            if !statement.orelse.is_empty() {
+                if let Some(Stmt::If(condition)) = statement.body.last()
+                    && condition.elif_else_clauses.is_empty()
+                    && matches!(condition.body.as_slice(), [Stmt::Continue(_)])
+                    && matches!(
+                        condition.test.as_ref(),
+                        Expr::Compare(comparison) if comparison.ops.len() == 1
+                    )
                 {
-                    ExceptionPolicy::EXCLUDE_ALWAYS
-                } else {
-                    ExceptionPolicy::default()
-                };
-                self.emit_with_exception_policy(NOP, 0, 0, exception_policy)?;
+                    // CPython retains the normal try-body exit as an ownerless source-position
+                    // NOP when a final single-comparison guard can continue into its loop.
+                    self.assembler
+                        .set_location(self.source_location(condition.test.range()));
+                    self.emit_with_exception_policy(NOP, 0, 0, ExceptionPolicy::EXCLUDE_ALWAYS)?;
+                    self.assembler.preserve_last_nop();
+                }
+                if let Some(location) = location {
+                    // If `try` and its pass body share a line, CPython retains the enclosing
+                    // statement location on the synthetic body marker.
+                    let location = self
+                        .assembler
+                        .last_instruction_location()
+                        .filter(|previous| previous.line == location.line)
+                        .unwrap_or(location);
+                    self.assembler.set_location(location);
+                    // The no-op body does not inherit an enclosing finally's exception owner.
+                    let exception_policy = if self.control.prevent_try_exit_inlining
+                        && self.control.active_exception_region_exclusions.len() > 1
+                    {
+                        ExceptionPolicy::EXCLUDE_ALWAYS
+                    } else {
+                        ExceptionPolicy::default()
+                    };
+                    self.emit_with_exception_policy(NOP, 0, 0, exception_policy)?;
+                }
             }
             location
         };
