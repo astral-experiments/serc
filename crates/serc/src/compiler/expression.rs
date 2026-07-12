@@ -112,7 +112,7 @@ impl PendingInterpolatedLiteral {
         }
     }
 
-    fn load(self, compiler: &mut Compiler) -> Result<(), CompileError> {
+    fn load(self, compiler: &mut Compiler<'_>) -> Result<(), CompileError> {
         compiler
             .assembler
             .set_location(compiler.source_location(self.range));
@@ -252,7 +252,7 @@ struct ConditionMarkerPolicy {
     ordinary: ExceptionPolicy,
 }
 
-impl Compiler {
+impl Compiler<'_> {
     pub(super) fn compile_match(
         &mut self,
         statement: &ruff_python_ast::StmtMatch,
@@ -1086,10 +1086,14 @@ impl Compiler {
             self.emit_folded_constant(origin, constant)?;
             return Ok(());
         }
-        if matches!(
+        if (matches!(
             expression,
-            Expr::BinOp(_) | Expr::Name(_) | Expr::Subscript(_) | Expr::UnaryOp(_) | Expr::Tuple(_)
-        ) && let Some(constant) = self.source_aware_fold_constant(expression)
+            Expr::BinOp(_) | Expr::Subscript(_) | Expr::UnaryOp(_) | Expr::Tuple(_)
+        ) || matches!(
+            expression,
+            Expr::Name(name)
+                if name.ctx == ExprContext::Load && name.id.as_str() == "__debug__"
+        )) && let Some(constant) = self.source_aware_fold_constant(expression)
         {
             self.emit_folded_constant(expression, constant)?;
             return Ok(());
@@ -1372,7 +1376,7 @@ impl Compiler {
         fstring: &ruff_python_ast::ExprFString,
     ) -> Result<(), CompileError> {
         fn flush_literal(
-            compiler: &mut Compiler,
+            compiler: &mut Compiler<'_>,
             pending: &mut Option<PendingInterpolatedLiteral>,
             value_count: &mut usize,
             large: bool,
@@ -1445,7 +1449,7 @@ impl Compiler {
                 FStringPart::Literal(literal) => {
                     PendingInterpolatedLiteral::append(
                         &mut pending_literal,
-                        &self.context.source,
+                        self.context.source,
                         &literal.value,
                         literal.range,
                         single_literal_range.unwrap_or(literal.range),
@@ -1458,7 +1462,7 @@ impl Compiler {
                             InterpolatedStringElement::Literal(literal) => {
                                 PendingInterpolatedLiteral::append(
                                     &mut pending_literal,
-                                    &self.context.source,
+                                    self.context.source,
                                     &literal.value,
                                     literal.range,
                                     single_literal_range.unwrap_or(literal.range),
@@ -1470,7 +1474,7 @@ impl Compiler {
                                     let debug_text = strip_expression_comments(debug.as_str());
                                     PendingInterpolatedLiteral::append(
                                         &mut pending_literal,
-                                        &self.context.source,
+                                        self.context.source,
                                         &debug_text,
                                         debug_text_range(interpolation),
                                         debug_text_range(interpolation),
@@ -1634,7 +1638,7 @@ impl Compiler {
         is_raw: bool,
     ) -> Result<(), CompileError> {
         fn flush_literal(
-            compiler: &mut Compiler,
+            compiler: &mut Compiler<'_>,
             pending: &mut Option<PendingInterpolatedLiteral>,
             value_count: &mut usize,
         ) -> Result<(), CompileError> {
@@ -1653,7 +1657,7 @@ impl Compiler {
                 InterpolatedStringElement::Literal(literal) => {
                     PendingInterpolatedLiteral::append(
                         &mut pending_literal,
-                        &self.context.source,
+                        self.context.source,
                         &literal.value,
                         literal.range,
                         literal.range,
@@ -1665,7 +1669,7 @@ impl Compiler {
                         let debug_text = strip_expression_comments(debug.as_str());
                         PendingInterpolatedLiteral::append(
                             &mut pending_literal,
-                            &self.context.source,
+                            self.context.source,
                             &debug_text,
                             debug_text_range(interpolation),
                             debug_text_range(interpolation),
@@ -1872,13 +1876,13 @@ impl Compiler {
             && self.compile_direct_global_callable(&call.func)?
                 == SpecializedLowering::NotApplicable
         {
-            let newly_owned_callable = if call
-                .arguments
-                .args
-                .iter()
-                .chain(call.arguments.keywords.iter().map(|keyword| &keyword.value))
-                .any(expression_contains_inlined_comprehension)
-                && let Expr::Name(name) = call.func.as_ref()
+            let newly_owned_callable = if let Expr::Name(name) = call.func.as_ref()
+                && call
+                    .arguments
+                    .args
+                    .iter()
+                    .chain(call.arguments.keywords.iter().map(|keyword| &keyword.value))
+                    .any(expression_contains_inlined_comprehension)
             {
                 let name = self.required_name_id(name.id.as_str());
                 self.symbols.owned_load_locals.insert(name)

@@ -53,7 +53,7 @@ impl CompiledFunctionDefaults {
     }
 }
 
-impl Compiler {
+impl Compiler<'_> {
     pub(super) fn compile_type_alias(
         &mut self,
         statement: &ruff_python_ast::StmtTypeAlias,
@@ -441,11 +441,13 @@ impl Compiler {
         } else {
             0
         }) | (self.unit.flags & SUPPORTED_FUTURE_FLAGS);
-        if definition.is_async && suite_contains_yield(&definition.body) {
+        let contains_yield = self.context.module_plan.has_yield_expressions
+            && suite_contains_yield(&definition.body);
+        if definition.is_async && contains_yield {
             parameter_flags |= CO_ASYNC_GENERATOR;
         } else if definition.is_async {
             parameter_flags |= CO_COROUTINE;
-        } else if suite_contains_yield(&definition.body) {
+        } else if contains_yield {
             parameter_flags |= CO_GENERATOR;
         }
         let qualified_name = self

@@ -12,7 +12,7 @@ use crate::target::code_flags::{CO_FUTURE_ANNOTATIONS, CO_FUTURE_BARRY_AS_BDFL};
 use super::symbol::mangle_name;
 use super::{Compiler, SHADOWED_SUPER_SENTINEL, Scope};
 
-impl Compiler {
+impl Compiler<'_> {
     pub(super) fn scope_arena(&self) -> &ScopeArena {
         &self.context.scopes
     }
@@ -809,6 +809,7 @@ pub(super) struct ModulePlan {
     pub(super) comprehension_cell_names: NameSet,
     pub(super) has_annotations: bool,
     pub(super) has_simple_annotations: bool,
+    pub(super) has_yield_expressions: bool,
 }
 
 #[derive(Debug, Default)]
@@ -818,6 +819,7 @@ struct ModulePlanBuilder {
     comprehension_cell_names: FxHashSet<String>,
     has_annotations: bool,
     has_simple_annotations: bool,
+    has_yield_expressions: bool,
 }
 
 impl ModulePlan {
@@ -861,6 +863,7 @@ impl ModulePlan {
                 .collect(),
             has_annotations: facts.has_annotations,
             has_simple_annotations: facts.has_simple_annotations,
+            has_yield_expressions: facts.has_yield_expressions,
         }
     }
 }
@@ -1409,6 +1412,8 @@ impl<'ast> Visitor<'ast> for ModuleNameCollector<'_> {
     }
 
     fn visit_expr(&mut self, expression: &'ast Expr) {
+        self.facts.has_yield_expressions |=
+            matches!(expression, Expr::Yield(_) | Expr::YieldFrom(_));
         if matches!(
             expression,
             Expr::Lambda(_)

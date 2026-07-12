@@ -58,8 +58,8 @@ enum Scope {
 }
 
 #[derive(Debug)]
-pub(crate) struct Compiler {
-    context: Arc<CompilationContext>,
+pub(crate) struct Compiler<'source> {
+    context: Arc<CompilationContext<'source>>,
     cached_source_line: Cell<Option<CachedSourceLine>>,
     unit: CodeUnit,
     output: OutputState,
