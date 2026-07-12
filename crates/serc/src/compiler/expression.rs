@@ -1344,16 +1344,17 @@ impl Compiler {
             | Expr::Attribute(_) => return Err(unsupported(expression_name(expression))),
         }
 
-        let deferred_restores = self
-            .control
-            .pending_comprehension_restores
-            .iter()
-            .map(|(indices, _)| indices.len())
-            .sum::<usize>();
         let expected_depth = starting_depth
             + 1
             + if self.control.defer_async_comprehension_restore {
-                i32::try_from(deferred_restores).unwrap()
+                i32::try_from(
+                    self.control
+                        .pending_comprehension_restores
+                        .iter()
+                        .map(|(indices, _)| indices.len())
+                        .sum::<usize>(),
+                )
+                .unwrap()
             } else {
                 0
             };

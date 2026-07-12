@@ -12,6 +12,9 @@ use crate::target::opcodes::{
     NOP, RAISE_VARARGS, RETURN_VALUE, STORE_ATTR, STORE_FAST,
 };
 
+const WARM_BLOCK: u8 = 1;
+const COLD_BLOCK: u8 = 2;
+
 struct NoExitCopyAnalysis {
     positions: Vec<usize>,
     predecessors: Vec<usize>,
@@ -503,7 +506,8 @@ impl OptimizationPipeline {
             .max()
             .map_or(0, |index| index + 1);
         let mut block_labels = vec![None; block_slot_count];
-        for block in order.iter().copied() {
+        let mut positions = vec![usize::MAX; block_slot_count];
+        for (position, block) in order.iter().copied().enumerate() {
             let label = if let Some(label) = graph[block].first_label() {
                 label
             } else {
@@ -513,10 +517,6 @@ impl OptimizationPipeline {
                 label
             };
             block_labels[block.index()] = Some(label);
-        }
-
-        let mut positions = vec![usize::MAX; block_slot_count];
-        for (position, block) in order.iter().copied().enumerate() {
             positions[block.index()] = position;
         }
         let region_ranges = self
@@ -537,13 +537,15 @@ impl OptimizationPipeline {
             })
             .collect::<Vec<_>>();
 
-        let mut warm = vec![false; block_slot_count];
+        let mut temperatures = vec![0_u8; block_slot_count];
         let mut stack = vec![order[0]];
         while let Some(block) = stack.pop() {
-            if std::mem::replace(&mut warm[block.index()], true) {
+            let slot = block.index();
+            if temperatures[slot] == WARM_BLOCK {
                 continue;
             }
-            let position = positions[block.index()];
+            temperatures[slot] = WARM_BLOCK;
+            let position = positions[slot];
             if block_has_fallthrough(graph[block].items())
                 && let Some(next) = order.get(position + 1)
             {
@@ -556,18 +558,19 @@ impl OptimizationPipeline {
             }
         }
 
-        let mut cold = vec![false; block_slot_count];
         let mut stack = self
             .exception_regions
             .iter()
             .filter_map(|region| graph.label_block(region.target))
-            .filter(|block| !warm[block.index()])
+            .filter(|block| temperatures[block.index()] != WARM_BLOCK)
             .collect::<Vec<_>>();
         while let Some(block) = stack.pop() {
-            if warm[block.index()] || std::mem::replace(&mut cold[block.index()], true) {
+            let slot = block.index();
+            if temperatures[slot] != 0 {
                 continue;
             }
-            let position = positions[block.index()];
+            temperatures[slot] = COLD_BLOCK;
+            let position = positions[slot];
             if block_has_fallthrough(graph[block].items())
                 && let Some(next) = order.get(position + 1)
             {
@@ -579,15 +582,15 @@ impl OptimizationPipeline {
                 stack.push(target);
             }
         }
-        if !cold.iter().any(|cold| *cold) {
+        if !temperatures.contains(&COLD_BLOCK) {
             return;
         }
 
         let explicit_jumps = (0..order.len().saturating_sub(1))
             .filter(|position| {
-                cold[order[*position].index()]
+                temperatures[order[*position].index()] == COLD_BLOCK
                     && block_has_fallthrough(graph[order[*position]].items())
-                    && warm[order[*position + 1].index()]
+                    && temperatures[order[*position + 1].index()] == WARM_BLOCK
             })
             .collect::<Vec<_>>();
         for position in explicit_jumps.into_iter().rev() {
@@ -635,16 +638,17 @@ impl OptimizationPipeline {
             );
             let index = block.index();
             block_labels.resize(index + 1, None);
-            warm.resize(index + 1, false);
-            cold.resize(index + 1, false);
+            positions.resize(index + 1, usize::MAX);
+            temperatures.resize(index + 1, 0);
             block_labels[index] = Some(label);
-            cold[index] = true;
+            temperatures[index] = COLD_BLOCK;
         }
 
         let mut order = Vec::with_capacity(graph.len());
         for expected_cold in [false, true] {
             for block in graph.order().iter().copied() {
-                if (expected_cold && cold[block.index()]) || (!expected_cold && warm[block.index()])
+                if (expected_cold && temperatures[block.index()] == COLD_BLOCK)
+                    || (!expected_cold && temperatures[block.index()] == WARM_BLOCK)
                 {
                     order.push(block);
                 }
@@ -671,7 +675,7 @@ impl OptimizationPipeline {
             cleanup_block_creation_order(graph[order[positions[0]]].items())
                 > cleanup_block_creation_order(graph[order[positions[1]]].items())
         }) {
-            let mut cleanup_throw_blocks = vec![false; cold.len()];
+            let mut cleanup_throw_blocks = vec![false; temperatures.len()];
             for position in &cleanup_throw_positions {
                 cleanup_throw_blocks[order[*position].index()] = true;
             }
@@ -781,7 +785,7 @@ impl OptimizationPipeline {
         }
         self.exception_regions = rebuilt_regions;
 
-        positions.resize(cold.len(), usize::MAX);
+        positions.resize(temperatures.len(), usize::MAX);
         positions.fill(usize::MAX);
         for (position, block) in order.iter().copied().enumerate() {
             positions[block.index()] = position;

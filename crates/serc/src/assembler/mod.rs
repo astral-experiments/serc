@@ -1069,19 +1069,28 @@ impl Assembler {
         let is_constant_load =
             |opcode| matches!(opcode, LOAD_CONST | LOAD_COMMON_CONSTANT | LOAD_SMALL_INT);
         let items = self.linear_items_mut();
+        let mut has_forward_constant_jump = false;
 
         for index in 0..items.len().saturating_sub(1) {
-            let [Item::Instruction(load), Item::Instruction(pop)] = &mut items[index..index + 2]
+            let [Item::Instruction(load), Item::Instruction(next)] = &mut items[index..index + 2]
             else {
                 continue;
             };
-            if !is_constant_load(load.opcode) || pop.opcode != POP_TOP {
+            if !is_constant_load(load.opcode) {
                 continue;
             }
-            load.opcode = NOP;
-            load.operand = Operand::Value(0);
-            pop.opcode = NOP;
-            pop.operand = Operand::Value(0);
+            if next.opcode == POP_TOP {
+                load.opcode = NOP;
+                load.operand = Operand::Value(0);
+                next.opcode = NOP;
+                next.operand = Operand::Value(0);
+            } else if next.opcode == JUMP_FORWARD && matches!(next.operand, Operand::Forward(_)) {
+                has_forward_constant_jump = true;
+            }
+        }
+
+        if !has_forward_constant_jump {
+            return;
         }
 
         let mut label_positions = FxHashMap::default();
@@ -1104,25 +1113,23 @@ impl Assembler {
             let Some(target_position) = label_positions.get(&target).copied() else {
                 continue;
             };
-            let target = items[target_position + 1..]
-                .iter()
-                .filter_map(|item| {
-                    if let Item::Instruction(instruction) = item {
-                        Some(*instruction)
-                    } else {
-                        None
-                    }
-                })
-                .take(3)
-                .collect::<Vec<_>>();
-            let [pop, return_load, return_value] = target.as_slice() else {
+            let mut target = items[target_position + 1..].iter().filter_map(|item| {
+                if let Item::Instruction(instruction) = item {
+                    Some(*instruction)
+                } else {
+                    None
+                }
+            });
+            let (Some(pop), Some(return_load), Some(return_value)) =
+                (target.next(), target.next(), target.next())
+            else {
                 continue;
             };
             if pop.opcode == POP_TOP
                 && is_constant_load(return_load.opcode)
                 && return_value.opcode == RETURN_VALUE
             {
-                replacements.push((index, *return_load, *return_value));
+                replacements.push((index, return_load, return_value));
             }
         }
         for (index, return_load, return_value) in replacements {
