@@ -7019,7 +7019,21 @@ impl Compiler {
                                 .elif_else_clauses
                                 .iter()
                                 .all(|clause| clause.body.len() == 1)
-                            && (handler.body.len() > 1 || suite_terminates(&tail.body)))
+                            && (handler.body.len() > 1
+                                || suite_terminates(&tail.body)
+                                || (matches!(
+                                    statement.body.as_slice(),
+                                    [Stmt::Import(_) | Stmt::ImportFrom(_)]
+                                ) && matches!(tail.body.as_slice(), [Stmt::Assign(_)])
+                                    && matches!(
+                                        tail.elif_else_clauses.as_slice(),
+                                        [clause]
+                                            if clause.test.is_none()
+                                                && matches!(
+                                                    clause.body.as_slice(),
+                                                    [Stmt::Import(_) | Stmt::ImportFrom(_)]
+                                                )
+                                    ))))
                             // A terminating alternative leaves the nested try's normal exit as
                             // the sole path to a named-handler cleanup. CPython copies the
                             // cleanup onto that exit before placing the cold terminating arm.
@@ -7036,6 +7050,38 @@ impl Compiler {
                                                     suite_terminates(&handler.body)
                                                 })
                                             })
+                                ))
+                            // A named handler around a single loop copies its cleanup onto both
+                            // conditional call exits before the following normal exit.
+                            || (handler.name.is_some()
+                                && handler.body.len() == 1
+                                && matches!(
+                                    statement.body.as_slice(),
+                                    [Stmt::For(statement)] if !statement.is_async
+                                )
+                                && (self.control.current_statement_has_following
+                                    || self.control.inherited_statement_has_following)
+                                && matches!(
+                                    tail.test.as_ref(),
+                                    Expr::BoolOp(boolean) if boolean.op == BoolOp::And
+                                )
+                                && matches!(
+                                    tail.body.as_slice(),
+                                    [Stmt::Expr(expression)]
+                                        if matches!(expression.value.as_ref(), Expr::Call(_))
+                                )
+                                && matches!(
+                                    tail.elif_else_clauses.as_slice(),
+                                    [clause]
+                                        if clause.test.is_none()
+                                            && matches!(
+                                                clause.body.as_slice(),
+                                                [Stmt::Expr(expression)]
+                                                    if matches!(
+                                                        expression.value.as_ref(),
+                                                        Expr::Call(_)
+                                                    )
+                                            )
                                 ))
                     }
                     _ => false,
