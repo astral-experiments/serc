@@ -7328,6 +7328,38 @@ impl Compiler<'_> {
                 true,
             );
             if terminal_handler_exclusions.is_none() && !terminal_handler_try_return {
+                // Multi-edge joins and folded unconditional false exits leave this cleanup
+                // source-less; a sole runtime-tested false edge carries its operand's location.
+                let handler_ends_with_unnamed_terminating_unlocated_and_cleanup = matches!(
+                    handler.body.last(),
+                    Some(Stmt::If(tail))
+                        if handler.name.is_none()
+                            && loop_tail.is_none()
+                            && (self.control.current_statement_has_following
+                                || self.control.inherited_statement_has_following)
+                            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                            && statement.orelse.is_empty()
+                            && statement.finalbody.is_empty()
+                            && tail.elif_else_clauses.is_empty()
+                            && matches!(tail.body.last(), Some(Stmt::Return(_) | Stmt::Raise(_)))
+                            && matches!(
+                                tail.test.as_ref(),
+                                Expr::BoolOp(boolean)
+                                    if boolean.op == BoolOp::And
+                                        && boolean.values.iter().all(|value| {
+                                            !matches!(value, Expr::Compare(comparison) if comparison.ops.len() > 1)
+                                        })
+                            )
+                            && {
+                                let false_edges = condition_jump_target_count(&tail.test, false);
+                                false_edges > 1
+                                    || (false_edges == 1
+                                        && unique_condition_jump_target(&tail.test, false)
+                                            .is_none_or(|owner| {
+                                                jump_constant_truthiness(owner).is_some()
+                                            }))
+                            }
+                );
                 // CPython propagates a handler's sole condition-fallthrough edge onto the
                 // normal cleanup block, even when code follows the enclosing try statement.
                 if handler_ends_with_unlocated_bare_raise_branch_cleanup {
@@ -7362,6 +7394,8 @@ impl Compiler<'_> {
                     && let Some(range) = unary_not_condition_exit_range(&statement.test)
                 {
                     self.assembler.set_location(self.source_location(range));
+                } else if handler_ends_with_unnamed_terminating_unlocated_and_cleanup {
+                    self.assembler.set_location(SourceLocation::NONE);
                 } else if let Some(Stmt::If(statement)) = handler.body.last()
                     && let Some(test) = terminating_if_fallthrough_test(statement)
                     && let Some(test) = unique_condition_jump_target(test, false)
@@ -7400,6 +7434,7 @@ impl Compiler<'_> {
                 if handler_ends_with_preserved_unlocated_cleanup
                     || handler_ends_with_unlocated_bare_raise_branch_cleanup
                     || handler_ends_with_unlocated_if_cleanup
+                    || handler_ends_with_unnamed_terminating_unlocated_and_cleanup
                 {
                     self.assembler.preserve_last_no_location();
                 }
