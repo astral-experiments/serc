@@ -8,8 +8,8 @@ use super::super::{
 use crate::assembler::block_graph::{BasicBlockId, BlockGraph};
 use crate::target::is_conditional_jump;
 use crate::target::opcodes::{
-    CLEANUP_THROW, END_ASYNC_FOR, END_SEND, LOAD_CONST, LOAD_FAST, LOAD_GLOBAL, NOP, RAISE_VARARGS,
-    RETURN_VALUE, STORE_FAST,
+    BUILD_TUPLE, CALL, CLEANUP_THROW, END_ASYNC_FOR, END_SEND, LOAD_CONST, LOAD_FAST, LOAD_GLOBAL,
+    NOP, RAISE_VARARGS, RETURN_VALUE, STORE_FAST,
 };
 
 struct NoExitCopyAnalysis {
@@ -1383,7 +1383,34 @@ impl OptimizationPipeline {
             } else if let Some(instruction) = graph.instructions_mut(source).next_back() {
                 instruction.retarget(Operand::Forward(copied_label));
             }
-            if inline_no_location_block {
+            // CPython appends a small, unprotected exit to its predecessor before inserting
+            // superinstructions. Keeping the copied entry label would split two local loads and
+            // fuse the following pair instead.
+            let inline_borrowed_tuple_exit = inline_small_exit
+                && graph[source]
+                    .last_instruction()
+                    .is_some_and(|instruction| instruction.opcode == LOAD_FAST)
+                && copied
+                    .iter()
+                    .find_map(|item| match item {
+                        Item::Instruction(instruction) => Some(instruction.opcode),
+                        Item::Label(_) => None,
+                    })
+                    .is_some_and(|opcode| opcode == LOAD_FAST)
+                && copied.iter().any(|item| {
+                    matches!(
+                        item,
+                        Item::Instruction(instruction)
+                            if matches!(instruction.opcode, BUILD_TUPLE | CALL)
+                    )
+                })
+                && region_memberships.iter().all(|membership| {
+                    !membership.contains(&source) && !membership.contains(&target)
+                });
+            if inline_borrowed_tuple_exit {
+                copied.retain(|item| !matches!(item, Item::Label(label) if *label == copied_label));
+                graph.append_to_block(source, copied);
+            } else if inline_no_location_block {
                 let copied_jump_target =
                     block_jump_target(&copied).and_then(|label| graph.label_block(label));
                 graph.append_to_block(source, copied);

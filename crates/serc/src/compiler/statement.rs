@@ -3417,7 +3417,23 @@ impl Compiler {
                                             handler.as_except_handler().is_some_and(|handler| {
                                                 matches!(handler.body.as_slice(), [Stmt::Pass(_)])
                                             })
-                                        })))));
+                                        }))))
+                        || (self.control.generator_region_start.is_none()
+                            && self.control.loops.is_empty()
+                            && self.control.active_with_region_exclusions.len() >= 2
+                            && self.control.active_exception_region_exclusions.is_empty()
+                            && self.control.active_normal_finally_bodies == 0
+                            && self.control.in_synchronous_with()
+                            && (matches!(test, Expr::BoolOp(boolean)
+                                if boolean.op == BoolOp::And
+                                    && matches!(boolean.values.last(), Some(Expr::Compare(comparison))
+                                        if comparison.ops.len() == 1
+                                            && comparison.ops[0] == CmpOp::IsNot
+                                            && matches!(comparison.comparators[0], Expr::NoneLiteral(_))))
+                                || matches!(test, Expr::Compare(comparison)
+                                    if comparison.ops.len() == 1
+                                        && comparison.ops[0] == CmpOp::Is
+                                        && matches!(comparison.comparators[0], Expr::NoneLiteral(_))))));
                 let exclude_later_handler_leading_marker = branch_index == 0
                     && !is_specialized_none_condition(test)
                     && is_later_bare_raise_fallback_if(statement)
@@ -4574,6 +4590,27 @@ impl Compiler {
             }
             let next = test.map(|_| self.assembler.label());
             if let (Some(test), Some(next)) = (test, next) {
+                let preserve_first_sync_iterator_owner = branch_index == 0
+                    && has_else
+                    && leading.is_empty()
+                    && matches!(test, Expr::Name(_))
+                    && !try_body_normal_exit
+                    && !non_final_branch
+                    && !self.control.active_with_region_exclusions.is_empty()
+                    && !self.context.has_lazy_imports
+                    && self.control.loops.len() == 1
+                    && self.control.loops.last().is_some_and(|context| {
+                        context.iterator_cleanup == IteratorCleanup::Sync
+                            && self.assembler.instruction_count() == context.body_start
+                            && context.with_depth == self.control.active_with_exits.len()
+                            && context.finally_end_depth == self.control.active_finally_end_blocks
+                            && context.exception_region_depth
+                                == self.control.active_exception_region_exclusions.len()
+                    })
+                    && condition_jump_target_count(test, false) == 1
+                    && !matches!(test, Expr::BoolOp(_) | Expr::If(_))
+                    && !expression_suspends_current_scope(test)
+                    && !expression_contains_generator(test);
                 let has_outer_exception_region = try_body_normal_exit
                     && self.control.active_exception_region_exclusions.len() > 1;
                 let protected_nested_branch = try_body_normal_exit && non_final_branch;
@@ -4600,6 +4637,9 @@ impl Compiler {
                         )
                     },
                 )?;
+                if preserve_first_sync_iterator_owner {
+                    self.assembler.preserve_last_not_taken_exception_owner();
+                }
                 if branch_index == 0
                     && !try_body_normal_exit
                     && !non_final_branch
