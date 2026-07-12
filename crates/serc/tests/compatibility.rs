@@ -6627,6 +6627,23 @@ def generator_first_iterable(values):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_flat_function_local_order() {
+        let source = r"@decorate(header_value)
+def ordering(values, *, fallback=default_value):
+    import package.part as imported
+    from elsewhere import value as alias
+    forward = later
+    container[index] = forward
+    for item in values:
+        with manager(item) as resource:
+            result = resource
+    later = result
+    return imported, alias, forward, item, later, fallback
+";
+        assert_matches_cpython_marshal(source, "flat_function_local_order.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_named_expression_local_order() {
         let source = r"def chained():
     return (outer := (inner := value))

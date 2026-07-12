@@ -279,6 +279,42 @@ fn single_pass_local_collection_preserves_source_order() {
 }
 
 #[test]
+fn flat_function_collection_preserves_local_and_header_order() {
+    let source = r"@decorate(header_value)
+def ordering(values, *, fallback=default_value):
+    import package.part as imported
+    from elsewhere import value as alias
+    forward = later
+    container[index] = forward
+    for item in values:
+        with manager(item) as resource:
+            result = resource
+    later = result
+    return imported, alias, forward, item, later, fallback
+";
+    let parsed = parse_module(source).unwrap();
+    let module = module_compiler(source, &parsed)
+        .compile_module(parsed.suite())
+        .unwrap();
+    let function = module
+        .constants
+        .iter()
+        .find_map(|constant| match constant {
+            Constant::Code(code) if code.name == "ordering" => Some(code),
+            _ => None,
+        })
+        .expect("module should contain the function body");
+
+    assert_eq!(
+        function.locals,
+        [
+            "values", "fallback", "imported", "alias", "later", "forward", "item", "resource",
+            "result",
+        ]
+    );
+}
+
+#[test]
 fn annotation_only_locals_claim_slots_at_first_runtime_use() {
     let source = r"def ordering(values):
     assigned_late: object
