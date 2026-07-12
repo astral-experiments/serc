@@ -3045,6 +3045,12 @@ impl Compiler {
                         self.assembler
                             .set_location(self.source_location(statement.range));
                         self.emit(POP_TOP, 0, -1)?;
+                        if matches!(
+                            statement.value.as_deref(),
+                            Some(Expr::BinOp(_) | Expr::Call(_) | Expr::Attribute(_))
+                        ) {
+                            self.assembler.use_next_location_for_last_instruction();
+                        }
                     }
                 } else {
                     self.emit(RETURN_VALUE, 0, -1)?;
@@ -7862,6 +7868,21 @@ impl Compiler {
             _ => None,
         };
         let overriding_return = matches!(statement.finalbody.last(), Some(Stmt::Return(_)));
+        if overriding_return
+            && self.control.active_with_region_exclusions.is_empty()
+            && matches!(statement.body.last(), Some(Stmt::Return(_)))
+            && let [Stmt::Return(final_return)] = statement.finalbody.as_slice()
+            && let Some(value) = final_return.value.as_deref()
+            && is_literal_constant(value)
+            && statement.handlers.iter().any(|handler| {
+                handler
+                    .as_except_handler()
+                    .is_some_and(|handler| handler.name.is_some())
+            })
+            && let Some(constant) = fold_constant(value)
+        {
+            self.add_constant(constant)?;
+        }
         let preserve_break_exit_loop_range = if overriding_return {
             match statement.body.last() {
                 Some(Stmt::While(loop_statement))
@@ -8044,6 +8065,22 @@ impl Compiler {
                 ExceptionPolicy::default()
             },
         )?;
+        if overriding_return
+            && !statement.handlers.is_empty()
+            && matches!(statement.body.last(), Some(Stmt::Return(_)))
+            && statement.handlers.iter().all(|handler| {
+                handler
+                    .as_except_handler()
+                    .is_some_and(|handler| matches!(handler.body.last(), Some(Stmt::Raise(_))))
+            })
+            && matches!(
+                statement.finalbody.as_slice(),
+                [Stmt::Return(final_return)]
+                    if final_return.value.as_deref().is_none_or(is_literal_constant)
+            )
+        {
+            self.assembler.preserve_last_no_location();
+        }
         if let Some(start) = normal_finally_pop_block_exclusion_start {
             let end = self.assembler.label();
             self.assembler.mark(end);
