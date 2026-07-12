@@ -69,8 +69,18 @@ impl Compiler<'_> {
     }
 
     pub(super) fn source_location(&self, range: ruff_text_size::TextRange) -> SourceLocation {
-        let (line, column) = self.source_position(u32::from(range.start()));
-        let (end_line, end_column) = self.source_position(u32::from(range.end()));
+        let start = self.source_offset(u32::from(range.start()));
+        let end = self.source_offset(u32::from(range.end()));
+        let source_line = self.source_line(start);
+        let line = i32::try_from(source_line.number).unwrap_or(i32::MAX);
+        let column = i32::try_from(u32::from(start - source_line.start)).unwrap_or(i32::MAX);
+
+        if source_line.contains(end) {
+            let end_column = i32::try_from(u32::from(end - source_line.start)).unwrap_or(i32::MAX);
+            return SourceLocation::new(line, line, column, end_column);
+        }
+
+        let (end_line, end_column) = self.source_position(u32::from(end));
         SourceLocation::new(line, end_line, column, end_column)
     }
 

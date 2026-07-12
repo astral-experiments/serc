@@ -9,8 +9,8 @@ use super::{
     BINARY_OP, BUILD_TUPLE, CALL_INTRINSIC_1, CALL_INTRINSIC_2, COMPARE_OP, CONVERT_VALUE,
     DELETE_DEREF, DELETE_FAST, DELETE_GLOBAL, DELETE_NAME, LOAD_COMMON_CONSTANT, LOAD_DEREF,
     LOAD_FAST, LOAD_FAST_CHECK, LOAD_FROM_DICT_OR_DEREF, LOAD_FROM_DICT_OR_GLOBALS, LOAD_GLOBAL,
-    LOAD_LOCALS, LOAD_NAME, LOAD_SPECIAL, RERAISE, RESUME, RETURN_VALUE, SET_FUNCTION_ATTRIBUTE,
-    STORE_DEREF, STORE_FAST, STORE_GLOBAL, STORE_NAME,
+    LOAD_LOCALS, LOAD_NAME, LOAD_SPECIAL, RERAISE, RESUME, SET_FUNCTION_ATTRIBUTE, STORE_DEREF,
+    STORE_FAST, STORE_GLOBAL, STORE_NAME,
 };
 use crate::CompileError;
 use crate::assembler::{ExceptionPolicy, Label, SourceLocation};
@@ -20,9 +20,12 @@ use crate::target::operands::{
     BinaryIntrinsic, BinaryOperation, CommonConstant, ComparisonOperation, Conversion,
     FunctionAttribute, ResumeLocation, SpecialMethod, UnaryIntrinsic,
 };
-use crate::target::{
-    Opcode, is_unconditional_jump, num_popped as opcode_num_popped, num_pushed as opcode_num_pushed,
-};
+#[cfg(any(test, debug_assertions))]
+use crate::target::stack_counts as opcode_stack_counts;
+use crate::target::{Opcode, is_unconditional_jump};
+
+#[cfg(any(test, debug_assertions))]
+use super::RETURN_VALUE;
 
 use super::constant::literal_constant;
 use super::scope::{NameId, NameSet, definitely_evaluated_references};
@@ -1168,7 +1171,15 @@ impl Compiler<'_> {
         argument: u32,
         declared: i32,
     ) -> Result<(), CompileError> {
+        // Lowering supplies a statically known effect at every call site. Keep the generated
+        // metadata cross-check on every test/debug emission without paying for it in production.
+        #[cfg(any(test, debug_assertions))]
         let effect = validate_compiler_stack_effect(opcode, argument, declared)?;
+        #[cfg(not(any(test, debug_assertions)))]
+        let effect = {
+            let _ = (opcode, argument);
+            declared
+        };
         self.apply_stack_effect(effect)
     }
 
@@ -1193,6 +1204,7 @@ impl Compiler<'_> {
     }
 }
 
+#[cfg(any(test, debug_assertions))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CompilerStackEffect {
     Fixed(i32),
@@ -1200,6 +1212,7 @@ pub(super) enum CompilerStackEffect {
 }
 
 /// Returns the effect on the compiler's logical value stack when it is fixed.
+#[cfg(any(test, debug_assertions))]
 pub(super) fn compiler_stack_effect(opcode: Opcode, argument: u32) -> CompilerStackEffect {
     match opcode {
         // CPython's physical interpreter stack retains the return value for frame teardown, but
@@ -1208,15 +1221,17 @@ pub(super) fn compiler_stack_effect(opcode: Opcode, argument: u32) -> CompilerSt
         // RERAISE can discard additional logical exception-state values introduced by the
         // surrounding lowering path. Its effect is supplied by that path explicitly.
         RERAISE => CompilerStackEffect::ContextDependent,
-        _ => CompilerStackEffect::Fixed(
-            i32::try_from(opcode_num_pushed(opcode, argument))
-                .expect("opcode push count fits in i32")
-                - i32::try_from(opcode_num_popped(opcode, argument))
-                    .expect("opcode pop count fits in i32"),
-        ),
+        _ => {
+            let (popped, pushed) = opcode_stack_counts(opcode, argument);
+            CompilerStackEffect::Fixed(
+                i32::try_from(pushed).expect("opcode push count fits in i32")
+                    - i32::try_from(popped).expect("opcode pop count fits in i32"),
+            )
+        }
     }
 }
 
+#[cfg(any(test, debug_assertions))]
 pub(super) fn validate_compiler_stack_effect(
     opcode: Opcode,
     argument: u32,

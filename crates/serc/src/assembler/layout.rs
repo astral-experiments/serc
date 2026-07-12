@@ -52,12 +52,10 @@ impl LayoutAssembler {
             setup_labels.insert(region.start);
         }
         for item in &self.items {
-            if let Item::Instruction(Instruction {
-                operand: Operand::Forward(label) | Operand::Backward(label),
-                ..
-            }) = item
+            if let Item::Instruction(instruction) = item
+                && let Operand::Forward(label) | Operand::Backward(label) = instruction.operand()
             {
-                block_labels.insert(*label);
+                block_labels.insert(label);
             }
         }
         let mut position = 0;
@@ -86,12 +84,12 @@ impl LayoutAssembler {
                     // first comprehension restore, leaving that CFG slot's exception owner for
                     // a later normalized marker.
                     let is_comprehension_restore = instruction.opcode == STORE_FAST
-                        && instruction.fusion_policy.prevent_with_previous;
+                        && instruction.fusion_policy.prevents_with_previous();
                     let applied_comprehension_swap = is_comprehension_restore
                         && previous_instruction.is_some_and(|previous: Instruction| {
                             matches!(previous.opcode, POP_TOP | STORE_FAST)
                                 && !(previous.opcode == STORE_FAST
-                                    && previous.fusion_policy.prevent_with_previous)
+                                    && previous.fusion_policy.prevents_with_previous())
                         });
 
                     let end = position
@@ -100,14 +98,12 @@ impl LayoutAssembler {
                         + u32::from(instruction.opcode.caches());
                     if instruction
                         .exception_policy
-                        .exclusion
+                        .exclusion()
                         .applies(extended_args[instruction_index])
                     {
                         late_exception_exclusions.push((position, end));
                     }
-                    if instruction.exception_policy.normalized_owner
-                        == NormalizedExceptionOwner::Absent
-                    {
+                    if instruction.exception_policy.owner() == NormalizedExceptionOwner::Absent {
                         if block_has_applied_comprehension_swap {
                             late_exception_inclusions.push((position, end));
                         }
@@ -115,12 +111,10 @@ impl LayoutAssembler {
                             late_exception_exclusions.push((position, end));
                         }
                     }
-                    if instruction.exception_policy.normalized_owner
-                        == NormalizedExceptionOwner::Present
-                    {
+                    if instruction.exception_policy.owner() == NormalizedExceptionOwner::Present {
                         late_exception_inclusions.push((position, end));
                     }
-                    if instruction.exception_policy.normalized_owner
+                    if instruction.exception_policy.owner()
                         == NormalizedExceptionOwner::OverridePresent
                     {
                         late_exception_overrides.push((position, end));
@@ -132,7 +126,7 @@ impl LayoutAssembler {
                             | STORE_FAST_LOAD_FAST
                             | STORE_FAST_STORE_FAST
                     ) || matches!(
-                        (instruction.opcode, instruction.operand),
+                        (instruction.opcode, instruction.operand()),
                         (LOAD_GLOBAL, Operand::Value(argument)) if argument & 1 != 0
                     ) || applied_comprehension_swap
                     {
@@ -146,7 +140,7 @@ impl LayoutAssembler {
                     block_has_instruction = true;
                     if instruction.opcode == NOT_TAKEN
                         || (!is_conditional_jump(instruction.opcode)
-                            && (!matches!(instruction.operand, Operand::Value(_))
+                            && (!matches!(instruction.operand(), Operand::Value(_))
                                 || ends_scope(instruction.opcode)))
                     {
                         block_has_instruction = false;
@@ -272,38 +266,58 @@ impl LayoutAssembler {
         Ok(output)
     }
 
-    pub(in crate::assembler) fn line_table(
+    pub(in crate::assembler) fn encode_final_artifacts(
         &self,
         extended_args: &[u8],
+        resolved_arguments: &[u32],
+        code_units: u32,
         first_line_number: u32,
-    ) -> Vec<u8> {
-        let mut output = Vec::with_capacity(extended_args.len().saturating_mul(2));
+    ) -> (Vec<u8>, Vec<u8>, u32) {
+        let mut bytecode = vec![0; usize::try_from(code_units).unwrap().saturating_mul(2)];
+        let mut line_table = Vec::with_capacity(extended_args.len().saturating_mul(2));
+        let mut byte_offset = 0;
         let mut current_line = i32::try_from(first_line_number).unwrap_or(i32::MAX);
         let mut run = None::<(SourceLocation, u32)>;
+        let mut max_depth = 0;
         let mut instruction_index = 0_usize;
+
         for item in &self.items {
-            let Item::Instruction(instruction) = item else {
+            let Item::Instruction(instruction) = *item else {
                 continue;
             };
-            let size = u32::from(extended_args[instruction_index])
-                + 1
-                + u32::from(instruction.opcode.caches());
+            let argument = resolved_arguments[instruction_index];
+            let extended_arg_count = extended_args[instruction_index];
+
+            for index in (1..=extended_arg_count).rev() {
+                bytecode[byte_offset] = EXTENDED_ARG.code();
+                bytecode[byte_offset + 1] = ((argument >> (u32::from(index) * 8)) & 0xff) as u8;
+                byte_offset += 2;
+            }
+            bytecode[byte_offset] = instruction.opcode.code();
+            bytecode[byte_offset + 1] = (argument & 0xff) as u8;
+            byte_offset += 2 + usize::from(instruction.opcode.caches()) * 2;
+
+            let size = u32::from(extended_arg_count) + 1 + u32::from(instruction.opcode.caches());
             if let Some((location, length)) = &mut run
                 && *location == instruction.location
             {
                 *length += size;
             } else {
                 if let Some((location, length)) = run {
-                    write_location_run(&mut output, location, length, &mut current_line);
+                    write_location_run(&mut line_table, location, length, &mut current_line);
                 }
                 run = Some((instruction.location, size));
             }
+            max_depth = max_depth.max(instruction.depth_after().unwrap_or(0));
             instruction_index += 1;
         }
+
         if let Some((location, length)) = run {
-            write_location_run(&mut output, location, length, &mut current_line);
+            write_location_run(&mut line_table, location, length, &mut current_line);
         }
-        output
+        debug_assert_eq!(byte_offset, bytecode.len());
+
+        (bytecode, line_table, max_depth)
     }
 
     pub(in crate::assembler) fn label_positions(
@@ -329,39 +343,6 @@ impl LayoutAssembler {
         }
 
         position
-    }
-
-    pub(in crate::assembler) fn encode(
-        &self,
-        extended_args: &[u8],
-        resolved_arguments: &[u32],
-        code_units: u32,
-    ) -> Vec<u8> {
-        let mut output = Vec::with_capacity(usize::try_from(code_units).unwrap().saturating_mul(2));
-        let mut instruction_index = 0;
-
-        for item in &self.items {
-            let Item::Instruction(instruction) = *item else {
-                continue;
-            };
-            let argument = resolved_arguments[instruction_index];
-            let extended_arg_count = extended_args[instruction_index];
-
-            for index in (1..=extended_arg_count).rev() {
-                output.push(EXTENDED_ARG.code());
-                output.push(((argument >> (u32::from(index) * 8)) & 0xff) as u8);
-            }
-            output.push(instruction.opcode.code());
-            output.push((argument & 0xff) as u8);
-            output.resize(
-                output.len() + usize::from(instruction.opcode.caches()) * 2,
-                0,
-            );
-
-            instruction_index += 1;
-        }
-
-        output
     }
 }
 

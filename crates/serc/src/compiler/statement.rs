@@ -5777,7 +5777,8 @@ impl Compiler<'_> {
         &mut self,
         statement: &ruff_python_ast::StmtAssert,
     ) -> Result<(), CompileError> {
-        if early_condition_truthiness(&statement.test) == Some(true) {
+        let condition_truthiness = early_condition_truthiness(&statement.test);
+        if condition_truthiness == Some(true) {
             if let Some(constant) = fold_constant(&statement.test) {
                 self.add_constant(constant)?;
             }
@@ -5797,6 +5798,12 @@ impl Compiler<'_> {
             Expr::Compare(comparison) if comparison.ops.len() > 1 => Some(comparison.range),
             _ => None,
         };
+        if condition_truthiness.is_none()
+            && statement.msg.is_none()
+            && retained_chained_comparison_exit.is_none()
+        {
+            self.assembler.mark_assertion_side_exit_candidate();
+        }
         let preserve_iterator_loop_owner =
             self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) != 0
                 && self.control.first_iterator_loop_assertion == Some(statement.range);

@@ -33,6 +33,12 @@ pub(super) struct ItemPosition {
     offset: usize,
 }
 
+impl ItemPosition {
+    pub(super) const fn new(block: BasicBlockId, offset: usize) -> Self {
+        Self { block, offset }
+    }
+}
+
 /// A mutable view of a block item that keeps labels opaque and immutable.
 pub(super) enum ItemMut<'a> {
     Label,
@@ -98,7 +104,7 @@ fn normalized_segment_lengths<'a>(
             has_instruction = false;
         }
         let ends_block = matches!(item, Item::Instruction(instruction) if
-            !matches!(instruction.operand, Operand::Value(_))
+            !matches!(instruction.operand(), Operand::Value(_))
                 || ends_scope(instruction.opcode));
         length += 1;
         has_instruction |= matches!(item, Item::Instruction(_));
@@ -193,7 +199,7 @@ impl BlockGraph {
                     }
                 }
                 Item::Instruction(instruction) => {
-                    if !matches!(instruction.operand, Operand::Value(_)) {
+                    if !matches!(instruction.operand(), Operand::Value(_)) {
                         return false;
                     }
                     has_instruction = true;
@@ -365,6 +371,7 @@ impl BlockGraph {
     /// block boundaries are narrower than the assembler's structural ones.
     /// Existing block IDs are reused in order; newly split suffixes receive
     /// fresh IDs from the append-only arena.
+    #[cfg(test)]
     pub(super) fn repartition(
         &mut self,
         boundary_labels: &FxHashSet<Label>,
@@ -531,6 +538,7 @@ impl BlockGraph {
     }
 
     /// Replaces block contents while preserving the exact label sequence.
+    #[cfg(test)]
     pub(super) fn replace_items_preserving_labels(
         &mut self,
         block: BasicBlockId,
@@ -583,7 +591,7 @@ impl BlockGraph {
                 // compacting the pair. Reversed assignment stores retain the first location.
                 if let Some(Item::Instruction(following)) = items.get_mut(read + 2)
                     && following.location.line < 0
-                    && !following.no_location_policy.preserve
+                    && !following.no_location_policy.preserves_location()
                     && second_location.line == instruction.location.line
                     && second_location.column > instruction.location.column
                 {
@@ -751,17 +759,6 @@ impl BlockGraph {
 
     pub(super) fn instruction_mut(&mut self, position: ItemPosition) -> Option<&mut Instruction> {
         match &mut self.blocks[position.block.index()].items[position.offset] {
-            Item::Instruction(instruction) => Some(instruction),
-            Item::Label(_) => None,
-        }
-    }
-
-    pub(super) fn instruction_at_mut(
-        &mut self,
-        block: BasicBlockId,
-        offset: usize,
-    ) -> Option<&mut Instruction> {
-        match &mut self.blocks[block.index()].items[offset] {
             Item::Instruction(instruction) => Some(instruction),
             Item::Label(_) => None,
         }

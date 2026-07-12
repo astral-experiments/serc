@@ -1157,6 +1157,10 @@ struct FlatFunctionInputs {
 
 impl FlatFunctionInputs {
     fn record(&mut self, name: NameId, bound: bool) {
+        if self.complex {
+            return;
+        }
+
         if let Some((_, was_bound)) = self
             .names
             .iter_mut()
@@ -1166,6 +1170,15 @@ impl FlatFunctionInputs {
         } else {
             self.names.push((name, bound));
         }
+    }
+
+    fn mark_complex(&mut self) {
+        if self.complex {
+            return;
+        }
+
+        self.complex = true;
+        self.names.clear();
     }
 }
 
@@ -1189,6 +1202,10 @@ impl<'a> ModuleNameCollector<'a> {
     }
 
     fn intern(&mut self, name: &str) -> NameId {
+        if self.private_name.is_none() {
+            return self.names.intern(name);
+        }
+
         let mangled = mangle_name(name, self.private_name.as_deref());
         let id = self.names.intern(name);
         if let Cow::Owned(mangled) = mangled {
@@ -1205,7 +1222,7 @@ impl<'a> ModuleNameCollector<'a> {
 
     fn mark_flat_complex(&mut self) {
         if let Some(flat) = &mut self.flat_function {
-            flat.complex = true;
+            flat.mark_complex();
         }
     }
 
@@ -3143,5 +3160,39 @@ pub(super) fn collect_simple_annotations<'a>(
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{FlatFunctionInputs, NameId};
+
+    #[test]
+    fn flat_function_inputs_preserve_first_occurrence_and_late_binding() {
+        let mut inputs = FlatFunctionInputs {
+            names: Vec::new(),
+            complex: false,
+        };
+
+        inputs.record(NameId(2), false);
+        inputs.record(NameId(1), true);
+        inputs.record(NameId(2), true);
+
+        assert_eq!(inputs.names, [(NameId(2), true), (NameId(1), true)]);
+    }
+
+    #[test]
+    fn complex_function_inputs_discard_and_stop_recording_names() {
+        let mut inputs = FlatFunctionInputs {
+            names: vec![(NameId(1), false), (NameId(2), true)],
+            complex: false,
+        };
+
+        inputs.mark_complex();
+        inputs.record(NameId(3), true);
+        inputs.record(NameId(1), true);
+
+        assert!(inputs.complex);
+        assert!(inputs.names.is_empty());
     }
 }
