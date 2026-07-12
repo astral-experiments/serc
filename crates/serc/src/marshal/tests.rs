@@ -181,6 +181,9 @@ fn tracks_interned_strings_from_constants_and_metadata() {
     assert!(graph.is_interned("metadata name with spaces"));
     assert!(graph.is_interned("module.py"));
     assert!(!graph.is_interned("not interned"));
+    assert!(graph.is_shared(&ObjectKey::String("identifier"), false));
+    assert!(graph.is_shared(&ObjectKey::String("méthode"), false));
+    assert!(graph.is_shared(&ObjectKey::String("metadata name with spaces"), false));
 }
 
 #[test]
