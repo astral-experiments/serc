@@ -2105,6 +2105,35 @@ impl Compiler<'_> {
                         } else {
                             ExceptionPolicy::EXCLUDE_ALWAYS
                         }
+                    // CPython appends tuple(genexpr)'s optimized dispatch marker
+                    // after labeling exception targets. In one ordinary try region,
+                    // it keeps an owner only when compaction leaves a concrete
+                    // protected slot in the fallthrough block.
+                    } else if collect_tuple
+                        && self.control.generator_region_start.is_none()
+                        && !self.control.in_iterator_loop()
+                        && !self.control.exceptional_finally_condition
+                        && self
+                            .control
+                            .active_comprehension_region_exclusions
+                            .is_empty()
+                        && self.control.active_with_region_exclusions.is_empty()
+                        && self.control.active_normal_finally_bodies == 0
+                        && self.control.active_finally_end_blocks == 0
+                        && self.control.active_exception_group_handlers == 0
+                        && !self.control.same_line_try_body
+                        && !self.control.current_exception_handler_binds_name()
+                        && !self.control.in_exception_handler()
+                        && self.control.active_exception_region_exclusions.len() == 1
+                    {
+                        if self
+                            .assembler
+                            .fallthrough_has_concrete_dynamic_exception_owner()
+                        {
+                            ExceptionPolicy::normalized_owner(true)
+                        } else {
+                            ExceptionPolicy::EXCLUDE_ALWAYS
+                        }
                     } else {
                         ExceptionPolicy::default()
                     }
