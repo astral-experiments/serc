@@ -2,16 +2,116 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::super::{
     BorrowFallthrough, COMPARE_OP, CONTAINS_OP, COPY, ExceptionExclusion, IS_OP, Instruction, Item,
-    JUMP_BACKWARD, JUMP_BACKWARD_NO_INTERRUPT, JUMP_FORWARD, NOP, NOT_TAKEN, Operand,
-    POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE, POP_TOP, STORE_FAST, STORE_FAST_STORE_FAST, TO_BOOL,
-    UNARY_NOT, UNPACK_SEQUENCE, ends_scope, is_unconditional_jump,
+    JUMP_BACKWARD, JUMP_BACKWARD_NO_INTERRUPT, JUMP_FORWARD, LOAD_COMMON_CONSTANT, NOP, NOT_TAKEN,
+    Operand, POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE, POP_TOP, STORE_FAST, STORE_FAST_STORE_FAST,
+    TO_BOOL, UNARY_NOT, UNPACK_SEQUENCE, ends_scope, is_unconditional_jump,
 };
 use crate::assembler::OptimizationPipeline;
 use crate::assembler::block_graph::{BlockGraph, ItemMut, ItemPosition};
 use crate::target::Opcode;
+use crate::target::opcodes::{POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE, RAISE_VARARGS};
 use crate::target::operands::ComparisonOperation;
 
 impl OptimizationPipeline {
+    /// Returns whether every branch is an ordinary, terminal assertion side exit.
+    ///
+    /// These graphs have no unreachable blocks, forward-jump threading, exit copies, or cold
+    /// exception handlers. Keeping the proof exact lets the optimizer retain the local and
+    /// location passes while skipping their otherwise repeated CFG scans.
+    pub(in crate::assembler) fn has_only_assertion_side_exits(&self) -> bool {
+        if !self.has_assertion_side_exit_candidate
+            || self.graph.len() < 3
+            || !self.exception_regions.is_empty()
+            || !self.preserved_block_boundaries.is_empty()
+            || !self.borrow_unreachable_blocks.is_empty()
+            || self.has_synthesized_percent_target_locations
+        {
+            return false;
+        }
+
+        let mut items = self.graph.iter_items();
+        let mut assertion_count = 0;
+        let mut ended_scope = false;
+        while let Some(item) = items.next() {
+            if ended_scope {
+                return false;
+            }
+            let Item::Instruction(instruction) = item else {
+                return false;
+            };
+            if matches!(
+                instruction.opcode,
+                POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE | POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE
+            ) {
+                let Operand::Forward(target) = instruction.operand() else {
+                    return false;
+                };
+                if !matches!(
+                    items.next(),
+                    Some(Item::Instruction(instruction))
+                        if instruction.opcode == NOT_TAKEN
+                            && matches!(instruction.operand(), Operand::Value(0))
+                ) || !matches!(
+                    items.next(),
+                    Some(Item::Instruction(instruction))
+                        if instruction.opcode == LOAD_COMMON_CONSTANT
+                            && matches!(instruction.operand(), Operand::Value(0))
+                ) || !matches!(
+                    items.next(),
+                    Some(Item::Instruction(instruction))
+                        if instruction.opcode == RAISE_VARARGS
+                            && matches!(instruction.operand(), Operand::Value(1))
+                ) || !matches!(items.next(), Some(Item::Label(label)) if *label == target)
+                {
+                    return false;
+                }
+                assertion_count += 1;
+                continue;
+            }
+            if instruction.opcode == NOT_TAKEN
+                || !matches!(instruction.operand(), Operand::Value(_))
+            {
+                return false;
+            }
+            ended_scope = ends_scope(instruction.opcode);
+        }
+
+        assertion_count > 0 && ended_scope
+    }
+
+    /// Propagates an assertion condition location into its wholly unlocated continuation block.
+    ///
+    /// `duplicate_exit_blocks` performs this repair even when it creates no copies. The assertion
+    /// fast path has one jump predecessor per continuation, so no predecessor table is needed.
+    pub(in crate::assembler) fn propagate_assertion_exit_locations(&mut self) {
+        let order = self.graph.order().to_vec();
+        for blocks in order.windows(3) {
+            let [source, _, target] = blocks else {
+                unreachable!();
+            };
+            let Some(jump) = self.graph[*source].last_instruction() else {
+                continue;
+            };
+            if !matches!(
+                jump.opcode,
+                POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE | POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE
+            ) {
+                continue;
+            }
+            if self.graph[*target].items().iter().any(
+                |item| matches!(item, Item::Instruction(instruction) if instruction.location.line >= 0),
+            ) {
+                continue;
+            }
+            let location = jump.location;
+            if let Some(first) = self.graph.instructions_mut(*target).next()
+                && !first.no_location_policy.preserves_location()
+            {
+                first.location = location;
+            }
+        }
+    }
+
     /// Replaces an overwritten local store with a stack pop.
     ///
     /// CPython applies this peephole before superinstruction fusion when two
@@ -22,13 +122,13 @@ impl OptimizationPipeline {
             if first.opcode == STORE_FAST
                 && second.opcode == STORE_FAST
                 && matches!(
-                    (first.operand, second.operand),
+                    (first.operand(), second.operand()),
                     (Operand::Value(first), Operand::Value(second)) if first == second
                 )
                 && first.location.line == second.location.line
             {
                 first.opcode = POP_TOP;
-                first.operand = Operand::Value(0);
+                first.set_operand(Operand::Value(0));
             }
         });
     }
@@ -49,7 +149,7 @@ impl OptimizationPipeline {
             graph.retain_items(block, |item| match item {
                 Item::Label(_) => true,
                 Item::Instruction(instruction) => {
-                    if let Some(depth) = instruction.depth_after {
+                    if let Some(depth) = instruction.depth_after() {
                         removed_max_depth =
                             Some(removed_max_depth.map_or(depth, |max: u32| max.max(depth)));
                     }
@@ -77,32 +177,32 @@ impl OptimizationPipeline {
             match (current.opcode, next.opcode) {
                 (TO_BOOL, TO_BOOL) => {
                     current.opcode = NOP;
-                    current.operand = Operand::Value(0);
+                    current.set_operand(Operand::Value(0));
                     return;
                 }
                 (UNARY_NOT, TO_BOOL) => {
                     current.opcode = NOP;
-                    current.operand = Operand::Value(0);
+                    current.set_operand(Operand::Value(0));
                     next.opcode = UNARY_NOT;
-                    next.operand = Operand::Value(0);
+                    next.set_operand(Operand::Value(0));
                     return;
                 }
                 (UNARY_NOT, UNARY_NOT) => {
                     current.opcode = NOP;
-                    current.operand = Operand::Value(0);
+                    current.set_operand(Operand::Value(0));
                     next.opcode = NOP;
-                    next.operand = Operand::Value(0);
+                    next.set_operand(Operand::Value(0));
                     return;
                 }
                 (CONTAINS_OP | IS_OP, UNARY_NOT) => {
-                    let Operand::Value(argument) = current.operand else {
+                    let Operand::Value(argument) = current.operand() else {
                         return;
                     };
                     let opcode = current.opcode;
                     current.opcode = NOP;
-                    current.operand = Operand::Value(0);
+                    current.set_operand(Operand::Value(0));
                     next.opcode = opcode;
-                    next.operand = Operand::Value(argument ^ 1);
+                    next.set_operand(Operand::Value(argument ^ 1));
                     return;
                 }
                 _ => {}
@@ -110,7 +210,7 @@ impl OptimizationPipeline {
             if next.opcode != TO_BOOL {
                 return;
             }
-            let Operand::Value(argument) = current.operand else {
+            let Operand::Value(argument) = current.operand() else {
                 return;
             };
             let replacement = match current.opcode {
@@ -123,9 +223,9 @@ impl OptimizationPipeline {
                 return;
             };
             current.opcode = NOP;
-            current.operand = Operand::Value(0);
+            current.set_operand(Operand::Value(0));
             next.opcode = opcode;
-            next.operand = Operand::Value(argument);
+            next.set_operand(Operand::Value(argument));
         });
     }
 
@@ -146,7 +246,7 @@ impl OptimizationPipeline {
                 return false;
             };
             if !matches!(instruction.opcode, POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE)
-                || !matches!(instruction.operand, Operand::Forward(_))
+                || !matches!(instruction.operand(), Operand::Forward(_))
             {
                 return false;
             }
@@ -164,7 +264,7 @@ impl OptimizationPipeline {
             };
             to_bool.opcode == TO_BOOL
                 && copy.opcode == COPY
-                && matches!(copy.operand, Operand::Value(1))
+                && matches!(copy.operand(), Operand::Value(1))
         }
 
         // CPython threads the value-preserving jumps used by boolean
@@ -179,7 +279,7 @@ impl OptimizationPipeline {
             let Item::Instruction(instruction) = item else {
                 continue;
             };
-            if !matches!(instruction.operand, Operand::Forward(_)) {
+            if !matches!(instruction.operand(), Operand::Forward(_)) {
                 continue;
             }
             match instruction.opcode {
@@ -228,10 +328,10 @@ impl OptimizationPipeline {
                     continue;
                 };
                 if copy.opcode != COPY
-                    || !matches!(copy.operand, Operand::Value(1))
+                    || !matches!(copy.operand(), Operand::Value(1))
                     || to_bool.opcode != TO_BOOL
                     || !matches!(jump.opcode, POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE)
-                    || !matches!(jump.operand, Operand::Forward(_))
+                    || !matches!(jump.operand(), Operand::Forward(_))
                     || not_taken.opcode != NOT_TAKEN
                     || pop.opcode != POP_TOP
                 {
@@ -241,7 +341,7 @@ impl OptimizationPipeline {
                     label,
                     ConditionalTarget {
                         opcode: jump.opcode,
-                        operand: jump.operand,
+                        operand: jump.operand(),
                         fallthrough_index,
                     },
                 );
@@ -259,7 +359,7 @@ impl OptimizationPipeline {
                         if !is_value_preserving_jump(graph, &positions, index) {
                             return None;
                         }
-                        let Operand::Forward(target) = instruction.operand else {
+                        let Operand::Forward(target) = instruction.operand() else {
                             return None;
                         };
                         let target = conditional_targets.get(&target)?;
@@ -291,7 +391,7 @@ impl OptimizationPipeline {
                     if !matches!(instruction.opcode, POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE) {
                         continue;
                     }
-                    let Operand::Forward(mut target) = instruction.operand else {
+                    let Operand::Forward(mut target) = instruction.operand() else {
                         continue;
                     };
                     for _ in 0..conditional_targets.len() {
@@ -340,7 +440,7 @@ impl OptimizationPipeline {
                             && !instruction.jump_policy.always_retains_nop()
                             && is_unconditional_jump(instruction.opcode)
                             && let operand @ (Operand::Forward(_) | Operand::Backward(_)) =
-                                instruction.operand
+                                instruction.operand()
                         {
                             jump_targets.insert(
                                 *label,
@@ -361,10 +461,10 @@ impl OptimizationPipeline {
             if instruction.opcode != JUMP_FORWARD || instruction.jump_policy.always_retains_nop() {
                 return;
             }
-            let Operand::Forward(mut target) = instruction.operand else {
+            let Operand::Forward(mut target) = instruction.operand() else {
                 return;
             };
-            let mut operand = instruction.operand;
+            let mut operand = instruction.operand();
             let mut opcode = instruction.opcode;
             let mut artificial_eval_break =
                 instruction.no_location_policy.is_artificial_eval_break();
@@ -417,7 +517,7 @@ impl OptimizationPipeline {
                     if instruction.opcode != JUMP_FORWARD {
                         continue;
                     }
-                    let Operand::Forward(jump_target) = instruction.operand else {
+                    let Operand::Forward(jump_target) = instruction.operand() else {
                         continue;
                     };
                     if instruction.jump_policy.defers_redundant_removal() {
@@ -434,137 +534,131 @@ impl OptimizationPipeline {
         if !has_work {
             return;
         }
-        let item_count = graph
-            .iter()
-            .map(|(_, contents)| contents.items().len())
-            .sum();
-        let mut items = Vec::with_capacity(item_count);
-        for (block, contents) in graph.iter() {
-            items.extend(contents.items().iter().copied().map(|item| (block, item)));
-        }
-        let mut index = 0;
-        while index < items.len() {
-            let Item::Instruction(instruction) = items[index].1 else {
-                index += 1;
-                continue;
-            };
-            let Operand::Forward(target) = instruction.operand else {
-                index += 1;
-                continue;
-            };
-            if instruction.opcode != JUMP_FORWARD {
-                index += 1;
-                continue;
-            }
-            if instruction.jump_policy.defers_redundant_removal() {
-                let Item::Instruction(instruction) = &mut items[index].1 else {
-                    unreachable!();
+        let order = graph.order().to_vec();
+        let mut previous = None;
+        let mut redundant = Vec::new();
+        for (block_index, block) in order.iter().copied().enumerate() {
+            for offset in 0..graph[block].items().len() {
+                let position = ItemPosition::new(block, offset);
+                let Item::Instruction(instruction) = *graph.item(position) else {
+                    continue;
                 };
-                instruction.jump_policy.resolve_deferred_removal();
-                index += 1;
-                continue;
-            }
-            if instruction.jump_policy.borrow_empty_block() && !finalize_borrow_empty_blocks {
-                index += 1;
-                continue;
-            }
-            let target_is_next = items[index + 1..]
-                .iter()
-                .map(|(_, item)| item)
-                .take_while(|item| matches!(item, Item::Label(_)))
-                .any(|item| matches!(item, Item::Label(label) if *label == target));
-            if !target_is_next {
-                index += 1;
-                continue;
-            }
-            if instruction.jump_policy.borrow_empty_block() {
-                let Item::Instruction(instruction) = &mut items[index].1 else {
-                    unreachable!();
+                let Operand::Forward(target) = instruction.operand() else {
+                    previous = Some(position);
+                    continue;
                 };
-                instruction.opcode = NOP;
-                instruction.operand = Operand::Value(0);
-                index += 1;
-                continue;
-            }
-            let previous = items[..index]
-                .iter()
-                .rposition(|(_, item)| matches!(item, Item::Instruction(_)));
-            let previous_line = previous.map(|previous| {
-                let Item::Instruction(instruction) = items[previous].1 else {
-                    unreachable!();
-                };
-                instruction.location.line
-            });
-            let next = items[index + 1..]
-                .iter()
-                .position(|(_, item)| matches!(item, Item::Instruction(_)))
-                .map(|next| index + 1 + next);
-            let next_line = next.map(|next| {
-                let Item::Instruction(instruction) = items[next].1 else {
-                    unreachable!();
-                };
-                instruction.location.line
-            });
-            if !instruction.jump_policy.always_retains_nop()
-                && (instruction.location.line < 0
-                    || previous_line == Some(instruction.location.line)
-                    || next_line == Some(instruction.location.line))
-            {
-                items.remove(index);
-                if instruction.exception_policy.exclusion == ExceptionExclusion::IfExtended
-                    && let Some(previous) = previous
+                if instruction.opcode != JUMP_FORWARD {
+                    previous = Some(position);
+                    continue;
+                }
+                if instruction.jump_policy.defers_redundant_removal() {
+                    graph
+                        .instruction_mut(position)
+                        .unwrap()
+                        .jump_policy
+                        .resolve_deferred_removal();
+                    previous = Some(position);
+                    continue;
+                }
+                if instruction.jump_policy.borrow_empty_block() && !finalize_borrow_empty_blocks {
+                    previous = Some(position);
+                    continue;
+                }
+
+                let mut target_is_next = false;
+                let mut next = None;
+                'next: for (next_block_index, next_block) in
+                    order.iter().copied().enumerate().skip(block_index)
                 {
-                    let Item::Instruction(previous) = &mut items[previous].1 else {
+                    let start = if next_block_index == block_index {
+                        offset + 1
+                    } else {
+                        0
+                    };
+                    for (next_offset, item) in
+                        graph[next_block].items().iter().enumerate().skip(start)
+                    {
+                        match item {
+                            Item::Label(label) => target_is_next |= *label == target,
+                            Item::Instruction(_) => {
+                                next = Some(ItemPosition::new(next_block, next_offset));
+                                break 'next;
+                            }
+                        }
+                    }
+                }
+                if !target_is_next {
+                    previous = Some(position);
+                    continue;
+                }
+                if instruction.jump_policy.borrow_empty_block() {
+                    let instruction = graph.instruction_mut(position).unwrap();
+                    instruction.opcode = NOP;
+                    instruction.set_operand(Operand::Value(0));
+                    previous = Some(position);
+                    continue;
+                }
+
+                let previous_line = previous.map(|previous| {
+                    let Item::Instruction(instruction) = *graph.item(previous) else {
                         unreachable!();
                     };
-                    previous
-                        .exception_policy
-                        .exclude(ExceptionExclusion::IfExtended);
-                }
-                if instruction.borrow_fallthrough == BorrowFallthrough::Barrier
-                    && let Some(previous) = previous
-                {
-                    let Item::Instruction(previous) = &mut items[previous].1 else {
+                    instruction.location.line
+                });
+                let next_line = next.map(|next| {
+                    let Item::Instruction(instruction) = *graph.item(next) else {
                         unreachable!();
                     };
-                    previous.borrow_fallthrough = BorrowFallthrough::Barrier;
-                }
-                if instruction.location.line >= 0
-                    && let Some(next) = next.map(|next| next - 1)
-                    && let Item::Instruction(next) = &mut items[next].1
-                    && next.location.line < 0
-                    && !next.no_location_policy.preserve
-                    && !next.no_location_policy.allows_block_inlining()
+                    instruction.location.line
+                });
+                if !instruction.jump_policy.always_retains_nop()
+                    && (instruction.location.line < 0
+                        || previous_line == Some(instruction.location.line)
+                        || next_line == Some(instruction.location.line))
                 {
-                    next.location = instruction.location;
+                    redundant.push(position);
+                    if instruction.exception_policy.exclusion() == ExceptionExclusion::IfExtended
+                        && let Some(previous) = previous
+                    {
+                        graph
+                            .instruction_mut(previous)
+                            .unwrap()
+                            .exception_policy
+                            .exclude(ExceptionExclusion::IfExtended);
+                    }
+                    if instruction.no_location_policy.borrow_fallthrough()
+                        == BorrowFallthrough::Barrier
+                        && let Some(previous) = previous
+                    {
+                        graph
+                            .instruction_mut(previous)
+                            .unwrap()
+                            .no_location_policy
+                            .set_borrow_fallthrough(BorrowFallthrough::Barrier);
+                    }
+                    if instruction.location.line >= 0
+                        && let Some(next) = next
+                    {
+                        let next = graph.instruction_mut(next).unwrap();
+                        if next.location.line < 0
+                            && !next.no_location_policy.preserves_location()
+                            && !next.no_location_policy.allows_block_inlining()
+                        {
+                            next.location = instruction.location;
+                        }
+                    }
+                } else {
+                    let instruction = graph.instruction_mut(position).unwrap();
+                    instruction.opcode = NOP;
+                    instruction.set_operand(Operand::Value(0));
+                    previous = Some(position);
                 }
-            } else {
-                let Item::Instruction(instruction) = &mut items[index].1 else {
-                    unreachable!();
-                };
-                instruction.opcode = NOP;
-                instruction.operand = Operand::Value(0);
-                index += 1;
             }
         }
 
-        let order = graph.order().to_vec();
-        let mut start = 0;
-        for block in order {
-            let mut end = start;
-            while items
-                .get(end)
-                .is_some_and(|(item_block, _)| *item_block == block)
-            {
-                end += 1;
-            }
-            graph.replace_items_preserving_labels(
-                block,
-                items[start..end].iter().map(|(_, item)| *item),
-            );
-            start = end;
+        for position in redundant.into_iter().rev() {
+            graph.remove_item(position);
         }
-        debug_assert_eq!(start, items.len());
     }
 
     pub(in crate::assembler) fn propagate_locations_within_blocks(&mut self) {
@@ -582,7 +676,8 @@ impl OptimizationPipeline {
                     ItemMut::Label => {}
                     ItemMut::Instruction(instruction) => {
                         block_has_instruction = true;
-                        if instruction.location.line < 0 && !instruction.no_location_policy.preserve
+                        if instruction.location.line < 0
+                            && !instruction.no_location_policy.preserves_location()
                         {
                             if let Some(location) = previous {
                                 instruction.location = location;
@@ -590,7 +685,7 @@ impl OptimizationPipeline {
                         } else {
                             previous = Some(instruction.location);
                         }
-                        if !matches!(instruction.operand, Operand::Value(_))
+                        if !matches!(instruction.operand(), Operand::Value(_))
                             || ends_scope(instruction.opcode)
                         {
                             previous = None;
@@ -604,36 +699,38 @@ impl OptimizationPipeline {
 
     pub(in crate::assembler) fn remove_redundant_nops(&mut self) {
         let graph = &self.graph;
-        let instructions = graph
-            .item_positions()
-            .into_iter()
-            .filter_map(|position| {
-                let Item::Instruction(instruction) = *graph.item(position) else {
-                    return None;
-                };
-                Some((position, instruction))
-            })
-            .collect::<Vec<_>>();
+        let instructions = graph.order().iter().copied().flat_map(|block| {
+            graph[block]
+                .items()
+                .iter()
+                .enumerate()
+                .filter_map(move |(offset, item)| {
+                    let Item::Instruction(instruction) = item else {
+                        return None;
+                    };
+                    Some((ItemPosition::new(block, offset), instruction))
+                })
+        });
+        let mut instructions = instructions.peekable();
         let mut previous = None;
         let mut redundant = Vec::new();
-        for (index, (position, instruction)) in instructions.iter().copied().enumerate() {
+        while let Some((position, instruction)) = instructions.next() {
+            let next = instructions.peek().map(|(_, instruction)| *instruction);
             let remove = instruction.opcode == NOP
                 && !instruction.jump_policy.preserves_explicit_nop()
                 && (instruction.location.line < 0
-                    || (instruction.converted_pop_block
-                        && previous.is_some_and(|previous: Instruction| {
+                    || (instruction.fusion_policy.is_converted_pop_block()
+                        && previous.is_some_and(|previous: &Instruction| {
                             previous.location.line == instruction.location.line
                                 && !(ends_scope(previous.opcode)
                                     || is_unconditional_jump(previous.opcode))
                         }))
-                    || instructions
-                        .get(index + 1)
-                        .is_some_and(|(_, next)| next.location.line == instruction.location.line)
+                    || next.is_some_and(|next| next.location.line == instruction.location.line)
                     // CPython deletes this traced rotation slot after applying an unpacked
                     // pattern's stack permutation to its local capture stores.
-                    || (previous.is_some_and(|previous: Instruction| {
+                    || (previous.is_some_and(|previous: &Instruction| {
                         previous.opcode == UNPACK_SEQUENCE
-                    }) && instructions.get(index + 1).is_some_and(|(_, next)| {
+                    }) && next.is_some_and(|next| {
                         matches!(next.opcode, STORE_FAST | STORE_FAST_STORE_FAST)
                     })));
             if remove {

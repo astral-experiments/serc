@@ -811,26 +811,31 @@ def render(sources: dict[str, str]) -> str:
         lines.append(f"    pub(crate) const {name}: u8 = {rust_hex(value, 2)};")
     lines.extend(["}", ""])
 
-    for direction, effects in (("popped", popped), ("pushed", pushed)):
-        lines.extend(
-            [
-                f"pub(crate) fn num_{direction}(opcode: Opcode, argument: u32) -> usize {{",
-                "    let argument = i64::from(argument);",
-                "    let value = match opcode {",
-            ]
+    lines.extend(
+        [
+            "pub(crate) fn stack_counts(opcode: Opcode, argument: u32) -> (usize, usize) {",
+            "    let argument = i64::from(argument);",
+            "    let (popped, pushed) = match opcode {",
+        ]
+    )
+    for name, _ in opcodes:
+        popped_expression = rust_stack_expression(popped[name])
+        pushed_expression = rust_stack_expression(pushed[name])
+        lines.append(
+            f"        opcodes::{name} => ({popped_expression}, {pushed_expression}),"
         )
-        for name, _ in opcodes:
-            expression = rust_stack_expression(effects[name])
-            lines.append(f"        opcodes::{name} => {expression},")
-        lines.extend(
-            [
-                '        _ => unreachable!("missing generated stack metadata for opcode {}", opcode.code()),',
-                "    };",
-                f'    usize::try_from(value).expect("negative generated stack-{direction} count")',
-                "}",
-                "",
-            ]
-        )
+    lines.extend(
+        [
+            '        _ => unreachable!("missing generated stack metadata for opcode {}", opcode.code()),',
+            "    };",
+            "    (",
+            '        usize::try_from(popped).expect("negative generated stack-popped count"),',
+            '        usize::try_from(pushed).expect("negative generated stack-pushed count"),',
+            "    )",
+            "}",
+            "",
+        ]
+    )
     return "\n".join(lines) + "\n"
 
 

@@ -7,13 +7,37 @@ use super::{
     Operand, OperandPatchId, SourceLocation,
 };
 use crate::target::opcodes::*;
-use crate::target::operands::ResumeLocation;
+use crate::target::operands::{CommonConstant, ResumeLocation};
 
 #[test]
 #[cfg(target_pointer_width = "64")]
 fn instruction_items_remain_cache_compact() {
-    assert_eq!(std::mem::size_of::<Instruction>(), 48);
-    assert_eq!(std::mem::size_of::<Item>(), 48);
+    assert_eq!(std::mem::size_of::<Instruction>(), 32);
+    assert_eq!(std::mem::size_of::<Item>(), 32);
+}
+
+#[test]
+fn compact_operands_preserve_full_width_payloads() {
+    let operands = [
+        Operand::Value(u32::MAX),
+        Operand::Deferred(OperandPatchId(u32::MAX)),
+        Operand::Forward(super::Label(u32::MAX)),
+        Operand::Backward(super::Label(u32::MAX)),
+    ];
+    let mut instruction = Instruction::new(NOP, operands[0], SourceLocation::NONE, None);
+    for operand in operands {
+        instruction.set_operand(operand);
+        assert_eq!(instruction.operand(), operand);
+    }
+
+    let mut first = Instruction::new(NOP, operands[2], SourceLocation::NONE, None);
+    first.fusion_policy.prevent_with_previous();
+    let mut second = Instruction::new(NOP, operands[3], SourceLocation::NONE, None);
+    second.fusion_policy.prevent_with_next();
+    let fused = Instruction::fused(NOP, operands[1], first, second);
+    assert_eq!(fused.operand(), operands[1]);
+    assert!(fused.fusion_policy.prevents_with_previous());
+    assert!(fused.fusion_policy.prevents_with_next());
 }
 
 #[test]
@@ -23,22 +47,68 @@ fn instruction_constructors_set_audited_defaults() {
     assert!(!regular.local_policy.may_store_null());
     assert_eq!(regular.no_location_policy, NoLocationPolicy::default());
     assert_eq!(regular.fusion_policy, FusionPolicy::default());
-    assert!(!regular.location_from_next);
-    assert!(!regular.converted_pop_block);
-    assert_eq!(regular.hidden_exception_owner_slots, 0);
+    assert!(!regular.fusion_policy.location_from_next());
+    assert!(!regular.fusion_policy.is_converted_pop_block());
+    assert_eq!(regular.local_policy.hidden_exception_owner_slots(), 0);
     assert_eq!(regular.jump_policy, JumpPolicy::default());
-    assert!(!regular.jump_provenance.is_authored_break());
-    assert!(!regular.jump_provenance.transitive_small_exit_inlining());
+    assert!(!regular.fusion_policy.is_authored_break());
+    assert!(!regular.fusion_policy.transitive_small_exit_inlining());
 
     let synthetic = Instruction::synthetic(NOP, Operand::Value(0), SourceLocation::NONE, None);
     assert!(!synthetic.jump_policy.inline_small_exit());
     let mut expected_synthetic_policy = JumpPolicy::default();
     expected_synthetic_policy.prevent_small_exit_inlining();
     assert_eq!(synthetic.jump_policy, expected_synthetic_policy);
-    assert!(!synthetic.jump_provenance.is_authored_break());
+    assert!(!synthetic.fusion_policy.is_authored_break());
     assert_eq!(synthetic.exception_policy, ExceptionPolicy::default());
-    assert_eq!(regular.borrow_fallthrough, BorrowFallthrough::Reachable);
-    assert_eq!(synthetic.borrow_fallthrough, BorrowFallthrough::Reachable);
+    assert_eq!(
+        regular.no_location_policy.borrow_fallthrough(),
+        BorrowFallthrough::Reachable
+    );
+    assert_eq!(
+        synthetic.no_location_policy.borrow_fallthrough(),
+        BorrowFallthrough::Reachable
+    );
+}
+
+#[test]
+fn packed_exception_policy_preserves_all_states() {
+    let exclusions = [
+        ExceptionExclusion::None,
+        ExceptionExclusion::IfExtended,
+        ExceptionExclusion::Always,
+    ];
+    let owners = [
+        NormalizedExceptionOwner::Unchanged,
+        NormalizedExceptionOwner::Present,
+        NormalizedExceptionOwner::OverridePresent,
+        NormalizedExceptionOwner::Absent,
+    ];
+    for exclusion in exclusions {
+        for owner in owners {
+            let mut policy = ExceptionPolicy::default();
+            policy.exclude(exclusion);
+            policy.set_owner(owner);
+            assert_eq!(policy.exclusion(), exclusion);
+            assert_eq!(policy.owner(), owner);
+        }
+    }
+    assert_eq!(
+        ExceptionPolicy::EXCLUDE_IF_EXTENDED.exclusion(),
+        ExceptionExclusion::IfExtended
+    );
+    assert_eq!(
+        ExceptionPolicy::EXCLUDE_ALWAYS.exclusion(),
+        ExceptionExclusion::Always
+    );
+    assert_eq!(
+        ExceptionPolicy::normalized_owner(true).owner(),
+        NormalizedExceptionOwner::Present
+    );
+    assert_eq!(
+        ExceptionPolicy::normalized_owner(false).owner(),
+        NormalizedExceptionOwner::Absent
+    );
 }
 
 #[test]
@@ -119,7 +189,11 @@ fn retained_jump_nop_distinguishes_direct_target_provenance() {
         None,
     );
     instruction.jump_policy.retain_nop_for_direct_target();
-    assert!(instruction.jump_policy.retains_nop_for(instruction.operand));
+    assert!(
+        instruction
+            .jump_policy
+            .retains_nop_for(instruction.operand())
+    );
 
     instruction.retarget(Operand::Forward(expected));
     assert_eq!(
@@ -132,12 +206,20 @@ fn retained_jump_nop_distinguishes_direct_target_provenance() {
         RetainedJumpNop::None
     );
     instruction.retarget(Operand::Forward(expected));
-    assert!(!instruction.jump_policy.retains_nop_for(instruction.operand));
+    assert!(
+        !instruction
+            .jump_policy
+            .retains_nop_for(instruction.operand())
+    );
 
     instruction.jump_policy.retain_nop();
     instruction.retarget(Operand::Backward(expected));
     assert!(instruction.jump_policy.always_retains_nop());
-    assert!(instruction.jump_policy.retains_nop_for(instruction.operand));
+    assert!(
+        instruction
+            .jump_policy
+            .retains_nop_for(instruction.operand())
+    );
 }
 
 #[test]
@@ -205,8 +287,14 @@ fn borrow_fallthrough_barrier_stays_on_predecessor_across_labels_and_emission() 
         );
     };
     assert_eq!(*actual_boundary, boundary);
-    assert_eq!(predecessor.borrow_fallthrough, BorrowFallthrough::Barrier);
-    assert_eq!(next.borrow_fallthrough, BorrowFallthrough::Reachable);
+    assert_eq!(
+        predecessor.no_location_policy.borrow_fallthrough(),
+        BorrowFallthrough::Barrier
+    );
+    assert_eq!(
+        next.no_location_policy.borrow_fallthrough(),
+        BorrowFallthrough::Reachable
+    );
 }
 
 #[test]
@@ -485,20 +573,22 @@ fn fusion_preserves_each_typed_instruction_policy() {
         .no_location_policy
         .make_copy_inherit_shared_predecessor();
     first.no_location_policy.percent_target_location = 7;
-    first.converted_pop_block = true;
-    first.hidden_exception_owner_slots = 2;
-    first.fusion_policy.prevent_with_next = true;
+    first.fusion_policy.mark_converted_pop_block();
+    first.local_policy.add_hidden_exception_owner_slots(2);
+    first.fusion_policy.prevent_with_next();
     first.jump_policy.prevent_threading_target();
     first.jump_policy.defer_removal();
     first.jump_policy.retain_nop();
     first.jump_policy.mark_borrow_empty_block();
     first.jump_policy.preserve_explicit_nop();
-    first.jump_provenance.mark_authored_break();
-    first.jump_provenance.allow_transitive_small_exit_inlining();
+    first.fusion_policy.mark_authored_break();
+    first.fusion_policy.allow_transitive_small_exit_inlining();
     first
         .exception_policy
         .exclude(ExceptionExclusion::IfExtended);
-    first.exception_policy.normalized_owner = NormalizedExceptionOwner::Absent;
+    first
+        .exception_policy
+        .set_owner(NormalizedExceptionOwner::Absent);
 
     let mut second = Instruction::new(
         LOAD_FAST,
@@ -507,20 +597,25 @@ fn fusion_preserves_each_typed_instruction_policy() {
         Some(2),
     );
     second.local_policy = LocalPolicy::for_load(false, true);
-    second.no_location_policy.preserve = true;
-    second.fusion_policy.prevent_with_previous = true;
+    second.no_location_policy.preserve_location();
+    second.fusion_policy.prevent_with_previous();
     second.jump_policy.prevent_small_exit_inlining();
     second.jump_policy.retain_redundant_nop_after_threading();
     second.jump_policy.retain_nop_for_direct_target();
     second.exception_policy.exclude(ExceptionExclusion::Always);
-    second.exception_policy.normalized_owner = NormalizedExceptionOwner::Present;
-    second.hidden_exception_owner_slots = 2;
-    second.borrow_fallthrough = BorrowFallthrough::Barrier;
+    second
+        .exception_policy
+        .set_owner(NormalizedExceptionOwner::Present);
+    second.local_policy.add_hidden_exception_owner_slots(2);
+    second
+        .no_location_policy
+        .set_borrow_fallthrough(BorrowFallthrough::Barrier);
 
     let fused = Instruction::fused(LOAD_FAST_LOAD_FAST, Operand::Value(0x12), first, second);
 
     let mut expected_local_policy = LocalPolicy::for_load(true, true);
     expected_local_policy.mark_maybe_null_comprehension_restore();
+    expected_local_policy.add_hidden_exception_owner_slots(3);
     assert_eq!(fused.local_policy, expected_local_policy);
     assert!(fused.no_location_policy.allows_block_inlining());
     assert!(
@@ -530,16 +625,17 @@ fn fusion_preserves_each_typed_instruction_policy() {
     );
     assert!(fused.no_location_policy.is_artificial_eval_break());
     assert!(fused.no_location_policy.copy_inherits_shared_predecessor());
-    assert!(fused.no_location_policy.preserve);
+    assert!(fused.no_location_policy.preserves_location());
     assert_eq!(fused.no_location_policy.percent_target_location, 7);
-    assert_eq!(fused.fusion_policy, FusionPolicy::default());
-    assert!(fused.converted_pop_block);
+    assert!(!fused.fusion_policy.prevents_with_previous());
+    assert!(!fused.fusion_policy.prevents_with_next());
+    assert!(fused.fusion_policy.is_converted_pop_block());
     assert!(fused.jump_policy.preserves_explicit_nop());
-    assert!(fused.jump_provenance.is_authored_break());
-    assert!(fused.jump_provenance.transitive_small_exit_inlining());
-    assert_eq!(fused.hidden_exception_owner_slots, 3);
+    assert!(fused.fusion_policy.is_authored_break());
+    assert!(fused.fusion_policy.transitive_small_exit_inlining());
+    assert_eq!(fused.local_policy.hidden_exception_owner_slots(), 3);
     assert_eq!(fused.location, first.location);
-    assert_eq!(fused.depth_after, second.depth_after);
+    assert_eq!(fused.depth_after(), second.depth_after());
     let mut expected_jump_policy = JumpPolicy::default();
     expected_jump_policy.prevent_small_exit_inlining();
     expected_jump_policy.prevent_threading_target();
@@ -547,13 +643,17 @@ fn fusion_preserves_each_typed_instruction_policy() {
     expected_jump_policy.mark_borrow_empty_block();
     expected_jump_policy.preserve_explicit_nop();
     assert_eq!(fused.jump_policy, expected_jump_policy);
-    assert_eq!(fused.borrow_fallthrough, BorrowFallthrough::Barrier);
     assert_eq!(
-        fused.exception_policy,
-        ExceptionPolicy {
-            exclusion: ExceptionExclusion::Always,
-            normalized_owner: NormalizedExceptionOwner::Absent,
-        }
+        fused.no_location_policy.borrow_fallthrough(),
+        BorrowFallthrough::Barrier
+    );
+    assert_eq!(
+        fused.exception_policy.exclusion(),
+        ExceptionExclusion::Always
+    );
+    assert_eq!(
+        fused.exception_policy.owner(),
+        NormalizedExceptionOwner::Absent
     );
 
     let mut next_first = Instruction::new(
@@ -562,7 +662,7 @@ fn fusion_preserves_each_typed_instruction_policy() {
         SourceLocation::new(3, 3, 0, 1),
         None,
     );
-    next_first.location_from_next = true;
+    next_first.fusion_policy.mark_location_from_next();
     let next_second = Instruction::new(
         LOAD_FAST,
         Operand::Value(2),
@@ -576,29 +676,29 @@ fn fusion_preserves_each_typed_instruction_policy() {
         next_second,
     );
     assert_eq!(fused_next.location, next_second.location);
-    assert!(!fused_next.location_from_next);
+    assert!(!fused_next.fusion_policy.location_from_next());
 
     let mut first_edge = Instruction::new(LOAD_FAST, Operand::Value(1), SourceLocation::NONE, None);
-    first_edge.fusion_policy.prevent_with_previous = true;
-    first_edge.borrow_fallthrough = BorrowFallthrough::Barrier;
+    first_edge.fusion_policy.prevent_with_previous();
+    first_edge
+        .no_location_policy
+        .set_borrow_fallthrough(BorrowFallthrough::Barrier);
     let mut second_edge =
         Instruction::new(LOAD_FAST, Operand::Value(2), SourceLocation::NONE, None);
-    second_edge.fusion_policy.prevent_with_next = true;
+    second_edge.fusion_policy.prevent_with_next();
     let fused_edges = Instruction::fused(
         LOAD_FAST_LOAD_FAST,
         Operand::Value(0x12),
         first_edge,
         second_edge,
     );
-    assert_eq!(
-        fused_edges.fusion_policy,
-        FusionPolicy {
-            prevent_with_previous: true,
-            prevent_with_next: true,
-        }
-    );
+    assert!(fused_edges.fusion_policy.prevents_with_previous());
+    assert!(fused_edges.fusion_policy.prevents_with_next());
     assert_eq!(fused_edges.jump_policy, JumpPolicy::default());
-    assert_eq!(fused_edges.borrow_fallthrough, BorrowFallthrough::Reachable);
+    assert_eq!(
+        fused_edges.no_location_policy.borrow_fallthrough(),
+        BorrowFallthrough::Reachable
+    );
 }
 
 #[test]
@@ -626,10 +726,7 @@ fn operand_patches_survive_item_insertion() {
     assert!(matches!(assembler.linear_items()[0], Item::Label(label) if label == preceding));
     assert!(matches!(
         assembler.linear_items()[1],
-        Item::Instruction(Instruction {
-            operand: Operand::Value(37),
-            ..
-        })
+        Item::Instruction(instruction) if instruction.operand() == Operand::Value(37)
     ));
 }
 
@@ -679,7 +776,7 @@ fn operand_patches_reject_duplicate_and_unknown_attachments() {
     let Item::Instruction(mut instruction) = unknown.linear_items()[0] else {
         unreachable!();
     };
-    instruction.operand = Operand::Deferred(OperandPatchId(1));
+    instruction.set_operand(Operand::Deferred(OperandPatchId(1)));
     unknown
         .linear_items_mut()
         .push(Item::Instruction(instruction));
@@ -792,6 +889,108 @@ fn emits_extended_arguments() {
 }
 
 #[test]
+fn emits_full_width_extended_arguments_and_zeroed_inline_caches() {
+    let mut assembler = Assembler::default();
+    assembler.emit(LOAD_GLOBAL, 0x1234_5678);
+    assert_eq!(
+        assembler.finish().unwrap(),
+        [
+            EXTENDED_ARG.code(),
+            0x12,
+            EXTENDED_ARG.code(),
+            0x34,
+            EXTENDED_ARG.code(),
+            0x56,
+            LOAD_GLOBAL.code(),
+            0x78,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ]
+    );
+}
+
+#[test]
+fn fused_final_artifacts_preserve_cache_extended_argument_location_and_depth_semantics() {
+    let first_location = SourceLocation::new(7, 7, 0, 1);
+    let second_location = SourceLocation::new(8, 8, 2, 4);
+    let assembler = super::LayoutAssembler {
+        items: vec![
+            Item::Instruction(Instruction::new(
+                LOAD_GLOBAL,
+                Operand::Value(0x1234_5678),
+                first_location,
+                Some(3),
+            )),
+            Item::Label(super::Label(0)),
+            Item::Instruction(Instruction::new(
+                LOAD_CONST,
+                Operand::Value(0x1234),
+                first_location,
+                None,
+            )),
+            Item::Instruction(Instruction::new(
+                LOAD_CONST,
+                Operand::Value(2),
+                second_location,
+                Some(12),
+            )),
+            Item::Instruction(Instruction::new(
+                LOAD_CONST,
+                Operand::Value(3),
+                SourceLocation::NONE,
+                Some(5),
+            )),
+        ],
+        exception_regions: Vec::new(),
+        preserved_block_boundaries: rustc_hash::FxHashSet::default(),
+        removed_max_depth: None,
+        next_label: 1,
+        has_next_location: false,
+    };
+
+    let (bytecode, line_table, max_depth) =
+        assembler.encode_final_artifacts(&[3, 1, 0, 0], &[0x1234_5678, 0x1234, 2, 3], 12, 7);
+
+    assert_eq!(
+        bytecode,
+        [
+            EXTENDED_ARG.code(),
+            0x12,
+            EXTENDED_ARG.code(),
+            0x34,
+            EXTENDED_ARG.code(),
+            0x56,
+            LOAD_GLOBAL.code(),
+            0x78,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            EXTENDED_ARG.code(),
+            0x12,
+            LOAD_CONST.code(),
+            0x34,
+            LOAD_CONST.code(),
+            2,
+            LOAD_CONST.code(),
+            3,
+        ]
+    );
+    assert_eq!(line_table, [0x87, 0x01, 0x81, 0x01, 0xd8, 2, 4, 0xf8]);
+    assert_eq!(max_depth, 12);
+}
+
+#[test]
 fn removes_an_overwritten_local_store() {
     let mut assembler = Assembler::default();
     assembler.emit(STORE_FAST, 1);
@@ -875,12 +1074,11 @@ fn optimization_pipeline(items: Vec<Item>) -> super::OptimizationPipeline {
     let next_label = items
         .iter()
         .filter_map(|item| match item {
-            Item::Label(label)
-            | Item::Instruction(Instruction {
-                operand: Operand::Forward(label) | Operand::Backward(label),
-                ..
-            }) => Some(label.0 + 1),
-            Item::Instruction(_) => None,
+            Item::Label(label) => Some(label.0 + 1),
+            Item::Instruction(instruction) => match instruction.operand() {
+                Operand::Forward(label) | Operand::Backward(label) => Some(label.0 + 1),
+                Operand::Value(_) | Operand::Deferred(_) => None,
+            },
         })
         .max()
         .unwrap_or(0);
@@ -890,6 +1088,216 @@ fn optimization_pipeline(items: Vec<Item>) -> super::OptimizationPipeline {
         ..Assembler::default()
     }
     .into_optimization_pipeline()
+}
+
+#[test]
+fn assertion_side_exit_fast_path_accepts_all_conditional_directions() {
+    let targets = [
+        super::Label(0),
+        super::Label(1),
+        super::Label(2),
+        super::Label(3),
+    ];
+    let mut items = Vec::new();
+    for (line, (opcode, target)) in [
+        POP_JUMP_IF_TRUE,
+        POP_JUMP_IF_FALSE,
+        POP_JUMP_IF_NONE,
+        POP_JUMP_IF_NOT_NONE,
+    ]
+    .into_iter()
+    .zip(targets)
+    .enumerate()
+    {
+        let line = i32::try_from(line + 1).unwrap();
+        items.push(pass_instruction(LOAD_FAST, 0, line));
+        items.push(Item::Instruction(Instruction::new(
+            opcode,
+            Operand::Forward(target),
+            SourceLocation::new(line, line, 0, 0),
+            None,
+        )));
+        items.push(pass_instruction(NOT_TAKEN, 0, line));
+        items.push(pass_instruction(
+            LOAD_COMMON_CONSTANT,
+            CommonConstant::ASSERTIONERROR.argument(),
+            line,
+        ));
+        items.push(pass_instruction(RAISE_VARARGS, 1, line));
+        items.push(Item::Label(target));
+    }
+    items.push(pass_instruction(RETURN_VALUE, 0, 4));
+
+    let mut assembler = optimization_pipeline(items);
+    assembler.has_assertion_side_exit_candidate = true;
+    assert!(assembler.has_only_assertion_side_exits());
+}
+
+#[test]
+fn assertion_side_exit_fast_path_rejects_mixed_control_flow() {
+    let assertion_target = super::Label(0);
+    let other_target = super::Label(1);
+    let assertion = [
+        pass_instruction(LOAD_FAST, 0, 1),
+        Item::Instruction(Instruction::new(
+            POP_JUMP_IF_TRUE,
+            Operand::Forward(assertion_target),
+            SourceLocation::new(1, 1, 0, 0),
+            None,
+        )),
+        pass_instruction(NOT_TAKEN, 0, 1),
+        pass_instruction(
+            LOAD_COMMON_CONSTANT,
+            CommonConstant::ASSERTIONERROR.argument(),
+            1,
+        ),
+        pass_instruction(RAISE_VARARGS, 1, 1),
+        Item::Label(assertion_target),
+    ];
+
+    let mut unconditional = assertion.to_vec();
+    unconditional.push(Item::Instruction(Instruction::new(
+        JUMP_FORWARD,
+        Operand::Forward(other_target),
+        SourceLocation::NONE,
+        None,
+    )));
+    unconditional.push(Item::Label(other_target));
+    unconditional.push(pass_instruction(RETURN_VALUE, 0, 2));
+    let mut unconditional = optimization_pipeline(unconditional);
+    unconditional.has_assertion_side_exit_candidate = true;
+    assert!(!unconditional.has_only_assertion_side_exits());
+
+    let mut conditional = assertion.to_vec();
+    conditional.push(pass_instruction(LOAD_FAST, 1, 2));
+    conditional.push(Item::Instruction(Instruction::new(
+        POP_JUMP_IF_FALSE,
+        Operand::Forward(other_target),
+        SourceLocation::new(2, 2, 0, 0),
+        None,
+    )));
+    conditional.push(pass_instruction(NOT_TAKEN, 0, 2));
+    conditional.push(pass_instruction(LOAD_CONST, 0, 2));
+    conditional.push(Item::Label(other_target));
+    conditional.push(pass_instruction(RETURN_VALUE, 0, 2));
+    let mut conditional = optimization_pipeline(conditional);
+    conditional.has_assertion_side_exit_candidate = true;
+    assert!(!conditional.has_only_assertion_side_exits());
+}
+
+#[test]
+fn assertion_side_exit_fast_path_rejects_single_block_without_scanning() {
+    let assembler = optimization_pipeline(vec![
+        pass_instruction(LOAD_FAST, 0, 1),
+        pass_instruction(RETURN_VALUE, 0, 1),
+    ]);
+
+    assert_eq!(assembler.graph.len(), 1);
+    assert!(!assembler.has_only_assertion_side_exits());
+}
+
+#[test]
+fn assertion_side_exit_fast_path_rejects_annotation_guard_without_scanning() {
+    let target = super::Label(0);
+    let assembler = optimization_pipeline(vec![
+        pass_instruction(LOAD_FAST, 0, 1),
+        Item::Instruction(Instruction::new(
+            POP_JUMP_IF_FALSE,
+            Operand::Forward(target),
+            SourceLocation::new(1, 1, 0, 0),
+            None,
+        )),
+        pass_instruction(NOT_TAKEN, 0, 1),
+        pass_instruction(LOAD_GLOBAL, 0, 1),
+        Item::Label(target),
+        pass_instruction(RETURN_VALUE, 0, 1),
+    ]);
+
+    assert!(assembler.graph.len() >= 3);
+    assert!(!assembler.has_assertion_side_exit_candidate);
+    assert!(!assembler.has_only_assertion_side_exits());
+}
+
+#[test]
+fn assertion_side_exit_fast_path_rejects_exception_regions() {
+    let target = super::Label(0);
+    let mut assembler = optimization_pipeline(vec![
+        pass_instruction(LOAD_FAST, 0, 1),
+        Item::Instruction(Instruction::new(
+            POP_JUMP_IF_TRUE,
+            Operand::Forward(target),
+            SourceLocation::new(1, 1, 0, 0),
+            None,
+        )),
+        pass_instruction(NOT_TAKEN, 0, 1),
+        pass_instruction(
+            LOAD_COMMON_CONSTANT,
+            CommonConstant::ASSERTIONERROR.argument(),
+            1,
+        ),
+        pass_instruction(RAISE_VARARGS, 1, 1),
+        Item::Label(target),
+        pass_instruction(RETURN_VALUE, 0, 1),
+    ]);
+    assembler.exception_regions.push(super::ExceptionRegion {
+        start: target,
+        end: target,
+        target,
+        depth: 0,
+        preserve_lasti: false,
+    });
+    assembler.has_assertion_side_exit_candidate = true;
+
+    assert!(!assembler.has_only_assertion_side_exits());
+}
+
+#[test]
+fn assertion_side_exit_fast_path_propagates_final_condition_location() {
+    let target = super::Label(0);
+    let location = SourceLocation::new(7, 7, 4, 19);
+    let mut assembler = optimization_pipeline(vec![
+        pass_instruction(LOAD_FAST, 0, 7),
+        Item::Instruction(Instruction::new(
+            POP_JUMP_IF_TRUE,
+            Operand::Forward(target),
+            location,
+            None,
+        )),
+        pass_instruction(NOT_TAKEN, 0, 7),
+        pass_instruction(
+            LOAD_COMMON_CONSTANT,
+            CommonConstant::ASSERTIONERROR.argument(),
+            7,
+        ),
+        pass_instruction(RAISE_VARARGS, 1, 7),
+        Item::Label(target),
+        Item::Instruction(Instruction::new(
+            LOAD_CONST,
+            Operand::Value(0),
+            SourceLocation::NONE,
+            None,
+        )),
+        Item::Instruction(Instruction::new(
+            RETURN_VALUE,
+            Operand::Value(0),
+            SourceLocation::NONE,
+            None,
+        )),
+    ]);
+    assembler.has_assertion_side_exit_candidate = true;
+    assert!(assembler.has_only_assertion_side_exits());
+
+    assembler.propagate_assertion_exit_locations();
+
+    let instructions = assembler
+        .graph
+        .iter_items()
+        .filter_map(|item| match item {
+            Item::Instruction(instruction) => Some(instruction),
+            Item::Label(_) => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(instructions[instructions.len() - 2].location, location);
 }
 
 fn graph_opcodes(assembler: &super::OptimizationPipeline) -> Vec<crate::target::Opcode> {
@@ -937,7 +1345,7 @@ fn threads_unconditional_forward_jumps_without_conditional_jumps() {
             Item::Label(_) => None,
         })
         .unwrap();
-    assert!(matches!(first.operand, Operand::Forward(label) if label == final_target));
+    assert!(matches!(first.operand(), Operand::Forward(label) if label == final_target));
 }
 
 #[test]
@@ -983,7 +1391,7 @@ fn threads_unconditional_forward_jumps_without_conditional_targets() {
             Item::Instruction(_) | Item::Label(_) => None,
         })
         .unwrap();
-    assert!(matches!(first_jump.operand, Operand::Forward(label) if label == final_target));
+    assert!(matches!(first_jump.operand(), Operand::Forward(label) if label == final_target));
 }
 
 #[test]
@@ -995,7 +1403,8 @@ fn redundant_jump_removal_preserves_borrow_traversal_barrier() {
         SourceLocation::NONE,
         None,
     );
-    jump.borrow_fallthrough = BorrowFallthrough::Barrier;
+    jump.no_location_policy
+        .set_borrow_fallthrough(BorrowFallthrough::Barrier);
     let mut assembler = optimization_pipeline(vec![
         pass_instruction(LOAD_CONST, 0, 1),
         Item::Instruction(jump),
@@ -1016,10 +1425,79 @@ fn redundant_jump_removal_preserves_borrow_traversal_barrier() {
     assert_eq!(instructions.len(), 2);
     assert_eq!(instructions[0].opcode, LOAD_CONST);
     assert_eq!(
-        instructions[0].borrow_fallthrough,
+        instructions[0].no_location_policy.borrow_fallthrough(),
         BorrowFallthrough::Barrier
     );
     assert_eq!(instructions[1].opcode, RETURN_VALUE);
+}
+
+#[test]
+fn redundant_jump_removal_streams_consecutive_cross_block_jumps() {
+    let intervening_label = super::Label(0);
+    let first_target = super::Label(1);
+    let second_target = super::Label(2);
+    let location = SourceLocation::new(7, 7, 0, 0);
+    let mut first = Instruction::new(JUMP_FORWARD, Operand::Forward(first_target), location, None);
+    first
+        .exception_policy
+        .exclude(ExceptionExclusion::IfExtended);
+    first
+        .no_location_policy
+        .set_borrow_fallthrough(BorrowFallthrough::Barrier);
+    let second = Instruction::new(
+        JUMP_FORWARD,
+        Operand::Forward(second_target),
+        SourceLocation::NONE,
+        None,
+    );
+    let mut assembler = optimization_pipeline(vec![
+        pass_instruction(LOAD_CONST, 0, 7),
+        Item::Instruction(first),
+        Item::Label(intervening_label),
+        Item::Label(first_target),
+        Item::Instruction(second),
+        Item::Label(second_target),
+        Item::Instruction(Instruction::new(
+            RETURN_VALUE,
+            Operand::Value(0),
+            SourceLocation::NONE,
+            None,
+        )),
+    ]);
+
+    assembler.remove_redundant_forward_jumps(true);
+
+    let instructions = assembler
+        .graph
+        .iter_items()
+        .filter_map(|item| match item {
+            Item::Instruction(instruction) => Some(instruction),
+            Item::Label(_) => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(instructions.len(), 2);
+    assert_eq!(instructions[0].opcode, LOAD_CONST);
+    assert_eq!(
+        instructions[0].exception_policy.exclusion(),
+        ExceptionExclusion::IfExtended
+    );
+    assert_eq!(
+        instructions[0].no_location_policy.borrow_fallthrough(),
+        BorrowFallthrough::Barrier
+    );
+    assert_eq!(instructions[1].opcode, RETURN_VALUE);
+    assert_eq!(instructions[1].location, location);
+    assert_eq!(
+        assembler
+            .graph
+            .iter_items()
+            .filter_map(|item| match item {
+                Item::Label(label) => Some(*label),
+                Item::Instruction(_) => None,
+            })
+            .collect::<Vec<_>>(),
+        [intervening_label, first_target, second_target]
+    );
 }
 
 #[test]
@@ -1051,7 +1529,7 @@ fn deferred_nonadjacent_forward_jump_is_still_resolved() {
             Item::Instruction(_) | Item::Label(_) => None,
         })
         .unwrap();
-    assert_eq!(jump.operand, Operand::Forward(target));
+    assert_eq!(jump.operand(), Operand::Forward(target));
     assert!(!jump.jump_policy.defers_redundant_removal());
 }
 
@@ -1098,8 +1576,18 @@ fn borrow_empty_block_marker_survives_until_local_analysis() {
         .unwrap();
     assert_eq!(marker.opcode, NOP);
 
-    assembler.remove_borrow_empty_block_markers();
-    assert_eq!(graph_opcodes(&assembler), [LOAD_CONST, RETURN_VALUE]);
+    let mut items = assembler.graph.into_items();
+    super::OptimizationPipeline::remove_borrow_empty_block_markers(&mut items);
+    assert_eq!(
+        items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Instruction(instruction) => Some(instruction.opcode),
+                Item::Label(_) => None,
+            })
+            .collect::<Vec<_>>(),
+        [LOAD_CONST, RETURN_VALUE]
+    );
 }
 
 #[test]
@@ -1199,7 +1687,7 @@ fn redundant_nop_removal_preserves_forward_scan_semantics() {
         Item::Instruction(instruction) => instruction,
         Item::Label(_) => unreachable!(),
     };
-    converted.converted_pop_block = true;
+    converted.fusion_policy.mark_converted_pop_block();
     let mut assembler = optimization_pipeline(vec![
         pass_instruction(NOP, 0, 1),
         Item::Label(super::Label(0)),

@@ -105,6 +105,9 @@ impl LocalPolicy {
     const FORCE_BORROWED_LOAD: u8 = 1 << 3;
     const POST_ANALYSIS_CLOSURE_LOAD: u8 = 1 << 4;
     const KNOWN_INITIALIZED_LOAD: u8 = 1 << 5;
+    // Compiler-side fold vacancies are capped at the three reusable owner slots.
+    const HIDDEN_EXCEPTION_OWNER_SLOTS_SHIFT: u8 = 6;
+    const HIDDEN_EXCEPTION_OWNER_SLOTS_MASK: u8 = 0b11 << Self::HIDDEN_EXCEPTION_OWNER_SLOTS_SHIFT;
 
     pub(super) const fn for_load(force_owned: bool, strict_owned: bool) -> Self {
         let mut policy = 0;
@@ -157,8 +160,29 @@ impl LocalPolicy {
         self.0 |= Self::KNOWN_INITIALIZED_LOAD;
     }
 
+    pub(super) const fn hidden_exception_owner_slots(self) -> u8 {
+        (self.0 & Self::HIDDEN_EXCEPTION_OWNER_SLOTS_MASK)
+            >> Self::HIDDEN_EXCEPTION_OWNER_SLOTS_SHIFT
+    }
+
+    pub(super) fn add_hidden_exception_owner_slots(&mut self, slots: u8) {
+        let slots = self
+            .hidden_exception_owner_slots()
+            .saturating_add(slots)
+            .min(3);
+        self.0 = (self.0 & !Self::HIDDEN_EXCEPTION_OWNER_SLOTS_MASK)
+            | (slots << Self::HIDDEN_EXCEPTION_OWNER_SLOTS_SHIFT);
+    }
+
     const fn fused(first: Self, second: Self) -> Self {
-        Self(first.0 | second.0)
+        let slots = first
+            .hidden_exception_owner_slots()
+            .saturating_add(second.hidden_exception_owner_slots());
+        let slots = if slots > 3 { 3 } else { slots };
+        Self(
+            (first.0 | second.0) & !Self::HIDDEN_EXCEPTION_OWNER_SLOTS_MASK
+                | (slots << Self::HIDDEN_EXCEPTION_OWNER_SLOTS_SHIFT),
+        )
     }
 }
 
@@ -171,9 +195,17 @@ impl NoLocationBlockPolicy {
     const ARTIFICIAL_EVAL_BREAK: u8 = 1 << 2;
     const COPY_INHERITS_SHARED_PREDECESSOR: u8 = 1 << 3;
     const COPY_SPLIT_RETURN_EXIT: u8 = 1 << 4;
+    const PRESERVE: u8 = 1 << 5;
+    // Borrowed-load traversal has three states and is inherited from the second fused item.
+    const BORROW_FALLTHROUGH_MASK: u8 = 0b11 << 6;
+    const BORROW_BARRIER: u8 = 0b01 << 6;
+    const BORROW_RETAINED_NOP_REACHABLE: u8 = 0b10 << 6;
 
     const fn fused(first: Self, second: Self) -> Self {
-        Self(first.0 | second.0)
+        Self(
+            (first.0 | second.0) & !Self::BORROW_FALLTHROUGH_MASK
+                | second.0 & Self::BORROW_FALLTHROUGH_MASK,
+        )
     }
 
     const fn contains(self, flag: u8) -> bool {
@@ -193,7 +225,6 @@ impl NoLocationBlockPolicy {
 pub(super) struct NoLocationPolicy {
     /// Whether an unlocated block ending at this instruction may be inlined.
     block_policy: NoLocationBlockPolicy,
-    pub(super) preserve: bool,
     /// An unresolved percent target or its deferred-location side-table index.
     pub(super) percent_target_location: u8,
 }
@@ -261,10 +292,40 @@ impl NoLocationPolicy {
             .remove(NoLocationBlockPolicy::COPY_SPLIT_RETURN_EXIT);
     }
 
+    pub(super) const fn preserves_location(self) -> bool {
+        self.block_policy.contains(NoLocationBlockPolicy::PRESERVE)
+    }
+
+    pub(super) fn preserve_location(&mut self) {
+        self.block_policy.insert(NoLocationBlockPolicy::PRESERVE);
+    }
+
+    pub(super) const fn borrow_fallthrough(self) -> BorrowFallthrough {
+        match self.block_policy.0 & NoLocationBlockPolicy::BORROW_FALLTHROUGH_MASK {
+            0 => BorrowFallthrough::Reachable,
+            NoLocationBlockPolicy::BORROW_BARRIER => BorrowFallthrough::Barrier,
+            NoLocationBlockPolicy::BORROW_RETAINED_NOP_REACHABLE => {
+                BorrowFallthrough::RetainedNopReachable
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    pub(super) fn set_borrow_fallthrough(&mut self, fallthrough: BorrowFallthrough) {
+        let fallthrough = match fallthrough {
+            BorrowFallthrough::Reachable => 0,
+            BorrowFallthrough::Barrier => NoLocationBlockPolicy::BORROW_BARRIER,
+            BorrowFallthrough::RetainedNopReachable => {
+                NoLocationBlockPolicy::BORROW_RETAINED_NOP_REACHABLE
+            }
+        };
+        self.block_policy.0 =
+            self.block_policy.0 & !NoLocationBlockPolicy::BORROW_FALLTHROUGH_MASK | fallthrough;
+    }
+
     const fn fused(first: Self, second: Self) -> Self {
         Self {
             block_policy: NoLocationBlockPolicy::fused(first.block_policy, second.block_policy),
-            preserve: first.preserve || second.preserve,
             percent_target_location: if matches!(first.percent_target_location, 0 | u8::MAX) {
                 second.percent_target_location
             } else {
@@ -275,17 +336,111 @@ impl NoLocationPolicy {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(super) struct FusionPolicy {
-    pub(super) prevent_with_previous: bool,
-    pub(super) prevent_with_next: bool,
-}
+pub(super) struct FusionPolicy(u8);
 
 impl FusionPolicy {
-    const fn fused(first: Self, second: Self) -> Self {
-        Self {
-            prevent_with_previous: first.prevent_with_previous,
-            prevent_with_next: second.prevent_with_next,
+    const PREVENT_WITH_PREVIOUS: u8 = 1 << 0;
+    const PREVENT_WITH_NEXT: u8 = 1 << 1;
+    // The four lossless operand variants share the two unused fusion-policy bits.
+    const OPERAND_KIND_MASK: u8 = 0b11 << 2;
+    const VALUE_OPERAND: u8 = 0b00 << 2;
+    const DEFERRED_OPERAND: u8 = 0b01 << 2;
+    const FORWARD_OPERAND: u8 = 0b10 << 2;
+    const BACKWARD_OPERAND: u8 = 0b11 << 2;
+    // Jump provenance occupies the remaining four bits; fusion keeps its asymmetric location rule.
+    const AUTHORED_BREAK: u8 = 1 << 4;
+    const TRANSITIVE_SMALL_EXIT_INLINING: u8 = 1 << 5;
+    const LOCATION_FROM_NEXT: u8 = 1 << 6;
+    const CONVERTED_POP_BLOCK: u8 = 1 << 7;
+
+    pub(super) const fn prevents_with_previous(self) -> bool {
+        self.0 & Self::PREVENT_WITH_PREVIOUS != 0
+    }
+
+    pub(super) const fn prevents_with_next(self) -> bool {
+        self.0 & Self::PREVENT_WITH_NEXT != 0
+    }
+
+    pub(super) fn prevent_with_previous(&mut self) {
+        self.0 |= Self::PREVENT_WITH_PREVIOUS;
+    }
+
+    pub(super) fn prevent_with_next(&mut self) {
+        self.0 |= Self::PREVENT_WITH_NEXT;
+    }
+
+    const fn operand(self, payload: u32) -> Operand {
+        match self.0 & Self::OPERAND_KIND_MASK {
+            Self::VALUE_OPERAND => Operand::Value(payload),
+            Self::DEFERRED_OPERAND => Operand::Deferred(OperandPatchId(payload)),
+            Self::FORWARD_OPERAND => Operand::Forward(Label(payload)),
+            Self::BACKWARD_OPERAND => Operand::Backward(Label(payload)),
+            _ => unreachable!(),
         }
+    }
+
+    fn set_operand(&mut self, operand: Operand) -> u32 {
+        let (kind, payload) = match operand {
+            Operand::Value(payload) => (Self::VALUE_OPERAND, payload),
+            Operand::Deferred(OperandPatchId(payload)) => (Self::DEFERRED_OPERAND, payload),
+            Operand::Forward(Label(payload)) => (Self::FORWARD_OPERAND, payload),
+            Operand::Backward(Label(payload)) => (Self::BACKWARD_OPERAND, payload),
+        };
+        self.0 = (self.0 & !Self::OPERAND_KIND_MASK) | kind;
+        payload
+    }
+
+    pub(super) const fn is_authored_break(self) -> bool {
+        self.0 & Self::AUTHORED_BREAK != 0
+    }
+
+    pub(super) fn mark_authored_break(&mut self) {
+        self.0 |= Self::AUTHORED_BREAK;
+    }
+
+    pub(super) const fn transitive_small_exit_inlining(self) -> bool {
+        self.0 & Self::TRANSITIVE_SMALL_EXIT_INLINING != 0
+    }
+
+    pub(super) fn allow_transitive_small_exit_inlining(&mut self) {
+        self.0 |= Self::TRANSITIVE_SMALL_EXIT_INLINING;
+    }
+
+    pub(super) const fn location_from_next(self) -> bool {
+        self.0 & Self::LOCATION_FROM_NEXT != 0
+    }
+
+    pub(super) fn mark_location_from_next(&mut self) {
+        self.0 |= Self::LOCATION_FROM_NEXT;
+    }
+
+    pub(super) fn clear_location_from_next(&mut self) {
+        self.0 &= !Self::LOCATION_FROM_NEXT;
+    }
+
+    pub(super) const fn is_converted_pop_block(self) -> bool {
+        self.0 & Self::CONVERTED_POP_BLOCK != 0
+    }
+
+    pub(super) fn mark_converted_pop_block(&mut self) {
+        self.0 |= Self::CONVERTED_POP_BLOCK;
+    }
+
+    const fn fused(first: Self, second: Self) -> Self {
+        let location_from_next = if first.location_from_next() {
+            second.0 & Self::LOCATION_FROM_NEXT
+        } else {
+            0
+        };
+        Self(
+            first.0 & Self::PREVENT_WITH_PREVIOUS
+                | second.0 & Self::PREVENT_WITH_NEXT
+                | (first.0 | second.0)
+                    & (Self::AUTHORED_BREAK
+                        | Self::TRANSITIVE_SMALL_EXIT_INLINING
+                        | Self::CONVERTED_POP_BLOCK)
+                | location_from_next,
+        )
     }
 }
 
@@ -304,40 +459,6 @@ pub(super) enum RetainedJumpNop {
     // Retain the jump's line event only while it still points at its original direct target.
     DirectTarget,
     Always,
-}
-
-/// Records provenance that affects how a jump is rewritten by block optimization.
-///
-/// Generated fallthrough edges must remain non-interruptible, while a source-authored `break`
-/// continues to check the eval breaker even if its exception-handler block moves after the loop
-/// exit.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-#[repr(transparent)]
-pub(super) struct JumpProvenance(u8);
-
-impl JumpProvenance {
-    const AUTHORED_BREAK: u8 = 1 << 0;
-    const TRANSITIVE_SMALL_EXIT_INLINING: u8 = 1 << 1;
-
-    pub(super) const fn is_authored_break(self) -> bool {
-        self.0 & Self::AUTHORED_BREAK != 0
-    }
-
-    pub(super) fn mark_authored_break(&mut self) {
-        self.0 |= Self::AUTHORED_BREAK;
-    }
-
-    pub(super) const fn transitive_small_exit_inlining(self) -> bool {
-        self.0 & Self::TRANSITIVE_SMALL_EXIT_INLINING != 0
-    }
-
-    pub(super) fn allow_transitive_small_exit_inlining(&mut self) {
-        self.0 |= Self::TRANSITIVE_SMALL_EXIT_INLINING;
-    }
-
-    const fn fused(first: Self, second: Self) -> Self {
-        Self(first.0 | second.0)
-    }
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -558,94 +679,169 @@ impl NormalizedExceptionOwner {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct ExceptionPolicy {
-    pub(super) exclusion: ExceptionExclusion,
-    pub(super) normalized_owner: NormalizedExceptionOwner,
+#[repr(u8)]
+pub(crate) enum ExceptionPolicy {
+    #[default]
+    NoneUnchanged,
+    NonePresent,
+    NoneOverridePresent,
+    NoneAbsent,
+    IfExtendedUnchanged,
+    IfExtendedPresent,
+    IfExtendedOverridePresent,
+    IfExtendedAbsent,
+    AlwaysUnchanged,
+    AlwaysPresent,
+    AlwaysOverridePresent,
+    AlwaysAbsent,
 }
 
 impl ExceptionPolicy {
-    pub(crate) const EXCLUDE_IF_EXTENDED: Self = Self {
-        exclusion: ExceptionExclusion::IfExtended,
-        normalized_owner: NormalizedExceptionOwner::Unchanged,
-    };
+    pub(crate) const EXCLUDE_IF_EXTENDED: Self = Self::IfExtendedUnchanged;
+    pub(crate) const EXCLUDE_ALWAYS: Self = Self::AlwaysUnchanged;
 
-    pub(crate) const EXCLUDE_ALWAYS: Self = Self {
-        exclusion: ExceptionExclusion::Always,
-        normalized_owner: NormalizedExceptionOwner::Unchanged,
-    };
+    const fn new(exclusion: ExceptionExclusion, owner: NormalizedExceptionOwner) -> Self {
+        match (exclusion, owner) {
+            (ExceptionExclusion::None, NormalizedExceptionOwner::Unchanged) => Self::NoneUnchanged,
+            (ExceptionExclusion::None, NormalizedExceptionOwner::Present) => Self::NonePresent,
+            (ExceptionExclusion::None, NormalizedExceptionOwner::OverridePresent) => {
+                Self::NoneOverridePresent
+            }
+            (ExceptionExclusion::None, NormalizedExceptionOwner::Absent) => Self::NoneAbsent,
+            (ExceptionExclusion::IfExtended, NormalizedExceptionOwner::Unchanged) => {
+                Self::IfExtendedUnchanged
+            }
+            (ExceptionExclusion::IfExtended, NormalizedExceptionOwner::Present) => {
+                Self::IfExtendedPresent
+            }
+            (ExceptionExclusion::IfExtended, NormalizedExceptionOwner::OverridePresent) => {
+                Self::IfExtendedOverridePresent
+            }
+            (ExceptionExclusion::IfExtended, NormalizedExceptionOwner::Absent) => {
+                Self::IfExtendedAbsent
+            }
+            (ExceptionExclusion::Always, NormalizedExceptionOwner::Unchanged) => {
+                Self::AlwaysUnchanged
+            }
+            (ExceptionExclusion::Always, NormalizedExceptionOwner::Present) => Self::AlwaysPresent,
+            (ExceptionExclusion::Always, NormalizedExceptionOwner::OverridePresent) => {
+                Self::AlwaysOverridePresent
+            }
+            (ExceptionExclusion::Always, NormalizedExceptionOwner::Absent) => Self::AlwaysAbsent,
+        }
+    }
 
     pub(crate) const fn normalized_owner(has_owner: bool) -> Self {
-        Self {
-            exclusion: ExceptionExclusion::None,
-            normalized_owner: if has_owner {
-                NormalizedExceptionOwner::Present
-            } else {
-                NormalizedExceptionOwner::Absent
-            },
+        if has_owner {
+            Self::NonePresent
+        } else {
+            Self::NoneAbsent
         }
+    }
+
+    pub(super) const fn exclusion(self) -> ExceptionExclusion {
+        match self {
+            Self::NoneUnchanged
+            | Self::NonePresent
+            | Self::NoneOverridePresent
+            | Self::NoneAbsent => ExceptionExclusion::None,
+            Self::IfExtendedUnchanged
+            | Self::IfExtendedPresent
+            | Self::IfExtendedOverridePresent
+            | Self::IfExtendedAbsent => ExceptionExclusion::IfExtended,
+            Self::AlwaysUnchanged
+            | Self::AlwaysPresent
+            | Self::AlwaysOverridePresent
+            | Self::AlwaysAbsent => ExceptionExclusion::Always,
+        }
+    }
+
+    pub(super) const fn owner(self) -> NormalizedExceptionOwner {
+        match self {
+            Self::NoneUnchanged | Self::IfExtendedUnchanged | Self::AlwaysUnchanged => {
+                NormalizedExceptionOwner::Unchanged
+            }
+            Self::NonePresent | Self::IfExtendedPresent | Self::AlwaysPresent => {
+                NormalizedExceptionOwner::Present
+            }
+            Self::NoneOverridePresent
+            | Self::IfExtendedOverridePresent
+            | Self::AlwaysOverridePresent => NormalizedExceptionOwner::OverridePresent,
+            Self::NoneAbsent | Self::IfExtendedAbsent | Self::AlwaysAbsent => {
+                NormalizedExceptionOwner::Absent
+            }
+        }
+    }
+
+    pub(super) fn set_owner(&mut self, owner: NormalizedExceptionOwner) {
+        *self = Self::new(self.exclusion(), owner);
     }
 
     const fn merged(self, other: Self) -> Self {
-        Self {
-            exclusion: self.exclusion.merged(other.exclusion),
-            normalized_owner: self.normalized_owner.merged(other.normalized_owner),
-        }
+        Self::new(
+            self.exclusion().merged(other.exclusion()),
+            self.owner().merged(other.owner()),
+        )
     }
 
     pub(super) fn exclude(&mut self, exclusion: ExceptionExclusion) {
-        self.exclusion = self.exclusion.merged(exclusion);
+        *self = Self::new(self.exclusion().merged(exclusion), self.owner());
     }
 }
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Instruction {
     pub(super) opcode: Opcode,
-    pub(super) operand: Operand,
+    operand_payload: u32,
     pub(super) location: SourceLocation,
-    // CPython resolves `NEXT_LOCATION` only after CFG optimization and instruction reordering.
-    // Keep that provenance separate from the provisional source location used by earlier passes.
-    pub(super) location_from_next: bool,
-    pub(super) depth_after: Option<u32>,
+    depth_after: u32,
     pub(super) local_policy: LocalPolicy,
     pub(super) no_location_policy: NoLocationPolicy,
     pub(super) fusion_policy: FusionPolicy,
-    pub(super) converted_pop_block: bool,
-    // Instruction slots removed by compiler-side constant folding. The count is capped at the
-    // three slots that a normalized boolean value marker can reuse.
-    pub(super) hidden_exception_owner_slots: u8,
     pub(super) jump_policy: JumpPolicy,
-    pub(super) jump_provenance: JumpProvenance,
     // `NOT_TAKEN` is added after CPython labels exception handlers. The new instruction keeps
     // whatever exception target remains in its reused CFG slot, if there is one.
     pub(super) exception_policy: ExceptionPolicy,
-    // A boundary used only by the final borrowed-load analysis. Earlier CFG passes must continue
-    // to see ordinary control-flow reachability across this edge.
-    pub(super) borrow_fallthrough: BorrowFallthrough,
 }
 
 impl Instruction {
+    const NO_DEPTH_AFTER: u32 = u32::MAX;
+
     pub(super) fn new(
         opcode: Opcode,
         operand: Operand,
         location: SourceLocation,
         depth_after: Option<u32>,
     ) -> Self {
+        let mut fusion_policy = FusionPolicy::default();
+        let operand_payload = fusion_policy.set_operand(operand);
         Self {
             opcode,
-            operand,
+            operand_payload,
             location,
-            location_from_next: false,
-            depth_after,
+            depth_after: depth_after.unwrap_or(Self::NO_DEPTH_AFTER),
             local_policy: LocalPolicy::default(),
             no_location_policy: NoLocationPolicy::default(),
-            fusion_policy: FusionPolicy::default(),
-            converted_pop_block: false,
-            hidden_exception_owner_slots: 0,
+            fusion_policy,
             jump_policy: JumpPolicy::default(),
-            jump_provenance: JumpProvenance::default(),
             exception_policy: ExceptionPolicy::default(),
-            borrow_fallthrough: BorrowFallthrough::default(),
         }
+    }
+
+    pub(super) const fn depth_after(&self) -> Option<u32> {
+        if self.depth_after == Self::NO_DEPTH_AFTER {
+            None
+        } else {
+            Some(self.depth_after)
+        }
+    }
+
+    pub(super) const fn operand(&self) -> Operand {
+        self.fusion_policy.operand(self.operand_payload)
+    }
+
+    pub(super) fn set_operand(&mut self, operand: Operand) {
+        self.operand_payload = self.fusion_policy.set_operand(operand);
     }
 
     /// Retargets a jump while keeping direct-target line-event provenance honest.
@@ -654,10 +850,10 @@ impl Instruction {
             operand,
             Operand::Forward(_) | Operand::Backward(_)
         ));
-        if self.operand != operand {
+        if self.operand() != operand {
             self.jump_policy.clear_direct_target_retention();
             self.no_location_policy.clear_split_return_exit_copy();
-            self.operand = operand;
+            self.set_operand(operand);
         }
     }
 
@@ -675,32 +871,26 @@ impl Instruction {
 
     /// Combines the provenance of two instructions replaced by one superinstruction.
     pub(super) fn fused(opcode: Opcode, operand: Operand, first: Self, second: Self) -> Self {
-        let (location, location_from_next) = if first.location_from_next {
-            (second.location, second.location_from_next)
+        let location = if first.fusion_policy.location_from_next() {
+            second.location
         } else {
-            (first.location, false)
+            first.location
         };
+        let mut fusion_policy = FusionPolicy::fused(first.fusion_policy, second.fusion_policy);
+        let operand_payload = fusion_policy.set_operand(operand);
         Self {
             opcode,
-            operand,
+            operand_payload,
             location,
-            location_from_next,
             depth_after: second.depth_after,
             local_policy: LocalPolicy::fused(first.local_policy, second.local_policy),
             no_location_policy: NoLocationPolicy::fused(
                 first.no_location_policy,
                 second.no_location_policy,
             ),
-            fusion_policy: FusionPolicy::fused(first.fusion_policy, second.fusion_policy),
-            converted_pop_block: first.converted_pop_block || second.converted_pop_block,
-            hidden_exception_owner_slots: first
-                .hidden_exception_owner_slots
-                .saturating_add(second.hidden_exception_owner_slots)
-                .min(3),
+            fusion_policy,
             jump_policy: JumpPolicy::fused(first.jump_policy, second.jump_policy),
-            jump_provenance: JumpProvenance::fused(first.jump_provenance, second.jump_provenance),
             exception_policy: first.exception_policy.merged(second.exception_policy),
-            borrow_fallthrough: second.borrow_fallthrough,
         }
     }
 }
@@ -732,6 +922,7 @@ pub(crate) struct Assembler {
     pub(super) load_fast_borrowing_enabled: bool,
     pub(super) strict_owned_loads: bool,
     pub(super) forced_borrowed_loads: bool,
+    pub(super) has_assertion_side_exit_candidate: bool,
     pub(super) has_synthesized_percent_target_locations: bool,
     pub(super) has_next_location: bool,
 }
@@ -747,6 +938,7 @@ pub(super) struct OptimizationPipeline {
     pub(super) exception_regions: Vec<ExceptionRegion>,
     pub(super) preserved_block_boundaries: FxHashSet<Label>,
     pub(super) borrow_unreachable_blocks: FxHashSet<Label>,
+    pub(super) has_assertion_side_exit_candidate: bool,
     pub(super) has_synthesized_percent_target_locations: bool,
     pub(super) has_next_location: bool,
 }
@@ -811,6 +1003,7 @@ impl Default for Assembler {
             load_fast_borrowing_enabled: true,
             strict_owned_loads: false,
             forced_borrowed_loads: false,
+            has_assertion_side_exit_candidate: false,
             has_synthesized_percent_target_locations: false,
             has_next_location: false,
         }

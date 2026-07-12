@@ -81,5 +81,5 @@ lto = "fat"
 inherits = "release"
 strip = false
 debug = "full"
-lto = false
+lto = "fat"
 codegen-units = 1

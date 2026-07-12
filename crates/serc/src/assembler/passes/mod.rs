@@ -47,7 +47,7 @@ fn validate_structure(
         let Item::Instruction(instruction) = item else {
             continue;
         };
-        let (target, is_forward) = match instruction.operand {
+        let (target, is_forward) = match instruction.operand() {
             Operand::Value(_) => continue,
             Operand::Deferred(id) => {
                 return Err(invariant_error(format!(
@@ -197,6 +197,7 @@ impl Assembler {
             exception_regions: self.exception_regions,
             preserved_block_boundaries: self.preserved_block_boundaries,
             borrow_unreachable_blocks: self.borrow_unreachable_blocks,
+            has_assertion_side_exit_candidate: self.has_assertion_side_exit_candidate,
             has_synthesized_percent_target_locations: self.has_synthesized_percent_target_locations,
             has_next_location: self.has_next_location,
         }
@@ -215,7 +216,12 @@ impl OptimizationPipeline {
         local_count: usize,
         parameter_count: usize,
     ) -> Result<LayoutAssembler, CompileError> {
-        let mut removed_max_depth = self.remove_unreachable_instructions();
+        let assertion_side_exits = self.has_only_assertion_side_exits();
+        let mut removed_max_depth = if assertion_side_exits {
+            None
+        } else {
+            self.remove_unreachable_instructions()
+        };
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::RemoveUnreachableInitial)?;
         self.resolve_synthesized_conditional_target_locations();
@@ -223,15 +229,22 @@ impl OptimizationPipeline {
         self.optimize_boolean_conversions();
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::OptimizeBooleanConversions)?;
-        self.thread_forward_jumps();
+        if !assertion_side_exits {
+            self.thread_forward_jumps();
+        }
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::ThreadForwardJumps)?;
-        if let Some(depth) = self.remove_unreachable_instructions() {
-            removed_max_depth = Some(removed_max_depth.map_or(depth, |current| current.max(depth)));
+        if !assertion_side_exits {
+            if let Some(depth) = self.remove_unreachable_instructions() {
+                removed_max_depth =
+                    Some(removed_max_depth.map_or(depth, |current| current.max(depth)));
+            }
         }
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::RemoveUnreachableAfterThreading)?;
-        self.remove_redundant_forward_jumps(false);
+        if !assertion_side_exits {
+            self.remove_redundant_forward_jumps(false);
+        }
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::RemoveRedundantForwardJumpsEarly)?;
         self.optimize_redundant_store_fast();
@@ -243,7 +256,11 @@ impl OptimizationPipeline {
         self.apply_static_swaps(swap_blocks);
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::ApplyStaticSwaps)?;
-        self.duplicate_exit_blocks();
+        if assertion_side_exits {
+            self.propagate_assertion_exit_locations();
+        } else {
+            self.duplicate_exit_blocks();
+        }
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::DuplicateExitBlocks)?;
         self.add_checks_for_uninitialized_loads(local_count, parameter_count);
@@ -252,7 +269,9 @@ impl OptimizationPipeline {
         self.fuse_superinstructions();
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::FuseSuperinstructions)?;
-        self.push_cold_blocks_to_end();
+        if !assertion_side_exits {
+            self.push_cold_blocks_to_end();
+        }
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::PushColdBlocksToEnd)?;
         self.remove_redundant_checked_loads();
@@ -267,16 +286,33 @@ impl OptimizationPipeline {
         self.remove_redundant_nops();
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::RemoveRedundantNops)?;
-        self.remove_redundant_forward_jumps(true);
+        if !assertion_side_exits {
+            self.remove_redundant_forward_jumps(true);
+        }
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::RemoveRedundantForwardJumpsLate)?;
-        self.optimize_load_fast();
-        self.remove_borrow_empty_block_markers();
+        let mut items = self.graph.into_items();
+        Self::optimize_load_fast(
+            &mut items,
+            &self.exception_regions,
+            &self.borrow_unreachable_blocks,
+            &self.preserved_block_boundaries,
+        );
+        Self::remove_borrow_empty_block_markers(&mut items);
         #[cfg(any(test, debug_assertions))]
-        self.validate_structure(AssemblerStage::OptimizeLoadFast)?;
-        self.resolve_deferred_fallthrough_locations(&synthesized_fallthrough_locations);
+        validate_structure(
+            &items,
+            &self.exception_regions,
+            None,
+            AssemblerStage::OptimizeLoadFast,
+        )?;
+        Self::resolve_deferred_fallthrough_locations(
+            &mut items,
+            self.has_synthesized_percent_target_locations,
+            &synthesized_fallthrough_locations,
+        );
         Ok(LayoutAssembler {
-            items: self.graph.into_items(),
+            items,
             exception_regions: self.exception_regions,
             preserved_block_boundaries: self.preserved_block_boundaries,
             removed_max_depth,
@@ -294,9 +330,9 @@ impl LayoutAssembler {
             let Item::Instruction(instruction) = item else {
                 continue;
             };
-            if instruction.location_from_next {
+            if instruction.fusion_policy.location_from_next() {
                 instruction.location = next_location.unwrap_or(super::SourceLocation::NONE);
-                instruction.location_from_next = false;
+                instruction.fusion_policy.clear_location_from_next();
             }
             next_location = Some(instruction.location);
         }
@@ -328,7 +364,7 @@ impl LayoutAssembler {
                 let opcode_position = position + u32::from(extended_args[instruction_index]);
                 let jump_base = opcode_position + 1 + u32::from(instruction.opcode.caches());
                 position = jump_base;
-                let argument = match instruction.operand {
+                let argument = match instruction.operand() {
                     Operand::Value(argument) => argument,
                     Operand::Deferred(id) => {
                         return Err(CompileError::Internal(format!(
@@ -366,19 +402,15 @@ impl LayoutAssembler {
             if !changed {
                 #[cfg(any(test, debug_assertions))]
                 self.validate_structure(AssemblerStage::FinalLayout)?;
-                let line_table = self.line_table(&extended_args, first_line_number);
+                let (bytecode, line_table, max_depth) = self.encode_final_artifacts(
+                    &extended_args,
+                    &resolved_arguments,
+                    code_units,
+                    first_line_number,
+                );
                 let exception_table = self.exception_table(&extended_args, &labels)?;
-                let max_depth = self
-                    .items
-                    .iter()
-                    .filter_map(|item| match item {
-                        Item::Instruction(instruction) => instruction.depth_after,
-                        Item::Label(_) => None,
-                    })
-                    .max()
-                    .unwrap_or(0);
                 return Ok(AssembledCode {
-                    bytecode: self.encode(&extended_args, &resolved_arguments, code_units),
+                    bytecode,
                     line_table,
                     exception_table,
                     max_depth,

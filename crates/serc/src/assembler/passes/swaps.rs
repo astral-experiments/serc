@@ -26,7 +26,7 @@ impl OptimizationPipeline {
         let mut redundant = Vec::new();
         for (index, (position, instruction)) in instructions.iter().copied().enumerate() {
             let remove = if instruction.opcode == SWAP
-                && let Operand::Value(depth) = instruction.operand
+                && let Operand::Value(depth) = instruction.operand()
             {
                 let pop_count = usize::try_from(depth).unwrap_or(usize::MAX);
                 previous.is_some_and(|previous: Instruction| previous.opcode == SWAP)
@@ -69,12 +69,10 @@ impl OptimizationPipeline {
         }
         let mut block_labels = FxHashSet::default();
         for item in graph.iter_items() {
-            if let Item::Instruction(Instruction {
-                operand: Operand::Forward(label) | Operand::Backward(label),
-                ..
-            }) = item
+            if let Item::Instruction(instruction) = item
+                && let Operand::Forward(label) | Operand::Backward(label) = instruction.operand()
             {
-                block_labels.insert(*label);
+                block_labels.insert(label);
             }
         }
         for region in &self.exception_regions {
@@ -82,7 +80,7 @@ impl OptimizationPipeline {
         }
         block_labels.extend(self.preserved_block_boundaries.iter().copied());
         let blocks = graph.partition_positions(&block_labels, |instruction| {
-            !matches!(instruction.operand, Operand::Value(_)) || ends_scope(instruction.opcode)
+            !matches!(instruction.operand(), Operand::Value(_)) || ends_scope(instruction.opcode)
         });
         let graph = &mut self.graph;
         for block in &blocks {
@@ -100,7 +98,7 @@ impl OptimizationPipeline {
                     position += 1;
                     continue;
                 }
-                let Operand::Value(first_depth) = first.operand else {
+                let Operand::Value(first_depth) = first.operand() else {
                     unreachable!();
                 };
                 let mut depth = usize::try_from(first_depth).unwrap();
@@ -113,7 +111,7 @@ impl OptimizationPipeline {
                         unreachable!();
                     };
                     if instruction.opcode == SWAP {
-                        let Operand::Value(argument) = instruction.operand else {
+                        let Operand::Value(argument) = instruction.operand() else {
                             unreachable!();
                         };
                         depth = depth.max(usize::try_from(argument).unwrap());
@@ -134,7 +132,7 @@ impl OptimizationPipeline {
                         unreachable!();
                     };
                     if instruction.opcode == SWAP {
-                        let Operand::Value(argument) = instruction.operand else {
+                        let Operand::Value(argument) = instruction.operand() else {
                             unreachable!();
                         };
                         stack.swap(0, usize::try_from(argument).unwrap() - 1);
@@ -156,8 +154,9 @@ impl OptimizationPipeline {
                                 unreachable!();
                             };
                             instruction.opcode = SWAP;
-                            instruction.operand =
-                                Operand::Value(u32::try_from(stack_index + 1).unwrap_or(u32::MAX));
+                            instruction.set_operand(Operand::Value(
+                                u32::try_from(stack_index + 1).unwrap_or(u32::MAX),
+                            ));
                         }
                         if stack[stack_index] == VISITED {
                             debug_assert_eq!(stack_index, index);
@@ -175,7 +174,7 @@ impl OptimizationPipeline {
                         unreachable!();
                     };
                     instruction.opcode = NOP;
-                    instruction.operand = Operand::Value(0);
+                    instruction.set_operand(Operand::Value(0));
                 }
                 position = run_end;
             }
@@ -194,7 +193,7 @@ impl OptimizationPipeline {
         }
 
         fn stored_local(instruction: &Instruction) -> Option<u32> {
-            (instruction.opcode == STORE_FAST).then(|| match instruction.operand {
+            (instruction.opcode == STORE_FAST).then(|| match instruction.operand() {
                 Operand::Value(argument) => argument,
                 Operand::Deferred(_) | Operand::Forward(_) | Operand::Backward(_) => {
                     unreachable!()
@@ -237,7 +236,7 @@ impl OptimizationPipeline {
                 if swap.opcode != SWAP {
                     continue;
                 }
-                let Operand::Value(depth) = swap.operand else {
+                let Operand::Value(depth) = swap.operand() else {
                     unreachable!();
                 };
                 let Some(first) =
@@ -296,7 +295,7 @@ impl OptimizationPipeline {
                     unreachable!();
                 };
                 swap.opcode = NOP;
-                swap.operand = Operand::Value(0);
+                swap.set_operand(Operand::Value(0));
                 *graph
                     .instruction_mut(positions[first])
                     .expect("swappable item is an instruction") = last_instruction;

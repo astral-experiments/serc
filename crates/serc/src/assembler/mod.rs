@@ -25,7 +25,7 @@ use crate::target::opcodes::{
 use crate::target::operands::ResumeLocation;
 use crate::target::{
     Opcode, is_conditional_jump, is_scope_exit as ends_scope, is_unconditional_jump,
-    num_popped as opcode_num_popped, num_pushed as opcode_num_pushed,
+    stack_counts as opcode_stack_counts,
 };
 
 #[cfg(any(test, debug_assertions))]
@@ -56,7 +56,7 @@ fn reachable_constant_indices(
                 continue;
             };
             if instruction.opcode == load_const
-                && let Operand::Value(index) = instruction.operand
+                && let Operand::Value(index) = instruction.operand()
                 && let Some(used) = used.get_mut(index as usize)
             {
                 *used = true;
@@ -142,7 +142,7 @@ impl Assembler {
         let instruction = self.required_last_instruction_mut(operation);
         assert!(
             matches!(
-                instruction.operand,
+                instruction.operand(),
                 Operand::Forward(_) | Operand::Backward(_)
             ),
             "{operation} requires a jump instruction"
@@ -159,7 +159,7 @@ impl Assembler {
                     instruction.opcode == NOT_TAKEN
                         || (!is_conditional_jump(instruction.opcode)
                             && (matches!(
-                                instruction.operand,
+                                instruction.operand(),
                                 Operand::Forward(_) | Operand::Backward(_)
                             ) || ends_scope(instruction.opcode)))
                 }
@@ -200,7 +200,9 @@ impl Assembler {
             })
             .nth(instruction_offset)
             .expect("instruction offset should reference an emitted instruction");
-        instruction.exception_policy.normalized_owner = NormalizedExceptionOwner::Absent;
+        instruction
+            .exception_policy
+            .set_owner(NormalizedExceptionOwner::Absent);
     }
 
     pub(crate) fn contains_opcode(&self, opcode: Opcode) -> bool {
@@ -243,14 +245,14 @@ impl Assembler {
     /// pseudo-instruction representation of those boundaries.
     fn dynamic_exception_owner_slots(&self, cross_labels: bool) -> usize {
         fn will_fuse(first: Instruction, second: Instruction) -> bool {
-            if first.fusion_policy.prevent_with_next
-                || first.borrow_fallthrough == BorrowFallthrough::Barrier
-                || second.fusion_policy.prevent_with_previous
+            if first.fusion_policy.prevents_with_next()
+                || first.no_location_policy.borrow_fallthrough() == BorrowFallthrough::Barrier
+                || second.fusion_policy.prevents_with_previous()
             {
                 return false;
             }
             let (Operand::Value(first_argument), Operand::Value(second_argument)) =
-                (first.operand, second.operand)
+                (first.operand(), second.operand())
             else {
                 return false;
             };
@@ -278,12 +280,11 @@ impl Assembler {
                 block_labels.insert(region.target);
             }
             for item in items {
-                if let Item::Instruction(Instruction {
-                    operand: Operand::Forward(label) | Operand::Backward(label),
-                    ..
-                }) = item
+                if let Item::Instruction(instruction) = item
+                    && let Operand::Forward(label) | Operand::Backward(label) =
+                        instruction.operand()
                 {
-                    block_labels.insert(*label);
+                    block_labels.insert(label);
                 }
             }
             block_labels
@@ -297,7 +298,7 @@ impl Assembler {
                         instruction.opcode == NOT_TAKEN
                             || (!is_conditional_jump(instruction.opcode)
                                 && (matches!(
-                                    instruction.operand,
+                                    instruction.operand(),
                                     Operand::Forward(_) | Operand::Backward(_)
                                 ) || ends_scope(instruction.opcode)))
                     }
@@ -328,7 +329,7 @@ impl Assembler {
                     usize::from(matches!(instruction.opcode, COPY_FREE_VARS | MAKE_CELL));
                 nop_count += usize::from(instruction.opcode == NOP);
             }
-            slots += usize::from(instruction.hidden_exception_owner_slots);
+            slots += usize::from(instruction.local_policy.hidden_exception_owner_slots());
             let following = items.get(index + 1).and_then(|item| match item {
                 Item::Instruction(instruction) => Some(*instruction),
                 Item::Label(_) => None,
@@ -357,10 +358,10 @@ impl Assembler {
                     }));
             let applied_comprehension_swap = following.is_some_and(|following| {
                 following.opcode == STORE_FAST
-                    && following.fusion_policy.prevent_with_previous
+                    && following.fusion_policy.prevents_with_previous()
                     && matches!(instruction.opcode, POP_TOP | STORE_FAST)
                     && !(instruction.opcode == STORE_FAST
-                        && instruction.fusion_policy.prevent_with_previous)
+                        && instruction.fusion_policy.prevents_with_previous())
             });
             if matches!(
                 instruction.opcode,
@@ -369,9 +370,9 @@ impl Assembler {
                     | STORE_FAST_LOAD_FAST
                     | STORE_FAST_STORE_FAST
             ) || matches!(
-                (instruction.opcode, instruction.operand),
+                (instruction.opcode, instruction.operand()),
                 (LOAD_GLOBAL, Operand::Value(argument)) if argument & 1 != 0
-            ) || instruction.converted_pop_block
+            ) || instruction.fusion_policy.is_converted_pop_block()
                 || removable_nop
                 || applied_comprehension_swap
             {
@@ -382,7 +383,7 @@ impl Assembler {
             if following.is_some_and(|following| will_fuse(instruction, following)) {
                 slots += 1;
                 slots += following.map_or(0, |following| {
-                    usize::from(following.hidden_exception_owner_slots)
+                    usize::from(following.local_policy.hidden_exception_owner_slots())
                 });
                 index += 2;
                 continue;
@@ -433,7 +434,7 @@ impl Assembler {
             };
             if instruction.opcode == RESUME {
                 return matches!(
-                    instruction.operand,
+                    instruction.operand(),
                     Operand::Value(argument)
                         if argument & 3 == ResumeLocation::AFTER_YIELD.argument()
                 );
@@ -441,7 +442,7 @@ impl Assembler {
             if instruction.opcode == NOT_TAKEN
                 || (!is_conditional_jump(instruction.opcode)
                     && (matches!(
-                        instruction.operand,
+                        instruction.operand(),
                         Operand::Forward(_) | Operand::Backward(_)
                     ) || ends_scope(instruction.opcode)))
             {
@@ -495,13 +496,15 @@ impl Assembler {
     pub(crate) fn mark_last_borrow_fallthrough_barrier(&mut self) {
         self.last_instruction_mut()
             .expect("borrow fallthrough barrier requires a preceding instruction")
-            .borrow_fallthrough = BorrowFallthrough::Barrier;
+            .no_location_policy
+            .set_borrow_fallthrough(BorrowFallthrough::Barrier);
     }
 
     /// Keeps borrowed-load traversal connected through a retained redundant-jump NOP.
     pub(crate) fn mark_last_retained_nop_borrow_fallthrough(&mut self) {
         self.last_jump_instruction_mut("marking retained NOP borrow fallthrough")
-            .borrow_fallthrough = BorrowFallthrough::RetainedNopReachable;
+            .no_location_policy
+            .set_borrow_fallthrough(BorrowFallthrough::RetainedNopReachable);
     }
 
     /// Retains a redundant jump as an analysis-only marker for CPython's empty CFG block.
@@ -537,7 +540,7 @@ impl Assembler {
         let Some((mut index, instruction)) = instructions.next() else {
             return false;
         };
-        if !instruction.converted_pop_block {
+        if !instruction.fusion_policy.is_converted_pop_block() {
             return false;
         }
         if let Some((previous_index, previous)) = instructions.next()
@@ -571,10 +574,9 @@ impl Assembler {
     pub(crate) fn add_last_hidden_exception_owner_slots(&mut self, slots: usize) {
         let slots = u8::try_from(slots.min(3)).expect("capped hidden slot count fits in u8");
         let instruction = self.required_last_instruction_mut("recording hidden owner slots");
-        instruction.hidden_exception_owner_slots = instruction
-            .hidden_exception_owner_slots
-            .saturating_add(slots)
-            .min(3);
+        instruction
+            .local_policy
+            .add_hidden_exception_owner_slots(slots);
     }
 
     /// Keeps the normalized exception owner on a trailing condition fallthrough marker.
@@ -582,7 +584,9 @@ impl Assembler {
         let instruction =
             self.required_last_instruction_mut("preserving a NOT_TAKEN exception owner");
         if instruction.opcode == NOT_TAKEN {
-            instruction.exception_policy.normalized_owner = NormalizedExceptionOwner::Present;
+            instruction
+                .exception_policy
+                .set_owner(NormalizedExceptionOwner::Present);
         }
     }
 
@@ -591,8 +595,9 @@ impl Assembler {
         let instruction =
             self.required_last_instruction_mut("overriding a NOT_TAKEN exception owner");
         if instruction.opcode == NOT_TAKEN {
-            instruction.exception_policy.normalized_owner =
-                NormalizedExceptionOwner::OverridePresent;
+            instruction
+                .exception_policy
+                .set_owner(NormalizedExceptionOwner::OverridePresent);
         }
     }
 
@@ -600,14 +605,14 @@ impl Assembler {
     pub(crate) fn prevent_last_instruction_fusion(&mut self) {
         self.required_last_instruction_mut("preventing fusion with the next instruction")
             .fusion_policy
-            .prevent_with_next = true;
+            .prevent_with_next();
     }
 
     /// Prevents fusion with the previous instruction without introducing a CFG boundary.
     pub(crate) fn prevent_last_instruction_fusion_with_previous(&mut self) {
         self.required_last_instruction_mut("preventing fusion with the previous instruction")
             .fusion_policy
-            .prevent_with_previous = true;
+            .prevent_with_previous();
     }
 
     /// Records that the last `STORE_FAST` restores a value saved by an inlined comprehension.
@@ -641,7 +646,7 @@ impl Assembler {
     }
     pub(crate) fn allow_last_transitive_small_exit_inlining(&mut self) {
         self.last_jump_instruction_mut("allowing transitive small-exit inlining")
-            .jump_provenance
+            .fusion_policy
             .allow_transitive_small_exit_inlining();
     }
 
@@ -684,7 +689,7 @@ impl Assembler {
             .next()
             .expect("condition jump should precede marker");
         assert!(
-            matches!(jump.operand, Operand::Forward(_) | Operand::Backward(_)),
+            matches!(jump.operand(), Operand::Forward(_) | Operand::Backward(_)),
             "condition marker should follow a jump"
         );
         jump.no_location_policy.allow_split_return_exit_copy();
@@ -698,7 +703,7 @@ impl Assembler {
 
     pub(crate) fn preserve_last_direct_inlined_jump_nop(&mut self) {
         let instruction = self.last_jump_instruction_mut("retaining a directly inlined jump NOP");
-        let Operand::Forward(_) = instruction.operand else {
+        let Operand::Forward(_) = instruction.operand() else {
             panic!("retaining a directly inlined jump NOP requires a forward jump");
         };
         instruction.jump_policy.retain_nop_for_direct_target();
@@ -712,7 +717,7 @@ impl Assembler {
 
     pub(crate) fn mark_last_jump_as_authored_break(&mut self) {
         self.last_jump_instruction_mut("marking an authored break jump")
-            .jump_provenance
+            .fusion_policy
             .mark_authored_break();
     }
 
@@ -752,7 +757,7 @@ impl Assembler {
     pub(crate) fn preserve_last_no_location(&mut self) {
         self.required_last_instruction_mut("preserving a no-location instruction")
             .no_location_policy
-            .preserve = true;
+            .preserve_location();
     }
 
     pub(crate) fn inherit_percent_target_location_for_last_instruction(&mut self) {
@@ -764,17 +769,23 @@ impl Assembler {
         self.has_synthesized_percent_target_locations = true;
     }
 
+    pub(crate) fn mark_assertion_side_exit_candidate(&mut self) {
+        self.has_assertion_side_exit_candidate = true;
+    }
+
     /// Gives the last instruction its final successor's location after optimization.
     /// This mirrors CPython's `NEXT_LOCATION` pseudo-location.
     pub(crate) fn use_next_location_for_last_instruction(&mut self) {
         self.has_next_location = true;
         self.required_last_instruction_mut("using the next instruction location")
-            .location_from_next = true;
+            .fusion_policy
+            .mark_location_from_next();
     }
 
     pub(crate) fn mark_last_as_converted_pop_block(&mut self) {
         self.required_last_instruction_mut("marking a converted POP_BLOCK")
-            .converted_pop_block = true;
+            .fusion_policy
+            .mark_converted_pop_block();
     }
 
     pub(crate) fn preserve_last_nop(&mut self) {
@@ -930,7 +941,7 @@ impl Assembler {
                     "{state} operand patch {id} has no instruction"
                 )));
             };
-            if !matches!(instruction.operand, Operand::Deferred(id) if id == expected) {
+            if !matches!(instruction.operand(), Operand::Deferred(id) if id == expected) {
                 return Err(CompileError::Internal(format!(
                     "{state} operand patch {id} has no instruction"
                 )));
@@ -941,7 +952,7 @@ impl Assembler {
             let Item::Instruction(instruction) = item else {
                 continue;
             };
-            let Operand::Deferred(id) = instruction.operand else {
+            let Operand::Deferred(id) = instruction.operand() else {
                 continue;
             };
             let index = usize::try_from(id.0).expect("operand patch ID should fit in usize");
@@ -965,7 +976,7 @@ impl Assembler {
                     id.0
                 )));
             };
-            instruction.operand = Operand::Value(argument);
+            instruction.set_operand(Operand::Value(argument));
         }
 
         self.operand_patches.clear();
@@ -993,12 +1004,12 @@ impl Assembler {
             let Item::Instruction(instruction) = item else {
                 continue;
             };
-            if ended_scope || !matches!(instruction.operand, Operand::Value(_)) {
+            if ended_scope || !matches!(instruction.operand(), Operand::Value(_)) {
                 straight_line = false;
                 break;
             }
             if instruction.opcode == load_const
-                && let Operand::Value(index) = instruction.operand
+                && let Operand::Value(index) = instruction.operand()
                 && let Some(used) = used.get_mut(index as usize)
             {
                 *used = true;
@@ -1030,20 +1041,19 @@ impl Assembler {
             if instruction.opcode != load_const {
                 return;
             }
-            let Operand::Value(index) = &mut instruction.operand else {
+            let Operand::Value(mut index) = instruction.operand() else {
                 unreachable!("LOAD_CONST has a jump operand");
             };
-            if *index == u32::MAX {
+            if index == u32::MAX {
                 let old_index = usize::try_from(
                     deferred_none.expect("deferred None constant should be resolved"),
                 )
                 .expect("constant index should fit in usize");
-                *index = index_map[old_index].expect("deferred None constant should be retained");
-                return;
+                index = index_map[old_index].expect("deferred None constant should be retained");
+            } else if let Some(new_index) = index_map[usize::try_from(index).unwrap()] {
+                index = new_index;
             }
-            if let Some(new_index) = index_map[usize::try_from(*index).unwrap()] {
-                *index = new_index;
-            }
+            instruction.set_operand(Operand::Value(index));
         };
         match &mut self.code {
             UnoptimizedCode::Linear(items) => {
@@ -1082,10 +1092,10 @@ impl Assembler {
             }
             if next.opcode == POP_TOP {
                 load.opcode = NOP;
-                load.operand = Operand::Value(0);
+                load.set_operand(Operand::Value(0));
                 next.opcode = NOP;
-                next.operand = Operand::Value(0);
-            } else if next.opcode == JUMP_FORWARD && matches!(next.operand, Operand::Forward(_)) {
+                next.set_operand(Operand::Value(0));
+            } else if next.opcode == JUMP_FORWARD && matches!(next.operand(), Operand::Forward(_)) {
                 has_forward_constant_jump = true;
             }
         }
@@ -1105,7 +1115,7 @@ impl Assembler {
             let [Item::Instruction(load), Item::Instruction(jump)] = items[index..index + 2] else {
                 continue;
             };
-            let Operand::Forward(target) = jump.operand else {
+            let Operand::Forward(target) = jump.operand() else {
                 continue;
             };
             if !is_constant_load(load.opcode) || jump.opcode != JUMP_FORWARD {
@@ -1230,8 +1240,8 @@ impl Assembler {
 }
 
 fn opcode_stack_effect(opcode: Opcode, argument: u32) -> i64 {
-    i64::try_from(opcode_num_pushed(opcode, argument)).unwrap()
-        - i64::try_from(opcode_num_popped(opcode, argument)).unwrap()
+    let (popped, pushed) = opcode_stack_counts(opcode, argument);
+    i64::try_from(pushed).unwrap() - i64::try_from(popped).unwrap()
 }
 
 fn block_has_fallthrough(block: &[Item]) -> bool {
@@ -1268,7 +1278,7 @@ fn block_jump_target(block: &[Item]) -> Option<Label> {
             None
         }
     })?;
-    match instruction.operand {
+    match instruction.operand() {
         Operand::Forward(target) | Operand::Backward(target) => Some(target),
         Operand::Value(_) | Operand::Deferred(_) => None,
     }

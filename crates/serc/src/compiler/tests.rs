@@ -1,7 +1,7 @@
 use ruff_python_ast::token::TokenKind;
 use ruff_python_ast::{Expr, ModModule, Stmt, StringLike};
 use ruff_python_parser::{Parsed, parse_module};
-use ruff_text_size::Ranged;
+use ruff_text_size::{Ranged, TextRange, TextSize};
 
 use crate::assembler::SourceLocation;
 use crate::code_object::Constant;
@@ -214,7 +214,9 @@ fn name_ids_do_not_define_observable_name_order() {
 
 #[test]
 fn name_ids_deduplicate_private_name_mangling_collisions() {
-    let source = r"class Container:
+    let source = r"__value = 0
+
+class Container:
     __value = 1
     _Container__value = 2
 
@@ -234,6 +236,7 @@ fn name_ids_deduplicate_private_name_mangling_collisions() {
         })
         .expect("module should contain the class body");
 
+    assert!(module.names.iter().any(|name| name.as_str() == "__value"));
     assert_eq!(
         class
             .names
@@ -310,6 +313,45 @@ def ordering(values, *, fallback=default_value):
             "result",
         ]
     );
+}
+
+#[test]
+fn complex_function_collection_preserves_late_local_and_sibling_order() {
+    let source = r"def complex_order(values):
+    early = values
+    early += later
+    print(final)
+    later = early
+    final = later
+    return early, later, final
+
+
+def flat_order(values):
+    print(later)
+    first = values
+    later = first
+    return first, later
+";
+    let parsed = parse_module(source).unwrap();
+    let module = module_compiler(source, &parsed)
+        .compile_module(parsed.suite())
+        .unwrap();
+    let locals = |name: &str| {
+        module
+            .constants
+            .iter()
+            .find_map(|constant| match constant {
+                Constant::Code(code) if code.name == name => Some(code.locals.as_slice()),
+                _ => None,
+            })
+            .expect("module should contain the function body")
+    };
+
+    assert_eq!(
+        locals("complex_order"),
+        ["values", "early", "later", "final"]
+    );
+    assert_eq!(locals("flat_order"), ["values", "later", "first"]);
 }
 
 #[test]
@@ -1174,6 +1216,48 @@ fn annotation_unparsing_matches_cpython_string_repr_categories() {
         };
         assert_eq!(unparse_annotation(&assignment.annotation), expected);
     }
+}
+
+#[test]
+fn source_locations_pair_utf8_columns_crlf_boundaries_and_eof() {
+    let source = "α = β\r\nγδ = ε";
+    let parsed = parse_module(source).unwrap();
+    let compiler = module_compiler(source, &parsed);
+    let range = |start, end| TextRange::new(TextSize::new(start), TextSize::new(end));
+
+    assert_eq!(
+        compiler.source_location(range(0, 7)),
+        SourceLocation::new(1, 1, 0, 7)
+    );
+    assert_eq!(
+        compiler.source_location(range(5, 8)),
+        SourceLocation::new(1, 1, 5, 8)
+    );
+    assert_eq!(
+        compiler.source_location(range(5, 9)),
+        SourceLocation::new(1, 2, 5, 0)
+    );
+    assert_eq!(
+        compiler.source_location(range(9, 18)),
+        SourceLocation::new(2, 2, 0, 9)
+    );
+    assert_eq!(
+        compiler.source_location(range(5, 18)),
+        SourceLocation::new(1, 2, 5, 9)
+    );
+
+    let source = "α = β\r\nγδ = ε\r\n";
+    let parsed = parse_module(source).unwrap();
+    let compiler = module_compiler(source, &parsed);
+
+    assert_eq!(
+        compiler.source_location(range(9, 19)),
+        SourceLocation::new(2, 2, 0, 10)
+    );
+    assert_eq!(
+        compiler.source_location(range(9, 20)),
+        SourceLocation::new(2, 3, 0, 0)
+    );
 }
 
 #[test]
