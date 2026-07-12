@@ -1280,6 +1280,15 @@ impl Compiler {
                 self.control.direct_comprehension_assignment_results =
                     previous_direct_comprehension_assignment_results;
                 result?;
+                if matches!(statement, Stmt::Break(_))
+                    && matches!(previous_statement, Some(Stmt::With(_)))
+                    && self.control.loops.last().is_some_and(|context| {
+                        context.iterator_cleanup == IteratorCleanup::None
+                            && !context.break_policy.returns()
+                    })
+                {
+                    self.assembler.preserve_last_inlined_jump_nop();
+                }
             }
             if statement_terminates(statement) {
                 let unreachable = &body[index + 1..];
@@ -1830,12 +1839,32 @@ impl Compiler {
             self.emit_jump_forward(POP_JUMP_IF_FALSE, cleanup, -1)?;
             self.emit(NOT_TAKEN, 0, 0)?;
         }
-        self.compile_expression(comparison.comparators.last().unwrap())?;
+        let final_comparator = comparison.comparators.last().unwrap();
+        let final_operator = *comparison.ops.last().unwrap();
+        let specialized_none_jump = matches!(final_comparator, Expr::NoneLiteral(_))
+            && matches!(final_operator, CmpOp::Is | CmpOp::IsNot);
+        if specialized_none_jump {
+            self.add_constant(Constant::None)?;
+        } else {
+            self.compile_expression(final_comparator)?;
+        }
         self.assembler
             .set_location(self.source_location(comparison.range));
-        let (opcode, argument) = comparison_operator_boolean(*comparison.ops.last().unwrap());
-        self.emit(opcode, argument, -1)?;
-        self.emit_jump_forward(POP_JUMP_IF_FALSE, condition_false, -1)?;
+        if specialized_none_jump {
+            self.emit_jump_forward(
+                if final_operator == CmpOp::Is {
+                    POP_JUMP_IF_NOT_NONE
+                } else {
+                    POP_JUMP_IF_NONE
+                },
+                condition_false,
+                -1,
+            )?;
+        } else {
+            let (opcode, argument) = comparison_operator_boolean(final_operator);
+            self.emit(opcode, argument, -1)?;
+            self.emit_jump_forward(POP_JUMP_IF_FALSE, condition_false, -1)?;
+        }
         self.emit(NOT_TAKEN, 0, 0)?;
         self.emit_jump_forward(JUMP_FORWARD, body, 0)?;
         self.assembler.prevent_last_jump_inlining();
