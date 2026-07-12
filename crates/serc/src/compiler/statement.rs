@@ -2805,6 +2805,7 @@ impl Compiler {
                 } else {
                     0
                 };
+                let mut protected_outer_pop_except_start = None;
                 let mut next_loop = self.control.loops.len();
                 for handler_index in (0..handler_count).rev() {
                     let (loop_depth, name, common_cleanup, common_cleanup_depth) = {
@@ -2845,6 +2846,21 @@ impl Compiler {
                                 true,
                             );
                         }
+                        if handler_index == 0
+                            && let Some(start) = protected_outer_pop_except_start.take()
+                        {
+                            // The inner handler's POP_EXCEPT and this outer SWAP share one
+                            // protected region in CPython's nested unnamed-handler return path.
+                            let end = self.assembler.label();
+                            self.assembler.mark(end);
+                            self.assembler.add_exception_region(
+                                start,
+                                end,
+                                common_cleanup,
+                                common_cleanup_depth,
+                                true,
+                            );
+                        }
                     }
                     if (delay_exception_unwind_start || unwinds_handler_before_sync_with)
                         && exception_unwind_start.is_none()
@@ -2866,28 +2882,36 @@ impl Compiler {
                     });
                     self.emit(POP_EXCEPT, 0, -1)?;
                     if let Some(start) = protected_pop_except {
-                        let end = self.assembler.label();
-                        self.assembler.mark(end);
-                        if let Some(handler) = handler_index
-                            .checked_sub(1)
-                            .map(|index| &self.control.active_exception_handlers[index])
+                        if protects_outer_handler
+                            && preserve_tos
+                            && handler_count == 2
+                            && handler_index == 1
                         {
-                            self.assembler.add_exception_region(
-                                start,
-                                end,
-                                handler.common_cleanup,
-                                handler.common_cleanup_depth,
-                                true,
-                            );
+                            protected_outer_pop_except_start = Some(start);
                         } else {
-                            for context in &self.control.active_return_finally_contexts {
+                            let end = self.assembler.label();
+                            self.assembler.mark(end);
+                            if let Some(handler) = handler_index
+                                .checked_sub(1)
+                                .map(|index| &self.control.active_exception_handlers[index])
+                            {
                                 self.assembler.add_exception_region(
                                     start,
                                     end,
-                                    context.handler,
-                                    context.depth,
-                                    false,
+                                    handler.common_cleanup,
+                                    handler.common_cleanup_depth,
+                                    true,
                                 );
+                            } else {
+                                for context in &self.control.active_return_finally_contexts {
+                                    self.assembler.add_exception_region(
+                                        start,
+                                        end,
+                                        context.handler,
+                                        context.depth,
+                                        false,
+                                    );
+                                }
                             }
                         }
                     }
