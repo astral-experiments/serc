@@ -3388,7 +3388,36 @@ impl Compiler {
                             && self.control.active_exception_region_exclusions.len() == 1
                             && self.control.active_normal_finally_bodies == 0
                             && !self.control.in_exception_handler()
-                            && is_call_none_default_assignment(test, body)));
+                            && is_call_none_default_assignment(test, body))
+                        || (!self.control.current_statement_has_following
+                            && self.control.generator_region_start.is_none()
+                            && self.control.active_with_region_exclusions.is_empty()
+                            && self.control.active_exception_region_exclusions.len() == 1
+                            && self.control.active_normal_finally_bodies == 0
+                            && !self.control.in_exception_handler()
+                            && self.assembler.contains_opcode(NOT_TAKEN)
+                            && self
+                                .control
+                                .direct_try_body_statements
+                                .contains(&statement.range)
+                            && matches!(test, Expr::Compare(comparison)
+                                if comparison.ops.len() == 1
+                                    && matches!(comparison.ops[0], CmpOp::Is)
+                                    && matches!(comparison.left.as_ref(), Expr::Call(_))
+                                    && matches!(comparison.comparators[0], Expr::NoneLiteral(_)))
+                            && matches!(body, [Stmt::Expr(expression), Stmt::For(loop_statement)]
+                            if matches!(expression.value.as_ref(), Expr::Call(_))
+                                && !loop_statement.is_async
+                                && loop_statement.orelse.is_empty()
+                                && matches!(loop_statement.body.as_slice(), [Stmt::Try(nested)]
+                                    if nested.orelse.is_empty()
+                                        && nested.finalbody.is_empty()
+                                        && !nested.handlers.is_empty()
+                                        && nested.handlers.iter().all(|handler| {
+                                            handler.as_except_handler().is_some_and(|handler| {
+                                                matches!(handler.body.as_slice(), [Stmt::Pass(_)])
+                                            })
+                                        })))));
                 let exclude_later_handler_leading_marker = branch_index == 0
                     && !is_specialized_none_condition(test)
                     && is_later_bare_raise_fallback_if(statement)
@@ -7082,6 +7111,12 @@ impl Compiler {
                         && self.control.active_pass_finally_locations.is_empty()
                         && !protected_loop_value_return
                         && !following_expression_exit_keeps_owner
+                        && !(self.control.in_iterator_loop()
+                            && self.control.generator_region_start.is_none()
+                            && self.control.active_with_region_exclusions.is_empty()
+                            && self.control.active_exception_region_exclusions.len() == 1
+                            && matches!(statement.body.as_slice(), [Stmt::Expr(_)])
+                            && matches!(handler.body.as_slice(), [Stmt::Pass(_)]))
                     {
                         ExceptionPolicy::EXCLUDE_IF_EXTENDED
                     } else {
