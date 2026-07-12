@@ -7150,6 +7150,36 @@ impl Compiler {
                 // normal cleanup block, even when code follows the enclosing try statement.
                 if handler_ends_with_unlocated_bare_raise_branch_cleanup {
                     self.assembler.set_location(SourceLocation::NONE);
+                } else if terminal
+                    && handler.name.is_none()
+                    && self.control.generator_region_start.is_none()
+                    && let Some(Stmt::If(statement)) = handler.body.last()
+                    && matches!(
+                        statement.elif_else_clauses.as_slice(),
+                        [clause] if clause.test.is_none()
+                            && matches!(
+                                clause.body.as_slice(),
+                                [Stmt::Raise(statement)]
+                                    if statement.exc.is_none() && statement.cause.is_none()
+                            )
+                    )
+                    && let Some(Stmt::Expr(expression)) = statement.body.last()
+                    && matches!(expression.value.as_ref(), Expr::Call(_))
+                {
+                    self.assembler
+                        .set_location(self.source_location(expression.range));
+                } else if self.control.in_synchronous_with()
+                    && self.control.generator_region_start.is_none()
+                    && let Some(Stmt::If(statement)) = handler.body.last()
+                    && statement.elif_else_clauses.is_empty()
+                    && matches!(
+                        statement.body.as_slice(),
+                        [Stmt::Assert(assertion)]
+                            if early_condition_truthiness(&assertion.test) == Some(false)
+                    )
+                    && let Some(range) = unary_not_condition_exit_range(&statement.test)
+                {
+                    self.assembler.set_location(self.source_location(range));
                 } else if let Some(Stmt::If(statement)) = handler.body.last()
                     && let Some(test) = terminating_if_fallthrough_test(statement)
                     && let Some(test) = unique_condition_jump_target(test, false)
