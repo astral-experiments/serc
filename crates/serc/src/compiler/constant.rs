@@ -1,4 +1,6 @@
 use std::borrow::Cow;
+use std::collections::hash_map::Entry;
+use std::hash::{Hash, Hasher};
 
 use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
 use ruff_python_ast::{
@@ -6,7 +8,7 @@ use ruff_python_ast::{
     Stmt, UnaryOp,
 };
 use ruff_text_size::Ranged;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 
 use super::{LOAD_CONST, LOAD_SMALL_INT, NOP, STORE_NAME};
 use crate::CompileError;
@@ -22,7 +24,10 @@ use crate::code_object::{CodeObject, Constant};
 #[derive(Debug, Default)]
 pub(super) struct ConstantPool {
     values: Vec<Constant>,
+    indices: Option<FxHashMap<u64, u32>>,
 }
+
+const CONSTANT_INDEX_THRESHOLD: usize = 12;
 
 impl ConstantPool {
     pub(super) fn is_empty(&self) -> bool {
@@ -34,6 +39,46 @@ impl ConstantPool {
     }
 
     pub(super) fn intern(&mut self, constant: Constant) -> Result<u32, CompileError> {
+        if self.indices.is_none() && self.values.len() >= CONSTANT_INDEX_THRESHOLD {
+            let mut indices = FxHashMap::default();
+            indices.reserve(self.values.len().saturating_mul(2));
+            for (index, value) in self.values.iter().enumerate() {
+                indices
+                    .entry(constant_pool_fingerprint(value))
+                    .or_insert_with(|| u32::try_from(index).expect("constant index fits in u32"));
+            }
+            self.indices = Some(indices);
+        }
+
+        if let Some(indices) = &mut self.indices {
+            let fingerprint = constant_pool_fingerprint(&constant);
+            match indices.entry(fingerprint) {
+                Entry::Occupied(entry) => {
+                    let index = *entry.get();
+                    let existing = &self.values[index as usize];
+                    if ConstantEquality::PoolKey.equal(existing, &constant) {
+                        return Ok(index);
+                    }
+                    if let Some(index) = self
+                        .values
+                        .iter()
+                        .position(|existing| ConstantEquality::PoolKey.equal(existing, &constant))
+                    {
+                        return to_u32(index, "constant index");
+                    }
+                }
+                Entry::Vacant(entry) => {
+                    let index = to_u32(self.values.len(), "constant count")?;
+                    entry.insert(index);
+                    self.values.push(constant);
+                    return Ok(index);
+                }
+            }
+            let index = to_u32(self.values.len(), "constant count")?;
+            self.values.push(constant);
+            return Ok(index);
+        }
+
         if let Some(index) = self
             .values
             .iter()
@@ -47,6 +92,7 @@ impl ConstantPool {
     }
 
     pub(super) fn retain_used(&mut self, used: &[bool]) -> Result<Vec<Option<u32>>, CompileError> {
+        self.indices = None;
         let mut index_map = vec![None; self.values.len()];
         let mut retained = Vec::with_capacity(self.values.len());
         for (old_index, constant) in std::mem::take(&mut self.values).into_iter().enumerate() {
@@ -63,6 +109,52 @@ impl ConstantPool {
     pub(super) fn into_values(self) -> Vec<Constant> {
         self.values
     }
+}
+
+fn constant_pool_fingerprint(constant: &Constant) -> u64 {
+    fn hash_constant(constant: &Constant, hasher: &mut FxHasher) {
+        std::mem::discriminant(constant).hash(hasher);
+        match constant {
+            Constant::None | Constant::Ellipsis => {}
+            Constant::Bool(value) => value.hash(hasher),
+            Constant::Int(value) => value.hash(hasher),
+            Constant::SignedInt(value) => value.hash(hasher),
+            Constant::BigInt { negative, digits } => {
+                negative.hash(hasher);
+                digits.hash(hasher);
+            }
+            Constant::Float(value) => value.to_bits().hash(hasher),
+            Constant::Complex { real, imag } => {
+                real.to_bits().hash(hasher);
+                imag.to_bits().hash(hasher);
+            }
+            Constant::String(value) => value.hash(hasher),
+            Constant::SurrogateString(value) | Constant::Bytes(value) => value.hash(hasher),
+            Constant::Tuple(values) => {
+                values.len().hash(hasher);
+                for value in values {
+                    hash_constant(value, hasher);
+                }
+            }
+            // Pool equality is order-independent and intentionally conservative for duplicate
+            // members, so length is the only universally valid frozenset fingerprint.
+            Constant::FrozenSet(values) => values.len().hash(hasher),
+            Constant::Slice { lower, upper, step } => {
+                hash_constant(lower, hasher);
+                hash_constant(upper, hasher);
+                hash_constant(step, hasher);
+            }
+            Constant::Code(code) => {
+                code.first_line_number.hash(hasher);
+                code.name.hash(hasher);
+                code.qualified_name.hash(hasher);
+            }
+        }
+    }
+
+    let mut hasher = FxHasher::default();
+    hash_constant(constant, &mut hasher);
+    hasher.finish()
 }
 
 #[derive(Debug, Default)]
@@ -1981,6 +2073,78 @@ mod tests {
             pool.into_values().as_slice(),
             [Constant::None, Constant::String(value)] if value == "kept"
         ));
+    }
+
+    #[test]
+    fn indexed_constant_pool_preserves_identity_collisions_and_retention() {
+        let mut pool = ConstantPool::default();
+        for value in 100..108 {
+            assert_eq!(
+                pool.intern(Constant::Int(value)).unwrap(),
+                u32::try_from(value - 100).unwrap()
+            );
+        }
+
+        assert_eq!(pool.intern(Constant::Bool(true)).unwrap(), 8);
+        assert_eq!(pool.intern(Constant::Int(1)).unwrap(), 9);
+        assert_eq!(pool.intern(Constant::SignedInt(1)).unwrap(), 10);
+        assert_eq!(pool.intern(Constant::Float(0.0)).unwrap(), 11);
+        assert_eq!(pool.intern(Constant::Float(-0.0)).unwrap(), 12);
+        assert_eq!(
+            pool.intern(Constant::Float(f64::from_bits(0x7ff8_0000_0000_0001)))
+                .unwrap(),
+            13
+        );
+        assert_eq!(
+            pool.intern(Constant::Float(f64::from_bits(0x7ff8_0000_0000_0002)))
+                .unwrap(),
+            14
+        );
+
+        let nested = Constant::Tuple(vec![Constant::FrozenSet(vec![
+            Constant::String("first".to_string()),
+            Constant::String("second".to_string()),
+        ])]);
+        let reordered = Constant::Tuple(vec![Constant::FrozenSet(vec![
+            Constant::String("second".to_string()),
+            Constant::String("first".to_string()),
+        ])]);
+        assert_eq!(pool.intern(nested).unwrap(), 15);
+        assert_eq!(pool.intern(reordered).unwrap(), 15);
+
+        let unhinted = code_object(vec![Constant::String("méthode".to_string())]);
+        let mut hinted = unhinted.clone();
+        hinted
+            .marshal_hints
+            .explicitly_interned_strings
+            .insert("méthode".to_string());
+        let mut different = unhinted.clone();
+        different.bytecode.push(1);
+        let mut fresh = unhinted.clone();
+        fresh.marshal_hints.locals_identity = LocalsIdentity::Fresh;
+
+        assert_eq!(pool.intern(Constant::Code(Box::new(unhinted))).unwrap(), 16);
+        assert_eq!(pool.intern(Constant::Code(Box::new(hinted))).unwrap(), 16);
+        assert_eq!(
+            pool.intern(Constant::Code(Box::new(different.clone())))
+                .unwrap(),
+            17
+        );
+        assert_eq!(
+            pool.intern(Constant::Code(Box::new(different))).unwrap(),
+            17
+        );
+        assert_eq!(pool.intern(Constant::Code(Box::new(fresh))).unwrap(), 18);
+
+        let mut used = vec![true; 19];
+        used[1] = false;
+        let index_map = pool.retain_used(&used).unwrap();
+        assert_eq!(index_map[0], Some(0));
+        assert_eq!(index_map[1], None);
+        assert_eq!(index_map[2], Some(1));
+        assert_eq!(pool.intern(Constant::Int(100)).unwrap(), 0);
+        assert_eq!(pool.intern(Constant::Int(102)).unwrap(), 1);
+        assert_eq!(pool.intern(Constant::Int(101)).unwrap(), 18);
     }
 
     #[test]
