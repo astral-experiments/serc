@@ -4535,12 +4535,22 @@ impl Compiler {
                 if comparison.ops.len() == 1
                     && matches!(comparison.ops[0], CmpOp::Is | CmpOp::IsNot)
                     && matches!(comparison.comparators[0], Expr::NoneLiteral(_)));
+        let preserve_generator_loop_condition_owner =
+            self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) != 0
+                && self.control.in_iterator_loop()
+                && !self.control.generator_expression
+                && self.control.active_exception_region_exclusions.is_empty()
+                && matches!(expression.test.as_ref(), Expr::UnaryOp(unary)
+                    if unary.op == UnaryOp::Not
+                        && matches!(unary.operand.as_ref(), Expr::Name(_)))
+                && matches!(expression.body.as_ref(), Expr::Name(_))
+                && matches!(expression.orelse.as_ref(), Expr::BinOp(_));
         self.with_control_override(
             |control| &mut control.exclude_condition_not_taken_from_exception,
             exclude_try_marker,
             |compiler| compiler.compile_jump_if(&expression.test, false, else_label),
         )?;
-        if preserve_generator_with_none_owner {
+        if preserve_generator_with_none_owner || preserve_generator_loop_condition_owner {
             self.assembler.override_last_not_taken_exception_owner();
         }
         self.compile_expression(&expression.body)?;
