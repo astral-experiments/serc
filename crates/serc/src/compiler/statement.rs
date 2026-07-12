@@ -6923,14 +6923,11 @@ impl Compiler {
             let handler_body_has_instructions =
                 self.assembler.instruction_count() > handler_body_start;
             // CPython allocates the normal exit before an explicit `else`, so collecting this
-            // cold class-body handler puts the named cleanup before the bare-raise arm.
+            // cold named handler puts the cleanup before the bare-raise arm.
             let handler_ends_with_preordered_named_cleanup = matches!(
-                handler.body.last(),
-                Some(Stmt::If(tail))
+                handler.body.as_slice(),
+                [Stmt::If(tail)]
                     if handler.name.is_some()
-                        && matches!(self.unit.scope, Scope::Class { .. })
-                        && handler.body.len() == 1
-                        && !suite_terminates(&tail.body)
                         && tail.elif_else_clauses.last().is_some_and(|clause| {
                             clause.test.is_none()
                                 && matches!(
@@ -6938,6 +6935,19 @@ impl Compiler {
                                     [Stmt::Raise(statement)] if statement.exc.is_none()
                                 )
                         })
+                        && ((matches!(self.unit.scope, Scope::Class { .. })
+                            && !suite_terminates(&tail.body))
+                            || (matches!(self.unit.scope, Scope::Function { .. })
+                                && matches!(
+                                    tail.body.as_slice(),
+                                    [Stmt::Assign(_)] | [Stmt::Assign(_), Stmt::Assign(_)]
+                                )
+                                && matches!(
+                                    statement.body.as_slice(),
+                                    [Stmt::Assign(_) | Stmt::Expr(_)]
+                                )
+                                && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+                                && self.control.active_with_region_exclusions.is_empty()))
             );
             let direct_nested_loop_handler_backedge = nested_loop_conversion_try;
             let copy_nested_loop_handler_backedge = direct_nested_loop_handler_backedge
