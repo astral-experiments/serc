@@ -7851,7 +7851,7 @@ impl Compiler {
         let retained_assertion_test = if preserve_exit_nop
             && matches!(
                 statement.finalbody.as_slice(),
-                [Stmt::Expr(_)] | [Stmt::Expr(_), Stmt::Expr(_) | Stmt::If(_)]
+                [Stmt::Expr(_) | Stmt::If(_)] | [Stmt::Expr(_), Stmt::Expr(_) | Stmt::If(_)]
             ) {
             match statement.body.last() {
                 Some(Stmt::Assert(assertion))
@@ -7949,9 +7949,17 @@ impl Compiler {
                     [Stmt::If(tail)]
                         if tail.elif_else_clauses.is_empty()
                             && statement.handlers.is_empty()
-                            && matches!(tail.test.as_ref(), Expr::Name(_))
-                            && matches!(tail.body.as_slice(), [Stmt::Expr(_)])
-                            && !matches!(statement.body.last(), Some(Stmt::Assert(_)))
+                            && (((matches!(tail.test.as_ref(), Expr::Name(_))
+                                || (matches!(tail.test.as_ref(), Expr::Attribute(_))
+                                    && matches!(statement.body.last(), Some(Stmt::Assign(_)))))
+                                && matches!(tail.body.as_slice(), [Stmt::Expr(_)])
+                                && !matches!(statement.body.last(), Some(Stmt::Assert(_))))
+                                || (matches!(tail.test.as_ref(), Expr::Compare(comparison)
+                                        if comparison.ops.len() == 1
+                                            && matches!(comparison.ops[0], CmpOp::Is | CmpOp::IsNot)
+                                            && matches!(comparison.comparators[0], Expr::NoneLiteral(_)))
+                                    && matches!(tail.body.as_slice(), [Stmt::Expr(_), Stmt::Expr(_)])
+                                    && matches!(statement.body.last(), Some(Stmt::Assert(_)))))
                 );
                 compiler.with_control_override(
                     |control| &mut control.include_simple_normal_finally_not_taken_from_with,
@@ -8425,7 +8433,14 @@ impl Compiler {
                                         || matches!(boolean.values.as_slice(), [Expr::UnaryOp(first), Expr::UnaryOp(second), Expr::BoolOp(_)]
                                             if matches!(first.operand.as_ref(), Expr::Name(_))
                                                 && matches!(second.operand.as_ref(), Expr::Attribute(_)))
-                                        || matches!(boolean.values.as_slice(), [Expr::Name(_), Expr::Compare(_), Expr::Compare(_)])))));
+                                        || matches!(boolean.values.as_slice(), [Expr::Name(_), Expr::Compare(_), Expr::Compare(_)])
+                                        || matches!(boolean.values.as_slice(), [Expr::Compare(first), Expr::Compare(second)]
+                                            if first.ops.len() == 1
+                                                && second.ops.len() == 1
+                                                && matches!(first.ops[0], CmpOp::Is | CmpOp::IsNot)
+                                                && matches!(second.ops[0], CmpOp::Is | CmpOp::IsNot)
+                                                && matches!(first.comparators[0], Expr::NoneLiteral(_))
+                                                && matches!(second.comparators[0], Expr::NoneLiteral(_)))))));
                 self.with_control_override(
                     |control| &mut control.terminal_with_condition,
                     Some(statement.test.range()),
@@ -8554,7 +8569,8 @@ impl Compiler {
             exception_region_depth: self.control.active_exception_region_exclusions.len(),
             loop_depth: self.control.loops.len(),
             preserves_none_condition_owner: remaining.is_empty()
-                && with_suite_has_fallthrough_handler_try(body),
+                && (with_suite_has_fallthrough_handler_try(body)
+                    || with_suite_has_terminal_none_and_raise(body)),
         };
         let (body_noop, region_exclusions) = self.with_region_exclusion_collector(
             |control| &mut control.active_with_region_exclusions,
@@ -10611,6 +10627,24 @@ fn with_suite_has_fallthrough_handler_try(body: &[Stmt]) -> bool {
                     .is_some_and(|handler| !suite_terminates(&handler.body))
             })
     })
+}
+
+fn with_suite_has_terminal_none_and_raise(body: &[Stmt]) -> bool {
+    matches!(
+        body.last(),
+        Some(Stmt::If(statement))
+            if statement.elif_else_clauses.is_empty()
+                && matches!(statement.body.last(), Some(Stmt::Raise(_)))
+                && matches!(statement.test.as_ref(), Expr::BoolOp(boolean)
+                    if boolean.op == BoolOp::And
+                        && matches!(boolean.values.as_slice(), [Expr::Compare(first), Expr::Compare(second)]
+                            if first.ops.len() == 1
+                                && second.ops.len() == 1
+                                && matches!(first.ops[0], CmpOp::Is | CmpOp::IsNot)
+                                && matches!(second.ops[0], CmpOp::Is | CmpOp::IsNot)
+                                && matches!(first.comparators[0], Expr::NoneLiteral(_))
+                                && matches!(second.comparators[0], Expr::NoneLiteral(_))))
+    )
 }
 
 fn finally_suite_preserves_none_condition_owner(body: &[Stmt]) -> bool {
