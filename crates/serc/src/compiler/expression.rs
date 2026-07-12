@@ -3444,6 +3444,40 @@ impl Compiler {
         include_comprehension_cleanup: bool,
     ) -> Result<(), CompileError> {
         if let Expr::BoolOp(boolean) = condition
+            && boolean.op == BoolOp::Or
+            && boolean
+                .values
+                .iter()
+                .all(|value| !matches!(value, Expr::BoolOp(_) | Expr::UnaryOp(_)))
+            && (!include_comprehension_cleanup
+                || (self.control.active_exception_region_exclusions.is_empty()
+                    && self.control.active_with_region_exclusions.is_empty()))
+        {
+            let Some((last, leading)) = boolean.values.split_last() else {
+                return Err(CompileError::Internal(
+                    "boolean expression contains no values".to_string(),
+                ));
+            };
+            for value in leading {
+                let next = self.assembler.label();
+                self.compile_negated_filter_operand(
+                    value,
+                    element_location,
+                    next,
+                    restart,
+                    include_comprehension_cleanup,
+                )?;
+                self.assembler.mark(next);
+            }
+            return self.compile_negated_filter_operand(
+                last,
+                element_location,
+                accepted,
+                restart,
+                include_comprehension_cleanup,
+            );
+        }
+        if let Expr::BoolOp(boolean) = condition
             && boolean.op == BoolOp::And
         {
             let Some((last, leading)) = boolean.values.split_last() else {
