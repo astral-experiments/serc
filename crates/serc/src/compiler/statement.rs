@@ -1339,9 +1339,13 @@ impl Compiler<'_> {
                 let unreachable = &body[index + 1..];
                 // CPython visits unreachable statements before the flow graph removes them.
                 // Its constant compaction always retains slot zero, so the first literal in
-                // an unreachable tail survives when no reachable constant preceded it.
+                // an unreachable tail survives when no reachable constant preceded it. A lone
+                // bare Ellipsis expression in a suspension scope is removed before compaction.
                 if self.output.constants.is_empty()
                     && let Some(constant) = first_suite_literal_constant(unreachable)
+                    && !(self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) != 0
+                        && matches!(unreachable, [Stmt::Expr(expression)]
+                            if matches!(expression.value.as_ref(), Expr::EllipsisLiteral(_))))
                 {
                     self.add_constant(constant)?;
                 }
