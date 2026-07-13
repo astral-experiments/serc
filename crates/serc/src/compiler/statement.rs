@@ -3390,6 +3390,19 @@ impl Compiler<'_> {
                         .active_with_exits
                         .last()
                         .is_some_and(|context| !context.is_async);
+                let preserve_shifted_sync_with_none_owner = branch_index == 0
+                    && !self.context.has_lazy_imports
+                    && self.control.in_synchronous_with()
+                    && matches!(test, Expr::Compare(comparison)
+                        if comparison.ops.len() == 1
+                            && matches!(comparison.ops[0], CmpOp::Is | CmpOp::IsNot)
+                            && matches!(comparison.comparators[0], Expr::NoneLiteral(_)))
+                    && (self.assembler.current_block_has_dynamic_exception_owner()
+                        || self
+                            .assembler
+                            .fallthrough_has_concrete_dynamic_exception_owner()
+                        || self.control.in_iterator_loop()
+                        || body.len() > 1);
 
                 let preserve_sync_with_terminating_call_owner = branch_index == 0
                     && statement.elif_else_clauses.len() > 1
@@ -3704,10 +3717,11 @@ impl Compiler<'_> {
                     // start in fresh blocks.
                     self.assembler.preserve_last_not_taken_exception_owner();
                 }
-                if preserve_sync_with_none_owner {
-                    // A complete non-exiting branch keeps its specialized `is None` marker in
-                    // the surrounding synchronous-with region even after an earlier normalized
-                    // marker consumes the with setup's stale owner slot.
+                if preserve_sync_with_none_owner || preserve_shifted_sync_with_none_owner {
+                    // A specialized None-condition marker can reuse the synchronous-with
+                    // owner after a concrete stale slot, in an iterator body, or before a
+                    // multi-statement branch. Complete non-exiting `is None` branches retain
+                    // the same owner even when an earlier marker consumed the setup slot.
                     self.assembler.preserve_last_not_taken_exception_owner();
                 }
                 if preserve_sync_with_terminating_call_owner {
