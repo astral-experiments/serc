@@ -5217,7 +5217,7 @@ impl Compiler<'_> {
                 self.control.protected_iterator_continue_condition == Some(expression.range());
             let short_circuit_jumps_to_target = matches!(boolean.op, BoolOp::Or) == jump_on;
             if short_circuit_jumps_to_target {
-                for value in leading {
+                for (operand_index, value) in leading.iter().enumerate() {
                     if defer_terminal_with_exclusion {
                         self.with_control_override(
                             |control| &mut control.exclude_terminal_if_not_taken,
@@ -5227,14 +5227,14 @@ impl Compiler<'_> {
                     } else {
                         self.compile_jump_if(value, jump_on, label)?;
                     }
-                    if preserve_leading_protected_loop_owner {
+                    if preserve_leading_protected_loop_owner && operand_index == 0 {
                         self.assembler.preserve_last_not_taken_exception_owner();
                     }
                 }
                 return self.compile_jump_if(last, jump_on, label);
             }
             let end = self.assembler.label();
-            for value in leading {
+            for (operand_index, value) in leading.iter().enumerate() {
                 if defer_terminal_with_exclusion {
                     self.with_control_override(
                         |control| &mut control.exclude_terminal_if_not_taken,
@@ -5244,7 +5244,7 @@ impl Compiler<'_> {
                 } else {
                     self.compile_jump_if(value, !jump_on, end)?;
                 }
-                if preserve_leading_protected_loop_owner {
+                if preserve_leading_protected_loop_owner && operand_index == 0 {
                     self.assembler.preserve_last_not_taken_exception_owner();
                 }
             }
