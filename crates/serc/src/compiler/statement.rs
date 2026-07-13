@@ -2601,6 +2601,18 @@ impl Compiler<'_> {
                         self.output.has_deferred_break_none = true;
                         self.emit(LOAD_CONST, u32::MAX, 1)?;
                         self.emit(RETURN_VALUE, 0, -1)?;
+                    } else if finally_end_unwind_start.is_none()
+                        && exclusion_start.is_none()
+                        && with_unwind_starts.is_empty()
+                        && context.iterator_cleanup == IteratorCleanup::None
+                        && self.control.active_exception_region_exclusions.is_empty()
+                        && self.control.active_exception_handlers.is_empty()
+                        && self.control.active_finally_try_bodies == 0
+                        && self.control.active_normal_finally_bodies == 0
+                    {
+                        // CPython visits the remaining loop body before interning the terminal
+                        // implicit None, so cleanup-free breaks must defer their return value.
+                        self.emit_deferred_implicit_return()?;
                     } else {
                         self.emit_implicit_return()?;
                     }
