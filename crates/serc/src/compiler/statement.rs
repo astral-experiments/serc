@@ -276,9 +276,9 @@ pub(super) struct ControlFlowState {
     // The protected iterator Boolean condition whose first short-circuit marker reuses the
     // surrounding owner. Synchronous-with continues and first generator conditions use this.
     pub(super) protected_iterator_continue_condition: Option<ruff_text_size::TextRange>,
-    // The first Boolean continue condition in a synchronous iterator body after one simple
+    // The first continue condition in a synchronous iterator body after one simple
     // leading assignment. The assignment can consume the removed iterator-target slot.
-    first_iterator_assignment_boolean_condition: Option<TextRange>,
+    first_iterator_assignment_condition: Option<TextRange>,
     // The direct nested condition that begins a suspending iterator loop's final `elif` body.
     // CPython excludes its normalized marker when the body has a real fallthrough path.
     loop_tail_final_elif_nested_condition: Option<TextRange>,
@@ -3460,7 +3460,9 @@ impl Compiler<'_> {
                     && self.control.loops.len() == 1
                     && self.control.loops.last().is_some_and(|context| {
                         context.iterator_cleanup == IteratorCleanup::Sync
-                            && self.assembler.instruction_count() == context.body_start
+                            && (self.assembler.instruction_count() == context.body_start
+                                || self.control.first_iterator_assignment_condition
+                                    == Some(test.range()))
                             && context.with_depth == self.control.active_with_exits.len()
                             && context.finally_end_depth == self.control.active_finally_end_blocks
                             && context.exception_region_depth
@@ -3691,7 +3693,7 @@ impl Compiler<'_> {
                                         || (matches!(body, [Stmt::Continue(_)])
                                             && self
                                                 .control
-                                                .first_iterator_assignment_boolean_condition
+                                                .first_iterator_assignment_condition
                                                 == Some(test.range())))
                                     && context.with_depth == self.control.active_with_exits.len()
                                     && context.finally_end_depth
@@ -5650,15 +5652,21 @@ impl Compiler<'_> {
         );
         let body_start = self.assembler.instruction_count();
         let first_iterator_loop_assertion = first_iterator_loop_assertion(&statement.body);
-        let first_iterator_assignment_boolean_condition = (!self.context.has_lazy_imports
+        let first_iterator_assignment_condition = (!self.context.has_lazy_imports
             && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) != 0
             && self.control.loops.is_empty())
-        .then(|| first_iterator_assignment_boolean_condition(&statement.body))
+        .then(|| {
+            first_iterator_assignment_condition(
+                &statement.body,
+                self.control.current_statement_has_following
+                    || self.control.inherited_statement_has_following,
+            )
+        })
         .flatten();
         let tail_jumps = self.with_loop_context(context, |compiler| {
             compiler.with_control_override(
-                |control| &mut control.first_iterator_assignment_boolean_condition,
-                first_iterator_assignment_boolean_condition,
+                |control| &mut control.first_iterator_assignment_condition,
+                first_iterator_assignment_condition,
                 |compiler| {
                     compiler.with_control_override(
                         |control| &mut control.first_iterator_loop_assertion,
@@ -10299,7 +10307,10 @@ fn first_iterator_loop_assertion(mut body: &[Stmt]) -> Option<TextRange> {
     }
 }
 
-fn first_iterator_assignment_boolean_condition(body: &[Stmt]) -> Option<TextRange> {
+fn first_iterator_assignment_condition(
+    body: &[Stmt],
+    outer_for_has_following: bool,
+) -> Option<TextRange> {
     let [Stmt::Assign(assignment), Stmt::If(branch), ..] = body else {
         return None;
     };
@@ -10308,16 +10319,30 @@ fn first_iterator_assignment_boolean_condition(body: &[Stmt]) -> Option<TextRang
             assignment.value.as_ref(),
             Expr::Call(_) | Expr::Subscript(_) | Expr::Attribute(_) | Expr::FString(_)
         )
-        || !matches!(branch.test.as_ref(), Expr::BoolOp(_))
         || !branch.elif_else_clauses.is_empty()
         || !matches!(branch.body.as_slice(), [Stmt::Continue(_)])
-        || !is_simple_iterator_assert_assignment_value(&assignment.value)
-        || matches!(branch.test.as_ref(), Expr::BoolOp(boolean)
-            if boolean.values.first().is_some_and(expression_contains_eager_suspension))
     {
         return None;
     }
-    Some(branch.test.range())
+    let test = branch.test.as_ref();
+    // A following outer-suite continuation can merge a unary marker with an inline owner.
+    // Reject it before walking the leading assignment value.
+    if (outer_for_has_following && !matches!(test, Expr::BoolOp(_)))
+        || !is_simple_iterator_assert_assignment_value(&assignment.value)
+    {
+        return None;
+    }
+    let supported_test = if let Expr::BoolOp(boolean) = test {
+        !boolean
+            .values
+            .first()
+            .is_some_and(expression_contains_eager_suspension)
+    } else {
+        condition_jump_target_count(test, false) == 1
+            && !matches!(test, Expr::If(_))
+            && !expression_contains_eager_suspension(test)
+    };
+    supported_test.then_some(test.range())
 }
 
 fn expression_contains_eager_suspension(expression: &Expr) -> bool {
@@ -12238,7 +12263,7 @@ fn try_has_conditional_shared_loop_exit(statement: &Stmt) -> bool {
 mod tests {
     use super::{
         IteratorCleanup, break_jump_needs_exception_region_exclusion,
-        terminal_assert_splits_success_return,
+        first_iterator_assignment_condition, terminal_assert_splits_success_return,
     };
     use crate::target::code_flags::{CO_ASYNC_GENERATOR, CO_COROUTINE, CO_GENERATOR};
     use ruff_python_ast::Stmt;
@@ -12251,6 +12276,21 @@ mod tests {
             panic!("expected one assertion");
         };
         terminal_assert_splits_success_return(statement)
+    }
+
+    fn iterator_assignment_condition(
+        test: &str,
+        tail: &str,
+        outer_for_has_following: bool,
+    ) -> bool {
+        let parsed = parse_module(&format!(
+            "for value in values:\n    prepared = value.strip()\n    if {test}:\n        continue\n    {tail}"
+        ))
+        .expect("iterator body should parse");
+        let [Stmt::For(statement)] = parsed.suite().as_slice() else {
+            panic!("expected one iterator loop");
+        };
+        first_iterator_assignment_condition(&statement.body, outer_for_has_following).is_some()
     }
 
     #[test]
@@ -12303,5 +12343,33 @@ mod tests {
         ] {
             assert!(!terminal_assert_splits(expression), "{expression}");
         }
+    }
+
+    #[test]
+    fn first_iterator_assignment_condition_rejects_following_outer_suite() {
+        for tail in [
+            "observe(prepared)",
+            "entries[prepared] += 1",
+            "del entries[prepared]",
+            "result = prepared",
+            "value.prepared = prepared",
+            "entries[prepared] = None",
+            "entries[prepared] = prepared",
+            "if first:\n        observe(prepared)",
+        ] {
+            assert!(
+                !iterator_assignment_condition("not prepared", tail, true),
+                "{tail}"
+            );
+            assert!(
+                iterator_assignment_condition("not prepared", tail, false),
+                "{tail}"
+            );
+        }
+        assert!(iterator_assignment_condition(
+            "not prepared and first",
+            "entries[prepared] = None",
+            true,
+        ));
     }
 }
