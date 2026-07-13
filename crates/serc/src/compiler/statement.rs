@@ -2992,8 +2992,7 @@ impl Compiler<'_> {
                     let previous_copy_return_finally_condition_exit =
                         self.control.copy_return_finally_condition_exit;
                     self.control.copy_return_finally_condition_exit =
-                        matches!(statement.value.as_deref(), Some(Expr::Name(_)))
-                            && finally_context.preserves_conditional_exit_owner;
+                        finally_context.preserves_conditional_exit_owner;
                     let initialized_locals = self.symbols.initialized_locals.clone();
                     let result = if context_index > 0 {
                         self.with_region_exclusion_collector(
