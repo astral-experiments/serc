@@ -1349,6 +1349,37 @@ impl Compiler<'_> {
                 {
                     self.add_constant(constant)?;
                 }
+                // A simple keyword call interns its names tuple after visiting all arguments;
+                // name/attribute-only operands ensure that tuple is the first unreachable constant.
+                if self.output.constants.is_empty()
+                    && let [Stmt::Expr(expression)] = unreachable
+                    && let Expr::Call(call) = expression.value.as_ref()
+                    && is_unreachable_call_kw_leaf(&call.func)
+                    && call.arguments.args.iter().all(is_unreachable_call_kw_leaf)
+                    && call
+                        .arguments
+                        .keywords
+                        .iter()
+                        .all(|keyword| is_unreachable_call_kw_leaf(&keyword.value))
+                {
+                    let shape = self.call_shape(call);
+                    if shape.direct_method.is_none()
+                        && shape.keyword_count > 0
+                        && !shape.has_starred
+                        && !shape.has_keyword_unpack
+                        && shape.positional_count + shape.keyword_count * 2 <= 30
+                    {
+                        let keyword_names = call
+                            .arguments
+                            .keywords
+                            .iter()
+                            .map(|keyword| {
+                                Constant::String(keyword.arg.as_ref().unwrap().as_str().to_string())
+                            })
+                            .collect();
+                        self.add_interned_string_tuple(keyword_names)?;
+                    }
+                }
                 self.pre_register_suite_names(unreachable)?;
                 break;
             }
@@ -10994,6 +11025,14 @@ fn statement_threads_through_empty_join(statement: &Stmt) -> bool {
             .iter()
             .take(statement.cases.len().saturating_sub(1))
             .any(|case| !suite_terminates(&case.body)),
+        _ => false,
+    }
+}
+
+fn is_unreachable_call_kw_leaf(expression: &Expr) -> bool {
+    match expression {
+        Expr::Name(_) => true,
+        Expr::Attribute(attribute) => is_unreachable_call_kw_leaf(&attribute.value),
         _ => false,
     }
 }
