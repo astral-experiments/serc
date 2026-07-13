@@ -6,11 +6,11 @@ use super::{
     BINARY_SLICE, BUILD_LIST, BUILD_MAP, BUILD_SET, BUILD_TUPLE, CALL, CHECK_EG_MATCH,
     CHECK_EXC_MATCH, CLEANUP_THROW, COPY, END_ASYNC_FOR, END_FOR, END_SEND, FOR_ITER, GET_AITER,
     GET_ANEXT, GET_ITER, IMPORT_FROM, IMPORT_NAME, JUMP_BACKWARD, JUMP_BACKWARD_NO_INTERRUPT,
-    JUMP_FORWARD, LIST_APPEND, LOAD_ATTR, LOAD_CONST, LOAD_DEREF, LOAD_GLOBAL, LOAD_SMALL_INT,
-    MAP_ADD, NOP, NOT_TAKEN, POP_EXCEPT, POP_ITER, POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE,
-    POP_JUMP_IF_NOT_NONE, POP_JUMP_IF_TRUE, POP_TOP, PUSH_EXC_INFO, RAISE_VARARGS, RETURN_VALUE,
-    SEND, SET_ADD, STORE_ATTR, STORE_SLICE, STORE_SUBSCR, SWAP, TO_BOOL, WITH_EXCEPT_START,
-    YIELD_VALUE,
+    JUMP_FORWARD, LIST_APPEND, LOAD_ATTR, LOAD_CONST, LOAD_DEREF, LOAD_FAST_AND_CLEAR, LOAD_GLOBAL,
+    LOAD_SMALL_INT, MAP_ADD, NOP, NOT_TAKEN, POP_EXCEPT, POP_ITER, POP_JUMP_IF_FALSE,
+    POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE, POP_JUMP_IF_TRUE, POP_TOP, PUSH_EXC_INFO,
+    RAISE_VARARGS, RETURN_VALUE, SEND, SET_ADD, STORE_ATTR, STORE_SLICE, STORE_SUBSCR, SWAP,
+    TO_BOOL, WITH_EXCEPT_START, YIELD_VALUE,
 };
 use crate::CompileError;
 use crate::assembler::{ExceptionPolicy, Label, SourceLocation};
@@ -132,6 +132,7 @@ struct TryMarkerSlotContext {
 struct WithExitContext {
     location: SourceLocation,
     is_async: bool,
+    body_start_instruction: usize,
     exception_region_depth: usize,
     loop_depth: usize,
     preserves_none_condition_owner: bool,
@@ -3503,6 +3504,48 @@ impl Compiler<'_> {
                         .active_with_exits
                         .last()
                         .is_some_and(|context| !context.is_async);
+                let preserve_sync_with_terminal_condition_owner = branch_index == 0
+                    && self.control.terminal_with_condition == Some(statement.test.range())
+                    && statement.elif_else_clauses.is_empty()
+                    && self
+                        .control
+                        .active_with_exits
+                        .last()
+                        .is_some_and(|context| {
+                            !self.assembler.contains_opcode_since(
+                                LOAD_FAST_AND_CLEAR,
+                                context.body_start_instruction,
+                            )
+                        })
+                    && (!self.assembler.contains_opcode(NOT_TAKEN)
+                        || matches!(test, Expr::Compare(comparison)
+                            if comparison.ops.len() == 1
+                                && matches!(comparison.ops[0], CmpOp::Is | CmpOp::IsNot)
+                                && matches!(comparison.comparators[0], Expr::NoneLiteral(_))))
+                    && matches!(self.unit.scope, Scope::Function { .. })
+                    && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR | CO_GENERATOR) == 0
+                    && self.control.loops.is_empty()
+                    && self.control.active_exception_region_exclusions.is_empty()
+                    && self.control.active_with_region_exclusions.len() == 1
+                    && self.control.active_with_exits.len() == 1
+                    && !self
+                        .control
+                        .synchronous_with_preserves_none_condition_owner()
+                    && self
+                        .control
+                        .active_with_exits
+                        .last()
+                        .is_some_and(|context| !context.is_async)
+                    && matches!(body.last(), Some(Stmt::Return(_) | Stmt::Raise(_)))
+                    && (matches!(test, Expr::Name(_) | Expr::Call(_) | Expr::Named(_))
+                        || matches!(test, Expr::UnaryOp(unary)
+                            if unary.op == UnaryOp::Not
+                                && matches!(unary.operand.as_ref(), Expr::Name(_) | Expr::Attribute(_) | Expr::Call(_)))
+                        || matches!(test, Expr::Compare(comparison)
+                            if comparison.ops.len() == 1
+                                && matches!(comparison.ops[0], CmpOp::Is | CmpOp::IsNot)
+                                && matches!(comparison.comparators[0], Expr::NoneLiteral(_))))
+                    && !expression_contains_inline_branch(test);
                 let preserve_sync_with_direct_return_chain_owner =
                     self.control.sync_with_direct_return_chain
                         || (!self.control.current_statement_has_following
@@ -3812,6 +3855,11 @@ impl Compiler<'_> {
                 }
                 if preserve_sync_with_terminating_call_owner {
                     // The removed branch edge leaves its manager owner on this marker.
+                    self.assembler.preserve_last_not_taken_exception_owner();
+                }
+                if preserve_sync_with_terminal_condition_owner {
+                    // A direct terminal condition in a synchronous-with body reuses the removed
+                    // branch edge's protected slot for its normalized fallthrough marker.
                     self.assembler.preserve_last_not_taken_exception_owner();
                 }
 
@@ -9475,6 +9523,7 @@ impl Compiler<'_> {
         let context = WithExitContext {
             location: self.source_location(item.context_expr.range()),
             is_async: false,
+            body_start_instruction: self.assembler.instruction_count(),
             exception_region_depth: self.control.active_exception_region_exclusions.len(),
             loop_depth: self.control.loops.len(),
             preserves_none_condition_owner: remaining.is_empty()
@@ -9707,6 +9756,7 @@ impl Compiler<'_> {
         let context = WithExitContext {
             location: self.source_location(item.context_expr.range()),
             is_async: true,
+            body_start_instruction: self.assembler.instruction_count(),
             exception_region_depth: self.control.active_exception_region_exclusions.len(),
             loop_depth: self.control.loops.len(),
             preserves_none_condition_owner: false,
@@ -11036,6 +11086,45 @@ pub(super) fn suite_contains_yield(body: &[Stmt]) -> bool {
         collector.visit_stmt(statement);
     }
     collector.found
+}
+
+fn expression_contains_inline_branch(expression: &Expr) -> bool {
+    #[derive(Default)]
+    struct InlineBranchDetector {
+        found: bool,
+    }
+
+    impl<'ast> Visitor<'ast> for InlineBranchDetector {
+        fn visit_expr(&mut self, expression: &'ast Expr) {
+            if self.found {
+                return;
+            }
+            if let Expr::Lambda(lambda) = expression {
+                if let Some(parameters) = &lambda.parameters {
+                    self.visit_parameters(parameters);
+                }
+                return;
+            }
+            if matches!(
+                expression,
+                Expr::BoolOp(_)
+                    | Expr::If(_)
+                    | Expr::ListComp(_)
+                    | Expr::SetComp(_)
+                    | Expr::DictComp(_)
+                    | Expr::Generator(_)
+            ) || matches!(expression, Expr::Compare(comparison) if comparison.ops.len() > 1)
+            {
+                self.found = true;
+                return;
+            }
+            walk_expr(self, expression);
+        }
+    }
+
+    let mut detector = InlineBranchDetector::default();
+    detector.visit_expr(expression);
+    detector.found
 }
 
 // CPython's cold-block ordering disconnects the normal outer exit when a nested try/except
