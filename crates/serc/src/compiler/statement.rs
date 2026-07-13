@@ -325,6 +325,8 @@ pub(super) struct ControlFlowState {
     branch_join_successor: Option<TextRange>,
     // Whether the current statement is nested directly in a terminal if branch suite.
     pub(super) in_terminal_if_branch_suite: bool,
+    // Whether a final assertion may split its successful terminal-branch returns.
+    split_terminal_assert_success: bool,
     // A terminal-if expression statement whose call suffix must remain shared across an ifexp.
     pub(super) terminal_if_call_expression: bool,
     copied_nested_handler_join_successor: bool,
@@ -1058,7 +1060,7 @@ impl Compiler<'_> {
                         continue;
                     }
                     Stmt::Assert(statement)
-                        if self.control.in_terminal_if_branch_suite
+                        if self.control.split_terminal_assert_success
                             && terminal_assert_splits_success_return(statement) =>
                     {
                         self.compile_terminal_split_assert(statement)?;
@@ -1774,9 +1776,15 @@ impl Compiler<'_> {
                     |control| &mut control.in_terminal_if_branch_suite,
                     true,
                     |compiler| {
-                        compiler.with_fallthrough_tracking(|compiler| {
-                            compiler.compile_suite_inner(body, true)
-                        })
+                        compiler.with_control_override(
+                            |control| &mut control.split_terminal_assert_success,
+                            true,
+                            |compiler| {
+                                compiler.with_fallthrough_tracking(|compiler| {
+                                    compiler.compile_suite_inner(body, true)
+                                })
+                            },
+                        )
                     },
                 )?;
                 if !suite_terminates(body) && !emitted_fallthrough {
@@ -1816,9 +1824,15 @@ impl Compiler<'_> {
                 let ((), emitted_fallthrough) = self.compile_with_strict_owned_loads(
                     suite_is_constant_false_assertion(body),
                     |compiler| {
-                        compiler.with_fallthrough_tracking(|compiler| {
-                            compiler.compile_suite_inner(body, true)
-                        })
+                        compiler.with_control_override(
+                            |control| &mut control.split_terminal_assert_success,
+                            true,
+                            |compiler| {
+                                compiler.with_fallthrough_tracking(|compiler| {
+                                    compiler.compile_suite_inner(body, true)
+                                })
+                            },
+                        )
                     },
                 )?;
                 if !suite_terminates(body) && !emitted_fallthrough {
@@ -5968,16 +5982,15 @@ impl Compiler<'_> {
         self.assembler.mark(end);
         self.set_depth(base_depth);
         if let Some(split_success) = split_success {
-            let Expr::BoolOp(boolean) = statement.test.as_ref() else {
-                unreachable!("split assertion requires a boolean test");
-            };
+            let [first_success, second_success] = terminal_assert_split_success_ranges(statement)
+                .expect("split assertion requires two supported success edges");
             self.assembler
-                .set_location(self.source_location(boolean.values[1].range()));
+                .set_location(self.source_location(second_success));
             self.emit_deferred_implicit_return()?;
             self.assembler.mark(split_success);
             self.set_depth(base_depth);
             self.assembler
-                .set_location(self.source_location(boolean.values[0].range()));
+                .set_location(self.source_location(first_success));
             self.emit_deferred_implicit_return()?;
         }
         Ok(())
@@ -11062,11 +11075,33 @@ fn suite_assert_success_fallthrough_range(body: &[Stmt]) -> Option<TextRange> {
     unique_condition_jump_target(&statement.test, true).map(Ranged::range)
 }
 
+// CPython gives each authored success edge of a terminal two-term `or` its own implicit-return
+// block, whose instructions inherit that operand's location.
 fn terminal_assert_splits_success_return(statement: &ruff_python_ast::StmtAssert) -> bool {
-    matches!(statement.test.as_ref(), Expr::BoolOp(boolean)
-        if boolean.op == BoolOp::Or
-            && boolean.values.len() == 2
-            && condition_jump_target_count(&statement.test, true) == 2)
+    terminal_assert_split_success_ranges(statement).is_some()
+}
+
+fn terminal_assert_split_success_ranges(
+    statement: &ruff_python_ast::StmtAssert,
+) -> Option<[TextRange; 2]> {
+    let Expr::BoolOp(boolean) = statement.test.as_ref() else {
+        return None;
+    };
+    let [first, second] = boolean.values.as_slice() else {
+        return None;
+    };
+    if boolean.op != BoolOp::Or {
+        return None;
+    }
+    let success_range = |operand: &Expr| {
+        let target = unique_condition_jump_target(operand, true)?;
+        let supported_nested_and = matches!(operand, Expr::BoolOp(nested)
+            if nested.op == BoolOp::And
+                && nested.values.iter().all(|value| jump_constant_truthiness(value).is_none())
+                && nested.values.last().is_some_and(|last| last.range() == target.range()));
+        (target.range() == operand.range() || supported_nested_and).then(|| target.range())
+    };
+    Some([success_range(first)?, success_range(second)?])
 }
 
 fn terminating_if_fallthrough_test(statement: &ruff_python_ast::StmtIf) -> Option<&Expr> {
@@ -11595,8 +11630,22 @@ fn try_has_conditional_shared_loop_exit(statement: &Stmt) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{IteratorCleanup, break_jump_needs_exception_region_exclusion};
+    use super::{
+        IteratorCleanup, break_jump_needs_exception_region_exclusion,
+        terminal_assert_splits_success_return,
+    };
     use crate::target::code_flags::{CO_ASYNC_GENERATOR, CO_COROUTINE, CO_GENERATOR};
+    use ruff_python_ast::Stmt;
+    use ruff_python_parser::parse_module;
+
+    fn terminal_assert_splits(expression: &str) -> bool {
+        let parsed = parse_module(&format!("assert {expression}"))
+            .expect("assertion expression should parse");
+        let [Stmt::Assert(statement)] = parsed.suite().as_slice() else {
+            panic!("expected one assertion");
+        };
+        terminal_assert_splits_success_return(statement)
+    }
 
     #[test]
     fn finally_iterator_break_exclusion_is_synchronous_generator_only() {
@@ -11622,5 +11671,31 @@ mod tests {
             IteratorCleanup::None,
             CO_GENERATOR,
         ));
+    }
+
+    #[test]
+    fn terminal_assert_split_requires_one_authored_success_edge_per_operand() {
+        for expression in [
+            "left or right",
+            "check(left) or check(right)",
+            "(value := left) or right",
+            "(left < middle < right) or other",
+            "True or right",
+            "left or True",
+            "(left and middle) or right",
+            "(left() and middle()) or right()",
+            "left == expected or (kwargs == expected_kwargs and length == expected_length)",
+        ] {
+            assert!(terminal_assert_splits(expression), "{expression}");
+        }
+        for expression in [
+            "(left or middle) or False",
+            "False or (left or right)",
+            "(left and True) or right",
+            "(not left) or right",
+            "(left if choose else False) or right",
+        ] {
+            assert!(!terminal_assert_splits(expression), "{expression}");
+        }
     }
 }
