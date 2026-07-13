@@ -8897,7 +8897,23 @@ impl Compiler<'_> {
                 )?;
             }
             if !suite_terminates(&statement.finalbody) {
-                if let Some(range) = suite_unary_not_fallthrough_range(&statement.finalbody) {
+                let exceptional_finally_has_split_fallthrough = matches!(
+                    statement.finalbody.as_slice(),
+                    [Stmt::If(final_if)]
+                        if matches!(
+                            final_if.elif_else_clauses.as_slice(),
+                            [clause]
+                                if clause.test.is_none()
+                                    && !suite_terminates(&final_if.body)
+                                    && !suite_terminates(&clause.body)
+                        )
+                );
+                if exceptional_finally_has_split_fallthrough {
+                    // CPython leaves the shared exceptional exit unlocated so CFG predecessor
+                    // propagation assigns the owning arm and can remove pass-only exits.
+                    self.assembler.set_location(SourceLocation::NONE);
+                } else if let Some(range) = suite_unary_not_fallthrough_range(&statement.finalbody)
+                {
                     self.assembler.set_location(self.source_location(range));
                 } else if let Some(statement) = statement
                     .finalbody
