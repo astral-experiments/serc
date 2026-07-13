@@ -1322,7 +1322,8 @@ impl Compiler<'_> {
                 child
                     .assembler
                     .set_location(child.source_location(annotation.range()));
-                child.load_string_constant(&unparse_annotation(annotation))?;
+                child
+                    .load_string_constant(&unparse_annotation(annotation, child.context.source))?;
             } else if let Expr::Starred(starred) = annotation {
                 child.compile_expression(&starred.value)?;
                 child.assembler.set_location(location);

@@ -1,6 +1,9 @@
 use ruff_python_ast::token::{TokenKind, Tokens};
+use ruff_python_ast::visitor::transformer::{Transformer, walk_expr as transform_expr};
+use ruff_python_ast::visitor::{Visitor, walk_expr};
 use ruff_python_ast::{
-    Expr, ExprContext, FStringPart, InterpolatedStringElement, Operator, Stmt, Suite,
+    Expr, ExprContext, FStringPart, InterpolatedStringElement, Operator, Stmt, StringLiteralFlags,
+    StringLiteralValue, Suite,
 };
 use ruff_python_codegen::{Generator, Indentation, Mode as CodegenMode};
 use ruff_source_file::{LineEnding, LineIndex};
@@ -609,14 +612,77 @@ fn last_discarded_annotation_slice_range(expression: &Expr) -> ruff_text_size::T
         _ => expression.range(),
     }
 }
-pub(super) fn unparse_annotation(expression: &Expr) -> String {
-    if let Expr::StringLiteral(string) = expression {
-        return python_string_repr(string.value.to_str());
+pub(super) fn unparse_annotation(expression: &Expr, source: &str) -> String {
+    struct AnnotationStringDetector(bool);
+
+    impl<'ast> Visitor<'ast> for AnnotationStringDetector {
+        fn visit_expr(&mut self, expression: &'ast Expr) {
+            if self.0 {
+                return;
+            }
+            if matches!(expression, Expr::StringLiteral(_)) {
+                self.0 = true;
+            } else {
+                walk_expr(self, expression);
+            }
+        }
     }
+
+    struct AnnotationStringNormalizer<'source> {
+        source: &'source str,
+    }
+
+    impl Transformer for AnnotationStringNormalizer<'_> {
+        fn visit_expr(&self, expression: &mut Expr) {
+            if let Expr::StringLiteral(string) = expression {
+                let mut literal = string
+                    .value
+                    .iter()
+                    .next()
+                    .expect("string literals contain at least one part")
+                    .clone();
+                literal.value = string.value.to_str().into();
+                literal.flags = if string.value.is_unicode()
+                    && self
+                        .source
+                        .as_bytes()
+                        .get(usize::from(literal.range.start()))
+                        == Some(&b'u')
+                {
+                    StringLiteralFlags::empty().with_prefix(literal.flags.prefix())
+                } else {
+                    StringLiteralFlags::empty()
+                };
+                string.value = StringLiteralValue::single(literal);
+            } else {
+                transform_expr(self, expression);
+            }
+        }
+    }
+
+    if let Expr::StringLiteral(string) = expression {
+        let mut annotation = python_string_repr(string.value.to_str());
+        if string.value.is_unicode()
+            && string.value.iter().next().is_some_and(|literal| {
+                source.as_bytes().get(usize::from(literal.range.start())) == Some(&b'u')
+            })
+        {
+            annotation.insert(0, 'u');
+        }
+        return annotation;
+    }
+
+    let mut detector = AnnotationStringDetector(false);
+    detector.visit_expr(expression);
+    let normalized = detector.0.then(|| {
+        let mut expression = expression.clone();
+        AnnotationStringNormalizer { source }.visit_expr(&mut expression);
+        expression
+    });
     let indentation = Indentation::default();
     let mut annotation = Generator::new(&indentation, LineEnding::Lf)
         .with_mode(CodegenMode::AstUnparse)
-        .expr(expression);
+        .expr(normalized.as_ref().unwrap_or(expression));
     let parsed = ruff_python_parser::parse_unchecked(
         &annotation,
         ruff_python_parser::ParseOptions::from(ruff_python_parser::Mode::ParenthesizedExpression),
