@@ -2857,7 +2857,10 @@ impl Compiler<'_> {
             |control| &mut control.in_unfiltered_comprehension,
             generators.iter().all(|generator| generator.ifs.is_empty()),
             |compiler| {
-                compiler.with_comprehension_context(
+                let suppressed = std::mem::take(
+                    &mut compiler.control.suppress_filtered_comprehension_none_owner,
+                );
+                let result = compiler.with_comprehension_context(
                     (cleanup, cleanup_depth),
                     local_names,
                     |compiler| {
@@ -2874,7 +2877,9 @@ impl Compiler<'_> {
                             },
                         )
                     },
-                )
+                );
+                compiler.control.suppress_filtered_comprehension_none_owner = suppressed;
+                result
             },
         );
         self.symbols.imported_scope_names.extend(removed_imports);
@@ -3558,11 +3563,27 @@ impl Compiler<'_> {
         restart: Label,
         include_comprehension_cleanup: bool,
     ) -> Result<(), CompileError> {
-        self.with_control_override(
-            |control| &mut control.generator_filter_expression,
-            true,
-            |compiler| compiler.compile_expression(operand),
-        )?;
+        if !self.control.suppress_filtered_comprehension_none_owner
+            && comprehension_filter_has_root_if_expression(operand)
+        {
+            self.with_control_override(
+                |control| &mut control.suppress_filtered_comprehension_none_owner,
+                true,
+                |compiler| {
+                    compiler.with_control_override(
+                        |control| &mut control.generator_filter_expression,
+                        true,
+                        |compiler| compiler.compile_expression(operand),
+                    )
+                },
+            )?;
+        } else {
+            self.with_control_override(
+                |control| &mut control.generator_filter_expression,
+                true,
+                |compiler| compiler.compile_expression(operand),
+            )?;
+        }
         self.assembler
             .set_location(self.source_location(operand.range()));
         self.emit(TO_BOOL, 0, 0)?;
@@ -3787,7 +3808,17 @@ impl Compiler<'_> {
             }
             return Ok(());
         }
-        self.compile_expression(condition)?;
+        if !self.control.suppress_filtered_comprehension_none_owner
+            && comprehension_filter_has_root_if_expression(condition)
+        {
+            self.with_control_override(
+                |control| &mut control.suppress_filtered_comprehension_none_owner,
+                true,
+                |compiler| compiler.compile_expression(condition),
+            )?;
+        } else {
+            self.compile_expression(condition)?;
+        }
         self.assembler
             .set_location(self.source_location(condition.range()));
         self.emit(TO_BOOL, 0, 0)?;
@@ -4607,7 +4638,11 @@ impl Compiler<'_> {
                 && matches!(expression.test.as_ref(), Expr::Name(_)));
         let preserve_none_condition_owner = (self.control.in_synchronous_with()
             || (self.control.active_exception_region_exclusions.is_empty()
-                && self.control.in_unfiltered_comprehension))
+                && !self
+                    .control
+                    .active_comprehension_region_exclusions
+                    .is_empty()
+                && !self.control.suppress_filtered_comprehension_none_owner))
             && matches!(expression.test.as_ref(), Expr::Compare(comparison)
                 if comparison.ops.len() == 1
                     && matches!(comparison.ops[0], CmpOp::Is | CmpOp::IsNot)
@@ -4622,6 +4657,13 @@ impl Compiler<'_> {
                         && matches!(unary.operand.as_ref(), Expr::Name(_)))
                 && matches!(expression.body.as_ref(), Expr::Name(_))
                 && matches!(expression.orelse.as_ref(), Expr::BinOp(_));
+        let enter_filtered_comprehension_conditional =
+            !self.control.suppress_filtered_comprehension_none_owner
+                && !self.control.in_unfiltered_comprehension
+                && !self
+                    .control
+                    .active_comprehension_region_exclusions
+                    .is_empty();
         self.with_control_override(
             |control| &mut control.exclude_condition_not_taken_from_exception,
             exclude_try_marker,
@@ -4630,7 +4672,15 @@ impl Compiler<'_> {
         if preserve_none_condition_owner || preserve_generator_loop_condition_owner {
             self.assembler.override_last_not_taken_exception_owner();
         }
-        self.compile_expression(&expression.body)?;
+        if enter_filtered_comprehension_conditional {
+            self.with_control_override(
+                |control| &mut control.suppress_filtered_comprehension_none_owner,
+                true,
+                |compiler| compiler.compile_expression(&expression.body),
+            )?;
+        } else {
+            self.compile_expression(&expression.body)?;
+        }
         // CPython emits the conditional-expression join without a location. Its later
         // propagation pass inherits the body location only when the join remains in the same
         // basic block; short-circuit bodies can leave it deliberately unlocated.
@@ -4656,7 +4706,15 @@ impl Compiler<'_> {
         }
         self.assembler.mark(else_label);
         self.set_depth(base_depth);
-        self.compile_expression(&expression.orelse)?;
+        if enter_filtered_comprehension_conditional {
+            self.with_control_override(
+                |control| &mut control.suppress_filtered_comprehension_none_owner,
+                true,
+                |compiler| compiler.compile_expression(&expression.orelse),
+            )?;
+        } else {
+            self.compile_expression(&expression.orelse)?;
+        }
         self.assembler.preserve_block_boundary(end);
         self.assembler.mark(end);
         self.set_depth(base_depth + 1);
@@ -5723,6 +5781,20 @@ fn expression_contains_yield(expression: &Expr) -> bool {
     let mut collector = Collector::default();
     collector.visit_expr(expression);
     collector.found
+}
+
+fn comprehension_filter_has_root_if_expression(expression: &Expr) -> bool {
+    match expression {
+        Expr::If(_) => true,
+        Expr::UnaryOp(unary) if unary.op == UnaryOp::Not => {
+            comprehension_filter_has_root_if_expression(&unary.operand)
+        }
+        Expr::BoolOp(boolean) => boolean
+            .values
+            .iter()
+            .any(comprehension_filter_has_root_if_expression),
+        _ => false,
+    }
 }
 
 fn expression_contains_inlined_comprehension(expression: &Expr) -> bool {
