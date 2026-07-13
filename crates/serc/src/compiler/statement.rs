@@ -273,9 +273,12 @@ pub(super) struct ControlFlowState {
     // A leading `not` around a two-operand Boolean condition routes the synchronous-with
     // terminal marker exclusion to the inner condition's final operand.
     pub(super) defer_terminal_with_exclusion_through_negation: bool,
-    // The first single-line two-operand condition of a protected iterator-loop continue.
-    // CPython keeps its leading marker in the synchronous-with owner.
+    // The protected iterator Boolean condition whose first short-circuit marker reuses the
+    // surrounding owner. Synchronous-with continues and first generator conditions use this.
     pub(super) protected_iterator_continue_condition: Option<ruff_text_size::TextRange>,
+    // The direct nested condition that begins a suspending iterator loop's final `elif` body.
+    // CPython excludes its normalized marker when the body has a real fallthrough path.
+    loop_tail_final_elif_nested_condition: Option<TextRange>,
     pub(super) exclude_condition_not_taken_from_exception: bool,
     pub(super) include_assert_none_condition_owner: bool,
     pub(super) include_scoped_none_condition_owner: bool,
@@ -3643,26 +3646,54 @@ impl Compiler<'_> {
                     && self.control.in_iterator_loop()
                     && self.control.in_first_unnamed_exception_handler();
                 let protected_iterator_continue_condition = (branch_index == 0
-                    && matches!(body, [Stmt::Continue(_)])
-                    && self.control.in_iterator_loop()
-                    && !self.control.active_with_region_exclusions.is_empty()
-                    && self
-                        .control
-                        .active_with_exits
-                        .last()
-                        .is_some_and(|context| {
-                            !context.is_async && context.location.line == context.location.end_line
-                        })
-                    && {
-                        let location = self.source_location(test.range());
-                        location.line == location.end_line
-                    }
-                    && matches!(test, Expr::BoolOp(boolean) if boolean.values.len() == 2)
-                    && self.control.loops.last().is_some_and(|context| {
-                        !self
-                            .assembler
-                            .contains_opcode_since(NOT_TAKEN, context.body_start)
-                    }))
+                    && matches!(test, Expr::BoolOp(_))
+                    && ((matches!(body, [Stmt::Continue(_)])
+                        && self.control.in_iterator_loop()
+                        && !self.control.active_with_region_exclusions.is_empty()
+                        && self
+                            .control
+                            .active_with_exits
+                            .last()
+                            .is_some_and(|context| {
+                                !context.is_async
+                                    && context.location.line == context.location.end_line
+                            })
+                        && {
+                            let location = self.source_location(test.range());
+                            location.line == location.end_line
+                        }
+                        && matches!(test, Expr::BoolOp(boolean) if boolean.values.len() == 2)
+                        && self.control.loops.last().is_some_and(|context| {
+                            !self
+                                .assembler
+                                .contains_opcode_since(NOT_TAKEN, context.body_start)
+                        }))
+                        || (!self.context.has_lazy_imports
+                            && self.unit.flags
+                                & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                                != 0
+                            && self.control.loops.len() == 1
+                            // Nested short-circuit operands emit their own markers, and a
+                            // leading assignment expression can merge with later inline owners.
+                            && matches!(test, Expr::BoolOp(boolean)
+                                if boolean.values.first().is_some_and(|first| {
+                                    !matches!(first, Expr::Named(_))
+                                        && !expression_contains_inline_branch(first)
+                                }))
+                            && !expression_suspends_current_scope(test)
+                            && !expression_contains_generator(test)
+                            && self.control.loops.last().is_some_and(|context| {
+                                context.iterator_cleanup == IteratorCleanup::Sync
+                                    && self.assembler.instruction_count() == context.body_start
+                                    && context.with_depth == self.control.active_with_exits.len()
+                                    && context.finally_end_depth
+                                        == self.control.active_finally_end_blocks
+                                    && context.exception_region_depth
+                                        == self
+                                            .control
+                                            .active_exception_region_exclusions
+                                            .len()
+                            }))))
                 .then(|| test.range());
                 let retain_folded_test_in_protected_region = branch_index == 0
                     && early_condition_truthiness(test) == Some(true)
@@ -3815,6 +3846,8 @@ impl Compiler<'_> {
                                             include_scoped_none_condition_owner,
                                             |compiler| {
                                                 let exclude_condition = compiler.control.exclude_condition_not_taken_from_exception
+                                                    || compiler.control.loop_tail_final_elif_nested_condition
+                                                        == Some(test.range())
                                                     || exclude_later_handler_leading_marker
                                                     || exclude_direct_try_while_return_marker
                                                     || exclude_direct_post_try_coroutine_walrus_and;
@@ -4950,10 +4983,39 @@ impl Compiler<'_> {
                 self.assembler.mark(body_label);
                 self.set_depth(base_depth);
                 let body_start = self.assembler.instruction_count();
-                let nested_tail = self
-                    .compile_with_strict_owned_loads(matches!(test, Expr::If(_)), |compiler| {
-                        compiler.compile_loop_tail_suite(body, restart, split_short_circuit)
-                    })?;
+                let final_elif_nested_condition =
+                    (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) != 0
+                        && self.control.loops.last().is_some_and(|context| {
+                            context.iterator_cleanup == IteratorCleanup::Sync
+                        })
+                        && matches!(body.split_first(), Some((Stmt::If(nested), following))
+                        if (matches!(nested.test.as_ref(), Expr::Name(_))
+                            || matches!(nested.test.as_ref(), Expr::UnaryOp(unary)
+                                if unary.op == UnaryOp::Not
+                                    && matches!(unary.operand.as_ref(), Expr::Name(_))))
+                            && !nested.body.iter().any(|statement| matches!(statement, Stmt::If(_)))
+                            && (!following.is_empty()
+                                || nested.elif_else_clauses.last().is_some_and(|clause| {
+                                    clause.test.is_none() && !clause.body.is_empty()
+                                }))))
+                    .then(|| {
+                        let Stmt::If(nested) = &body[0] else {
+                            unreachable!("final-elif nested condition was checked above")
+                        };
+                        nested.test.range()
+                    });
+                let nested_tail = self.compile_with_strict_owned_loads(
+                    matches!(test, Expr::If(_)),
+                    |compiler| {
+                        compiler.with_control_override(
+                            |control| &mut control.loop_tail_final_elif_nested_condition,
+                            final_elif_nested_condition,
+                            |compiler| {
+                                compiler.compile_loop_tail_suite(body, restart, split_short_circuit)
+                            },
+                        )
+                    },
+                )?;
                 if nested_tail == LoopBackedge::Required && !suite_terminates(body) {
                     self.set_branch_end_location(body, body_start);
                     self.emit_jump_backward(JUMP_BACKWARD, restart, 0)?;
@@ -4988,6 +5050,7 @@ impl Compiler<'_> {
                 let protected_nested_branch = try_body_normal_exit && non_final_branch;
                 let exclude_from_control_flow_regions = has_outer_exception_region
                     || protected_nested_branch
+                    || self.control.loop_tail_final_elif_nested_condition == Some(test.range())
                     || (!try_body_normal_exit
                         && (!self.control.active_exception_region_exclusions.is_empty()
                             || self
@@ -4996,6 +5059,33 @@ impl Compiler<'_> {
                 let exclude_from_all_exception_regions = has_outer_exception_region
                     || (!try_body_normal_exit
                         && !self.control.active_exception_region_exclusions.is_empty());
+                let preserve_first_yielding_iterator_boolean_owner = branch_index == 0
+                    && !statement.elif_else_clauses.is_empty()
+                    && leading.is_empty()
+                    && !try_body_normal_exit
+                    && !non_final_branch
+                    && !self.context.has_lazy_imports
+                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) != 0
+                    && self.control.active_exception_region_exclusions.is_empty()
+                    && self.control.active_with_region_exclusions.is_empty()
+                    && self.control.loops.len() == 1
+                    && matches!(body.last(), Some(Stmt::Expr(expression))
+                        if matches!(expression.value.as_ref(), Expr::Yield(_) | Expr::YieldFrom(_) | Expr::Await(_)))
+                    && matches!(test, Expr::BoolOp(boolean)
+                    if boolean.values.first().is_some_and(|first| {
+                        !matches!(first, Expr::Named(_))
+                            && !expression_contains_inline_branch(first)
+                    }))
+                    && !expression_suspends_current_scope(test)
+                    && !expression_contains_generator(test)
+                    && self.control.loops.last().is_some_and(|context| {
+                        context.iterator_cleanup == IteratorCleanup::Sync
+                            && self.assembler.instruction_count() == context.body_start
+                            && context.with_depth == self.control.active_with_exits.len()
+                            && context.finally_end_depth == self.control.active_finally_end_blocks
+                            && context.exception_region_depth
+                                == self.control.active_exception_region_exclusions.len()
+                    });
                 self.with_control_override(
                     |control| &mut control.exclude_condition_not_taken_from_exception,
                     exclude_from_control_flow_regions,
@@ -5005,7 +5095,14 @@ impl Compiler<'_> {
                                 &mut control.exclude_condition_not_taken_from_all_exception_regions
                             },
                             exclude_from_all_exception_regions,
-                            |compiler| compiler.compile_jump_if(test, false, next),
+                            |compiler| {
+                                compiler.with_control_override(
+                                    |control| &mut control.protected_iterator_continue_condition,
+                                    preserve_first_yielding_iterator_boolean_owner
+                                        .then(|| test.range()),
+                                    |compiler| compiler.compile_jump_if(test, false, next),
+                                )
+                            },
                         )
                     },
                 )?;
