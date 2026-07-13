@@ -223,6 +223,8 @@ pub(super) struct ControlFlowState {
     pub(super) active_comprehension_region_exclusions: Vec<Vec<(Label, Label)>>,
     // Authored filters can leave their first conditional marker before an exclusion is recorded.
     pub(super) in_unfiltered_comprehension: bool,
+    // A conditional used as filtered truthiness, or nested in its arms, cannot reuse that owner.
+    pub(super) suppress_filtered_comprehension_none_owner: bool,
     active_with_exits: Vec<WithExitContext>,
     pub(super) active_with_suspension_epochs: Vec<usize>,
     pub(super) active_with_region_exclusions: Vec<Vec<(Label, Label)>>,
