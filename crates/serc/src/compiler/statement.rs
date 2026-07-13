@@ -3517,6 +3517,20 @@ impl Compiler<'_> {
                                 context.body_start_instruction,
                             )
                         })
+                    && (self
+                        .control
+                        .active_with_exits
+                        .last()
+                        .is_some_and(|context| {
+                            !self.assembler.contains_opcode_since(
+                                PUSH_EXC_INFO,
+                                context.body_start_instruction,
+                            )
+                        })
+                        || matches!(test, Expr::Compare(comparison)
+                            if comparison.ops.len() == 1
+                                && matches!(comparison.ops[0], CmpOp::Is | CmpOp::IsNot)
+                                && matches!(comparison.comparators[0], Expr::NoneLiteral(_))))
                     && (!self.assembler.contains_opcode(NOT_TAKEN)
                         || matches!(test, Expr::Compare(comparison)
                             if comparison.ops.len() == 1

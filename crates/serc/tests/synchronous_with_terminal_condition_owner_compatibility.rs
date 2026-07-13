@@ -234,6 +234,83 @@ def leading_consumed_dict_comprehension_return(manager, condition, items):
     return None
 
 
+def leading_finally_name_return(manager, condition, value):
+    with manager:
+        try:
+            prepare(value)
+        finally:
+            cleanup(value)
+        if condition:
+            return value
+    return None
+
+
+def leading_finally_not_attribute_raise(manager, value):
+    with manager:
+        try:
+            prepare(value)
+        finally:
+            cleanup(value)
+        if not value.ready:
+            raise RuntimeError(value)
+    return None
+
+
+def leading_finally_named_non_call_return(manager, condition, value):
+    with manager:
+        try:
+            prepare(value)
+        finally:
+            cleanup(value)
+        if result := condition:
+            return result
+    return None
+
+
+def outside_finally_name_return(manager, condition, value):
+    try:
+        prepare(value)
+    finally:
+        cleanup(value)
+    with manager:
+        if condition:
+            return value
+    return None
+
+
+def leading_finally_call_return(manager, value):
+    with manager:
+        try:
+            prepare(value)
+        finally:
+            cleanup(value)
+        if value.check():
+            return value
+    return None
+
+
+def leading_finally_named_call_return(manager, value):
+    with manager:
+        try:
+            prepare(value)
+        finally:
+            cleanup(value)
+        if result := value.check():
+            return result
+    return None
+
+
+def leading_finally_none_return(manager, condition, value):
+    with manager:
+        try:
+            prepare(value)
+        finally:
+            cleanup(value)
+        if condition is None:
+            return value
+    return None
+
+
 def nested_call_chained_comparison_return(manager, value, first, second, third):
     with manager:
         if value.check(first < second < third):
