@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use ruff_python_ast::visitor::{Visitor, walk_expr, walk_pattern, walk_stmt};
-use ruff_python_ast::{Expr, Pattern, Stmt};
+use ruff_python_ast::{Expr, ExprContext, Pattern, Stmt};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{
@@ -816,6 +816,8 @@ impl Compiler<'_> {
 
             fn visit_expr(&mut self, expression: &'ast Expr) {
                 match expression {
+                    Expr::Name(name)
+                        if name.ctx == ExprContext::Load && name.id.as_str() == "__debug__" => {}
                     Expr::Name(name) => self.names.push((name.id.as_str().to_string(), false)),
                     Expr::Attribute(attribute) => {
                         self.visit_expr(&attribute.value);

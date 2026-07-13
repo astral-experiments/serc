@@ -1363,7 +1363,13 @@ impl Compiler<'_> {
                         .all(|keyword| is_unreachable_call_kw_leaf(&keyword.value))
                 {
                     let shape = self.call_shape(call);
-                    if shape.direct_method.is_none()
+                    if std::iter::once(call.func.as_ref())
+                        .chain(call.arguments.args.iter())
+                        .chain(call.arguments.keywords.iter().map(|keyword| &keyword.value))
+                        .any(is_unreachable_call_kw_debug_leaf)
+                    {
+                        self.add_constant(Constant::Bool(true))?;
+                    } else if shape.direct_method.is_none()
                         && shape.keyword_count > 0
                         && !shape.has_starred
                         && !shape.has_keyword_unpack
@@ -11033,6 +11039,14 @@ fn is_unreachable_call_kw_leaf(expression: &Expr) -> bool {
     match expression {
         Expr::Name(_) => true,
         Expr::Attribute(attribute) => is_unreachable_call_kw_leaf(&attribute.value),
+        _ => false,
+    }
+}
+
+fn is_unreachable_call_kw_debug_leaf(expression: &Expr) -> bool {
+    match expression {
+        Expr::Name(name) => name.id.as_str() == "__debug__",
+        Expr::Attribute(attribute) => is_unreachable_call_kw_debug_leaf(&attribute.value),
         _ => false,
     }
 }

@@ -38,6 +38,33 @@ async def coroutine(call, value):
     call(value=value)
 
 
+def debug_leaf_control(call):
+    raise NotImplementedError
+    call(value=__debug__)
+
+
+def debug_attribute_leaf_control(call):
+    raise NotImplementedError
+    call(value=__debug__.attribute)
+
+
+def debug_receiver(value):
+    raise NotImplementedError
+    __debug__.call(value=value)
+
+
+def debug_literal_first_control(call):
+    raise NotImplementedError
+    call(1, __debug__)
+
+
+def debug_name_kind_order(value):
+    raise NotImplementedError
+    __debug__
+    middle
+    value.__debug__
+
+
 def earlier_literal(call, value):
     raise RuntimeError("earlier")
     call(value=value)
