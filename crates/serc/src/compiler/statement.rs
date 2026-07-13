@@ -8828,22 +8828,29 @@ impl Compiler<'_> {
             }
             Ok(())
         })?;
-        if self.control.generator_region_start.is_some()
-            && !statement.handlers.is_empty()
-            && (self
-                .assembler
-                .instruction_opcode_at(normal_finally_pop_block + 1)
-                == Some(LOAD_GLOBAL)
-                || (self.unit.flags & CO_COROUTINE != 0
-                    && statement.orelse.is_empty()
-                    && matches!(statement.body.last(), Some(Stmt::Expr(_) | Stmt::Assign(_)))
-                    && matches!(
-                        statement.finalbody.as_slice(),
-                        [Stmt::Expr(_) | Stmt::Assign(_)]
-                    )))
+        if (statement.handlers.is_empty()
+            && statement.orelse.is_empty()
+            && !self.control.active_with_region_exclusions.is_empty()
+            && self.control.active_exception_region_exclusions.is_empty()
+            && self.control.active_exception_handlers.is_empty()
+            && self.control.active_normal_finally_bodies == 0
+            && matches!(statement.body.last(), Some(Stmt::Assert(_))))
+            || (self.control.generator_region_start.is_some()
+                && !statement.handlers.is_empty()
+                && (self
+                    .assembler
+                    .instruction_opcode_at(normal_finally_pop_block + 1)
+                    == Some(LOAD_GLOBAL)
+                    || (self.unit.flags & CO_COROUTINE != 0
+                        && statement.orelse.is_empty()
+                        && matches!(statement.body.last(), Some(Stmt::Expr(_) | Stmt::Assign(_)))
+                        && matches!(
+                            statement.finalbody.as_slice(),
+                            [Stmt::Expr(_) | Stmt::Assign(_)]
+                        ))))
         {
             // CPython moves this converted POP_BLOCK into a fresh normal-finally block. The NOP
-            // loses the generator stop handler unless normalization reuses a stale owned slot.
+            // loses its surrounding dynamic owner unless normalization reuses a stale owned slot.
             self.assembler
                 .exclude_normalized_exception_owner_at(normal_finally_pop_block);
         }
