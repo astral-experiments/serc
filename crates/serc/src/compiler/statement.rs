@@ -1350,7 +1350,8 @@ impl Compiler<'_> {
                     self.add_constant(constant)?;
                 }
                 // A simple keyword call interns its names tuple after visiting all arguments;
-                // name/attribute-only operands ensure that tuple is the first unreachable constant.
+                // name/attribute-only operands retain either folded `__debug__` or that tuple first.
+                let mut skip_unreachable_debug_name = false;
                 if self.output.constants.is_empty()
                     && let [Stmt::Expr(expression)] = unreachable
                     && let Expr::Call(call) = expression.value.as_ref()
@@ -1363,7 +1364,18 @@ impl Compiler<'_> {
                         .all(|keyword| is_unreachable_call_kw_leaf(&keyword.value))
                 {
                     let shape = self.call_shape(call);
-                    if shape.direct_method.is_none()
+                    if !shape.has_starred
+                        && !shape.has_keyword_unpack
+                        && (shape.direct_method.is_some()
+                            || shape.positional_count + shape.keyword_count * 2 <= 30)
+                        && std::iter::once(call.func.as_ref())
+                            .chain(call.arguments.args.iter())
+                            .chain(call.arguments.keywords.iter().map(|keyword| &keyword.value))
+                            .any(is_unreachable_call_kw_debug_leaf)
+                    {
+                        self.add_constant(Constant::Bool(true))?;
+                        skip_unreachable_debug_name = true;
+                    } else if shape.direct_method.is_none()
                         && shape.keyword_count > 0
                         && !shape.has_starred
                         && !shape.has_keyword_unpack
@@ -1380,7 +1392,7 @@ impl Compiler<'_> {
                         self.add_interned_string_tuple(keyword_names)?;
                     }
                 }
-                self.pre_register_suite_names(unreachable)?;
+                self.pre_register_suite_names_filtered(unreachable, skip_unreachable_debug_name)?;
                 break;
             }
         }
@@ -11033,6 +11045,14 @@ fn is_unreachable_call_kw_leaf(expression: &Expr) -> bool {
     match expression {
         Expr::Name(_) => true,
         Expr::Attribute(attribute) => is_unreachable_call_kw_leaf(&attribute.value),
+        _ => false,
+    }
+}
+
+fn is_unreachable_call_kw_debug_leaf(expression: &Expr) -> bool {
+    match expression {
+        Expr::Name(name) => name.id.as_str() == "__debug__",
+        Expr::Attribute(attribute) => is_unreachable_call_kw_debug_leaf(&attribute.value),
         _ => false,
     }
 }

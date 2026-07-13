@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use ruff_python_ast::visitor::{Visitor, walk_expr, walk_pattern, walk_stmt};
-use ruff_python_ast::{Expr, Pattern, Stmt};
+use ruff_python_ast::{Expr, ExprContext, Pattern, Stmt};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::{
@@ -712,9 +712,18 @@ impl Compiler<'_> {
     }
 
     pub(super) fn pre_register_suite_names(&mut self, body: &[Stmt]) -> Result<(), CompileError> {
+        self.pre_register_suite_names_filtered(body, false)
+    }
+
+    pub(super) fn pre_register_suite_names_filtered(
+        &mut self,
+        body: &[Stmt],
+        skip_debug: bool,
+    ) -> Result<(), CompileError> {
         #[derive(Default)]
         struct Collector {
             names: Vec<(String, bool)>,
+            skip_debug: bool,
         }
 
         impl<'ast> Visitor<'ast> for Collector {
@@ -816,6 +825,10 @@ impl Compiler<'_> {
 
             fn visit_expr(&mut self, expression: &'ast Expr) {
                 match expression {
+                    Expr::Name(name)
+                        if self.skip_debug
+                            && name.ctx == ExprContext::Load
+                            && name.id.as_str() == "__debug__" => {}
                     Expr::Name(name) => self.names.push((name.id.as_str().to_string(), false)),
                     Expr::Attribute(attribute) => {
                         self.visit_expr(&attribute.value);
@@ -856,7 +869,10 @@ impl Compiler<'_> {
             }
         }
 
-        let mut collector = Collector::default();
+        let mut collector = Collector {
+            skip_debug,
+            ..Collector::default()
+        };
         for statement in body {
             collector.visit_stmt(statement);
         }
