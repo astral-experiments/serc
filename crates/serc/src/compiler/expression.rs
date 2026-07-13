@@ -4557,7 +4557,39 @@ impl Compiler<'_> {
         let base_depth = self.control.depth;
         let else_label = self.assembler.label();
         let end = self.assembler.label();
+        // CPython appends this repeated-attribute if-expression marker after
+        // compacting an ordinary try inside an iterator loop. A fresh marker slot
+        // is ownerless; a concrete protected fallthrough vacancy remains owned.
+        let exclude_plain_try_attribute_marker = self.control.generator_region_start.is_none()
+            && self.control.in_iterator_loop()
+            && !self.control.exceptional_finally_condition
+            && self
+                .control
+                .active_comprehension_region_exclusions
+                .is_empty()
+            && self.control.active_with_region_exclusions.is_empty()
+            && self.control.active_normal_finally_bodies == 0
+            && self.control.active_finally_end_blocks == 0
+            && self.control.active_exception_group_handlers == 0
+            && !self.control.same_line_try_body
+            && !self.control.current_exception_handler_binds_name()
+            && !self.control.in_exception_handler()
+            && self.control.active_exception_region_exclusions.len() == 1
+            && !self
+                .assembler
+                .fallthrough_has_concrete_dynamic_exception_owner()
+            && matches!(
+                (expression.test.as_ref(), expression.body.as_ref()),
+                (Expr::Attribute(test), Expr::Attribute(body))
+                    if test.attr.as_str() == body.attr.as_str()
+                        && matches!(
+                            (test.value.as_ref(), body.value.as_ref()),
+                            (Expr::Name(test), Expr::Name(body))
+                                if test.id.as_str() == body.id.as_str()
+                        )
+            );
         let exclude_try_marker = self.control.exclude_condition_not_taken_from_exception
+            || exclude_plain_try_attribute_marker
             || (self
                 .control
                 .current_try_handler_starts_with_optimized_boolean_generator()
