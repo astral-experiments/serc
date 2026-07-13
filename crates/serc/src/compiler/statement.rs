@@ -8799,10 +8799,17 @@ impl Compiler<'_> {
         })?;
         if self.control.generator_region_start.is_some()
             && !statement.handlers.is_empty()
-            && self
+            && (self
                 .assembler
                 .instruction_opcode_at(normal_finally_pop_block + 1)
                 == Some(LOAD_GLOBAL)
+                || (self.unit.flags & CO_COROUTINE != 0
+                    && statement.orelse.is_empty()
+                    && matches!(statement.body.last(), Some(Stmt::Expr(_) | Stmt::Assign(_)))
+                    && matches!(
+                        statement.finalbody.as_slice(),
+                        [Stmt::Expr(_) | Stmt::Assign(_)]
+                    )))
         {
             // CPython moves this converted POP_BLOCK into a fresh normal-finally block. The NOP
             // loses the generator stop handler unless normalization reuses a stale owned slot.
