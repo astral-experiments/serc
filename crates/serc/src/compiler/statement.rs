@@ -221,6 +221,8 @@ pub(super) struct ControlFlowState {
     pub(super) active_comprehension_cleanups: Vec<(Label, u32)>,
     pub(super) active_comprehension_local_names: Vec<NameSet>,
     pub(super) active_comprehension_region_exclusions: Vec<Vec<(Label, Label)>>,
+    // Authored filters can leave their first conditional marker before an exclusion is recorded.
+    pub(super) in_unfiltered_comprehension: bool,
     active_with_exits: Vec<WithExitContext>,
     pub(super) active_with_suspension_epochs: Vec<usize>,
     pub(super) active_with_region_exclusions: Vec<Vec<(Label, Label)>>,
