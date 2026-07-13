@@ -320,6 +320,8 @@ pub(super) struct ControlFlowState {
     // Whether that successor is another try statement. A loop break that targets this sibling
     // remains inside the current protected region instead of exiting through its normal edge.
     current_statement_followed_by_try: bool,
+    // Whether this statement directly follows a try in the same suite.
+    current_statement_preceded_by_try: bool,
     branch_join_successor: Option<TextRange>,
     // Whether the current statement is nested directly in a terminal if branch suite.
     pub(super) in_terminal_if_branch_suite: bool,
@@ -1164,6 +1166,11 @@ impl Compiler<'_> {
                     matches!(body.get(index + 1), Some(Stmt::Return(_) | Stmt::Raise(_)));
                 let followed_by_try = matches!(body.get(index + 1), Some(Stmt::Try(_)));
                 let previous_statement = body[..index].last();
+                let preceded_by_try = matches!(previous_statement, Some(Stmt::Try(_)));
+                let previous_statement_preceded_by_try = std::mem::replace(
+                    &mut self.control.current_statement_preceded_by_try,
+                    preceded_by_try,
+                );
                 // CPython leaves an empty join block after a sibling `if`; its borrowed-load
                 // traversal does not cross that block to reach a folded assertion's failure
                 // path, so the assertion message remains owned.
@@ -1304,6 +1311,7 @@ impl Compiler<'_> {
                     previous_statement_propagates_following;
                 self.control.copied_nested_handler_join_successor =
                     previous_copied_nested_handler_join_successor;
+                self.control.current_statement_preceded_by_try = previous_statement_preceded_by_try;
                 self.control.direct_comprehension_assignment_results =
                     previous_direct_comprehension_assignment_results;
                 result?;
@@ -3439,6 +3447,24 @@ impl Compiler<'_> {
                     || (!self.control.active_with_region_exclusions.is_empty()
                         && branch_index > 0
                         && suite_terminates(body));
+                // CPython moves this direct post-try condition into the coroutine's normal CFG
+                // before appending its short-circuit markers. The first marker therefore uses a
+                // fresh slot instead of inheriting the coroutine stop-iteration owner.
+                let exclude_direct_post_try_coroutine_walrus_and = branch_index == 0
+                    && self.control.current_statement_preceded_by_try
+                    && self.unit.flags & CO_COROUTINE != 0
+                    && self.control.generator_region_start.is_some()
+                    && self.control.loops.is_empty()
+                    && self.control.active_exception_region_exclusions.is_empty()
+                    && self.control.active_with_region_exclusions.is_empty()
+                    && self.control.active_normal_finally_bodies == 0
+                    && self.control.active_finally_end_blocks == 0
+                    && self.control.active_exception_group_handlers == 0
+                    && !self.control.in_exception_handler()
+                    && matches!(test, Expr::BoolOp(boolean)
+                        if boolean.op == BoolOp::And
+                            && matches!(boolean.values.as_slice(),
+                                [Expr::Named(_), Expr::Named(_)]));
                 let preserve_first_unnamed_handler_loop_owner = branch_index == 0
                     && self.control.synthesized_loop_tail_predecessor == Some(statement.range)
                     && self.control.in_iterator_loop()
@@ -3617,7 +3643,8 @@ impl Compiler<'_> {
                                             |compiler| {
                                                 let exclude_condition = compiler.control.exclude_condition_not_taken_from_exception
                                                     || exclude_later_handler_leading_marker
-                                                    || exclude_direct_try_while_return_marker;
+                                                    || exclude_direct_try_while_return_marker
+                                                    || exclude_direct_post_try_coroutine_walrus_and;
                                                 compiler.with_control_override(
                                                     |control| &mut control.exclude_condition_not_taken_from_exception,
                                                     exclude_condition,
