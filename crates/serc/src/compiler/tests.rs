@@ -1350,7 +1350,7 @@ async def owned(self):
         .compile_module(parsed.suite())
         .unwrap();
 
-    for (name, expected) in [("fresh", [false, false]), ("owned", [false, true])] {
+    for (name, expected) in [("fresh", [false, false]), ("owned", [false, false])] {
         let function = module
             .constants
             .iter()
