@@ -4594,10 +4594,8 @@ impl Compiler<'_> {
                 .control
                 .current_try_handler_starts_with_optimized_boolean_generator()
                 && matches!(expression.test.as_ref(), Expr::Name(_)));
-        let preserve_generator_with_none_owner =
-            self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) != 0
-                && self.control.in_synchronous_with()
-                && matches!(expression.test.as_ref(), Expr::Compare(comparison)
+        let preserve_sync_with_none_owner = self.control.in_synchronous_with()
+            && matches!(expression.test.as_ref(), Expr::Compare(comparison)
                 if comparison.ops.len() == 1
                     && matches!(comparison.ops[0], CmpOp::Is | CmpOp::IsNot)
                     && matches!(comparison.comparators[0], Expr::NoneLiteral(_)));
@@ -4616,7 +4614,7 @@ impl Compiler<'_> {
             exclude_try_marker,
             |compiler| compiler.compile_jump_if(&expression.test, false, else_label),
         )?;
-        if preserve_generator_with_none_owner || preserve_generator_loop_condition_owner {
+        if preserve_sync_with_none_owner || preserve_generator_loop_condition_owner {
             self.assembler.override_last_not_taken_exception_owner();
         }
         self.compile_expression(&expression.body)?;

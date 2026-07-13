@@ -38,6 +38,23 @@ def terminal_both_branch_or(enabled, left, right, other_left, other_right):
         assert other_left or other_right
 
 
+def terminal_nested_and_or(enabled, left, middle, right):
+    if enabled:
+        assert (left and middle) or right
+
+
+def terminal_nested_call_and_or(enabled, value):
+    if enabled:
+        assert (value.left() and value.middle()) or value.right()
+
+
+def terminal_nested_compare_and_or(enabled, left, expected, kwargs, expected_kwargs, length, expected_length):
+    if enabled:
+        assert left == expected or (
+            kwargs == expected_kwargs and length == expected_length
+        )
+
+
 def protected_terminal_or(enabled, left, right):
     try:
         if enabled:

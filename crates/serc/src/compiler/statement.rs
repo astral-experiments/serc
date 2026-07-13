@@ -5968,16 +5968,15 @@ impl Compiler<'_> {
         self.assembler.mark(end);
         self.set_depth(base_depth);
         if let Some(split_success) = split_success {
-            let Expr::BoolOp(boolean) = statement.test.as_ref() else {
-                unreachable!("split assertion requires a boolean test");
-            };
+            let [first_success, second_success] = terminal_assert_split_success_ranges(statement)
+                .expect("split assertion requires two supported success edges");
             self.assembler
-                .set_location(self.source_location(boolean.values[1].range()));
+                .set_location(self.source_location(second_success));
             self.emit_deferred_implicit_return()?;
             self.assembler.mark(split_success);
             self.set_depth(base_depth);
             self.assembler
-                .set_location(self.source_location(boolean.values[0].range()));
+                .set_location(self.source_location(first_success));
             self.emit_deferred_implicit_return()?;
         }
         Ok(())
@@ -11065,17 +11064,31 @@ fn suite_assert_success_fallthrough_range(body: &[Stmt]) -> Option<TextRange> {
 // CPython gives each authored success edge of a terminal two-term `or` its own implicit-return
 // block, whose instructions inherit that operand's location.
 fn terminal_assert_splits_success_return(statement: &ruff_python_ast::StmtAssert) -> bool {
+    terminal_assert_split_success_ranges(statement).is_some()
+}
+
+fn terminal_assert_split_success_ranges(
+    statement: &ruff_python_ast::StmtAssert,
+) -> Option<[TextRange; 2]> {
     let Expr::BoolOp(boolean) = statement.test.as_ref() else {
-        return false;
+        return None;
     };
     let [first, second] = boolean.values.as_slice() else {
-        return false;
+        return None;
     };
-    boolean.op == BoolOp::Or
-        && [first, second].into_iter().all(|operand| {
-            unique_condition_jump_target(operand, true)
-                .is_some_and(|target| target.range() == operand.range())
-        })
+    if boolean.op != BoolOp::Or {
+        return None;
+    }
+    let success_range = |operand: &Expr| {
+        let target = unique_condition_jump_target(operand, true)?;
+        let supported_nested_and = matches!(operand, Expr::BoolOp(nested)
+            if nested.op == BoolOp::And
+                && early_condition_truthiness(operand).is_none()
+                && jump_constant_truthiness(target).is_none()
+                && nested.values.last().is_some_and(|last| last.range() == target.range()));
+        (target.range() == operand.range() || supported_nested_and).then(|| target.range())
+    };
+    Some([success_range(first)?, success_range(second)?])
 }
 
 fn terminating_if_fallthrough_test(statement: &ruff_python_ast::StmtIf) -> Option<&Expr> {
@@ -11656,11 +11669,15 @@ mod tests {
             "(left < middle < right) or other",
             "True or right",
             "left or True",
+            "(left and middle) or right",
+            "(False and left) or right",
+            "(True and left) or right",
+            "(left() and middle()) or right()",
+            "left == expected or (kwargs == expected_kwargs and length == expected_length)",
         ] {
             assert!(terminal_assert_splits(expression), "{expression}");
         }
         for expression in [
-            "(left and middle) or right",
             "(left or middle) or False",
             "False or (left or right)",
             "(left and True) or right",
