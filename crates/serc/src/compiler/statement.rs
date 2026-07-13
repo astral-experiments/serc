@@ -3179,6 +3179,19 @@ impl Compiler<'_> {
                         }
                     }
                 } else {
+                    // CPython keeps the folded `__debug__` return on the authored name when no
+                    // exception, context-manager, or finally unwind can own the exit.
+                    if exception_unwind_start.is_none()
+                        && with_unwind_starts.is_empty()
+                        && finally_unwind_start.is_none()
+                        && let Some(Expr::Name(name)) = statement.value.as_deref()
+                        && name.id.as_str() == "__debug__"
+                        && self.source_location(statement.range).line
+                            == self.source_location(name.range).line
+                    {
+                        self.assembler
+                            .set_location(self.source_location(name.range));
+                    }
                     self.emit(RETURN_VALUE, 0, -1)?;
                 }
                 if exception_unwind_start.is_some() || return_exclusion_start.is_some() {
