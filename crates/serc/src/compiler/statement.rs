@@ -11415,7 +11415,15 @@ fn finally_suite_preserves_none_condition_owner(body: &[Stmt]) -> bool {
         body,
         [Stmt::If(statement)]
             if statement.elif_else_clauses.is_empty()
-                && matches!(statement.test.as_ref(), Expr::Name(_))
+                && (matches!(statement.test.as_ref(), Expr::Name(_))
+                    || matches!(
+                        statement.test.as_ref(),
+                        Expr::Compare(comparison)
+                            if comparison.ops.len() == 1
+                                && comparison.ops[0] == CmpOp::IsNot
+                                && matches!(comparison.left.as_ref(), Expr::Name(_))
+                                && matches!(comparison.comparators.as_ref(), [Expr::NoneLiteral(_)])
+                    ))
                 && matches!(
                     statement.body.as_slice(),
                     [Stmt::Expr(expression)]
