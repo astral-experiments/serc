@@ -5473,16 +5473,7 @@ impl Compiler<'_> {
                     )
         );
         let body_start = self.assembler.instruction_count();
-        let first_iterator_loop_assertion = match statement.body.as_slice() {
-            [Stmt::Assert(assertion), following, ..]
-                if condition_jump_target_count(&assertion.test, true) == 1
-                    && !is_optimized_generator_assert(following)
-                    && !matches!(assertion.test.as_ref(), Expr::Await(_) | Expr::Call(_)) =>
-            {
-                Some(assertion.range)
-            }
-            _ => None,
-        };
+        let first_iterator_loop_assertion = first_iterator_loop_assertion(&statement.body);
         let tail_jumps = self.with_loop_context(context, |compiler| {
             compiler.with_control_override(
                 |control| &mut control.first_iterator_loop_assertion,
@@ -5610,16 +5601,7 @@ impl Compiler<'_> {
         );
         context.has_orelse = !statement.orelse.is_empty();
         let body_start = self.assembler.instruction_count();
-        let first_iterator_loop_assertion = match statement.body.as_slice() {
-            [Stmt::Assert(assertion), following, ..]
-                if condition_jump_target_count(&assertion.test, true) == 1
-                    && !is_optimized_generator_assert(following)
-                    && !matches!(assertion.test.as_ref(), Expr::Await(_) | Expr::Call(_)) =>
-            {
-                Some(assertion.range)
-            }
-            _ => None,
-        };
+        let first_iterator_loop_assertion = first_iterator_loop_assertion(&statement.body);
         let tail_jumps = self.with_loop_context(context, |compiler| {
             compiler.with_control_override(
                 |control| &mut control.first_iterator_loop_assertion,
@@ -10079,6 +10061,75 @@ fn condition_fallthrough_range(expression: &Expr) -> TextRange {
     // multi-edge joins retain the whole synthetic condition range.
     unique_condition_jump_target(expression, false)
         .map_or_else(|| synthetic_condition_exit_range(expression), Ranged::range)
+}
+
+// Up to three simple, single-name assignments can precede the first non-terminal iterator
+// assertion without changing its condition-marker owner. Branching or suspension in an
+// assignment rebuilds that owner and stays excluded.
+fn first_iterator_loop_assertion(mut body: &[Stmt]) -> Option<TextRange> {
+    for _ in 0..3 {
+        let [Stmt::Assign(assignment), following @ ..] = body else {
+            break;
+        };
+        if !matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+            || !matches!(
+                assignment.value.as_ref(),
+                Expr::Call(_) | Expr::Subscript(_) | Expr::Attribute(_) | Expr::FString(_)
+            )
+            || !is_simple_iterator_assert_assignment_value(&assignment.value)
+        {
+            break;
+        }
+        body = following;
+    }
+
+    match body {
+        [Stmt::Assert(assertion), following, ..]
+            if condition_jump_target_count(&assertion.test, true) == 1
+                && !is_optimized_generator_assert(following)
+                && !matches!(assertion.test.as_ref(), Expr::Await(_) | Expr::Call(_)) =>
+        {
+            Some(assertion.range)
+        }
+        _ => None,
+    }
+}
+
+fn is_simple_iterator_assert_assignment_value(expression: &Expr) -> bool {
+    #[derive(Default)]
+    struct Detector {
+        complex: bool,
+    }
+
+    impl<'ast> Visitor<'ast> for Detector {
+        fn visit_expr(&mut self, expression: &'ast Expr) {
+            if self.complex {
+                return;
+            }
+            if !matches!(
+                expression,
+                Expr::Call(_)
+                    | Expr::Subscript(_)
+                    | Expr::Attribute(_)
+                    | Expr::FString(_)
+                    | Expr::StringLiteral(_)
+                    | Expr::BytesLiteral(_)
+                    | Expr::NumberLiteral(_)
+                    | Expr::BooleanLiteral(_)
+                    | Expr::NoneLiteral(_)
+                    | Expr::EllipsisLiteral(_)
+                    | Expr::Name(_)
+            ) {
+                self.complex = true;
+                return;
+            }
+            walk_expr(self, expression);
+        }
+    }
+
+    let mut detector = Detector::default();
+    detector.visit_expr(expression);
+    !detector.complex
 }
 
 // A following optimized generator assertion rebuilds the coroutine owner around its inlined
