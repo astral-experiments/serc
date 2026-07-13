@@ -6766,7 +6766,7 @@ impl Compiler<'_> {
                 && suite_retained_try_exit_has_normal_fallthrough(&statement.orelse)
                 && let Some(Stmt::If(nested)) = statement.orelse.last()
                 && let Some(test) = terminating_if_fallthrough_test(nested)
-                && matches!(test, Expr::Name(_))
+                && matches!(test, Expr::Name(_) | Expr::Call(_))
             {
                 self.assembler
                     .set_location(self.source_location(condition_fallthrough_range(test)));
