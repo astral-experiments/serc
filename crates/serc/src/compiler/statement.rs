@@ -4535,12 +4535,11 @@ impl Compiler<'_> {
 
             self.assembler.mark(success);
             self.set_depth(base_depth);
-            // CPython propagates a successful negated assertion's contributing operand range
-            // onto this copied backedge instead of retaining the whole unary expression.
-            if matches!(statement.test.as_ref(), Expr::UnaryOp(unary) if unary.op == UnaryOp::Not) {
-                self.assembler.set_location(
-                    self.source_location(condition_fallthrough_range(&statement.test)),
-                );
+            // CPython propagates the successful assertion's contributing operand range onto
+            // this copied backedge instead of retaining the whole condition expression.
+            if let Some(test) = unique_condition_jump_target(&statement.test, true) {
+                self.assembler
+                    .set_location(self.source_location(test.range()));
             }
             self.emit_jump_backward(JUMP_BACKWARD, restart, 0)?;
             return Ok(());

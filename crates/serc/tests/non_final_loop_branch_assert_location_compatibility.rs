@@ -54,6 +54,78 @@ def check(items):
 ",
         ),
         (
+            "negated_and_true_tail.py",
+            r"
+def check(items):
+    for item in items:
+        if item.selected:
+            assert not (item.done and True)
+        else:
+            raise ValueError(item)
+    finish()
+",
+        ),
+        (
+            "negated_or_false_tail.py",
+            r"
+def check(items):
+    for item in items:
+        if item.selected:
+            assert not (item.done or False)
+        else:
+            raise ValueError(item)
+    finish()
+",
+        ),
+        (
+            "positive_and_true_tail.py",
+            r"
+def check(items):
+    for item in items:
+        if item.selected:
+            assert item.done and True
+        else:
+            raise ValueError(item)
+    finish()
+",
+        ),
+        (
+            "positive_and_true_tail_message.py",
+            r#"
+def check(items):
+    for item in items:
+        if item.selected:
+            assert item.done and True, "not done"
+        else:
+            raise ValueError(item)
+    finish()
+"#,
+        ),
+        (
+            "positive_or_false_tail.py",
+            r"
+def check(items):
+    for item in items:
+        if item.selected:
+            assert item.done or False
+        else:
+            raise ValueError(item)
+    finish()
+",
+        ),
+        (
+            "positive_or_false_tail_message.py",
+            r#"
+def check(items):
+    for item in items:
+        if item.selected:
+            assert item.done or False, "not done"
+        else:
+            raise ValueError(item)
+    finish()
+"#,
+        ),
+        (
             "outside_loop_control.py",
             r"
 def check(item):
