@@ -8639,13 +8639,29 @@ impl Compiler<'_> {
             && matches!(statement.body.last(), Some(Stmt::Assert(_)))
             && (!self.control.active_exception_region_exclusions.is_empty()
                 || !self.control.active_with_region_exclusions.is_empty());
+        let exclude_coroutine_assert_pop_block_from_generator =
+            self.control.generator_region_start.is_some()
+                && self.unit.flags & CO_COROUTINE != 0
+                && statement.handlers.is_empty()
+                && statement.orelse.is_empty()
+                && !self.control.current_statement_has_following
+                && self.control.loops.is_empty()
+                && self.control.active_exception_region_exclusions.is_empty()
+                && self.control.active_with_region_exclusions.is_empty()
+                && matches!(statement.body.last(), Some(Stmt::Assert(_)))
+                && matches!(
+                    statement.finalbody.as_slice(),
+                    [Stmt::Expr(_) | Stmt::Assign(_)]
+                )
+                && !suite_contains_loop(&statement.body);
         let exclude_conditional_pop_block_from_with =
             !self.control.active_with_region_exclusions.is_empty()
                 && !self.control.current_statement_has_following
                 && matches!(statement.finalbody.as_slice(), [Stmt::If(_)]);
         let normal_finally_pop_block_exclusion_start =
             (exclude_assert_pop_block_from_enclosing_regions
-                || exclude_conditional_pop_block_from_with)
+                || exclude_conditional_pop_block_from_with
+                || exclude_coroutine_assert_pop_block_from_generator)
                 .then(|| {
                     let start = self.assembler.label();
                     self.assembler.mark(start);
@@ -8689,6 +8705,9 @@ impl Compiler<'_> {
             }
             for exclusions in &mut self.control.active_with_region_exclusions {
                 exclusions.push((start, end));
+            }
+            if exclude_coroutine_assert_pop_block_from_generator {
+                self.control.generator_region_exclusions.push((start, end));
             }
         }
         let noop_finally_body = statement.finalbody.iter().all(|statement| {
@@ -11384,6 +11403,32 @@ pub(super) fn is_wildcard_pattern(pattern: &Pattern) -> bool {
         pattern,
         Pattern::MatchAs(pattern) if pattern.pattern.is_none() && pattern.name.is_none()
     )
+}
+
+fn suite_contains_loop(body: &[Stmt]) -> bool {
+    #[derive(Default)]
+    struct LoopDetector {
+        found: bool,
+    }
+
+    impl<'ast> Visitor<'ast> for LoopDetector {
+        fn visit_stmt(&mut self, statement: &'ast Stmt) {
+            if self.found || matches!(statement, Stmt::FunctionDef(_) | Stmt::ClassDef(_)) {
+                return;
+            }
+            if matches!(statement, Stmt::For(_) | Stmt::While(_)) {
+                self.found = true;
+                return;
+            }
+            walk_stmt(self, statement);
+        }
+    }
+
+    let mut detector = LoopDetector::default();
+    for statement in body {
+        detector.visit_stmt(statement);
+    }
+    detector.found
 }
 
 fn suite_contains_loop_break(body: &[Stmt]) -> bool {
