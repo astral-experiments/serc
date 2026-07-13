@@ -133,6 +133,7 @@ struct WithExitContext {
     location: SourceLocation,
     is_async: bool,
     body_start_instruction: usize,
+    terminal_condition_preceded_by_finally: bool,
     exception_region_depth: usize,
     loop_depth: usize,
     preserves_none_condition_owner: bool,
@@ -3512,25 +3513,33 @@ impl Compiler<'_> {
                         .active_with_exits
                         .last()
                         .is_some_and(|context| {
-                            !self.assembler.contains_opcode_since(
-                                LOAD_FAST_AND_CLEAR,
-                                context.body_start_instruction,
-                            )
+                            (!context.terminal_condition_preceded_by_finally
+                                || matches!(test, Expr::Compare(comparison)
+                                    if comparison.ops.len() == 1
+                                        && matches!(comparison.ops[0], CmpOp::Is | CmpOp::IsNot)
+                                        && matches!(comparison.comparators[0], Expr::NoneLiteral(_)))
+                                || terminal_condition_contains_owner_wrapper(test)
+                                || terminal_condition_contains_global_callable(test, |name| {
+                                    let name_id = self.required_name_id(name);
+                                    matches!(
+                                        &self.unit.scope,
+                                        Scope::Function {
+                                            indices,
+                                            free_indices,
+                                            globals,
+                                            ..
+                                        } if self.unit.annotation_classdict_index.is_none()
+                                            && !self.symbols.active_temporaries.contains(name_id)
+                                            && (globals.contains(name_id)
+                                                || (!indices.contains_key(&name_id)
+                                                    && !free_indices.contains_key(&name_id)))
+                                    )
+                                }))
+                                && !self.assembler.contains_opcode_since(
+                                    LOAD_FAST_AND_CLEAR,
+                                    context.body_start_instruction,
+                                )
                         })
-                    && (self
-                        .control
-                        .active_with_exits
-                        .last()
-                        .is_some_and(|context| {
-                            !self.assembler.contains_opcode_since(
-                                PUSH_EXC_INFO,
-                                context.body_start_instruction,
-                            )
-                        })
-                        || matches!(test, Expr::Compare(comparison)
-                            if comparison.ops.len() == 1
-                                && matches!(comparison.ops[0], CmpOp::Is | CmpOp::IsNot)
-                                && matches!(comparison.comparators[0], Expr::NoneLiteral(_))))
                     && (!self.assembler.contains_opcode(NOT_TAKEN)
                         || matches!(test, Expr::Compare(comparison)
                             if comparison.ops.len() == 1
@@ -9538,6 +9547,14 @@ impl Compiler<'_> {
             location: self.source_location(item.context_expr.range()),
             is_async: false,
             body_start_instruction: self.assembler.instruction_count(),
+            terminal_condition_preceded_by_finally: matches!(
+                body.split_last(),
+                Some((Stmt::If(_), leading))
+                    if matches!(
+                        leading.last(),
+                        Some(Stmt::Try(statement)) if !statement.finalbody.is_empty()
+                    )
+            ),
             exception_region_depth: self.control.active_exception_region_exclusions.len(),
             loop_depth: self.control.loops.len(),
             preserves_none_condition_owner: remaining.is_empty()
@@ -9771,6 +9788,7 @@ impl Compiler<'_> {
             location: self.source_location(item.context_expr.range()),
             is_async: true,
             body_start_instruction: self.assembler.instruction_count(),
+            terminal_condition_preceded_by_finally: false,
             exception_region_depth: self.control.active_exception_region_exclusions.len(),
             loop_depth: self.control.loops.len(),
             preserves_none_condition_owner: false,
@@ -11139,6 +11157,81 @@ fn expression_contains_inline_branch(expression: &Expr) -> bool {
     let mut detector = InlineBranchDetector::default();
     detector.visit_expr(expression);
     detector.found
+}
+
+fn terminal_condition_contains_global_callable(
+    expression: &Expr,
+    is_global: impl FnMut(&str) -> bool,
+) -> bool {
+    struct GlobalCallableDetector<F> {
+        is_global: F,
+        found: bool,
+    }
+
+    impl<'ast, F: FnMut(&str) -> bool> Visitor<'ast> for GlobalCallableDetector<F> {
+        fn visit_expr(&mut self, expression: &'ast Expr) {
+            if self.found {
+                return;
+            }
+            if let Expr::Lambda(lambda) = expression {
+                if let Some(parameters) = &lambda.parameters {
+                    self.visit_parameters(parameters);
+                }
+                return;
+            }
+            if let Expr::Generator(generator) = expression {
+                if let Some(first) = generator.generators.first() {
+                    self.visit_expr(&first.iter);
+                }
+                return;
+            }
+            if let Expr::Call(call) = expression {
+                let mut callable = call.func.as_ref();
+                while let Expr::Call(nested) = callable {
+                    callable = nested.func.as_ref();
+                }
+                if let Expr::Name(name) = callable
+                    && (self.is_global)(name.id.as_str())
+                {
+                    self.found = true;
+                    return;
+                }
+            }
+            walk_expr(self, expression);
+        }
+    }
+
+    let mut detector = GlobalCallableDetector {
+        is_global,
+        found: false,
+    };
+    detector.visit_expr(expression);
+    detector.found
+}
+
+fn terminal_condition_contains_owner_wrapper(expression: &Expr) -> bool {
+    let Expr::Named(named) = expression else {
+        return false;
+    };
+    let mut expression = named.value.as_ref();
+    loop {
+        match expression {
+            Expr::Named(named) => expression = named.value.as_ref(),
+            Expr::UnaryOp(unary) if unary.op == UnaryOp::Not => {
+                let operand = unary.operand.as_ref();
+                if matches!(operand, Expr::UnaryOp(inner) if inner.op == UnaryOp::Not)
+                    || matches!(operand, Expr::Compare(comparison)
+                        if comparison.ops.len() == 1
+                            && matches!(comparison.ops[0], CmpOp::Is | CmpOp::IsNot)
+                            && matches!(comparison.comparators[0], Expr::NoneLiteral(_)))
+                {
+                    return true;
+                }
+                expression = operand;
+            }
+            _ => return false,
+        }
+    }
 }
 
 // CPython's cold-block ordering disconnects the normal outer exit when a nested try/except
