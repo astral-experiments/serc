@@ -2853,19 +2853,30 @@ impl Compiler<'_> {
                 }
             }
         }
-        let result =
-            self.with_comprehension_context((cleanup, cleanup_depth), local_names, |compiler| {
-                compiler.with_control_override(
-                    |control| &mut control.reorder_async_comprehension_cleanup_throw,
-                    // CPython 3.14.5's flow graph leaves the throw cleanup immediately before
-                    // `END_SEND` for a discarded async comprehension whose target is captured.
-                    discard_result && !comprehension_cell_names.is_empty(),
+        let result = self.with_control_override(
+            |control| &mut control.in_unfiltered_comprehension,
+            generators.iter().all(|generator| generator.ifs.is_empty()),
+            |compiler| {
+                compiler.with_comprehension_context(
+                    (cleanup, cleanup_depth),
+                    local_names,
                     |compiler| {
-                        compiler
-                            .compile_comprehension_generator(generators, 0, key, value, add_opcode)
+                        compiler.with_control_override(
+                            |control| &mut control.reorder_async_comprehension_cleanup_throw,
+                            // CPython 3.14.5's flow graph leaves the throw cleanup immediately
+                            // before `END_SEND` for a discarded async comprehension whose target
+                            // is captured.
+                            discard_result && !comprehension_cell_names.is_empty(),
+                            |compiler| {
+                                compiler.compile_comprehension_generator(
+                                    generators, 0, key, value, add_opcode,
+                                )
+                            },
+                        )
                     },
                 )
-            });
+            },
+        );
         self.symbols.imported_scope_names.extend(removed_imports);
         let ((), region_exclusions) = result?;
         self.assembler.mark(protected_end);
@@ -4594,7 +4605,9 @@ impl Compiler<'_> {
                 .control
                 .current_try_handler_starts_with_optimized_boolean_generator()
                 && matches!(expression.test.as_ref(), Expr::Name(_)));
-        let preserve_sync_with_none_owner = self.control.in_synchronous_with()
+        let preserve_none_condition_owner = (self.control.in_synchronous_with()
+            || (self.control.active_exception_region_exclusions.is_empty()
+                && self.control.in_unfiltered_comprehension))
             && matches!(expression.test.as_ref(), Expr::Compare(comparison)
                 if comparison.ops.len() == 1
                     && matches!(comparison.ops[0], CmpOp::Is | CmpOp::IsNot)
@@ -4614,7 +4627,7 @@ impl Compiler<'_> {
             exclude_try_marker,
             |compiler| compiler.compile_jump_if(&expression.test, false, else_label),
         )?;
-        if preserve_sync_with_none_owner || preserve_generator_loop_condition_owner {
+        if preserve_none_condition_owner || preserve_generator_loop_condition_owner {
             self.assembler.override_last_not_taken_exception_owner();
         }
         self.compile_expression(&expression.body)?;
