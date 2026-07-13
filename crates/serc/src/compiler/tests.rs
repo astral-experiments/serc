@@ -1195,7 +1195,7 @@ fn annotation_unparsing_uses_tokens_for_nested_delimiters() {
         let [Stmt::AnnAssign(assignment)] = module.suite().as_slice() else {
             panic!("expected an annotated assignment");
         };
-        assert_eq!(unparse_annotation(&assignment.annotation), expected);
+        assert_eq!(unparse_annotation(&assignment.annotation, source), expected);
     }
 }
 
@@ -1210,11 +1210,15 @@ fn annotation_unparsing_matches_cpython_string_repr_categories() {
         (r#""\x08\x0c""#, r"'\x08\x0c'"),
         (r#""\U0001f600""#, "'😀'"),
     ] {
-        let module = parse_module(&format!("value: {literal}")).unwrap();
+        let source = format!("value: {literal}");
+        let module = parse_module(&source).unwrap();
         let [Stmt::AnnAssign(assignment)] = module.suite().as_slice() else {
             panic!("expected an annotated assignment");
         };
-        assert_eq!(unparse_annotation(&assignment.annotation), expected);
+        assert_eq!(
+            unparse_annotation(&assignment.annotation, &source),
+            expected
+        );
     }
 }
 

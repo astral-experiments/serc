@@ -5784,7 +5784,7 @@ impl Compiler<'_> {
             if self.unit.flags & CO_FUTURE_ANNOTATIONS != 0 {
                 self.assembler
                     .set_location(self.source_location(assignment.annotation.range()));
-                let annotation = unparse_annotation(&assignment.annotation);
+                let annotation = unparse_annotation(&assignment.annotation, self.context.source);
                 self.load_string_constant(&annotation)?;
                 self.assembler
                     .set_location(self.source_location(assignment.range));
