@@ -8654,6 +8654,32 @@ impl Compiler<'_> {
                     [Stmt::Expr(_) | Stmt::Assign(_)]
                 )
                 && !suite_contains_loop(&statement.body);
+        let exclude_direct_yield_pop_block_from_generator = self
+            .control
+            .generator_region_start
+            .is_some()
+            && self.unit.flags & CO_GENERATOR != 0
+            && statement.orelse.is_empty()
+            && !self.control.current_statement_has_following
+            && self.control.loops.is_empty()
+            && self.control.active_exception_region_exclusions.is_empty()
+            && self.control.active_with_region_exclusions.is_empty()
+            && matches!(
+                statement.body.split_last(),
+                Some((Stmt::Expr(expression), leading))
+                    if matches!(expression.value.as_ref(), Expr::Yield(_))
+                        && leading.iter().all(|statement| matches!(statement, Stmt::Assign(_)))
+            )
+            && matches!(
+                statement.handlers.as_slice(),
+                [handler]
+                    if handler.as_except_handler().is_some_and(|handler| matches!(
+                        handler.body.split_last(),
+                        Some((Stmt::Raise(_), leading))
+                            if leading.iter().all(|statement| matches!(statement, Stmt::Expr(_)))
+                    ))
+            )
+            && matches!(statement.finalbody.as_slice(), [Stmt::Expr(_)]);
         let exclude_conditional_pop_block_from_with =
             !self.control.active_with_region_exclusions.is_empty()
                 && !self.control.current_statement_has_following
@@ -8661,7 +8687,8 @@ impl Compiler<'_> {
         let normal_finally_pop_block_exclusion_start =
             (exclude_assert_pop_block_from_enclosing_regions
                 || exclude_conditional_pop_block_from_with
-                || exclude_coroutine_assert_pop_block_from_generator)
+                || exclude_coroutine_assert_pop_block_from_generator
+                || exclude_direct_yield_pop_block_from_generator)
                 .then(|| {
                     let start = self.assembler.label();
                     self.assembler.mark(start);
@@ -8707,6 +8734,9 @@ impl Compiler<'_> {
                 exclusions.push((start, end));
             }
             if exclude_coroutine_assert_pop_block_from_generator {
+                self.control.generator_region_exclusions.push((start, end));
+            }
+            if exclude_direct_yield_pop_block_from_generator {
                 self.control.generator_region_exclusions.push((start, end));
             }
         }
