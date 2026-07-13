@@ -1057,6 +1057,14 @@ impl Compiler<'_> {
                         self.control.emitted_fallthrough_return = true;
                         continue;
                     }
+                    Stmt::Assert(statement)
+                        if self.control.in_terminal_if_branch_suite
+                            && terminal_assert_splits_success_return(statement) =>
+                    {
+                        self.compile_terminal_split_assert(statement)?;
+                        self.control.emitted_fallthrough_return = true;
+                        continue;
+                    }
                     _ => {}
                 }
             }
@@ -5834,6 +5842,21 @@ impl Compiler<'_> {
         &mut self,
         statement: &ruff_python_ast::StmtAssert,
     ) -> Result<(), CompileError> {
+        self.compile_assert_inner(statement, false)
+    }
+
+    fn compile_terminal_split_assert(
+        &mut self,
+        statement: &ruff_python_ast::StmtAssert,
+    ) -> Result<(), CompileError> {
+        self.compile_assert_inner(statement, true)
+    }
+
+    fn compile_assert_inner(
+        &mut self,
+        statement: &ruff_python_ast::StmtAssert,
+        split_success_return: bool,
+    ) -> Result<(), CompileError> {
         let condition_truthiness = early_condition_truthiness(&statement.test);
         if condition_truthiness == Some(true) {
             if let Some(constant) = fold_constant(&statement.test) {
@@ -5874,6 +5897,7 @@ impl Compiler<'_> {
             }
             _ => None,
         };
+        let split_success = split_success_return.then(|| self.assembler.label());
         self.with_control_override(
             |control| &mut control.include_assert_none_condition_owner,
             include_none_owner,
@@ -5889,7 +5913,23 @@ impl Compiler<'_> {
                                 compiler.with_control_override(
                                     |control| &mut control.retained_multiline_assert_ifexp_exit,
                                     retained_multiline_assert_ifexp_exit,
-                                    |compiler| compiler.compile_jump_if(&statement.test, true, end),
+                                    |compiler| {
+                                        if let Some(split_success) = split_success {
+                                            let Expr::BoolOp(boolean) = statement.test.as_ref()
+                                            else {
+                                                unreachable!("split assertion requires a boolean test");
+                                            };
+                                            let [first, second] = boolean.values.as_slice() else {
+                                                unreachable!(
+                                                    "split assertion requires two operands"
+                                                );
+                                            };
+                                            compiler.compile_jump_if(first, true, split_success)?;
+                                            compiler.compile_jump_if(second, true, end)
+                                        } else {
+                                            compiler.compile_jump_if(&statement.test, true, end)
+                                        }
+                                    },
                                 )
                             },
                         )
@@ -5911,6 +5951,19 @@ impl Compiler<'_> {
         self.emit(RAISE_VARARGS, 1, -1)?;
         self.assembler.mark(end);
         self.set_depth(base_depth);
+        if let Some(split_success) = split_success {
+            let Expr::BoolOp(boolean) = statement.test.as_ref() else {
+                unreachable!("split assertion requires a boolean test");
+            };
+            self.assembler
+                .set_location(self.source_location(boolean.values[1].range()));
+            self.emit_deferred_implicit_return()?;
+            self.assembler.mark(split_success);
+            self.set_depth(base_depth);
+            self.assembler
+                .set_location(self.source_location(boolean.values[0].range()));
+            self.emit_deferred_implicit_return()?;
+        }
         Ok(())
     }
 
@@ -10991,6 +11044,15 @@ fn suite_assert_success_fallthrough_range(body: &[Stmt]) -> Option<TextRange> {
     };
     // Only a unique success edge can supply one stable location to a shared branch exit.
     unique_condition_jump_target(&statement.test, true).map(Ranged::range)
+}
+
+// CPython gives each authored success edge of a terminal two-term `or` its own implicit-return
+// block, whose instructions inherit that operand's location.
+fn terminal_assert_splits_success_return(statement: &ruff_python_ast::StmtAssert) -> bool {
+    matches!(statement.test.as_ref(), Expr::BoolOp(boolean)
+        if boolean.op == BoolOp::Or
+            && boolean.values.len() == 2
+            && condition_jump_target_count(&statement.test, true) == 2)
 }
 
 fn terminating_if_fallthrough_test(statement: &ruff_python_ast::StmtIf) -> Option<&Expr> {
