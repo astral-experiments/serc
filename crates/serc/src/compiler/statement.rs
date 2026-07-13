@@ -7444,11 +7444,10 @@ impl Compiler<'_> {
             if terminal_handler_exclusions.is_none() && !terminal_handler_try_return {
                 // Multi-edge joins and folded unconditional false exits leave this cleanup
                 // source-less; a sole runtime-tested false edge carries its operand's location.
-                let handler_ends_with_unnamed_terminating_unlocated_and_cleanup = matches!(
+                let handler_ends_with_terminating_unlocated_and_cleanup = matches!(
                     handler.body.last(),
                     Some(Stmt::If(tail))
-                        if handler.name.is_none()
-                            && loop_tail.is_none()
+                        if loop_tail.is_none()
                             && (self.control.current_statement_has_following
                                 || self.control.inherited_statement_has_following)
                             && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
@@ -7508,7 +7507,7 @@ impl Compiler<'_> {
                     && let Some(range) = unary_not_condition_exit_range(&statement.test)
                 {
                     self.assembler.set_location(self.source_location(range));
-                } else if handler_ends_with_unnamed_terminating_unlocated_and_cleanup {
+                } else if handler_ends_with_terminating_unlocated_and_cleanup {
                     self.assembler.set_location(SourceLocation::NONE);
                 } else if let Some(Stmt::If(statement)) = handler.body.last()
                     && let Some(test) = terminating_if_fallthrough_test(statement)
@@ -7548,7 +7547,7 @@ impl Compiler<'_> {
                 if handler_ends_with_preserved_unlocated_cleanup
                     || handler_ends_with_unlocated_bare_raise_branch_cleanup
                     || handler_ends_with_unlocated_if_cleanup
-                    || handler_ends_with_unnamed_terminating_unlocated_and_cleanup
+                    || handler_ends_with_terminating_unlocated_and_cleanup
                 {
                     self.assembler.preserve_last_no_location();
                 }
