@@ -1070,7 +1070,10 @@ fn constant_pop_candidates_are_recorded_during_emission() {
     ));
 
     let mut direct = Assembler::default();
-    direct.emit(LOAD_COMMON_CONSTANT, 0);
+    direct.emit(
+        LOAD_COMMON_CONSTANT,
+        CommonConstant::ASSERTIONERROR.argument(),
+    );
     direct.emit(POP_TOP, 0);
     assert!(direct.has_constant_pop_candidate);
     direct.optimize_constant_pops();
