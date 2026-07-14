@@ -382,7 +382,8 @@ pub(super) struct ControlFlowState {
     pub(super) copy_optimized_tuple_branch_exit: bool,
     // Whether the current expression is being lowered as one atom of a Boolean condition.
     pub(super) optimized_generator_boolean_condition: bool,
-    // The direct `all(genexpr)` or `any(genexpr)` test of a message-free coroutine assertion
+    // The direct `all(genexpr)` or `any(genexpr)` test of a message-free coroutine assertion,
+    // or the `any(genexpr)` test in a direct `assert not any(...)` with or without a message,
     // before suspension.
     // The range prevents nested calls and other Boolean contexts from inheriting its loop owner.
     pub(super) pre_suspension_coroutine_boolean_assertion: Option<TextRange>,
@@ -6530,6 +6531,18 @@ impl Compiler<'_> {
                     && matches!(optimized_generator_callable(call), Some("all" | "any")) =>
             {
                 Some(call.range)
+            }
+            Expr::UnaryOp(unary)
+                if unary.op == UnaryOp::Not
+                    && self.unit.flags & CO_COROUTINE != 0
+                    && self.control.coroutine_suspension_epoch == 0 =>
+            {
+                match unary.operand.as_ref() {
+                    Expr::Call(call) if optimized_generator_callable(call) == Some("any") => {
+                        Some(call.range)
+                    }
+                    _ => None,
+                }
             }
             _ => None,
         };
