@@ -1419,6 +1419,27 @@ async def after_suspension(value, run):
     await run(None)
     selected = value or None
     return selected
+
+async def one_slot_after_condition(value, fallback, run, flag):
+    if flag:
+        run(flag)
+    selected = bool(value or fallback)
+    return await run(selected)
+
+async def iterator_one_slot_after_condition(items, fallback, run, flag):
+    for item in items:
+        if flag:
+            run(flag)
+        selected = bool(item.value or fallback)
+        run(selected)
+
+async def iterator_keyword_gap(items, fallback, run):
+    result = []
+    for item in items:
+        if (value := item.value) and not run(value):
+            value = fallback
+        result.append(Record(value=item.value or fallback, other=item.other))
+    return result
 "#;
     let parsed = parse_module(source).unwrap();
     let module = module_compiler(source, &parsed)
@@ -1430,6 +1451,9 @@ async def after_suspension(value, run):
         ("first_value_marker", &[true][..]),
         ("nested_region", &[true, true][..]),
         ("after_suspension", &[false][..]),
+        ("one_slot_after_condition", &[true, false][..]),
+        ("iterator_one_slot_after_condition", &[true, true][..]),
+        ("iterator_keyword_gap", &[false, false, true][..]),
     ] {
         let function = module
             .constants
