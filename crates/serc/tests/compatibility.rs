@@ -1,4 +1,5 @@
 mod common;
+mod compatibility_cases;
 
 #[cfg(test)]
 mod tests {
