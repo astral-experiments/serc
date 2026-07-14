@@ -5711,6 +5711,15 @@ impl Compiler<'_> {
                     self.assembler.instruction_count(),
                     expression.range(),
                 );
+        let exclude_post_async_with_marker = !comparison_is_boolean
+            && self.control.post_async_with_condition_marker == Some(expression.range())
+            && !self.assembler.current_block_has_dynamic_exception_owner();
+        if exclude_post_async_with_marker {
+            return self.emit_condition_not_taken(ConditionMarkerPolicy {
+                excluded: ExceptionPolicy::EXCLUDE_ALWAYS,
+                ordinary: ExceptionPolicy::EXCLUDE_ALWAYS,
+            });
+        }
         if self.control.force_filtered_comprehension_truth_ownerless && !comparison_is_boolean {
             let exception_policy = if self.assembler.current_block_has_dynamic_exception_owner() {
                 ExceptionPolicy::normalized_owner(true)
