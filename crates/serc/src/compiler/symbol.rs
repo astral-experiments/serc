@@ -13,18 +13,16 @@ use super::{
     STORE_FAST, STORE_GLOBAL, STORE_NAME, YIELD_VALUE,
 };
 use crate::CompileError;
-use crate::assembler::{ExceptionPolicy, Label, SourceLocation};
+use crate::assembler::{EmittedInstruction, EmittedJump, ExceptionPolicy, Label, SourceLocation};
 use crate::code_object::Constant;
 use crate::target::code_flags::{CO_ASYNC_GENERATOR, CO_COROUTINE};
 use crate::target::operands::{
     BinaryIntrinsic, BinaryOperation, CommonConstant, ComparisonOperation, Conversion,
     FunctionAttribute, ResumeLocation, SpecialMethod, UnaryIntrinsic,
 };
-#[cfg(any(test, debug_assertions))]
 use crate::target::stack_counts as opcode_stack_counts;
 use crate::target::{Opcode, is_unconditional_jump};
 
-#[cfg(any(test, debug_assertions))]
 use super::RETURN_VALUE;
 
 use super::constant::literal_constant;
@@ -296,16 +294,16 @@ impl Compiler<'_> {
                             self.emit(LOAD_DEREF, index, 1)
                         }
                     } else if self.symbols.initialized_locals.contains(name_id) {
-                        if self.symbols.owned_load_locals.contains(name_id) {
-                            self.emit_owned_fast(index, 1)?;
+                        let emitted = if self.symbols.owned_load_locals.contains(name_id) {
+                            self.emit_owned_fast_instruction(index)?
                         } else {
-                            self.emit(LOAD_FAST, index, 1)?;
-                        }
+                            self.emit_instruction(LOAD_FAST, index)?
+                        };
                         if self
                             .control
                             .take_direct_comprehension_assignment_result(name_id)
                         {
-                            self.assembler.mark_last_load_fast_as_known_initialized();
+                            self.assembler.mark_load_fast_as_known_initialized(emitted);
                         }
                         Ok(())
                     } else {
@@ -606,13 +604,13 @@ impl Compiler<'_> {
     pub(super) fn emit_closure_tuple(&mut self, names: &[NameId]) -> Result<(), CompileError> {
         for name in names {
             let local = self.closure_index_id(*name)?;
-            self.emit(LOAD_FAST, local, 1)?;
+            let emitted = self.emit_instruction(LOAD_FAST, local)?;
             // CPython lowers pseudo `LOAD_CLOSURE` instructions after checking ordinary fast
             // loads for initialization and after forming superinstructions.
             self.assembler
-                .mark_last_load_fast_as_post_analysis_closure();
+                .mark_load_fast_as_post_analysis_closure(emitted);
             self.assembler
-                .prevent_last_instruction_fusion_with_previous();
+                .prevent_instruction_fusion_with_previous(emitted);
         }
         self.emit_build(BUILD_TUPLE, names.len())
     }
@@ -622,19 +620,22 @@ impl Compiler<'_> {
             std::mem::take(&mut self.control.comprehensions.pending_comprehension_restores);
         for (restores, location) in restores {
             self.assembler.set_location(location);
+            let mut last_restore = None;
             for (position, restore) in restores.iter().copied().enumerate() {
                 self.assembler.fusion_barrier();
                 if position > 0 {
                     self.assembler.set_location(location);
                 }
-                self.emit_comprehension_restore(restore)?;
+                let emitted = self.emit_comprehension_restore(restore)?;
                 self.assembler
-                    .prevent_last_instruction_fusion_with_previous();
+                    .prevent_instruction_fusion_with_previous(emitted);
+                last_restore = Some(emitted);
             }
+            let last_restore = last_restore.expect("pending restores should not be empty");
             // The SWAP/STORE_FAST_MAYBE_NULL restore contracts by one CFG slot.
             self.assembler.add_last_hidden_exception_owner_slots(1);
             // CPython converts STORE_FAST_MAYBE_NULL only after inserting superinstructions.
-            self.assembler.prevent_last_instruction_fusion();
+            self.assembler.prevent_instruction_fusion(last_restore);
         }
         Ok(())
     }
@@ -642,15 +643,15 @@ impl Compiler<'_> {
     pub(super) fn emit_comprehension_restore(
         &mut self,
         restore: ComprehensionRestore,
-    ) -> Result<(), CompileError> {
-        self.emit(STORE_FAST, restore.index, -1)?;
+    ) -> Result<EmittedInstruction, CompileError> {
+        let emitted = self.emit_instruction(STORE_FAST, restore.index)?;
         if usize::try_from(restore.index).is_ok_and(|index| index < self.symbols.fast_local_count)
             && !self.symbols.cell_names.contains(restore.name)
         {
             self.assembler
-                .mark_last_store_fast_as_maybe_null_comprehension_restore();
+                .mark_store_fast_as_maybe_null_comprehension_restore(emitted);
         }
-        Ok(())
+        Ok(emitted)
     }
 
     pub(super) fn child_function_is_nested(&self) -> bool {
@@ -987,6 +988,22 @@ impl Compiler<'_> {
         self.emit_with_exception_policy(opcode, argument, effect, ExceptionPolicy::default())
     }
 
+    /// Emits an instruction whose logical stack effect is fixed by target metadata.
+    pub(super) fn emit_instruction(
+        &mut self,
+        opcode: Opcode,
+        argument: u32,
+    ) -> Result<EmittedInstruction, CompileError> {
+        let effect = required_compiler_stack_effect(opcode, argument)?;
+        self.apply_stack_effect(effect)?;
+        Ok(self.assembler.emit_with_depth(
+            opcode,
+            argument,
+            self.control.stack.depth.cast_unsigned(),
+            ExceptionPolicy::default(),
+        ))
+    }
+
     pub(super) fn emit_yield_value(
         &mut self,
         argument: u32,
@@ -1112,6 +1129,17 @@ impl Compiler<'_> {
         Ok(())
     }
 
+    pub(super) fn emit_owned_fast_instruction(
+        &mut self,
+        argument: u32,
+    ) -> Result<EmittedInstruction, CompileError> {
+        let effect = required_compiler_stack_effect(LOAD_FAST, argument)?;
+        self.apply_stack_effect(effect)?;
+        Ok(self
+            .assembler
+            .emit_owned_fast_with_depth(argument, self.control.stack.depth.cast_unsigned()))
+    }
+
     pub(super) fn emit_jump_forward(
         &mut self,
         opcode: Opcode,
@@ -1124,6 +1152,40 @@ impl Compiler<'_> {
             effect,
             ExceptionPolicy::default(),
         )
+    }
+
+    /// Emits a forward jump whose logical stack effect is fixed by target metadata.
+    pub(super) fn emit_jump_forward_instruction(
+        &mut self,
+        opcode: Opcode,
+        label: Label,
+    ) -> Result<EmittedJump, CompileError> {
+        self.emit_jump_forward_instruction_with_exception_policy(
+            opcode,
+            label,
+            ExceptionPolicy::default(),
+        )
+    }
+
+    pub(super) fn emit_jump_forward_instruction_with_exception_policy(
+        &mut self,
+        opcode: Opcode,
+        label: Label,
+        exception_policy: ExceptionPolicy,
+    ) -> Result<EmittedJump, CompileError> {
+        if is_unconditional_jump(opcode)
+            && let Some(location) = self.take_trailing_nop_location()
+        {
+            self.assembler.set_location(location);
+        }
+        let effect = required_compiler_stack_effect(opcode, 0)?;
+        self.apply_stack_effect(effect)?;
+        Ok(self.assembler.emit_forward_with_depth(
+            opcode,
+            label,
+            self.control.stack.depth.cast_unsigned(),
+            exception_policy,
+        ))
     }
 
     pub(super) fn emit_jump_forward_with_exception_policy(
@@ -1160,6 +1222,29 @@ impl Compiler<'_> {
             effect,
             ExceptionPolicy::default(),
         )
+    }
+
+    /// Emits a backward jump whose logical stack effect is fixed by target metadata.
+    pub(super) fn emit_jump_backward_instruction(
+        &mut self,
+        opcode: Opcode,
+        label: Label,
+    ) -> Result<EmittedJump, CompileError> {
+        if is_unconditional_jump(opcode)
+            && let Some(location) = self.take_trailing_nop_location()
+        {
+            self.assembler.set_location(location);
+        }
+        let effect = required_compiler_stack_effect(opcode, 0)?;
+        self.apply_stack_effect(effect)?;
+        Ok(self
+            .assembler
+            .emit_backward_with_depth_and_exception_policy(
+                opcode,
+                label,
+                self.control.stack.depth.cast_unsigned(),
+                ExceptionPolicy::default(),
+            ))
     }
 
     pub(super) fn emit_jump_backward_with_exception_policy(
@@ -1249,7 +1334,6 @@ impl Compiler<'_> {
     }
 }
 
-#[cfg(any(test, debug_assertions))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CompilerStackEffect {
     Fixed(i32),
@@ -1257,7 +1341,6 @@ pub(super) enum CompilerStackEffect {
 }
 
 /// Returns the effect on the compiler's logical value stack when it is fixed.
-#[cfg(any(test, debug_assertions))]
 pub(super) fn compiler_stack_effect(opcode: Opcode, argument: u32) -> CompilerStackEffect {
     match opcode {
         // CPython's physical interpreter stack retains the return value for frame teardown, but
@@ -1273,6 +1356,16 @@ pub(super) fn compiler_stack_effect(opcode: Opcode, argument: u32) -> CompilerSt
                     - i32::try_from(popped).expect("opcode pop count fits in i32"),
             )
         }
+    }
+}
+
+fn required_compiler_stack_effect(opcode: Opcode, argument: u32) -> Result<i32, CompileError> {
+    match compiler_stack_effect(opcode, argument) {
+        CompilerStackEffect::Fixed(effect) => Ok(effect),
+        CompilerStackEffect::ContextDependent => Err(CompileError::Internal(format!(
+            "opcode {} with argument {argument} has a context-dependent stack effect; use its typed emitter",
+            opcode.code(),
+        ))),
     }
 }
 
