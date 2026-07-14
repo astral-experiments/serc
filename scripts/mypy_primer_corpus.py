@@ -25,8 +25,11 @@ DEFAULT_CORPUS = REPO_ROOT / "target" / "corpora" / "mypy-primer"
 CATALOG_URL = "https://github.com/hauntsaninja/mypy_primer"
 SOURCE_SUFFIXES = (".py", ".pyi")
 LOCK_FORMAT = 1
-EXPECTED_FAILURES = 5_527
+EXPECTED_BYTE_MISMATCHES = 5_527
 EXPECTED_CPYTHON_REJECTED = 160
+EXPECTED_MATCHED_REJECTIONS = 64
+EXPECTED_REJECTION_MISMATCHES = 84
+EXPECTED_COMPILER_FAILURES = 12
 HEX_REVISION = re.compile(r"[0-9a-f]{40}\Z")
 SAFE_ID = re.compile(r"[A-Za-z0-9._-]+\Z")
 
@@ -580,15 +583,21 @@ def compatibility_command(
         "pyi",
     ]
     if limit is None:
-        expected_exact = files - EXPECTED_FAILURES - EXPECTED_CPYTHON_REJECTED
-        command.extend(
-            [
-                "--expected-exact",
-                str(expected_exact),
-                "--expected-cpython-rejected",
-                str(EXPECTED_CPYTHON_REJECTED),
-            ]
-        )
+        expected_exact = files - EXPECTED_BYTE_MISMATCHES - EXPECTED_CPYTHON_REJECTED
+        expected_outcomes = [
+            ("exact", expected_exact),
+            ("byte-mismatch", EXPECTED_BYTE_MISMATCHES),
+            ("unsupported", 0),
+            ("parse-mismatch", 0),
+            ("compiler-failure", EXPECTED_COMPILER_FAILURES),
+            ("matched-rejection", EXPECTED_MATCHED_REJECTIONS),
+            ("rejection-mismatch", EXPECTED_REJECTION_MISMATCHES),
+            ("non-utf8", 0),
+            ("oracle-failure", 0),
+        ]
+        for outcome, expected in expected_outcomes:
+            command.extend(["--expected-outcome", f"{outcome}={expected}"])
+        command.extend(["--expected-cpython-rejected", str(EXPECTED_CPYTHON_REJECTED)])
     else:
         command.extend(["--limit", str(limit), "--require-all"])
     command.extend(map(str, roots))

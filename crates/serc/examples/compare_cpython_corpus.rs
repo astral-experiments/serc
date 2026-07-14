@@ -42,6 +42,18 @@ enum OutcomeKind {
 }
 
 impl OutcomeKind {
+    const ALL: [Self; 9] = [
+        Self::Exact,
+        Self::ByteMismatch,
+        Self::Unsupported,
+        Self::ParseMismatch,
+        Self::CompilerFailure,
+        Self::MatchedRejection,
+        Self::RejectionMismatch,
+        Self::NonUtf8,
+        Self::OracleFailure,
+    ];
+
     const fn label(self) -> &'static str {
         match self {
             Self::Exact => "exact",
@@ -54,6 +66,24 @@ impl OutcomeKind {
             Self::NonUtf8 => "non-UTF-8",
             Self::OracleFailure => "oracle failure",
         }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::ByteMismatch => "byte-mismatch",
+            Self::Unsupported => "unsupported",
+            Self::ParseMismatch => "parse-mismatch",
+            Self::CompilerFailure => "compiler-failure",
+            Self::MatchedRejection => "matched-rejection",
+            Self::RejectionMismatch => "rejection-mismatch",
+            Self::NonUtf8 => "non-utf8",
+            Self::OracleFailure => "oracle-failure",
+        }
+    }
+
+    fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.name() == name)
     }
 
     const fn is_failure(self) -> bool {
@@ -93,7 +123,7 @@ struct Options {
     extensions: Vec<String>,
     limit: Option<usize>,
     expected_files: Option<usize>,
-    expected_exact: Option<usize>,
+    expected_outcomes: BTreeMap<OutcomeKind, usize>,
     expected_cpython_rejected: Option<usize>,
     require_all: bool,
     require_rejection_parity: bool,
@@ -250,7 +280,7 @@ fn main() -> ExitCode {
             .iter()
             .filter(|outcome| outcome.oracle_rejected && outcome.kind.is_failure())
             .count(),
-        options.expected_exact,
+        &options.expected_outcomes,
         options.expected_cpython_rejected,
         options.require_all,
         options.require_rejection_parity,
@@ -270,7 +300,7 @@ fn validate_outcome_counts(
     cpython_rejected: usize,
     cpython_accepted_failures: usize,
     rejection_failures: usize,
-    expected_exact: Option<usize>,
+    expected_outcomes: &BTreeMap<OutcomeKind, usize>,
     expected_cpython_rejected: Option<usize>,
     require_all: bool,
     require_rejection_parity: bool,
@@ -279,12 +309,20 @@ fn validate_outcome_counts(
     let exact = count(OutcomeKind::Exact);
     let mut failures = Vec::new();
 
-    if let Some(expected) = expected_exact
-        && exact != expected
-    {
-        failures.push(format!(
-            "found {exact} exact matches, but expected {expected}"
-        ));
+    for (&kind, &expected) in expected_outcomes {
+        let actual = count(kind);
+        if actual == expected {
+            continue;
+        }
+        failures.push(match kind {
+            OutcomeKind::Exact => {
+                format!("found {actual} exact matches, but expected {expected}")
+            }
+            _ => format!(
+                "found {actual} {} outcomes, but expected {expected}",
+                kind.label()
+            ),
+        });
     }
     if let Some(expected) = expected_cpython_rejected
         && cpython_rejected != expected
@@ -344,7 +382,7 @@ fn parse_options() -> Result<Options, String> {
     let mut extensions = vec!["py".to_string()];
     let mut limit = None;
     let mut expected_files = None;
-    let mut expected_exact = None;
+    let mut expected_outcomes = BTreeMap::new();
     let mut expected_cpython_rejected = None;
     let mut require_all = false;
     let mut require_rejection_parity = false;
@@ -402,22 +440,27 @@ fn parse_options() -> Result<Options, String> {
                 );
             }
             "--expected-exact" => {
-                expected_exact = Some(
-                    arguments
-                        .next()
-                        .ok_or_else(|| "--expected-exact requires a number".to_string())?
-                        .parse()
-                        .map_err(|_| "--expected-exact requires a number".to_string())?,
-                );
+                insert_expected_outcome(
+                    &mut expected_outcomes,
+                    OutcomeKind::Exact,
+                    parse_count(&mut arguments, "--expected-exact")?,
+                    "--expected-exact",
+                )?;
             }
             "--expected-cpython-rejected" => {
-                expected_cpython_rejected = Some(
-                    arguments
-                        .next()
-                        .ok_or_else(|| "--expected-cpython-rejected requires a number".to_string())?
-                        .parse()
-                        .map_err(|_| "--expected-cpython-rejected requires a number".to_string())?,
-                );
+                let count = parse_count(&mut arguments, "--expected-cpython-rejected")?;
+                if expected_cpython_rejected.replace(count).is_some() {
+                    return Err(
+                        "--expected-cpython-rejected may only be specified once".to_string()
+                    );
+                }
+            }
+            "--expected-outcome" => {
+                let expected = arguments
+                    .next()
+                    .ok_or_else(|| "--expected-outcome requires a KIND=COUNT value".to_string())?;
+                let (kind, count) = parse_expected_outcome(&expected)?;
+                insert_expected_outcome(&mut expected_outcomes, kind, count, "--expected-outcome")?;
             }
             "--dump-mismatches" => {
                 dump_mismatches =
@@ -461,7 +504,7 @@ fn parse_options() -> Result<Options, String> {
         extensions,
         limit,
         expected_files,
-        expected_exact,
+        expected_outcomes,
         expected_cpython_rejected,
         require_all,
         require_rejection_parity,
@@ -469,6 +512,43 @@ fn parse_options() -> Result<Options, String> {
         dump_mismatches,
         source_bytes,
     })
+}
+
+fn parse_count(
+    arguments: &mut impl Iterator<Item = String>,
+    option: &str,
+) -> Result<usize, String> {
+    arguments
+        .next()
+        .ok_or_else(|| format!("{option} requires a number"))?
+        .parse()
+        .map_err(|_| format!("{option} requires a number"))
+}
+
+fn parse_expected_outcome(value: &str) -> Result<(OutcomeKind, usize), String> {
+    let (name, count) = value
+        .split_once('=')
+        .ok_or_else(|| "--expected-outcome requires a KIND=COUNT value".to_string())?;
+    let kind = OutcomeKind::from_name(name).ok_or_else(|| {
+        let names = OutcomeKind::ALL.map(OutcomeKind::name).join(", ");
+        format!("unknown outcome kind `{name}`; expected one of: {names}")
+    })?;
+    let count = count
+        .parse()
+        .map_err(|_| "--expected-outcome count must be a number".to_string())?;
+    Ok((kind, count))
+}
+
+fn insert_expected_outcome(
+    outcomes: &mut BTreeMap<OutcomeKind, usize>,
+    kind: OutcomeKind,
+    count: usize,
+    option: &str,
+) -> Result<(), String> {
+    if outcomes.insert(kind, count).is_some() {
+        return Err(format!("{option} may only be specified once"));
+    }
+    Ok(())
 }
 
 fn dump_mismatches(
@@ -711,7 +791,8 @@ mod tests {
     fn require_all_rejects_a_corpus_without_exact_matches() {
         let counts = BTreeMap::from([(OutcomeKind::MatchedRejection, 3)]);
 
-        let failures = validate_outcome_counts(&counts, 3, 0, 0, None, None, true, false);
+        let failures =
+            validate_outcome_counts(&counts, 3, 0, 0, &BTreeMap::new(), None, true, false);
 
         assert!(
             failures
@@ -776,12 +857,13 @@ mod tests {
     #[test]
     fn cpython_rejected_count_is_independent_from_rejection_parity() {
         let counts = BTreeMap::from([(OutcomeKind::Exact, 1), (OutcomeKind::RejectionMismatch, 1)]);
+        let expected = BTreeMap::from([(OutcomeKind::Exact, 1)]);
 
         assert!(
-            validate_outcome_counts(&counts, 1, 0, 1, Some(1), Some(1), true, false).is_empty()
+            validate_outcome_counts(&counts, 1, 0, 1, &expected, Some(1), true, false).is_empty()
         );
         assert_eq!(
-            validate_outcome_counts(&counts, 1, 0, 1, Some(1), Some(1), true, true),
+            validate_outcome_counts(&counts, 1, 0, 1, &expected, Some(1), true, true),
             ["1 CPython-rejected files were not rejected cleanly by Serc"]
         );
     }
@@ -840,14 +922,18 @@ mod tests {
     #[test]
     fn validates_expected_outcome_counts() {
         let counts = BTreeMap::from([(OutcomeKind::Exact, 2), (OutcomeKind::MatchedRejection, 1)]);
+        let expected =
+            BTreeMap::from([(OutcomeKind::Exact, 2), (OutcomeKind::MatchedRejection, 1)]);
 
         assert!(
-            validate_outcome_counts(&counts, 1, 0, 0, Some(2), Some(1), true, false).is_empty()
+            validate_outcome_counts(&counts, 1, 0, 0, &expected, Some(1), true, false).is_empty()
         );
+        let expected = BTreeMap::from([(OutcomeKind::Exact, 3), (OutcomeKind::ByteMismatch, 4)]);
         assert_eq!(
-            validate_outcome_counts(&counts, 1, 0, 0, Some(3), Some(2), false, false),
+            validate_outcome_counts(&counts, 1, 0, 0, &expected, Some(2), false, false),
             [
                 "found 2 exact matches, but expected 3",
+                "found 0 byte mismatch outcomes, but expected 4",
                 "CPython rejected 1 files, but expected 2",
             ]
         );

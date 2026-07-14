@@ -71,9 +71,14 @@ The current compatibility measurements are:
 | mypy-primer snapshot | 73,537 | 160 | 67,850 | 5,527 | 92.47% |
 | **Combined** | **76,493** | **381** | **70,585** | **5,527** | **92.74%** |
 
-The second command freezes the mypy-primer outcome baseline and exits
-unsuccessfully when its counts change so compatibility improvements advance the
-baseline explicitly. CI validates the pinned catalog and the
+Of the 160 CPython-rejected mypy-primer files, Serc matches 64 rejections, accepts 84, and
+reports a compiler failure for 12. These outcomes are frozen independently of the marshal-byte
+measurements above.
+
+The second command freezes every mypy-primer outcome category and exits unsuccessfully when any
+category count changes, so compatibility improvements advance the baseline explicitly and
+mismatches cannot silently turn into unsupported inputs, compiler failures, or oracle failures. CI
+validates the pinned catalog and the
 corpus-management scripts, but the full comparison does not replace or weaken
 the Ruff compatibility gate above. See [`corpora/README.md`](corpora/README.md)
 for the exact snapshot boundary and reproducibility details.

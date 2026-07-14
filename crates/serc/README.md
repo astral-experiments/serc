@@ -120,7 +120,8 @@ emitted under `src/marshal`.
 
 The Ruff dependencies are pinned to a specific Git revision because Ruff's parser crates are not
 published independently. From the workspace root, `./scripts/check-ruff-pin` verifies that the
-Cargo manifest, lockfile, submodule gitlink, and initialized submodule all select the same revision.
+Cargo manifest, lockfile, submodule gitlink, and initialized, clean submodule all select the same
+revision.
 
 From the workspace root, `./scripts/check-cpython-compatibility /path/to/python3.14` requires the
 initialized matching Ruff submodule and runs the complete frozen gate without mutating the checkout.

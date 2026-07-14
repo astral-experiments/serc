@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import tempfile
 import unittest
+from itertools import pairwise
 from pathlib import Path
 
 import mypy_primer_corpus as corpus
@@ -150,23 +151,35 @@ def get_projects():
         with self.assertRaisesRegex(corpus.CorpusError, "invalid revision"):
             corpus.validate_lock(short)
 
-    def test_compatibility_command_freezes_the_full_failure_count(self) -> None:
+    def test_compatibility_command_freezes_every_outcome_count(self) -> None:
         roots = [Path("/corpus/first"), Path("/corpus/second")]
         full = corpus.compatibility_command("python3.14", roots, 73_537, None)
-        expected_exact_index = full.index("--expected-exact") + 1
-        rejected_index = full.index("--expected-cpython-rejected") + 1
-        expected_exact = int(full[expected_exact_index])
-        expected_rejected = int(full[rejected_index])
+        expected_outcomes = {
+            value.split("=", 1)[0]: int(value.split("=", 1)[1])
+            for option, value in pairwise(full)
+            if option == "--expected-outcome"
+        }
+        expected_exact = expected_outcomes["exact"]
+        expected_rejected = int(full[full.index("--expected-cpython-rejected") + 1])
 
         self.assertEqual(expected_exact, 67_850)
         self.assertEqual(expected_rejected, 160)
+        self.assertEqual(expected_outcomes["matched-rejection"], 64)
+        self.assertEqual(expected_outcomes["byte-mismatch"], 5_527)
+        self.assertEqual(expected_outcomes["unsupported"], 0)
+        self.assertEqual(expected_outcomes["parse-mismatch"], 0)
+        self.assertEqual(expected_outcomes["compiler-failure"], 12)
+        self.assertEqual(expected_outcomes["rejection-mismatch"], 84)
+        self.assertEqual(expected_outcomes["non-utf8"], 0)
+        self.assertEqual(expected_outcomes["oracle-failure"], 0)
         self.assertEqual(
-            73_537 - expected_exact - expected_rejected, corpus.EXPECTED_FAILURES
+            73_537 - expected_exact - expected_rejected,
+            corpus.EXPECTED_BYTE_MISMATCHES,
         )
         self.assertNotIn("--require-all", full)
 
         limited = corpus.compatibility_command("python3.14", roots, 73_537, 100)
-        self.assertNotIn("--expected-exact", limited)
+        self.assertNotIn("--expected-outcome", limited)
         self.assertNotIn("--expected-cpython-rejected", limited)
         self.assertEqual(limited[limited.index("--limit") + 1], "100")
         self.assertIn("--require-all", limited)

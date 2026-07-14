@@ -80,5 +80,7 @@ ruff_toplevel="$(cd "$ruff_toplevel" && pwd -P)"
 [[ "$ruff_toplevel" == "$ruff" ]] || die "$ruff is not the root of the Ruff submodule checkout"
 ruff_revision="$(git -C "$ruff" rev-parse 'HEAD^{commit}')"
 [[ "$ruff_revision" == "$gitlink_revision" ]] || die "Ruff submodule HEAD $ruff_revision does not match gitlink $gitlink_revision"
+ruff_status="$(git -C "$ruff" status --porcelain=v1 --untracked-files=all)"
+[[ -z "$ruff_status" ]] || die "Ruff submodule has local changes; restore the pinned corpus before running compatibility checks"
 
-echo "Ruff Cargo dependencies, lockfile, gitlink, and submodule agree on $cargo_revision"
+echo "Ruff Cargo dependencies, lockfile, gitlink, and clean submodule agree on $cargo_revision"
