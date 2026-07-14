@@ -2029,6 +2029,37 @@ impl Compiler<'_> {
             && self.control.optimized_generator_boolean_condition
             && self.control.in_exception_handler())
         .then_some(ExceptionPolicy::EXCLUDE_ALWAYS);
+        let coroutine_boolean_loop_policy = (!collect_tuple
+            && self.unit.flags & CO_COROUTINE != 0
+            && !self.context.has_lazy_imports
+            && self.control.generator_region_start.is_some()
+            && self.control.depth == 0
+            && self.control.coroutine_suspension_epoch > 0
+            && self.control.active_exception_region_exclusions.is_empty()
+            && self.control.active_with_region_exclusions.is_empty()
+            && self
+                .control
+                .active_comprehension_region_exclusions
+                .is_empty()
+            && !self.control.in_exception_handler()
+            && self.control.active_exception_group_handlers == 0
+            && self.control.active_normal_finally_bodies == 0
+            && self.control.active_finally_end_blocks == 0
+            && matches!(
+                call.arguments.args.as_ref(),
+                [Expr::Generator(generator)]
+                    if !expression_suspends_current_scope(&generator.elt)
+                        && generator.generators.iter().enumerate().all(|(index, generator)| {
+                            !generator.is_async
+                                && (index == 0
+                                    || !expression_suspends_current_scope(&generator.iter))
+                                && !generator
+                                    .ifs
+                                    .iter()
+                                    .any(expression_suspends_current_scope)
+                        })
+            ))
+        .then_some(ExceptionPolicy::EXCLUDE_ALWAYS);
 
         // The optimized-call guard's NOT_TAKEN is appended after exception targets are labeled.
         // In a plain generator's while body, it inherits the stop-iteration owner after a direct
@@ -2081,6 +2112,15 @@ impl Compiler<'_> {
             0,
             handler_boolean_loop_policy
                 .or(generator_guard_exception_policy)
+                .or_else(|| {
+                    coroutine_boolean_loop_policy.map(|_| {
+                        if self.assembler.current_block_has_dynamic_exception_owner() {
+                            ExceptionPolicy::normalized_owner(true)
+                        } else {
+                            ExceptionPolicy::EXCLUDE_ALWAYS
+                        }
+                    })
+                })
                 .unwrap_or_else(|| {
                     if self
                         .control
@@ -2201,13 +2241,17 @@ impl Compiler<'_> {
                 NOT_TAKEN,
                 0,
                 0,
-                handler_boolean_loop_policy.unwrap_or_default(),
+                handler_boolean_loop_policy
+                    .or(coroutine_boolean_loop_policy)
+                    .unwrap_or_default(),
             )?;
             self.emit_jump_backward_with_exception_policy(
                 JUMP_BACKWARD,
                 loop_start,
                 0,
-                handler_boolean_loop_policy.unwrap_or_default(),
+                handler_boolean_loop_policy
+                    .or(coroutine_boolean_loop_policy)
+                    .unwrap_or_default(),
             )?;
             if let Some(start) = comprehension_exclusion_start {
                 let end = self.assembler.label();
