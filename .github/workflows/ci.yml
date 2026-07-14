@@ -183,7 +183,12 @@ jobs:
         run: rustup show
       - name: "Test core library and binary"
         run: cargo test --workspace --lib --bins --all-features --locked
-      # The benchmark-script integration tests require Bash and are covered by Linux.
+      # The benchmark_scripts integration target remains Linux-only because it exercises
+      # Bash-specific tooling.
+      - name: "Test CPython compatibility"
+        run: cargo test -p serc --test compatibility --all-features --locked
+      - name: "Test pinned inputs"
+        run: cargo test -p serc --test pinned_inputs --all-features --locked
       - name: "Test CLI"
         run: cargo test -p serc-cli --test cli --all-features --locked
 

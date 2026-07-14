@@ -85,8 +85,27 @@ fn checker() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/check-ruff-pin")
 }
 
+#[cfg(windows)]
+fn bash() -> PathBuf {
+    let output = Command::new("git").arg("--exec-path").output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let exec_path = String::from_utf8(output.stdout).unwrap();
+    let git_root = Path::new(exec_path.trim())
+        .ancestors()
+        .nth(3)
+        .expect("Git's exec path should be nested under its installation root");
+    let bash = git_root.join("bin/bash.exe");
+    assert!(bash.is_file(), "Git Bash is missing at {}", bash.display());
+    bash
+}
+
+#[cfg(not(windows))]
+fn bash() -> PathBuf {
+    PathBuf::from("bash")
+}
+
 fn check(checkout: &Path) -> Output {
-    Command::new("bash")
+    Command::new(bash())
         .arg(checker())
         .args(["--repo-root", checkout.to_str().unwrap()])
         .output()
