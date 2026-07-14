@@ -10821,7 +10821,26 @@ fn first_coroutine_try_else_condition(statement: &ruff_python_ast::StmtTry) -> O
 fn is_coroutine_try_else_truth_leaf(expression: &Expr) -> bool {
     match expression {
         Expr::Name(_) => true,
-        Expr::Attribute(attribute) => is_coroutine_try_else_truth_leaf(&attribute.value),
+        Expr::Attribute(attribute) => is_coroutine_try_else_attribute_chain(&attribute.value),
+        Expr::Call(call) => {
+            call.arguments.args.is_empty()
+                && call.arguments.keywords.is_empty()
+                && matches!(call.func.as_ref(), Expr::Attribute(attribute)
+                    if is_coroutine_try_else_attribute_chain(&attribute.value))
+        }
+        Expr::Subscript(subscript) => {
+            (matches!(subscript.slice.as_ref(), Expr::Name(_))
+                || is_literal_constant(&subscript.slice))
+                && is_coroutine_try_else_attribute_chain(&subscript.value)
+        }
+        _ => false,
+    }
+}
+
+fn is_coroutine_try_else_attribute_chain(expression: &Expr) -> bool {
+    match expression {
+        Expr::Name(_) => true,
+        Expr::Attribute(attribute) => is_coroutine_try_else_attribute_chain(&attribute.value),
         _ => false,
     }
 }
@@ -13050,6 +13069,72 @@ mod tests {
             "not [value for value in results][0].ready",
             "(1).real",
             "not (1).real",
+        ] {
+            assert!(
+                !coroutine_try_else_condition("result = await validate()", condition, ""),
+                "{condition}"
+            );
+        }
+    }
+
+    #[test]
+    fn coroutine_try_else_condition_accepts_zero_argument_methods_and_name_indices() {
+        for condition in [
+            "result.is_ready()",
+            "not result.service.is_ready()",
+            "(__debug__).real()",
+            "not (__debug__).real()",
+            "values[key]",
+            "result.values[key]",
+            "not result.service.values[key]",
+            "result.values[0]",
+            "result.values['ready']",
+            "result.values[b'ready']",
+            "result.values[None]",
+            "result.values[True]",
+            "result.values[...]",
+        ] {
+            assert!(
+                coroutine_try_else_condition("result = await validate()", condition, ""),
+                "{condition}"
+            );
+        }
+    }
+
+    #[test]
+    fn coroutine_try_else_condition_rejects_inline_or_suspending_call_and_subscript_parts() {
+        for condition in [
+            "ready()",
+            "__class__()",
+            "(__debug__)()",
+            "not (__debug__)()",
+            "super()",
+            "not super()",
+            "locals()",
+            "not locals()",
+            "globals()",
+            "not globals()",
+            "result.is_ready(value)",
+            "result.is_ready(value=value)",
+            "result.is_ready(await get_value())",
+            "result.is_ready(value=await get_value())",
+            "result.is_ready(first and second)",
+            "result.is_ready(value=first or second)",
+            "result.is_ready(first if choose else second)",
+            "result.is_ready(value for value in values)",
+            "result.is_ready([value for value in values])",
+            "result.is_ready(*values)",
+            "result.is_ready(**values)",
+            "factory().is_ready()",
+            "result.values[-1]",
+            "result.values[start:stop]",
+            "result.values[first, second]",
+            "result.values[first and second]",
+            "result.values[first if choose else second]",
+            "(await get_result()).values[key]",
+            "result.values[await get_key()]",
+            "value := result.ready",
+            "not (value := result.ready)",
         ] {
             assert!(
                 !coroutine_try_else_condition("result = await validate()", condition, ""),
