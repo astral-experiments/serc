@@ -1717,6 +1717,34 @@ def multiline_is_not(values, suffix):
         if suffix is not None or item.name.endswith(suffix)
     ]
 
+def multiline_trailing_truth(values, suffix):
+    return [
+        item
+        for item in values
+        if suffix is None or item.name
+    ]
+
+def multiline_leading_named(values, suffix):
+    return [
+        item
+        for item in values
+        if (selected := suffix.value) is None or item.name in selected
+    ]
+
+def multiline_leading_subscript(values, suffix):
+    return [
+        item
+        for item in values
+        if suffix[0] is None or item.name in suffix[0]
+    ]
+
+def multiline_three_arm(values, suffix, backup):
+    return [
+        item
+        for item in values
+        if suffix is None or backup is None or item.name in suffix
+    ]
+
 def multiline_second_filter(values, suffix, ready):
     return [
         item
@@ -1784,6 +1812,10 @@ def unfiltered_with(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, 
         ("multiline_try", &[false, false, true][..]),
         ("multiline_with", &[false, false, true][..]),
         ("multiline_is_not", &[false, false][..]),
+        ("multiline_trailing_truth", &[false, false][..]),
+        ("multiline_leading_named", &[false, false][..]),
+        ("multiline_leading_subscript", &[false, false][..]),
+        ("multiline_three_arm", &[false, false, false][..]),
         ("multiline_second_filter", &[false, true, false][..]),
         (
             "multiline_nested_comprehension_filter",
