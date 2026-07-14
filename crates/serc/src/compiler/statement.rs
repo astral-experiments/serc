@@ -299,8 +299,8 @@ pub(super) struct ControlFlowState {
     // The protected iterator Boolean condition whose first short-circuit marker reuses the
     // surrounding owner. Synchronous-with continues and first generator conditions use this.
     pub(super) protected_iterator_continue_condition: Option<ruff_text_size::TextRange>,
-    // The first continue condition in a synchronous iterator body after one simple
-    // leading assignment. The assignment can consume the removed iterator-target slot.
+    // The first eligible condition in a synchronous iterator body after simple leading
+    // assignments. Those assignments can consume the removed iterator-target slot.
     first_iterator_assignment_condition: Option<TextRange>,
     // The direct nested condition that begins a suspending iterator loop's final `elif` body.
     // CPython excludes its normalized marker when the body has a real fallthrough path.
@@ -3594,6 +3594,20 @@ impl Compiler<'_> {
                     && !matches!(test, Expr::BoolOp(_) | Expr::If(_))
                     && !expression_suspends_current_scope(test)
                     && !expression_contains_generator(test);
+                let preserve_first_coroutine_iterator_condition_owner =
+                    branch_index == 0
+                        && self.unit.flags & CO_COROUTINE != 0
+                        && self.control.generator_region_start.is_some()
+                        && self.control.active_exception_region_exclusions.is_empty()
+                        && self.control.active_with_region_exclusions.is_empty()
+                        && self.control.first_iterator_assignment_condition == Some(test.range())
+                        && (matches!(test, Expr::Name(_))
+                            || matches!(test, Expr::Named(named)
+                            if !matches!(body, [Stmt::Continue(_)])
+                                || is_simple_iterator_assert_assignment_value(&named.value)))
+                        && self.control.loops.last().is_some_and(|context| {
+                            context.iterator_cleanup == IteratorCleanup::Sync
+                        });
                 let preserve_sync_with_none_owner = branch_index == 0
                     && !suite_terminates(body)
                     && matches!(statement.elif_else_clauses.as_slice(), [clause]
@@ -4090,7 +4104,9 @@ impl Compiler<'_> {
                     // loop-control block slot.
                     self.assembler.preserve_last_not_taken_exception_owner();
                 }
-                if preserve_first_sync_iterator_condition_owner {
+                if preserve_first_sync_iterator_condition_owner
+                    || preserve_first_coroutine_iterator_condition_owner
+                {
                     // CPython removes the synthetic NOP before a synchronous iterator target.
                     // The first direct body condition reuses its protected CFG slot.
                     self.assembler.preserve_last_not_taken_exception_owner();
@@ -5915,7 +5931,15 @@ impl Compiler<'_> {
                     || self.control.inherited_statement_has_following,
             )
         })
-        .flatten();
+        .flatten()
+        .or_else(|| {
+            (!self.context.has_lazy_imports
+                && self.unit.flags & CO_COROUTINE != 0
+                && self.control.active_exception_region_exclusions.is_empty()
+                && self.control.active_with_region_exclusions.is_empty())
+            .then(|| first_coroutine_iterator_assignment_condition(&statement.body))
+            .flatten()
+        });
         let tail_jumps = self.with_loop_context(context, |compiler| {
             compiler.with_control_override(
                 |control| &mut control.first_iterator_assignment_condition,
@@ -10670,6 +10694,26 @@ fn first_iterator_assignment_condition(
             && !expression_contains_eager_suspension(test)
     };
     supported_test.then_some(test.range())
+}
+
+pub(super) fn first_coroutine_iterator_assignment_condition(body: &[Stmt]) -> Option<TextRange> {
+    let (leading, branch) = match body {
+        [Stmt::Assign(_), Stmt::If(branch), _, ..] => (&body[..1], branch),
+        [Stmt::Assign(_), Stmt::Assign(_), Stmt::If(branch), _, ..] => (&body[..2], branch),
+        _ => return None,
+    };
+    if !(matches!(branch.test.as_ref(), Expr::Name(_))
+        || matches!(branch.test.as_ref(), Expr::Named(named)
+            if is_simple_iterator_assert_assignment_value(&named.value)))
+        || !leading.iter().all(|statement| {
+            matches!(statement, Stmt::Assign(assignment)
+                if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                    && is_simple_iterator_assert_assignment_value(&assignment.value))
+        })
+    {
+        return None;
+    }
+    Some(branch.test.range())
 }
 
 fn expression_contains_eager_suspension(expression: &Expr) -> bool {
