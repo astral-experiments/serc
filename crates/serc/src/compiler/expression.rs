@@ -5676,6 +5676,12 @@ impl Compiler<'_> {
         };
         let preserve_iterator_loop_assertion_owner =
             self.control.preserve_first_iterator_loop_assertion_owner;
+        // A direct attribute-call assertion can reuse a compacted protected slot in a with body.
+        // Keep the block scan behind the cheap assertion and call guards.
+        let preserve_sync_with_assertion_owner = self.control.include_assert_none_condition_owner
+            && !self.control.active_with_region_exclusions.is_empty()
+            && matches!(expression, Expr::Call(call) if matches!(call.func.as_ref(), Expr::Attribute(_)))
+            && self.assembler.current_block_has_dynamic_exception_owner();
         let policy = ConditionMarkerPolicy {
             excluded: if comparison_is_boolean {
                 comparison_marker_owner
@@ -5687,7 +5693,8 @@ impl Compiler<'_> {
             } else {
                 ExceptionPolicy::normalized_owner(
                     self.control.active_normal_finally_bodies > 0
-                        || preserve_iterator_loop_assertion_owner,
+                        || preserve_iterator_loop_assertion_owner
+                        || preserve_sync_with_assertion_owner,
                 )
             },
         };
