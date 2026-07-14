@@ -4790,6 +4790,25 @@ impl Compiler<'_> {
             && self.control.active_with_region_exclusions.is_empty();
         let preserve_filtered_comprehension_short_circuit_none_owner = direct_filtered_comprehension
             && comprehension_condition_has_trailing_none(&expression.test);
+        // An unfused comprehension target can leave the leading specialized None-condition
+        // marker inside the cleanup region when the conditional short-circuits to a comparison.
+        let preserve_unfiltered_comprehension_leading_none_owner =
+            self.control.in_unfiltered_comprehension
+                && self.control.generator_region_start.is_none()
+                && self.control.active_exception_region_exclusions.is_empty()
+                && self.control.active_with_region_exclusions.is_empty()
+                && self.control.active_comprehension_region_exclusions.len() == 1
+                && matches!(expression.test.as_ref(), Expr::BoolOp(boolean)
+                if boolean.op == BoolOp::Or
+                    && matches!(boolean.values.as_slice(), [Expr::Compare(first), Expr::Compare(_)]
+                        if first.ops.len() == 1
+                            && matches!(first.ops[0], CmpOp::Is | CmpOp::IsNot)
+                            && matches!(first.left.as_ref(), Expr::Name(_))
+                            && first.comparators.len() == 1
+                            && matches!(first.comparators[0], Expr::NoneLiteral(_))));
+        let include_scoped_none_condition_owner =
+            preserve_unfiltered_comprehension_leading_none_owner
+                || self.control.include_scoped_none_condition_owner;
         if direct_filtered_comprehension
             && filtered_comprehension_has_ownerless_truth_condition(expression)
             && !self.control.force_filtered_comprehension_truth_ownerless
@@ -4807,9 +4826,15 @@ impl Compiler<'_> {
             )?;
         } else {
             self.with_control_override(
-                |control| &mut control.exclude_condition_not_taken_from_exception,
-                exclude_try_marker,
-                |compiler| compiler.compile_jump_if(&expression.test, false, else_label),
+                |control| &mut control.include_scoped_none_condition_owner,
+                include_scoped_none_condition_owner,
+                |compiler| {
+                    compiler.with_control_override(
+                        |control| &mut control.exclude_condition_not_taken_from_exception,
+                        exclude_try_marker,
+                        |compiler| compiler.compile_jump_if(&expression.test, false, else_label),
+                    )
+                },
             )?;
         }
         if preserve_none_condition_owner

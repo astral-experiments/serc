@@ -1741,6 +1741,37 @@ def multiline_singleton_after_outer_filter(values, suffix, ready):
         for extra in (item,)
         if suffix is None or extra.name.endswith(suffix)
     ]
+
+def unfiltered_nested_inner(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, groups, array):
+    return [
+        [value if replacement is None or array.kind == 'O' else replacement for value, replacement in group]
+        for group in groups
+    ]
+
+def unfiltered_try(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, values, replacements, array):
+    try:
+        return [
+            value if replacement is None or array.kind == 'O' else replacement
+            for value, replacement in zip(values, replacements, strict=True)
+        ]
+    except Exception:
+        return []
+
+def unfiltered_finally(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, values, replacements, array, cleanup):
+    try:
+        return [
+            value if replacement is None or array.kind == 'O' else replacement
+            for value, replacement in zip(values, replacements, strict=True)
+        ]
+    finally:
+        cleanup()
+
+def unfiltered_with(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, values, replacements, array, manager):
+    with manager:
+        return [
+            value if replacement is None or array.kind == 'O' else replacement
+            for value, replacement in zip(values, replacements, strict=True)
+        ]
 ";
     let parsed = parse_module(source).unwrap();
     let module = module_compiler(source, &parsed)
@@ -1762,6 +1793,10 @@ def multiline_singleton_after_outer_filter(values, suffix, ready):
             "multiline_singleton_after_outer_filter",
             &[false, true, false][..],
         ),
+        ("unfiltered_nested_inner", &[false, true][..]),
+        ("unfiltered_try", &[false, true, true][..]),
+        ("unfiltered_finally", &[false, true][..]),
+        ("unfiltered_with", &[false, true, true][..]),
     ] {
         let function = module
             .constants
