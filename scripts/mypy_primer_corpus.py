@@ -14,10 +14,10 @@ import re
 import subprocess
 import sys
 from collections import defaultdict
+from collections.abc import Iterable, Sequence
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any
 from urllib.parse import urlparse
-
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_LOCK = REPO_ROOT / "corpora" / "mypy-primer.lock.json"
@@ -27,9 +27,9 @@ SOURCE_SUFFIXES = (".py", ".pyi")
 LOCK_FORMAT = 1
 EXPECTED_BYTE_MISMATCHES = 5_527
 EXPECTED_CPYTHON_REJECTED = 160
-EXPECTED_MATCHED_REJECTIONS = 64
+EXPECTED_MATCHED_REJECTIONS = 67
 EXPECTED_REJECTION_MISMATCHES = 84
-EXPECTED_COMPILER_FAILURES = 12
+EXPECTED_COMPILER_FAILURES = 9
 HEX_REVISION = re.compile(r"[0-9a-f]{40}\Z")
 SAFE_ID = re.compile(r"[A-Za-z0-9._-]+\Z")
 
@@ -48,8 +48,7 @@ def run(
     process = subprocess.run(
         command,
         cwd=cwd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
         text=True,
         encoding="utf-8",
         errors="replace",
@@ -148,7 +147,10 @@ def validate_lock(lock: dict[str, Any]) -> None:
         raise CorpusError("corpus lock repositories are not sorted by id")
     if len(repositories) != repository_count:
         raise CorpusError("catalog repository count does not match the repository lock")
-    if sum(len(repository["logical_projects"]) for repository in repositories) != entries:
+    if (
+        sum(len(repository["logical_projects"]) for repository in repositories)
+        != entries
+    ):
         raise CorpusError("catalog entry count does not match the logical project lock")
 
     content = lock.get("content")
@@ -199,11 +201,16 @@ def read_catalog(checkout: Path) -> tuple[str, list[tuple[str, str]]]:
     try:
         source = projects_file.read_text(encoding="utf-8")
     except FileNotFoundError as error:
-        raise CorpusError(f"mypy_primer project catalog is missing: {projects_file}") from error
+        raise CorpusError(
+            f"mypy_primer project catalog is missing: {projects_file}"
+        ) from error
     tree = ast.parse(source, filename=str(projects_file))
     calls: list[ast.Call] | None = None
     for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "get_projects":
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "get_projects"
+        ):
             for statement in node.body:
                 if (
                     isinstance(statement, ast.Assign)
@@ -251,7 +258,9 @@ def read_catalog(checkout: Path) -> tuple[str, list[tuple[str, str]]]:
         cwd=checkout,
     ).stdout
     if dirty:
-        raise CorpusError(f"mypy_primer project catalog has local changes: {dirty.strip()}")
+        raise CorpusError(
+            f"mypy_primer project catalog has local changes: {dirty.strip()}"
+        )
     return revision, entries
 
 
@@ -280,14 +289,18 @@ def check_catalog(args: argparse.Namespace) -> None:
         missing = sorted(expected.keys() - actual.keys())
         added = sorted(actual.keys() - expected.keys())
         changed = sorted(
-            url for url in actual.keys() & expected.keys() if actual[url] != expected[url]
+            url
+            for url in actual.keys() & expected.keys()
+            if actual[url] != expected[url]
         )
         raise CorpusError(
             "mypy_primer catalog does not match the corpus lock: "
             f"missing={missing}, added={added}, changed={changed}"
         )
     if lock["catalog"].get("entries") != len(entries):
-        raise CorpusError("mypy_primer catalog entry count does not match the corpus lock")
+        raise CorpusError(
+            "mypy_primer catalog entry count does not match the corpus lock"
+        )
     if lock["catalog"].get("repositories") != len(actual):
         raise CorpusError("mypy_primer repository count does not match the corpus lock")
     print(
@@ -339,7 +352,9 @@ def update_lock(args: argparse.Namespace) -> None:
             except Exception as error:  # report every failed remote together
                 failures.append(f"{url}: {error}")
     if failures:
-        raise CorpusError("failed to resolve repository revisions:\n  " + "\n  ".join(failures))
+        raise CorpusError(
+            "failed to resolve repository revisions:\n  " + "\n  ".join(failures)
+        )
 
     repositories = []
     for url, names in by_url.items():
@@ -385,7 +400,9 @@ def current_revision(checkout: Path) -> str | None:
 
 
 def require_clean(checkout: Path) -> None:
-    status = git(["status", "--porcelain", "--untracked-files=all"], cwd=checkout).stdout
+    status = git(
+        ["status", "--porcelain", "--untracked-files=all"], cwd=checkout
+    ).stdout
     if status:
         raise CorpusError(f"checkout has local changes: {checkout}\n{status.rstrip()}")
 
@@ -426,7 +443,9 @@ def setup_repository(corpus_root: Path, repository: dict[str, Any]) -> str:
 
     actual = current_revision(checkout)
     if actual != revision:
-        raise CorpusError(f"checkout revision mismatch for {checkout}: {actual} != {revision}")
+        raise CorpusError(
+            f"checkout revision mismatch for {checkout}: {actual} != {revision}"
+        )
     require_clean(checkout)
     return repository["id"]
 
@@ -441,7 +460,9 @@ def setup(args: argparse.Namespace) -> None:
     completed: list[str] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as executor:
         futures = {
-            executor.submit(setup_repository, args.corpus_root, repository): repository["id"]
+            executor.submit(setup_repository, args.corpus_root, repository): repository[
+                "id"
+            ]
             for repository in lock["repositories"]
         }
         for future in concurrent.futures.as_completed(futures):
@@ -451,7 +472,9 @@ def setup(args: argparse.Namespace) -> None:
             except Exception as error:
                 failures.append(f"{identifier}: {error}")
     if failures:
-        raise CorpusError("failed to set up corpus repositories:\n  " + "\n  ".join(failures))
+        raise CorpusError(
+            "failed to set up corpus repositories:\n  " + "\n  ".join(failures)
+        )
     print(f"Prepared {len(completed)} locked repositories under {args.corpus_root}")
 
 
@@ -468,7 +491,11 @@ def iter_sources(
             )
             for filename in sorted(filenames):
                 path = Path(directory) / filename
-                if path.suffix in SOURCE_SUFFIXES and path.is_file() and not path.is_symlink():
+                if (
+                    path.suffix in SOURCE_SUFFIXES
+                    and path.is_file()
+                    and not path.is_symlink()
+                ):
                     yield repository["id"], path.relative_to(checkout), path
 
 
@@ -630,10 +657,13 @@ def parser() -> argparse.ArgumentParser:
     subparsers = result.add_subparsers(dest="command", required=True)
 
     update_parser = subparsers.add_parser(
-        "update-lock", help="resolve a pinned mypy_primer catalog to exact repository commits"
+        "update-lock",
+        help="resolve a pinned mypy_primer catalog to exact repository commits",
     )
     update_parser.add_argument("--primer-checkout", type=Path, required=True)
-    update_parser.add_argument("--jobs", type=positive_int, default=min(8, os.cpu_count() or 1))
+    update_parser.add_argument(
+        "--jobs", type=positive_int, default=min(8, os.cpu_count() or 1)
+    )
     update_parser.set_defaults(handler=update_lock)
 
     catalog_parser = subparsers.add_parser(
@@ -643,21 +673,28 @@ def parser() -> argparse.ArgumentParser:
     catalog_parser.set_defaults(handler=check_catalog)
 
     setup_parser = subparsers.add_parser("setup", help="fetch every locked repository")
-    setup_parser.add_argument("--jobs", type=positive_int, default=min(8, os.cpu_count() or 1))
+    setup_parser.add_argument(
+        "--jobs", type=positive_int, default=min(8, os.cpu_count() or 1)
+    )
     setup_parser.set_defaults(handler=setup)
 
-    verify_parser = subparsers.add_parser("verify", help="verify revisions and frozen source bytes")
+    verify_parser = subparsers.add_parser(
+        "verify", help="verify revisions and frozen source bytes"
+    )
     verify_parser.set_defaults(handler=verify)
 
     content_parser = subparsers.add_parser(
-        "lock-content", help="record source count, byte count, and aggregate digest after an update"
+        "lock-content",
+        help="record source count, byte count, and aggregate digest after an update",
     )
     content_parser.set_defaults(handler=lock_content)
 
     check_parser = subparsers.add_parser(
         "check", help="run byte-for-byte CPython compatibility over the frozen corpus"
     )
-    check_parser.add_argument("--python", default=os.environ.get("CPYTHON", "python3.14"))
+    check_parser.add_argument(
+        "--python", default=os.environ.get("CPYTHON", "python3.14")
+    )
     check_parser.add_argument("--limit", type=positive_int)
     check_parser.set_defaults(handler=check_compatibility)
     return result

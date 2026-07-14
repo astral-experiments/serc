@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+if ! command -v ruff >/dev/null 2>&1; then
+  echo "error: Ruff 0.15.15 is required; install it with: python3 -m pip install ruff==0.15.15" >&2
+  exit 1
+fi
+
+# The Ruff configuration excludes compiler fixtures and vendored sources whose
+# spelling and layout must remain unchanged. All other Python is repository tooling.
+ruff check .
+ruff format --check .

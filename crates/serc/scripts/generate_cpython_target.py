@@ -106,8 +106,7 @@ def read_committed_file(checkout: Path, relative: str) -> str:
         result = subprocess.run(
             ["git", "-C", str(checkout), "show", f"{TARGET_COMMIT}:{relative}"],
             check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
         )
     except subprocess.CalledProcessError as error:
         detail = error.stderr.decode(errors="replace").strip()
@@ -702,7 +701,9 @@ def render(sources: dict[str, str]) -> str:
     lines.extend(["}", "", "pub(crate) static PREINTERNED_STRINGS: &[&str] = &["])
     lines.extend(f"    {rust_string_literal(value)}," for value in preinterned_strings)
     lines.extend(["];", ""])
-    lines.extend(render_preinterned_lookup(preinterned_strings, STARTUP_INTERNED_STRINGS))
+    lines.extend(
+        render_preinterned_lookup(preinterned_strings, STARTUP_INTERNED_STRINGS)
+    )
     lines.extend(["", "#[allow(dead_code)]", "impl Opcode {"])
     for method, flag in (
         ("has_argument", "HAS_ARG_FLAG"),

@@ -50,9 +50,10 @@ let source = b"# coding: utf-8\r\nanswer = 42\r\n";
 let pyc = serc::compile_bytes_to_pyc(source, "module.py", 1_700_000_000).unwrap();
 ```
 
-Filesystem-aware callers that must sample metadata after compilation can call `compile_bytes`,
-sample the mtime and size, then call `CompiledModule::to_timestamp_pyc`. The CLI uses this order so
-a source changed during compilation gets the same timestamp-header behavior as before.
+Filesystem-aware callers should snapshot metadata, read the source, call `compile_bytes`, then call
+`CompiledModule::to_timestamp_pyc` with the snapshot. The CLI takes the snapshot before reading so
+a path changed during compilation receives a header for the old snapshot and cannot validate the
+new source as fresh.
 
 ## CPython corpus comparison
 
@@ -84,12 +85,12 @@ current result is:
 ```text
 exact:               2,230
 CPython rejected:      221
-matched rejection:      118
-rejection mismatch:     76
+matched rejection:      128
+rejection mismatch:     75
 byte mismatch:           0
 unsupported:             0
-Ruff parse mismatch:     0
-compiler failure:       27
+parse/decode mismatch:   0
+compiler failure:       18
 non-UTF-8:               0
 oracle failure:          0
 ```
@@ -108,8 +109,8 @@ CPython tag `v3.14.5` at commit
 that exact commit, then verify that it is current:
 
 ```console
-python3 scripts/generate_cpython_target.py --cpython /path/to/cpython
-python3 scripts/generate_cpython_target.py --cpython /path/to/cpython --check
+python3 crates/serc/scripts/generate_cpython_target.py --cpython /path/to/cpython
+python3 crates/serc/scripts/generate_cpython_target.py --cpython /path/to/cpython --check
 ```
 
 The generator rejects a checkout at any other commit and reads every input through that pinned

@@ -4,9 +4,9 @@ Serc compiles Python source to CPython code objects without embedding or startin
 Python runtime. Ruff supplies the parser and AST; the rest of the compiler, assembler, marshal
 writer, and `.pyc` wrapper are implemented in Rust.
 
-This document describes the boundaries that must remain stable for byte-for-byte compatibility.
-It is intentionally specific to the current backend rather than a design for a generic Python
-virtual machine.
+This document describes the boundaries that must remain stable for byte-for-byte compatibility
+with the pinned CPython 3.14.5 oracle and required corpus. It is intentionally specific to the
+current backend rather than a design for a generic Python virtual machine.
 
 ## Compatibility contract
 
@@ -28,8 +28,9 @@ The oracle comparison is:
 marshal.dumps(compile(source, filename, "exec", dont_inherit=True, optimize=0))
 ```
 
-Matching executable behavior is therefore insufficient. The emitted marshal bytes must match the
-oracle, including metadata and reference layout.
+Matching executable behavior is therefore insufficient. For every CPython-accepted fixture in the
+required corpus, the emitted marshal bytes must match the oracle, including metadata and reference
+layout.
 
 ## Pipeline and ownership
 
@@ -115,10 +116,10 @@ Before assembly, `Compiler::finish_inner`:
 1. computes CPython local-kind bytes; and
 1. passes the symbolic stream to `Assembler::finish_code`.
 
-`src/code_object.rs` owns the finished `Constant` and `CodeObject` model. It is a neutral leaf
-shared by the compiler and marshal layers, so binary encoding does not depend on compiler
-implementation details. The resulting `CodeObject` is the complete handwritten representation
-consumed by the marshal layer.
+`src/code_object.rs` owns the finished `Constant` and `CodeObject` model shared by the compiler and
+marshal layers. Alongside semantic code-object fields, it carries marshal planning hints computed
+during compilation; binary encoding remains owned by the marshal layer. The resulting `CodeObject`
+is the complete handwritten representation consumed by that layer.
 
 ### Assembler
 
@@ -245,6 +246,7 @@ The generator reads these CPython files:
 - `Include/cpython/code.h`;
 - `Include/internal/pycore_code.h`;
 - `Include/internal/pycore_magic_number.h`;
+- `Include/internal/pycore_global_strings.h`;
 - `Include/patchlevel.h`;
 - `Python/codegen.c`;
 - `Python/flowgraph.c`;
@@ -279,7 +281,7 @@ marshal output. From the repository root, with `RUFF` pointing to a Ruff checkou
 
 ```console
 SERC_TEST_PYTHON=/path/to/python3.14 \
-  cargo test --locked --workspace --all-targets
+  cargo test --locked --workspace --all-targets --all-features
 
 cargo run --locked -p serc --example compare_cpython_corpus -- \
   --python /path/to/python3.14 \
@@ -300,7 +302,7 @@ result. `--require-all` requires every CPython-accepted file to match exactly;
 without an internal failure.
 
 The frozen baseline is 2,230 exact matches and 221 CPython-rejected files. Of the rejected files,
-118 are matched rejections, 76 are currently accepted by Serc, and 27 reach an internal compiler
+128 are matched rejections, 75 are currently accepted by Serc, and 18 reach an internal compiler
 failure. There are zero byte mismatches, unsupported files, parse mismatches, non-UTF-8 files, or
 oracle failures among CPython-accepted inputs.
 

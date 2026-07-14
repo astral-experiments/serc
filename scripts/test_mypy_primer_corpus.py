@@ -164,11 +164,11 @@ def get_projects():
 
         self.assertEqual(expected_exact, 67_850)
         self.assertEqual(expected_rejected, 160)
-        self.assertEqual(expected_outcomes["matched-rejection"], 64)
+        self.assertEqual(expected_outcomes["matched-rejection"], 67)
         self.assertEqual(expected_outcomes["byte-mismatch"], 5_527)
         self.assertEqual(expected_outcomes["unsupported"], 0)
         self.assertEqual(expected_outcomes["parse-mismatch"], 0)
-        self.assertEqual(expected_outcomes["compiler-failure"], 12)
+        self.assertEqual(expected_outcomes["compiler-failure"], 9)
         self.assertEqual(expected_outcomes["rejection-mismatch"], 84)
         self.assertEqual(expected_outcomes["non-utf8"], 0)
         self.assertEqual(expected_outcomes["oracle-failure"], 0)

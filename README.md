@@ -3,7 +3,8 @@
 ![CI](https://github.com/astral-sh/serc/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-A Rust compiler from Python source to byte-for-byte-compatible CPython bytecode.
+A Rust compiler for Python source that targets byte-for-byte compatibility with CPython 3.14.5 on
+pinned corpora.
 
 **Experimental:** This project was authored by GPT and is not intended for
 public consumption. Use at your own risk.
@@ -15,12 +16,17 @@ Serc compiles Python without embedding or starting a Python runtime. The
 ## Development
 
 ```console
-SERC_TEST_PYTHON=/path/to/python3.14 cargo test --workspace --all-targets
-cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all --check
+./scripts/check-python-style
+SERC_TEST_PYTHON=/path/to/python3.14 \
+  cargo test --workspace --all-targets --all-features --locked
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 ```
 
 Oracle-dependent tests fail unless `SERC_TEST_PYTHON` names the exact
 CPython 3.14.5 target, including its expected bytecode magic number.
+The Python style gate requires exactly Ruff 0.15.15; install it with
+`python3 -m pip install ruff==0.15.15`.
 
 ## Benchmarks
 
@@ -44,11 +50,13 @@ cd serc
 ./scripts/check-cpython-compatibility /path/to/python3.14
 ```
 
-The script requires the pinned submodule corpus and compares Serc's marshal
-output with `marshal.dumps(compile(...))` for 2,451 Python fixtures. It checks
-the frozen split of 2,230 exact matches and 221 CPython-rejected inputs, with no
-other outcomes. CI runs this gate against the exact supported CPython release
-on every pull request and every push to `main`.
+The script requires the pinned submodule corpus and runs the exact CPython
+oracle over 2,451 Python fixtures. For the 2,230 inputs accepted by CPython, it
+requires Serc's marshal output to match `marshal.dumps(compile(...))`
+exactly. The frozen baseline separately records 221 CPython-rejected inputs: 128 matched Serc
+rejections, 75 inputs accepted by Serc, and 18 internal compiler failures. CI freezes each
+outcome category against the exact supported CPython release on every pull request and every push
+to `main`.
 
 For broader diagnostics, Serc also has a separately pinned corpus derived
 from [`mypy_primer`](https://github.com/hauntsaninja/mypy_primer). The frozen
@@ -64,24 +72,24 @@ network, storage, and CPU resources:
 
 The current compatibility measurements are:
 
-| Corpus | Files | CPython-rejected | Byte-identical | Byte mismatches | Match rate |
+| Corpus | Files | CPython-rejected | Byte-identical accepted | Byte mismatches | Accepted-input match rate |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | Ruff fixtures | 2,451 | 221 | 2,230 | 0 | 100% |
 | NumPy `v2.4.6` | 505 | 0 | 505 | 0 | 100% |
 | mypy-primer snapshot | 73,537 | 160 | 67,850 | 5,527 | 92.47% |
 | **Combined** | **76,493** | **381** | **70,585** | **5,527** | **92.74%** |
 
-Of the 160 CPython-rejected mypy-primer files, Serc matches 64 rejections, accepts 84, and
-reports a compiler failure for 12. These outcomes are frozen independently of the marshal-byte
+Of the 160 CPython-rejected mypy-primer files, Serc matches 67 rejections, accepts 84, and
+reports a compiler failure for 9. These outcomes are frozen independently of the marshal-byte
 measurements above.
 
 The second command freezes every mypy-primer outcome category and exits unsuccessfully when any
 category count changes, so compatibility improvements advance the baseline explicitly and
 mismatches cannot silently turn into unsupported inputs, compiler failures, or oracle failures. CI
-validates the pinned catalog and the
-corpus-management scripts, but the full comparison does not replace or weaken
-the Ruff compatibility gate above. See [`corpora/README.md`](corpora/README.md)
-for the exact snapshot boundary and reproducibility details.
+validates the pinned catalog and the corpus-management scripts, but the full comparison does not
+replace or weaken the Ruff compatibility gate above. See
+[`corpora/README.md`](corpora/README.md) for the exact snapshot boundary and reproducibility
+details.
 
 ### Holdout compatibility
 
@@ -90,7 +98,7 @@ four large OSS projects that are absent from the mypy-primer snapshot. The
 July 14, 2026 holdout compiled each project's Python sources and stubs with
 CPython 3.14.5 and compared the resulting marshal output byte for byte:
 
-| Holdout project | Files | CPython-rejected | Byte-identical | Byte mismatches | Match rate |
+| Holdout project | Files | CPython-rejected | Byte-identical accepted | Byte mismatches | Accepted-input match rate |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | [Django `bf5e73c`](https://github.com/django/django/tree/bf5e73c576c8c7d8b3ef1c03a22cf724dbb2f306) | 2,927 | 1 | 2,785 | 141 | 95.18% |
 | [Airflow `cad6220`](https://github.com/apache/airflow/tree/cad6220034e87c586eb87e14b5a75f4b82984fd0) | 7,621 | 0 | 7,236 | 385 | 94.95% |
@@ -99,7 +107,7 @@ CPython 3.14.5 and compared the resulting marshal output byte for byte:
 | **Combined holdout** | **17,001** | **1** | **16,150** | **850** | **95.00%** |
 
 The holdout had no unsupported inputs, parse/decode mismatches, compiler
-panics, or oracle failures. It is an independent diagnostic measurement, not
+failures, or oracle failures. It is an independent diagnostic measurement, not
 part of the frozen compatibility baseline or the required CI gate.
 
 See [`crates/serc/ARCHITECTURE.md`](crates/serc/ARCHITECTURE.md) for
@@ -109,9 +117,10 @@ compiler internals and target-generation details.
 
 Serc is experimental. It currently targets exactly CPython 3.14.5; Python
 bytecode and marshal formats are not stable across Python releases. Changes to
-the compiler are accepted only when the pinned compatibility corpus remains
-byte-for-byte compatible with CPython. Serc was authored entirely by GPT
-in Codex.
+the compiler are accepted only when every CPython-accepted input in the
+required pinned corpus remains byte-identical and the frozen outcome counts
+remain unchanged unless intentionally advanced. Serc was authored entirely
+by GPT in Codex.
 
 ## License
 
