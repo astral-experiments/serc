@@ -3822,10 +3822,11 @@ impl Compiler<'_> {
                 && matches!(leading, [Expr::Compare(comparison)]
                     if comparison.ops.len() == 1
                         && comparison.ops[0] == CmpOp::Is
-                        && matches!(comparison.left.as_ref(), Expr::Name(_))
+                        && matches!(comparison.left.as_ref(), Expr::Name(_) | Expr::Attribute(_))
                         && comparison.comparators.len() == 1
                         && matches!(comparison.comparators[0], Expr::NoneLiteral(_)))
-                && matches!(last, Expr::Call(call) if matches!(call.func.as_ref(), Expr::Attribute(_)))
+                && (matches!(last, Expr::Call(call) if matches!(call.func.as_ref(), Expr::Attribute(_)))
+                    || matches!(last, Expr::Compare(_)))
                 && self.assembler.location().line < self.source_location(leading[0].range()).line;
             for value in leading {
                 if preserve_multiline_list_filter_none_owner {
