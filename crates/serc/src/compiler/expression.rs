@@ -2079,6 +2079,41 @@ impl Compiler<'_> {
                         })
             ))
         .then_some(ExceptionPolicy::EXCLUDE_ALWAYS);
+        // CPython appends the Boolean-loop marker and backedge after the coroutine assertion's
+        // stop-iteration target is labeled. The dispatch marker keeps its ordinary owner.
+        let pre_suspension_coroutine_all_loop_policy = (callable == "all"
+            && self.control.pre_suspension_coroutine_all_assertion == Some(call.range)
+            && self.unit.flags & CO_COROUTINE != 0
+            && !self.context.has_lazy_imports
+            && self.control.generator_region_start.is_some()
+            && self.control.depth == 0
+            && self.control.coroutine_suspension_epoch == 0
+            && !self.control.in_loop()
+            && self.control.active_exception_region_exclusions.is_empty()
+            && self.control.active_with_region_exclusions.is_empty()
+            && self
+                .control
+                .active_comprehension_region_exclusions
+                .is_empty()
+            && !self.control.in_exception_handler()
+            && self.control.active_exception_group_handlers == 0
+            && self.control.active_normal_finally_bodies == 0
+            && self.control.active_finally_end_blocks == 0
+            && matches!(
+                call.arguments.args.as_ref(),
+                [Expr::Generator(generator)]
+                    if generator.generators.len() == 1
+                        && !expression_suspends_current_scope(&generator.elt)
+                        && generator.generators.iter().all(|generator| {
+                            !generator.is_async
+                                && !expression_suspends_current_scope(&generator.iter)
+                                && !generator
+                                    .ifs
+                                    .iter()
+                                    .any(expression_suspends_current_scope)
+                        })
+            ))
+        .then_some(ExceptionPolicy::EXCLUDE_ALWAYS);
 
         // The optimized-call guard's NOT_TAKEN is appended after exception targets are labeled.
         // In a plain generator's while body, it inherits the stop-iteration owner after a direct
@@ -2263,6 +2298,7 @@ impl Compiler<'_> {
                 handler_boolean_loop_policy
                     .or(coroutine_boolean_loop_policy)
                     .or(synchronous_with_boolean_loop_policy)
+                    .or(pre_suspension_coroutine_all_loop_policy)
                     .unwrap_or_default(),
             )?;
             self.emit_jump_backward_with_exception_policy(
@@ -2272,6 +2308,7 @@ impl Compiler<'_> {
                 handler_boolean_loop_policy
                     .or(coroutine_boolean_loop_policy)
                     .or(synchronous_with_boolean_loop_policy)
+                    .or(pre_suspension_coroutine_all_loop_policy)
                     .unwrap_or_default(),
             )?;
             if let Some(start) = comprehension_exclusion_start {
