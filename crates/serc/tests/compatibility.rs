@@ -147,6 +147,112 @@ mod tests {
     }
 
     #[test]
+    fn structured_semantic_syntax_errors_have_ranges() {
+        let cases = [
+            ("break\n", "'break' outside loop", "break"),
+            ("continue\n", "'continue' not properly in loop", "continue"),
+            ("return value\n", "'return' outside function", "return"),
+            ("await value\n", "'await' outside function", "await"),
+            (
+                "async for item in items:\n    pass\n",
+                "'async for' outside async function",
+                "async for",
+            ),
+            ("yield value\n", "'yield' outside function", "yield"),
+            (
+                "yield from values\n",
+                "'yield from' outside function",
+                "yield from",
+            ),
+            (
+                "async def f():\n    yield from values\n",
+                "'yield from' inside async function",
+                "yield from",
+            ),
+            (
+                "while condition:\n    pass\nelse:\n    break\n",
+                "'break' outside loop",
+                "break",
+            ),
+            (
+                "while condition:\n    def nested():\n        continue\n",
+                "'continue' not properly in loop",
+                "continue",
+            ),
+            (
+                "def outer():\n    class Nested:\n        return value\n",
+                "'return' outside function",
+                "return",
+            ),
+        ];
+
+        for (source, expected_message, expected_prefix) in cases {
+            let error = compile(source, "invalid_semantic_syntax.py").unwrap_err();
+            let CompileError::InvalidSyntax { message, range } = &error else {
+                panic!("expected invalid syntax error, got {error:?}");
+            };
+
+            assert_eq!(message, expected_message);
+            assert_eq!(error.range(), Some(*range));
+            assert!(
+                source[*range].starts_with(expected_prefix),
+                "expected {range:?} to start with {expected_prefix:?}, got {:?}",
+                &source[*range]
+            );
+            assert!(error.source().is_none());
+            assert_eq!(
+                error.to_string(),
+                format!("failed to parse Python source: {expected_message}")
+            );
+        }
+    }
+
+    #[test]
+    fn async_with_is_rejected_consistently_outside_async_functions() {
+        let cases = [
+            "async with manager:\n    pass\n",
+            "async with manager:\n    pass\nafter = 1\n",
+            "def f():\n    async with manager:\n        pass\n",
+            "def f():\n    async with manager:\n        pass\n    after = 1\n",
+        ];
+
+        for source in cases {
+            let error = compile(source, "invalid_async_with.py").unwrap_err();
+            let CompileError::InvalidSyntax { message, range } = &error else {
+                panic!("expected invalid syntax error, got {error:?}");
+            };
+
+            assert_eq!(message, "'async with' outside async function");
+            assert_eq!(error.range(), Some(*range));
+            assert!(source[*range].starts_with("async with"));
+        }
+    }
+
+    #[test]
+    fn valid_semantic_syntax_still_compiles() {
+        let source = r"
+while condition:
+    break
+
+def regular():
+    return value
+
+def generator():
+    yield value
+    yield from values
+
+async def coroutine():
+    await value
+    async for item in items:
+        continue
+    async with manager:
+        return item
+";
+
+        compile(source, "valid_semantic_syntax.py").unwrap();
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_an_empty_module() {
         assert_matches_cpython_marshal("", "empty.py");
     }

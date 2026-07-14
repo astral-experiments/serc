@@ -111,6 +111,13 @@ pub enum CompileError {
         /// The byte range of the invalid pattern in the normalized source.
         range: TextRange,
     },
+    /// The parsed source violates a context-dependent Python syntax restriction.
+    InvalidSyntax {
+        /// The syntax restriction violated by the source.
+        message: String,
+        /// The byte range of the invalid syntax in the normalized source.
+        range: TextRange,
+    },
     /// The source uses valid Python syntax that this backend does not support yet.
     Unsupported(String),
     /// The compiler violated one of its own invariants.
@@ -122,8 +129,15 @@ impl CompileError {
     pub fn range(&self) -> Option<TextRange> {
         match self {
             Self::Parse(error) => Some(error.location),
-            Self::InvalidPattern { range, .. } => Some(*range),
+            Self::InvalidPattern { range, .. } | Self::InvalidSyntax { range, .. } => Some(*range),
             Self::Decode(_) | Self::Unsupported(_) | Self::Internal(_) => None,
+        }
+    }
+
+    pub(crate) fn invalid_syntax(message: impl Into<String>, range: TextRange) -> Self {
+        Self::InvalidSyntax {
+            message: message.into(),
+            range,
         }
     }
 }
@@ -133,7 +147,7 @@ impl fmt::Display for CompileError {
         match self {
             Self::Decode(error) => write!(formatter, "failed to decode Python source: {error}"),
             Self::Parse(error) => write!(formatter, "failed to parse Python source: {error}"),
-            Self::InvalidPattern { message, .. } => {
+            Self::InvalidPattern { message, .. } | Self::InvalidSyntax { message, .. } => {
                 write!(formatter, "failed to parse Python source: {message}")
             }
             Self::Unsupported(message) => formatter.write_str(message),
@@ -147,7 +161,10 @@ impl Error for CompileError {
         match self {
             Self::Decode(error) => Some(error),
             Self::Parse(error) => Some(error),
-            Self::InvalidPattern { .. } | Self::Unsupported(_) | Self::Internal(_) => None,
+            Self::InvalidPattern { .. }
+            | Self::InvalidSyntax { .. }
+            | Self::Unsupported(_)
+            | Self::Internal(_) => None,
         }
     }
 }

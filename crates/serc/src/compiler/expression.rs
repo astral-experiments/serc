@@ -1268,7 +1268,10 @@ impl Compiler<'_> {
             Expr::Generator(generator) => self.compile_generator_expression(generator)?,
             Expr::Yield(expression) => {
                 if self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0 {
-                    return Err(unsupported("yield outside generator code"));
+                    return Err(CompileError::invalid_syntax(
+                        "'yield' outside function",
+                        expression.range,
+                    ));
                 }
                 if let Some(value) = &expression.value {
                     self.compile_expression(value)?;
@@ -1295,7 +1298,12 @@ impl Compiler<'_> {
             }
             Expr::YieldFrom(expression) => {
                 if self.unit.flags & CO_GENERATOR == 0 {
-                    return Err(unsupported("yield from outside generator code"));
+                    let message = if self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR) != 0 {
+                        "'yield from' inside async function"
+                    } else {
+                        "'yield from' outside function"
+                    };
+                    return Err(CompileError::invalid_syntax(message, expression.range));
                 }
                 self.compile_expression(&expression.value)?;
                 self.emit(GET_YIELD_FROM_ITER, 0, 0)?;
@@ -1800,7 +1808,10 @@ impl Compiler<'_> {
         expression: &ruff_python_ast::ExprAwait,
     ) -> Result<(), CompileError> {
         if self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR) == 0 {
-            return Err(unsupported("await outside coroutine code"));
+            return Err(CompileError::invalid_syntax(
+                "'await' outside function",
+                expression.range,
+            ));
         }
 
         self.compile_expression(&expression.value)?;
