@@ -5786,13 +5786,17 @@ impl Compiler<'_> {
         let condition_fallthrough_to_loop_backedge =
             self.control.suite_fallthrough_to_loop_backedge;
         let retain_dynamic_while_condition_owner = exclude_not_taken
+            && !self.context.has_lazy_imports
             && !condition_fallthrough_to_loop_backedge
             && matches!(
                 statement.test.as_ref(),
                 Expr::Named(named)
                     if matches!(
                         named.value.as_ref(),
-                        Expr::Call(call) if matches!(call.func.as_ref(), Expr::Name(_))
+                        Expr::Call(call)
+                            if matches!(call.func.as_ref(), Expr::Name(_))
+                                || (self.control.active_with_region_exclusions.is_empty()
+                                    && matches!(call.func.as_ref(), Expr::Attribute(_)))
                     )
             )
             && !expression_suspends_current_scope(&statement.test)

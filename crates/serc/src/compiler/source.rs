@@ -60,9 +60,28 @@ impl<'source> CompilationContext<'source> {
 }
 
 fn suite_has_lazy_imports(body: &Suite) -> bool {
-    body.iter().any(|statement| {
-        matches!(statement, Stmt::Import(import) if import.is_lazy)
-            || matches!(statement, Stmt::ImportFrom(import) if import.is_lazy)
+    body.iter().any(|statement| match statement {
+        Stmt::Import(import) => import.is_lazy,
+        Stmt::ImportFrom(import) => import.is_lazy,
+        Stmt::If(statement) => {
+            suite_has_lazy_imports(&statement.body)
+                || statement
+                    .elif_else_clauses
+                    .iter()
+                    .any(|clause| suite_has_lazy_imports(&clause.body))
+        }
+        Stmt::For(statement) => {
+            suite_has_lazy_imports(&statement.body) || suite_has_lazy_imports(&statement.orelse)
+        }
+        Stmt::While(statement) => {
+            suite_has_lazy_imports(&statement.body) || suite_has_lazy_imports(&statement.orelse)
+        }
+        Stmt::With(statement) => suite_has_lazy_imports(&statement.body),
+        Stmt::Match(statement) => statement
+            .cases
+            .iter()
+            .any(|case| suite_has_lazy_imports(&case.body)),
+        _ => false,
     })
 }
 
