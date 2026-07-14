@@ -5670,11 +5670,42 @@ impl Compiler<'_> {
         let exclude_not_taken = !self.control.active_exception_region_exclusions.is_empty()
             || self.control.active_terminal_withs > 0
             || self.control.generator_region_start.is_some();
+        let preserve_protected_while_none_owner =
+            !self.control.active_with_region_exclusions.is_empty()
+                && statement.body.len() <= 8
+                && is_specialized_none_condition(&statement.test)
+                && !self.context.has_lazy_imports
+                && matches!(self.unit.scope, Scope::Function { .. })
+                && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+                && self
+                    .control
+                    .active_with_exits
+                    .last()
+                    .is_some_and(|context| {
+                        context.loop_depth == self.control.loops.len()
+                            && (context.exception_region_depth
+                                == self.control.active_exception_region_exclusions.len()
+                                || self
+                                    .control
+                                    .direct_try_body_statements
+                                    .last()
+                                    .is_some_and(|range| *range == statement.range))
+                    })
+                && !suite_terminates(&statement.body)
+                && !suite_contains_multiple_loop_breaks(&statement.body)
+                && !(self.unit.flags & CO_COROUTINE != 0
+                    && expression_suspends_current_scope(&statement.test)
+                    && suite_contains_loop_break(&statement.body));
+        let reconstruct_protected_while_none_owner = preserve_protected_while_none_owner
+            && exclude_not_taken
+            && self.control.terminal_with_condition.is_some()
+            && !self.control.current_statement_has_following;
         let condition_fallthrough_to_loop_backedge =
             self.control.suite_fallthrough_to_loop_backedge;
         self.with_control_override(
             |control| &mut control.exclude_condition_not_taken_from_exception,
-            exclude_not_taken,
+            exclude_not_taken
+                && (!preserve_protected_while_none_owner || reconstruct_protected_while_none_owner),
             |compiler| {
                 compiler.with_control_override(
                     |control| &mut control.loop_tail_while_condition,
@@ -5683,6 +5714,15 @@ impl Compiler<'_> {
                 )
             },
         )?;
+        if preserve_protected_while_none_owner {
+            if reconstruct_protected_while_none_owner {
+                self.assembler.preserve_last_not_taken_exception_owner();
+            } else {
+                // Keep the marker in its structural region without a late owner lookup.
+                self.assembler
+                    .retain_last_not_taken_structural_exception_owner();
+            }
+        }
         let context = self.loop_context(
             start,
             end,
@@ -12105,6 +12145,42 @@ fn suite_contains_loop_break(body: &[Stmt]) -> bool {
     })
 }
 
+fn suite_contains_multiple_loop_breaks(body: &[Stmt]) -> bool {
+    fn contains(body: &[Stmt], seen_break: &mut bool) -> bool {
+        body.iter().any(|statement| match statement {
+            Stmt::Break(_) => std::mem::replace(seen_break, true),
+            Stmt::If(statement) => {
+                contains(&statement.body, seen_break)
+                    || statement
+                        .elif_else_clauses
+                        .iter()
+                        .any(|clause| contains(&clause.body, seen_break))
+            }
+            Stmt::Try(statement) => {
+                contains(&statement.body, seen_break)
+                    || statement
+                        .handlers
+                        .iter()
+                        .filter_map(ruff_python_ast::ExceptHandler::as_except_handler)
+                        .any(|handler| contains(&handler.body, seen_break))
+                    || contains(&statement.orelse, seen_break)
+                    || contains(&statement.finalbody, seen_break)
+            }
+            Stmt::With(statement) => contains(&statement.body, seen_break),
+            Stmt::Match(statement) => statement
+                .cases
+                .iter()
+                .any(|case| contains(&case.body, seen_break)),
+            Stmt::For(statement) => contains(&statement.orelse, seen_break),
+            Stmt::While(statement) => contains(&statement.orelse, seen_break),
+            Stmt::FunctionDef(_) | Stmt::ClassDef(_) => false,
+            _ => false,
+        })
+    }
+
+    contains(body, &mut false)
+}
+
 fn try_handler_starts_with_optimized_boolean_generator(
     statement: &ruff_python_ast::StmtTry,
 ) -> bool {
@@ -12548,7 +12624,8 @@ fn try_has_conditional_shared_loop_exit(statement: &Stmt) -> bool {
 mod tests {
     use super::{
         IteratorCleanup, break_jump_needs_exception_region_exclusion,
-        first_iterator_assignment_condition, terminal_assert_splits_success_return,
+        first_iterator_assignment_condition, suite_contains_multiple_loop_breaks,
+        terminal_assert_splits_success_return,
     };
     use crate::target::code_flags::{CO_ASYNC_GENERATOR, CO_COROUTINE, CO_GENERATOR};
     use ruff_python_ast::Stmt;
@@ -12576,6 +12653,15 @@ mod tests {
             panic!("expected one iterator loop");
         };
         first_iterator_assignment_condition(&statement.body, outer_for_has_following).is_some()
+    }
+
+    fn has_multiple_loop_breaks(body: &str) -> bool {
+        let parsed =
+            parse_module(&format!("while value:\n{body}")).expect("while body should parse");
+        let [Stmt::While(statement)] = parsed.suite().as_slice() else {
+            panic!("expected one while loop");
+        };
+        suite_contains_multiple_loop_breaks(&statement.body)
     }
 
     #[test]
@@ -12627,6 +12713,30 @@ mod tests {
             "(left if choose else False) or right",
         ] {
             assert!(!terminal_assert_splits(expression), "{expression}");
+        }
+    }
+
+    #[test]
+    fn multiple_loop_breaks_ignore_nested_loop_bodies() {
+        for body in [
+            "    pass",
+            "    if first:\n        break",
+            "    try:\n        break\n    except ValueError:\n        pass",
+            "    with manager:\n        break",
+            "    match value:\n        case 0:\n            break",
+            "    for item in items:\n        break",
+            "    while other:\n        break",
+        ] {
+            assert!(!has_multiple_loop_breaks(body), "{body}");
+        }
+        for body in [
+            "    if first:\n        break\n    if second:\n        break",
+            "    try:\n        break\n    except ValueError:\n        break",
+            "    with manager:\n        break\n    break",
+            "    match value:\n        case 0:\n            break\n        case _:\n            break",
+            "    for item in items:\n        pass\n    else:\n        break\n    break",
+        ] {
+            assert!(has_multiple_loop_breaks(body), "{body}");
         }
     }
 

@@ -622,6 +622,17 @@ impl Assembler {
         }
     }
 
+    /// Keeps a trailing condition marker in its existing structural exception region.
+    pub(crate) fn retain_last_not_taken_structural_exception_owner(&mut self) {
+        let instruction =
+            self.required_last_instruction_mut("retaining a NOT_TAKEN structural exception owner");
+        if instruction.opcode == NOT_TAKEN {
+            instruction
+                .exception_policy
+                .set_owner(NormalizedExceptionOwner::Unchanged);
+        }
+    }
+
     /// Restores the innermost normalized exception owner on a trailing condition marker.
     pub(crate) fn override_last_not_taken_exception_owner(&mut self) {
         let instruction =
