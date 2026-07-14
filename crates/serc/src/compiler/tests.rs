@@ -1491,6 +1491,180 @@ async def iterator_keyword_gap(items, fallback, run):
 }
 
 #[test]
+fn async_with_terminal_condition_markers_respect_direct_body_and_argument_boundaries() {
+    fn read_exception_varint(table: &[u8], index: &mut usize) -> u32 {
+        let mut byte = table[*index];
+        *index += 1;
+        let mut value = u32::from(byte & 0x3f);
+        while byte & 0x40 != 0 {
+            byte = table[*index];
+            *index += 1;
+            value = (value << 6) | u32::from(byte & 0x3f);
+        }
+        value
+    }
+
+    let source = r"async def hazardous_method_ifexp_arg(manager, state, value, fallback):
+    async with manager:
+        if state.first:
+            return value
+        if not state.check(value if value is None else fallback):
+            raise LocalError(value)
+    return fallback
+
+async def later_nested_if_terminal(manager, state, value):
+    async with manager:
+        if state.first:
+            return value
+        if state.second:
+            if state.inner:
+                return value
+            else:
+                raise LocalError(value)
+    return value
+
+async def cap_16(manager, state, value):
+    async with manager:
+        if state.first:
+            return value
+        a1 = value
+        a2 = value
+        a3 = value
+        a4 = value
+        a5 = value
+        a6 = value
+        a7 = value
+        a8 = value
+        a9 = value
+        a10 = value
+        a11 = value
+        a12 = value
+        a13 = value
+        a14 = value
+        if state.second:
+            return value
+    return value
+
+async def cap_17(manager, state, value):
+    async with manager:
+        if state.first:
+            return value
+        a1 = value
+        a2 = value
+        a3 = value
+        a4 = value
+        a5 = value
+        a6 = value
+        a7 = value
+        a8 = value
+        a9 = value
+        a10 = value
+        a11 = value
+        a12 = value
+        a13 = value
+        a14 = value
+        a15 = value
+        if state.second:
+            return value
+    return value
+
+async def sibling_manager_reset(first, second, state, value):
+    async with first:
+        if state.first:
+            return value
+        if state.second:
+            return value
+    async with second:
+        if state.third:
+            return value
+    return value
+
+async def nested_manager_restore(outer, inner, state, value):
+    async with outer:
+        if state.first:
+            return value
+        async with inner:
+            if state.inner_first:
+                return value
+            if state.inner_second:
+                return value
+        if state.second:
+            return value
+    return value
+
+async def nested_manager_inner_single(outer, inner, state, value):
+    async with outer:
+        if state.first:
+            return value
+        async with inner:
+            if state.inner_first:
+                return value
+        if state.second:
+            return value
+    return value
+";
+    let parsed = parse_module(source).unwrap();
+    let module = module_compiler(source, &parsed)
+        .compile_module(parsed.suite())
+        .unwrap();
+
+    for (name, expected) in [
+        (
+            "hazardous_method_ifexp_arg",
+            &[true, true, false, false][..],
+        ),
+        ("later_nested_if_terminal", &[true, true, false, false][..]),
+        ("cap_16", &[true, false, false][..]),
+        ("cap_17", &[true, true, false][..]),
+        (
+            "sibling_manager_reset",
+            &[true, false, true, false, false][..],
+        ),
+        (
+            "nested_manager_restore",
+            &[true, true, false, false, false, false][..],
+        ),
+        (
+            "nested_manager_inner_single",
+            &[true, true, false, false, false][..],
+        ),
+    ] {
+        let function = module
+            .constants
+            .iter()
+            .find_map(|constant| match constant {
+                Constant::Code(code) if code.name == name => Some(code),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("module should contain {name}"));
+        let mut ranges = Vec::new();
+        let mut index = 0;
+        while index < function.exception_table.len() {
+            let start = read_exception_varint(&function.exception_table, &mut index);
+            let length = read_exception_varint(&function.exception_table, &mut index);
+            read_exception_varint(&function.exception_table, &mut index);
+            read_exception_varint(&function.exception_table, &mut index);
+            ranges.push(start..start + length);
+        }
+        let marker_owners = function
+            .bytecode
+            .chunks_exact(2)
+            .enumerate()
+            .filter(|(_, instruction)| instruction[0] == NOT_TAKEN.code())
+            .map(|(offset, _)| {
+                let offset = u32::try_from(offset).unwrap();
+                ranges.iter().any(|range| range.contains(&offset))
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            marker_owners, expected,
+            "unexpected marker owners for {name}"
+        );
+    }
+}
+
+#[test]
 fn chained_generator_filters_keep_their_first_comparison_marker_owned() {
     fn read_exception_varint(table: &[u8], index: &mut usize) -> u32 {
         let mut byte = table[*index];

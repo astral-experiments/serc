@@ -236,6 +236,9 @@ pub(super) struct ControlFlowState {
     // Only direct None-condition siblings in the innermost synchronous-with body can reuse a
     // preceding conditional owner. Nested suites and earlier returns use a different layout.
     shifted_sync_with_none_owner_statements: Vec<TextRange>,
+    // Direct terminal-condition siblings in the innermost async-with body can leave the first
+    // marker of a later terminal branch outside the manager's exception region.
+    shifted_async_with_terminal_owner_statements: Vec<TextRange>,
     // A direct None-condition after an earlier branch in a plain try body can reuse the removed
     // protected block slot. Keep the selected statements local to the innermost try body.
     shifted_try_none_owner_statements: Vec<TextRange>,
@@ -286,6 +289,9 @@ pub(super) struct ControlFlowState {
     // routed across a short-circuit condition without affecting nested body expressions.
     pub(super) terminal_with_condition: Option<ruff_text_size::TextRange>,
     pub(super) exclude_terminal_if_not_taken: bool,
+    // A later direct async-with terminal condition leaves its first marker outside both the
+    // manager and coroutine stop-iteration regions; later short-circuit markers stay protected.
+    pub(super) exclude_terminal_if_not_taken_from_generator: bool,
     pub(super) force_terminal_with_marker_ownerless: bool,
     // A leading `not` around a two-operand Boolean condition routes the synchronous-with
     // terminal marker exclusion to the inner condition's final operand.
@@ -3780,8 +3786,29 @@ impl Compiler<'_> {
                         if boolean.op == BoolOp::And
                             && matches!(boolean.values.as_slice(),
                                 [Expr::Compare(_), Expr::Name(_)]));
+                let exclude_later_async_with_terminal = branch_index == 0
+                    && self.unit.flags & CO_COROUTINE != 0
+                    && self.unit.flags & CO_ASYNC_GENERATOR == 0
+                    && self.control.loops.is_empty()
+                    && self.control.active_exception_region_exclusions.is_empty()
+                    && self
+                        .control
+                        .active_with_exits
+                        .last()
+                        .is_some_and(|context| {
+                            context.is_async && context.exception_region_depth == 0
+                        })
+                    && self
+                        .control
+                        .shifted_async_with_terminal_owner_statements
+                        .binary_search_by_key(
+                            &(statement.range.start(), statement.range.end()),
+                            |range| (range.start(), range.end()),
+                        )
+                        .is_ok();
                 let exclude_not_taken = self.control.exclude_terminal_if_not_taken
                     || exclude_normal_finally_short_circuit
+                    || exclude_later_async_with_terminal
                     || (!self.control.active_with_region_exclusions.is_empty()
                         && branch_index > 0
                         && suite_terminates(body));
@@ -3996,6 +4023,10 @@ impl Compiler<'_> {
                         .contains(&statement.range);
                 let previous_forced_borrowed_loads = exclude_normal_finally_short_circuit
                     .then(|| self.assembler.set_forced_borrowed_loads(true));
+                let previous_terminal_if_generator_exclusion = std::mem::replace(
+                    &mut self.control.exclude_terminal_if_not_taken_from_generator,
+                    exclude_later_async_with_terminal,
+                );
                 let compile_condition = self.with_control_override(
                     |control| &mut control.protected_iterator_continue_condition,
                     protected_iterator_continue_condition,
@@ -4044,6 +4075,8 @@ impl Compiler<'_> {
                         )
                     },
                 );
+                self.control.exclude_terminal_if_not_taken_from_generator =
+                    previous_terminal_if_generator_exclusion;
                 if let Some(previous) = previous_forced_borrowed_loads {
                     self.assembler.set_forced_borrowed_loads(previous);
                 }
@@ -10161,6 +10194,19 @@ impl Compiler<'_> {
                         && statement.orelse.is_empty()
                         && !suite_contains_loop_break(&statement.body)
             );
+        // The owner shift is limited to small, direct coroutine manager bodies. Filtering before
+        // the AST scan also keeps large sibling suites and protected or looped managers cheap.
+        let shifted_terminal_owner_statements = if remaining.is_empty()
+            && body.len() <= 16
+            && self.unit.flags & CO_COROUTINE != 0
+            && self.unit.flags & CO_ASYNC_GENERATOR == 0
+            && self.control.loops.is_empty()
+            && self.control.active_exception_region_exclusions.is_empty()
+        {
+            shifted_async_with_terminal_owner_statements(body)
+        } else {
+            Vec::new()
+        };
 
         let ((), mut region_exclusions) = self.with_region_exclusion_collector(
             |control| &mut control.active_with_region_exclusions,
@@ -10172,21 +10218,28 @@ impl Compiler<'_> {
                 }
                 compiler.with_with_context(context, false, |compiler| {
                     let body_start = compiler.assembler.instruction_count();
-                    if remaining.is_empty() {
-                        if !matches!(body, [Stmt::Pass(_)]) {
-                            if let Some(Stmt::While(statement)) = body.last() {
-                                compiler.with_control_override(
-                                    |control| &mut control.direct_final_async_with_while,
-                                    Some(statement.range),
-                                    |compiler| compiler.compile_suite(body),
-                                )?;
+                    compiler.with_control_override(
+                        |control| &mut control.shifted_async_with_terminal_owner_statements,
+                        shifted_terminal_owner_statements,
+                        |compiler| {
+                            if remaining.is_empty() {
+                                if !matches!(body, [Stmt::Pass(_)]) {
+                                    if let Some(Stmt::While(statement)) = body.last() {
+                                        compiler.with_control_override(
+                                            |control| &mut control.direct_final_async_with_while,
+                                            Some(statement.range),
+                                            |compiler| compiler.compile_suite(body),
+                                        )?;
+                                    } else {
+                                        compiler.compile_suite(body)?;
+                                    }
+                                }
                             } else {
-                                compiler.compile_suite(body)?;
+                                compiler.compile_async_with_items(remaining, body, false)?;
                             }
-                        }
-                    } else {
-                        compiler.compile_async_with_items(remaining, body, false)?;
-                    }
+                            Ok(())
+                        },
+                    )?;
                     if remaining.is_empty()
                         && compiler.assembler.instruction_count() == body_start
                         && let Some(statement) = body.last()
@@ -12508,6 +12561,45 @@ fn shifted_sync_with_none_owner_statements(body: &[Stmt]) -> Vec<TextRange> {
                 && !detector.contains_handler
                 && is_specialized_none_condition(&statement.test))
             .then_some(statement.range)
+        })
+        .collect()
+}
+
+fn shifted_async_with_terminal_owner_statements(body: &[Stmt]) -> Vec<TextRange> {
+    let mut preceding_terminal_if = false;
+    body.iter()
+        .filter_map(|statement| {
+            let Stmt::If(statement) = statement else {
+                return None;
+            };
+            let terminal = statement.elif_else_clauses.is_empty()
+                && suite_terminates(&statement.body);
+            let eligible_test = match statement.test.as_ref() {
+                Expr::Attribute(attribute) => {
+                    matches!(attribute.value.as_ref(), Expr::Name(_))
+                }
+                Expr::UnaryOp(unary) => {
+                    unary.op == UnaryOp::Not
+                        && matches!(unary.operand.as_ref(), Expr::Call(call)
+                            if call.arguments.is_empty()
+                                && matches!(call.func.as_ref(), Expr::Attribute(attribute)
+                                if matches!(attribute.value.as_ref(), Expr::Name(_))))
+                }
+                Expr::BoolOp(boolean) => {
+                    boolean.op == BoolOp::And
+                        && matches!(boolean.values.as_slice(), [Expr::Name(_), Expr::Compare(comparison)]
+                            if comparison.ops.as_ref() == [CmpOp::LtE]
+                                && matches!(comparison.left.as_ref(), Expr::Name(_))
+                                && matches!(comparison.comparators.as_ref(), [Expr::Name(_)]))
+                }
+                _ => false,
+            };
+            let selected = preceding_terminal_if
+                && terminal
+                && eligible_test
+                && matches!(statement.body.as_slice(), [Stmt::Return(_) | Stmt::Raise(_)]);
+            preceding_terminal_if |= terminal;
+            selected.then_some(statement.range)
         })
         .collect()
 }
