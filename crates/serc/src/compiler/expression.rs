@@ -2081,8 +2081,8 @@ impl Compiler<'_> {
         .then_some(ExceptionPolicy::EXCLUDE_ALWAYS);
         // CPython appends the Boolean-loop marker and backedge after the coroutine assertion's
         // stop-iteration target is labeled. The dispatch marker keeps its ordinary owner.
-        let pre_suspension_coroutine_all_loop_policy = (callable == "all"
-            && self.control.pre_suspension_coroutine_all_assertion == Some(call.range)
+        let pre_suspension_coroutine_boolean_loop_policy = (matches!(callable, "all" | "any")
+            && self.control.pre_suspension_coroutine_boolean_assertion == Some(call.range)
             && self.unit.flags & CO_COROUTINE != 0
             && !self.context.has_lazy_imports
             && self.control.generator_region_start.is_some()
@@ -2298,7 +2298,7 @@ impl Compiler<'_> {
                 handler_boolean_loop_policy
                     .or(coroutine_boolean_loop_policy)
                     .or(synchronous_with_boolean_loop_policy)
-                    .or(pre_suspension_coroutine_all_loop_policy)
+                    .or(pre_suspension_coroutine_boolean_loop_policy)
                     .unwrap_or_default(),
             )?;
             self.emit_jump_backward_with_exception_policy(
@@ -2308,7 +2308,7 @@ impl Compiler<'_> {
                 handler_boolean_loop_policy
                     .or(coroutine_boolean_loop_policy)
                     .or(synchronous_with_boolean_loop_policy)
-                    .or(pre_suspension_coroutine_all_loop_policy)
+                    .or(pre_suspension_coroutine_boolean_loop_policy)
                     .unwrap_or_default(),
             )?;
             if let Some(start) = comprehension_exclusion_start {

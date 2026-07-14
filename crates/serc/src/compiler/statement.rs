@@ -382,9 +382,10 @@ pub(super) struct ControlFlowState {
     pub(super) copy_optimized_tuple_branch_exit: bool,
     // Whether the current expression is being lowered as one atom of a Boolean condition.
     pub(super) optimized_generator_boolean_condition: bool,
-    // The direct `all(genexpr)` test of a message-free coroutine assertion before suspension.
+    // The direct `all(genexpr)` or `any(genexpr)` test of a message-free coroutine assertion
+    // before suspension.
     // The range prevents nested calls and other Boolean contexts from inheriting its loop owner.
-    pub(super) pre_suspension_coroutine_all_assertion: Option<TextRange>,
+    pub(super) pre_suspension_coroutine_boolean_assertion: Option<TextRange>,
     // Whether that successor is a direct return of one local. CPython copies this tiny exit
     // before removing a constant-loop break edge, so its borrowed-load pass still visits it.
     current_statement_followed_by_name_return: bool,
@@ -6521,12 +6522,12 @@ impl Compiler<'_> {
             && subscript_contains_folded_index(&statement.test)
             && !expression_suspends_current_scope(&statement.test)
             && !expression_contains_inline_branch(&statement.test);
-        let pre_suspension_coroutine_all_assertion = match statement.test.as_ref() {
+        let pre_suspension_coroutine_boolean_assertion = match statement.test.as_ref() {
             Expr::Call(call)
                 if statement.msg.is_none()
                     && self.unit.flags & CO_COROUTINE != 0
                     && self.control.coroutine_suspension_epoch == 0
-                    && optimized_generator_callable(call) == Some("all") =>
+                    && matches!(optimized_generator_callable(call), Some("all" | "any")) =>
             {
                 Some(call.range)
             }
@@ -6552,9 +6553,9 @@ impl Compiler<'_> {
                                         compiler.with_control_override(
                                             |control| {
                                                 &mut control
-                                                    .pre_suspension_coroutine_all_assertion
+                                                    .pre_suspension_coroutine_boolean_assertion
                                             },
-                                            pre_suspension_coroutine_all_assertion,
+                                            pre_suspension_coroutine_boolean_assertion,
                                             |compiler| {
                                                 if let Some(split_success) = split_success {
                                                     let Expr::BoolOp(boolean) =
