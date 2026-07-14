@@ -613,7 +613,7 @@ impl Compiler<'_> {
                 if matches!(pattern.value, Singleton::None)
                     && !self.assembler.has_exception_regions()
                     && !context.in_class_keyword
-                    && !self.context.has_lazy_imports
+                    && self.context.target_specific_rules_enabled()
                 {
                     // CPython specializes the identity comparison and failure jump into a
                     // consuming None jump. Register the constant before the specialization so
@@ -2042,7 +2042,7 @@ impl Compiler<'_> {
         .then_some(ExceptionPolicy::EXCLUDE_ALWAYS);
         let coroutine_boolean_loop_policy = (!collect_tuple
             && self.unit.flags & CO_COROUTINE != 0
-            && !self.context.has_lazy_imports
+            && self.context.target_specific_rules_enabled()
             && self.control.generator_region_start.is_some()
             && self.control.depth == 0
             && self.control.coroutine_suspension_epoch > 0
@@ -2074,7 +2074,7 @@ impl Compiler<'_> {
         // Keep prior manager-owner holes and terminal handler returns out of scope: adding the
         // correct loop-owner split there worsens the table while earlier gaps remain unmatched.
         let preserve_synchronous_with_boolean_loop_owner = !collect_tuple
-            && !self.context.has_lazy_imports
+            && self.context.target_specific_rules_enabled()
             && self.control.in_synchronous_with()
             && !self.control.include_assert_none_condition_owner
             && ((self.control.current_statement_has_following
@@ -2090,7 +2090,7 @@ impl Compiler<'_> {
                     && !self.control.current_statement_has_following
                     && self.control.generator_region_exclusions.is_empty()));
         let synchronous_with_boolean_loop_policy = (!collect_tuple
-            && !self.context.has_lazy_imports
+            && self.context.target_specific_rules_enabled()
             && self.control.in_synchronous_with()
             && !preserve_synchronous_with_boolean_loop_owner
             && matches!(
@@ -2139,7 +2139,7 @@ impl Compiler<'_> {
         let pre_suspension_coroutine_boolean_loop_policy = (matches!(callable, "all" | "any")
             && self.control.pre_suspension_coroutine_boolean_assertion == Some(call.range)
             && self.unit.flags & CO_COROUTINE != 0
-            && !self.context.has_lazy_imports
+            && self.context.target_specific_rules_enabled()
             && self.control.generator_region_start.is_some()
             && self.control.depth == 0
             && self.control.coroutine_suspension_epoch == 0
@@ -3891,7 +3891,7 @@ impl Compiler<'_> {
         if include_protected_region_exclusion
             && (!self.control.active_exception_region_exclusions.is_empty()
                 || !self.control.active_with_region_exclusions.is_empty())
-            && !self.context.has_lazy_imports
+            && self.context.target_specific_rules_enabled()
             && (!self.control.in_exception_handler()
                 || self.control.active_exception_region_exclusions.len() == 1)
             && self.control.active_normal_finally_bodies == 0
