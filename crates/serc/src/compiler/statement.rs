@@ -382,6 +382,9 @@ pub(super) struct ControlFlowState {
     pub(super) copy_optimized_tuple_branch_exit: bool,
     // Whether the current expression is being lowered as one atom of a Boolean condition.
     pub(super) optimized_generator_boolean_condition: bool,
+    // The direct `all(genexpr)` test of a message-free coroutine assertion before suspension.
+    // The range prevents nested calls and other Boolean contexts from inheriting its loop owner.
+    pub(super) pre_suspension_coroutine_all_assertion: Option<TextRange>,
     // Whether that successor is a direct return of one local. CPython copies this tiny exit
     // before removing a constant-loop break edge, so its borrowed-load pass still visits it.
     current_statement_followed_by_name_return: bool,
@@ -6518,6 +6521,17 @@ impl Compiler<'_> {
             && subscript_contains_folded_index(&statement.test)
             && !expression_suspends_current_scope(&statement.test)
             && !expression_contains_inline_branch(&statement.test);
+        let pre_suspension_coroutine_all_assertion = match statement.test.as_ref() {
+            Expr::Call(call)
+                if statement.msg.is_none()
+                    && self.unit.flags & CO_COROUTINE != 0
+                    && self.control.coroutine_suspension_epoch == 0
+                    && optimized_generator_callable(call) == Some("all") =>
+            {
+                Some(call.range)
+            }
+            _ => None,
+        };
         let split_success = split_success_return.then(|| self.assembler.label());
         self.with_control_override(
             |control| &mut control.include_assert_none_condition_owner,
@@ -6535,23 +6549,43 @@ impl Compiler<'_> {
                                     |control| &mut control.retained_multiline_assert_ifexp_exit,
                                     retained_multiline_assert_ifexp_exit,
                                     |compiler| {
-                                        if let Some(split_success) = split_success {
-                                            let Expr::BoolOp(boolean) = statement.test.as_ref()
-                                            else {
-                                                unreachable!(
-                                                    "split assertion requires a boolean test"
-                                                );
-                                            };
-                                            let [first, second] = boolean.values.as_slice() else {
-                                                unreachable!(
-                                                    "split assertion requires two operands"
-                                                );
-                                            };
-                                            compiler.compile_jump_if(first, true, split_success)?;
-                                            compiler.compile_jump_if(second, true, end)
-                                        } else {
-                                            compiler.compile_jump_if(&statement.test, true, end)
-                                        }
+                                        compiler.with_control_override(
+                                            |control| {
+                                                &mut control
+                                                    .pre_suspension_coroutine_all_assertion
+                                            },
+                                            pre_suspension_coroutine_all_assertion,
+                                            |compiler| {
+                                                if let Some(split_success) = split_success {
+                                                    let Expr::BoolOp(boolean) =
+                                                        statement.test.as_ref()
+                                                    else {
+                                                        unreachable!(
+                                                            "split assertion requires a boolean test"
+                                                        );
+                                                    };
+                                                    let [first, second] =
+                                                        boolean.values.as_slice()
+                                                    else {
+                                                        unreachable!(
+                                                            "split assertion requires two operands"
+                                                        );
+                                                    };
+                                                    compiler.compile_jump_if(
+                                                        first,
+                                                        true,
+                                                        split_success,
+                                                    )?;
+                                                    compiler.compile_jump_if(second, true, end)
+                                                } else {
+                                                    compiler.compile_jump_if(
+                                                        &statement.test,
+                                                        true,
+                                                        end,
+                                                    )
+                                                }
+                                            },
+                                        )
                                     },
                                 )
                             },
