@@ -489,6 +489,10 @@ impl ControlFlowState {
             .is_some_and(|handler| handler.trailing_statement == Some(range))
     }
 
+    pub(super) fn in_loop(&self) -> bool {
+        !self.loops.is_empty()
+    }
+
     pub(super) fn in_iterator_loop(&self) -> bool {
         self.loops
             .last()

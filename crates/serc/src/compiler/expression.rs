@@ -5012,21 +5012,24 @@ impl Compiler<'_> {
                 || resumes_after_yield
                 || exception_group_handler;
             let suspension_epoch = self.control.coroutine_suspension_epoch;
-            let follows_boolean_value_marker_before_coroutine_suspension =
-                self.unit.flags & CO_COROUTINE != 0
-                    && suspension_epoch == 0
-                    && self
-                        .control
-                        .active_comprehension_region_exclusions
-                        .is_empty()
-                    && self.control.active_with_region_exclusions.is_empty()
-                    && self.control.active_exception_region_exclusions.is_empty()
-                    && self.control.active_normal_finally_bodies == 0
-                    && self.control.active_finally_end_blocks == 0
-                    && self.control.active_exception_group_handlers == 0
-                    && self.assembler.contains_boolean_value_marker();
+            let follows_marker_before_coroutine_suspension = self.unit.flags & CO_COROUTINE != 0
+                && suspension_epoch == 0
+                && self
+                    .control
+                    .active_comprehension_region_exclusions
+                    .is_empty()
+                && self.control.active_with_region_exclusions.is_empty()
+                && self.control.active_exception_region_exclusions.is_empty()
+                && self.control.active_normal_finally_bodies == 0
+                && self.control.active_finally_end_blocks == 0
+                && self.control.active_exception_group_handlers == 0
+                && ((marker_owner_slots == 1
+                    && self.control.generator_region_exclusions.is_empty()
+                    && !self.control.in_loop()
+                    && self.assembler.contains_opcode(NOT_TAKEN))
+                    || self.assembler.contains_boolean_value_marker());
             let exclude_generator_region_owner = (self.control.generator_expression
-                || follows_boolean_value_marker_before_coroutine_suspension)
+                || follows_marker_before_coroutine_suspension)
                 && !marker_reuses_exception_owner;
             let after_coroutine_suspension =
                 self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR) != 0 && suspension_epoch > 0;
