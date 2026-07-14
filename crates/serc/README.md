@@ -57,9 +57,10 @@ a source changed during compilation gets the same timestamp-header behavior as b
 ## CPython corpus comparison
 
 The `compare_cpython_corpus` example discovers every `.py` file under the vendored Ruff
-submodule's linter, formatter, parser, and ty semantic test resources. For each CPython-accepted
-file it compares
-`marshal.dumps(compile(...))` directly with this crate's marshal output:
+submodule's linter, formatter, parser, and ty semantic test resources. It compiles every file with
+both compilers. For each CPython-accepted file it compares `marshal.dumps(compile(...))` directly
+with this crate's marshal output. For each CPython-rejected file it records whether Serc rejects
+the input, accepts it, or fails internally:
 
 ```console
 ./scripts/check-cpython-compatibility /path/to/cpython-3.14.5
@@ -68,10 +69,12 @@ file it compares
 The comparator refuses any interpreter whose implementation, three-part version, or magic number
 does not exactly match this backend. It also fails on a missing corpus root or an empty corpus.
 Pass `--require-all` to return a failure status unless the corpus contains at least one exact match
-and every CPython-accepted file matches exactly. CPython-rejected fixtures are reported separately.
-The authoritative wrapper also pins the exact and rejected outcome counts, so a changed rejection
-boundary fails the gate. Additional roots can be supplied directly to the example, and `--python`,
-`--limit`, and `--examples` control the oracle executable and report size. Pass
+and every CPython-accepted file matches exactly. Pass `--require-rejection-parity` to additionally
+require clean Serc rejections for every CPython-rejected input. Rejection outcomes are reported
+separately, and the independent CPython rejection total includes every one of them so the frozen
+oracle boundary does not depend on Serc's result. The authoritative wrapper also pins the exact
+and CPython-rejected totals. Additional roots can be supplied directly to the example, and
+`--python`, `--limit`, and `--examples` control the oracle executable and report size. Pass
 `--dump-mismatches DIR` to save mismatch inputs and outputs for inspection.
 
 The frozen compatibility gate is pinned to CPython 3.14.5 with magic number `2b0e0d0a` and 2,451
@@ -81,17 +84,20 @@ current result is:
 ```text
 exact:               2,230
 CPython rejected:      221
+matched rejection:      118
+rejection mismatch:     76
 byte mismatch:           0
 unsupported:             0
 Ruff parse mismatch:     0
-compiler panic:          0
+compiler failure:       27
 non-UTF-8:               0
 oracle failure:          0
 ```
 
 This exact-compatibility result is specific to the pinned oracle version and frozen corpus; it is
-not a claim about arbitrary CPython versions or Python inputs. A successful `--require-all` run is
-the authoritative compatibility gate.
+not a claim about arbitrary CPython versions or Python inputs. The exact-output gate remains fully
+green; the separately reported rejection outcomes expose existing validation debt instead of
+hiding it behind the oracle's rejection.
 
 ## Updating the CPython target
 
