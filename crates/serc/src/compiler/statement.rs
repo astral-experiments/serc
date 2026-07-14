@@ -1105,7 +1105,7 @@ impl Compiler<'_> {
                         continue;
                     }
                     Stmt::With(statement) => {
-                        self.compile_async_with_items(&statement.items, &statement.body, true)?;
+                        self.compile_async_with(statement, true)?;
                         self.control.emitted_fallthrough_return = true;
                         continue;
                     }
@@ -2722,15 +2722,12 @@ impl Compiler<'_> {
             Stmt::While(statement) => self.compile_while(statement)?,
             Stmt::For(statement) if statement.is_async => self.compile_async_for(statement)?,
             Stmt::For(statement) => self.compile_for(statement)?,
-            Stmt::Break(_) => {
+            Stmt::Break(statement) => {
                 // Loop-control cleanup runs after CPython unwinds the active exception block.
                 let unreachable_depth = self.control.depth;
-                let context = self
-                    .control
-                    .loops
-                    .last()
-                    .copied()
-                    .ok_or_else(|| CompileError::Internal("break outside loop".to_string()))?;
+                let context = self.control.loops.last().copied().ok_or_else(|| {
+                    CompileError::invalid_syntax("'break' outside loop", statement.range)
+                })?;
                 let is_first_emitted_body_instruction =
                     self.assembler.instruction_count() == context.body_start;
                 self.emit(NOP, 0, 0)?;
@@ -2844,12 +2841,11 @@ impl Compiler<'_> {
                 }
                 self.set_depth(unreachable_depth);
             }
-            Stmt::Continue(_) => {
+            Stmt::Continue(statement) => {
                 // Loop-control cleanup runs after CPython unwinds the active exception block.
-                let context =
-                    self.control.loops.last().copied().ok_or_else(|| {
-                        CompileError::Internal("continue outside loop".to_string())
-                    })?;
+                let context = self.control.loops.last().copied().ok_or_else(|| {
+                    CompileError::invalid_syntax("'continue' not properly in loop", statement.range)
+                })?;
                 self.emit(NOP, 0, 0)?;
                 let finally_end_unwind_start =
                     self.emit_finally_end_unwind(context.finally_end_depth, false)?;
@@ -2892,7 +2888,10 @@ impl Compiler<'_> {
             }
             Stmt::Return(statement) => {
                 if !matches!(self.unit.scope, Scope::Function { .. }) {
-                    return Err(unsupported("return outside a function"));
+                    return Err(CompileError::invalid_syntax(
+                        "'return' outside function",
+                        statement.range,
+                    ));
                 }
                 let return_is_overridden = self.control.active_overriding_finally_returns > 0;
                 let preserve_tos = statement
@@ -3413,7 +3412,9 @@ impl Compiler<'_> {
             Stmt::Try(statement) => self.compile_try(statement)?,
             Stmt::Match(statement) => self.compile_match(statement)?,
             Stmt::TypeAlias(statement) => self.compile_type_alias(statement)?,
-            Stmt::With(statement) if statement.is_async => self.compile_async_with(statement)?,
+            Stmt::With(statement) if statement.is_async => {
+                self.compile_async_with(statement, false)?;
+            }
             Stmt::With(statement) => self.compile_with(statement)?,
             Stmt::IpyEscapeCommand(_) => {
                 return Err(unsupported(statement_name(statement)));
@@ -6071,7 +6072,10 @@ impl Compiler<'_> {
         statement: &ruff_python_ast::StmtFor,
     ) -> Result<(), CompileError> {
         if self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR) == 0 {
-            return Err(unsupported("async for outside coroutine code"));
+            return Err(CompileError::invalid_syntax(
+                "'async for' outside async function",
+                statement.range,
+            ));
         }
 
         let base_depth = self.control.depth;
@@ -7695,7 +7699,12 @@ impl Compiler<'_> {
                     .loops
                     .last()
                     .map(|context| context.continue_label)
-                    .ok_or_else(|| CompileError::Internal("continue outside loop".to_string()))?;
+                    .ok_or_else(|| {
+                        CompileError::invalid_syntax(
+                            "'continue' not properly in loop",
+                            handler.body[0].range(),
+                        )
+                    })?;
                 self.emit_jump_backward(JUMP_BACKWARD, continue_label, 0)?;
                 if let Some(name) = &handler.name {
                     self.assembler.add_exception_region(
@@ -7735,12 +7744,9 @@ impl Compiler<'_> {
                     .set_location(self.source_location(handler.body[0].range()));
                 self.emit(POP_EXCEPT, 0, -1)?;
                 let unreachable_depth = self.control.depth;
-                let context = self
-                    .control
-                    .loops
-                    .last()
-                    .copied()
-                    .ok_or_else(|| CompileError::Internal("break outside loop".to_string()))?;
+                let context = self.control.loops.last().copied().ok_or_else(|| {
+                    CompileError::invalid_syntax("'break' outside loop", handler.body[0].range())
+                })?;
                 match context.iterator_cleanup {
                     IteratorCleanup::None => {}
                     IteratorCleanup::Sync | IteratorCleanup::Async => {
@@ -9693,12 +9699,12 @@ impl Compiler<'_> {
         statement: &ruff_python_ast::StmtTry,
     ) -> Result<(), CompileError> {
         let base_depth = self.control.depth;
-        let context = self
-            .control
-            .loops
-            .last()
-            .copied()
-            .ok_or_else(|| CompileError::Internal("break outside loop".to_string()))?;
+        let context = self.control.loops.last().copied().ok_or_else(|| {
+            CompileError::invalid_syntax(
+                "'continue' not properly in loop",
+                statement.body[0].range(),
+            )
+        })?;
         let continue_statement = &statement.body[0];
         let break_statement = &statement.finalbody[0];
         let handler = self.assembler.label();
@@ -10304,11 +10310,15 @@ impl Compiler<'_> {
     fn compile_async_with(
         &mut self,
         statement: &ruff_python_ast::StmtWith,
+        terminal: bool,
     ) -> Result<(), CompileError> {
         if self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR) == 0 {
-            return Err(unsupported("async with outside coroutine code"));
+            return Err(CompileError::invalid_syntax(
+                "'async with' outside async function",
+                statement.range,
+            ));
         }
-        self.compile_async_with_items(&statement.items, &statement.body, false)
+        self.compile_async_with_items(&statement.items, &statement.body, terminal)
     }
 
     fn compile_async_with_items(
