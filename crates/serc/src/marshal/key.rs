@@ -642,7 +642,7 @@ pub(super) fn locals_tuple_key(code: &CodeObject) -> ObjectKey<'_> {
     if code.locals.is_empty() {
         ObjectKey::EmptyTuple
     } else {
-        match code.marshal_hints.locals_identity {
+        match code.marshal_provenance.locals_identity {
             LocalsIdentity::ByValue => strings_tuple_key(&code.locals),
             LocalsIdentity::Fresh => ObjectKey::AnnotationLocals(std::ptr::from_ref(code).addr()),
         }
