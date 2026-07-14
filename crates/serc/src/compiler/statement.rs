@@ -1265,20 +1265,21 @@ impl Compiler<'_> {
                     &mut self.control.current_statement_preceded_by_try,
                     preceded_by_try,
                 );
-                let post_async_with_condition_marker = (matches!(
-                    previous_statement,
-                    Some(Stmt::With(previous)) if previous.is_async
-                ) && !self.context.has_lazy_imports
-                    && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR) != 0
-                    && self.control.generator_region_start.is_some()
-                    && self.control.loops.is_empty()
-                    && self.control.active_exception_region_exclusions.is_empty())
-                .then(|| match statement {
-                    Stmt::If(statement) => first_generic_condition_marker(&statement.test),
-                    Stmt::Assert(statement) => first_generic_condition_marker(&statement.test),
-                    _ => None,
-                })
-                .flatten();
+                let post_async_with_condition_marker =
+                    (matches!(
+                        previous_statement,
+                        Some(Stmt::With(previous)) if previous.is_async
+                    ) && self.context.target_specific_rules_enabled()
+                        && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR) != 0
+                        && self.control.generator_region_start.is_some()
+                        && self.control.loops.is_empty()
+                        && self.control.active_exception_region_exclusions.is_empty())
+                    .then(|| match statement {
+                        Stmt::If(statement) => first_generic_condition_marker(&statement.test),
+                        Stmt::Assert(statement) => first_generic_condition_marker(&statement.test),
+                        _ => None,
+                    })
+                    .flatten();
                 let previous_post_async_with_condition_marker = std::mem::replace(
                     &mut self.control.post_async_with_condition_marker,
                     post_async_with_condition_marker,
@@ -3564,7 +3565,7 @@ impl Compiler<'_> {
                                         context.body_start_item,
                                     )
                                 }))
-                                || (!self.context.has_lazy_imports
+                                || (self.context.target_specific_rules_enabled()
                                     && matches!(self.unit.scope, Scope::Function { .. })
                                     && self.unit.flags
                                         & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
@@ -3590,7 +3591,7 @@ impl Compiler<'_> {
                                                 )
                                     })))));
                 let preserve_first_sync_iterator_condition_owner = branch_index == 0
-                    && !self.context.has_lazy_imports
+                    && self.context.target_specific_rules_enabled()
                     && self.control.loops.len() == 1
                     && self.control.loops.last().is_some_and(|context| {
                         context.iterator_cleanup == IteratorCleanup::Sync
@@ -3637,7 +3638,7 @@ impl Compiler<'_> {
                         .last()
                         .is_some_and(|context| !context.is_async);
                 let preserve_shifted_sync_with_none_owner = branch_index == 0
-                    && !self.context.has_lazy_imports
+                    && self.context.target_specific_rules_enabled()
                     && self.control.in_synchronous_with()
                     && matches!(test, Expr::Compare(comparison)
                         if comparison.ops.len() == 1
@@ -3727,7 +3728,7 @@ impl Compiler<'_> {
                                         LOAD_FAST_AND_CLEAR,
                                         context.body_start_item,
                                     )
-                                } else if self.context.has_lazy_imports {
+                                } else if !self.context.target_specific_rules_enabled() {
                                     !self.assembler.contains_opcode_since_item(
                                         LOAD_FAST_AND_CLEAR,
                                         context.body_start_item,
@@ -3885,7 +3886,7 @@ impl Compiler<'_> {
                                 .assembler
                                 .contains_opcode_since(NOT_TAKEN, context.body_start)
                         }))
-                        || (!self.context.has_lazy_imports
+                        || (self.context.target_specific_rules_enabled()
                             && self.unit.flags
                                 & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
                                 != 0
@@ -5287,7 +5288,7 @@ impl Compiler<'_> {
                     && !try_body_normal_exit
                     && !non_final_branch
                     && !self.control.active_with_region_exclusions.is_empty()
-                    && !self.context.has_lazy_imports
+                    && self.context.target_specific_rules_enabled()
                     && self.control.loops.len() == 1
                     && self.control.loops.last().is_some_and(|context| {
                         context.iterator_cleanup == IteratorCleanup::Sync
@@ -5320,7 +5321,7 @@ impl Compiler<'_> {
                     && leading.is_empty()
                     && !try_body_normal_exit
                     && !non_final_branch
-                    && !self.context.has_lazy_imports
+                    && self.context.target_specific_rules_enabled()
                     && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) != 0
                     && self.control.active_exception_region_exclusions.is_empty()
                     && self.control.active_with_region_exclusions.is_empty()
@@ -5766,7 +5767,7 @@ impl Compiler<'_> {
             !self.control.active_with_region_exclusions.is_empty()
                 && statement.body.len() <= 8
                 && is_specialized_none_condition(&statement.test)
-                && !self.context.has_lazy_imports
+                && self.context.target_specific_rules_enabled()
                 && matches!(self.unit.scope, Scope::Function { .. })
                 && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
                 && self
@@ -5795,7 +5796,7 @@ impl Compiler<'_> {
         let condition_fallthrough_to_loop_backedge =
             self.control.suite_fallthrough_to_loop_backedge;
         let retain_dynamic_while_condition_owner = exclude_not_taken
-            && !self.context.has_lazy_imports
+            && self.context.target_specific_rules_enabled()
             && !condition_fallthrough_to_loop_backedge
             && (matches!(
                 statement.test.as_ref(),
@@ -5971,7 +5972,7 @@ impl Compiler<'_> {
         );
         let body_start = self.assembler.instruction_count();
         let first_iterator_loop_assertion = first_iterator_loop_assertion(&statement.body);
-        let first_iterator_assignment_condition = (!self.context.has_lazy_imports
+        let first_iterator_assignment_condition = (self.context.target_specific_rules_enabled()
             && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) != 0
             && self.control.loops.is_empty())
         .then(|| {
@@ -5983,7 +5984,7 @@ impl Compiler<'_> {
         })
         .flatten()
         .or_else(|| {
-            (!self.context.has_lazy_imports
+            (self.context.target_specific_rules_enabled()
                 && self.unit.flags & CO_COROUTINE != 0
                 && self.control.active_exception_region_exclusions.is_empty()
                 && self.control.active_with_region_exclusions.is_empty())
@@ -6506,7 +6507,7 @@ impl Compiler<'_> {
             _ => None,
         };
         let preserve_coroutine_folded_subscript_owner = self.unit.flags & CO_COROUTINE != 0
-            && !self.context.has_lazy_imports
+            && self.context.target_specific_rules_enabled()
             && self.control.coroutine_suspension_epoch > 0
             && self.control.generator_region_start.is_some()
             && self.control.loops.is_empty()
@@ -7273,7 +7274,7 @@ impl Compiler<'_> {
             .pop()
             .expect("active try region has exclusion collector");
         let orelse_instruction_count = self.assembler.instruction_count();
-        let preserve_coroutine_try_else_condition = (!self.context.has_lazy_imports
+        let preserve_coroutine_try_else_condition = (self.context.target_specific_rules_enabled()
             && self.unit.flags & CO_COROUTINE != 0
             && self.control.generator_region_start.is_some()
             && !statement.is_star
@@ -10111,7 +10112,7 @@ impl Compiler<'_> {
             Vec::new()
         };
         let shifted_boolean_dispatch_calls =
-            if remaining.is_empty() && !self.context.has_lazy_imports {
+            if remaining.is_empty() && self.context.target_specific_rules_enabled() {
                 shifted_sync_with_boolean_dispatch_calls(body)
             } else {
                 Vec::new()

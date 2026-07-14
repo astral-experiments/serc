@@ -25,9 +25,32 @@ pub(super) struct CompilationContext<'source> {
     line_index: LineIndex,
     pub(super) module_plan: ModulePlan,
     pub(super) scopes: ScopeArena,
-    // The pinned 3.14 target rejects 3.15 lazy-import modules, so compatibility-only lowering
-    // must leave their otherwise accepted Ruff ASTs unchanged.
-    pub(super) has_lazy_imports: bool,
+    lowering_profile: LoweringProfile,
+}
+
+/// Selects which target-specific layout rules may run while lowering a parsed module.
+///
+/// Ruff accepts some forward syntax that the pinned CPython target rejects. Keeping that case as
+/// an explicit profile prevents a source feature from acting as an undocumented global switch
+/// throughout the compiler.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LoweringProfile {
+    ExactTarget,
+    ForwardSyntax,
+}
+
+impl LoweringProfile {
+    fn for_suite(body: &Suite) -> Self {
+        if suite_has_lazy_imports(body) {
+            Self::ForwardSyntax
+        } else {
+            Self::ExactTarget
+        }
+    }
+
+    const fn target_specific_rules_enabled(self) -> bool {
+        matches!(self, Self::ExactTarget)
+    }
 }
 
 pub(super) struct CallShape<'a> {
@@ -46,7 +69,6 @@ impl<'source> CompilationContext<'source> {
         body: &Suite,
     ) -> Self {
         let (scopes, module_plan) = ScopeArena::analyze(body);
-        let has_lazy_imports = suite_has_lazy_imports(body);
         Self {
             filename: filename.to_string(),
             source,
@@ -54,8 +76,12 @@ impl<'source> CompilationContext<'source> {
             line_index: LineIndex::from_source_text(source),
             module_plan,
             scopes,
-            has_lazy_imports,
+            lowering_profile: LoweringProfile::for_suite(body),
         }
+    }
+
+    pub(super) const fn target_specific_rules_enabled(&self) -> bool {
+        self.lowering_profile.target_specific_rules_enabled()
     }
 }
 
