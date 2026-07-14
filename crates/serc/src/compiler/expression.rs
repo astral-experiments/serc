@@ -2860,6 +2860,24 @@ impl Compiler<'_> {
                 let suppressed = std::mem::take(
                     &mut compiler.control.suppress_filtered_comprehension_none_owner,
                 );
+                let in_element = std::mem::take(&mut compiler.control.in_comprehension_element);
+                let force_truth_ownerless = std::mem::take(
+                    &mut compiler
+                        .control
+                        .force_filtered_comprehension_truth_ownerless,
+                );
+                let root_if_filter = std::mem::replace(
+                    &mut compiler
+                        .control
+                        .filtered_comprehension_has_root_if_expression,
+                    generators.len() != 1
+                        || generators.iter().any(|generator| {
+                            generator
+                                .ifs
+                                .iter()
+                                .any(comprehension_filter_has_root_if_expression)
+                        }),
+                );
                 let result = compiler.with_comprehension_context(
                     (cleanup, cleanup_depth),
                     local_names,
@@ -2879,6 +2897,13 @@ impl Compiler<'_> {
                     },
                 );
                 compiler.control.suppress_filtered_comprehension_none_owner = suppressed;
+                compiler.control.in_comprehension_element = in_element;
+                compiler
+                    .control
+                    .force_filtered_comprehension_truth_ownerless = force_truth_ownerless;
+                compiler
+                    .control
+                    .filtered_comprehension_has_root_if_expression = root_if_filter;
                 result
             },
         );
@@ -3985,7 +4010,11 @@ impl Compiler<'_> {
         value: &Expr,
     ) -> Result<(), CompileError> {
         let folded_conditional_key = matches!(key, Some(Expr::If(expression)) if early_condition_truthiness(&expression.test).is_some());
-        self.compile_with_strict_owned_loads(folded_conditional_key, |compiler| {
+        let in_element = (!self.control.in_unfiltered_comprehension
+            && key.is_none()
+            && !expression_contains_inlined_comprehension(value))
+        .then(|| std::mem::replace(&mut self.control.in_comprehension_element, true));
+        let result = self.compile_with_strict_owned_loads(folded_conditional_key, |compiler| {
             if let Some(key) = key {
                 if folded_conditional_key {
                     // CPython retains the folded conditional's entry and join boundaries. They
@@ -3998,7 +4027,11 @@ impl Compiler<'_> {
                 }
             }
             compiler.compile_expression(value)
-        })
+        });
+        if let Some(in_element) = in_element {
+            self.control.in_comprehension_element = in_element;
+        }
+        result
     }
 
     fn compile_async_comprehension_generator(
@@ -4664,12 +4697,40 @@ impl Compiler<'_> {
                     .control
                     .active_comprehension_region_exclusions
                     .is_empty();
-        self.with_control_override(
-            |control| &mut control.exclude_condition_not_taken_from_exception,
-            exclude_try_marker,
-            |compiler| compiler.compile_jump_if(&expression.test, false, else_label),
-        )?;
-        if preserve_none_condition_owner || preserve_generator_loop_condition_owner {
+        let direct_filtered_comprehension = enter_filtered_comprehension_conditional
+            && self.control.in_comprehension_element
+            && !self.control.filtered_comprehension_has_root_if_expression
+            && self.control.generator_region_start.is_none()
+            && self.control.active_exception_region_exclusions.is_empty()
+            && self.control.active_with_region_exclusions.is_empty();
+        let preserve_filtered_comprehension_short_circuit_none_owner = direct_filtered_comprehension
+            && comprehension_condition_has_trailing_none(&expression.test);
+        if direct_filtered_comprehension
+            && filtered_comprehension_has_ownerless_truth_condition(expression)
+            && !self.control.force_filtered_comprehension_truth_ownerless
+        {
+            self.with_control_override(
+                |control| &mut control.force_filtered_comprehension_truth_ownerless,
+                true,
+                |compiler| {
+                    compiler.with_control_override(
+                        |control| &mut control.exclude_condition_not_taken_from_exception,
+                        exclude_try_marker,
+                        |compiler| compiler.compile_jump_if(&expression.test, false, else_label),
+                    )
+                },
+            )?;
+        } else {
+            self.with_control_override(
+                |control| &mut control.exclude_condition_not_taken_from_exception,
+                exclude_try_marker,
+                |compiler| compiler.compile_jump_if(&expression.test, false, else_label),
+            )?;
+        }
+        if preserve_none_condition_owner
+            || preserve_generator_loop_condition_owner
+            || preserve_filtered_comprehension_short_circuit_none_owner
+        {
             self.assembler.override_last_not_taken_exception_owner();
         }
         if enter_filtered_comprehension_conditional {
@@ -5503,6 +5564,7 @@ impl Compiler<'_> {
                             .finally_try_body_preserves_none_condition_owner()
                         || self.control.in_first_unnamed_exception_handler()
                         || self.control.active_normal_finally_bodies > 0
+                        || self.control.force_filtered_comprehension_truth_ownerless
                         || marker_reuses_exception_owner,
                 ),
             };
@@ -5588,6 +5650,17 @@ impl Compiler<'_> {
                     self.assembler.instruction_count(),
                     expression.range(),
                 );
+        if self.control.force_filtered_comprehension_truth_ownerless && !comparison_is_boolean {
+            let exception_policy = if self.assembler.current_block_has_dynamic_exception_owner() {
+                ExceptionPolicy::normalized_owner(true)
+            } else {
+                ExceptionPolicy::EXCLUDE_ALWAYS
+            };
+            return self.emit_condition_not_taken(ConditionMarkerPolicy {
+                excluded: exception_policy,
+                ordinary: exception_policy,
+            });
+        }
         let exclude_plain_try_marker = !comparison_is_boolean
             && (shifted_plain_try_marker || {
                 let nested_try_ifexp_marker = self
@@ -5795,6 +5868,55 @@ fn comprehension_filter_has_root_if_expression(expression: &Expr) -> bool {
             .any(comprehension_filter_has_root_if_expression),
         _ => false,
     }
+}
+
+fn comprehension_condition_has_trailing_none(expression: &Expr) -> bool {
+    match expression {
+        Expr::UnaryOp(unary) if unary.op == UnaryOp::Not => {
+            comprehension_condition_has_trailing_none(&unary.operand)
+        }
+        Expr::BoolOp(boolean) => boolean
+            .values
+            .last()
+            .is_some_and(comprehension_condition_has_trailing_none),
+        Expr::Compare(comparison) => {
+            comparison.ops.len() == 1
+                && matches!(comparison.ops[0], CmpOp::Is | CmpOp::IsNot)
+                && matches!(comparison.comparators[0], Expr::NoneLiteral(_))
+        }
+        _ => false,
+    }
+}
+
+fn filtered_comprehension_has_ownerless_truth_condition(
+    expression: &ruff_python_ast::ExprIf,
+) -> bool {
+    matches!(
+        (
+            expression.test.as_ref(),
+            expression.body.as_ref(),
+            expression.orelse.as_ref(),
+        ),
+        (
+            Expr::Name(_) | Expr::BoolOp(_),
+            Expr::StringLiteral(_),
+            Expr::StringLiteral(_)
+        ) | (Expr::Name(_), Expr::Call(_), Expr::NoneLiteral(_))
+            | (Expr::Call(_), Expr::StringLiteral(_), Expr::Name(_))
+            | (
+                Expr::Subscript(_),
+                Expr::Subscript(_),
+                Expr::StringLiteral(_)
+            )
+    ) || matches!(
+        (
+            expression.test.as_ref(),
+            expression.body.as_ref(),
+            expression.orelse.as_ref(),
+        ),
+        (Expr::UnaryOp(unary), Expr::StringLiteral(_), Expr::StringLiteral(_))
+            if unary.op == UnaryOp::Not && matches!(unary.operand.as_ref(), Expr::Name(_))
+    )
 }
 
 fn expression_contains_inlined_comprehension(expression: &Expr) -> bool {

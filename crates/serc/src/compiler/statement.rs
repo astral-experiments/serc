@@ -225,6 +225,12 @@ pub(super) struct ControlFlowState {
     pub(super) in_unfiltered_comprehension: bool,
     // A conditional used as filtered truthiness, or nested in its arms, cannot reuse that owner.
     pub(super) suppress_filtered_comprehension_none_owner: bool,
+    // Tracks eligible filtered list/set elements so other conditional layouts stay separate.
+    pub(super) in_comprehension_element: bool,
+    // Root conditional filters and multi-generator comprehensions use a distinct owner layout.
+    pub(super) filtered_comprehension_has_root_if_expression: bool,
+    // Generic truthiness markers in a direct filtered element normalize against dynamic owner slots.
+    pub(super) force_filtered_comprehension_truth_ownerless: bool,
     active_with_exits: Vec<WithExitContext>,
     pub(super) active_with_suspension_epochs: Vec<usize>,
     pub(super) active_with_region_exclusions: Vec<Vec<(Label, Label)>>,
