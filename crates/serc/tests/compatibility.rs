@@ -7395,6 +7395,31 @@ def non_assertion_chain(first, middle, last):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_simple_comparison_condition_locations() {
+        let source = r"def assertions(first, second):
+    assert first.value < second.value
+    assert (
+        first.value
+        <= second.value
+    )
+    assert first.value != second.value
+
+
+def branches(first, second, predicate):
+    if first.value == second.value:
+        consume(first)
+    if (
+        first.value
+        >= second.value
+    ):
+        consume(second)
+    if predicate(first, second):
+        consume(first, second)
+";
+        assert_matches_cpython_marshal(source, "simple_comparison_condition_locations.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_multiline_assertion_conditional_expression_exit_nops() {
         let source = r#"def direct(condition, first, second):
     assert (

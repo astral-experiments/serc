@@ -1054,6 +1054,51 @@ fn removes_an_overwritten_local_store() {
     );
 }
 
+#[test]
+fn constant_pop_candidates_are_recorded_during_emission() {
+    let mut separated = Assembler::default();
+    separated.emit(LOAD_CONST, 0);
+    let boundary = separated.label();
+    separated.mark(boundary);
+    separated.emit(POP_TOP, 0);
+    assert!(!separated.has_constant_pop_candidate);
+    separated.optimize_constant_pops();
+    assert!(matches!(
+        separated.linear_items(),
+        [Item::Instruction(load), Item::Label(_), Item::Instruction(pop)]
+            if load.opcode == LOAD_CONST && pop.opcode == POP_TOP
+    ));
+
+    let mut direct = Assembler::default();
+    direct.emit(LOAD_COMMON_CONSTANT, 0);
+    direct.emit(POP_TOP, 0);
+    assert!(direct.has_constant_pop_candidate);
+    direct.optimize_constant_pops();
+    assert!(matches!(
+        direct.linear_items(),
+        [Item::Instruction(first), Item::Instruction(second)]
+            if first.opcode == NOP && second.opcode == NOP
+    ));
+
+    let mut forwarded = Assembler::default();
+    let target = forwarded.label();
+    forwarded.emit(LOAD_SMALL_INT, 0);
+    forwarded.emit_forward_with_depth(JUMP_FORWARD, target, 1, ExceptionPolicy::default());
+    forwarded.mark(target);
+    forwarded.emit(POP_TOP, 0);
+    forwarded.emit(LOAD_CONST, 1);
+    forwarded.emit(RETURN_VALUE, 0);
+    assert!(forwarded.has_constant_pop_candidate);
+    forwarded.optimize_constant_pops();
+    assert!(matches!(
+        forwarded.linear_items()[..2],
+        [Item::Instruction(load), Item::Instruction(return_value)]
+            if load.opcode == LOAD_CONST
+                && matches!(load.operand(), Operand::Value(1))
+                && return_value.opcode == RETURN_VALUE
+    ));
+}
+
 fn assembler_with_preserved_constant_boundary() -> Assembler {
     let entry = super::Label(0);
     let preserved = super::Label(1);
@@ -1091,10 +1136,32 @@ fn constant_reachability_prepares_the_optimization_graph() {
         assembler.used_constant_indices(LOAD_CONST, 3),
         [true, false, true]
     );
-    assert!(matches!(assembler.code, UnoptimizedCode::Prepared(_)));
+    assert!(matches!(assembler.code, UnoptimizedCode::Prepared { .. }));
     assembler.remap_constant_indices(LOAD_CONST, &[Some(0), Some(1), Some(2)]);
 
     assert_eq!(assembler.finish().unwrap(), expected);
+}
+
+#[test]
+fn prepared_reachability_survives_preserved_boundary_removal() {
+    let mut assembler = assembler_with_preserved_constant_boundary();
+    assert_eq!(
+        assembler.used_constant_indices(LOAD_CONST, 3),
+        [true, false, true]
+    );
+    let UnoptimizedCode::Prepared { reachable, .. } = &assembler.code else {
+        panic!("constant reachability should prepare the optimization graph");
+    };
+    assert_eq!(reachable, &[true, true, false, true]);
+
+    let mut pipeline = assembler.into_optimization_pipeline();
+    assert_eq!(
+        pipeline.initial_reachable.as_deref(),
+        Some([true, false, true].as_slice())
+    );
+    assert_eq!(pipeline.remove_unreachable_instructions(), None);
+    assert!(pipeline.initial_reachable.is_none());
+    assert_eq!(pipeline.graph.len(), 2);
 }
 
 #[test]
@@ -1112,6 +1179,142 @@ fn straight_line_constant_reachability_uses_dense_indices() {
         assembler.used_constant_indices(LOAD_CONST, 3),
         [true, false, true]
     );
+}
+
+#[test]
+fn assertion_constant_reachability_keeps_the_optimization_stream_linear() {
+    let target = super::Label(0);
+    let assembler = || Assembler {
+        code: UnoptimizedCode::Linear(vec![
+            pass_instruction(LOAD_CONST, 0, 1),
+            Item::Instruction(Instruction::new(
+                POP_JUMP_IF_TRUE,
+                Operand::Forward(target),
+                SourceLocation::new(1, 1, 0, 0),
+                None,
+            )),
+            pass_instruction(NOT_TAKEN, 0, 1),
+            pass_instruction(
+                LOAD_COMMON_CONSTANT,
+                CommonConstant::ASSERTIONERROR.argument(),
+                1,
+            ),
+            pass_instruction(RAISE_VARARGS, 1, 1),
+            Item::Label(target),
+            pass_instruction(LOAD_CONST, 2, 2),
+            pass_instruction(RETURN_VALUE, 0, 2),
+        ]),
+        next_label: 1,
+        has_assertion_side_exit_candidate: true,
+        ..Assembler::default()
+    };
+    let expected = assembler().finish().unwrap();
+    let mut assembler = assembler();
+
+    assert_eq!(
+        assembler.used_constant_indices(LOAD_CONST, 3),
+        [true, false, true]
+    );
+    assert!(matches!(assembler.code, UnoptimizedCode::Linear(_)));
+    assert!(assembler.has_proven_linear_assertion_side_exits);
+    assembler.remap_constant_indices(LOAD_CONST, &[Some(0), Some(1), Some(2)]);
+
+    assert_eq!(assembler.finish().unwrap(), expected);
+}
+
+#[test]
+fn assertion_constant_reachability_rejects_mixed_control_flow() {
+    let assertion_target = super::Label(0);
+    let other_target = super::Label(1);
+    let mut assembler = Assembler {
+        code: UnoptimizedCode::Linear(vec![
+            pass_instruction(LOAD_CONST, 0, 1),
+            Item::Instruction(Instruction::new(
+                POP_JUMP_IF_TRUE,
+                Operand::Forward(assertion_target),
+                SourceLocation::new(1, 1, 0, 0),
+                None,
+            )),
+            pass_instruction(NOT_TAKEN, 0, 1),
+            pass_instruction(
+                LOAD_COMMON_CONSTANT,
+                CommonConstant::ASSERTIONERROR.argument(),
+                1,
+            ),
+            pass_instruction(RAISE_VARARGS, 1, 1),
+            Item::Label(assertion_target),
+            Item::Instruction(Instruction::new(
+                JUMP_FORWARD,
+                Operand::Forward(other_target),
+                SourceLocation::new(2, 2, 0, 0),
+                None,
+            )),
+            pass_instruction(LOAD_CONST, 1, 2),
+            Item::Label(other_target),
+            pass_instruction(LOAD_CONST, 2, 3),
+            pass_instruction(RETURN_VALUE, 0, 3),
+        ]),
+        next_label: 2,
+        has_assertion_side_exit_candidate: true,
+        ..Assembler::default()
+    };
+
+    assert_eq!(
+        assembler.used_constant_indices(LOAD_CONST, 3),
+        [true, false, true]
+    );
+    assert!(matches!(assembler.code, UnoptimizedCode::Prepared { .. }));
+}
+
+#[test]
+fn assertion_constant_reachability_keeps_swap_and_borrow_markers_off_the_linear_fast_path() {
+    for borrow_marker in [false, true] {
+        let target = super::Label(0);
+        let mut jump = Instruction::new(
+            POP_JUMP_IF_TRUE,
+            Operand::Forward(target),
+            SourceLocation::new(1, 1, 0, 0),
+            None,
+        );
+        if borrow_marker {
+            jump.jump_policy.mark_borrow_empty_block();
+        }
+        let mut items = vec![pass_instruction(LOAD_CONST, 0, 1)];
+        if !borrow_marker {
+            items.extend([
+                pass_instruction(LOAD_CONST, 2, 1),
+                pass_instruction(SWAP, 2, 1),
+                pass_instruction(POP_TOP, 0, 1),
+            ]);
+        }
+        items.extend([
+            Item::Instruction(jump),
+            pass_instruction(NOT_TAKEN, 0, 1),
+            pass_instruction(
+                LOAD_COMMON_CONSTANT,
+                CommonConstant::ASSERTIONERROR.argument(),
+                1,
+            ),
+            pass_instruction(RAISE_VARARGS, 1, 1),
+            Item::Label(target),
+            pass_instruction(LOAD_CONST, 2, 2),
+            pass_instruction(RETURN_VALUE, 0, 2),
+        ]);
+        let mut assembler = Assembler {
+            code: UnoptimizedCode::Linear(items),
+            next_label: 1,
+            has_assertion_side_exit_candidate: true,
+            ..Assembler::default()
+        };
+
+        assert_eq!(
+            assembler.used_constant_indices(LOAD_CONST, 3),
+            [true, false, true]
+        );
+        assert!(matches!(assembler.code, UnoptimizedCode::Linear(_)));
+        assert!(!assembler.has_proven_linear_assertion_side_exits);
+        assert!(!assembler.has_only_linear_assertion_side_exits());
+    }
 }
 
 fn pass_instruction(opcode: crate::target::Opcode, argument: u32, line: i32) -> Item {
@@ -1697,6 +1900,111 @@ fn uninitialized_load_analysis_resets_locals_above_the_fast_mask_at_block_entry(
             LOAD_FAST
         ]
     );
+}
+
+#[test]
+fn assertion_uninitialized_load_analysis_preserves_low_and_high_local_semantics() {
+    let target = super::Label(0);
+    let mut assembler = optimization_pipeline(vec![
+        pass_instruction(STORE_FAST, 63, 1),
+        pass_instruction(STORE_FAST, 64, 1),
+        Item::Instruction(Instruction::new(
+            POP_JUMP_IF_TRUE,
+            Operand::Forward(target),
+            SourceLocation::new(1, 1, 0, 0),
+            None,
+        )),
+        pass_instruction(NOT_TAKEN, 0, 1),
+        pass_instruction(
+            LOAD_COMMON_CONSTANT,
+            CommonConstant::ASSERTIONERROR.argument(),
+            1,
+        ),
+        pass_instruction(RAISE_VARARGS, 1, 1),
+        Item::Label(target),
+        pass_instruction(LOAD_FAST_CHECK, 63, 2),
+        pass_instruction(LOAD_FAST, 64, 2),
+        pass_instruction(LOAD_FAST_CHECK, 64, 2),
+        pass_instruction(RETURN_VALUE, 0, 2),
+    ]);
+    assembler.has_assertion_side_exit_candidate = true;
+    assert!(assembler.has_only_assertion_side_exits());
+
+    assembler.add_checks_for_assertion_side_exits(65, 0);
+
+    assert_eq!(
+        graph_opcodes(&assembler),
+        [
+            STORE_FAST,
+            STORE_FAST,
+            POP_JUMP_IF_TRUE,
+            NOT_TAKEN,
+            LOAD_COMMON_CONSTANT,
+            RAISE_VARARGS,
+            LOAD_FAST,
+            LOAD_FAST_CHECK,
+            LOAD_FAST,
+            RETURN_VALUE,
+        ]
+    );
+}
+
+#[test]
+fn linear_assertion_optimizer_matches_the_block_graph_pipeline() {
+    let target = super::Label(0);
+    let items = vec![
+        pass_instruction(LOAD_FAST, 0, 1),
+        pass_instruction(TO_BOOL, 0, 1),
+        pass_instruction(TO_BOOL, 0, 1),
+        Item::Instruction(Instruction::new(
+            POP_JUMP_IF_TRUE,
+            Operand::Forward(target),
+            SourceLocation::new(1, 1, 0, 0),
+            Some(0),
+        )),
+        pass_instruction(NOT_TAKEN, 0, 1),
+        pass_instruction(
+            LOAD_COMMON_CONSTANT,
+            CommonConstant::ASSERTIONERROR.argument(),
+            1,
+        ),
+        pass_instruction(RAISE_VARARGS, 1, 1),
+        Item::Label(target),
+        pass_instruction(LOAD_CONST, 0, 2),
+        pass_instruction(LOAD_CONST, 1, 2),
+        pass_instruction(STORE_FAST, 1, 2),
+        pass_instruction(STORE_FAST, 1, 2),
+        pass_instruction(LOAD_FAST, 1, 3),
+        pass_instruction(LOAD_FAST, 0, 3),
+        pass_instruction(IS_OP, 0, 3),
+        pass_instruction(RETURN_VALUE, 0, 3),
+    ];
+    let linear = Assembler {
+        code: UnoptimizedCode::Linear(items.clone()),
+        next_label: 1,
+        has_assertion_side_exit_candidate: true,
+        ..Assembler::default()
+    };
+    assert!(linear.has_only_linear_assertion_side_exits());
+    let graph =
+        super::block_graph::BlockGraph::from_items(items, &rustc_hash::FxHashSet::default());
+    let reachable = graph.reachable_blocks(&[]);
+    let generic = Assembler {
+        code: UnoptimizedCode::Prepared { graph, reachable },
+        next_label: 1,
+        has_assertion_side_exit_candidate: true,
+        ..Assembler::default()
+    };
+    assert!(!generic.has_only_linear_assertion_side_exits());
+
+    let actual = linear.finish_code(1, 2, 1).unwrap();
+    let expected = generic.finish_code(1, 2, 1).unwrap();
+
+    assert_eq!(actual.bytecode, expected.bytecode);
+    assert_eq!(actual.line_table, expected.line_table);
+    assert_eq!(actual.exception_table, expected.exception_table);
+    assert_eq!(actual.max_depth, expected.max_depth);
+    assert_eq!(actual.removed_max_depth, expected.removed_max_depth);
 }
 
 #[test]

@@ -13,6 +13,7 @@ use crate::CompileError;
 
 mod blocks;
 mod control_flow;
+mod linear;
 mod locals;
 mod swaps;
 
@@ -176,23 +177,33 @@ impl Assembler {
         parameter_count: usize,
     ) -> Result<AssembledCode, CompileError> {
         self.resolve_operand_patches()?;
+        if self.has_only_linear_assertion_side_exits() {
+            return self
+                .optimize_linear_assertion_side_exits(local_count, parameter_count)?
+                .finish(first_line_number);
+        }
         self.into_optimization_pipeline()
             .optimize(local_count, parameter_count)?
             .finish(first_line_number)
     }
 
     pub(in crate::assembler) fn into_optimization_pipeline(self) -> OptimizationPipeline {
-        let graph = match self.code {
-            UnoptimizedCode::Linear(items) => {
-                BlockGraph::from_items(items, &rustc_hash::FxHashSet::default())
-            }
-            UnoptimizedCode::Prepared(mut graph) => {
-                graph.remove_initial_preserved_boundaries();
-                graph
+        let (graph, initial_reachable) = match self.code {
+            UnoptimizedCode::Linear(items) => (
+                BlockGraph::from_items(items, &rustc_hash::FxHashSet::default()),
+                None,
+            ),
+            UnoptimizedCode::Prepared {
+                mut graph,
+                mut reachable,
+            } => {
+                graph.remove_initial_preserved_boundaries(Some(&mut reachable));
+                (graph, Some(reachable))
             }
         };
         OptimizationPipeline {
             graph,
+            initial_reachable,
             next_label: self.next_label,
             exception_regions: self.exception_regions,
             preserved_block_boundaries: self.preserved_block_boundaries,
@@ -263,7 +274,11 @@ impl OptimizationPipeline {
         }
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::DuplicateExitBlocks)?;
-        self.add_checks_for_uninitialized_loads(local_count, parameter_count);
+        if assertion_side_exits {
+            self.add_checks_for_assertion_side_exits(local_count, parameter_count);
+        } else {
+            self.add_checks_for_uninitialized_loads(local_count, parameter_count);
+        }
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::AddChecksForUninitializedLoads)?;
         self.fuse_superinstructions();
@@ -274,7 +289,9 @@ impl OptimizationPipeline {
         }
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::PushColdBlocksToEnd)?;
-        self.remove_redundant_checked_loads();
+        if !assertion_side_exits {
+            self.remove_redundant_checked_loads();
+        }
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::RemoveRedundantCheckedLoads)?;
         self.propagate_locations_within_blocks();
@@ -297,6 +314,7 @@ impl OptimizationPipeline {
             &self.exception_regions,
             &self.borrow_unreachable_blocks,
             &self.preserved_block_boundaries,
+            assertion_side_exits,
         );
         Self::remove_borrow_empty_block_markers(&mut items);
         #[cfg(any(test, debug_assertions))]

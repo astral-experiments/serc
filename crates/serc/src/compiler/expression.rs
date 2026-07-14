@@ -2609,9 +2609,8 @@ impl Compiler<'_> {
                 globals,
                 ..
             } => {
-                self.contains_name(globals, name.id.as_str())
-                    || (self.scope_index(indices, name.id.as_str()).is_none()
-                        && self.scope_index(free_indices, name.id.as_str()).is_none())
+                globals.contains(name_id)
+                    || (!indices.contains_key(&name_id) && !free_indices.contains_key(&name_id))
             }
             Scope::Class {
                 globals,
@@ -2628,7 +2627,7 @@ impl Compiler<'_> {
         }
         self.assembler
             .set_location(self.source_location(expression.range()));
-        let index = self.name_index(name.id.as_str())?;
+        let index = self.name_index_with_id(name.id.as_str(), name_id)?;
         self.emit(LOAD_GLOBAL, (index << 1) | 1, 2)?;
         Ok(SpecializedLowering::Applied)
     }
@@ -5870,9 +5869,9 @@ impl Compiler<'_> {
             )?;
             false
         };
-        self.assembler
-            .set_location(self.source_location(expression.range()));
         if !comparison_is_boolean {
+            self.assembler
+                .set_location(self.source_location(expression.range()));
             self.emit(TO_BOOL, 0, 0)?;
         }
         self.emit_jump_forward(

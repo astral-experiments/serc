@@ -390,7 +390,15 @@ fn interns_adversarial_identifier_families_densely() {
     }
     for (index, name) in names.iter().enumerate().rev() {
         assert_eq!(interner.intern(name), NameId(u32::try_from(index).unwrap()));
+        assert_eq!(
+            interner.get(name),
+            Some(NameId(u32::try_from(index).unwrap()))
+        );
     }
+    assert_eq!(
+        interner.get("collision_prefix_missing_collision_suffix"),
+        None
+    );
 }
 
 #[test]

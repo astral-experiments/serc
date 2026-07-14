@@ -906,7 +906,10 @@ pub(super) enum UnoptimizedCode {
     /// Instructions are still being emitted and patched by the compiler.
     Linear(Vec<Item>),
     /// Constant reachability has prepared the graph that the CFG pipeline will consume.
-    Prepared(BlockGraph),
+    Prepared {
+        graph: BlockGraph,
+        reachable: Vec<bool>,
+    },
 }
 
 #[derive(Debug)]
@@ -922,7 +925,9 @@ pub(crate) struct Assembler {
     pub(super) load_fast_borrowing_enabled: bool,
     pub(super) strict_owned_loads: bool,
     pub(super) forced_borrowed_loads: bool,
+    pub(super) has_constant_pop_candidate: bool,
     pub(super) has_assertion_side_exit_candidate: bool,
+    pub(super) has_proven_linear_assertion_side_exits: bool,
     pub(super) has_synthesized_percent_target_locations: bool,
     pub(super) has_next_location: bool,
 }
@@ -934,6 +939,7 @@ pub(crate) struct Assembler {
 #[derive(Debug)]
 pub(super) struct OptimizationPipeline {
     pub(super) graph: BlockGraph,
+    pub(super) initial_reachable: Option<Vec<bool>>,
     pub(super) next_label: u32,
     pub(super) exception_regions: Vec<ExceptionRegion>,
     pub(super) preserved_block_boundaries: FxHashSet<Label>,
@@ -1003,7 +1009,9 @@ impl Default for Assembler {
             load_fast_borrowing_enabled: true,
             strict_owned_loads: false,
             forced_borrowed_loads: false,
+            has_constant_pop_candidate: false,
             has_assertion_side_exit_candidate: false,
+            has_proven_linear_assertion_side_exits: false,
             has_synthesized_percent_target_locations: false,
             has_next_location: false,
         }
