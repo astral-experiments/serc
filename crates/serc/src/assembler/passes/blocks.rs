@@ -15,21 +15,22 @@ use crate::target::opcodes::{
 const WARM_BLOCK: u8 = 1;
 const COLD_BLOCK: u8 = 2;
 
-struct NoExitCopyAnalysis {
+struct ExitBlockAnalysis {
     positions: Vec<usize>,
     predecessors: Vec<usize>,
     jump_predecessors: Vec<Option<BasicBlockId>>,
-    exception_handler_blocks: FxHashSet<BasicBlockId>,
+    exception_handler_blocks: Vec<bool>,
+    requires_copy: bool,
 }
 
 // Most multi-block code objects reach this pass without an eligible exit copy. Returning an
 // analysis proves that the copy-producing loop below cannot run while retaining the location
 // propagation performed at the end of the full pass.
-fn no_exit_copy_analysis(
+fn exit_block_analysis(
     graph: &BlockGraph,
     order: &[BasicBlockId],
     exception_regions: &[ExceptionRegion],
-) -> Option<NoExitCopyAnalysis> {
+) -> ExitBlockAnalysis {
     let vector_len = order
         .iter()
         .map(|block| block.index())
@@ -41,10 +42,13 @@ fn no_exit_copy_analysis(
         positions[block.index()] = position;
     }
 
-    let exception_handler_blocks = exception_regions
+    let mut exception_handler_blocks = vec![false; vector_len];
+    for target in exception_regions
         .iter()
         .filter_map(|region| graph.label_block(region.target))
-        .collect::<FxHashSet<_>>();
+    {
+        exception_handler_blocks[target.index()] = true;
+    }
     let mut predecessors = vec![0_usize; vector_len];
     let mut jump_predecessors = vec![None; vector_len];
     predecessors[order[0].index()] = 1;
@@ -116,12 +120,13 @@ fn no_exit_copy_analysis(
             || conditional_split_return_source
     });
     if !possible_copy {
-        return Some(NoExitCopyAnalysis {
+        return ExitBlockAnalysis {
             positions,
             predecessors,
             jump_predecessors,
             exception_handler_blocks,
-        });
+            requires_copy: false,
+        };
     }
 
     // Prove that the remaining candidates are false positives. These predicates must remain a
@@ -202,12 +207,12 @@ fn no_exit_copy_analysis(
                     matches!(item, Item::Instruction(instruction) if instruction.opcode == END_SEND)
                 })
             })
-            && !exception_handler_blocks.contains(&target);
+            && !exception_handler_blocks[target.index()];
         let copy_conditional_split_return = source_has_fallthrough
             && source_copies_split_return
             && target_is_small_exit
             && predecessors[target.index()] > 1
-            && !exception_handler_blocks.contains(&target);
+            && !exception_handler_blocks[target.index()];
         let target_has_no_location = target_blocks.iter().all(|block| {
             graph[*block].items().iter().all(|item| {
                 !matches!(item, Item::Instruction(instruction) if instruction.location.line >= 0)
@@ -224,16 +229,23 @@ fn no_exit_copy_analysis(
             || (!source_has_fallthrough && no_location_exit)
             || (predecessors[target.index()] > 1 && (shared_exit || no_location_exit))
         {
-            return None;
+            return ExitBlockAnalysis {
+                positions,
+                predecessors,
+                jump_predecessors,
+                exception_handler_blocks,
+                requires_copy: true,
+            };
         }
     }
 
-    Some(NoExitCopyAnalysis {
+    ExitBlockAnalysis {
         positions,
         predecessors,
         jump_predecessors,
         exception_handler_blocks,
-    })
+        requires_copy: false,
+    }
 }
 
 // The original pass performs these location repairs even when it creates no copies, so the fast
@@ -241,10 +253,10 @@ fn no_exit_copy_analysis(
 fn propagate_exit_block_locations(
     graph: &mut BlockGraph,
     order: &[BasicBlockId],
-    analysis: &NoExitCopyAnalysis,
+    analysis: &ExitBlockAnalysis,
 ) {
     for target in order.iter().copied() {
-        if analysis.exception_handler_blocks.contains(&target) {
+        if analysis.exception_handler_blocks[target.index()] {
             continue;
         }
         if analysis.predecessors[target.index()] == 1
@@ -855,10 +867,18 @@ impl OptimizationPipeline {
         }
 
         let order = graph.order().to_vec();
-        if let Some(analysis) = no_exit_copy_analysis(graph, &order, &self.exception_regions) {
+        let analysis = exit_block_analysis(graph, &order, &self.exception_regions);
+        if !analysis.requires_copy {
             propagate_exit_block_locations(graph, &order, &analysis);
             return;
         }
+        let ExitBlockAnalysis {
+            positions,
+            predecessors,
+            jump_predecessors: _,
+            exception_handler_blocks,
+            requires_copy: _,
+        } = analysis;
         for block in order.iter().copied() {
             if graph[block].first_label().is_none() {
                 let label = Label(self.next_label);
@@ -866,40 +886,28 @@ impl OptimizationPipeline {
                 graph.insert_label(block, 0, label);
             }
         }
-        let positions = order
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(position, block)| (block, position))
-            .collect::<FxHashMap<_, _>>();
-        let exception_boundary_blocks = self
+        let mut exception_boundary_blocks = vec![false; positions.len()];
+        for block in self
             .exception_regions
             .iter()
             .flat_map(|region| [region.start, region.end, region.target])
             .filter_map(|label| graph.label_block(label))
-            .collect::<FxHashSet<_>>();
-        let exception_handler_blocks = self
-            .exception_regions
-            .iter()
-            .filter_map(|region| graph.label_block(region.target))
-            .collect::<FxHashSet<_>>();
+        {
+            exception_boundary_blocks[block.index()] = true;
+        }
         let region_memberships = self
             .exception_regions
             .iter()
             .map(|region| {
                 let start = graph
                     .label_block(region.start)
-                    .and_then(|block| positions.get(&block).copied())
+                    .map(|block| positions[block.index()])
                     .unwrap_or(0);
                 let end = graph
                     .label_block(region.end)
-                    .and_then(|block| positions.get(&block).copied())
+                    .map(|block| positions[block.index()])
                     .unwrap_or(order.len());
-                if start <= end {
-                    order[start..end].iter().copied().collect::<FxHashSet<_>>()
-                } else {
-                    FxHashSet::default()
-                }
+                if start <= end { start..end } else { 0..0 }
             })
             .collect::<Vec<_>>();
 
@@ -908,50 +916,28 @@ impl OptimizationPipeline {
             .iter()
             .flat_map(|region| [region.start, region.end])
             .collect::<FxHashSet<_>>();
-        let mut predecessors = order
-            .iter()
-            .copied()
-            .map(|block| (block, 0_usize))
-            .collect::<FxHashMap<_, _>>();
-        predecessors.insert(order[0], 1);
-        for (position, block) in order.iter().copied().enumerate() {
-            if block_has_fallthrough(graph[block].items())
-                && let Some(next) = order.get(position + 1)
-            {
-                predecessors.entry(*next).and_modify(|count| *count += 1);
-            }
-            if let Some(target) = block_jump_target(graph[block].items())
-                && let Some(target) = graph.label_block(target)
-            {
-                predecessors.entry(target).and_modify(|count| *count += 1);
-            }
-        }
-
-        let exit_without_unique_predecessor = order
-            .iter()
-            .copied()
-            .filter(|block| {
-                let unlocated_scope_exit = graph[*block].items().iter().all(|item| {
+        let mut exit_without_unique_predecessor = vec![false; positions.len()];
+        for block in order.iter().copied() {
+            let unlocated_scope_exit = graph[block].items().iter().all(|item| {
                         !matches!(item, Item::Instruction(instruction) if instruction.location.line >= 0)
                     })
-                    && graph[*block]
+                    && graph[block]
                         .last_instruction()
                         .is_some_and(|instruction| ends_scope(instruction.opcode));
-                let artificial_eval_break = graph[*block]
-                    .last_instruction()
-                    .is_some_and(|instruction| {
-                        instruction.no_location_policy.is_artificial_eval_break()
-                    });
-                predecessors[block] > 1 && (unlocated_scope_exit || artificial_eval_break)
-            })
-            .collect::<FxHashSet<_>>();
+            let artificial_eval_break =
+                graph[block].last_instruction().is_some_and(|instruction| {
+                    instruction.no_location_policy.is_artificial_eval_break()
+                });
+            exit_without_unique_predecessor[block.index()] =
+                predecessors[block.index()] > 1 && (unlocated_scope_exit || artificial_eval_break);
+        }
 
         let mut inline_copies = FxHashMap::<_, Vec<Vec<Item>>>::default();
         let mut target_copies = FxHashMap::<_, Vec<Vec<Item>>>::default();
         let mut copied_region_exclusions =
             vec![Vec::<(Label, Label)>::new(); self.exception_regions.len()];
         let mut copied_exception_regions = Vec::new();
-        let mut drop_blocks = FxHashSet::default();
+        let mut drop_blocks = vec![false; positions.len()];
         let mut remaining_predecessors = predecessors.clone();
         let mut sources = order.clone();
         let mut source_cursor = 0;
@@ -963,13 +949,13 @@ impl OptimizationPipeline {
             let Some(target) = graph.label_block(target_label) else {
                 continue;
             };
-            let source_position = positions[&source];
-            let target_position = positions[&target];
+            let source_position = positions[source.index()];
+            let target_position = positions[target.index()];
             let source_has_fallthrough = block_has_fallthrough(graph[source].items());
             let mut target_chain_end = target_position;
             while target_chain_end + 1 < order.len()
                 && block_has_fallthrough(graph[order[target_chain_end]].items())
-                && predecessors[&order[target_chain_end + 1]] == 1
+                && predecessors[order[target_chain_end + 1].index()] == 1
                 && graph[order[target_chain_end + 1]]
                     .items()
                     .iter()
@@ -1052,22 +1038,22 @@ impl OptimizationPipeline {
                 && target_is_small_exit
                 && source_allows_small_exit_inlining
                 && !target_contains_end_send
-                && !exception_handler_blocks.contains(&target);
+                && !exception_handler_blocks[target.index()];
             let inline_no_location_block =
                 !source_has_fallthrough && target_is_no_location_no_fallthrough;
             let copy_conditional_split_return = source_has_fallthrough
                 && source_copies_split_return
                 && target_is_small_exit
-                && remaining_predecessors[&target] > 1
-                && !exception_handler_blocks.contains(&target);
+                && remaining_predecessors[target.index()] > 1
+                && !exception_handler_blocks[target.index()];
             let later_jump_predecessor = order[source_position + 1..].iter().any(|predecessor| {
                 block_jump_target(graph[*predecessor].items())
                     .and_then(|label| graph.label_block(label))
                     == Some(target)
             });
-            if exit_without_unique_predecessor.contains(&target)
+            if exit_without_unique_predecessor[target.index()]
                 && target_pre_fusion_size > 4
-                && remaining_predecessors[&target] > 1
+                && remaining_predecessors[target.index()] > 1
                 && later_jump_predecessor
             {
                 // CPython's second exit-duplication pass runs after cold blocks move. For a
@@ -1076,9 +1062,9 @@ impl OptimizationPipeline {
                 continue;
             }
             if !(inline_small_exit || inline_no_location_block || copy_conditional_split_return)
-                && (!(exit_without_unique_predecessor.contains(&target)
+                && (!(exit_without_unique_predecessor[target.index()]
                     || target_is_no_location_no_fallthrough)
-                    || remaining_predecessors[&target] <= 1)
+                    || remaining_predecessors[target.index()] <= 1)
             {
                 continue;
             }
@@ -1106,7 +1092,7 @@ impl OptimizationPipeline {
                 && instruction
                     .no_location_policy
                     .first_copy_is_interruptible_backward()
-                && remaining_predecessors[&target] == predecessors[&target]
+                && remaining_predecessors[target.index()] == predecessors[target.index()]
                 && instruction.opcode == JUMP_FORWARD
             {
                 // CPython's copied normal exit checks the eval breaker if cold-block ordering
@@ -1162,7 +1148,7 @@ impl OptimizationPipeline {
                 |(index, region)| {
                     let start = copied_labels.get(&region.start).copied().or_else(|| {
                         (target_chain_end > target_position
-                            && region_memberships[index].contains(&target))
+                            && region_memberships[index].contains(&positions[target.index()]))
                         .then_some(copied_label)
                     })?;
                     Some(ExceptionRegion {
@@ -1206,7 +1192,7 @@ impl OptimizationPipeline {
                         || target_has_artificial_eval_break
                         || copy_conditional_split_return)
                         && (!inline_no_location_block
-                            || predecessors[&source] <= 1
+                            || predecessors[source.index()] <= 1
                             || inherits_shared_predecessor)
                         && !instruction.no_location_policy.preserves_location()
                 });
@@ -1237,8 +1223,9 @@ impl OptimizationPipeline {
                     .iter()
                     .enumerate()
                     .filter_map(|(index, membership)| {
-                        (membership.contains(&source) && !membership.contains(&target))
-                            .then_some(index)
+                        (membership.contains(&positions[source.index()])
+                            && !membership.contains(&positions[target.index()]))
+                        .then_some(index)
                     })
                     .collect::<Vec<_>>();
                 // CPython carries an internal protected-region end into an exit copy when the
@@ -1258,8 +1245,8 @@ impl OptimizationPipeline {
                     .filter_map(|(index, region)| {
                         let membership = &region_memberships[index];
                         (target_has_preserved_boundary_alias
-                            && membership.contains(&source)
-                            && membership.contains(&target))
+                            && membership.contains(&positions[source.index()])
+                            && membership.contains(&positions[target.index()]))
                         .then(|| copied_labels.get(&region.end).copied())
                         .flatten()
                         .map(|start| (index, start))
@@ -1271,8 +1258,8 @@ impl OptimizationPipeline {
                     .enumerate()
                     .filter_map(|(index, region)| {
                         (source_copies_split_return
-                            && region_memberships[index].contains(&source)
-                            && region_memberships[index].contains(&target))
+                            && region_memberships[index].contains(&positions[source.index()])
+                            && region_memberships[index].contains(&positions[target.index()]))
                         .then(|| copied_labels.get(&region.end).copied())
                         .flatten()
                         .map(|start| (index, start))
@@ -1333,8 +1320,10 @@ impl OptimizationPipeline {
                                     instruction.fusion_policy.transitive_small_exit_inlining()
                                 })
                             && region_memberships.iter().all(|membership| {
-                                membership.contains(predecessor) == membership.contains(&source)
-                                    && membership.contains(&source) == membership.contains(&target)
+                                membership.contains(&positions[predecessor.index()])
+                                    == membership.contains(&positions[source.index()])
+                                    && membership.contains(&positions[source.index()])
+                                        == membership.contains(&positions[target.index()])
                             })
                     })
                     .collect::<Vec<_>>()
@@ -1392,9 +1381,7 @@ impl OptimizationPipeline {
                             .entry(predecessor)
                             .or_default()
                             .push(predecessor_copy);
-                        remaining_predecessors
-                            .entry(source)
-                            .and_modify(|count| *count -= 1);
+                        remaining_predecessors[source.index()] -= 1;
                     }
                 }
             }
@@ -1438,7 +1425,8 @@ impl OptimizationPipeline {
                             && return_value.opcode == RETURN_VALUE
                 ))
                 && region_memberships.iter().all(|membership| {
-                    !membership.contains(&source) && !membership.contains(&target)
+                    !membership.contains(&positions[source.index()])
+                        && !membership.contains(&positions[target.index()])
                 });
             if inline_borrowed_tuple_exit {
                 copied.retain(|item| !matches!(item, Item::Label(label) if *label == copied_label));
@@ -1448,10 +1436,8 @@ impl OptimizationPipeline {
                     block_jump_target(&copied).and_then(|label| graph.label_block(label));
                 graph.append_to_block(source, copied);
                 if let Some(copied_jump_target) = copied_jump_target {
-                    remaining_predecessors
-                        .entry(copied_jump_target)
-                        .and_modify(|count| *count += 1);
-                    drop_blocks.remove(&copied_jump_target);
+                    remaining_predecessors[copied_jump_target.index()] += 1;
+                    drop_blocks[copied_jump_target.index()] = false;
                 }
                 // CPython repeats no-line block inlining to a fixed point. The copied block can
                 // itself end in a jump to another synthetic cleanup block, so revisit this source
@@ -1472,11 +1458,9 @@ impl OptimizationPipeline {
             } else {
                 inline_copies.entry(source).or_default().push(copied);
             }
-            remaining_predecessors
-                .entry(target)
-                .and_modify(|count| *count -= 1);
-            if remaining_predecessors[&target] == 0 {
-                drop_blocks.insert(target);
+            remaining_predecessors[target.index()] -= 1;
+            if remaining_predecessors[target.index()] == 0 {
+                drop_blocks[target.index()] = true;
             }
         }
 
@@ -1574,10 +1558,10 @@ impl OptimizationPipeline {
         self.exception_regions.extend(copied_exception_regions);
 
         for target in order.iter().copied() {
-            if exception_handler_blocks.contains(&target) {
+            if exception_handler_blocks[target.index()] {
                 continue;
             }
-            if remaining_predecessors[&target] == 1
+            if remaining_predecessors[target.index()] == 1
                 && let Some(Item::Instruction(first)) = graph[target]
                     .items()
                     .iter()
@@ -1608,7 +1592,7 @@ impl OptimizationPipeline {
             }) {
                 continue;
             }
-            let target_position = positions[&target];
+            let target_position = positions[target.index()];
             let predecessor = if target_position > 0
                 && block_has_fallthrough(graph[order[target_position - 1]].items())
             {
@@ -1644,7 +1628,7 @@ impl OptimizationPipeline {
         let mut retained_jump_targets = order
             .iter()
             .copied()
-            .filter(|block| !drop_blocks.contains(block))
+            .filter(|block| !drop_blocks[block.index()])
             .flat_map(|block| graph[block].items())
             .chain(
                 inline_copies
@@ -1658,7 +1642,7 @@ impl OptimizationPipeline {
         // A copied exit can retain an edge to a block outside the copied chain. Keep that
         // original target even when all of its original predecessors were themselves copied.
         while let Some(target) = retained_jump_targets.pop() {
-            if !drop_blocks.remove(&target) {
+            if !std::mem::replace(&mut drop_blocks[target.index()], false) {
                 continue;
             }
             retained_jump_targets.extend(graph[target].items().iter().filter_map(
@@ -1676,9 +1660,9 @@ impl OptimizationPipeline {
 
         let mut final_order = Vec::new();
         for block in order {
-            if !drop_blocks.contains(&block) {
+            if !drop_blocks[block.index()] {
                 final_order.push(block);
-            } else if exception_boundary_blocks.contains(&block) {
+            } else if exception_boundary_blocks[block.index()] {
                 graph.retain_items(block, |item| matches!(item, Item::Label(_)));
                 final_order.push(block);
             }

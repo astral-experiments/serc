@@ -699,7 +699,7 @@ impl<'source> Compiler<'source> {
         }
         self.assembler.resolve_operand_patches()?;
         self.assembler.optimize_constant_pops();
-        self.remove_unused_constants()?;
+        self.remove_unused_constants();
 
         let local_kinds = self
             .symbols

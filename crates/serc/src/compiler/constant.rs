@@ -91,19 +91,21 @@ impl ConstantPool {
         Ok(index)
     }
 
-    pub(super) fn retain_used(&mut self, used: &[bool]) -> Result<Vec<Option<u32>>, CompileError> {
+    pub(super) fn retain_used(&mut self, used: &[bool]) -> Vec<Option<u32>> {
         self.indices = None;
         let mut index_map = vec![None; self.values.len()];
-        let mut retained = Vec::with_capacity(self.values.len());
-        for (old_index, constant) in std::mem::take(&mut self.values).into_iter().enumerate() {
-            if old_index == 0 || used.get(old_index).copied().unwrap_or(false) {
-                let new_index = to_u32(retained.len(), "constant count")?;
+        let mut old_index = 0;
+        let mut new_index = 0;
+        self.values.retain(|_| {
+            let retain = old_index == 0 || used.get(old_index).copied().unwrap_or(false);
+            if retain {
                 index_map[old_index] = Some(new_index);
-                retained.push(constant);
+                new_index += 1;
             }
-        }
-        self.values = retained;
-        Ok(index_map)
+            old_index += 1;
+            retain
+        });
+        index_map
     }
 
     pub(super) fn into_values(self) -> Vec<Constant> {
@@ -328,18 +330,26 @@ impl Compiler<'_> {
         name: &str,
         name_id: NameId,
     ) -> Result<u32, CompileError> {
-        let name = mangle_name(name, self.unit.private_name.as_deref());
+        let name = self
+            .unit
+            .private_name
+            .as_deref()
+            .map_or(Cow::Borrowed(name), |private_name| {
+                mangle_name(name, Some(private_name))
+            });
         let name_id = match &name {
             Cow::Borrowed(_) => name_id,
             Cow::Owned(name) => self.required_name_id(name),
         };
-        if let Some(index) = self.output.name_indices.get(&name_id) {
-            return Ok(*index);
+        match self.output.name_indices.entry(name_id) {
+            Entry::Occupied(entry) => Ok(*entry.get()),
+            Entry::Vacant(entry) => {
+                let index = to_u32(self.output.names.len(), "name count")?;
+                self.output.names.push(name.into_owned());
+                entry.insert(index);
+                Ok(index)
+            }
         }
-        let index = to_u32(self.output.names.len(), "name count")?;
-        self.output.names.push(name.into_owned());
-        self.output.name_indices.insert(name_id, index);
-        Ok(index)
     }
 
     pub(super) fn emit_annotation_index(&mut self, index: u32) -> Result<(), CompileError> {
@@ -376,18 +386,21 @@ impl Compiler<'_> {
         self.add_constant(Constant::Tuple(values))
     }
 
-    pub(super) fn remove_unused_constants(&mut self) -> Result<(), CompileError> {
+    pub(super) fn remove_unused_constants(&mut self) {
+        let deferred_none = self.assembler.deferred_none_constant_index();
+        if self.output.constants.len() <= 1 && deferred_none.is_none() {
+            return;
+        }
         let mut used = self
             .assembler
             .used_constant_indices(LOAD_CONST, self.output.constants.len());
-        let deferred_none = self.assembler.deferred_none_constant_index();
         if let Some(index) = deferred_none {
             used[usize::try_from(index).expect("constant index should fit in usize")] = true;
         }
         if deferred_none.is_none() && used.iter().skip(1).all(|used| *used) {
-            return Ok(());
+            return;
         }
-        let index_map = self.output.constants.retain_used(&used)?;
+        let index_map = self.output.constants.retain_used(&used);
         self.assembler
             .remap_constant_indices(LOAD_CONST, &index_map);
         self.output.qualified_name_constant_index =
@@ -395,7 +408,6 @@ impl Compiler<'_> {
                 let index = usize::try_from(index).expect("constant index always fits in usize");
                 index_map[index]
             });
-        Ok(())
     }
 
     pub(super) fn emit_deferred_constant(
@@ -2066,7 +2078,7 @@ mod tests {
             2
         );
 
-        let index_map = pool.retain_used(&[false, false, true]).unwrap();
+        let index_map = pool.retain_used(&[false, false, true]);
 
         assert_eq!(index_map, [Some(0), None, Some(1)]);
         assert!(matches!(
@@ -2138,7 +2150,7 @@ mod tests {
 
         let mut used = vec![true; 19];
         used[1] = false;
-        let index_map = pool.retain_used(&used).unwrap();
+        let index_map = pool.retain_used(&used);
         assert_eq!(index_map[0], Some(0));
         assert_eq!(index_map[1], None);
         assert_eq!(index_map[2], Some(1));

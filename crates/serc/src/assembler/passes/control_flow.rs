@@ -138,7 +138,10 @@ impl OptimizationPipeline {
         if self.exception_regions.is_empty() && graph.len() == 1 {
             return None;
         }
-        let reachable = graph.reachable_blocks(&self.exception_regions);
+        let reachable = self
+            .initial_reachable
+            .take()
+            .unwrap_or_else(|| graph.reachable_blocks(&self.exception_regions));
         let mut removed_max_depth = None;
         let order = graph.order().to_vec();
         let mut empty = FxHashSet::default();

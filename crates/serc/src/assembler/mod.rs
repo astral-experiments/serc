@@ -17,10 +17,11 @@ use crate::target::opcodes::{
     LOAD_FAST_AND_CLEAR, LOAD_FAST_BORROW, LOAD_FAST_BORROW_LOAD_FAST_BORROW, LOAD_FAST_CHECK,
     LOAD_FAST_LOAD_FAST, LOAD_GLOBAL, LOAD_SMALL_INT, LOAD_SPECIAL, LOAD_SUPER_ATTR, MAKE_CELL,
     MAP_ADD, MATCH_KEYS, MATCH_MAPPING, MATCH_SEQUENCE, NOP, NOT_TAKEN, POP_EXCEPT,
-    POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE, POP_TOP, PUSH_EXC_INFO, RERAISE, RESUME, RETURN_VALUE,
-    SEND, SET_ADD, SET_FUNCTION_ATTRIBUTE, SET_UPDATE, STORE_DEREF, STORE_FAST,
-    STORE_FAST_LOAD_FAST, STORE_FAST_STORE_FAST, STORE_GLOBAL, SWAP, TO_BOOL, UNARY_NOT,
-    UNPACK_SEQUENCE, WITH_EXCEPT_START,
+    POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE, POP_JUMP_IF_TRUE, POP_TOP,
+    PUSH_EXC_INFO, RAISE_VARARGS, RERAISE, RESUME, RETURN_VALUE, SEND, SET_ADD,
+    SET_FUNCTION_ATTRIBUTE, SET_UPDATE, STORE_DEREF, STORE_FAST, STORE_FAST_LOAD_FAST,
+    STORE_FAST_STORE_FAST, STORE_GLOBAL, SWAP, TO_BOOL, UNARY_NOT, UNPACK_SEQUENCE,
+    WITH_EXCEPT_START,
 };
 use crate::target::operands::ResumeLocation;
 use crate::target::{
@@ -41,12 +42,12 @@ use ir::{
 
 fn reachable_constant_indices(
     graph: &block_graph::BlockGraph,
-    exception_regions: &[ExceptionRegion],
+    reachable: &[bool],
     load_const: Opcode,
     constant_count: usize,
 ) -> Vec<bool> {
-    let reachable = graph.reachable_blocks(exception_regions);
     let mut used = vec![false; constant_count];
+    let mut remaining = constant_count.saturating_sub(1);
     for (block, contents) in graph.iter() {
         if !reachable[block.index()] {
             continue;
@@ -57,13 +58,93 @@ fn reachable_constant_indices(
             };
             if instruction.opcode == load_const
                 && let Operand::Value(index) = instruction.operand()
-                && let Some(used) = used.get_mut(index as usize)
+                && let Some(slot) = used.get_mut(index as usize)
             {
-                *used = true;
+                let newly_used = !std::mem::replace(slot, true);
+                if index != 0 && newly_used {
+                    remaining -= 1;
+                    if remaining == 0 {
+                        return used;
+                    }
+                }
             }
         }
     }
     used
+}
+
+/// Marks reachable constants in an assertion-only stream and reports linear-optimizer eligibility.
+///
+/// `None` rejects the grammar; `Some(false)` preserves valid streams that still require the CFG.
+fn assertion_constant_indices(
+    items: &[Item],
+    load_const: Opcode,
+    used: &mut [bool],
+) -> Option<bool> {
+    let mut items = items.iter();
+    let mut assertion_count = 0;
+    let mut ended_scope = false;
+    let mut linear_eligible = true;
+
+    while let Some(item) = items.next() {
+        if ended_scope {
+            return None;
+        }
+        let Item::Instruction(instruction) = item else {
+            return None;
+        };
+        linear_eligible &=
+            instruction.opcode != SWAP && !instruction.jump_policy.borrow_empty_block();
+        if matches!(
+            instruction.opcode,
+            POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE | POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE
+        ) {
+            let Operand::Forward(target) = instruction.operand() else {
+                return None;
+            };
+            let Some(Item::Instruction(not_taken)) = items.next() else {
+                return None;
+            };
+            let Some(Item::Instruction(assertion_error)) = items.next() else {
+                return None;
+            };
+            let Some(Item::Instruction(raise)) = items.next() else {
+                return None;
+            };
+            let Some(Item::Label(label)) = items.next() else {
+                return None;
+            };
+            if not_taken.opcode != NOT_TAKEN
+                || !matches!(not_taken.operand(), Operand::Value(0))
+                || assertion_error.opcode != LOAD_COMMON_CONSTANT
+                || !matches!(assertion_error.operand(), Operand::Value(0))
+                || raise.opcode != RAISE_VARARGS
+                || !matches!(raise.operand(), Operand::Value(1))
+                || *label != target
+            {
+                return None;
+            }
+            linear_eligible &= !not_taken.jump_policy.borrow_empty_block()
+                && !assertion_error.jump_policy.borrow_empty_block()
+                && !raise.jump_policy.borrow_empty_block();
+            assertion_count += 1;
+            continue;
+        }
+        let Operand::Value(argument) = instruction.operand() else {
+            return None;
+        };
+        if instruction.opcode == NOT_TAKEN {
+            return None;
+        }
+        if instruction.opcode == load_const
+            && let Some(slot) = used.get_mut(argument as usize)
+        {
+            *slot = true;
+        }
+        ended_scope = ends_scope(instruction.opcode);
+    }
+
+    (assertion_count > 0 && ended_scope).then_some(linear_eligible)
 }
 
 impl Assembler {
@@ -79,6 +160,21 @@ impl Assembler {
             panic!("linear instructions are unavailable after constant reachability analysis");
         };
         items
+    }
+
+    pub(in crate::assembler) fn has_only_linear_assertion_side_exits(&self) -> bool {
+        if self.has_proven_linear_assertion_side_exits {
+            return true;
+        }
+        let UnoptimizedCode::Linear(items) = &self.code else {
+            return false;
+        };
+        self.has_assertion_side_exit_candidate
+            && self.exception_regions.is_empty()
+            && self.preserved_block_boundaries.is_empty()
+            && self.borrow_unreachable_blocks.is_empty()
+            && !self.has_synthesized_percent_target_locations
+            && assertion_constant_indices(items, LOAD_CONST, &mut []).unwrap_or(false)
     }
 
     pub(crate) fn disable_load_fast_borrowing(&mut self) {
@@ -1031,16 +1127,12 @@ impl Assembler {
         load_const: Opcode,
         constant_count: usize,
     ) -> Vec<bool> {
-        if let UnoptimizedCode::Prepared(graph) = &self.code {
-            return reachable_constant_indices(
-                graph,
-                &self.exception_regions,
-                load_const,
-                constant_count,
-            );
+        if let UnoptimizedCode::Prepared { graph, reachable } = &self.code {
+            return reachable_constant_indices(graph, reachable, load_const, constant_count);
         }
 
         let mut used = vec![false; constant_count];
+        let mut remaining = constant_count.saturating_sub(1);
         let mut ended_scope = false;
         let mut straight_line = true;
         for item in self.linear_items() {
@@ -1053,13 +1145,30 @@ impl Assembler {
             }
             if instruction.opcode == load_const
                 && let Operand::Value(index) = instruction.operand()
-                && let Some(used) = used.get_mut(index as usize)
+                && let Some(slot) = used.get_mut(index as usize)
             {
-                *used = true;
+                let newly_used = !std::mem::replace(slot, true);
+                if index != 0 && newly_used {
+                    remaining -= 1;
+                    if remaining == 0 {
+                        return used;
+                    }
+                }
             }
             ended_scope = ends_scope(instruction.opcode);
         }
         if straight_line {
+            return used;
+        }
+        if self.has_assertion_side_exit_candidate
+            && self.exception_regions.is_empty()
+            && self.preserved_block_boundaries.is_empty()
+            && self.borrow_unreachable_blocks.is_empty()
+            && !self.has_synthesized_percent_target_locations
+            && let Some(linear_eligible) =
+                assertion_constant_indices(self.linear_items(), load_const, &mut used)
+        {
+            self.has_proven_linear_assertion_side_exits = linear_eligible;
             return used;
         }
 
@@ -1068,14 +1177,11 @@ impl Assembler {
         else {
             unreachable!();
         };
-        self.code = UnoptimizedCode::Prepared(block_graph::BlockGraph::from_items(
-            items,
-            &self.preserved_block_boundaries,
-        ));
-        let UnoptimizedCode::Prepared(graph) = &self.code else {
-            unreachable!();
-        };
-        reachable_constant_indices(graph, &self.exception_regions, load_const, constant_count)
+        let graph = block_graph::BlockGraph::from_items(items, &self.preserved_block_boundaries);
+        let reachable = graph.reachable_blocks(&self.exception_regions);
+        let used = reachable_constant_indices(&graph, &reachable, load_const, constant_count);
+        self.code = UnoptimizedCode::Prepared { graph, reachable };
+        used
     }
 
     pub(crate) fn remap_constant_indices(&mut self, load_const: Opcode, index_map: &[Option<u32>]) {
@@ -1106,7 +1212,7 @@ impl Assembler {
                     }
                 }
             }
-            UnoptimizedCode::Prepared(graph) => graph.for_each_instruction_mut(remap),
+            UnoptimizedCode::Prepared { graph, .. } => graph.for_each_instruction_mut(remap),
         }
     }
 
@@ -1120,6 +1226,9 @@ impl Assembler {
 
     /// Removes a side-effect-free constant whose value is immediately discarded.
     pub(crate) fn optimize_constant_pops(&mut self) {
+        if !self.has_constant_pop_candidate {
+            return;
+        }
         let is_constant_load =
             |opcode| matches!(opcode, LOAD_CONST | LOAD_COMMON_CONSTANT | LOAD_SMALL_INT);
         let items = self.linear_items_mut();
@@ -1277,6 +1386,16 @@ impl Assembler {
         instruction.local_policy = LocalPolicy::for_load(force_owned_load, strict_owned_load);
         if self.forced_borrowed_loads && opcode == LOAD_FAST {
             instruction.local_policy.mark_force_borrowed_load();
+        }
+        if !self.has_constant_pop_candidate
+            && (opcode == POP_TOP
+                || (opcode == JUMP_FORWARD && matches!(operand, Operand::Forward(_))))
+            && self.linear_items().last().is_some_and(|item| {
+                matches!(item, Item::Instruction(instruction)
+                    if matches!(instruction.opcode, LOAD_CONST | LOAD_COMMON_CONSTANT | LOAD_SMALL_INT))
+            })
+        {
+            self.has_constant_pop_candidate = true;
         }
         self.linear_items_mut().push(Item::Instruction(instruction));
     }

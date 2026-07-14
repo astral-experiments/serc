@@ -1,10 +1,11 @@
 use std::borrow::Cow;
 use std::collections::BTreeSet;
+use std::hash::Hasher;
 
 use ruff_python_ast::name::Name;
 use ruff_python_ast::visitor::{Visitor, walk_expr, walk_pattern, walk_stmt};
 use ruff_python_ast::{Expr, ExprContext, Pattern, Stmt, StmtClassDef, StmtFunctionDef, TypeParam};
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 
 use crate::CompileError;
 use crate::target::code_flags::{CO_FUTURE_ANNOTATIONS, CO_FUTURE_BARRY_AS_BDFL};
@@ -105,7 +106,7 @@ pub(super) struct NameId(pub(super) u32);
 #[derive(Debug, Default)]
 pub(super) struct NameInterner {
     names: Vec<String>,
-    by_name: FxHashMap<String, NameId>,
+    slots: Vec<Option<NameId>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -177,28 +178,61 @@ impl FromIterator<NameId> for NameSet {
 
 impl NameInterner {
     pub(super) fn intern(&mut self, name: &str) -> NameId {
-        if let Some(id) = self.by_name.get(name) {
-            return *id;
+        if let Some(id) = self.get(name) {
+            return id;
         }
         self.insert_owned(name.to_string())
     }
 
     fn intern_owned(&mut self, name: String) -> NameId {
-        if let Some(id) = self.by_name.get(name.as_str()) {
-            return *id;
+        if let Some(id) = self.get(name.as_str()) {
+            return id;
         }
         self.insert_owned(name)
     }
 
     fn insert_owned(&mut self, name: String) -> NameId {
+        if self.names.len() * 2 >= self.slots.len() {
+            let mut slots = vec![None; self.slots.len().max(8) * 2];
+            for (index, name) in self.names.iter().enumerate() {
+                let mut slot = Self::hash(name) & (slots.len() - 1);
+                while slots[slot].is_some() {
+                    slot = (slot + 1) & (slots.len() - 1);
+                }
+                slots[slot] = Some(NameId(
+                    u32::try_from(index).expect("too many interned names"),
+                ));
+            }
+            self.slots = slots;
+        }
         let id = NameId(u32::try_from(self.names.len()).expect("too many interned names"));
-        self.names.push(name.clone());
-        self.by_name.insert(name, id);
+        let mut slot = Self::hash(&name) & (self.slots.len() - 1);
+        while self.slots[slot].is_some() {
+            slot = (slot + 1) & (self.slots.len() - 1);
+        }
+        self.slots[slot] = Some(id);
+        self.names.push(name);
         id
     }
 
     pub(super) fn get(&self, name: &str) -> Option<NameId> {
-        self.by_name.get(name).copied()
+        if self.slots.is_empty() {
+            return None;
+        }
+        let mut slot = Self::hash(name) & (self.slots.len() - 1);
+        loop {
+            let id = self.slots[slot]?;
+            if self.names[usize::try_from(id.0).expect("name ID should fit in usize")] == name {
+                return Some(id);
+            }
+            slot = (slot + 1) & (self.slots.len() - 1);
+        }
+    }
+
+    fn hash(name: &str) -> usize {
+        let mut hasher = FxHasher::default();
+        hasher.write(name.as_bytes());
+        usize::try_from(hasher.finish()).expect("FxHasher output should fit in usize")
     }
 
     fn intern_set(&mut self, names: impl IntoIterator<Item = String>) -> FxHashSet<NameId> {

@@ -151,7 +151,19 @@ impl BlockGraph {
         preserved_block_boundaries: &FxHashSet<Label>,
     ) -> Vec<Vec<Item>> {
         let lengths = normalized_segment_lengths(&items, items.len(), preserved_block_boundaries);
-        collect_segments(items, lengths)
+        if lengths.len() == 1 {
+            return vec![items];
+        }
+        let mut remaining = items.as_slice();
+        let mut segments = Vec::with_capacity(lengths.len());
+        for length in lengths {
+            debug_assert!(length > 0);
+            let (segment, rest) = remaining.split_at(length);
+            segments.push(segment.to_vec());
+            remaining = rest;
+        }
+        debug_assert!(remaining.is_empty());
+        segments
     }
 
     pub(super) fn from_items(
@@ -358,13 +370,36 @@ impl BlockGraph {
 
     /// Returns whether normalization would preserve every physical block boundary.
     pub(super) fn is_normalized(&self, boundaries: &FxHashSet<Label>) -> bool {
-        let lengths = self
-            .order
-            .iter()
-            .map(|block| self[*block].items.len())
-            .collect::<Vec<_>>();
-        let item_count = lengths.iter().sum();
-        normalized_segment_lengths(self.iter_items(), item_count, boundaries) == lengths
+        let mut physical_lengths = self.order.iter().map(|block| self[*block].items.len());
+        let mut length = 0;
+        let mut has_instruction = false;
+        for item in self.iter_items() {
+            if let Item::Label(label) = item
+                && (has_instruction || (length > 0 && boundaries.contains(label)))
+            {
+                if physical_lengths.next() != Some(length) {
+                    return false;
+                }
+                length = 0;
+                has_instruction = false;
+            }
+            let ends_block = matches!(item, Item::Instruction(instruction) if
+                !matches!(instruction.operand(), Operand::Value(_))
+                    || ends_scope(instruction.opcode));
+            length += 1;
+            has_instruction |= matches!(item, Item::Instruction(_));
+            if ends_block {
+                if physical_lengths.next() != Some(length) {
+                    return false;
+                }
+                length = 0;
+                has_instruction = false;
+            }
+        }
+        if length > 0 && physical_lengths.next() != Some(length) {
+            return false;
+        }
+        physical_lengths.next().is_none()
     }
 
     /// Repartitions the ordered instruction stream for a pass whose logical
@@ -627,7 +662,10 @@ impl BlockGraph {
     /// boundaries used for the pre-assembly reachability scan.
     ///
     /// This is only valid before any pass has reordered or allocated blocks.
-    pub(super) fn remove_initial_preserved_boundaries(&mut self) {
+    pub(super) fn remove_initial_preserved_boundaries(
+        &mut self,
+        mut reachable: Option<&mut Vec<bool>>,
+    ) {
         debug_assert_eq!(self.order.len(), self.blocks.len());
         debug_assert!(
             self.order
@@ -637,18 +675,30 @@ impl BlockGraph {
         );
 
         let original = std::mem::take(&mut self.blocks);
+        let reachable_len = reachable.as_ref().map(|reachable| reachable.len());
+        debug_assert!(reachable_len.is_none_or(|len| len == original.len()));
         let mut blocks: Vec<BasicBlock> = Vec::with_capacity(original.len());
-        for mut block in original {
+        for (index, mut block) in original.into_iter().enumerate() {
             if blocks.last().is_some_and(|previous| {
                 previous
                     .items()
                     .iter()
                     .all(|item| matches!(item, Item::Label(_)))
             }) {
+                if let Some(reachable) = &mut reachable {
+                    let previous = blocks.len() - 1;
+                    reachable[previous] |= reachable[index];
+                }
                 blocks.last_mut().unwrap().items.append(&mut block.items);
             } else {
+                if let Some(reachable) = &mut reachable {
+                    reachable[blocks.len()] = reachable[index];
+                }
                 blocks.push(block);
             }
+        }
+        if let Some(reachable) = reachable {
+            reachable.truncate(blocks.len());
         }
         self.blocks = blocks;
         self.order = (0..self.blocks.len()).map(BasicBlockId).collect();
@@ -978,6 +1028,56 @@ mod tests {
     }
 
     #[test]
+    fn partitioning_bulk_copies_each_normalized_segment() {
+        let entry = Label(0);
+        let preserved = Label(1);
+        let jump = Label(2);
+        let target = Label(3);
+        let items = vec![
+            Item::Label(entry),
+            Item::Label(preserved),
+            instruction(NOP, Operand::Value(0)),
+            Item::Label(jump),
+            instruction(JUMP_FORWARD, Operand::Forward(target)),
+            Item::Label(target),
+            instruction(RETURN_VALUE, Operand::Value(0)),
+        ];
+
+        let segments =
+            BlockGraph::partition_items(items.clone(), &FxHashSet::from_iter([preserved]));
+
+        assert_eq!(
+            segments.iter().map(Vec::len).collect::<Vec<_>>(),
+            [1, 2, 2, 2]
+        );
+        assert!(segments.iter().flatten().zip(items).all(|(left, right)| {
+            match (*left, right) {
+                (Item::Label(left), Item::Label(right)) => left == right,
+                (Item::Instruction(left), Item::Instruction(right)) => {
+                    left.opcode == right.opcode && left.operand() == right.operand()
+                }
+                (Item::Label(_), Item::Instruction(_)) | (Item::Instruction(_), Item::Label(_)) => {
+                    false
+                }
+            }
+        }));
+    }
+
+    #[test]
+    fn partitioning_reuses_a_single_segment_allocation() {
+        let mut items = Vec::with_capacity(16);
+        items.push(Item::Label(Label(0)));
+        items.push(instruction(NOP, Operand::Value(0)));
+        items.push(instruction(RETURN_VALUE, Operand::Value(0)));
+        let pointer = items.as_ptr();
+
+        let segments = BlockGraph::partition_items(items, &FxHashSet::default());
+
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].as_ptr(), pointer);
+    }
+
+    #[test]
     fn block_ids_survive_reordering_and_insertion() {
         let first_label = Label(0);
         let second_label = Label(1);
@@ -1235,6 +1335,57 @@ mod tests {
     }
 
     #[test]
+    fn streaming_normalization_check_matches_segment_planner() {
+        let entry = Label(0);
+        let preserved = Label(1);
+        let internal = Label(2);
+        let jump = Label(3);
+        let target = Label(4);
+        let items = vec![
+            Item::Label(entry),
+            Item::Label(preserved),
+            instruction(NOP, Operand::Value(0)),
+            Item::Label(internal),
+            instruction(JUMP_FORWARD, Operand::Forward(target)),
+            Item::Label(jump),
+            instruction(RETURN_VALUE, Operand::Value(0)),
+            Item::Label(target),
+            instruction(NOP, Operand::Value(0)),
+        ];
+
+        for boundary_mask in 0..8 {
+            let boundaries = [preserved, internal, jump]
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, label)| (boundary_mask & (1 << index) != 0).then_some(label))
+                .collect::<FxHashSet<_>>();
+            let normalized_lengths = normalized_segment_lengths(&items, items.len(), &boundaries);
+            for split_mask in 0..(1 << (items.len() - 1)) {
+                let mut graph = BlockGraph {
+                    blocks: Vec::new(),
+                    order: Vec::new(),
+                    label_blocks: Vec::new(),
+                };
+                let mut start = 0;
+                let mut physical_lengths = Vec::new();
+                for end in 1..=items.len() {
+                    if end == items.len() || split_mask & (1 << (end - 1)) != 0 {
+                        physical_lengths.push(end - start);
+                        graph.push_block(items[start..end].to_vec());
+                        start = end;
+                    }
+                }
+
+                assert_eq!(
+                    graph.is_normalized(&boundaries),
+                    physical_lengths == normalized_lengths,
+                    "boundary mask {boundary_mask:#05b}, split mask {split_mask:#010b}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn recognizes_a_normalized_jump_free_single_block() {
         let label = Label(0);
         let graph = BlockGraph::from_items(
@@ -1304,7 +1455,7 @@ mod tests {
         );
         assert_eq!(graph.len(), 3);
 
-        graph.remove_initial_preserved_boundaries();
+        graph.remove_initial_preserved_boundaries(None);
 
         assert_eq!(graph.len(), 2);
         assert_eq!(graph.block_at(0).index(), 0);
