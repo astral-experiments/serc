@@ -21,7 +21,7 @@ use super::{
     POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE, POP_JUMP_IF_TRUE, POP_TOP,
     PUSH_NULL, RETURN_VALUE, SEND, SET_ADD, SET_UPDATE, STORE_ATTR, STORE_FAST, STORE_SLICE,
     STORE_SUBSCR, SWAP, TO_BOOL, UNARY_INVERT, UNARY_NEGATIVE, UNARY_NOT, UNPACK_EX,
-    UNPACK_SEQUENCE, YIELD_VALUE,
+    UNPACK_SEQUENCE,
 };
 use crate::CompileError;
 use crate::assembler::{ExceptionPolicy, Label, SourceLocation};
@@ -1281,7 +1281,7 @@ impl Compiler<'_> {
                 if self.unit.flags & CO_ASYNC_GENERATOR != 0 {
                     self.emit_unary_intrinsic(UnaryIntrinsic::ASYNC_GEN_WRAP)?;
                 }
-                self.emit(YIELD_VALUE, 0, 0)?;
+                self.emit_yield_value(0, 0)?;
                 let wrapper_is_only_exception_region =
                     self.control.generator_region_start.is_some()
                         && self.control.active_exception_region_exclusions.is_empty()
@@ -1309,7 +1309,7 @@ impl Compiler<'_> {
                 self.assembler.mark(send);
                 self.emit_jump_forward(SEND, end, 0)?;
                 self.assembler.mark(yielded);
-                self.emit(YIELD_VALUE, 1, 0)?;
+                self.emit_yield_value(1, 0)?;
                 self.assembler.mark(yielded_end);
                 let resume_depth = if self.control.generator_region_start.is_none() {
                     ResumeDepth::One
@@ -1825,7 +1825,7 @@ impl Compiler<'_> {
         self.assembler.mark(send);
         self.emit_jump_forward(SEND, end, 0)?;
         self.assembler.mark(yielded);
-        self.emit(YIELD_VALUE, 1, 0)?;
+        self.emit_yield_value(1, 0)?;
         self.assembler.mark(yielded_end);
         self.emit_resume(ResumeLocation::AFTER_AWAIT, ResumeDepth::Zero)?;
         self.emit_jump_backward(JUMP_BACKWARD_NO_INTERRUPT, send, 0)?;
@@ -3244,7 +3244,7 @@ impl Compiler<'_> {
             if self.unit.flags & CO_ASYNC_GENERATOR != 0 {
                 self.emit_unary_intrinsic(UnaryIntrinsic::ASYNC_GEN_WRAP)?;
             }
-            self.emit(YIELD_VALUE, 0, 0)?;
+            self.emit_yield_value(0, 0)?;
             self.emit_resume(ResumeLocation::AFTER_YIELD, ResumeDepth::One)?;
             self.emit(POP_TOP, 0, -1)?;
         }
@@ -3287,7 +3287,7 @@ impl Compiler<'_> {
         self.assembler.mark(send);
         self.emit_jump_forward(SEND, send_end, 0)?;
         self.assembler.mark(yielded);
-        self.emit(YIELD_VALUE, 1, 0)?;
+        self.emit_yield_value(1, 0)?;
         self.assembler.mark(yielded_end);
         self.emit_resume(ResumeLocation::AFTER_AWAIT, ResumeDepth::Zero)?;
         self.emit_jump_backward(JUMP_BACKWARD_NO_INTERRUPT, send, 0)?;
@@ -3332,7 +3332,7 @@ impl Compiler<'_> {
             self.assembler
                 .set_location(self.source_location(element.range()));
             self.emit_unary_intrinsic(UnaryIntrinsic::ASYNC_GEN_WRAP)?;
-            self.emit(YIELD_VALUE, 0, 0)?;
+            self.emit_yield_value(0, 0)?;
             self.emit_resume(ResumeLocation::AFTER_YIELD, ResumeDepth::One)?;
             self.emit(POP_TOP, 0, -1)?;
         }
@@ -3444,6 +3444,7 @@ impl Compiler<'_> {
                 accepted,
                 restart,
                 false,
+                false,
             );
         }
         if let Expr::Compare(comparison) = condition
@@ -3454,6 +3455,7 @@ impl Compiler<'_> {
                 self.source_location(element.range()),
                 accepted,
                 restart,
+                false,
                 false,
             );
         }
@@ -3517,6 +3519,7 @@ impl Compiler<'_> {
         accepted: Label,
         restart: Label,
         include_comprehension_cleanup: bool,
+        include_protected_region_exclusion: bool,
     ) -> Result<(), CompileError> {
         if let Expr::BoolOp(boolean) = condition
             && boolean.op == BoolOp::Or
@@ -3541,6 +3544,7 @@ impl Compiler<'_> {
                     next,
                     restart,
                     include_comprehension_cleanup,
+                    include_protected_region_exclusion,
                 )?;
                 self.assembler.mark(next);
             }
@@ -3550,6 +3554,7 @@ impl Compiler<'_> {
                 accepted,
                 restart,
                 include_comprehension_cleanup,
+                include_protected_region_exclusion,
             );
         }
         if let Expr::BoolOp(boolean) = condition
@@ -3569,6 +3574,7 @@ impl Compiler<'_> {
                 accepted,
                 restart,
                 include_comprehension_cleanup,
+                include_protected_region_exclusion,
             );
         }
         self.compile_negated_filter_operand(
@@ -3577,6 +3583,7 @@ impl Compiler<'_> {
             accepted,
             restart,
             include_comprehension_cleanup,
+            include_protected_region_exclusion,
         )
     }
 
@@ -3587,6 +3594,7 @@ impl Compiler<'_> {
         accepted: Label,
         restart: Label,
         include_comprehension_cleanup: bool,
+        include_protected_region_exclusion: bool,
     ) -> Result<(), CompileError> {
         if !self.control.suppress_filtered_comprehension_none_owner
             && comprehension_filter_has_root_if_expression(operand)
@@ -3624,6 +3632,7 @@ impl Compiler<'_> {
             exclusion_start,
             exclusion_end,
             include_comprehension_cleanup,
+            include_protected_region_exclusion,
         );
         Ok(())
     }
@@ -3635,6 +3644,7 @@ impl Compiler<'_> {
         accepted: Label,
         restart: Label,
         include_comprehension_cleanup: bool,
+        include_protected_region_exclusion: bool,
     ) -> Result<(), CompileError> {
         let base_depth = self.control.depth;
         let cleanup = self.assembler.label();
@@ -3689,11 +3699,13 @@ impl Compiler<'_> {
             terminal_exclusion_start,
             terminal_exclusion_end,
             include_comprehension_cleanup,
+            include_protected_region_exclusion,
         );
         self.record_filter_exclusion(
             cleanup_exclusion_start,
             cleanup_exclusion_end,
             include_comprehension_cleanup,
+            include_protected_region_exclusion,
         );
         Ok(())
     }
@@ -3703,10 +3715,31 @@ impl Compiler<'_> {
         start: Label,
         end: Label,
         include_comprehension_cleanup: bool,
+        include_protected_region_exclusion: bool,
     ) {
         self.control.generator_region_exclusions.push((start, end));
         if include_comprehension_cleanup {
             for exclusions in &mut self.control.active_comprehension_region_exclusions {
+                exclusions.push((start, end));
+            }
+        }
+        // CPython leaves the synchronous filter-rejection block outside its active try/with
+        // owners. Handler nesting, copied finally bodies, and suspension use different owners.
+        if include_protected_region_exclusion
+            && (!self.control.active_exception_region_exclusions.is_empty()
+                || !self.control.active_with_region_exclusions.is_empty())
+            && !self.context.has_lazy_imports
+            && (!self.control.in_exception_handler()
+                || self.control.active_exception_region_exclusions.len() == 1)
+            && self.control.active_normal_finally_bodies == 0
+            && !self.control.in_async_with_nested_exception_region()
+            && (self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR | CO_GENERATOR) == 0
+                || !self.control.emitted_yield_value)
+        {
+            for exclusions in &mut self.control.active_exception_region_exclusions {
+                exclusions.push((start, end));
+            }
+            for exclusions in &mut self.control.active_with_region_exclusions {
                 exclusions.push((start, end));
             }
         }
@@ -3719,7 +3752,10 @@ impl Compiler<'_> {
         accepted: Label,
         restart: Label,
         include_with_region_exclusion: bool,
+        include_protected_region_exclusion: bool,
     ) -> Result<(), CompileError> {
+        let include_protected_region_exclusion = include_protected_region_exclusion
+            && !comprehension_filter_has_root_if_expression(condition);
         if comprehension_filter_truthiness(condition) == Some(true) {
             self.record_folded_value(condition)?;
             if matches!(condition, Expr::UnaryOp(unary) if unary.op == UnaryOp::Not) {
@@ -3747,6 +3783,7 @@ impl Compiler<'_> {
                     next,
                     restart,
                     include_with_region_exclusion,
+                    include_protected_region_exclusion,
                 )?;
                 self.assembler.mark(next);
             }
@@ -3756,6 +3793,7 @@ impl Compiler<'_> {
                 accepted,
                 restart,
                 include_with_region_exclusion,
+                include_protected_region_exclusion,
             );
         }
         if let Expr::BoolOp(boolean) = condition
@@ -3775,6 +3813,7 @@ impl Compiler<'_> {
                 accepted,
                 restart,
                 include_with_region_exclusion,
+                include_protected_region_exclusion,
             );
         }
         if let Expr::UnaryOp(unary) = condition
@@ -3786,6 +3825,7 @@ impl Compiler<'_> {
                 accepted,
                 restart,
                 true,
+                include_protected_region_exclusion,
             );
         }
         if let Expr::Compare(comparison) = condition
@@ -3797,6 +3837,7 @@ impl Compiler<'_> {
                 accepted,
                 restart,
                 true,
+                include_protected_region_exclusion,
             );
         }
         if let Expr::Compare(comparison) = condition
@@ -3823,7 +3864,12 @@ impl Compiler<'_> {
             self.emit_jump_backward(JUMP_BACKWARD, restart, 0)?;
             let exclusion_end = self.assembler.label();
             self.assembler.mark(exclusion_end);
-            self.record_filter_exclusion(exclusion_start, exclusion_end, true);
+            self.record_filter_exclusion(
+                exclusion_start,
+                exclusion_end,
+                true,
+                include_protected_region_exclusion,
+            );
             if include_with_region_exclusion
                 && self.control.active_exception_region_exclusions.is_empty()
             {
@@ -3855,7 +3901,12 @@ impl Compiler<'_> {
         self.emit_jump_backward(JUMP_BACKWARD, restart, 0)?;
         let exclusion_end = self.assembler.label();
         self.assembler.mark(exclusion_end);
-        self.record_filter_exclusion(exclusion_start, exclusion_end, true);
+        self.record_filter_exclusion(
+            exclusion_start,
+            exclusion_end,
+            true,
+            include_protected_region_exclusion,
+        );
         if include_with_region_exclusion
             && self.control.active_exception_region_exclusions.is_empty()
         {
@@ -3900,6 +3951,7 @@ impl Compiler<'_> {
                 accepted,
                 start,
                 add_opcode == LIST_APPEND,
+                true,
             )?;
             self.assembler.mark(accepted);
         }
@@ -3939,6 +3991,7 @@ impl Compiler<'_> {
                         accepted,
                         start,
                         add_opcode == LIST_APPEND,
+                        true,
                     )?;
                     self.assembler.mark(accepted);
                 }
@@ -4067,7 +4120,7 @@ impl Compiler<'_> {
         self.assembler.mark(send);
         self.emit_jump_forward(SEND, send_end, 0)?;
         self.assembler.mark(yielded);
-        self.emit(YIELD_VALUE, 1, 0)?;
+        self.emit_yield_value(1, 0)?;
         self.assembler.mark(yielded_end);
         self.emit_resume(ResumeLocation::AFTER_AWAIT, ResumeDepth::Zero)?;
         self.emit_jump_backward(JUMP_BACKWARD_NO_INTERRUPT, send, 0)?;
@@ -4098,6 +4151,7 @@ impl Compiler<'_> {
                 accepted,
                 start,
                 add_opcode == LIST_APPEND,
+                false,
             )?;
             self.assembler.mark(accepted);
         }

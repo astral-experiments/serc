@@ -10,7 +10,7 @@ use super::{
     DELETE_DEREF, DELETE_FAST, DELETE_GLOBAL, DELETE_NAME, LOAD_COMMON_CONSTANT, LOAD_DEREF,
     LOAD_FAST, LOAD_FAST_CHECK, LOAD_FROM_DICT_OR_DEREF, LOAD_FROM_DICT_OR_GLOBALS, LOAD_GLOBAL,
     LOAD_LOCALS, LOAD_NAME, LOAD_SPECIAL, RERAISE, RESUME, SET_FUNCTION_ATTRIBUTE, STORE_DEREF,
-    STORE_FAST, STORE_GLOBAL, STORE_NAME,
+    STORE_FAST, STORE_GLOBAL, STORE_NAME, YIELD_VALUE,
 };
 use crate::CompileError;
 use crate::assembler::{ExceptionPolicy, Label, SourceLocation};
@@ -974,6 +974,15 @@ impl Compiler<'_> {
         effect: i32,
     ) -> Result<(), CompileError> {
         self.emit_with_exception_policy(opcode, argument, effect, ExceptionPolicy::default())
+    }
+
+    pub(super) fn emit_yield_value(
+        &mut self,
+        argument: u32,
+        effect: i32,
+    ) -> Result<(), CompileError> {
+        self.control.emitted_yield_value = true;
+        self.emit(YIELD_VALUE, argument, effect)
     }
 
     pub(super) fn emit_with_exception_policy(
