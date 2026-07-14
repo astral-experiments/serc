@@ -78,6 +78,25 @@ corpus-management scripts, but the full comparison does not replace or weaken
 the Ruff compatibility gate above. See [`corpora/README.md`](corpora/README.md)
 for the exact snapshot boundary and reproducibility details.
 
+### Holdout compatibility
+
+To measure compatibility beyond the pinned corpora, Serc was tested against
+four large OSS projects that are absent from the mypy-primer snapshot. The
+July 14, 2026 holdout compiled each project's Python sources and stubs with
+CPython 3.14.5 and compared the resulting marshal output byte for byte:
+
+| Holdout project | Files | CPython-rejected | Byte-identical | Byte mismatches | Match rate |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| [Django `bf5e73c`](https://github.com/django/django/tree/bf5e73c576c8c7d8b3ef1c03a22cf724dbb2f306) | 2,927 | 1 | 2,785 | 141 | 95.18% |
+| [Airflow `cad6220`](https://github.com/apache/airflow/tree/cad6220034e87c586eb87e14b5a75f4b82984fd0) | 7,621 | 0 | 7,236 | 385 | 94.95% |
+| [Transformers `ab1771c`](https://github.com/huggingface/transformers/tree/ab1771c9e42891d893189978a8009426d70b4688) | 4,643 | 0 | 4,470 | 173 | 96.27% |
+| [Ansible `3217c35`](https://github.com/ansible/ansible/tree/3217c352bb7b77392317aac0cf8b859d7d43b5b5) | 1,810 | 0 | 1,659 | 151 | 91.66% |
+| **Combined holdout** | **17,001** | **1** | **16,150** | **850** | **95.00%** |
+
+The holdout had no unsupported inputs, parse/decode mismatches, compiler
+panics, or oracle failures. It is an independent diagnostic measurement, not
+part of the frozen compatibility baseline or the required CI gate.
+
 See [`crates/serc/ARCHITECTURE.md`](crates/serc/ARCHITECTURE.md) for
 compiler internals and target-generation details.
 
