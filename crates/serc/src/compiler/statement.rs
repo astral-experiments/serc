@@ -5788,7 +5788,7 @@ impl Compiler<'_> {
         let retain_dynamic_while_condition_owner = exclude_not_taken
             && !self.context.has_lazy_imports
             && !condition_fallthrough_to_loop_backedge
-            && matches!(
+            && (matches!(
                 statement.test.as_ref(),
                 Expr::Named(named)
                     if matches!(
@@ -5798,7 +5798,23 @@ impl Compiler<'_> {
                                 || (self.control.active_with_region_exclusions.is_empty()
                                     && matches!(call.func.as_ref(), Expr::Attribute(_)))
                     )
-            )
+            ) || (self.unit.flags & CO_GENERATOR != 0
+                && self.control.loops.is_empty()
+                && self.control.active_exception_region_exclusions.is_empty()
+                && self.control.active_with_region_exclusions.is_empty()
+                && self.control.active_exception_handlers.is_empty()
+                && self.control.active_exception_group_handlers == 0
+                && self.control.active_finally_try_bodies == 0
+                && self.control.active_normal_finally_bodies == 0
+                && self.control.active_finally_end_blocks == 0
+                && matches!(
+                    statement.test.as_ref(),
+                    Expr::Call(call)
+                        if matches!(
+                            call.func.as_ref(),
+                            Expr::Name(name) if name.id.as_str() != "__debug__"
+                        )
+                )))
             && !expression_suspends_current_scope(&statement.test)
             && !expression_contains_inline_branch(&statement.test);
         self.with_control_override(

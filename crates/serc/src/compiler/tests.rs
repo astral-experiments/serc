@@ -217,6 +217,166 @@ def direct_name(check, item):
 }
 
 #[test]
+fn generator_call_name_condition_owner_excludes_protected_and_folded_tests() {
+    fn read_exception_varint(table: &[u8], index: &mut usize) -> u32 {
+        let mut byte = table[*index];
+        *index += 1;
+        let mut value = u32::from(byte & 0x3f);
+        while byte & 0x40 != 0 {
+            byte = table[*index];
+            *index += 1;
+            value = (value << 6) | u32::from(byte & 0x3f);
+        }
+        value
+    }
+
+    let source = r#"def debug_callable_control():
+    while (__debug__)():
+        yield 1
+
+
+def optimized_generator_controls(items):
+    while all(item for item in items):
+        yield items
+    while any(item for item in items):
+        yield items
+    while tuple(item for item in items):
+        yield items
+
+
+def unary_not_control(item):
+    while not should_continue(item):
+        yield item
+
+
+def nested_non_tail_control(items, observe):
+    for item in items:
+        while should_continue(item):
+            yield item
+        observe(item)
+
+
+def protected_try_control(item):
+    try:
+        while should_continue(item):
+            yield item
+    except ValueError:
+        yield None
+
+
+def handler_control(item):
+    try:
+        raise ValueError(item)
+    except ValueError:
+        while should_continue(item):
+            yield item
+
+
+def exception_group_handler_control(item):
+    try:
+        raise ExceptionGroup("group", [ValueError(item)])
+    except* ValueError:
+        while should_continue(item):
+            yield item
+
+
+def protected_with_control(manager, item):
+    with manager:
+        while should_continue(item):
+            yield item
+
+
+def finally_control(item, cleanup):
+    try:
+        yield item
+    finally:
+        while should_continue(item):
+            cleanup(item)
+
+
+def nested_finally_control(item, cleanup):
+    try:
+        try:
+            yield item
+        finally:
+            while should_continue(item):
+                cleanup(item)
+    finally:
+        cleanup(None)
+
+
+def inline_controls(first, second, items):
+    while should_continue(first and second):
+        yield first
+    while should_continue([item for item in items if item]):
+        yield items
+
+
+async def coroutine_control(item, consume):
+    while should_continue(item):
+        item = await consume(item)
+
+
+async def async_generator_control(item, consume):
+    while should_continue(item):
+        yield item
+        item = await consume(item)
+"#;
+    let parsed = parse_module(source).unwrap();
+    let module = module_compiler(source, &parsed)
+        .compile_module(parsed.suite())
+        .unwrap();
+
+    for (name, expected) in [
+        ("debug_callable_control", &[false][..]),
+        (
+            "optimized_generator_controls",
+            &[true, true, false, true, true, false, true, false][..],
+        ),
+        ("unary_not_control", &[false][..]),
+        ("nested_non_tail_control", &[false][..]),
+        ("protected_try_control", &[false, true][..]),
+        ("handler_control", &[true, false][..]),
+        ("exception_group_handler_control", &[true, true, true][..]),
+        ("protected_with_control", &[false, true][..]),
+        ("finally_control", &[false, false][..]),
+        ("nested_finally_control", &[false, true][..]),
+        ("inline_controls", &[true, false, false, false][..]),
+        ("coroutine_control", &[false][..]),
+        ("async_generator_control", &[false][..]),
+    ] {
+        let function = module
+            .constants
+            .iter()
+            .find_map(|constant| match constant {
+                Constant::Code(code) if code.name == name => Some(code),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("module should contain {name}"));
+        let mut ranges = Vec::new();
+        let mut index = 0;
+        while index < function.exception_table.len() {
+            let start = read_exception_varint(&function.exception_table, &mut index);
+            let length = read_exception_varint(&function.exception_table, &mut index);
+            read_exception_varint(&function.exception_table, &mut index);
+            read_exception_varint(&function.exception_table, &mut index);
+            ranges.push(start..start + length);
+        }
+        let marker_owners = function
+            .bytecode
+            .chunks_exact(2)
+            .enumerate()
+            .filter(|(_, instruction)| instruction[0] == NOT_TAKEN.code())
+            .map(|(offset, _)| {
+                let offset = u32::try_from(offset).unwrap();
+                ranges.iter().any(|range| range.contains(&offset))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(marker_owners, expected, "unexpected owner for {name}");
+    }
+}
+
+#[test]
 fn interns_adversarial_identifier_families_densely() {
     let mut interner = NameInterner::default();
     let names = (0..4096)
