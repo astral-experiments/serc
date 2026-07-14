@@ -44,6 +44,7 @@ use super::{Compiler, Scope};
 #[derive(Clone, Copy, Debug)]
 struct LoopContext {
     body_start: usize,
+    body_start_item: usize,
     continue_label: Label,
     break_label: Label,
     iterator_cleanup: IteratorCleanup,
@@ -589,6 +590,7 @@ impl Compiler<'_> {
     ) -> LoopContext {
         LoopContext {
             body_start: self.assembler.instruction_count(),
+            body_start_item: self.assembler.item_count(),
             continue_label,
             break_label,
             iterator_cleanup,
@@ -3510,13 +3512,39 @@ impl Compiler<'_> {
                             self.assembler.instruction_count() == context.body_start
                         }))
                         || (self.control.current_statement_has_following
-                            && matches!(test, Expr::Name(_) | Expr::Call(_))
                             && matches!(body.last(), Some(Stmt::Continue(_)))
-                            && self.control.loops.last().is_some_and(|context| {
-                                !self
-                                    .assembler
-                                    .contains_opcode_since(NOT_TAKEN, context.body_start)
-                            })));
+                            && ((matches!(test, Expr::Name(_) | Expr::Call(_))
+                                && self.control.loops.last().is_some_and(|context| {
+                                    !self.assembler.contains_opcode_since_item(
+                                        NOT_TAKEN,
+                                        context.body_start_item,
+                                    )
+                                }))
+                                || (!self.context.has_lazy_imports
+                                    && matches!(self.unit.scope, Scope::Function { .. })
+                                    && self.unit.flags
+                                        & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                                        == 0
+                                    && self.control.active_exception_handlers.is_empty()
+                                    && matches!(body, [Stmt::Continue(_)])
+                                    && matches!(test, Expr::UnaryOp(unary)
+                                        if unary.op == UnaryOp::Not
+                                            && matches!(unary.operand.as_ref(), Expr::Name(_)))
+                                    && self.control.loops.last().is_some_and(|context| {
+                                        context.iterator_cleanup == IteratorCleanup::Sync
+                                            && context.exception_region_depth
+                                                == self
+                                                    .control
+                                                    .active_exception_region_exclusions
+                                                    .len()
+                                            && context.finally_end_depth
+                                                == self.control.active_finally_end_blocks
+                                            && !self
+                                                .assembler
+                                                .contains_terminal_with_barrier_since_item(
+                                                    context.body_start_item,
+                                                )
+                                    })))));
                 let preserve_first_sync_iterator_condition_owner = branch_index == 0
                     && !self.context.has_lazy_imports
                     && self.control.loops.len() == 1
