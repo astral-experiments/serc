@@ -2127,8 +2127,7 @@ impl Compiler<'_> {
             && matches!(
                 call.arguments.args.as_ref(),
                 [Expr::Generator(generator)]
-                    if generator.generators.len() == 1
-                        && !expression_suspends_current_scope(&generator.elt)
+                    if !expression_suspends_current_scope(&generator.elt)
                         && generator.generators.iter().all(|generator| {
                             !generator.is_async
                                 && !expression_suspends_current_scope(&generator.iter)
@@ -2193,6 +2192,10 @@ impl Compiler<'_> {
                 .or_else(|| {
                     synchronous_with_boolean_dispatch_policy
                         .filter(|_| !self.assembler.current_block_has_dynamic_exception_owner())
+                })
+                .or_else(|| {
+                    pre_suspension_coroutine_boolean_loop_policy
+                        .filter(|_| self.assembler.contains_opcode(NOT_TAKEN))
                 })
                 .or(generator_guard_exception_policy)
                 .or_else(|| {
