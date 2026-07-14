@@ -179,6 +179,10 @@ impl Assembler {
             .count()
     }
 
+    pub(crate) fn item_count(&self) -> usize {
+        self.linear_items().len()
+    }
+
     pub(crate) fn instruction_opcode_at(&self, instruction_offset: usize) -> Option<Opcode> {
         self.linear_items()
             .iter()
@@ -235,6 +239,22 @@ impl Assembler {
             })
             .skip(instruction_offset)
             .any(|instruction| instruction.opcode == opcode)
+    }
+
+    /// Returns whether `opcode` was emitted since the captured linear-item offset.
+    pub(crate) fn contains_opcode_since_item(&self, opcode: Opcode, item_offset: usize) -> bool {
+        self.linear_items().iter().skip(item_offset).any(
+            |item| matches!(item, Item::Instruction(instruction) if instruction.opcode == opcode),
+        )
+    }
+
+    /// Returns whether a terminal synchronous-with owner barrier was emitted since `item_offset`.
+    pub(crate) fn contains_terminal_with_barrier_since_item(&self, item_offset: usize) -> bool {
+        self.linear_items().iter().skip(item_offset).any(|item| {
+            matches!(item, Item::Instruction(instruction)
+                    if matches!(instruction.opcode,
+                        LOAD_FAST_AND_CLEAR | NOT_TAKEN | FOR_ITER | PUSH_EXC_INFO))
+        })
     }
 
     /// Returns how many instruction slots optimization can vacate before a normalized marker.
