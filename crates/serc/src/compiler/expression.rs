@@ -3804,8 +3804,39 @@ impl Compiler<'_> {
                     "boolean expression contains no values".to_string(),
                 ));
             };
+            // A source-line split prevents the comprehension target load from fusing; CPython
+            // keeps the leading specialized None-condition marker inside the cleanup region.
+            let preserve_multiline_list_filter_none_owner = include_with_region_exclusion
+                && include_protected_region_exclusion
+                && matches!(self.unit.scope, Scope::Function { .. })
+                && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR | CO_GENERATOR) == 0
+                && self.control.generator_region_start.is_none()
+                && self.control.active_exception_region_exclusions.is_empty()
+                && self.control.active_with_region_exclusions.is_empty()
+                && self.control.active_comprehension_region_exclusions.len() == 1
+                && self
+                    .control
+                    .active_comprehension_region_exclusions
+                    .last()
+                    .is_some_and(Vec::is_empty)
+                && matches!(leading, [Expr::Compare(comparison)]
+                    if comparison.ops.len() == 1
+                        && comparison.ops[0] == CmpOp::Is
+                        && matches!(comparison.left.as_ref(), Expr::Name(_))
+                        && comparison.comparators.len() == 1
+                        && matches!(comparison.comparators[0], Expr::NoneLiteral(_)))
+                && matches!(last, Expr::Call(call) if matches!(call.func.as_ref(), Expr::Attribute(_)))
+                && self.assembler.location().line < self.source_location(leading[0].range()).line;
             for value in leading {
-                self.compile_jump_if(value, true, accepted)?;
+                if preserve_multiline_list_filter_none_owner {
+                    self.with_control_override(
+                        |control| &mut control.include_scoped_none_condition_owner,
+                        true,
+                        |compiler| compiler.compile_jump_if(value, true, accepted),
+                    )?;
+                } else {
+                    self.compile_jump_if(value, true, accepted)?;
+                }
             }
             return self.compile_comprehension_filter(
                 last,

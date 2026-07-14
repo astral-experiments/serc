@@ -1665,6 +1665,140 @@ async def nested_manager_inner_single(outer, inner, state, value):
 }
 
 #[test]
+fn multiline_comprehension_filter_markers_respect_owner_boundaries() {
+    fn read_exception_varint(table: &[u8], index: &mut usize) -> u32 {
+        let mut byte = table[*index];
+        *index += 1;
+        let mut value = u32::from(byte & 0x3f);
+        while byte & 0x40 != 0 {
+            byte = table[*index];
+            *index += 1;
+            value = (value << 6) | u32::from(byte & 0x3f);
+        }
+        value
+    }
+
+    let source = r"def multiline_set(values, suffix):
+    return {
+        item
+        for item in values
+        if suffix is None or item.name.endswith(suffix)
+    }
+
+def multiline_dict(values, suffix):
+    return {
+        item.name: item
+        for item in values
+        if suffix is None or item.name.endswith(suffix)
+    }
+
+def multiline_try(values, suffix):
+    try:
+        return [
+            item
+            for item in values
+            if suffix is None or item.name.endswith(suffix)
+        ]
+    except Exception:
+        return []
+
+def multiline_with(values, suffix, manager):
+    with manager:
+        return [
+            item
+            for item in values
+            if suffix is None or item.name.endswith(suffix)
+        ]
+
+def multiline_is_not(values, suffix):
+    return [
+        item
+        for item in values
+        if suffix is not None or item.name.endswith(suffix)
+    ]
+
+def multiline_second_filter(values, suffix, ready):
+    return [
+        item
+        for item in values
+        if ready(item)
+        if suffix is None or item.name.endswith(suffix)
+    ]
+
+def multiline_nested_comprehension_filter(groups, suffix):
+    return [
+        item
+        for item in groups
+        if suffix is None
+        or [value for value in item.values if value.name.endswith(suffix)]
+    ]
+
+def multiline_singleton_after_outer_filter(values, suffix, ready):
+    return [
+        (item, extra)
+        for item in values
+        if ready(item)
+        for extra in (item,)
+        if suffix is None or extra.name.endswith(suffix)
+    ]
+";
+    let parsed = parse_module(source).unwrap();
+    let module = module_compiler(source, &parsed)
+        .compile_module(parsed.suite())
+        .unwrap();
+
+    for (name, expected) in [
+        ("multiline_set", &[false, false][..]),
+        ("multiline_dict", &[false, false][..]),
+        ("multiline_try", &[false, false, true][..]),
+        ("multiline_with", &[false, false, true][..]),
+        ("multiline_is_not", &[false, false][..]),
+        ("multiline_second_filter", &[false, true, false][..]),
+        (
+            "multiline_nested_comprehension_filter",
+            &[false, false, false][..],
+        ),
+        (
+            "multiline_singleton_after_outer_filter",
+            &[false, true, false][..],
+        ),
+    ] {
+        let function = module
+            .constants
+            .iter()
+            .find_map(|constant| match constant {
+                Constant::Code(code) if code.name == name => Some(code),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("module should contain {name}"));
+        let mut ranges = Vec::new();
+        let mut index = 0;
+        while index < function.exception_table.len() {
+            let start = read_exception_varint(&function.exception_table, &mut index);
+            let length = read_exception_varint(&function.exception_table, &mut index);
+            read_exception_varint(&function.exception_table, &mut index);
+            read_exception_varint(&function.exception_table, &mut index);
+            ranges.push(start..start + length);
+        }
+        let marker_owners = function
+            .bytecode
+            .chunks_exact(2)
+            .enumerate()
+            .filter(|(_, instruction)| instruction[0] == NOT_TAKEN.code())
+            .map(|(offset, _)| {
+                let offset = u32::try_from(offset).unwrap();
+                ranges.iter().any(|range| range.contains(&offset))
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            marker_owners, expected,
+            "unexpected marker owners for {name}"
+        );
+    }
+}
+
+#[test]
 fn chained_generator_filters_keep_their_first_comparison_marker_owned() {
     fn read_exception_varint(table: &[u8], index: &mut usize) -> u32 {
         let mut byte = table[*index];
