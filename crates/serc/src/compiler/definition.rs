@@ -441,7 +441,7 @@ impl Compiler<'_> {
         } else {
             0
         }) | (self.unit.flags & SUPPORTED_FUTURE_FLAGS);
-        let contains_yield = self.context.module_plan.has_yield_expressions
+        let contains_yield = self.context.module_plan().has_yield_expressions
             && suite_contains_yield(&definition.body);
         if definition.is_async && contains_yield {
             parameter_flags |= CO_ASYNC_GENERATOR;

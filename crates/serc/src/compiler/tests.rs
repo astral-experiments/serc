@@ -984,7 +984,7 @@ if condition:
 ";
     let parsed = parse_module(source).unwrap();
     let compiler = module_compiler(source, &parsed);
-    let plan = &compiler.context.module_plan;
+    let plan = compiler.context.module_plan();
     let names = &compiler.context.scopes.names;
     let name_id = |name| {
         names

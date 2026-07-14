@@ -97,7 +97,7 @@ impl<'source> Compiler<'source> {
         body: &Suite,
     ) -> Self {
         let context = Arc::new(CompilationContext::new(filename, source, tokens, body));
-        let future_flags = context.module_plan.future_flags;
+        let future_flags = context.module_plan().future_flags;
         let unit = CodeUnit::from_spec(CodeUnitSpec {
             scope: Scope::Module,
             scope_id: ScopeId::MODULE,
@@ -302,11 +302,11 @@ impl<'source> Compiler<'source> {
     pub(crate) fn compile_module(mut self, body: &Suite) -> Result<CodeObject, CompileError> {
         self.symbols
             .module_globals
-            .clone_from(&self.context.module_plan.module_globals);
+            .clone_from(&self.context.module_plan().module_globals);
         self.symbols
             .imported_scope_names
-            .clone_from(&self.context.module_plan.imported_scope_names);
-        for &name in &self.context.module_plan.comprehension_targets {
+            .clone_from(&self.context.module_plan().imported_scope_names);
+        for &name in &self.context.module_plan().comprehension_targets {
             let index = to_u32(self.symbols.locals.len(), "module local count")?;
             self.symbols.locals.push(name);
             self.symbols.temporary_indices.insert(name, index);
@@ -314,7 +314,7 @@ impl<'source> Compiler<'source> {
         }
         self.symbols.cell_names.extend(
             self.context
-                .module_plan
+                .module_plan()
                 .comprehension_cell_names
                 .iter_unordered(),
         );
@@ -331,8 +331,8 @@ impl<'source> Compiler<'source> {
         for index in comprehension_cells {
             self.emit(MAKE_CELL, to_u32(index, "module cell index")?, 0)?;
         }
-        let simple_module_annotations = self.context.module_plan.has_simple_annotations;
-        let module_annotations = self.context.module_plan.has_annotations;
+        let simple_module_annotations = self.context.module_plan().has_simple_annotations;
+        let module_annotations = self.context.module_plan().has_annotations;
         let future_module_annotations =
             self.unit.flags & CO_FUTURE_ANNOTATIONS != 0 && module_annotations;
         if module_annotations {
