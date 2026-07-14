@@ -398,6 +398,9 @@ pub(super) struct ControlFlowState {
     copied_split_return_try: Option<TextRange>,
     // A final try-else `if` whose retained normal-exit marker moves to its first nested join.
     relocated_try_else_exit: Option<TextRange>,
+    // A direct awaited try body can leave its first else-condition marker on the coroutine
+    // stop-iteration owner after the protected body is removed.
+    preserve_coroutine_try_else_condition: Option<TextRange>,
     // The direct final synchronous `with` in an active non-final try body, if any.
     direct_final_sync_with_try_body: Option<ruff_text_size::TextRange>,
     // The direct final synchronous `with` with a normal body fallthrough in a handler-form try
@@ -3608,6 +3611,8 @@ impl Compiler<'_> {
                         && self.control.loops.last().is_some_and(|context| {
                             context.iterator_cleanup == IteratorCleanup::Sync
                         });
+                let preserve_coroutine_try_else_condition_owner = branch_index == 0
+                    && self.control.preserve_coroutine_try_else_condition == Some(test.range());
                 let preserve_sync_with_none_owner = branch_index == 0
                     && !suite_terminates(body)
                     && matches!(statement.elif_else_clauses.as_slice(), [clause]
@@ -4109,6 +4114,9 @@ impl Compiler<'_> {
                 {
                     // CPython removes the synthetic NOP before a synchronous iterator target.
                     // The first direct body condition reuses its protected CFG slot.
+                    self.assembler.preserve_last_not_taken_exception_owner();
+                }
+                if preserve_coroutine_try_else_condition_owner {
                     self.assembler.preserve_last_not_taken_exception_owner();
                 }
                 if preserve_first_unnamed_handler_loop_owner {
@@ -7156,24 +7164,46 @@ impl Compiler<'_> {
             .pop()
             .expect("active try region has exclusion collector");
         let orelse_instruction_count = self.assembler.instruction_count();
+        let preserve_coroutine_try_else_condition = (!self.context.has_lazy_imports
+            && self.unit.flags & CO_COROUTINE != 0
+            && self.control.generator_region_start.is_some()
+            && !statement.is_star
+            && statement.finalbody.is_empty()
+            && !suite_terminates(&statement.body)
+            && self.control.loops.is_empty()
+            && self.control.active_exception_region_exclusions.is_empty()
+            && self.control.active_with_region_exclusions.is_empty()
+            && self.control.active_exception_handlers.is_empty()
+            && self.control.active_normal_finally_bodies == 0
+            && self.control.active_finally_end_blocks == 0
+            && self.control.active_finally_try_bodies == 0
+            && self.control.active_exception_group_handlers == 0)
+            .then(|| first_coroutine_try_else_condition(statement))
+            .flatten();
         self.with_control_override(
             |control| &mut control.relocated_try_else_exit,
             relocated_try_else_exit,
             |compiler| {
-                if terminal
-                    && statement
-                        .orelse
-                        .last()
-                        .is_some_and(terminal_try_distributes_implicit_return)
-                {
-                    let ((), emitted) = compiler.with_fallthrough_tracking(|compiler| {
-                        compiler.compile_suite_inner(&statement.orelse, true)
-                    })?;
-                    normal_return_emitted = emitted;
-                    Ok(())
-                } else {
-                    compiler.compile_suite(&statement.orelse)
-                }
+                compiler.with_control_override(
+                    |control| &mut control.preserve_coroutine_try_else_condition,
+                    preserve_coroutine_try_else_condition,
+                    |compiler| {
+                        if terminal
+                            && statement
+                                .orelse
+                                .last()
+                                .is_some_and(terminal_try_distributes_implicit_return)
+                        {
+                            let ((), emitted) = compiler.with_fallthrough_tracking(|compiler| {
+                                compiler.compile_suite_inner(&statement.orelse, true)
+                            })?;
+                            normal_return_emitted = emitted;
+                            Ok(())
+                        } else {
+                            compiler.compile_suite(&statement.orelse)
+                        }
+                    },
+                )
             },
         )?;
         let orelse_noop_location = (self.assembler.instruction_count() == orelse_instruction_count)
@@ -10746,6 +10776,30 @@ fn expression_contains_eager_suspension(expression: &Expr) -> bool {
     detector.found
 }
 
+fn first_coroutine_try_else_condition(statement: &ruff_python_ast::StmtTry) -> Option<TextRange> {
+    let Stmt::If(condition) = statement.orelse.first()? else {
+        return None;
+    };
+    if !matches!(condition.test.as_ref(), Expr::Name(_))
+        && !matches!(condition.test.as_ref(), Expr::UnaryOp(unary)
+            if unary.op == UnaryOp::Not && matches!(unary.operand.as_ref(), Expr::Name(_)))
+    {
+        return None;
+    }
+    statement
+        .body
+        .iter()
+        .any(|statement| {
+            matches!(statement, Stmt::Expr(expression)
+                if matches!(expression.value.as_ref(), Expr::Await(_)))
+                || matches!(statement, Stmt::Assign(assignment)
+                    if matches!(assignment.value.as_ref(), Expr::Await(_)))
+                || matches!(statement, Stmt::AnnAssign(assignment)
+                    if matches!(assignment.value.as_deref(), Some(Expr::Await(_))))
+        })
+        .then_some(condition.test.range())
+}
+
 fn is_simple_iterator_assert_assignment_value(expression: &Expr) -> bool {
     #[derive(Default)]
     struct Detector {
@@ -12827,7 +12881,8 @@ fn try_has_conditional_shared_loop_exit(statement: &Stmt) -> bool {
 mod tests {
     use super::{
         IteratorCleanup, break_jump_needs_exception_region_exclusion,
-        first_iterator_assignment_condition, suite_contains_multiple_loop_breaks,
+        first_coroutine_try_else_condition, first_iterator_assignment_condition,
+        suite_contains_multiple_loop_breaks, suite_terminates,
         terminal_assert_splits_success_return,
     };
     use crate::target::code_flags::{CO_ASYNC_GENERATOR, CO_COROUTINE, CO_GENERATOR};
@@ -12865,6 +12920,84 @@ mod tests {
             panic!("expected one while loop");
         };
         suite_contains_multiple_loop_breaks(&statement.body)
+    }
+
+    fn coroutine_try_else_condition(body: &str, condition: &str, prefix: &str) -> bool {
+        let parsed = parse_module(&format!(
+            "async def test():\n    try:\n        {body}\n    except ValueError:\n        pass\n    else:\n{prefix}        if {condition}:\n            pass"
+        ))
+        .expect("coroutine try-else should parse");
+        let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+            panic!("expected one function definition");
+        };
+        let [Stmt::Try(statement)] = function.body.as_slice() else {
+            panic!("expected one try statement");
+        };
+        first_coroutine_try_else_condition(statement).is_some()
+    }
+
+    fn selects_coroutine_try_else_condition(source: &str) -> bool {
+        let parsed = parse_module(source).expect("coroutine try should parse");
+        let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+            panic!("expected one function definition");
+        };
+        let [Stmt::Try(statement)] = function.body.as_slice() else {
+            panic!("expected one try statement");
+        };
+        !statement.is_star
+            && statement.finalbody.is_empty()
+            && !suite_terminates(&statement.body)
+            && first_coroutine_try_else_condition(statement).is_some()
+    }
+
+    #[test]
+    fn coroutine_try_else_condition_requires_direct_await_and_leading_name_test() {
+        for body in [
+            "await validate()",
+            "result = await validate()",
+            "result: object = await validate()",
+        ] {
+            assert!(coroutine_try_else_condition(body, "result", ""));
+            assert!(coroutine_try_else_condition(body, "not result", ""));
+        }
+
+        for body in [
+            "result = validate()",
+            "result = [await validate()]",
+            "async with manager:\n            result = validate()",
+        ] {
+            assert!(!coroutine_try_else_condition(body, "not result", ""));
+        }
+        for condition in [
+            "result.ready",
+            "validate(result)",
+            "result is None",
+            "result and ready",
+            "not result.ready",
+        ] {
+            assert!(!coroutine_try_else_condition(
+                "result = await validate()",
+                condition,
+                "",
+            ));
+        }
+        assert!(!coroutine_try_else_condition(
+            "result = await validate()",
+            "not result",
+            "        observe(result)\n",
+        ));
+    }
+
+    #[test]
+    fn coroutine_try_else_condition_rejects_finally_exception_group_and_unreachable_body() {
+        for source in [
+            "async def test():\n    try:\n        result = await validate()\n    except ValueError:\n        recover()\n    else:\n        if not result:\n            consume()\n    finally:\n        cleanup()\n",
+            "async def test():\n    try:\n        result = await validate()\n    except* ValueError:\n        recover()\n    else:\n        if not result:\n            consume()\n",
+            "async def test():\n    try:\n        result = await validate()\n        return result\n    except ValueError:\n        recover()\n    else:\n        if not result:\n            consume()\n",
+            "async def test():\n    try:\n        return None\n        result = await validate()\n    except ValueError:\n        recover()\n    else:\n        if not result:\n            consume()\n",
+        ] {
+            assert!(!selects_coroutine_try_else_condition(source), "{source}");
+        }
     }
 
     #[test]
