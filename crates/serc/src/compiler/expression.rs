@@ -2060,10 +2060,28 @@ impl Compiler<'_> {
                         })
             ))
         .then_some(ExceptionPolicy::EXCLUDE_ALWAYS);
+        // Keep prior manager-owner holes and terminal handler returns out of scope: adding the
+        // correct loop-owner split there worsens the table while earlier gaps remain unmatched.
+        let preserve_synchronous_with_boolean_loop_owner = !collect_tuple
+            && !self.context.has_lazy_imports
+            && self.control.in_synchronous_with()
+            && !self.control.include_assert_none_condition_owner
+            && ((self.control.current_statement_has_following
+                && !self.control.in_loop()
+                && self.control.active_exception_region_exclusions.is_empty()
+                && self.control.generator_region_exclusions.is_empty()
+                && self
+                    .control
+                    .active_with_region_exclusions
+                    .last()
+                    .is_some_and(|exclusions| !exclusions.is_empty()))
+                || (self.control.in_exception_handler()
+                    && !self.control.current_statement_has_following
+                    && self.control.generator_region_exclusions.is_empty()));
         let synchronous_with_boolean_loop_policy = (!collect_tuple
             && !self.context.has_lazy_imports
             && self.control.in_synchronous_with()
-            && self.control.include_assert_none_condition_owner
+            && !preserve_synchronous_with_boolean_loop_owner
             && matches!(
                 call.arguments.args.as_ref(),
                 [Expr::Generator(generator)]
@@ -2084,6 +2102,7 @@ impl Compiler<'_> {
         // retain their first marker, so keep this range-scoped and separate from the loop policy.
         let synchronous_with_boolean_dispatch_policy = (synchronous_with_boolean_loop_policy
             .is_some()
+            && self.control.include_assert_none_condition_owner
             && (self
                 .control
                 .shifted_sync_with_boolean_dispatch_calls
