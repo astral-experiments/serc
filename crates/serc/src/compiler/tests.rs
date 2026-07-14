@@ -17,7 +17,8 @@ use super::source::{
     unparse_annotation,
 };
 use super::statement::{
-    NestedIfExitLocation, nested_if_exit_location, try_propagates_protected_loop_tail_mode,
+    NestedIfExitLocation, first_coroutine_iterator_assignment_condition, nested_if_exit_location,
+    try_propagates_protected_loop_tail_mode,
 };
 use super::symbol::{
     CompilerStackEffect, ReraiseStackState, compiler_stack_effect, validate_compiler_stack_effect,
@@ -1861,6 +1862,206 @@ def unfiltered_with(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, 
         assert_eq!(
             marker_owners, expected,
             "unexpected marker owners for {name}"
+        );
+    }
+}
+
+#[test]
+fn coroutine_iterator_assignment_conditions_respect_prefix_and_tail_boundaries() {
+    let cases = [
+        (
+            "async def f(values, get_state, use):\n    for item in values:\n        state = get_state(item)\n        if state:\n            use(state)\n        use(item)\n",
+            true,
+        ),
+        (
+            "async def f(values, get_state, use):\n    for item in values:\n        state_dict = None\n        if state := get_state(item):\n            use(state)\n        use(state_dict)\n",
+            true,
+        ),
+        (
+            "async def f(values, get_state, use):\n    for item in values:\n        state = get_state(item)\n        state_dict = None\n        if state:\n            use(state)\n        use(state_dict)\n",
+            true,
+        ),
+        (
+            "async def f(values, get_state, use):\n    for item in values:\n        state = get_state(item)\n        if state:\n            use(state)\n",
+            false,
+        ),
+        (
+            "async def f(values, get_state, use):\n    for item in values:\n        state = get_state(item)\n        state_dict = None\n        observed = False\n        if state:\n            use(state)\n        use(observed, state_dict)\n",
+            false,
+        ),
+        (
+            "async def f(values, get_state, use):\n    for item in values:\n        use(item)\n        state = get_state(item)\n        if state:\n            use(state)\n        use(item)\n",
+            false,
+        ),
+        (
+            "async def f(values, ready, get_state, use):\n    for item in values:\n        state = get_state(item) if ready(item) else None\n        if state:\n            use(state)\n        use(item)\n",
+            false,
+        ),
+        (
+            "async def f(values, get_state, use):\n    for item in values:\n        state = [get_state(value) for value in item]\n        if state:\n            use(state)\n        use(item)\n",
+            false,
+        ),
+        (
+            "async def f(values, get_state, use):\n    for item in values:\n        state_dict = None\n        if state := [get_state(value) for value in item]:\n            use(state)\n        use(state_dict)\n",
+            false,
+        ),
+        (
+            "async def f(values, get_state, use):\n    for item in values:\n        first = second = get_state(item)\n        if first:\n            use(first)\n        use(item)\n",
+            false,
+        ),
+        (
+            "async def f(values, get_state, use):\n    for item in values:\n        state = get_state(item)\n        if state.ready:\n            use(state)\n        use(item)\n",
+            false,
+        ),
+        (
+            "async def f(values, get_state, use):\n    for item in values:\n        state = get_state(item)\n        if not state:\n            use(item)\n        use(item)\n",
+            false,
+        ),
+    ];
+
+    for (source, expected) in cases {
+        let parsed = parse_module(source).unwrap();
+        let [Stmt::FunctionDef(function)] = parsed.suite().as_slice() else {
+            panic!("expected one function definition");
+        };
+        let [Stmt::For(statement)] = function.body.as_slice() else {
+            panic!("expected one iterator loop");
+        };
+        assert_eq!(
+            first_coroutine_iterator_assignment_condition(&statement.body).is_some(),
+            expected,
+            "unexpected iterator assignment condition for {source}"
+        );
+    }
+}
+
+#[test]
+fn coroutine_iterator_condition_markers_respect_region_and_scope_boundaries() {
+    fn read_exception_varint(table: &[u8], index: &mut usize) -> u32 {
+        let mut byte = table[*index];
+        *index += 1;
+        let mut value = u32::from(byte & 0x3f);
+        while byte & 0x40 != 0 {
+            byte = table[*index];
+            *index += 1;
+            value = (value << 6) | u32::from(byte & 0x3f);
+        }
+        value
+    }
+
+    let source = r"async def protected_loop(values, get_state, use):
+    try:
+        for item in values:
+            state = get_state(item)
+            if state:
+                use(state)
+            use(item)
+    except Exception:
+        use(None)
+
+async def with_loop(values, get_state, use, manager):
+    with manager:
+        for item in values:
+            state = get_state(item)
+            if state:
+                use(state)
+            use(item)
+
+async def async_with_loop(values, get_state, use, manager):
+    async with manager:
+        for item in values:
+            state = get_state(item)
+            if state:
+                use(state)
+            use(item)
+
+async def handler_loop(values, get_state, use):
+    try:
+        use(None)
+    except Exception:
+        for item in values:
+            state = get_state(item)
+            if state:
+                use(state)
+            use(item)
+
+async def finally_loop(values, get_state, use):
+    try:
+        use(None)
+    finally:
+        for item in values:
+            state = get_state(item)
+            if state:
+                use(state)
+            use(item)
+
+async def async_for_control(values, get_state, use):
+    async for item in values:
+        state = get_state(item)
+        if state:
+            use(state)
+        use(item)
+
+def generator_control(values, get_state, use):
+    for item in values:
+        state = get_state(item)
+        if state:
+            use(state)
+        yield item
+
+async def async_generator_control(values, get_state, use):
+    for item in values:
+        state = get_state(item)
+        if state:
+            use(state)
+        yield item
+";
+    let parsed = parse_module(source).unwrap();
+    let module = module_compiler(source, &parsed)
+        .compile_module(parsed.suite())
+        .unwrap();
+
+    for (name, expected) in [
+        ("protected_loop", &[false, true][..]),
+        ("with_loop", &[false, true][..]),
+        ("async_with_loop", &[false, false][..]),
+        ("handler_loop", &[true, false][..]),
+        ("finally_loop", &[true, false][..]),
+        ("async_for_control", &[true, false][..]),
+        ("generator_control", &[false][..]),
+        ("async_generator_control", &[false][..]),
+    ] {
+        let function = module
+            .constants
+            .iter()
+            .find_map(|constant| match constant {
+                Constant::Code(code) if code.name == name => Some(code),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("module should contain {name}"));
+        let mut ranges = Vec::new();
+        let mut index = 0;
+        while index < function.exception_table.len() {
+            let start = read_exception_varint(&function.exception_table, &mut index);
+            let length = read_exception_varint(&function.exception_table, &mut index);
+            read_exception_varint(&function.exception_table, &mut index);
+            read_exception_varint(&function.exception_table, &mut index);
+            ranges.push(start..start + length);
+        }
+        let marker_owners = function
+            .bytecode
+            .chunks_exact(2)
+            .enumerate()
+            .filter(|(_, instruction)| instruction[0] == NOT_TAKEN.code())
+            .map(|(offset, _)| {
+                let offset = u32::try_from(offset).unwrap();
+                ranges.iter().any(|range| range.contains(&offset))
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            marker_owners, expected,
+            "unexpected iterator marker owners for {name}"
         );
     }
 }
