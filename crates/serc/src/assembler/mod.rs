@@ -155,7 +155,7 @@ impl Assembler {
         items
     }
 
-    fn linear_items_mut(&mut self) -> &mut Vec<Item> {
+    fn linear_items_mut(&mut self) -> &mut [Item] {
         let UnoptimizedCode::Linear(items) = &mut self.code else {
             panic!("linear instructions are unavailable after constant reachability analysis");
         };
@@ -175,6 +175,46 @@ impl Assembler {
             && self.borrow_unreachable_blocks.is_empty()
             && !self.has_synthesized_percent_target_locations
             && assertion_constant_indices(items, LOAD_CONST, &mut []).unwrap_or(false)
+    }
+
+    fn push_linear_item(&mut self, item: Item) {
+        let UnoptimizedCode::Linear(items) = &mut self.code else {
+            panic!("linear instructions are unavailable after constant reachability analysis");
+        };
+        if matches!(item, Item::Instruction(_)) {
+            self.instruction_item_indices.push(items.len());
+        }
+        items.push(item);
+    }
+
+    #[cfg(test)]
+    fn from_linear_items(items: Vec<Item>) -> Self {
+        let mut assembler = Self::default();
+        for item in items {
+            assembler.push_linear_item(item);
+        }
+        assembler
+    }
+
+    #[cfg(test)]
+    fn pop_linear_item(&mut self) -> Option<Item> {
+        let UnoptimizedCode::Linear(items) = &mut self.code else {
+            panic!("linear instructions are unavailable after constant reachability analysis");
+        };
+        let item = items.pop()?;
+        if matches!(item, Item::Instruction(_)) {
+            assert_eq!(self.instruction_item_indices.pop(), Some(items.len()));
+        }
+        Some(item)
+    }
+
+    #[cfg(test)]
+    fn clear_linear_items(&mut self) {
+        let UnoptimizedCode::Linear(items) = &mut self.code else {
+            panic!("linear instructions are unavailable after constant reachability analysis");
+        };
+        items.clear();
+        self.instruction_item_indices.clear();
     }
 
     pub(crate) fn disable_load_fast_borrowing(&mut self) {
@@ -199,34 +239,28 @@ impl Assembler {
     }
 
     pub(crate) fn last_instruction_location(&self) -> Option<SourceLocation> {
-        self.linear_items()
-            .iter()
-            .rev()
-            .find_map(|item| match item {
-                Item::Instruction(instruction) => Some(instruction.location),
-                Item::Label(_) => None,
-            })
+        let items = self.linear_items();
+        let index = *self.instruction_item_indices.last()?;
+        let Item::Instruction(instruction) = items[index] else {
+            unreachable!("instruction index points to a label");
+        };
+        Some(instruction.location)
     }
 
     pub(crate) fn last_instruction_is_nop(&self) -> bool {
-        self.linear_items()
-            .iter()
-            .rev()
-            .find_map(|item| match item {
-                Item::Instruction(instruction) => Some(instruction.opcode == NOP),
-                Item::Label(_) => None,
-            })
-            .unwrap_or(false)
+        let items = self.linear_items();
+        self.instruction_item_indices.last().is_some_and(|index| {
+            matches!(items[*index], Item::Instruction(instruction) if instruction.opcode == NOP)
+        })
     }
 
     fn last_instruction_mut(&mut self) -> Option<&mut Instruction> {
-        self.linear_items_mut()
-            .iter_mut()
-            .rev()
-            .find_map(|item| match item {
-                Item::Instruction(instruction) => Some(instruction),
-                Item::Label(_) => None,
-            })
+        let _ = self.linear_items();
+        let index = *self.instruction_item_indices.last()?;
+        let Item::Instruction(instruction) = &mut self.linear_items_mut()[index] else {
+            unreachable!("instruction index points to a label");
+        };
+        Some(instruction)
     }
 
     fn required_last_instruction_mut(&mut self, operation: &str) -> &mut Instruction {
@@ -269,10 +303,8 @@ impl Assembler {
     }
 
     pub(crate) fn instruction_count(&self) -> usize {
-        self.linear_items()
-            .iter()
-            .filter(|item| matches!(item, Item::Instruction(_)))
-            .count()
+        let _ = self.linear_items();
+        self.instruction_item_indices.len()
     }
 
     pub(crate) fn item_count(&self) -> usize {
@@ -280,26 +312,24 @@ impl Assembler {
     }
 
     pub(crate) fn instruction_opcode_at(&self, instruction_offset: usize) -> Option<Opcode> {
-        self.linear_items()
-            .iter()
-            .filter_map(|item| match item {
-                Item::Instruction(instruction) => Some(instruction.opcode),
-                Item::Label(_) => None,
-            })
-            .nth(instruction_offset)
+        let items = self.linear_items();
+        let item_offset = *self.instruction_item_indices.get(instruction_offset)?;
+        let Item::Instruction(instruction) = items[item_offset] else {
+            unreachable!("instruction index points to a label");
+        };
+        Some(instruction.opcode)
     }
 
     /// Marks an emitted instruction as ownerless when normalization does not reuse a stale slot.
     pub(crate) fn exclude_normalized_exception_owner_at(&mut self, instruction_offset: usize) {
-        let instruction = self
-            .linear_items_mut()
-            .iter_mut()
-            .filter_map(|item| match item {
-                Item::Instruction(instruction) => Some(instruction),
-                Item::Label(_) => None,
-            })
-            .nth(instruction_offset)
+        let _ = self.linear_items();
+        let item_offset = *self
+            .instruction_item_indices
+            .get(instruction_offset)
             .expect("instruction offset should reference an emitted instruction");
+        let Item::Instruction(instruction) = &mut self.linear_items_mut()[item_offset] else {
+            unreachable!("instruction index points to a label");
+        };
         instruction
             .exception_policy
             .set_owner(NormalizedExceptionOwner::Absent);
@@ -587,15 +617,15 @@ impl Assembler {
     }
 
     pub(crate) fn mark(&mut self, label: Label) {
-        self.linear_items_mut().push(Item::Label(label));
+        self.push_linear_item(Item::Label(label));
     }
 
     /// Inserts a boundary before every join label at the current instruction position.
     pub(crate) fn mark_before_trailing_labels(&mut self, label: Label) {
+        let _ = self.linear_items();
         let index = self
-            .linear_items()
-            .iter()
-            .rposition(|item| matches!(item, Item::Instruction(_)))
+            .instruction_item_indices
+            .last()
             .map_or(0, |index| index + 1);
         self.insert_label(index, label);
     }
@@ -643,14 +673,13 @@ impl Assembler {
     }
 
     pub(crate) fn mark_before_trailing_instructions(&mut self, label: Label, count: usize) {
-        let items = self.linear_items();
-        let index = items
-            .iter()
-            .enumerate()
-            .rev()
-            .filter(|(_, item)| matches!(item, Item::Instruction(_)))
-            .nth(count.saturating_sub(1))
-            .map_or(items.len(), |(index, _)| index);
+        let instruction_count = self.instruction_count();
+        let count = count.max(1);
+        let index = if count > instruction_count {
+            self.linear_items().len()
+        } else {
+            self.instruction_item_indices[instruction_count - count]
+        };
         self.insert_label(index, label);
     }
 
@@ -690,7 +719,16 @@ impl Assembler {
                     .expect("too many assembler items");
             }
         }
-        self.linear_items_mut().insert(index, Item::Label(label));
+        let shifted_instructions = self
+            .instruction_item_indices
+            .partition_point(|item| *item < index);
+        for item in &mut self.instruction_item_indices[shifted_instructions..] {
+            *item = item.checked_add(1).expect("too many assembler items");
+        }
+        let UnoptimizedCode::Linear(items) = &mut self.code else {
+            panic!("linear instructions are unavailable after constant reachability analysis");
+        };
+        items.insert(index, Item::Label(label));
     }
 
     pub(crate) fn fusion_barrier(&mut self) {
@@ -941,10 +979,9 @@ impl Assembler {
         &mut self,
     ) -> Option<(SourceLocation, Option<(Label, Label)>)> {
         let current_location = self.location;
+        let _ = self.linear_items();
+        let index = *self.instruction_item_indices.last()?;
         let items = self.linear_items_mut();
-        let index = items
-            .iter()
-            .rposition(|item| matches!(item, Item::Instruction(_)))?;
         let Item::Instruction(instruction) = items[index] else {
             unreachable!();
         };
@@ -965,7 +1002,11 @@ impl Assembler {
         } else {
             None
         };
+        let UnoptimizedCode::Linear(items) = &mut self.code else {
+            unreachable!();
+        };
         items.remove(index);
+        self.instruction_item_indices.pop();
         Some((instruction.location, exclusion))
     }
 
@@ -1397,7 +1438,7 @@ impl Assembler {
         {
             self.has_constant_pop_candidate = true;
         }
-        self.linear_items_mut().push(Item::Instruction(instruction));
+        self.push_linear_item(Item::Instruction(instruction));
     }
 }
 
