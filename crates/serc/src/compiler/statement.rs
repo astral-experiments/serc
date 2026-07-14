@@ -23,8 +23,9 @@ use crate::target::operands::{
 };
 
 use super::constant::{
-    first_literal_constant, first_suite_literal_constant, fold_constant, is_literal_constant,
-    literal_constant, optimized_percent_format, two_element_slice_optimization,
+    first_literal_constant, first_suite_literal_constant, fold_constant,
+    folded_constant_owner_slots, is_literal_constant, literal_constant, optimized_percent_format,
+    two_element_slice_optimization,
 };
 use super::expression::{
     binary_operator, comparison_operator, comparison_operator_boolean, early_condition_truthiness,
@@ -6496,6 +6497,27 @@ impl Compiler<'_> {
             }
             _ => None,
         };
+        let preserve_coroutine_folded_subscript_owner = self.unit.flags & CO_COROUTINE != 0
+            && !self.context.has_lazy_imports
+            && self.control.coroutine_suspension_epoch > 0
+            && self.control.generator_region_start.is_some()
+            && self.control.loops.is_empty()
+            && self
+                .control
+                .active_comprehension_region_exclusions
+                .is_empty()
+            && self.control.active_with_region_exclusions.is_empty()
+            && self.control.active_exception_region_exclusions.is_empty()
+            && self.control.active_exception_handlers.is_empty()
+            && self.control.active_exception_group_handlers == 0
+            && self.control.active_finally_try_bodies == 0
+            && self.control.active_normal_finally_bodies == 0
+            && self.control.active_finally_end_blocks == 0
+            && statement.msg.is_none()
+            && matches!(statement.test.as_ref(), Expr::Subscript(_))
+            && subscript_contains_folded_index(&statement.test)
+            && !expression_suspends_current_scope(&statement.test)
+            && !expression_contains_inline_branch(&statement.test);
         let split_success = split_success_return.then(|| self.assembler.label());
         self.with_control_override(
             |control| &mut control.include_assert_none_condition_owner,
@@ -6538,6 +6560,9 @@ impl Compiler<'_> {
                 )
             },
         )?;
+        if preserve_coroutine_folded_subscript_owner {
+            self.assembler.preserve_last_not_taken_exception_owner();
+        }
         self.assembler
             .set_location(self.source_location(statement.range));
         self.emit_common_constant(CommonConstant::ASSERTIONERROR)?;
@@ -11835,6 +11860,18 @@ fn expression_contains_inline_branch(expression: &Expr) -> bool {
     let mut detector = InlineBranchDetector::default();
     detector.visit_expr(expression);
     detector.found
+}
+
+fn subscript_contains_folded_index(mut expression: &Expr) -> bool {
+    while let Expr::Subscript(subscript) = expression {
+        if folded_constant_owner_slots(&subscript.slice) > 0
+            && fold_constant(&subscript.slice).is_some()
+        {
+            return true;
+        }
+        expression = &subscript.value;
+    }
+    false
 }
 
 fn terminal_condition_contains_global_callable(
