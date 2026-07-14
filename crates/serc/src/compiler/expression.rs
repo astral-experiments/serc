@@ -5249,12 +5249,14 @@ impl Compiler<'_> {
         }
 
         let exclude_from_generator = (self.control.exclude_condition_not_taken_from_exception
-            || terminal_try_depth.is_some())
+            || terminal_try_depth.is_some()
+            || self.control.exclude_terminal_if_not_taken_from_generator)
             && self.control.generator_region_start.is_some();
         let exclude_from_exception = self.control.exclude_condition_not_taken_from_exception
             || (self.control.exclude_terminal_if_not_taken
                 && !self.control.active_with_region_exclusions.is_empty());
         self.control.exclude_terminal_if_not_taken = false;
+        self.control.exclude_terminal_if_not_taken_from_generator = false;
 
         let exclusion_start = self.assembler.label();
         self.assembler.mark(exclusion_start);
