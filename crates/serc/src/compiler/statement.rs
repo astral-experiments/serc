@@ -232,6 +232,9 @@ pub(super) struct ControlFlowState {
     // Generic truthiness markers in a direct filtered element normalize against dynamic owner slots.
     pub(super) force_filtered_comprehension_truth_ownerless: bool,
     active_with_exits: Vec<WithExitContext>,
+    // Only direct None-condition siblings in the innermost synchronous-with body can reuse a
+    // preceding conditional owner. Nested suites and earlier returns use a different layout.
+    shifted_sync_with_none_owner_statements: Vec<TextRange>,
     pub(super) active_with_suspension_epochs: Vec<usize>,
     pub(super) active_with_region_exclusions: Vec<Vec<(Label, Label)>>,
     active_terminal_withs: usize,
@@ -294,6 +297,9 @@ pub(super) struct ControlFlowState {
     loop_tail_final_elif_nested_condition: Option<TextRange>,
     pub(super) exclude_condition_not_taken_from_exception: bool,
     pub(super) include_assert_none_condition_owner: bool,
+    // Protected multi-branch chains and None-condition tuple branches relocate their source
+    // jump; the final else assertion cannot reuse the stale owner slot.
+    suppress_else_assert_none_condition_owner: bool,
     pub(super) include_scoped_none_condition_owner: bool,
     // The final chained comparison whose fallthrough jump survives small-exit inlining as a NOP.
     pub(super) retained_chained_comparison_exit: Option<TextRange>,
@@ -3517,7 +3523,23 @@ impl Compiler<'_> {
                             .assembler
                             .fallthrough_has_concrete_dynamic_exception_owner()
                         || self.control.in_iterator_loop()
-                        || body.len() > 1);
+                        || body.len() > 1
+                        || ((matches!(body, [Stmt::Expr(expression)]
+                            if fold_constant(&expression.value).is_none())
+                            || matches!(
+                                body,
+                                [Stmt::Assign(_) | Stmt::AugAssign(_) | Stmt::Assert(_)]
+                            )
+                            || matches!(body, [Stmt::AnnAssign(statement)]
+                                if statement.value.is_some()))
+                            && self
+                                .control
+                                .shifted_sync_with_none_owner_statements
+                                .binary_search_by_key(
+                                    &(statement.range.start(), statement.range.end()),
+                                    |range| (range.start(), range.end()),
+                                )
+                                .is_ok()));
 
                 let preserve_sync_with_terminating_call_owner = branch_index == 0
                     && statement.elif_else_clauses.len() > 1
@@ -4233,7 +4255,29 @@ impl Compiler<'_> {
                         compiler.with_control_override(
                             |control| &mut control.direct_try_if_exit,
                             direct_try_if_exit,
-                            |compiler| compiler.compile_suite(body),
+                            |compiler| {
+                                let suppress_else_assert_none_condition_owner = compiler
+                                    .control
+                                    .suppress_else_assert_none_condition_owner
+                                    || (!compiler
+                                        .control
+                                        .active_exception_region_exclusions
+                                        .is_empty()
+                                        && (statement.elif_else_clauses.len() > 1
+                                            || (is_specialized_none_condition(&statement.test)
+                                                && matches!(
+                                                    statement.body.last(),
+                                                    Some(Stmt::Assign(assignment))
+                                                        if matches!(assignment.targets.as_slice(), [Expr::Tuple(_)])
+                                                ))));
+                                compiler.with_control_override(
+                                    |control| {
+                                        &mut control.suppress_else_assert_none_condition_owner
+                                    },
+                                    suppress_else_assert_none_condition_owner,
+                                    |compiler| compiler.compile_suite(body),
+                                )
+                            },
                         )
                     },
                 )?;
@@ -6169,7 +6213,11 @@ impl Compiler<'_> {
         let base_depth = self.control.depth;
         let end = self.assembler.label();
         let include_none_owner = self.control.include_assert_none_condition_owner
-            || !self.control.active_with_region_exclusions.is_empty();
+            || !self.control.active_with_region_exclusions.is_empty()
+            || (!self.control.active_exception_region_exclusions.is_empty()
+                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                && !self.control.suppress_else_assert_none_condition_owner
+                && is_specialized_none_condition(&statement.test));
         let retained_chained_comparison_exit = match statement.test.as_ref() {
             Expr::Compare(comparison) if comparison.ops.len() > 1 => Some(comparison.range),
             _ => None,
@@ -9704,11 +9752,20 @@ impl Compiler<'_> {
                 && (with_suite_has_fallthrough_handler_try(body)
                     || with_suite_has_terminal_none_and_raise(body)),
         };
+        let shifted_none_owner_statements = if remaining.is_empty() {
+            shifted_sync_with_none_owner_statements(body)
+        } else {
+            Vec::new()
+        };
         let (body_noop, region_exclusions) = self.with_region_exclusion_collector(
             |control| &mut control.active_with_region_exclusions,
             |compiler| {
                 compiler.with_with_context(context, terminal, |compiler| {
-                    compiler.compile_with_body(remaining, body)
+                    compiler.with_control_override(
+                        |control| &mut control.shifted_sync_with_none_owner_statements,
+                        shifted_none_owner_statements,
+                        |compiler| compiler.compile_with_body(remaining, body),
+                    )
                 })
             },
         )?;
@@ -12168,6 +12225,57 @@ fn with_suite_has_terminal_none_and_raise(body: &[Stmt]) -> bool {
                                 && matches!(first.comparators[0], Expr::NoneLiteral(_))
                                 && matches!(second.comparators[0], Expr::NoneLiteral(_))))
     )
+}
+
+fn shifted_sync_with_none_owner_statements(body: &[Stmt]) -> Vec<TextRange> {
+    #[derive(Default)]
+    struct Detector {
+        contains_return: bool,
+        contains_handler: bool,
+    }
+
+    impl<'ast> Visitor<'ast> for Detector {
+        fn visit_stmt(&mut self, statement: &'ast Stmt) {
+            if self.contains_handler
+                || matches!(statement, Stmt::FunctionDef(_) | Stmt::ClassDef(_))
+            {
+                return;
+            }
+            if matches!(statement, Stmt::Try(_) | Stmt::With(_)) {
+                self.contains_handler = true;
+                return;
+            }
+            if matches!(statement, Stmt::Return(_)) {
+                self.contains_return = true;
+                return;
+            }
+            walk_stmt(self, statement);
+        }
+    }
+
+    let mut detector = Detector::default();
+    body.windows(2)
+        .filter_map(|pair| {
+            let [previous, next] = pair else {
+                unreachable!("two-statement window must contain two statements");
+            };
+            let preceding_return = detector.contains_return;
+            detector.visit_stmt(previous);
+            let Stmt::If(statement) = next else {
+                return None;
+            };
+            let stable_predecessor = matches!(previous, Stmt::Assert(statement)
+                    if early_condition_truthiness(&statement.test).is_none())
+                || matches!(previous, Stmt::If(statement)
+                    if statement.elif_else_clauses.is_empty()
+                        && jump_constant_truthiness(&statement.test).is_none());
+            (stable_predecessor
+                && !preceding_return
+                && !detector.contains_handler
+                && is_specialized_none_condition(&statement.test))
+            .then_some(statement.range)
+        })
+        .collect()
 }
 
 fn finally_suite_preserves_none_condition_owner(body: &[Stmt]) -> bool {
