@@ -32,8 +32,7 @@ published results.
 The latest published end-to-end measurement (July 7, 2026, Serc `bd51c6d`)
 compiled NumPy's 505 Python files in **1.471 s ± 0.079 s**, compared with
 **2.056 s ± 0.451 s** for CPython 3.14.5 `compileall`: **1.40 ± 0.32 times
-faster** on that machine and workload. This is a historical performance
-measurement, not a compatibility score or a claim about every workload.
+faster** on that machine and workload.
 
 ## CPython compatibility
 
@@ -65,16 +64,12 @@ network, storage, and CPU resources:
 
 The current compatibility measurements are:
 
-| Corpus | Files | CPython-rejected | Byte-identical | Byte mismatches | Match rate* |
+| Corpus | Files | CPython-rejected | Byte-identical | Byte mismatches | Match rate |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | Ruff fixtures | 2,451 | 221 | 2,230 | 0 | 100% |
 | NumPy `v2.4.6` | 505 | 0 | 505 | 0 | 100% |
 | mypy-primer snapshot | 73,537 | 160 | 67,850 | 5,527 | 92.47% |
 | **Combined** | **76,493** | **381** | **70,585** | **5,527** | **92.74%** |
-
-\* Match rates use only CPython-accepted inputs as the denominator. The
-mypy-primer baseline has no unsupported inputs, parse/decode mismatches,
-compiler panics, or oracle failures; its 5,527 failures are byte mismatches.
 
 The second command freezes the mypy-primer outcome baseline and exits
 unsuccessfully when its counts change so compatibility improvements advance the
