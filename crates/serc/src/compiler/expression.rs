@@ -2060,6 +2060,25 @@ impl Compiler<'_> {
                         })
             ))
         .then_some(ExceptionPolicy::EXCLUDE_ALWAYS);
+        let synchronous_with_boolean_loop_policy = (!collect_tuple
+            && !self.context.has_lazy_imports
+            && self.control.in_synchronous_with()
+            && self.control.include_assert_none_condition_owner
+            && matches!(
+                call.arguments.args.as_ref(),
+                [Expr::Generator(generator)]
+                    if !expression_suspends_current_scope(&generator.elt)
+                        && generator.generators.iter().enumerate().all(|(index, generator)| {
+                            !generator.is_async
+                                && (index == 0
+                                    || !expression_suspends_current_scope(&generator.iter))
+                                && !generator
+                                    .ifs
+                                    .iter()
+                                    .any(expression_suspends_current_scope)
+                        })
+            ))
+        .then_some(ExceptionPolicy::EXCLUDE_ALWAYS);
 
         // The optimized-call guard's NOT_TAKEN is appended after exception targets are labeled.
         // In a plain generator's while body, it inherits the stop-iteration owner after a direct
@@ -2243,6 +2262,7 @@ impl Compiler<'_> {
                 0,
                 handler_boolean_loop_policy
                     .or(coroutine_boolean_loop_policy)
+                    .or(synchronous_with_boolean_loop_policy)
                     .unwrap_or_default(),
             )?;
             self.emit_jump_backward_with_exception_policy(
@@ -2251,6 +2271,7 @@ impl Compiler<'_> {
                 0,
                 handler_boolean_loop_policy
                     .or(coroutine_boolean_loop_policy)
+                    .or(synchronous_with_boolean_loop_policy)
                     .unwrap_or_default(),
             )?;
             if let Some(start) = comprehension_exclusion_start {
