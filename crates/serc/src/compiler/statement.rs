@@ -5785,9 +5785,22 @@ impl Compiler<'_> {
             && !self.control.current_statement_has_following;
         let condition_fallthrough_to_loop_backedge =
             self.control.suite_fallthrough_to_loop_backedge;
+        let retain_dynamic_while_condition_owner = exclude_not_taken
+            && !condition_fallthrough_to_loop_backedge
+            && matches!(
+                statement.test.as_ref(),
+                Expr::Named(named)
+                    if matches!(
+                        named.value.as_ref(),
+                        Expr::Call(call) if matches!(call.func.as_ref(), Expr::Name(_))
+                    )
+            )
+            && !expression_suspends_current_scope(&statement.test)
+            && !expression_contains_inline_branch(&statement.test);
         self.with_control_override(
             |control| &mut control.exclude_condition_not_taken_from_exception,
             exclude_not_taken
+                && !retain_dynamic_while_condition_owner
                 && (!preserve_protected_while_none_owner || reconstruct_protected_while_none_owner),
             |compiler| {
                 compiler.with_control_override(

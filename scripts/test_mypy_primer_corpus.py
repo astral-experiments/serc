@@ -158,7 +158,7 @@ def get_projects():
         expected_exact = int(full[expected_exact_index])
         expected_rejected = int(full[rejected_index])
 
-        self.assertEqual(expected_exact, 67_596)
+        self.assertEqual(expected_exact, 67_597)
         self.assertEqual(expected_rejected, 160)
         self.assertEqual(
             73_537 - expected_exact - expected_rejected, corpus.EXPECTED_FAILURES
