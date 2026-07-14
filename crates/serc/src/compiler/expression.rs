@@ -2079,6 +2079,31 @@ impl Compiler<'_> {
                         })
             ))
         .then_some(ExceptionPolicy::EXCLUDE_ALWAYS);
+        // A prior assertion or conditional, or a suspension inside this with body, labels the
+        // manager target before CPython appends the optimized dispatch marker. Fresh with bodies
+        // retain their first marker, so keep this range-scoped and separate from the loop policy.
+        let synchronous_with_boolean_dispatch_policy = (synchronous_with_boolean_loop_policy
+            .is_some()
+            && (self
+                .control
+                .shifted_sync_with_boolean_dispatch_calls
+                .contains(&call.range)
+                || self
+                    .control
+                    .active_with_suspension_epochs
+                    .last()
+                    .is_some_and(|epoch| self.control.coroutine_suspension_epoch > *epoch))
+            && !self.control.in_loop()
+            && self.control.active_exception_region_exclusions.is_empty()
+            && self
+                .control
+                .active_comprehension_region_exclusions
+                .is_empty()
+            && !self.control.in_exception_handler()
+            && self.control.active_exception_group_handlers == 0
+            && self.control.active_normal_finally_bodies == 0
+            && self.control.active_finally_end_blocks == 0)
+            .then_some(ExceptionPolicy::EXCLUDE_ALWAYS);
         // CPython appends the Boolean-loop marker and backedge after the coroutine assertion's
         // stop-iteration target is labeled. The dispatch marker keeps its ordinary owner.
         let pre_suspension_coroutine_boolean_loop_policy = (matches!(callable, "all" | "any")
@@ -2165,6 +2190,10 @@ impl Compiler<'_> {
             0,
             0,
             handler_boolean_loop_policy
+                .or_else(|| {
+                    synchronous_with_boolean_dispatch_policy
+                        .filter(|_| !self.assembler.current_block_has_dynamic_exception_owner())
+                })
                 .or(generator_guard_exception_policy)
                 .or_else(|| {
                     coroutine_boolean_loop_policy.map(|_| {

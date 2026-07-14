@@ -237,6 +237,9 @@ pub(super) struct ControlFlowState {
     // Only direct None-condition siblings in the innermost synchronous-with body can reuse a
     // preceding conditional owner. Nested suites and earlier returns use a different layout.
     shifted_sync_with_none_owner_statements: Vec<TextRange>,
+    // Direct optimized Boolean assertions after a prior assertion or branch in the innermost
+    // synchronous-with body. Their dispatch marker is appended outside the manager's owner.
+    pub(super) shifted_sync_with_boolean_dispatch_calls: Vec<TextRange>,
     // Direct terminal-condition siblings in the innermost async-with body can leave the first
     // marker of a later terminal branch outside the manager's exception region.
     shifted_async_with_terminal_owner_statements: Vec<TextRange>,
@@ -10107,6 +10110,12 @@ impl Compiler<'_> {
         } else {
             Vec::new()
         };
+        let shifted_boolean_dispatch_calls =
+            if remaining.is_empty() && !self.context.has_lazy_imports {
+                shifted_sync_with_boolean_dispatch_calls(body)
+            } else {
+                Vec::new()
+            };
         let (body_noop, region_exclusions) = self.with_region_exclusion_collector(
             |control| &mut control.active_with_region_exclusions,
             |compiler| {
@@ -10114,7 +10123,13 @@ impl Compiler<'_> {
                     compiler.with_control_override(
                         |control| &mut control.shifted_sync_with_none_owner_statements,
                         shifted_none_owner_statements,
-                        |compiler| compiler.compile_with_body(remaining, body),
+                        |compiler| {
+                            compiler.with_control_override(
+                                |control| &mut control.shifted_sync_with_boolean_dispatch_calls,
+                                shifted_boolean_dispatch_calls,
+                                |compiler| compiler.compile_with_body(remaining, body),
+                            )
+                        },
                     )
                 })
             },
@@ -12807,6 +12822,56 @@ fn shifted_sync_with_none_owner_statements(body: &[Stmt]) -> Vec<TextRange> {
             .then_some(statement.range)
         })
         .collect()
+}
+
+fn shifted_sync_with_boolean_dispatch_calls(body: &[Stmt]) -> Vec<TextRange> {
+    fn assertion_call(statement: &ruff_python_ast::StmtAssert) -> Option<TextRange> {
+        let (test, negated) = match statement.test.as_ref() {
+            Expr::UnaryOp(unary) if unary.op == UnaryOp::Not => (unary.operand.as_ref(), true),
+            test => (test, false),
+        };
+        let Expr::Call(call) = test else {
+            return None;
+        };
+        matches!(
+            (optimized_generator_callable(call), negated),
+            (Some("all"), false) | (Some("any"), _)
+        )
+        .then_some(call.range)
+    }
+
+    fn collect(body: &[Stmt], shifted: bool, calls: &mut Vec<TextRange>) {
+        let mut shifted = shifted;
+        for statement in body {
+            match statement {
+                Stmt::Assert(statement) => {
+                    if shifted && let Some(call) = assertion_call(statement) {
+                        calls.push(call);
+                    }
+                    shifted = true;
+                }
+                Stmt::If(statement) => {
+                    collect(&statement.body, true, calls);
+                    for clause in &statement.elif_else_clauses {
+                        collect(&clause.body, true, calls);
+                    }
+                    shifted = true;
+                }
+                Stmt::While(statement) => {
+                    collect(&statement.body, true, calls);
+                    collect(&statement.orelse, true, calls);
+                    shifted = true;
+                }
+                Stmt::Match(_) | Stmt::With(_) => shifted = true,
+                Stmt::Try(_) | Stmt::For(_) | Stmt::FunctionDef(_) | Stmt::ClassDef(_) => {}
+                _ => {}
+            }
+        }
+    }
+
+    let mut calls = Vec::new();
+    collect(body, false, &mut calls);
+    calls
 }
 
 fn shifted_async_with_terminal_owner_statements(body: &[Stmt]) -> Vec<TextRange> {
