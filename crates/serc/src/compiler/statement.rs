@@ -235,6 +235,9 @@ pub(super) struct ControlFlowState {
     // Only direct None-condition siblings in the innermost synchronous-with body can reuse a
     // preceding conditional owner. Nested suites and earlier returns use a different layout.
     shifted_sync_with_none_owner_statements: Vec<TextRange>,
+    // A direct None-condition after an earlier branch in a plain try body can reuse the removed
+    // protected block slot. Keep the selected statements local to the innermost try body.
+    shifted_try_none_owner_statements: Vec<TextRange>,
     pub(super) active_with_suspension_epochs: Vec<usize>,
     pub(super) active_with_region_exclusions: Vec<Vec<(Label, Label)>>,
     active_terminal_withs: usize,
@@ -636,6 +639,19 @@ impl Compiler<'_> {
         .then_some(final_sync_with_try_body)
         .flatten();
         let direct_try_body_statements = statement.body.iter().map(Ranged::range).collect();
+        let shifted_try_none_owner_statements = if !statement.is_star
+            && statement.orelse.is_empty()
+            && statement.finalbody.is_empty()
+            && statement.handlers.len() == 1
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && self.control.loops.is_empty()
+            && self.control.active_with_region_exclusions.is_empty()
+            && self.control.active_exception_region_exclusions.len() == 1
+        {
+            shifted_try_none_owner_statements(&statement.body)
+        } else {
+            Vec::new()
+        };
         let direct_try_body_has_else = !statement.orelse.is_empty();
         let direct_try_body_has_single_raise_handler = matches!(
             statement.handlers.as_slice(),
@@ -695,17 +711,26 @@ impl Compiler<'_> {
                                                         compiler.with_control_override(
                                                             |control| {
                                                                 &mut control
-                                                                    .direct_final_sync_with_protected_handler_try_body
+                                                                    .shifted_try_none_owner_statements
                                                             },
-                                                            direct_final_sync_with_protected_handler_try_body,
+                                                            shifted_try_none_owner_statements,
                                                             |compiler| {
                                                                 compiler.with_control_override(
                                                                     |control| {
                                                                         &mut control
-                                                                            .direct_final_sync_with_try_body
+                                                                            .direct_final_sync_with_protected_handler_try_body
                                                                     },
-                                                                    direct_final_sync_with_try_body,
-                                                                    compile,
+                                                                    direct_final_sync_with_protected_handler_try_body,
+                                                                    |compiler| {
+                                                                        compiler.with_control_override(
+                                                                            |control| {
+                                                                                &mut control
+                                                                                    .direct_final_sync_with_try_body
+                                                                            },
+                                                                            direct_final_sync_with_try_body,
+                                                                            compile,
+                                                                        )
+                                                                    },
                                                                 )
                                                             },
                                                         )
@@ -1850,6 +1875,18 @@ impl Compiler<'_> {
                         )
                     },
                 )?;
+                if branch_index == 0
+                    && self
+                        .control
+                        .shifted_try_none_owner_statements
+                        .binary_search_by_key(
+                            &(statement.range.start(), statement.range.end()),
+                            |range| (range.start(), range.end()),
+                        )
+                        .is_ok()
+                {
+                    self.assembler.preserve_last_not_taken_exception_owner();
+                }
                 self.mark_definitely_evaluated_locals(test);
                 let body_start = self.assembler.instruction_count();
                 let ((), emitted_fallthrough) = self.with_control_override(
@@ -3540,6 +3577,15 @@ impl Compiler<'_> {
                                     |range| (range.start(), range.end()),
                                 )
                                 .is_ok()));
+                let preserve_shifted_try_none_owner = branch_index == 0
+                    && self
+                        .control
+                        .shifted_try_none_owner_statements
+                        .binary_search_by_key(
+                            &(statement.range.start(), statement.range.end()),
+                            |range| (range.start(), range.end()),
+                        )
+                        .is_ok();
 
                 let preserve_sync_with_terminating_call_owner = branch_index == 0
                     && statement.elif_else_clauses.len() > 1
@@ -3953,11 +3999,12 @@ impl Compiler<'_> {
                     // start in fresh blocks.
                     self.assembler.preserve_last_not_taken_exception_owner();
                 }
-                if preserve_sync_with_none_owner || preserve_shifted_sync_with_none_owner {
-                    // A specialized None-condition marker can reuse the synchronous-with
-                    // owner after a concrete stale slot, in an iterator body, or before a
-                    // multi-statement branch. Complete non-exiting `is None` branches retain
-                    // the same owner even when an earlier marker consumed the setup slot.
+                if preserve_sync_with_none_owner
+                    || preserve_shifted_sync_with_none_owner
+                    || preserve_shifted_try_none_owner
+                {
+                    // A specialized None-condition marker can reuse the synchronous-with or
+                    // plain-try owner after a preceding conditional consumed the setup slot.
                     self.assembler.preserve_last_not_taken_exception_owner();
                 }
                 if preserve_sync_with_terminating_call_owner {
@@ -12276,6 +12323,73 @@ fn shifted_sync_with_none_owner_statements(body: &[Stmt]) -> Vec<TextRange> {
             .then_some(statement.range)
         })
         .collect()
+}
+
+fn shifted_try_none_owner_statements(body: &[Stmt]) -> Vec<TextRange> {
+    #[derive(Default)]
+    struct Detector {
+        found: bool,
+    }
+
+    impl<'ast> Visitor<'ast> for Detector {
+        fn visit_stmt(&mut self, statement: &'ast Stmt) {
+            if self.found
+                || matches!(
+                    statement,
+                    Stmt::FunctionDef(_) | Stmt::ClassDef(_) | Stmt::Try(_) | Stmt::With(_)
+                )
+            {
+                return;
+            }
+            if matches!(
+                statement,
+                Stmt::If(_) | Stmt::Assert(_) | Stmt::For(_) | Stmt::While(_)
+            ) {
+                self.found = true;
+                return;
+            }
+            walk_stmt(self, statement);
+        }
+
+        fn visit_expr(&mut self, expression: &'ast Expr) {
+            if self.found
+                || matches!(
+                    expression,
+                    Expr::Lambda(_)
+                        | Expr::ListComp(_)
+                        | Expr::SetComp(_)
+                        | Expr::DictComp(_)
+                        | Expr::Generator(_)
+                )
+            {
+                return;
+            }
+            if matches!(expression, Expr::BoolOp(_) | Expr::If(_))
+                || matches!(expression, Expr::Compare(comparison) if comparison.ops.len() > 1)
+            {
+                self.found = true;
+                return;
+            }
+            walk_expr(self, expression);
+        }
+    }
+
+    let mut detector = Detector::default();
+    let mut preceding_loop = false;
+    let mut selected = Vec::new();
+    for statement in body {
+        if detector.found
+            && let Stmt::If(statement) = statement
+            && is_specialized_none_condition(&statement.test)
+            && statement.elif_else_clauses.is_empty()
+            && !(preceding_loop && matches!(statement.body.as_slice(), [Stmt::Return(_)]))
+        {
+            selected.push(statement.range);
+        }
+        detector.visit_stmt(statement);
+        preceding_loop |= matches!(statement, Stmt::For(_) | Stmt::While(_));
+    }
+    selected
 }
 
 fn finally_suite_preserves_none_condition_owner(body: &[Stmt]) -> bool {
