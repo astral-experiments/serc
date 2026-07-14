@@ -10793,9 +10793,10 @@ fn first_coroutine_try_else_condition(statement: &ruff_python_ast::StmtTry) -> O
     let Stmt::If(condition) = statement.orelse.first()? else {
         return None;
     };
-    if !matches!(condition.test.as_ref(), Expr::Name(_))
+    if !is_coroutine_try_else_truth_leaf(&condition.test)
         && !matches!(condition.test.as_ref(), Expr::UnaryOp(unary)
-            if unary.op == UnaryOp::Not && matches!(unary.operand.as_ref(), Expr::Name(_)))
+            if unary.op == UnaryOp::Not
+                && is_coroutine_try_else_truth_leaf(&unary.operand))
     {
         return None;
     }
@@ -10811,6 +10812,14 @@ fn first_coroutine_try_else_condition(statement: &ruff_python_ast::StmtTry) -> O
                     if matches!(assignment.value.as_deref(), Some(Expr::Await(_))))
         })
         .then_some(condition.test.range())
+}
+
+fn is_coroutine_try_else_truth_leaf(expression: &Expr) -> bool {
+    match expression {
+        Expr::Name(_) => true,
+        Expr::Attribute(attribute) => is_coroutine_try_else_truth_leaf(&attribute.value),
+        _ => false,
+    }
 }
 
 fn is_simple_iterator_assert_assignment_value(expression: &Expr) -> bool {
@@ -12981,13 +12990,7 @@ mod tests {
         ] {
             assert!(!coroutine_try_else_condition(body, "not result", ""));
         }
-        for condition in [
-            "result.ready",
-            "validate(result)",
-            "result is None",
-            "result and ready",
-            "not result.ready",
-        ] {
+        for condition in ["validate(result)", "result is None", "result and ready"] {
             assert!(!coroutine_try_else_condition(
                 "result = await validate()",
                 condition,
@@ -12999,6 +13002,56 @@ mod tests {
             "not result",
             "        observe(result)\n",
         ));
+    }
+
+    #[test]
+    fn coroutine_try_else_condition_accepts_name_rooted_attribute_tests() {
+        for body in [
+            "await validate()",
+            "result = await validate()",
+            "result: object = await validate()",
+        ] {
+            for condition in [
+                "result.ready",
+                "not result.ready",
+                "result.service.connection.ready",
+                "not result.service.connection.ready",
+                "(__debug__).real",
+                "not (__debug__).real",
+            ] {
+                assert!(
+                    coroutine_try_else_condition(body, condition, ""),
+                    "{condition}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn coroutine_try_else_condition_rejects_complex_attribute_roots() {
+        for condition in [
+            "get_result().ready",
+            "not get_result().ready",
+            "results[0].ready",
+            "not results[0].ready",
+            "(await get_result()).ready",
+            "not (await get_result()).ready",
+            "(value := result).ready",
+            "not (value := result).ready",
+            "(result if ready else other).ready",
+            "not (result if ready else other).ready",
+            "(lambda: result)().ready",
+            "not (lambda: result)().ready",
+            "[value for value in results][0].ready",
+            "not [value for value in results][0].ready",
+            "(1).real",
+            "not (1).real",
+        ] {
+            assert!(
+                !coroutine_try_else_condition("result = await validate()", condition, ""),
+                "{condition}"
+            );
+        }
     }
 
     #[test]
