@@ -6,6 +6,8 @@ repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 python="${1:-${CPYTHON:-python3.14}}"
 ruff="$repo_root/vendor/ruff"
 
+"$repo_root/scripts/check-ruff-pin"
+
 corpus_roots=(
     "$ruff/crates/ty_python_semantic/resources/corpus"
     "$ruff/crates/ruff_python_parser/resources/valid"
@@ -28,5 +30,13 @@ cargo run --locked --manifest-path "$repo_root/Cargo.toml" \
   --expected-files 2451 \
   --expected-exact 2230 \
   --expected-cpython-rejected 221 \
+  --expected-outcome matched-rejection=118 \
+  --expected-outcome rejection-mismatch=76 \
+  --expected-outcome byte-mismatch=0 \
+  --expected-outcome unsupported=0 \
+  --expected-outcome parse-mismatch=0 \
+  --expected-outcome compiler-failure=27 \
+  --expected-outcome non-utf8=0 \
+  --expected-outcome oracle-failure=0 \
   --require-all \
   "${corpus_roots[@]}"

@@ -141,3 +141,26 @@ fn ruff_pin_check_rejects_an_uninitialized_submodule() {
         "{output:?}"
     );
 }
+
+#[test]
+fn ruff_pin_check_rejects_local_corpus_changes() {
+    let (checkout, _) = pinned_checkout();
+    let ruff = checkout.path().join("vendor/ruff");
+
+    fs_err::write(ruff.join("README.md"), "modified fixture\n").unwrap();
+    let output = check(checkout.path());
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("local changes"),
+        "{output:?}"
+    );
+
+    checked_git(&ruff, &["restore", "README.md"]);
+    fs_err::write(ruff.join("untracked.py"), "fixture = True\n").unwrap();
+    let output = check(checkout.path());
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("local changes"),
+        "{output:?}"
+    );
+}
