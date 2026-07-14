@@ -352,6 +352,8 @@ pub(super) struct ControlFlowState {
     current_statement_followed_by_try: bool,
     // Whether this statement directly follows a try in the same suite.
     current_statement_preceded_by_try: bool,
+    // The first generic condition marker in a statement immediately following async-with.
+    pub(super) post_async_with_condition_marker: Option<TextRange>,
     branch_join_successor: Option<TextRange>,
     // Whether the current statement is nested directly in a terminal if branch suite.
     pub(super) in_terminal_if_branch_suite: bool,
@@ -1241,6 +1243,24 @@ impl Compiler<'_> {
                     &mut self.control.current_statement_preceded_by_try,
                     preceded_by_try,
                 );
+                let post_async_with_condition_marker = (matches!(
+                    previous_statement,
+                    Some(Stmt::With(previous)) if previous.is_async
+                ) && !self.context.has_lazy_imports
+                    && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR) != 0
+                    && self.control.generator_region_start.is_some()
+                    && self.control.loops.is_empty()
+                    && self.control.active_exception_region_exclusions.is_empty())
+                .then(|| match statement {
+                    Stmt::If(statement) => first_generic_condition_marker(&statement.test),
+                    Stmt::Assert(statement) => first_generic_condition_marker(&statement.test),
+                    _ => None,
+                })
+                .flatten();
+                let previous_post_async_with_condition_marker = std::mem::replace(
+                    &mut self.control.post_async_with_condition_marker,
+                    post_async_with_condition_marker,
+                );
                 // CPython leaves an empty join block after a sibling `if`; its borrowed-load
                 // traversal does not cross that block to reach a folded assertion's failure
                 // path, so the assertion message remains owned.
@@ -1382,6 +1402,8 @@ impl Compiler<'_> {
                 self.control.copied_nested_handler_join_successor =
                     previous_copied_nested_handler_join_successor;
                 self.control.current_statement_preceded_by_try = previous_statement_preceded_by_try;
+                self.control.post_async_with_condition_marker =
+                    previous_post_async_with_condition_marker;
                 self.control.direct_comprehension_assignment_results =
                     previous_direct_comprehension_assignment_results;
                 result?;
@@ -10512,6 +10534,29 @@ fn first_iterator_loop_assertion(mut body: &[Stmt]) -> Option<TextRange> {
         }
         _ => None,
     }
+}
+
+fn first_generic_condition_marker(expression: &Expr) -> Option<TextRange> {
+    let mut first = expression;
+    loop {
+        match first {
+            Expr::UnaryOp(unary) if unary.op == UnaryOp::Not => first = &unary.operand,
+            Expr::BoolOp(boolean) => first = boolean.values.first()?,
+            _ => break,
+        }
+    }
+    if matches!(first, Expr::Compare(_) | Expr::If(_))
+        || matches!(first, Expr::Call(call)
+            if matches!(call.func.as_ref(), Expr::Name(_))
+                || matches!(call.func.as_ref(), Expr::Attribute(attribute)
+                    if matches!(attribute.value.as_ref(), Expr::BinOp(_))))
+        || early_condition_truthiness(first).is_some()
+        || expression_suspends_current_scope(expression)
+        || expression_contains_generator(expression)
+    {
+        return None;
+    }
+    Some(first.range())
 }
 
 fn first_iterator_assignment_condition(
