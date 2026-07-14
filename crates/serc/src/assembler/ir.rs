@@ -915,6 +915,11 @@ pub(super) enum UnoptimizedCode {
 #[derive(Debug)]
 pub(crate) struct Assembler {
     pub(super) code: UnoptimizedCode,
+    /// Maps emitted instruction offsets to their positions in the linear item stream.
+    ///
+    /// Labels do not consume instruction offsets, so keeping this index alongside `code` avoids
+    /// repeatedly scanning every preceding item while the compiler is still emitting code.
+    pub(super) instruction_item_indices: Vec<usize>,
     pub(super) operand_patches: Vec<OperandPatch>,
     pub(super) deferred_none_constant_index: Option<u32>,
     pub(super) next_label: u32,
@@ -999,6 +1004,7 @@ impl Default for Assembler {
     fn default() -> Self {
         Self {
             code: UnoptimizedCode::Linear(Vec::new()),
+            instruction_item_indices: Vec::new(),
             operand_patches: Vec::new(),
             deferred_none_constant_index: None,
             next_label: 0,

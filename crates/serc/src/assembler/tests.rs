@@ -387,7 +387,7 @@ fn terminal_with_barrier_scan_ignores_prefix_and_labels() {
     assembler.emit(NOP, 0);
     assert!(!assembler.contains_terminal_with_barrier_since_item(body_start));
     assert!(matches!(
-        assembler.linear_items_mut().pop(),
+        assembler.pop_linear_item(),
         Some(Item::Instruction(instruction)) if instruction.opcode == NOP
     ));
     assert!(!assembler.contains_terminal_with_barrier_since_item(body_start));
@@ -400,18 +400,44 @@ fn terminal_with_barrier_scan_ignores_prefix_and_labels() {
         let body_start = assembler.item_count();
         let body_boundary = assembler.label();
         assembler.mark(body_boundary);
-        assembler
-            .linear_items_mut()
-            .push(Item::Instruction(Instruction::new(
-                opcode,
-                Operand::Value(0),
-                SourceLocation::NONE,
-                None,
-            )));
+        assembler.push_linear_item(Item::Instruction(Instruction::new(
+            opcode,
+            Operand::Value(0),
+            SourceLocation::NONE,
+            None,
+        )));
         assert!(assembler.contains_terminal_with_barrier_since_item(body_start));
         assert!(assembler.contains_opcode_since_item(opcode, body_start));
         assert!(!assembler.contains_terminal_with_barrier_since_item(assembler.item_count()));
     }
+}
+
+#[test]
+fn instruction_offsets_follow_label_insertions_and_trailing_removal() {
+    let mut assembler = Assembler::default();
+    assembler.emit(LOAD_CONST, 0);
+    assembler.emit(NOP, 0);
+
+    let trailing = assembler.label();
+    assembler.mark(trailing);
+    let before_nop = assembler.label();
+    assembler.mark_before_trailing_instructions(before_nop, 1);
+    let before_labels = assembler.label();
+    assembler.mark_before_trailing_labels(before_labels);
+
+    assert_eq!(assembler.instruction_count(), 2);
+    assert_eq!(assembler.instruction_opcode_at(0), Some(LOAD_CONST));
+    assert_eq!(assembler.instruction_opcode_at(1), Some(NOP));
+    assert_eq!(assembler.instruction_opcode_at(2), None);
+
+    assert!(assembler.take_trailing_nop_location().is_some());
+    assert_eq!(assembler.instruction_count(), 1);
+    assert_eq!(assembler.instruction_opcode_at(0), Some(LOAD_CONST));
+    assert_eq!(assembler.instruction_opcode_at(1), None);
+
+    assembler.emit(RETURN_VALUE, 0);
+    assert_eq!(assembler.instruction_count(), 2);
+    assert_eq!(assembler.instruction_opcode_at(1), Some(RETURN_VALUE));
 }
 
 #[test]
@@ -804,7 +830,7 @@ fn operand_patches_must_be_resolved_and_attached() {
     let mut detached = Assembler::default();
     let patch = detached.emit_placeholder_with_depth(LOAD_CONST, 1);
     detached.patch_argument(patch, 1).unwrap();
-    detached.linear_items_mut().clear();
+    detached.clear_linear_items();
     let error = detached.resolve_operand_patches().unwrap_err();
     assert!(error.to_string().contains("has no instruction"));
 }
@@ -815,7 +841,7 @@ fn operand_patches_reject_duplicate_and_unknown_attachments() {
     let patch = duplicate.emit_placeholder_with_depth(LOAD_CONST, 1);
     duplicate.patch_argument(patch, 1).unwrap();
     let item = duplicate.linear_items()[0];
-    duplicate.linear_items_mut().push(item);
+    duplicate.push_linear_item(item);
     let error = duplicate.resolve_operand_patches().unwrap_err();
     assert!(
         error
@@ -830,9 +856,7 @@ fn operand_patches_reject_duplicate_and_unknown_attachments() {
         unreachable!();
     };
     instruction.set_operand(Operand::Deferred(OperandPatchId(1)));
-    unknown
-        .linear_items_mut()
-        .push(Item::Instruction(instruction));
+    unknown.push_linear_item(Item::Instruction(instruction));
     let error = unknown.resolve_operand_patches().unwrap_err();
     assert!(error.to_string().contains("unknown operand patch"));
 }
@@ -1106,26 +1130,24 @@ fn assembler_with_preserved_constant_boundary() -> Assembler {
     let entry = super::Label(0);
     let preserved = super::Label(1);
     let target = super::Label(2);
-    Assembler {
-        code: UnoptimizedCode::Linear(vec![
-            Item::Label(entry),
-            Item::Label(preserved),
-            pass_instruction(LOAD_CONST, 0, 1),
-            Item::Instruction(Instruction::new(
-                JUMP_FORWARD,
-                Operand::Forward(target),
-                SourceLocation::new(1, 1, 0, 0),
-                None,
-            )),
-            pass_instruction(LOAD_CONST, 1, 1),
-            Item::Label(target),
-            pass_instruction(LOAD_CONST, 2, 2),
-            pass_instruction(RETURN_VALUE, 0, 2),
-        ]),
-        next_label: 3,
-        preserved_block_boundaries: rustc_hash::FxHashSet::from_iter([preserved]),
-        ..Assembler::default()
-    }
+    let mut assembler = Assembler::from_linear_items(vec![
+        Item::Label(entry),
+        Item::Label(preserved),
+        pass_instruction(LOAD_CONST, 0, 1),
+        Item::Instruction(Instruction::new(
+            JUMP_FORWARD,
+            Operand::Forward(target),
+            SourceLocation::new(1, 1, 0, 0),
+            None,
+        )),
+        pass_instruction(LOAD_CONST, 1, 1),
+        Item::Label(target),
+        pass_instruction(LOAD_CONST, 2, 2),
+        pass_instruction(RETURN_VALUE, 0, 2),
+    ]);
+    assembler.next_label = 3;
+    assembler.preserved_block_boundaries = rustc_hash::FxHashSet::from_iter([preserved]);
+    assembler
 }
 
 #[test]
@@ -1169,14 +1191,11 @@ fn prepared_reachability_survives_preserved_boundary_removal() {
 
 #[test]
 fn straight_line_constant_reachability_uses_dense_indices() {
-    let mut assembler = Assembler {
-        code: UnoptimizedCode::Linear(vec![
-            pass_instruction(LOAD_CONST, 0, 1),
-            pass_instruction(LOAD_CONST, 2, 1),
-            pass_instruction(RETURN_VALUE, 0, 1),
-        ]),
-        ..Assembler::default()
-    };
+    let mut assembler = Assembler::from_linear_items(vec![
+        pass_instruction(LOAD_CONST, 0, 1),
+        pass_instruction(LOAD_CONST, 2, 1),
+        pass_instruction(RETURN_VALUE, 0, 1),
+    ]);
 
     assert_eq!(
         assembler.used_constant_indices(LOAD_CONST, 3),
@@ -1187,8 +1206,8 @@ fn straight_line_constant_reachability_uses_dense_indices() {
 #[test]
 fn assertion_constant_reachability_keeps_the_optimization_stream_linear() {
     let target = super::Label(0);
-    let assembler = || Assembler {
-        code: UnoptimizedCode::Linear(vec![
+    let assembler = || {
+        let mut assembler = Assembler::from_linear_items(vec![
             pass_instruction(LOAD_CONST, 0, 1),
             Item::Instruction(Instruction::new(
                 POP_JUMP_IF_TRUE,
@@ -1206,10 +1225,10 @@ fn assertion_constant_reachability_keeps_the_optimization_stream_linear() {
             Item::Label(target),
             pass_instruction(LOAD_CONST, 2, 2),
             pass_instruction(RETURN_VALUE, 0, 2),
-        ]),
-        next_label: 1,
-        has_assertion_side_exit_candidate: true,
-        ..Assembler::default()
+        ]);
+        assembler.next_label = 1;
+        assembler.has_assertion_side_exit_candidate = true;
+        assembler
     };
     let expected = assembler().finish().unwrap();
     let mut assembler = assembler();
@@ -1229,38 +1248,35 @@ fn assertion_constant_reachability_keeps_the_optimization_stream_linear() {
 fn assertion_constant_reachability_rejects_mixed_control_flow() {
     let assertion_target = super::Label(0);
     let other_target = super::Label(1);
-    let mut assembler = Assembler {
-        code: UnoptimizedCode::Linear(vec![
-            pass_instruction(LOAD_CONST, 0, 1),
-            Item::Instruction(Instruction::new(
-                POP_JUMP_IF_TRUE,
-                Operand::Forward(assertion_target),
-                SourceLocation::new(1, 1, 0, 0),
-                None,
-            )),
-            pass_instruction(NOT_TAKEN, 0, 1),
-            pass_instruction(
-                LOAD_COMMON_CONSTANT,
-                CommonConstant::ASSERTIONERROR.argument(),
-                1,
-            ),
-            pass_instruction(RAISE_VARARGS, 1, 1),
-            Item::Label(assertion_target),
-            Item::Instruction(Instruction::new(
-                JUMP_FORWARD,
-                Operand::Forward(other_target),
-                SourceLocation::new(2, 2, 0, 0),
-                None,
-            )),
-            pass_instruction(LOAD_CONST, 1, 2),
-            Item::Label(other_target),
-            pass_instruction(LOAD_CONST, 2, 3),
-            pass_instruction(RETURN_VALUE, 0, 3),
-        ]),
-        next_label: 2,
-        has_assertion_side_exit_candidate: true,
-        ..Assembler::default()
-    };
+    let mut assembler = Assembler::from_linear_items(vec![
+        pass_instruction(LOAD_CONST, 0, 1),
+        Item::Instruction(Instruction::new(
+            POP_JUMP_IF_TRUE,
+            Operand::Forward(assertion_target),
+            SourceLocation::new(1, 1, 0, 0),
+            None,
+        )),
+        pass_instruction(NOT_TAKEN, 0, 1),
+        pass_instruction(
+            LOAD_COMMON_CONSTANT,
+            CommonConstant::ASSERTIONERROR.argument(),
+            1,
+        ),
+        pass_instruction(RAISE_VARARGS, 1, 1),
+        Item::Label(assertion_target),
+        Item::Instruction(Instruction::new(
+            JUMP_FORWARD,
+            Operand::Forward(other_target),
+            SourceLocation::new(2, 2, 0, 0),
+            None,
+        )),
+        pass_instruction(LOAD_CONST, 1, 2),
+        Item::Label(other_target),
+        pass_instruction(LOAD_CONST, 2, 3),
+        pass_instruction(RETURN_VALUE, 0, 3),
+    ]);
+    assembler.next_label = 2;
+    assembler.has_assertion_side_exit_candidate = true;
 
     assert_eq!(
         assembler.used_constant_indices(LOAD_CONST, 3),
@@ -1303,12 +1319,9 @@ fn assertion_constant_reachability_keeps_swap_and_borrow_markers_off_the_linear_
             pass_instruction(LOAD_CONST, 2, 2),
             pass_instruction(RETURN_VALUE, 0, 2),
         ]);
-        let mut assembler = Assembler {
-            code: UnoptimizedCode::Linear(items),
-            next_label: 1,
-            has_assertion_side_exit_candidate: true,
-            ..Assembler::default()
-        };
+        let mut assembler = Assembler::from_linear_items(items);
+        assembler.next_label = 1;
+        assembler.has_assertion_side_exit_candidate = true;
 
         assert_eq!(
             assembler.used_constant_indices(LOAD_CONST, 3),
@@ -1341,12 +1354,9 @@ fn optimization_pipeline(items: Vec<Item>) -> super::OptimizationPipeline {
         })
         .max()
         .unwrap_or(0);
-    Assembler {
-        code: UnoptimizedCode::Linear(items),
-        next_label,
-        ..Assembler::default()
-    }
-    .into_optimization_pipeline()
+    let mut assembler = Assembler::from_linear_items(items);
+    assembler.next_label = next_label;
+    assembler.into_optimization_pipeline()
 }
 
 #[test]
@@ -1982,12 +1992,9 @@ fn linear_assertion_optimizer_matches_the_block_graph_pipeline() {
         pass_instruction(IS_OP, 0, 3),
         pass_instruction(RETURN_VALUE, 0, 3),
     ];
-    let linear = Assembler {
-        code: UnoptimizedCode::Linear(items.clone()),
-        next_label: 1,
-        has_assertion_side_exit_candidate: true,
-        ..Assembler::default()
-    };
+    let mut linear = Assembler::from_linear_items(items.clone());
+    linear.next_label = 1;
+    linear.has_assertion_side_exit_candidate = true;
     assert!(linear.has_only_linear_assertion_side_exits());
     let graph =
         super::block_graph::BlockGraph::from_items(items, &rustc_hash::FxHashSet::default());

@@ -9,6 +9,7 @@ use ruff_python_ast::{
 };
 use ruff_text_size::Ranged;
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
+use smallvec::SmallVec;
 
 use super::{LOAD_CONST, LOAD_SMALL_INT, NOP, STORE_NAME};
 use crate::CompileError;
@@ -24,10 +25,65 @@ use crate::code_object::{CodeObject, Constant};
 #[derive(Debug, Default)]
 pub(super) struct ConstantPool {
     values: Vec<Constant>,
-    indices: Option<FxHashMap<u64, u32>>,
+    indices: Option<ConstantIndices>,
 }
 
 const CONSTANT_INDEX_THRESHOLD: usize = 12;
+
+#[derive(Debug, Default)]
+struct ConstantIndices {
+    primary: FxHashMap<u64, u32>,
+    collisions: FxHashMap<u64, Vec<u32>>,
+    /// Constants containing duplicate frozenset members cannot safely use a rich fingerprint
+    /// because pool equality conservatively ignores member multiplicity. The compiler does not
+    /// emit such values, but retaining a fallback preserves the existing behavior for
+    /// hand-constructed constants.
+    fallback: Vec<u32>,
+}
+
+impl ConstantIndices {
+    fn insert(&mut self, fingerprint: Option<u64>, index: u32) {
+        if let Some(fingerprint) = fingerprint {
+            match self.primary.entry(fingerprint) {
+                Entry::Occupied(_) => {
+                    self.collisions.entry(fingerprint).or_default().push(index);
+                }
+                Entry::Vacant(entry) => {
+                    entry.insert(index);
+                }
+            }
+        } else {
+            self.fallback.push(index);
+        }
+    }
+
+    fn find(
+        &self,
+        values: &[Constant],
+        constant: &Constant,
+        fingerprint: Option<u64>,
+    ) -> Option<u32> {
+        let matches = |index: &u32| {
+            let index = usize::try_from(*index).expect("constant index fits in usize");
+            ConstantEquality::PoolKey.equal(&values[index], constant)
+        };
+        if let Some(fingerprint) = fingerprint {
+            return self
+                .primary
+                .get(&fingerprint)
+                .into_iter()
+                .chain(self.collisions.get(&fingerprint).into_iter().flatten())
+                .chain(&self.fallback)
+                .filter(|index| matches(index))
+                .copied()
+                .min();
+        }
+        values
+            .iter()
+            .position(|existing| ConstantEquality::PoolKey.equal(existing, constant))
+            .map(|index| u32::try_from(index).expect("constant index fits in u32"))
+    }
+}
 
 impl ConstantPool {
     pub(super) fn is_empty(&self) -> bool {
@@ -40,41 +96,24 @@ impl ConstantPool {
 
     pub(super) fn intern(&mut self, constant: Constant) -> Result<u32, CompileError> {
         if self.indices.is_none() && self.values.len() >= CONSTANT_INDEX_THRESHOLD {
-            let mut indices = FxHashMap::default();
-            indices.reserve(self.values.len().saturating_mul(2));
+            let mut indices = ConstantIndices::default();
+            indices.primary.reserve(self.values.len().saturating_mul(2));
             for (index, value) in self.values.iter().enumerate() {
-                indices
-                    .entry(constant_pool_fingerprint(value))
-                    .or_insert_with(|| u32::try_from(index).expect("constant index fits in u32"));
+                indices.insert(
+                    constant_pool_fingerprint(value),
+                    u32::try_from(index).expect("constant index fits in u32"),
+                );
             }
             self.indices = Some(indices);
         }
 
         if let Some(indices) = &mut self.indices {
             let fingerprint = constant_pool_fingerprint(&constant);
-            match indices.entry(fingerprint) {
-                Entry::Occupied(entry) => {
-                    let index = *entry.get();
-                    let existing = &self.values[index as usize];
-                    if ConstantEquality::PoolKey.equal(existing, &constant) {
-                        return Ok(index);
-                    }
-                    if let Some(index) = self
-                        .values
-                        .iter()
-                        .position(|existing| ConstantEquality::PoolKey.equal(existing, &constant))
-                    {
-                        return to_u32(index, "constant index");
-                    }
-                }
-                Entry::Vacant(entry) => {
-                    let index = to_u32(self.values.len(), "constant count")?;
-                    entry.insert(index);
-                    self.values.push(constant);
-                    return Ok(index);
-                }
+            if let Some(index) = indices.find(&self.values, &constant, fingerprint) {
+                return Ok(index);
             }
             let index = to_u32(self.values.len(), "constant count")?;
+            indices.insert(fingerprint, index);
             self.values.push(constant);
             return Ok(index);
         }
@@ -113,50 +152,87 @@ impl ConstantPool {
     }
 }
 
-fn constant_pool_fingerprint(constant: &Constant) -> u64 {
-    fn hash_constant(constant: &Constant, hasher: &mut FxHasher) {
-        std::mem::discriminant(constant).hash(hasher);
+fn constant_pool_fingerprint(constant: &Constant) -> Option<u64> {
+    fn hash_constant(constant: &Constant) -> Option<u64> {
+        let mut hasher = FxHasher::default();
+        std::mem::discriminant(constant).hash(&mut hasher);
         match constant {
             Constant::None | Constant::Ellipsis => {}
-            Constant::Bool(value) => value.hash(hasher),
-            Constant::Int(value) => value.hash(hasher),
-            Constant::SignedInt(value) => value.hash(hasher),
+            Constant::Bool(value) => value.hash(&mut hasher),
+            Constant::Int(value) => value.hash(&mut hasher),
+            Constant::SignedInt(value) => value.hash(&mut hasher),
             Constant::BigInt { negative, digits } => {
-                negative.hash(hasher);
-                digits.hash(hasher);
+                negative.hash(&mut hasher);
+                digits.hash(&mut hasher);
             }
-            Constant::Float(value) => value.to_bits().hash(hasher),
+            Constant::Float(value) => value.to_bits().hash(&mut hasher),
             Constant::Complex { real, imag } => {
-                real.to_bits().hash(hasher);
-                imag.to_bits().hash(hasher);
+                real.to_bits().hash(&mut hasher);
+                imag.to_bits().hash(&mut hasher);
             }
-            Constant::String(value) => value.hash(hasher),
-            Constant::SurrogateString(value) | Constant::Bytes(value) => value.hash(hasher),
+            Constant::String(value) => value.hash(&mut hasher),
+            Constant::SurrogateString(value) | Constant::Bytes(value) => {
+                value.hash(&mut hasher);
+            }
             Constant::Tuple(values) => {
-                values.len().hash(hasher);
+                values.len().hash(&mut hasher);
                 for value in values {
-                    hash_constant(value, hasher);
+                    hash_constant(value)?.hash(&mut hasher);
                 }
             }
-            // Pool equality is order-independent and intentionally conservative for duplicate
-            // members, so length is the only universally valid frozenset fingerprint.
-            Constant::FrozenSet(values) => values.len().hash(hasher),
+            Constant::FrozenSet(values) => {
+                let mut members = SmallVec::<[(u64, &Constant); 4]>::with_capacity(values.len());
+                for value in values {
+                    members.push((hash_constant(value)?, value));
+                }
+                members.sort_unstable_by_key(|(fingerprint, _)| *fingerprint);
+                for group in members.chunk_by(|left, right| left.0 == right.0) {
+                    for (offset, (_, left)) in group.iter().enumerate() {
+                        if group[offset + 1..].iter().any(|(_, right)| {
+                            ConstantEquality::PoolKey.equal(left, right)
+                                || ConstantEquality::PoolKey.equal(right, left)
+                        }) {
+                            return None;
+                        }
+                    }
+                }
+                values.len().hash(&mut hasher);
+                for (fingerprint, _) in members {
+                    fingerprint.hash(&mut hasher);
+                }
+            }
             Constant::Slice { lower, upper, step } => {
-                hash_constant(lower, hasher);
-                hash_constant(upper, hasher);
-                hash_constant(step, hasher);
+                hash_constant(lower)?.hash(&mut hasher);
+                hash_constant(upper)?.hash(&mut hasher);
+                hash_constant(step)?.hash(&mut hasher);
             }
             Constant::Code(code) => {
-                code.first_line_number.hash(hasher);
-                code.name.hash(hasher);
-                code.qualified_name.hash(hasher);
+                code.arg_count.hash(&mut hasher);
+                code.positional_only_arg_count.hash(&mut hasher);
+                code.keyword_only_arg_count.hash(&mut hasher);
+                code.stack_size.hash(&mut hasher);
+                code.flags.hash(&mut hasher);
+                code.bytecode.hash(&mut hasher);
+                code.constants.len().hash(&mut hasher);
+                for constant in &code.constants {
+                    hash_constant(constant)?.hash(&mut hasher);
+                }
+                code.names.hash(&mut hasher);
+                code.locals.hash(&mut hasher);
+                code.local_kinds.hash(&mut hasher);
+                code.filename.hash(&mut hasher);
+                code.first_line_number.hash(&mut hasher);
+                code.name.hash(&mut hasher);
+                code.qualified_name.hash(&mut hasher);
+                code.line_table.hash(&mut hasher);
+                code.exception_table.hash(&mut hasher);
+                std::mem::discriminant(&code.marshal_hints.locals_identity).hash(&mut hasher);
             }
         }
+        Some(hasher.finish())
     }
 
-    let mut hasher = FxHasher::default();
-    hash_constant(constant, &mut hasher);
-    hasher.finish()
+    hash_constant(constant)
 }
 
 #[derive(Debug, Default)]
@@ -2033,7 +2109,10 @@ pub(super) fn big_integer_digits(token: &str) -> Vec<u16> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConstantEquality, ConstantPool};
+    use super::{
+        CONSTANT_INDEX_THRESHOLD, ConstantEquality, ConstantIndices, ConstantPool,
+        constant_pool_fingerprint,
+    };
     use crate::code_object::{CodeObject, Constant, LocalsIdentity, MarshalHints};
 
     fn code_object(constants: Vec<Constant>) -> CodeObject {
@@ -2157,6 +2236,48 @@ mod tests {
         assert_eq!(pool.intern(Constant::Int(100)).unwrap(), 0);
         assert_eq!(pool.intern(Constant::Int(102)).unwrap(), 1);
         assert_eq!(pool.intern(Constant::Int(101)).unwrap(), 18);
+    }
+
+    #[test]
+    fn frozenset_fingerprints_are_order_independent_and_value_sensitive() {
+        let first = Constant::FrozenSet(vec![Constant::Int(1), Constant::Int(2)]);
+        let reordered = Constant::FrozenSet(vec![Constant::Int(2), Constant::Int(1)]);
+        let different = Constant::FrozenSet(vec![Constant::Int(3), Constant::Int(4)]);
+
+        assert_eq!(
+            constant_pool_fingerprint(&first),
+            constant_pool_fingerprint(&reordered)
+        );
+        assert_ne!(
+            constant_pool_fingerprint(&first),
+            constant_pool_fingerprint(&different)
+        );
+    }
+
+    #[test]
+    fn constant_indices_resolve_fingerprint_collisions() {
+        let values = [Constant::Int(1), Constant::Int(2)];
+        let mut indices = ConstantIndices::default();
+        indices.insert(Some(0), 0);
+        indices.insert(Some(0), 1);
+
+        assert_eq!(indices.find(&values, &Constant::Int(2), Some(0)), Some(1));
+        assert_eq!(indices.find(&values, &Constant::Int(3), Some(0)), None);
+    }
+
+    #[test]
+    fn indexed_constant_pool_preserves_duplicate_frozenset_fallback() {
+        let mut pool = ConstantPool::default();
+        for value in 0..CONSTANT_INDEX_THRESHOLD {
+            pool.intern(Constant::Int(u64::try_from(value).unwrap()))
+                .unwrap();
+        }
+
+        let duplicate = Constant::FrozenSet(vec![Constant::Int(1), Constant::Int(1)]);
+        let compatible = Constant::FrozenSet(vec![Constant::Int(1), Constant::Int(2)]);
+        assert_eq!(constant_pool_fingerprint(&duplicate), None);
+        let duplicate_index = pool.intern(duplicate).unwrap();
+        assert_eq!(pool.intern(compatible).unwrap(), duplicate_index);
     }
 
     #[test]
