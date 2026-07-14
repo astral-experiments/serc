@@ -265,7 +265,7 @@ impl Compiler<'_> {
         statement: &ruff_python_ast::StmtMatch,
         terminal: bool,
     ) -> Result<(), CompileError> {
-        let base_depth = self.control.depth;
+        let base_depth = self.control.stack.depth;
         if matches!(statement.subject.as_ref(), Expr::Tuple(_))
             && let Some(constant) = fold_constant(&statement.subject)
         {
@@ -501,7 +501,7 @@ impl Compiler<'_> {
         statement: &ruff_python_ast::StmtIf,
         match_end: Label,
     ) -> Result<(), CompileError> {
-        let base_depth = self.control.depth;
+        let base_depth = self.control.stack.depth;
         let false_exit = self.assembler.label();
         self.compile_jump_if(&statement.test, false, false_exit)?;
         self.mark_definitely_evaluated_locals(&statement.test);
@@ -700,7 +700,7 @@ impl Compiler<'_> {
         pattern: &ruff_python_ast::PatternMatchOr,
         context: &mut MatchContext,
     ) -> Result<(), CompileError> {
-        let entry_depth = self.control.depth;
+        let entry_depth = self.control.stack.depth;
         let end = self.assembler.label();
         let mut control: Option<Vec<NameId>> = None;
         for (index, alternative) in pattern.patterns.iter().enumerate() {
@@ -1070,7 +1070,7 @@ impl Compiler<'_> {
     }
 
     fn compile_expression_inner(&mut self, expression: &Expr) -> Result<(), CompileError> {
-        let starting_depth = self.control.depth;
+        let starting_depth = self.control.stack.depth;
         if matches!(expression, Expr::BoolOp(_))
             && let Some((origin, constant)) = folded_bool_operand(expression)
         {
@@ -1160,7 +1160,11 @@ impl Compiler<'_> {
                         && matches!(binary.right.as_ref(), Expr::Call(call)
                                 if optimized_generator_callable(call) == Some("tuple"));
                     self.with_control_override(
-                        |control| &mut control.exclude_optimized_tuple_guard_from_comprehension,
+                        |control| {
+                            &mut control
+                                .comprehensions
+                                .exclude_optimized_tuple_guard_from_comprehension
+                        },
                         exclude_optimized_tuple_guard_from_comprehension,
                         |compiler| compiler.compile_expression(&binary.right),
                     )?;
@@ -1286,9 +1290,13 @@ impl Compiler<'_> {
                 }
                 self.emit_yield_value(0, 0)?;
                 let wrapper_is_only_exception_region =
-                    self.control.generator_region_start.is_some()
-                        && self.control.active_exception_region_exclusions.is_empty()
-                        && self.control.active_with_region_exclusions.is_empty();
+                    self.control.generators.generator_region_start.is_some()
+                        && self
+                            .control
+                            .exceptions
+                            .active_exception_region_exclusions
+                            .is_empty()
+                        && self.control.withs.active_with_region_exclusions.is_empty();
                 let resume_depth = if wrapper_is_only_exception_region {
                     ResumeDepth::One
                 } else {
@@ -1319,7 +1327,7 @@ impl Compiler<'_> {
                 self.assembler.mark(yielded);
                 self.emit_yield_value(1, 0)?;
                 self.assembler.mark(yielded_end);
-                let resume_depth = if self.control.generator_region_start.is_none() {
+                let resume_depth = if self.control.generators.generator_region_start.is_none() {
                     ResumeDepth::One
                 } else {
                     ResumeDepth::Zero
@@ -1358,9 +1366,14 @@ impl Compiler<'_> {
 
         let expected_depth = starting_depth
             + 1
-            + if self.control.defer_async_comprehension_restore {
+            + if self
+                .control
+                .comprehensions
+                .defer_async_comprehension_restore
+            {
                 i32::try_from(
                     self.control
+                        .comprehensions
                         .pending_comprehension_restores
                         .iter()
                         .map(|(indices, _)| indices.len())
@@ -1370,10 +1383,10 @@ impl Compiler<'_> {
             } else {
                 0
             };
-        if self.control.depth != expected_depth {
+        if self.control.stack.depth != expected_depth {
             return Err(CompileError::Internal(format!(
                 "expression changed stack depth from {starting_depth} to {}",
-                self.control.depth
+                self.control.stack.depth
             )));
         }
         Ok(())
@@ -1822,7 +1835,7 @@ impl Compiler<'_> {
         &mut self,
         get_awaitable_argument: u32,
     ) -> Result<(), CompileError> {
-        let base_depth = self.control.depth - 1;
+        let base_depth = self.control.stack.depth - 1;
         let cleanup_location = self.assembler.location();
         self.emit(GET_AWAITABLE, get_awaitable_argument, 0)?;
         let none = self.add_constant(Constant::None)?;
@@ -2030,32 +2043,40 @@ impl Compiler<'_> {
             _ => unreachable!("optimized generator call must use all, any, or tuple"),
         };
         let callable_location = self.source_location(call.func.range());
-        let base_depth = self.control.depth;
+        let base_depth = self.control.stack.depth;
         let fallback = self.assembler.label();
         let end = self.assembler.label();
 
         // CPython appends the optimized Boolean loop's artificial control-flow instructions
         // after exception-handler regions are labeled, so they do not inherit handler cleanup.
         let handler_boolean_loop_policy = (!collect_tuple
-            && self.control.optimized_generator_boolean_condition
+            && self
+                .control
+                .generators
+                .optimized_generator_boolean_condition
             && self.control.in_exception_handler())
         .then_some(ExceptionPolicy::EXCLUDE_ALWAYS);
         let coroutine_boolean_loop_policy = (!collect_tuple
             && self.unit.flags & CO_COROUTINE != 0
             && self.context.target_specific_rules_enabled()
-            && self.control.generator_region_start.is_some()
-            && self.control.depth == 0
-            && self.control.coroutine_suspension_epoch > 0
-            && self.control.active_exception_region_exclusions.is_empty()
-            && self.control.active_with_region_exclusions.is_empty()
+            && self.control.generators.generator_region_start.is_some()
+            && self.control.stack.depth == 0
+            && self.control.generators.coroutine_suspension_epoch > 0
             && self
                 .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            && self.control.withs.active_with_region_exclusions.is_empty()
+            && self
+                .control
+                .comprehensions
                 .active_comprehension_region_exclusions
                 .is_empty()
             && !self.control.in_exception_handler()
-            && self.control.active_exception_group_handlers == 0
-            && self.control.active_normal_finally_bodies == 0
-            && self.control.active_finally_end_blocks == 0
+            && self.control.exceptions.active_exception_group_handlers == 0
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
             && matches!(
                 call.arguments.args.as_ref(),
                 [Expr::Generator(generator)]
@@ -2076,19 +2097,32 @@ impl Compiler<'_> {
         let preserve_synchronous_with_boolean_loop_owner = !collect_tuple
             && self.context.target_specific_rules_enabled()
             && self.control.in_synchronous_with()
-            && !self.control.include_assert_none_condition_owner
-            && ((self.control.current_statement_has_following
+            && !self.control.conditions.include_assert_none_condition_owner
+            && ((self.control.statements.current_statement_has_following
                 && !self.control.in_loop()
-                && self.control.active_exception_region_exclusions.is_empty()
-                && self.control.generator_region_exclusions.is_empty()
                 && self
                     .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .is_empty()
+                && self
+                    .control
+                    .generators
+                    .generator_region_exclusions
+                    .is_empty()
+                && self
+                    .control
+                    .withs
                     .active_with_region_exclusions
                     .last()
                     .is_some_and(|exclusions| !exclusions.is_empty()))
                 || (self.control.in_exception_handler()
-                    && !self.control.current_statement_has_following
-                    && self.control.generator_region_exclusions.is_empty()));
+                    && !self.control.statements.current_statement_has_following
+                    && self
+                        .control
+                        .generators
+                        .generator_region_exclusions
+                        .is_empty()));
         let synchronous_with_boolean_loop_policy = (!collect_tuple
             && self.context.target_specific_rules_enabled()
             && self.control.in_synchronous_with()
@@ -2113,47 +2147,63 @@ impl Compiler<'_> {
         // retain their first marker, so keep this range-scoped and separate from the loop policy.
         let synchronous_with_boolean_dispatch_policy = (synchronous_with_boolean_loop_policy
             .is_some()
-            && self.control.include_assert_none_condition_owner
+            && self.control.conditions.include_assert_none_condition_owner
             && (self
                 .control
+                .withs
                 .shifted_sync_with_boolean_dispatch_calls
                 .contains(&call.range)
                 || self
                     .control
-                    .active_with_suspension_epochs
-                    .last()
-                    .is_some_and(|epoch| self.control.coroutine_suspension_epoch > *epoch))
+                    .current_with_suspension_epoch()
+                    .is_some_and(|epoch| {
+                        self.control.generators.coroutine_suspension_epoch > epoch
+                    }))
             && !self.control.in_loop()
-            && self.control.active_exception_region_exclusions.is_empty()
             && self
                 .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            && self
+                .control
+                .comprehensions
                 .active_comprehension_region_exclusions
                 .is_empty()
             && !self.control.in_exception_handler()
-            && self.control.active_exception_group_handlers == 0
-            && self.control.active_normal_finally_bodies == 0
-            && self.control.active_finally_end_blocks == 0)
+            && self.control.exceptions.active_exception_group_handlers == 0
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0)
             .then_some(ExceptionPolicy::EXCLUDE_ALWAYS);
         // CPython appends the Boolean-loop marker and backedge after the coroutine assertion's
         // stop-iteration target is labeled. The dispatch marker keeps its ordinary owner.
         let pre_suspension_coroutine_boolean_loop_policy = (matches!(callable, "all" | "any")
-            && self.control.pre_suspension_coroutine_boolean_assertion == Some(call.range)
-            && self.unit.flags & CO_COROUTINE != 0
-            && self.context.target_specific_rules_enabled()
-            && self.control.generator_region_start.is_some()
-            && self.control.depth == 0
-            && self.control.coroutine_suspension_epoch == 0
-            && !self.control.in_loop()
-            && self.control.active_exception_region_exclusions.is_empty()
-            && self.control.active_with_region_exclusions.is_empty()
             && self
                 .control
+                .generators
+                .pre_suspension_coroutine_boolean_assertion
+                == Some(call.range)
+            && self.unit.flags & CO_COROUTINE != 0
+            && self.context.target_specific_rules_enabled()
+            && self.control.generators.generator_region_start.is_some()
+            && self.control.stack.depth == 0
+            && self.control.generators.coroutine_suspension_epoch == 0
+            && !self.control.in_loop()
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            && self.control.withs.active_with_region_exclusions.is_empty()
+            && self
+                .control
+                .comprehensions
                 .active_comprehension_region_exclusions
                 .is_empty()
             && !self.control.in_exception_handler()
-            && self.control.active_exception_group_handlers == 0
-            && self.control.active_normal_finally_bodies == 0
-            && self.control.active_finally_end_blocks == 0
+            && self.control.exceptions.active_exception_group_handlers == 0
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
             && matches!(
                 call.arguments.args.as_ref(),
                 [Expr::Generator(generator)]
@@ -2173,16 +2223,21 @@ impl Compiler<'_> {
         // In a plain generator's while body, it inherits the stop-iteration owner after a direct
         // yield resume but uses a fresh ownerless slot on the loop's initial entry.
         let generator_guard_exception_policy = (self.unit.flags & CO_GENERATOR != 0
-            && !self.control.generator_expression
-            && self.control.active_exception_region_exclusions.is_empty()
-            && self.control.active_with_region_exclusions.is_empty()
+            && !self.control.generators.generator_expression
             && self
                 .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            && self.control.withs.active_with_region_exclusions.is_empty()
+            && self
+                .control
+                .comprehensions
                 .active_comprehension_region_exclusions
                 .is_empty()
-            && self.control.active_normal_finally_bodies == 0
-            && self.control.active_finally_end_blocks == 0
-            && self.control.active_exception_group_handlers == 0
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
+            && self.control.exceptions.active_exception_group_handlers == 0
             && !self.control.in_exception_handler()
             && self.control.in_while_loop())
         .then(|| {
@@ -2196,18 +2251,27 @@ impl Compiler<'_> {
         self.emit_jump_forward(POP_JUMP_IF_FALSE, fallback, -1)?;
         let in_inlined_comprehension = !self
             .control
+            .comprehensions
             .active_comprehension_region_exclusions
             .is_empty();
         let exclude_not_taken_from_comprehension = collect_tuple
             && self
                 .control
+                .comprehensions
                 .exclude_optimized_tuple_guard_from_comprehension
             && in_inlined_comprehension;
         let exclude_not_taken_from_exception = collect_tuple
-            && self.control.current_statement_has_following
-            && self.control.direct_optimized_generator_assignment
+            && self.control.statements.current_statement_has_following
+            && self
+                .control
+                .generators
+                .direct_optimized_generator_assignment
             && self.optimized_generator_dispatch_is_in_normal_try()
-            && !self.control.active_exception_region_exclusions.is_empty();
+            && !self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty();
         let not_taken_exclusion_start =
             (exclude_not_taken_from_comprehension || exclude_not_taken_from_exception).then(|| {
                 let start = self.assembler.label();
@@ -2241,7 +2305,7 @@ impl Compiler<'_> {
                     if self
                         .control
                         .synchronous_with_preserves_none_condition_owner()
-                        && !self.control.current_statement_has_following
+                        && !self.control.statements.current_statement_has_following
                     {
                         ExceptionPolicy::normalized_owner(false)
                     } else if !collect_tuple
@@ -2269,21 +2333,27 @@ impl Compiler<'_> {
                         && ((in_inlined_comprehension
                             && !exclude_not_taken_from_comprehension
                             && !exclude_not_taken_from_exception)
-                            || (self.control.generator_region_start.is_none()
+                            || (self.control.generators.generator_region_start.is_none()
                                 && !self.control.in_iterator_loop()
-                                && !self.control.exceptional_finally_condition
+                                && !self.control.finally.exceptional_finally_condition
                                 && self
                                     .control
+                                    .comprehensions
                                     .active_comprehension_region_exclusions
                                     .is_empty()
-                                && self.control.active_with_region_exclusions.is_empty()
-                                && self.control.active_normal_finally_bodies == 0
-                                && self.control.active_finally_end_blocks == 0
-                                && self.control.active_exception_group_handlers == 0
-                                && !self.control.same_line_try_body
+                                && self.control.withs.active_with_region_exclusions.is_empty()
+                                && self.control.finally.active_normal_finally_bodies == 0
+                                && self.control.finally.active_finally_end_blocks == 0
+                                && self.control.exceptions.active_exception_group_handlers == 0
+                                && !self.control.exceptions.same_line_try_body
                                 && !self.control.current_exception_handler_binds_name()
                                 && !self.control.in_exception_handler()
-                                && self.control.active_exception_region_exclusions.len() == 1))
+                                && self
+                                    .control
+                                    .exceptions
+                                    .active_exception_region_exclusions
+                                    .len()
+                                    == 1))
                     {
                         if self
                             .assembler
@@ -2302,12 +2372,16 @@ impl Compiler<'_> {
             let end = self.assembler.label();
             self.assembler.mark(end);
             if exclude_not_taken_from_comprehension {
-                for exclusions in &mut self.control.active_comprehension_region_exclusions {
+                for exclusions in &mut self
+                    .control
+                    .comprehensions
+                    .active_comprehension_region_exclusions
+                {
                     exclusions.push((start, end));
                 }
             }
             if exclude_not_taken_from_exception {
-                for exclusions in &mut self.control.active_exception_region_exclusions {
+                for exclusions in &mut self.control.exceptions.active_exception_region_exclusions {
                     exclusions.push((start, end));
                 }
             }
@@ -2321,7 +2395,7 @@ impl Compiler<'_> {
 
         let loop_start = self.assembler.label();
         let exhausted = self.assembler.label();
-        let iterator_depth = self.control.depth;
+        let iterator_depth = self.control.stack.depth;
         self.assembler.mark(loop_start);
         self.assembler.set_location(callable_location);
         self.emit_jump_forward(FOR_ITER, exhausted, 1)?;
@@ -2345,8 +2419,12 @@ impl Compiler<'_> {
             // comprehension is the only active protected region; nested try/with
             // ownership follows a separate CFG-sensitive path.
             let exclude_boolean_loop_from_comprehension = in_inlined_comprehension
-                && self.control.active_exception_region_exclusions.is_empty()
-                && self.control.active_with_region_exclusions.is_empty();
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .is_empty()
+                && self.control.withs.active_with_region_exclusions.is_empty();
             let comprehension_exclusion_start =
                 exclude_boolean_loop_from_comprehension.then(|| {
                     let start = self.assembler.label();
@@ -2376,7 +2454,11 @@ impl Compiler<'_> {
             if let Some(start) = comprehension_exclusion_start {
                 let end = self.assembler.label();
                 self.assembler.mark(end);
-                for exclusions in &mut self.control.active_comprehension_region_exclusions {
+                for exclusions in &mut self
+                    .control
+                    .comprehensions
+                    .active_comprehension_region_exclusions
+                {
                     exclusions.push((start, end));
                 }
             }
@@ -2400,7 +2482,7 @@ impl Compiler<'_> {
             self.emit(LOAD_CONST, result, 1)?;
         }
         self.emit_jump_forward(JUMP_FORWARD, end, 0)?;
-        if collect_tuple && self.control.copy_optimized_tuple_branch_exit {
+        if collect_tuple && self.control.generators.copy_optimized_tuple_branch_exit {
             self.assembler.allow_last_transitive_small_exit_inlining();
         }
 
@@ -2629,7 +2711,11 @@ impl Compiler<'_> {
                 ..
             } => {
                 globals.contains(name_id)
-                    || (!self.control.active_comprehension_cleanups.is_empty()
+                    || (!self
+                        .control
+                        .comprehensions
+                        .active_comprehension_cleanups
+                        .is_empty()
                         && !free_indices.contains_key(&name_id))
             }
         };
@@ -2762,7 +2848,11 @@ impl Compiler<'_> {
                     0
                 }
         } else if !closure_names.is_empty()
-            || !self.control.active_comprehension_cleanups.is_empty()
+            || !self
+                .control
+                .comprehensions
+                .active_comprehension_cleanups
+                .is_empty()
         {
             CO_NESTED
         } else {
@@ -2794,7 +2884,7 @@ impl Compiler<'_> {
         if parameter_flags & CO_GENERATOR != 0 {
             // CPython does not wrap generator lambdas in the stop-iteration
             // handler used by `def` generators and generator expressions.
-            child.control.generator_region_start = None;
+            child.control.generators.generator_region_start = None;
         }
         let return_location = child.source_location(lambda.body.range());
         child.compile_tail_return_expression(&lambda.body, return_location)?;
@@ -2833,7 +2923,7 @@ impl Compiler<'_> {
             ));
         }
         let comprehension_cell_names = comprehension_cell_names(generators, key, value);
-        let base_depth = self.control.depth;
+        let base_depth = self.control.stack.depth;
         let comprehension_location = self.assembler.location();
         if generators[0].is_async {
             self.compile_expression(&generators[0].iter)?;
@@ -2975,7 +3065,12 @@ impl Compiler<'_> {
         let protected_start = self.assembler.label();
         let protected_end = self.assembler.label();
         let cleanup = self.assembler.label();
-        let parent_cleanup = self.control.active_comprehension_cleanups.last().copied();
+        let parent_cleanup = self
+            .control
+            .comprehensions
+            .active_comprehension_cleanups
+            .last()
+            .copied();
         let cleanup_location = self.assembler.location();
         self.assembler.mark(protected_start);
         self.emit(build_opcode, 0, 1)?;
@@ -3001,6 +3096,7 @@ impl Compiler<'_> {
                 let is_free = !is_local
                     && self
                         .control
+                        .comprehensions
                         .active_comprehension_local_names
                         .iter()
                         .any(|locals| locals.contains(name_id));
@@ -3017,21 +3113,27 @@ impl Compiler<'_> {
             }
         }
         let result = self.with_control_override(
-            |control| &mut control.in_unfiltered_comprehension,
+            |control| &mut control.comprehensions.in_unfiltered_comprehension,
             generators.iter().all(|generator| generator.ifs.is_empty()),
             |compiler| {
                 let suppressed = std::mem::take(
-                    &mut compiler.control.suppress_filtered_comprehension_none_owner,
+                    &mut compiler
+                        .control
+                        .comprehensions
+                        .suppress_filtered_comprehension_none_owner,
                 );
-                let in_element = std::mem::take(&mut compiler.control.in_comprehension_element);
+                let in_element =
+                    std::mem::take(&mut compiler.control.comprehensions.in_comprehension_element);
                 let force_truth_ownerless = std::mem::take(
                     &mut compiler
                         .control
+                        .comprehensions
                         .force_filtered_comprehension_truth_ownerless,
                 );
                 let root_if_filter = std::mem::replace(
                     &mut compiler
                         .control
+                        .comprehensions
                         .filtered_comprehension_has_root_if_expression,
                     generators.len() != 1
                         || generators.iter().any(|generator| {
@@ -3046,7 +3148,11 @@ impl Compiler<'_> {
                     local_names,
                     |compiler| {
                         compiler.with_control_override(
-                            |control| &mut control.reorder_async_comprehension_cleanup_throw,
+                            |control| {
+                                &mut control
+                                    .comprehensions
+                                    .reorder_async_comprehension_cleanup_throw
+                            },
                             // CPython 3.14.5's flow graph leaves the throw cleanup immediately
                             // before `END_SEND` for a discarded async comprehension whose target
                             // is captured.
@@ -3059,13 +3165,18 @@ impl Compiler<'_> {
                         )
                     },
                 );
-                compiler.control.suppress_filtered_comprehension_none_owner = suppressed;
-                compiler.control.in_comprehension_element = in_element;
                 compiler
                     .control
+                    .comprehensions
+                    .suppress_filtered_comprehension_none_owner = suppressed;
+                compiler.control.comprehensions.in_comprehension_element = in_element;
+                compiler
+                    .control
+                    .comprehensions
                     .force_filtered_comprehension_truth_ownerless = force_truth_ownerless;
                 compiler
                     .control
+                    .comprehensions
                     .filtered_comprehension_has_root_if_expression = root_if_filter;
                 result
             },
@@ -3115,11 +3226,15 @@ impl Compiler<'_> {
         }
         self.assembler.mark(normal_cleanup);
 
-        let deferred_normal_restore = self.control.defer_async_comprehension_restore;
+        let deferred_normal_restore = self
+            .control
+            .comprehensions
+            .defer_async_comprehension_restore;
         self.set_depth(base_depth + i32::try_from(temporary_names.len()).unwrap() + 1);
         self.assembler.set_location(comprehension_location);
         if deferred_normal_restore {
             self.control
+                .comprehensions
                 .pending_comprehension_restores
                 .push((temporary_restores, comprehension_location));
         } else {
@@ -3267,7 +3382,11 @@ impl Compiler<'_> {
             freevars,
             ..LoweringFunctionPlan::default()
         };
-        let inlined_comprehension_parent = !self.control.active_comprehension_cleanups.is_empty();
+        let inlined_comprehension_parent = !self
+            .control
+            .comprehensions
+            .active_comprehension_cleanups
+            .is_empty();
         let flags =
             if is_async {
                 CO_ASYNC_GENERATOR
@@ -3294,7 +3413,7 @@ impl Compiler<'_> {
             0,
             flags,
         )?;
-        child.control.generator_expression = true;
+        child.control.generators.generator_expression = true;
         child.unit.private_name.clone_from(&self.unit.private_name);
         child
             .symbols
@@ -3362,7 +3481,7 @@ impl Compiler<'_> {
                 generator_location,
             );
         }
-        let loop_depth = self.control.depth;
+        let loop_depth = self.control.stack.depth;
         let start = self.assembler.label();
         let cleanup = self.assembler.label();
         self.assembler.mark(start);
@@ -3429,7 +3548,7 @@ impl Compiler<'_> {
         generator_location: SourceLocation,
     ) -> Result<(), CompileError> {
         let generator = &generators[index];
-        let loop_depth = self.control.depth;
+        let loop_depth = self.control.stack.depth;
         let cleanup_location = generator_location;
         let start = self.assembler.label();
         let protected_start = self.assembler.label();
@@ -3517,6 +3636,7 @@ impl Compiler<'_> {
         );
         self.assembler.mark(async_cleanup);
         self.control
+            .generators
             .generator_region_exclusions
             .push((cleanup_throw, async_cleanup));
         self.set_depth(loop_depth + 1);
@@ -3648,12 +3768,13 @@ impl Compiler<'_> {
             let exclusion_end = self.assembler.label();
             self.assembler.mark(exclusion_end);
             self.control
+                .generators
                 .generator_region_exclusions
                 .push((exclusion_start, exclusion_end));
             return Ok(());
         }
         self.with_control_override(
-            |control| &mut control.generator_filter_expression,
+            |control| &mut control.generators.generator_filter_expression,
             true,
             |compiler| compiler.compile_expression(condition),
         )?;
@@ -3670,6 +3791,7 @@ impl Compiler<'_> {
         let exclusion_end = self.assembler.label();
         self.assembler.mark(exclusion_end);
         self.control
+            .generators
             .generator_region_exclusions
             .push((exclusion_start, exclusion_end));
         Ok(())
@@ -3691,8 +3813,12 @@ impl Compiler<'_> {
                 .iter()
                 .all(|value| !matches!(value, Expr::BoolOp(_) | Expr::UnaryOp(_)))
             && (!include_comprehension_cleanup
-                || (self.control.active_exception_region_exclusions.is_empty()
-                    && self.control.active_with_region_exclusions.is_empty()))
+                || (self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .is_empty()
+                    && self.control.withs.active_with_region_exclusions.is_empty()))
         {
             let Some((last, leading)) = boolean.values.split_last() else {
                 return Err(CompileError::Internal(
@@ -3759,15 +3885,22 @@ impl Compiler<'_> {
         include_comprehension_cleanup: bool,
         include_protected_region_exclusion: bool,
     ) -> Result<(), CompileError> {
-        if !self.control.suppress_filtered_comprehension_none_owner
+        if !self
+            .control
+            .comprehensions
+            .suppress_filtered_comprehension_none_owner
             && comprehension_filter_has_root_if_expression(operand)
         {
             self.with_control_override(
-                |control| &mut control.suppress_filtered_comprehension_none_owner,
+                |control| {
+                    &mut control
+                        .comprehensions
+                        .suppress_filtered_comprehension_none_owner
+                },
                 true,
                 |compiler| {
                     compiler.with_control_override(
-                        |control| &mut control.generator_filter_expression,
+                        |control| &mut control.generators.generator_filter_expression,
                         true,
                         |compiler| compiler.compile_expression(operand),
                     )
@@ -3775,7 +3908,7 @@ impl Compiler<'_> {
             )?;
         } else {
             self.with_control_override(
-                |control| &mut control.generator_filter_expression,
+                |control| &mut control.generators.generator_filter_expression,
                 true,
                 |compiler| compiler.compile_expression(operand),
             )?;
@@ -3809,7 +3942,7 @@ impl Compiler<'_> {
         include_comprehension_cleanup: bool,
         include_protected_region_exclusion: bool,
     ) -> Result<(), CompileError> {
-        let base_depth = self.control.depth;
+        let base_depth = self.control.stack.depth;
         let cleanup = self.assembler.label();
         let residue = self.assembler.label();
         let comparison_location = self.source_location(comparison.range);
@@ -3880,29 +4013,45 @@ impl Compiler<'_> {
         include_comprehension_cleanup: bool,
         include_protected_region_exclusion: bool,
     ) {
-        self.control.generator_region_exclusions.push((start, end));
+        self.control
+            .generators
+            .generator_region_exclusions
+            .push((start, end));
         if include_comprehension_cleanup {
-            for exclusions in &mut self.control.active_comprehension_region_exclusions {
+            for exclusions in &mut self
+                .control
+                .comprehensions
+                .active_comprehension_region_exclusions
+            {
                 exclusions.push((start, end));
             }
         }
         // CPython leaves the synchronous filter-rejection block outside its active try/with
         // owners. Handler nesting, copied finally bodies, and suspension use different owners.
         if include_protected_region_exclusion
-            && (!self.control.active_exception_region_exclusions.is_empty()
-                || !self.control.active_with_region_exclusions.is_empty())
+            && (!self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+                || !self.control.withs.active_with_region_exclusions.is_empty())
             && self.context.target_specific_rules_enabled()
             && (!self.control.in_exception_handler()
-                || self.control.active_exception_region_exclusions.len() == 1)
-            && self.control.active_normal_finally_bodies == 0
+                || self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .len()
+                    == 1)
+            && self.control.finally.active_normal_finally_bodies == 0
             && !self.control.in_async_with_nested_exception_region()
             && (self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR | CO_GENERATOR) == 0
-                || !self.control.emitted_yield_value)
+                || !self.control.generators.emitted_yield_value)
         {
-            for exclusions in &mut self.control.active_exception_region_exclusions {
+            for exclusions in &mut self.control.exceptions.active_exception_region_exclusions {
                 exclusions.push((start, end));
             }
-            for exclusions in &mut self.control.active_with_region_exclusions {
+            for exclusions in &mut self.control.withs.active_with_region_exclusions {
                 exclusions.push((start, end));
             }
         }
@@ -3973,12 +4122,22 @@ impl Compiler<'_> {
                 && include_protected_region_exclusion
                 && matches!(self.unit.scope, Scope::Function { .. })
                 && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR | CO_GENERATOR) == 0
-                && self.control.generator_region_start.is_none()
-                && self.control.active_exception_region_exclusions.is_empty()
-                && self.control.active_with_region_exclusions.is_empty()
-                && self.control.active_comprehension_region_exclusions.len() == 1
+                && self.control.generators.generator_region_start.is_none()
                 && self
                     .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .is_empty()
+                && self.control.withs.active_with_region_exclusions.is_empty()
+                && self
+                    .control
+                    .comprehensions
+                    .active_comprehension_region_exclusions
+                    .len()
+                    == 1
+                && self
+                    .control
+                    .comprehensions
                     .active_comprehension_region_exclusions
                     .last()
                     .is_some_and(Vec::is_empty)
@@ -3994,7 +4153,7 @@ impl Compiler<'_> {
             for value in leading {
                 if preserve_multiline_list_filter_none_owner {
                     self.with_control_override(
-                        |control| &mut control.include_scoped_none_condition_owner,
+                        |control| &mut control.conditions.include_scoped_none_condition_owner,
                         true,
                         |compiler| compiler.compile_jump_if(value, true, accepted),
                     )?;
@@ -4066,19 +4225,30 @@ impl Compiler<'_> {
                 include_protected_region_exclusion,
             );
             if include_with_region_exclusion
-                && self.control.active_exception_region_exclusions.is_empty()
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .is_empty()
             {
-                for exclusions in &mut self.control.active_with_region_exclusions {
+                for exclusions in &mut self.control.withs.active_with_region_exclusions {
                     exclusions.push((exclusion_start, exclusion_end));
                 }
             }
             return Ok(());
         }
-        if !self.control.suppress_filtered_comprehension_none_owner
+        if !self
+            .control
+            .comprehensions
+            .suppress_filtered_comprehension_none_owner
             && comprehension_filter_has_root_if_expression(condition)
         {
             self.with_control_override(
-                |control| &mut control.suppress_filtered_comprehension_none_owner,
+                |control| {
+                    &mut control
+                        .comprehensions
+                        .suppress_filtered_comprehension_none_owner
+                },
                 true,
                 |compiler| compiler.compile_expression(condition),
             )?;
@@ -4103,9 +4273,13 @@ impl Compiler<'_> {
             include_protected_region_exclusion,
         );
         if include_with_region_exclusion
-            && self.control.active_exception_region_exclusions.is_empty()
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
         {
-            for exclusions in &mut self.control.active_with_region_exclusions {
+            for exclusions in &mut self.control.withs.active_with_region_exclusions {
                 exclusions.push((exclusion_start, exclusion_end));
             }
         }
@@ -4125,7 +4299,7 @@ impl Compiler<'_> {
             return self
                 .compile_async_comprehension_generator(generators, index, key, value, add_opcode);
         }
-        let loop_depth = self.control.depth;
+        let loop_depth = self.control.stack.depth;
         let start = self.assembler.label();
         let cleanup = self.assembler.label();
         self.assembler.mark(start);
@@ -4258,10 +4432,15 @@ impl Compiler<'_> {
         value: &Expr,
     ) -> Result<(), CompileError> {
         let folded_conditional_key = matches!(key, Some(Expr::If(expression)) if early_condition_truthiness(&expression.test).is_some());
-        let in_element = (!self.control.in_unfiltered_comprehension
+        let in_element = (!self.control.comprehensions.in_unfiltered_comprehension
             && key.is_none()
             && !expression_contains_inlined_comprehension(value))
-        .then(|| std::mem::replace(&mut self.control.in_comprehension_element, true));
+        .then(|| {
+            std::mem::replace(
+                &mut self.control.comprehensions.in_comprehension_element,
+                true,
+            )
+        });
         let result = self.compile_with_strict_owned_loads(folded_conditional_key, |compiler| {
             if let Some(key) = key {
                 if folded_conditional_key {
@@ -4277,7 +4456,7 @@ impl Compiler<'_> {
             compiler.compile_expression(value)
         });
         if let Some(in_element) = in_element {
-            self.control.in_comprehension_element = in_element;
+            self.control.comprehensions.in_comprehension_element = in_element;
         }
         result
     }
@@ -4291,8 +4470,11 @@ impl Compiler<'_> {
         add_opcode: Opcode,
     ) -> Result<(), CompileError> {
         let generator = &generators[index];
-        let reorder_cleanup = self.control.reorder_async_comprehension_cleanup_throw;
-        let loop_depth = self.control.depth;
+        let reorder_cleanup = self
+            .control
+            .comprehensions
+            .reorder_async_comprehension_cleanup_throw;
+        let loop_depth = self.control.stack.depth;
         let cleanup_location = self.assembler.location();
         let start = self.assembler.label();
         let protected_start = self.assembler.label();
@@ -4415,6 +4597,7 @@ impl Compiler<'_> {
             let async_cleanup_end = self.assembler.label();
             self.assembler.mark(async_cleanup_end);
             self.control
+                .generators
                 .generator_region_exclusions
                 .push((cleanup_throw, async_cleanup_end));
             self.assembler.add_exception_region(
@@ -4433,15 +4616,20 @@ impl Compiler<'_> {
             );
         } else {
             self.control
+                .generators
                 .generator_region_exclusions
                 .push((cleanup_throw, async_cleanup));
-            for exclusions in &mut self.control.active_comprehension_region_exclusions {
+            for exclusions in &mut self
+                .control
+                .comprehensions
+                .active_comprehension_region_exclusions
+            {
                 exclusions.push((cleanup_throw_end, async_cleanup));
             }
-            for exclusions in &mut self.control.active_with_region_exclusions {
+            for exclusions in &mut self.control.withs.active_with_region_exclusions {
                 exclusions.push((cleanup_throw_end, async_cleanup));
             }
-            for exclusions in &mut self.control.active_exception_region_exclusions {
+            for exclusions in &mut self.control.exceptions.active_exception_region_exclusions {
                 exclusions.push((cleanup_throw_end, async_cleanup));
             }
             self.assembler.add_exception_region(
@@ -4878,53 +5066,71 @@ impl Compiler<'_> {
             self.assembler.mark_last_borrow_fallthrough_barrier();
             return Ok(());
         }
-        let base_depth = self.control.depth;
+        let base_depth = self.control.stack.depth;
         let else_label = self.assembler.label();
         let end = self.assembler.label();
         // CPython appends this repeated-attribute if-expression marker after
         // compacting an ordinary try inside an iterator loop. A fresh marker slot
         // is ownerless; a concrete protected fallthrough vacancy remains owned.
-        let exclude_plain_try_attribute_marker = self.control.generator_region_start.is_none()
-            && self.control.in_iterator_loop()
-            && !self.control.exceptional_finally_condition
-            && self
-                .control
-                .active_comprehension_region_exclusions
-                .is_empty()
-            && self.control.active_with_region_exclusions.is_empty()
-            && self.control.active_normal_finally_bodies == 0
-            && self.control.active_finally_end_blocks == 0
-            && self.control.active_exception_group_handlers == 0
-            && !self.control.same_line_try_body
-            && !self.control.current_exception_handler_binds_name()
-            && !self.control.in_exception_handler()
-            && self.control.active_exception_region_exclusions.len() == 1
-            && !self
-                .assembler
-                .fallthrough_has_concrete_dynamic_exception_owner()
-            && matches!(
-                (expression.test.as_ref(), expression.body.as_ref()),
-                (Expr::Attribute(test), Expr::Attribute(body))
-                    if test.attr.as_str() == body.attr.as_str()
-                        && matches!(
-                            (test.value.as_ref(), body.value.as_ref()),
-                            (Expr::Name(test), Expr::Name(body))
-                                if test.id.as_str() == body.id.as_str()
-                        )
-            );
-        let exclude_try_marker = self.control.exclude_condition_not_taken_from_exception
+        let exclude_plain_try_attribute_marker =
+            self.control.generators.generator_region_start.is_none()
+                && self.control.in_iterator_loop()
+                && !self.control.finally.exceptional_finally_condition
+                && self
+                    .control
+                    .comprehensions
+                    .active_comprehension_region_exclusions
+                    .is_empty()
+                && self.control.withs.active_with_region_exclusions.is_empty()
+                && self.control.finally.active_normal_finally_bodies == 0
+                && self.control.finally.active_finally_end_blocks == 0
+                && self.control.exceptions.active_exception_group_handlers == 0
+                && !self.control.exceptions.same_line_try_body
+                && !self.control.current_exception_handler_binds_name()
+                && !self.control.in_exception_handler()
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .len()
+                    == 1
+                && !self
+                    .assembler
+                    .fallthrough_has_concrete_dynamic_exception_owner()
+                && matches!(
+                    (expression.test.as_ref(), expression.body.as_ref()),
+                    (Expr::Attribute(test), Expr::Attribute(body))
+                        if test.attr.as_str() == body.attr.as_str()
+                            && matches!(
+                                (test.value.as_ref(), body.value.as_ref()),
+                                (Expr::Name(test), Expr::Name(body))
+                                    if test.id.as_str() == body.id.as_str()
+                            )
+                );
+        let exclude_try_marker = self
+            .control
+            .conditions
+            .exclude_condition_not_taken_from_exception
             || exclude_plain_try_attribute_marker
             || (self
                 .control
                 .current_try_handler_starts_with_optimized_boolean_generator()
                 && matches!(expression.test.as_ref(), Expr::Name(_)));
         let preserve_none_condition_owner = (self.control.in_synchronous_with()
-            || (self.control.active_exception_region_exclusions.is_empty()
+            || (self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
                 && !self
                     .control
+                    .comprehensions
                     .active_comprehension_region_exclusions
                     .is_empty()
-                && !self.control.suppress_filtered_comprehension_none_owner))
+                && !self
+                    .control
+                    .comprehensions
+                    .suppress_filtered_comprehension_none_owner))
             && matches!(expression.test.as_ref(), Expr::Compare(comparison)
                 if comparison.ops.len() == 1
                     && matches!(comparison.ops[0], CmpOp::Is | CmpOp::IsNot)
@@ -4932,36 +5138,59 @@ impl Compiler<'_> {
         let preserve_generator_loop_condition_owner =
             self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) != 0
                 && self.control.in_iterator_loop()
-                && !self.control.generator_expression
-                && self.control.active_exception_region_exclusions.is_empty()
+                && !self.control.generators.generator_expression
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .is_empty()
                 && matches!(expression.test.as_ref(), Expr::UnaryOp(unary)
                     if unary.op == UnaryOp::Not
                         && matches!(unary.operand.as_ref(), Expr::Name(_)))
                 && matches!(expression.body.as_ref(), Expr::Name(_))
                 && matches!(expression.orelse.as_ref(), Expr::BinOp(_));
-        let enter_filtered_comprehension_conditional =
-            !self.control.suppress_filtered_comprehension_none_owner
-                && !self.control.in_unfiltered_comprehension
-                && !self
-                    .control
-                    .active_comprehension_region_exclusions
-                    .is_empty();
+        let enter_filtered_comprehension_conditional = !self
+            .control
+            .comprehensions
+            .suppress_filtered_comprehension_none_owner
+            && !self.control.comprehensions.in_unfiltered_comprehension
+            && !self
+                .control
+                .comprehensions
+                .active_comprehension_region_exclusions
+                .is_empty();
         let direct_filtered_comprehension = enter_filtered_comprehension_conditional
-            && self.control.in_comprehension_element
-            && !self.control.filtered_comprehension_has_root_if_expression
-            && self.control.generator_region_start.is_none()
-            && self.control.active_exception_region_exclusions.is_empty()
-            && self.control.active_with_region_exclusions.is_empty();
+            && self.control.comprehensions.in_comprehension_element
+            && !self
+                .control
+                .comprehensions
+                .filtered_comprehension_has_root_if_expression
+            && self.control.generators.generator_region_start.is_none()
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            && self.control.withs.active_with_region_exclusions.is_empty();
         let preserve_filtered_comprehension_short_circuit_none_owner = direct_filtered_comprehension
             && comprehension_condition_has_trailing_none(&expression.test);
         // An unfused comprehension target can leave the leading specialized None-condition
         // marker inside the cleanup region when the conditional short-circuits to a comparison.
         let preserve_unfiltered_comprehension_leading_none_owner =
-            self.control.in_unfiltered_comprehension
-                && self.control.generator_region_start.is_none()
-                && self.control.active_exception_region_exclusions.is_empty()
-                && self.control.active_with_region_exclusions.is_empty()
-                && self.control.active_comprehension_region_exclusions.len() == 1
+            self.control.comprehensions.in_unfiltered_comprehension
+                && self.control.generators.generator_region_start.is_none()
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .is_empty()
+                && self.control.withs.active_with_region_exclusions.is_empty()
+                && self
+                    .control
+                    .comprehensions
+                    .active_comprehension_region_exclusions
+                    .len()
+                    == 1
                 && matches!(expression.test.as_ref(), Expr::BoolOp(boolean)
                 if boolean.op == BoolOp::Or
                     && matches!(boolean.values.as_slice(), [Expr::Compare(first), Expr::Compare(_)]
@@ -4972,17 +5201,28 @@ impl Compiler<'_> {
                             && matches!(first.comparators[0], Expr::NoneLiteral(_))));
         let include_scoped_none_condition_owner =
             preserve_unfiltered_comprehension_leading_none_owner
-                || self.control.include_scoped_none_condition_owner;
+                || self.control.conditions.include_scoped_none_condition_owner;
         if direct_filtered_comprehension
             && filtered_comprehension_has_ownerless_truth_condition(expression)
-            && !self.control.force_filtered_comprehension_truth_ownerless
+            && !self
+                .control
+                .comprehensions
+                .force_filtered_comprehension_truth_ownerless
         {
             self.with_control_override(
-                |control| &mut control.force_filtered_comprehension_truth_ownerless,
+                |control| {
+                    &mut control
+                        .comprehensions
+                        .force_filtered_comprehension_truth_ownerless
+                },
                 true,
                 |compiler| {
                     compiler.with_control_override(
-                        |control| &mut control.exclude_condition_not_taken_from_exception,
+                        |control| {
+                            &mut control
+                                .conditions
+                                .exclude_condition_not_taken_from_exception
+                        },
                         exclude_try_marker,
                         |compiler| compiler.compile_jump_if(&expression.test, false, else_label),
                     )
@@ -4990,11 +5230,15 @@ impl Compiler<'_> {
             )?;
         } else {
             self.with_control_override(
-                |control| &mut control.include_scoped_none_condition_owner,
+                |control| &mut control.conditions.include_scoped_none_condition_owner,
                 include_scoped_none_condition_owner,
                 |compiler| {
                     compiler.with_control_override(
-                        |control| &mut control.exclude_condition_not_taken_from_exception,
+                        |control| {
+                            &mut control
+                                .conditions
+                                .exclude_condition_not_taken_from_exception
+                        },
                         exclude_try_marker,
                         |compiler| compiler.compile_jump_if(&expression.test, false, else_label),
                     )
@@ -5009,7 +5253,11 @@ impl Compiler<'_> {
         }
         if enter_filtered_comprehension_conditional {
             self.with_control_override(
-                |control| &mut control.suppress_filtered_comprehension_none_owner,
+                |control| {
+                    &mut control
+                        .comprehensions
+                        .suppress_filtered_comprehension_none_owner
+                },
                 true,
                 |compiler| compiler.compile_expression(&expression.body),
             )?;
@@ -5033,7 +5281,7 @@ impl Compiler<'_> {
             false
         };
         self.emit_jump_forward(JUMP_FORWARD, end, 0)?;
-        if self.control.terminal_if_call_expression {
+        if self.control.statements.terminal_if_call_expression {
             self.assembler.prevent_last_jump_inlining();
         }
         if matches!(expression.body.as_ref(), Expr::BoolOp(_)) || preserve_nested_no_location {
@@ -5043,7 +5291,11 @@ impl Compiler<'_> {
         self.set_depth(base_depth);
         if enter_filtered_comprehension_conditional {
             self.with_control_override(
-                |control| &mut control.suppress_filtered_comprehension_none_owner,
+                |control| {
+                    &mut control
+                        .comprehensions
+                        .suppress_filtered_comprehension_none_owner
+                },
                 true,
                 |compiler| compiler.compile_expression(&expression.orelse),
             )?;
@@ -5107,7 +5359,7 @@ impl Compiler<'_> {
             );
         }
 
-        let base_depth = self.control.depth;
+        let base_depth = self.control.stack.depth;
         let otherwise = self.assembler.label();
         self.compile_jump_if(&conditional.test, false, otherwise)?;
         self.compile_tail_return_expression_inner(&conditional.body, return_location, false)?;
@@ -5170,7 +5422,7 @@ impl Compiler<'_> {
             // jump as a source-position NOP when the next operand starts on another line.
             self.emit(NOP, 0, 0)?;
         }
-        let base_depth = self.control.depth;
+        let base_depth = self.control.stack.depth;
         let end = self.assembler.label();
         let jump = match expression.op {
             BoolOp::And => POP_JUMP_IF_FALSE,
@@ -5194,6 +5446,7 @@ impl Compiler<'_> {
             let marker_owner_slots = self.assembler.current_block_dynamic_exception_owner_slots();
             let fallthrough_marker_reuses_exception_owner = self
                 .control
+                .exceptions
                 .active_tuple_handler_try_bodies
                 .last()
                 .is_some_and(|tuple_handler| *tuple_handler)
@@ -5214,6 +5467,7 @@ impl Compiler<'_> {
                 exception_type_marker_owner == Some(false) && !marker_reuses_exception_owner;
             let exclude_inlined_comprehension_owner = !self
                 .control
+                .comprehensions
                 .active_comprehension_region_exclusions
                 .is_empty()
                 && !marker_reuses_exception_owner
@@ -5226,59 +5480,70 @@ impl Compiler<'_> {
             let exclusion_end = self.assembler.label();
             self.assembler.mark(exclusion_end);
 
-            let exception_group_handler = self.control.active_exception_group_handlers > 0;
-            let normalized_owner = self.control.active_normal_finally_bodies > 0
-                || self.control.active_finally_end_blocks > 0
+            let exception_group_handler =
+                self.control.exceptions.active_exception_group_handlers > 0;
+            let normalized_owner = self.control.finally.active_normal_finally_bodies > 0
+                || self.control.finally.active_finally_end_blocks > 0
                 || resumes_after_yield
                 || exception_group_handler;
-            let suspension_epoch = self.control.coroutine_suspension_epoch;
+            let suspension_epoch = self.control.generators.coroutine_suspension_epoch;
             let follows_marker_before_coroutine_suspension = self.unit.flags & CO_COROUTINE != 0
                 && suspension_epoch == 0
                 && self
                     .control
+                    .comprehensions
                     .active_comprehension_region_exclusions
                     .is_empty()
-                && self.control.active_with_region_exclusions.is_empty()
-                && self.control.active_exception_region_exclusions.is_empty()
-                && self.control.active_normal_finally_bodies == 0
-                && self.control.active_finally_end_blocks == 0
-                && self.control.active_exception_group_handlers == 0
+                && self.control.withs.active_with_region_exclusions.is_empty()
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .is_empty()
+                && self.control.finally.active_normal_finally_bodies == 0
+                && self.control.finally.active_finally_end_blocks == 0
+                && self.control.exceptions.active_exception_group_handlers == 0
                 && ((marker_owner_slots == 1
-                    && self.control.generator_region_exclusions.is_empty()
+                    && self
+                        .control
+                        .generators
+                        .generator_region_exclusions
+                        .is_empty()
                     && !self.control.in_loop()
                     && self.assembler.contains_opcode(NOT_TAKEN))
                     || self.assembler.contains_boolean_value_marker());
-            let exclude_generator_region_owner = (self.control.generator_expression
+            let exclude_generator_region_owner = (self.control.generators.generator_expression
                 || follows_marker_before_coroutine_suspension)
                 && !marker_reuses_exception_owner;
             let after_coroutine_suspension =
                 self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR) != 0 && suspension_epoch > 0;
             let has_fresh_with_owner = after_coroutine_suspension
-                && self
-                    .control
-                    .active_with_suspension_epochs
-                    .contains(&suspension_epoch);
+                && self.control.has_with_suspension_epoch(suspension_epoch);
             let named_exception_handler = self.control.current_exception_handler_binds_name();
             let exclude_after_coroutine_suspension = after_coroutine_suspension
                 && !has_fresh_with_owner
-                && self.control.active_finally_end_blocks == 0
+                && self.control.finally.active_finally_end_blocks == 0
                 && !marker_reuses_exception_owner
-                && !self.control.same_line_try_body
+                && !self.control.exceptions.same_line_try_body
                 && !named_exception_handler
                 && !exception_group_handler
                 && exception_type_marker_owner.is_none();
-            let exclude_from_plain_try = self.control.generator_region_start.is_none()
-                && self.control.active_with_suspension_epochs.is_empty()
-                && self.control.active_normal_finally_bodies == 0
-                && self.control.active_finally_end_blocks == 0
-                && !self.control.same_line_try_body
+            let exclude_from_plain_try = self.control.generators.generator_region_start.is_none()
+                && self.control.active_with_count() == 0
+                && self.control.finally.active_normal_finally_bodies == 0
+                && self.control.finally.active_finally_end_blocks == 0
+                && !self.control.exceptions.same_line_try_body
                 && !named_exception_handler
                 && !exception_group_handler
                 && !marker_reuses_exception_owner
                 && exception_type_marker_owner.is_none()
-                && !self.control.active_exception_region_exclusions.is_empty();
+                && !self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .is_empty();
             if nested_leading_group && exclude_from_plain_try {
-                for exclusions in &mut self.control.active_exception_region_exclusions {
+                for exclusions in &mut self.control.exceptions.active_exception_region_exclusions {
                     exclusions.push((exclusion_start, exclusion_end));
                 }
             }
@@ -5315,19 +5580,21 @@ impl Compiler<'_> {
             if let Some(marker_start) = marker_start {
                 let marker_end = self.assembler.label();
                 self.assembler.mark(marker_end);
-                if self.control.generator_region_start.is_some()
+                if self.control.generators.generator_region_start.is_some()
                     && (exclude_generator_region_owner || exclude_after_coroutine_suspension)
                 {
                     self.control
+                        .generators
                         .generator_region_exclusions
                         .push((marker_start, marker_end));
                 }
                 if exclude_after_coroutine_suspension
-                    && self.control.active_normal_finally_bodies == 0
+                    && self.control.finally.active_normal_finally_bodies == 0
                 {
-                    let active_with_count = self.control.active_with_suspension_epochs.len();
+                    let active_with_count = self.control.active_with_count();
                     for exclusions in self
                         .control
+                        .withs
                         .active_with_region_exclusions
                         .iter_mut()
                         .take(active_with_count)
@@ -5337,9 +5604,11 @@ impl Compiler<'_> {
                 }
                 if exclude_from_plain_try
                     || (exclude_after_coroutine_suspension
-                        && self.control.active_normal_finally_bodies == 0)
+                        && self.control.finally.active_normal_finally_bodies == 0)
                 {
-                    for exclusions in &mut self.control.active_exception_region_exclusions {
+                    for exclusions in
+                        &mut self.control.exceptions.active_exception_region_exclusions
+                    {
                         exclusions.push((marker_start, marker_end));
                     }
                 }
@@ -5374,7 +5643,7 @@ impl Compiler<'_> {
             return self.emit(opcode, argument, -1);
         }
 
-        let base_depth = self.control.depth - 1;
+        let base_depth = self.control.stack.depth - 1;
         let cleanup = self.assembler.label();
         for (operator, comparator) in expression
             .ops
@@ -5393,9 +5662,9 @@ impl Compiler<'_> {
             // CPython appends the chained-comparison marker after compacting the CFG. The
             // generator's stop-iteration owner survives only when this block offers a stale
             // instruction slot for the marker to reuse.
-            let exclude_generator_owner = self.control.generator_expression
-                && self.control.generator_region_start.is_some()
-                && !self.control.generator_filter_expression
+            let exclude_generator_owner = self.control.generators.generator_expression
+                && self.control.generators.generator_region_start.is_some()
+                && !self.control.generators.generator_filter_expression
                 && !self.assembler.current_block_has_dynamic_exception_owner();
             let marker_start = exclude_generator_owner.then(|| {
                 let start = self.assembler.label();
@@ -5407,6 +5676,7 @@ impl Compiler<'_> {
                 let marker_end = self.assembler.label();
                 self.assembler.mark(marker_end);
                 self.control
+                    .generators
                     .generator_region_exclusions
                     .push((marker_start, marker_end));
             }
@@ -5445,14 +5715,16 @@ impl Compiler<'_> {
     ) -> Result<(), CompileError> {
         let terminal_try_depth = self
             .control
+            .exceptions
             .terminal_try_condition_exception_exclusion_depth;
-        let exclude_normal_finally_not_taken_from_with = self.control.active_normal_finally_bodies
-            > 0
-            && !self.control.active_with_region_exclusions.is_empty()
-            && !self
-                .control
-                .include_simple_normal_finally_not_taken_from_with;
-        if self.control.force_terminal_with_marker_ownerless {
+        let exclude_normal_finally_not_taken_from_with =
+            self.control.finally.active_normal_finally_bodies > 0
+                && !self.control.withs.active_with_region_exclusions.is_empty()
+                && !self
+                    .control
+                    .withs
+                    .include_simple_normal_finally_not_taken_from_with;
+        if self.control.withs.force_terminal_with_marker_ownerless {
             return self.emit_with_exception_policy(
                 NOT_TAKEN,
                 0,
@@ -5460,23 +5732,37 @@ impl Compiler<'_> {
                 ExceptionPolicy::EXCLUDE_ALWAYS,
             );
         }
-        if !self.control.exclude_terminal_if_not_taken
-            && !self.control.exclude_condition_not_taken_from_exception
+        if !self.control.conditions.exclude_terminal_if_not_taken
+            && !self
+                .control
+                .conditions
+                .exclude_condition_not_taken_from_exception
             && terminal_try_depth.is_none()
             && !exclude_normal_finally_not_taken_from_with
         {
             return self.emit_with_exception_policy(NOT_TAKEN, 0, 0, policy.ordinary);
         }
 
-        let exclude_from_generator = (self.control.exclude_condition_not_taken_from_exception
+        let exclude_from_generator = (self
+            .control
+            .conditions
+            .exclude_condition_not_taken_from_exception
             || terminal_try_depth.is_some()
-            || self.control.exclude_terminal_if_not_taken_from_generator)
-            && self.control.generator_region_start.is_some();
-        let exclude_from_exception = self.control.exclude_condition_not_taken_from_exception
-            || (self.control.exclude_terminal_if_not_taken
-                && !self.control.active_with_region_exclusions.is_empty());
-        self.control.exclude_terminal_if_not_taken = false;
-        self.control.exclude_terminal_if_not_taken_from_generator = false;
+            || self
+                .control
+                .withs
+                .exclude_terminal_if_not_taken_from_generator)
+            && self.control.generators.generator_region_start.is_some();
+        let exclude_from_exception = self
+            .control
+            .conditions
+            .exclude_condition_not_taken_from_exception
+            || (self.control.conditions.exclude_terminal_if_not_taken
+                && !self.control.withs.active_with_region_exclusions.is_empty());
+        self.control.conditions.exclude_terminal_if_not_taken = false;
+        self.control
+            .withs
+            .exclude_terminal_if_not_taken_from_generator = false;
 
         let exclusion_start = self.assembler.label();
         self.assembler.mark(exclusion_start);
@@ -5486,24 +5772,27 @@ impl Compiler<'_> {
 
         if exclude_from_generator {
             self.control
+                .generators
                 .generator_region_exclusions
                 .push((exclusion_start, exclusion_end));
         }
-        for exclusions in &mut self.control.active_with_region_exclusions {
+        for exclusions in &mut self.control.withs.active_with_region_exclusions {
             exclusions.push((exclusion_start, exclusion_end));
         }
         if exclude_from_exception
             && self
                 .control
+                .conditions
                 .exclude_condition_not_taken_from_all_exception_regions
         {
-            for exclusions in &mut self.control.active_exception_region_exclusions {
+            for exclusions in &mut self.control.exceptions.active_exception_region_exclusions {
                 exclusions.push((exclusion_start, exclusion_end));
             }
         } else {
             if let Some(depth) = terminal_try_depth {
                 for exclusions in self
                     .control
+                    .exceptions
                     .active_exception_region_exclusions
                     .iter_mut()
                     .take(depth)
@@ -5512,11 +5801,20 @@ impl Compiler<'_> {
                 }
             }
             let terminal_try_includes_innermost = terminal_try_depth.is_some_and(|depth| {
-                depth >= self.control.active_exception_region_exclusions.len()
+                depth
+                    >= self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .len()
             });
             if exclude_from_exception
                 && !terminal_try_includes_innermost
-                && let Some(exclusions) = self.control.active_exception_region_exclusions.last_mut()
+                && let Some(exclusions) = self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .last_mut()
             {
                 exclusions.push((exclusion_start, exclusion_end));
             }
@@ -5529,7 +5827,11 @@ impl Compiler<'_> {
         policy: ConditionMarkerPolicy,
     ) -> Result<(), CompileError> {
         self.with_control_override(
-            |control| &mut control.terminal_try_condition_exception_exclusion_depth,
+            |control| {
+                &mut control
+                    .exceptions
+                    .terminal_try_condition_exception_exclusion_depth
+            },
             None,
             |compiler| compiler.emit_condition_not_taken(policy),
         )
@@ -5544,14 +5846,14 @@ impl Compiler<'_> {
         if let Expr::UnaryOp(unary) = expression
             && unary.op == UnaryOp::Not
         {
-            let defer_terminal_with_exclusion = self.control.terminal_with_condition
+            let defer_terminal_with_exclusion = self.control.withs.terminal_with_condition
                 == Some(expression.range())
-                && self.control.exclude_terminal_if_not_taken
-                && !self.control.active_with_region_exclusions.is_empty()
+                && self.control.conditions.exclude_terminal_if_not_taken
+                && !self.control.withs.active_with_region_exclusions.is_empty()
                 && matches!(unary.operand.as_ref(), Expr::BoolOp(boolean) if boolean.values.len() == 2);
             if defer_terminal_with_exclusion {
                 return self.with_control_override(
-                    |control| &mut control.defer_terminal_with_exclusion_through_negation,
+                    |control| &mut control.withs.defer_terminal_with_exclusion_through_negation,
                     true,
                     |compiler| compiler.compile_jump_if(&unary.operand, !jump_on, label),
                 );
@@ -5592,15 +5894,16 @@ impl Compiler<'_> {
                 self.emit(NOP, 0, 0)?;
                 let exclusion_end = self.assembler.label();
                 self.assembler.mark(exclusion_end);
-                if self.control.generator_region_start.is_some() {
+                if self.control.generators.generator_region_start.is_some() {
                     self.control
+                        .generators
                         .generator_region_exclusions
                         .push((exclusion_start, exclusion_end));
                 }
-                for exclusions in &mut self.control.active_with_region_exclusions {
+                for exclusions in &mut self.control.withs.active_with_region_exclusions {
                     exclusions.push((exclusion_start, exclusion_end));
                 }
-                for exclusions in &mut self.control.active_exception_region_exclusions {
+                for exclusions in &mut self.control.exceptions.active_exception_region_exclusions {
                     exclusions.push((exclusion_start, exclusion_end));
                 }
             }
@@ -5613,25 +5916,29 @@ impl Compiler<'_> {
                 ));
             };
             let operands_are_negated =
-                self.control.terminal_with_condition == Some(expression.range())
+                self.control.withs.terminal_with_condition == Some(expression.range())
                     && matches!(boolean.op, BoolOp::Or)
                     && !jump_on
                     && boolean.values.iter().all(
                         |value| matches!(value, Expr::UnaryOp(unary) if unary.op == UnaryOp::Not),
                     );
             let defer_terminal_with_exclusion = leading.len() == 1
-                && self.control.exclude_terminal_if_not_taken
-                && !self.control.active_with_region_exclusions.is_empty()
+                && self.control.conditions.exclude_terminal_if_not_taken
+                && !self.control.withs.active_with_region_exclusions.is_empty()
                 && (operands_are_negated
-                    || self.control.defer_terminal_with_exclusion_through_negation);
+                    || self
+                        .control
+                        .withs
+                        .defer_terminal_with_exclusion_through_negation);
             let preserve_leading_protected_loop_owner =
-                self.control.protected_iterator_continue_condition == Some(expression.range());
+                self.control.loops.protected_iterator_continue_condition
+                    == Some(expression.range());
             let short_circuit_jumps_to_target = matches!(boolean.op, BoolOp::Or) == jump_on;
             if short_circuit_jumps_to_target {
                 for (operand_index, value) in leading.iter().enumerate() {
                     if defer_terminal_with_exclusion {
                         self.with_control_override(
-                            |control| &mut control.exclude_terminal_if_not_taken,
+                            |control| &mut control.conditions.exclude_terminal_if_not_taken,
                             false,
                             |compiler| compiler.compile_jump_if(value, jump_on, label),
                         )?;
@@ -5648,7 +5955,7 @@ impl Compiler<'_> {
             for (operand_index, value) in leading.iter().enumerate() {
                 if defer_terminal_with_exclusion {
                     self.with_control_override(
-                        |control| &mut control.exclude_terminal_if_not_taken,
+                        |control| &mut control.conditions.exclude_terminal_if_not_taken,
                         false,
                         |compiler| compiler.compile_jump_if(value, !jump_on, end),
                     )?;
@@ -5671,17 +5978,24 @@ impl Compiler<'_> {
             self.compile_jump_if(&conditional.body, jump_on, label)?;
             self.assembler.set_location(SourceLocation::NONE);
             self.emit_jump_forward(JUMP_FORWARD, end, 0)?;
-            if self.control.retained_multiline_assert_ifexp_exit == Some(conditional.range) {
+            if self.control.conditions.retained_multiline_assert_ifexp_exit
+                == Some(conditional.range)
+            {
                 self.assembler.preserve_last_inlined_jump_nop();
             }
             self.assembler.mark(otherwise);
             if self
                 .control
+                .exceptions
                 .terminal_try_condition_exception_exclusion_depth
                 .is_some()
             {
                 self.with_control_override(
-                    |control| &mut control.terminal_try_condition_exception_exclusion_depth,
+                    |control| {
+                        &mut control
+                            .exceptions
+                            .terminal_try_condition_exception_exclusion_depth
+                    },
                     None,
                     |compiler| compiler.compile_jump_if(&conditional.orelse, jump_on, label),
                 )?;
@@ -5695,7 +6009,7 @@ impl Compiler<'_> {
         if let Expr::Compare(comparison) = expression
             && comparison.ops.len() > 1
         {
-            let base_depth = self.control.depth;
+            let base_depth = self.control.stack.depth;
             let cleanup = self.assembler.label();
             let end = self.assembler.label();
             self.compile_expression(&comparison.left)?;
@@ -5753,7 +6067,7 @@ impl Compiler<'_> {
             }
             self.emit(NOT_TAKEN, 0, 0)?;
             self.emit_jump_forward(JUMP_FORWARD, end, 0)?;
-            if self.control.retained_chained_comparison_exit == Some(comparison.range) {
+            if self.control.conditions.retained_chained_comparison_exit == Some(comparison.range) {
                 // CPython retains this final comparison fallthrough jump as a NOP when its
                 // neighboring terminal exit is copied through the optimized CFG.
                 self.assembler.preserve_last_inlined_jump_nop();
@@ -5766,8 +6080,9 @@ impl Compiler<'_> {
             self.emit(POP_TOP, 0, -1)?;
             if !jump_on {
                 self.emit_jump_forward(JUMP_FORWARD, label, 0)?;
-                if self.control.in_terminal_if_branch_suite
-                    && self.control.retained_chained_comparison_exit == Some(comparison.range)
+                if self.control.statements.in_terminal_if_branch_suite
+                    && self.control.conditions.retained_chained_comparison_exit
+                        == Some(comparison.range)
                 {
                     // The cleanup and false edges must continue sharing a small following exit.
                     self.assembler.prevent_last_jump_inlining();
@@ -5816,14 +6131,19 @@ impl Compiler<'_> {
             // stop-iteration region. Override the generic condition exclusion only when no
             // nested control-flow region can own the marker instead.
             let preserve_generator_stop_iteration_owner =
-                self.control.generator_region_start.is_some()
+                self.control.generators.generator_region_start.is_some()
                     && self
                         .control
+                        .comprehensions
                         .active_comprehension_region_exclusions
                         .is_empty()
-                    && self.control.active_with_region_exclusions.is_empty()
-                    && self.control.active_exception_region_exclusions.is_empty()
-                    && self.control.active_normal_finally_bodies == 0;
+                    && self.control.withs.active_with_region_exclusions.is_empty()
+                    && self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .is_empty()
+                    && self.control.finally.active_normal_finally_bodies == 0;
             // CPython specializes this condition by removing LOAD_CONST(None), IS_OP, and
             // TO_BOOL before appending NOT_TAKEN. Preserve the owner only when optimization can
             // reuse a stale protected slot in the current block.
@@ -5832,9 +6152,9 @@ impl Compiler<'_> {
             let policy = ConditionMarkerPolicy {
                 excluded: ExceptionPolicy::default(),
                 ordinary: ExceptionPolicy::normalized_owner(
-                    self.control.generator_region_start.is_some()
-                        || self.control.include_assert_none_condition_owner
-                        || self.control.include_scoped_none_condition_owner
+                    self.control.generators.generator_region_start.is_some()
+                        || self.control.conditions.include_assert_none_condition_owner
+                        || self.control.conditions.include_scoped_none_condition_owner
                         || self
                             .control
                             .synchronous_with_preserves_none_condition_owner()
@@ -5842,14 +6162,21 @@ impl Compiler<'_> {
                             .control
                             .finally_try_body_preserves_none_condition_owner()
                         || self.control.in_first_unnamed_exception_handler()
-                        || self.control.active_normal_finally_bodies > 0
-                        || self.control.force_filtered_comprehension_truth_ownerless
+                        || self.control.finally.active_normal_finally_bodies > 0
+                        || self
+                            .control
+                            .comprehensions
+                            .force_filtered_comprehension_truth_ownerless
                         || marker_reuses_exception_owner,
                 ),
             };
             return if preserve_generator_stop_iteration_owner {
                 self.with_control_override(
-                    |control| &mut control.exclude_condition_not_taken_from_exception,
+                    |control| {
+                        &mut control
+                            .conditions
+                            .exclude_condition_not_taken_from_exception
+                    },
                     false,
                     |compiler| {
                         compiler.emit_condition_not_taken_preserving_terminal_try_owner(policy)
@@ -5874,7 +6201,7 @@ impl Compiler<'_> {
                 .control
                 .is_ownerless_optimized_boolean_generator_test(expression.range());
             self.with_control_override(
-                |control| &mut control.optimized_generator_boolean_condition,
+                |control| &mut control.generators.optimized_generator_boolean_condition,
                 ownerless_boolean_generator,
                 |compiler| compiler.compile_expression(expression),
             )?;
@@ -5894,17 +6221,22 @@ impl Compiler<'_> {
             label,
             -1,
         )?;
-        let comparison_marker_owner = if self.control.loop_tail_while_condition {
+        let comparison_marker_owner = if self.control.loops.loop_tail_while_condition {
             ExceptionPolicy::default()
         } else {
             ExceptionPolicy::normalized_owner(true)
         };
-        let preserve_iterator_loop_assertion_owner =
-            self.control.preserve_first_iterator_loop_assertion_owner;
+        let preserve_iterator_loop_assertion_owner = self
+            .control
+            .loops
+            .preserve_first_iterator_loop_assertion_owner;
         // A direct attribute-call assertion can reuse a compacted protected slot in a with body.
         // Keep the block scan behind the cheap assertion and call guards.
-        let preserve_sync_with_assertion_owner = self.control.include_assert_none_condition_owner
-            && !self.control.active_with_region_exclusions.is_empty()
+        let preserve_sync_with_assertion_owner = self
+            .control
+            .conditions
+            .include_assert_none_condition_owner
+            && !self.control.withs.active_with_region_exclusions.is_empty()
             && matches!(expression, Expr::Call(call) if matches!(call.func.as_ref(), Expr::Attribute(_)))
             && self.assembler.current_block_has_dynamic_exception_owner();
         let policy = ConditionMarkerPolicy {
@@ -5917,7 +6249,7 @@ impl Compiler<'_> {
                 comparison_marker_owner
             } else {
                 ExceptionPolicy::normalized_owner(
-                    self.control.active_normal_finally_bodies > 0
+                    self.control.finally.active_normal_finally_bodies > 0
                         || preserve_iterator_loop_assertion_owner
                         || preserve_sync_with_assertion_owner,
                 )
@@ -5926,6 +6258,7 @@ impl Compiler<'_> {
         let preserve_terminal_try_owner = comparison_is_boolean
             || (self
                 .control
+                .exceptions
                 .terminal_try_condition_exception_exclusion_depth
                 .is_some()
                 && self.assembler.current_block_has_dynamic_exception_owner());
@@ -5937,7 +6270,7 @@ impl Compiler<'_> {
                     expression.range(),
                 );
         let exclude_post_async_with_marker = !comparison_is_boolean
-            && self.control.post_async_with_condition_marker == Some(expression.range())
+            && self.control.withs.post_async_with_condition_marker == Some(expression.range())
             && !self.assembler.current_block_has_dynamic_exception_owner();
         if exclude_post_async_with_marker {
             return self.emit_condition_not_taken(ConditionMarkerPolicy {
@@ -5945,7 +6278,12 @@ impl Compiler<'_> {
                 ordinary: ExceptionPolicy::EXCLUDE_ALWAYS,
             });
         }
-        if self.control.force_filtered_comprehension_truth_ownerless && !comparison_is_boolean {
+        if self
+            .control
+            .comprehensions
+            .force_filtered_comprehension_truth_ownerless
+            && !comparison_is_boolean
+        {
             let exception_policy = if self.assembler.current_block_has_dynamic_exception_owner() {
                 ExceptionPolicy::normalized_owner(true)
             } else {
@@ -5966,21 +6304,27 @@ impl Compiler<'_> {
                         .fallthrough_has_concrete_dynamic_exception_owner()
                 } else {
                     self.assembler.fallthrough_has_dynamic_exception_owner()
-                }) && self.control.generator_region_start.is_none()
+                }) && self.control.generators.generator_region_start.is_none()
                     && !self.control.in_iterator_loop()
-                    && !self.control.exceptional_finally_condition
+                    && !self.control.finally.exceptional_finally_condition
                     && self
                         .control
+                        .comprehensions
                         .active_comprehension_region_exclusions
                         .is_empty()
-                    && self.control.active_with_region_exclusions.is_empty()
-                    && self.control.active_normal_finally_bodies == 0
-                    && self.control.active_finally_end_blocks == 0
-                    && self.control.active_exception_group_handlers == 0
-                    && !self.control.same_line_try_body
+                    && self.control.withs.active_with_region_exclusions.is_empty()
+                    && self.control.finally.active_normal_finally_bodies == 0
+                    && self.control.finally.active_finally_end_blocks == 0
+                    && self.control.exceptions.active_exception_group_handlers == 0
+                    && !self.control.exceptions.same_line_try_body
                     && !self.control.current_exception_handler_binds_name()
                     && !self.control.in_exception_handler()
-                    && (self.control.active_exception_region_exclusions.len() == 1
+                    && (self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .len()
+                        == 1
                         || nested_try_ifexp_marker)
             });
         if exclude_plain_try_marker {

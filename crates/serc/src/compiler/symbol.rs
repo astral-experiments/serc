@@ -225,7 +225,12 @@ impl Compiler<'_> {
                     let index = self.name_index_with_id(name, name_id)?;
                     self.emit(LOAD_GLOBAL, index << 1, 1)
                 } else if let Some(index) = free_indices.get(&name_id).copied() {
-                    if self.control.active_comprehension_cleanups.is_empty() {
+                    if self
+                        .control
+                        .comprehensions
+                        .active_comprehension_cleanups
+                        .is_empty()
+                    {
                         self.emit(LOAD_LOCALS, 0, 1)?;
                         self.emit(LOAD_FROM_DICT_OR_DEREF, index, 0)
                     } else {
@@ -233,7 +238,12 @@ impl Compiler<'_> {
                     }
                 } else {
                     let index = self.name_index_with_id(name, name_id)?;
-                    if self.control.active_comprehension_cleanups.is_empty() {
+                    if self
+                        .control
+                        .comprehensions
+                        .active_comprehension_cleanups
+                        .is_empty()
+                    {
                         self.emit(LOAD_NAME, index, 1)
                     } else {
                         // The first iterable runs in the class namespace, but the inlined
@@ -608,7 +618,8 @@ impl Compiler<'_> {
     }
 
     pub(super) fn emit_pending_comprehension_restores(&mut self) -> Result<(), CompileError> {
-        let restores = std::mem::take(&mut self.control.pending_comprehension_restores);
+        let restores =
+            std::mem::take(&mut self.control.comprehensions.pending_comprehension_restores);
         for (restores, location) in restores {
             self.assembler.set_location(location);
             for (position, restore) in restores.iter().copied().enumerate() {
@@ -981,7 +992,7 @@ impl Compiler<'_> {
         argument: u32,
         effect: i32,
     ) -> Result<(), CompileError> {
-        self.control.emitted_yield_value = true;
+        self.control.generators.emitted_yield_value = true;
         self.emit(YIELD_VALUE, argument, effect)
     }
 
@@ -996,7 +1007,7 @@ impl Compiler<'_> {
         self.assembler.emit_with_depth(
             opcode,
             argument,
-            self.control.depth.cast_unsigned(),
+            self.control.stack.depth.cast_unsigned(),
             exception_policy,
         );
         Ok(())
@@ -1008,7 +1019,7 @@ impl Compiler<'_> {
         self.assembler.emit_with_depth(
             RERAISE,
             argument,
-            self.control.depth.cast_unsigned(),
+            self.control.stack.depth.cast_unsigned(),
             ExceptionPolicy::default(),
         );
         Ok(())
@@ -1051,8 +1062,11 @@ impl Compiler<'_> {
         if location == ResumeLocation::AFTER_AWAIT
             && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR) != 0
         {
-            self.control.coroutine_suspension_epoch =
-                self.control.coroutine_suspension_epoch.saturating_add(1);
+            self.control.generators.coroutine_suspension_epoch = self
+                .control
+                .generators
+                .coroutine_suspension_epoch
+                .saturating_add(1);
         }
         Ok(())
     }
@@ -1094,7 +1108,7 @@ impl Compiler<'_> {
     ) -> Result<(), CompileError> {
         self.apply_compiler_stack_effect(LOAD_FAST, argument, effect)?;
         self.assembler
-            .emit_owned_fast_with_depth(argument, self.control.depth.cast_unsigned());
+            .emit_owned_fast_with_depth(argument, self.control.stack.depth.cast_unsigned());
         Ok(())
     }
 
@@ -1128,7 +1142,7 @@ impl Compiler<'_> {
         self.assembler.emit_forward_with_depth(
             opcode,
             label,
-            self.control.depth.cast_unsigned(),
+            self.control.stack.depth.cast_unsigned(),
             exception_policy,
         );
         Ok(())
@@ -1165,7 +1179,7 @@ impl Compiler<'_> {
             .emit_backward_with_depth_and_exception_policy(
                 opcode,
                 label,
-                self.control.depth.cast_unsigned(),
+                self.control.stack.depth.cast_unsigned(),
                 exception_policy,
             );
         Ok(())
@@ -1175,15 +1189,20 @@ impl Compiler<'_> {
         let (location, exclusion) = self.assembler.take_trailing_nop_location()?;
         if let Some(exclusion) = exclusion {
             self.control
+                .generators
                 .generator_region_exclusions
                 .retain(|candidate| *candidate != exclusion);
-            for exclusions in &mut self.control.active_with_region_exclusions {
+            for exclusions in &mut self.control.withs.active_with_region_exclusions {
                 exclusions.retain(|candidate| *candidate != exclusion);
             }
-            for exclusions in &mut self.control.active_exception_region_exclusions {
+            for exclusions in &mut self.control.exceptions.active_exception_region_exclusions {
                 exclusions.retain(|candidate| *candidate != exclusion);
             }
-            for exclusions in &mut self.control.active_comprehension_region_exclusions {
+            for exclusions in &mut self
+                .control
+                .comprehensions
+                .active_comprehension_region_exclusions
+            {
                 exclusions.retain(|candidate| *candidate != exclusion);
             }
         }
@@ -1209,23 +1228,24 @@ impl Compiler<'_> {
     }
 
     fn apply_stack_effect(&mut self, effect: i32) -> Result<(), CompileError> {
-        self.control.depth += effect;
-        if self.control.depth < 0 {
+        self.control.stack.depth += effect;
+        if self.control.stack.depth < 0 {
             return Err(CompileError::Internal(
                 "compiler produced a negative stack depth".to_string(),
             ));
         }
-        self.control.max_depth = self
+        self.control.stack.max_depth = self
             .control
+            .stack
             .max_depth
-            .max(self.control.depth.cast_unsigned());
+            .max(self.control.stack.depth.cast_unsigned());
         Ok(())
     }
 
     pub(super) fn set_depth(&mut self, depth: i32) {
         debug_assert!(depth >= 0);
-        self.control.depth = depth;
-        self.control.max_depth = self.control.max_depth.max(depth.cast_unsigned());
+        self.control.stack.depth = depth;
+        self.control.stack.max_depth = self.control.stack.max_depth.max(depth.cast_unsigned());
     }
 }
 
