@@ -318,6 +318,8 @@ pub(super) struct ControlFlowState {
     unwind_exception_handlers_for_implicit_return: bool,
     prevent_try_exit_inlining: bool,
     pub(super) coroutine_suspension_epoch: usize,
+    // Avoid rescanning a large code unit for post-suspension comprehension filters.
+    pub(super) emitted_yield_value: bool,
     pub(super) generator_expression: bool,
     // Whether an expression is being evaluated as a generator-expression filter. CPython lowers
     // filter conditions before the generator element, so their internal markers do not use the
@@ -442,6 +444,13 @@ impl ControlFlowState {
         self.active_with_exits
             .last()
             .is_some_and(|context| !context.is_async)
+    }
+
+    pub(super) fn in_async_with_nested_exception_region(&self) -> bool {
+        self.active_with_exits.last().is_some_and(|context| {
+            context.is_async
+                && self.active_exception_region_exclusions.len() > context.exception_region_depth
+        })
     }
 
     pub(super) fn synchronous_with_preserves_none_condition_owner(&self) -> bool {
@@ -5787,7 +5796,7 @@ impl Compiler<'_> {
         self.assembler.mark(send);
         self.emit_jump_forward(SEND, send_end, 0)?;
         self.assembler.mark(yielded);
-        self.emit(YIELD_VALUE, 1, 0)?;
+        self.emit_yield_value(1, 0)?;
         self.assembler.mark(yielded_end);
         self.emit_resume(ResumeLocation::AFTER_AWAIT, ResumeDepth::Zero)?;
         self.emit_jump_backward(JUMP_BACKWARD_NO_INTERRUPT, send, 0)?;
