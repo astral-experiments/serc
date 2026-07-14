@@ -1,5 +1,6 @@
 #![allow(clippy::print_stderr, clippy::print_stdout)]
 
+use std::any::Any;
 use std::collections::BTreeMap;
 use std::env;
 use std::path::{Path, PathBuf};
@@ -33,8 +34,9 @@ enum OutcomeKind {
     ByteMismatch,
     Unsupported,
     ParseMismatch,
-    CompilerPanic,
-    CpythonRejected,
+    CompilerFailure,
+    MatchedRejection,
+    RejectionMismatch,
     NonUtf8,
     OracleFailure,
 }
@@ -46,15 +48,16 @@ impl OutcomeKind {
             Self::ByteMismatch => "byte mismatch",
             Self::Unsupported => "unsupported",
             Self::ParseMismatch => "parse/decode mismatch",
-            Self::CompilerPanic => "compiler panic",
-            Self::CpythonRejected => "CPython rejected",
+            Self::CompilerFailure => "compiler failure",
+            Self::MatchedRejection => "matched rejection",
+            Self::RejectionMismatch => "rejection mismatch",
             Self::NonUtf8 => "non-UTF-8",
             Self::OracleFailure => "oracle failure",
         }
     }
 
     const fn is_failure(self) -> bool {
-        !matches!(self, Self::Exact | Self::CpythonRejected)
+        !matches!(self, Self::Exact | Self::MatchedRejection)
     }
 }
 
@@ -63,11 +66,24 @@ struct Outcome {
     path: PathBuf,
     kind: OutcomeKind,
     detail: String,
+    oracle_rejected: bool,
 }
 
 enum CompilerInput {
     Bytes(Vec<u8>),
     Text(String),
+}
+
+enum OracleOutcome {
+    Compiled(Vec<u8>),
+    Rejected(String),
+}
+
+enum CompilerOutcome {
+    Compiled(Vec<u8>),
+    Unsupported(String),
+    Rejected(String),
+    Failed(String),
 }
 
 #[derive(Debug)]
@@ -80,6 +96,7 @@ struct Options {
     expected_exact: Option<usize>,
     expected_cpython_rejected: Option<usize>,
     require_all: bool,
+    require_rejection_parity: bool,
     examples: usize,
     dump_mismatches: Option<PathBuf>,
     source_bytes: bool,
@@ -144,6 +161,10 @@ fn main() -> ExitCode {
     for outcome in &outcomes {
         *counts.entry(outcome.kind).or_default() += 1;
     }
+    let cpython_rejected = outcomes
+        .iter()
+        .filter(|outcome| outcome.oracle_rejected)
+        .count();
 
     println!(
         "Compared {} Python files with {} in {:.2?}",
@@ -151,24 +172,32 @@ fn main() -> ExitCode {
         options.python,
         started.elapsed()
     );
+    println!(
+        "{:>20}: {}",
+        OutcomeKind::Exact.label(),
+        counts.get(&OutcomeKind::Exact).copied().unwrap_or_default()
+    );
+    println!("{:>20}: {cpython_rejected}", "CPython rejected");
     for kind in [
-        OutcomeKind::Exact,
+        OutcomeKind::MatchedRejection,
+        OutcomeKind::RejectionMismatch,
         OutcomeKind::ByteMismatch,
         OutcomeKind::Unsupported,
         OutcomeKind::ParseMismatch,
-        OutcomeKind::CompilerPanic,
-        OutcomeKind::CpythonRejected,
+        OutcomeKind::CompilerFailure,
         OutcomeKind::NonUtf8,
         OutcomeKind::OracleFailure,
     ] {
-        println!("{:>20}: {}", kind.label(), counts.get(&kind).unwrap_or(&0));
+        let count = counts.get(&kind).copied().unwrap_or_default();
+        println!("{:>20}: {count}", kind.label());
     }
 
     for kind in [
         OutcomeKind::ByteMismatch,
         OutcomeKind::Unsupported,
         OutcomeKind::ParseMismatch,
-        OutcomeKind::CompilerPanic,
+        OutcomeKind::CompilerFailure,
+        OutcomeKind::RejectionMismatch,
         OutcomeKind::OracleFailure,
     ] {
         let examples: Vec<_> = outcomes
@@ -212,9 +241,19 @@ fn main() -> ExitCode {
 
     let gate_failures = validate_outcome_counts(
         &counts,
+        cpython_rejected,
+        outcomes
+            .iter()
+            .filter(|outcome| !outcome.oracle_rejected && outcome.kind.is_failure())
+            .count(),
+        outcomes
+            .iter()
+            .filter(|outcome| outcome.oracle_rejected && outcome.kind.is_failure())
+            .count(),
         options.expected_exact,
         options.expected_cpython_rejected,
         options.require_all,
+        options.require_rejection_parity,
     );
     for failure in &gate_failures {
         eprintln!("compatibility gate failed: {failure}");
@@ -228,13 +267,16 @@ fn main() -> ExitCode {
 
 fn validate_outcome_counts(
     counts: &BTreeMap<OutcomeKind, usize>,
+    cpython_rejected: usize,
+    cpython_accepted_failures: usize,
+    rejection_failures: usize,
     expected_exact: Option<usize>,
     expected_cpython_rejected: Option<usize>,
     require_all: bool,
+    require_rejection_parity: bool,
 ) -> Vec<String> {
     let count = |kind| counts.get(&kind).copied().unwrap_or_default();
     let exact = count(OutcomeKind::Exact);
-    let cpython_rejected = count(OutcomeKind::CpythonRejected);
     let mut failures = Vec::new();
 
     if let Some(expected) = expected_exact
@@ -252,17 +294,19 @@ fn validate_outcome_counts(
         ));
     }
     if require_all {
-        let failed = counts
-            .iter()
-            .filter(|(kind, _)| kind.is_failure())
-            .map(|(_, count)| count)
-            .sum::<usize>();
-        if failed != 0 {
-            failures.push(format!("{failed} files did not match CPython exactly"));
+        if cpython_accepted_failures != 0 {
+            failures.push(format!(
+                "{cpython_accepted_failures} CPython-accepted files did not match exactly"
+            ));
         }
         if exact == 0 {
             failures.push("no files matched CPython exactly".to_string());
         }
+    }
+    if require_rejection_parity && rejection_failures != 0 {
+        failures.push(format!(
+            "{rejection_failures} CPython-rejected files were not rejected cleanly by Serc"
+        ));
     }
 
     failures
@@ -303,6 +347,7 @@ fn parse_options() -> Result<Options, String> {
     let mut expected_exact = None;
     let mut expected_cpython_rejected = None;
     let mut require_all = false;
+    let mut require_rejection_parity = false;
     let mut examples = 10;
     let mut dump_mismatches = None;
     let mut source_bytes = false;
@@ -381,10 +426,11 @@ fn parse_options() -> Result<Options, String> {
                     })?));
             }
             "--require-all" => require_all = true,
+            "--require-rejection-parity" => require_rejection_parity = true,
             "--source-bytes" => source_bytes = true,
             "--help" | "-h" => {
                 return Err(
-                    "usage: compare_cpython_corpus [--python PATH] [--extension EXT] [--source-bytes] [--limit N] [--expected-files N] [--expected-exact N] [--expected-cpython-rejected N] [--examples N] [--require-all] [--dump-mismatches DIR] [ROOT ...]"
+                    "usage: compare_cpython_corpus [--python PATH] [--extension EXT] [--source-bytes] [--limit N] [--expected-files N] [--expected-exact N] [--expected-cpython-rejected N] [--examples N] [--require-all] [--require-rejection-parity] [--dump-mismatches DIR] [ROOT ...]"
                         .to_string(),
                 );
             }
@@ -418,6 +464,7 @@ fn parse_options() -> Result<Options, String> {
         expected_exact,
         expected_cpython_rejected,
         require_all,
+        require_rejection_parity,
         examples,
         dump_mismatches,
         source_bytes,
@@ -489,13 +536,9 @@ fn compare(path: &Path, python: &str, source_bytes: bool) -> Outcome {
         .arg(path)
         .output()
     {
-        Ok(output) if output.status.success() => output.stdout,
+        Ok(output) if output.status.success() => OracleOutcome::Compiled(output.stdout),
         Ok(output) if output.status.code() == Some(2) => {
-            return Outcome {
-                path: path.to_path_buf(),
-                kind: OutcomeKind::CpythonRejected,
-                detail: one_line(&output.stderr),
-            };
+            OracleOutcome::Rejected(one_line(&output.stderr))
         }
         Ok(output) => {
             return Outcome {
@@ -506,6 +549,7 @@ fn compare(path: &Path, python: &str, source_bytes: bool) -> Outcome {
                     output.status.code(),
                     one_line(&output.stderr)
                 ),
+                oracle_rejected: false,
             };
         }
         Err(error) => {
@@ -513,9 +557,11 @@ fn compare(path: &Path, python: &str, source_bytes: bool) -> Outcome {
                 path: path.to_path_buf(),
                 kind: OutcomeKind::OracleFailure,
                 detail: error.to_string(),
+                oracle_rejected: false,
             };
         }
     };
+    let oracle_rejected = matches!(&oracle, OracleOutcome::Rejected(_));
 
     let source = if source_bytes {
         fs_err::read(path).map(CompilerInput::Bytes)
@@ -529,6 +575,7 @@ fn compare(path: &Path, python: &str, source_bytes: bool) -> Outcome {
                 path: path.to_path_buf(),
                 kind: OutcomeKind::NonUtf8,
                 detail: error.to_string(),
+                oracle_rejected,
             };
         }
         Err(error) => {
@@ -536,94 +583,110 @@ fn compare(path: &Path, python: &str, source_bytes: bool) -> Outcome {
                 path: path.to_path_buf(),
                 kind: OutcomeKind::OracleFailure,
                 detail: error.to_string(),
+                oracle_rejected,
             };
         }
     };
 
     let filename = path.to_string_lossy();
-    let compiled = std::panic::catch_unwind(|| match &source {
-        CompilerInput::Bytes(source) => compile_bytes(source, &filename),
-        CompilerInput::Text(source) => compile(source, &filename),
-    });
-    let ours = match compiled {
-        Ok(Ok(module)) => module.marshal(),
-        Ok(Err(CompileError::Unsupported(message))) => {
-            return Outcome {
-                path: path.to_path_buf(),
-                kind: OutcomeKind::Unsupported,
-                detail: message,
-            };
-        }
-        Ok(Err(CompileError::Parse(error))) => {
-            return Outcome {
-                path: path.to_path_buf(),
-                kind: OutcomeKind::ParseMismatch,
-                detail: error.to_string(),
-            };
-        }
-        Ok(Err(CompileError::InvalidPattern { message, .. })) => {
-            return Outcome {
-                path: path.to_path_buf(),
-                kind: OutcomeKind::ParseMismatch,
-                detail: message,
-            };
-        }
-        Ok(Err(CompileError::Decode(error))) => {
-            return Outcome {
-                path: path.to_path_buf(),
-                kind: OutcomeKind::ParseMismatch,
-                detail: error.to_string(),
-            };
-        }
-        Ok(Err(CompileError::Internal(message))) => {
-            return Outcome {
-                path: path.to_path_buf(),
-                kind: OutcomeKind::CompilerPanic,
-                detail: message,
-            };
-        }
-        Ok(Err(error)) => {
-            return Outcome {
-                path: path.to_path_buf(),
-                kind: OutcomeKind::CompilerPanic,
-                detail: error.to_string(),
-            };
-        }
-        Err(_) => {
-            return Outcome {
-                path: path.to_path_buf(),
-                kind: OutcomeKind::CompilerPanic,
-                detail: "panic while compiling".to_string(),
-            };
-        }
-    };
+    let compiled = compile_input(&source, &filename);
 
-    if ours == oracle {
-        Outcome {
-            path: path.to_path_buf(),
-            kind: OutcomeKind::Exact,
-            detail: format!("{} bytes", ours.len()),
+    classify(path, oracle, compiled)
+}
+
+fn compile_input(source: &CompilerInput, filename: &str) -> CompilerOutcome {
+    capture_compiler(|| {
+        match source {
+            CompilerInput::Bytes(source) => compile_bytes(source, filename),
+            CompilerInput::Text(source) => compile(source, filename),
         }
-    } else {
-        let first_difference = ours
-            .iter()
-            .zip(&oracle)
-            .position(|(ours, oracle)| ours != oracle)
-            .unwrap_or_else(|| ours.len().min(oracle.len()));
-        Outcome {
-            path: path.to_path_buf(),
-            kind: OutcomeKind::ByteMismatch,
-            detail: {
+        .map(|module| module.marshal())
+    })
+}
+
+fn capture_compiler(compile: impl FnOnce() -> Result<Vec<u8>, CompileError>) -> CompilerOutcome {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(compile)) {
+        Ok(Ok(marshal)) => CompilerOutcome::Compiled(marshal),
+        Ok(Err(CompileError::Unsupported(message))) => CompilerOutcome::Unsupported(message),
+        Ok(Err(CompileError::Parse(error))) => CompilerOutcome::Rejected(error.to_string()),
+        Ok(Err(CompileError::InvalidPattern { message, .. })) => CompilerOutcome::Rejected(message),
+        Ok(Err(CompileError::Decode(error))) => CompilerOutcome::Rejected(error.to_string()),
+        Ok(Err(CompileError::Internal(message))) => CompilerOutcome::Failed(message),
+        Ok(Err(error)) => CompilerOutcome::Failed(error.to_string()),
+        Err(payload) => CompilerOutcome::Failed(format!(
+            "panic while compiling or marshaling: {}",
+            panic_message(payload.as_ref())
+        )),
+    }
+}
+
+fn classify(path: &Path, oracle: OracleOutcome, compiled: CompilerOutcome) -> Outcome {
+    let oracle_rejected = matches!(&oracle, OracleOutcome::Rejected(_));
+    let (kind, detail) = match (oracle, compiled) {
+        (OracleOutcome::Compiled(oracle), CompilerOutcome::Compiled(ours)) => {
+            if ours == oracle {
+                (OutcomeKind::Exact, format!("{} bytes", ours.len()))
+            } else {
+                let first_difference = ours
+                    .iter()
+                    .zip(&oracle)
+                    .position(|(ours, oracle)| ours != oracle)
+                    .unwrap_or_else(|| ours.len().min(oracle.len()));
                 let ours_byte = ours.get(first_difference).copied();
                 let oracle_byte = oracle.get(first_difference).copied();
-                format!(
-                    "first difference at byte {first_difference} ({ours_byte:?} != {oracle_byte:?}); ours={} bytes, CPython={} bytes",
-                    ours.len(),
-                    oracle.len()
+                (
+                    OutcomeKind::ByteMismatch,
+                    format!(
+                        "first difference at byte {first_difference} ({ours_byte:?} != {oracle_byte:?}); ours={} bytes, CPython={} bytes",
+                        ours.len(),
+                        oracle.len()
+                    ),
                 )
-            },
+            }
         }
+        (OracleOutcome::Compiled(_), CompilerOutcome::Unsupported(detail)) => {
+            (OutcomeKind::Unsupported, detail)
+        }
+        (OracleOutcome::Compiled(_), CompilerOutcome::Rejected(detail)) => {
+            (OutcomeKind::ParseMismatch, detail)
+        }
+        (OracleOutcome::Compiled(_), CompilerOutcome::Failed(detail)) => {
+            (OutcomeKind::CompilerFailure, detail)
+        }
+        (OracleOutcome::Rejected(cpython), CompilerOutcome::Compiled(ours)) => (
+            OutcomeKind::RejectionMismatch,
+            format!(
+                "CPython rejected ({cpython}); Serc compiled successfully ({} marshal bytes)",
+                ours.len()
+            ),
+        ),
+        (
+            OracleOutcome::Rejected(cpython),
+            CompilerOutcome::Unsupported(serc) | CompilerOutcome::Rejected(serc),
+        ) => (
+            OutcomeKind::MatchedRejection,
+            format!("CPython rejected ({cpython}); Serc rejected ({serc})"),
+        ),
+        (OracleOutcome::Rejected(cpython), CompilerOutcome::Failed(serc)) => (
+            OutcomeKind::CompilerFailure,
+            format!("CPython rejected ({cpython}); Serc failed ({serc})"),
+        ),
+    };
+
+    Outcome {
+        path: path.to_path_buf(),
+        kind,
+        detail,
+        oracle_rejected,
     }
+}
+
+fn panic_message(payload: &(dyn Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&'static str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string panic payload")
 }
 
 fn one_line(bytes: &[u8]) -> String {
@@ -636,15 +699,19 @@ fn one_line(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ORACLE, OutcomeKind, discover, validate_outcome_counts};
+    use super::{
+        CompilerInput, CompilerOutcome, ORACLE, OracleOutcome, OutcomeKind, capture_compiler,
+        classify, compile_input, discover, validate_outcome_counts,
+    };
     use std::collections::BTreeMap;
     use std::fs;
+    use std::path::Path;
 
     #[test]
     fn require_all_rejects_a_corpus_without_exact_matches() {
-        let counts = BTreeMap::from([(OutcomeKind::CpythonRejected, 3)]);
+        let counts = BTreeMap::from([(OutcomeKind::MatchedRejection, 3)]);
 
-        let failures = validate_outcome_counts(&counts, None, None, true);
+        let failures = validate_outcome_counts(&counts, 3, 0, 0, None, None, true, false);
 
         assert!(
             failures
@@ -665,6 +732,84 @@ mod tests {
         assert!(read < try_compile);
         assert!(try_compile < compile_exception);
         assert!(compile_exception < marshal);
+    }
+
+    #[test]
+    fn cpython_rejection_requires_serc_rejection_for_text_and_bytes() {
+        for source in [
+            CompilerInput::Text("if:\n".to_string()),
+            CompilerInput::Bytes(b"if:\n".to_vec()),
+        ] {
+            let compiled = compile_input(&source, "invalid.py");
+            let outcome = classify(
+                Path::new("invalid.py"),
+                OracleOutcome::Rejected("SyntaxError: invalid syntax".to_string()),
+                compiled,
+            );
+
+            assert_eq!(outcome.kind, OutcomeKind::MatchedRejection);
+            assert!(outcome.oracle_rejected);
+            assert!(outcome.detail.contains("Serc rejected"));
+        }
+    }
+
+    #[test]
+    fn cpython_rejection_detects_serc_acceptance_for_text_and_bytes() {
+        for source in [
+            CompilerInput::Text("pass\n".to_string()),
+            CompilerInput::Bytes(b"pass\n".to_vec()),
+        ] {
+            let compiled = compile_input(&source, "valid.py");
+            let outcome = classify(
+                Path::new("valid.py"),
+                OracleOutcome::Rejected("SyntaxError: invalid syntax".to_string()),
+                compiled,
+            );
+
+            assert_eq!(outcome.kind, OutcomeKind::RejectionMismatch);
+            assert!(outcome.kind.is_failure());
+            assert!(outcome.oracle_rejected);
+            assert!(outcome.detail.contains("Serc compiled successfully"));
+        }
+    }
+
+    #[test]
+    fn cpython_rejected_count_is_independent_from_rejection_parity() {
+        let counts = BTreeMap::from([(OutcomeKind::Exact, 1), (OutcomeKind::RejectionMismatch, 1)]);
+
+        assert!(
+            validate_outcome_counts(&counts, 1, 0, 1, Some(1), Some(1), true, false).is_empty()
+        );
+        assert_eq!(
+            validate_outcome_counts(&counts, 1, 0, 1, Some(1), Some(1), true, true),
+            ["1 CPython-rejected files were not rejected cleanly by Serc"]
+        );
+    }
+
+    #[test]
+    fn compiler_panics_preserve_their_diagnostic() {
+        let compiled = capture_compiler(|| -> Result<Vec<u8>, serc::CompileError> {
+            panic!("sentinel compiler panic")
+        });
+
+        let CompilerOutcome::Failed(detail) = compiled else {
+            panic!("a compiler panic must be classified as a failure");
+        };
+        assert!(detail.contains("sentinel compiler panic"));
+    }
+
+    #[test]
+    fn compiler_failure_does_not_hide_cpython_rejection() {
+        let outcome = classify(
+            Path::new("invalid.py"),
+            OracleOutcome::Rejected("SyntaxError: invalid syntax".to_string()),
+            CompilerOutcome::Failed("sentinel failure".to_string()),
+        );
+
+        assert_eq!(outcome.kind, OutcomeKind::CompilerFailure);
+        assert!(outcome.oracle_rejected);
+        assert!(outcome.detail.contains("CPython rejected"));
+        assert!(outcome.detail.contains("sentinel failure"));
     }
 
     #[test]
@@ -694,11 +839,13 @@ mod tests {
 
     #[test]
     fn validates_expected_outcome_counts() {
-        let counts = BTreeMap::from([(OutcomeKind::Exact, 2), (OutcomeKind::CpythonRejected, 1)]);
+        let counts = BTreeMap::from([(OutcomeKind::Exact, 2), (OutcomeKind::MatchedRejection, 1)]);
 
-        assert!(validate_outcome_counts(&counts, Some(2), Some(1), true).is_empty());
+        assert!(
+            validate_outcome_counts(&counts, 1, 0, 0, Some(2), Some(1), true, false).is_empty()
+        );
         assert_eq!(
-            validate_outcome_counts(&counts, Some(3), Some(2), false),
+            validate_outcome_counts(&counts, 1, 0, 0, Some(3), Some(2), false, false),
             [
                 "found 2 exact matches, but expected 3",
                 "CPython rejected 1 files, but expected 2",

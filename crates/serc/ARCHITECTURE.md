@@ -293,12 +293,16 @@ cargo run --locked -p serc --example compare_cpython_corpus -- \
 ```
 
 The comparator verifies the oracle's implementation, three-part version, and magic number before
-running. It also pins the discovered file count. CPython-rejected fixtures are reported separately;
-every CPython-accepted file must match exactly under `--require-all`.
+running. It also pins the discovered file count. Every input is compiled with Serc.
+CPython-rejected fixtures are reported separately, with their frozen count independent of Serc's
+result. `--require-all` requires every CPython-accepted file to match exactly;
+`--require-rejection-parity` separately requires Serc to reject every CPython-rejected fixture
+without an internal failure.
 
-The frozen baseline is 2,230 exact matches and 221 CPython-rejected files, with zero byte
-mismatches, unsupported files, parse mismatches, compiler panics, non-UTF-8 files, or oracle
-failures.
+The frozen baseline is 2,230 exact matches and 221 CPython-rejected files. Of the rejected files,
+118 are matched rejections, 76 are currently accepted by Serc, and 27 reach an internal compiler
+failure. There are zero byte mismatches, unsupported files, parse mismatches, non-UTF-8 files, or
+oracle failures among CPython-accepted inputs.
 
 ## Safe changes
 
