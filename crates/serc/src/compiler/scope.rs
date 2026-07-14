@@ -829,12 +829,13 @@ struct ScopeNode {
 #[derive(Debug)]
 pub(super) struct ScopeArena {
     pub(super) names: NameInterner,
+    module: ModulePlan,
     nodes: Vec<ScopeNode>,
     by_parent_and_origin: FxHashMap<(ScopeId, ScopeOrigin), ScopeId>,
     flat_functions: FxHashMap<u32, FlatFunctionInputs>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(super) struct ModulePlan {
     pub(super) future_flags: u32,
     pub(super) module_globals: NameSet,
@@ -906,6 +907,7 @@ impl Default for ScopeArena {
     fn default() -> Self {
         Self {
             names: NameInterner::default(),
+            module: ModulePlan::default(),
             nodes: vec![ScopeNode {
                 plan: ScopePlan::Module,
                 children: Vec::new(),
@@ -917,7 +919,7 @@ impl Default for ScopeArena {
 }
 
 impl ScopeArena {
-    pub(super) fn analyze(body: &[Stmt]) -> (Self, ModulePlan) {
+    pub(super) fn analyze(body: &[Stmt]) -> Self {
         let future_flags = future_feature_flags(body);
         let future_annotations = future_flags & CO_FUTURE_ANNOTATIONS != 0;
         let mut arena = Self::default();
@@ -958,8 +960,12 @@ impl ScopeArena {
         let mut bindings = LocalCollector::default();
         bindings.collect_suite(body);
         arena.build_suite(ScopeId::MODULE, body, future_annotations);
-        let module = ModulePlan::build(&arena.names, future_flags, facts, bindings);
-        (arena, module)
+        arena.module = ModulePlan::build(&arena.names, future_flags, facts, bindings);
+        arena
+    }
+
+    pub(super) const fn module(&self) -> &ModulePlan {
+        &self.module
     }
 
     fn build_suite(&mut self, parent: ScopeId, body: &[Stmt], future_annotations: bool) {

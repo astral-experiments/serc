@@ -23,7 +23,6 @@ pub(super) struct CompilationContext<'source> {
     pub(super) source: &'source str,
     pub(super) tokens: &'source Tokens,
     line_index: LineIndex,
-    pub(super) module_plan: ModulePlan,
     pub(super) scopes: ScopeArena,
     lowering_profile: LoweringProfile,
 }
@@ -68,13 +67,12 @@ impl<'source> CompilationContext<'source> {
         tokens: &'source Tokens,
         body: &Suite,
     ) -> Self {
-        let (scopes, module_plan) = ScopeArena::analyze(body);
+        let scopes = ScopeArena::analyze(body);
         Self {
             filename: filename.to_string(),
             source,
             tokens,
             line_index: LineIndex::from_source_text(source),
-            module_plan,
             scopes,
             lowering_profile: LoweringProfile::for_suite(body),
         }
@@ -82,6 +80,10 @@ impl<'source> CompilationContext<'source> {
 
     pub(super) const fn target_specific_rules_enabled(&self) -> bool {
         self.lowering_profile.target_specific_rules_enabled()
+    }
+
+    pub(super) const fn module_plan(&self) -> &ModulePlan {
+        self.scopes.module()
     }
 }
 
