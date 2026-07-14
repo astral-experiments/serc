@@ -132,7 +132,7 @@ struct TryMarkerSlotContext {
 struct WithExitContext {
     location: SourceLocation,
     is_async: bool,
-    body_start_instruction: usize,
+    body_start_item: usize,
     terminal_condition_preceded_by_finally: bool,
     exception_region_depth: usize,
     loop_depth: usize,
@@ -3630,16 +3630,32 @@ impl Compiler<'_> {
                                                     && !free_indices.contains_key(&name_id)))
                                     )
                                 }))
-                                && !self.assembler.contains_opcode_since(
-                                    LOAD_FAST_AND_CLEAR,
-                                    context.body_start_instruction,
-                                )
+                                && if matches!(test, Expr::Compare(comparison)
+                                    if comparison.ops.len() == 1
+                                        && matches!(comparison.ops[0], CmpOp::Is | CmpOp::IsNot)
+                                        && matches!(comparison.comparators[0], Expr::NoneLiteral(_)))
+                                {
+                                    !self.assembler.contains_opcode_since_item(
+                                        LOAD_FAST_AND_CLEAR,
+                                        context.body_start_item,
+                                    )
+                                } else if self.context.has_lazy_imports {
+                                    !self.assembler.contains_opcode_since_item(
+                                        LOAD_FAST_AND_CLEAR,
+                                        context.body_start_item,
+                                    ) && !self.assembler.contains_opcode(NOT_TAKEN)
+                                } else {
+                                    !self
+                                        .assembler
+                                        .contains_terminal_with_barrier_since_item(
+                                            context.body_start_item,
+                                        )
+                                        || (!self.assembler.contains_opcode_since_item(
+                                            LOAD_FAST_AND_CLEAR,
+                                            context.body_start_item,
+                                        ) && !self.assembler.contains_opcode(NOT_TAKEN))
+                                }
                         })
-                    && (!self.assembler.contains_opcode(NOT_TAKEN)
-                        || matches!(test, Expr::Compare(comparison)
-                            if comparison.ops.len() == 1
-                                && matches!(comparison.ops[0], CmpOp::Is | CmpOp::IsNot)
-                                && matches!(comparison.comparators[0], Expr::NoneLiteral(_))))
                     && matches!(self.unit.scope, Scope::Function { .. })
                     && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR | CO_GENERATOR) == 0
                     && self.control.loops.is_empty()
@@ -9784,7 +9800,7 @@ impl Compiler<'_> {
         let context = WithExitContext {
             location: self.source_location(item.context_expr.range()),
             is_async: false,
-            body_start_instruction: self.assembler.instruction_count(),
+            body_start_item: self.assembler.item_count(),
             terminal_condition_preceded_by_finally: matches!(
                 body.split_last(),
                 Some((Stmt::If(_), leading))
@@ -10034,7 +10050,7 @@ impl Compiler<'_> {
         let context = WithExitContext {
             location: self.source_location(item.context_expr.range()),
             is_async: true,
-            body_start_instruction: self.assembler.instruction_count(),
+            body_start_item: self.assembler.item_count(),
             terminal_condition_preceded_by_finally: false,
             exception_region_depth: self.control.active_exception_region_exclusions.len(),
             loop_depth: self.control.loops.len(),

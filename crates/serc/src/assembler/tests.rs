@@ -374,6 +374,47 @@ fn exception_exclusion_names_layout_policy() {
 }
 
 #[test]
+fn terminal_with_barrier_scan_ignores_prefix_and_labels() {
+    let mut assembler = Assembler::default();
+    assembler.emit(NOT_TAKEN, 0);
+    let prefix_boundary = assembler.label();
+    assembler.mark(prefix_boundary);
+    let body_start = assembler.item_count();
+    let body_boundary = assembler.label();
+    assembler.mark(body_boundary);
+    assert!(!assembler.contains_opcode_since_item(LOAD_FAST_AND_CLEAR, body_start));
+    assert!(!assembler.contains_terminal_with_barrier_since_item(body_start));
+    assembler.emit(NOP, 0);
+    assert!(!assembler.contains_terminal_with_barrier_since_item(body_start));
+    assert!(matches!(
+        assembler.linear_items_mut().pop(),
+        Some(Item::Instruction(instruction)) if instruction.opcode == NOP
+    ));
+    assert!(!assembler.contains_terminal_with_barrier_since_item(body_start));
+
+    for opcode in [LOAD_FAST_AND_CLEAR, NOT_TAKEN, FOR_ITER, PUSH_EXC_INFO] {
+        let mut assembler = Assembler::default();
+        assembler.emit(NOT_TAKEN, 0);
+        let prefix_boundary = assembler.label();
+        assembler.mark(prefix_boundary);
+        let body_start = assembler.item_count();
+        let body_boundary = assembler.label();
+        assembler.mark(body_boundary);
+        assembler
+            .linear_items_mut()
+            .push(Item::Instruction(Instruction::new(
+                opcode,
+                Operand::Value(0),
+                SourceLocation::NONE,
+                None,
+            )));
+        assert!(assembler.contains_terminal_with_barrier_since_item(body_start));
+        assert!(assembler.contains_opcode_since_item(opcode, body_start));
+        assert!(!assembler.contains_terminal_with_barrier_since_item(assembler.item_count()));
+    }
+}
+
+#[test]
 fn dynamic_exception_owner_tracks_fusible_loads_and_null_globals() {
     let location = SourceLocation::new(1, 1, 0, 1);
 
