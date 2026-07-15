@@ -7,7 +7,6 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-
 SCRIPT = Path(__file__).with_name("generate_cpython_target.py")
 SPEC = importlib.util.spec_from_file_location("generate_cpython_target", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None

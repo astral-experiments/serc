@@ -689,7 +689,10 @@ fn capture_compiler(compile: impl FnOnce() -> Result<Vec<u8>, CompileError>) -> 
         Ok(Ok(marshal)) => CompilerOutcome::Compiled(marshal),
         Ok(Err(CompileError::Unsupported(message))) => CompilerOutcome::Unsupported(message),
         Ok(Err(CompileError::Parse(error))) => CompilerOutcome::Rejected(error.to_string()),
-        Ok(Err(CompileError::InvalidPattern { message, .. })) => CompilerOutcome::Rejected(message),
+        Ok(Err(
+            CompileError::InvalidPattern { message, .. }
+            | CompileError::InvalidSyntax { message, .. },
+        )) => CompilerOutcome::Rejected(message),
         Ok(Err(CompileError::Decode(error))) => CompilerOutcome::Rejected(error.to_string()),
         Ok(Err(CompileError::Internal(message))) => CompilerOutcome::Failed(message),
         Ok(Err(error)) => CompilerOutcome::Failed(error.to_string()),
@@ -832,6 +835,20 @@ mod tests {
             assert!(outcome.oracle_rejected);
             assert!(outcome.detail.contains("Serc rejected"));
         }
+    }
+
+    #[test]
+    fn cpython_semantic_rejection_requires_serc_rejection() {
+        let compiled = compile_input(&CompilerInput::Text("return\n".to_string()), "invalid.py");
+        let outcome = classify(
+            Path::new("invalid.py"),
+            OracleOutcome::Rejected("SyntaxError: 'return' outside function".to_string()),
+            compiled,
+        );
+
+        assert_eq!(outcome.kind, OutcomeKind::MatchedRejection);
+        assert!(outcome.oracle_rejected);
+        assert!(outcome.detail.contains("Serc rejected"));
     }
 
     #[test]
