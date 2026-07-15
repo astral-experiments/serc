@@ -6902,6 +6902,43 @@ def ordering(values, *, fallback=default_value):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_leaf_expression_and_scope_fast_paths() {
+        let source = r#"class Container:
+    def method(self, __value):
+        self.__field = __value
+        result = self.__field
+        del self.__field
+        return result, super().__repr__()
+
+
+def leaves(values, source):
+    first_small = 7
+    later_small = 7
+    huge = 123456789012345678901234567890
+    negative_zero = -0.0
+    complex_value = 2j
+    text = "implicit " "concatenation"
+    data = b"adjacent " b"bytes"
+    observed = ((captured := item) for item in values)
+    wrapped = [item for item in values].__class__
+    named = (captured := source).__class__
+    return (
+        __debug__, None, True, False, ..., first_small, later_small, huge,
+        negative_zero, complex_value, text, data, observed, wrapped, named,
+    )
+
+
+def yielding(values):
+    return (yield values).__class__
+
+
+async def nested(values):
+    return [(__debug__, item, b"x", "y") async for item in values]
+"#;
+        assert_matches_cpython_marshal(source, "leaf_expression_and_scope_fast_paths.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_named_expression_local_order() {
         let source = r"def chained():
     return (outer := (inner := value))
@@ -10753,5 +10790,53 @@ print(Box.__type_params__, Box[int], Box[int](42).value)
             future.result()
 "#;
         assert_matches_cpython_marshal(source, "followed_finally_cleanup_condition_in_with.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_linear_assert_conditions_and_fallbacks() {
+        let source = r"def comparisons(value, other, items):
+    assert value == other
+    assert value < other
+    assert value in items
+    assert value is other
+    assert value is not other
+    assert value.method() != other.method()
+    assert (
+        value.attribute
+        == other.attribute
+    )
+
+def truth_tests(value, items, predicate):
+    assert value
+    assert value.attribute
+    assert items[0]
+    assert predicate(value)
+
+def fallbacks(value, other, predicate):
+    assert value is None
+    assert value is not None
+    assert not value
+    assert value and other
+    assert value or other
+    assert value if predicate() else other
+    assert value < other < predicate()
+    assert (value, other)
+    assert __debug__
+
+def protected(manager, values, predicate):
+    for value in values:
+        assert predicate(value)
+    with manager:
+        assert predicate(values)
+    try:
+        assert predicate(values)
+    except Exception:
+        assert predicate(values), 'message'
+
+def generator(values, predicate):
+    yield values
+    assert predicate(values)
+";
+        assert_matches_cpython_marshal(source, "linear_assert_conditions_and_fallbacks.py");
     }
 }

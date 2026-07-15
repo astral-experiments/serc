@@ -97,6 +97,7 @@ const CACHED_SCALAR_SLOTS: usize =
     CACHED_INT_SLOTS + CACHED_SIGNED_INT_SLOTS + CACHED_BYTE_SLOTS + CACHED_CHARACTER_SLOTS;
 const UNSEEN_CACHED_OBJECT: u32 = u32::MAX;
 const MIN_CACHED_SCALAR_CONSTANTS: usize = 32;
+const MAX_DENSE_METADATA_SLOTS: usize = 1 << 20;
 
 #[derive(Clone, Copy, Debug)]
 enum CachedObject {
@@ -155,6 +156,7 @@ impl CachedObject {
 pub(super) struct ObjectGraph<'a> {
     objects: FxHashMap<HashedObjectKey<'a>, ObjectId>,
     interned_strings: FxHashMap<&'a str, ObjectId>,
+    metadata_slots: Box<[Option<(&'a str, ObjectId)>]>,
     cached_empty_bytes: Option<ObjectId>,
     cached_empty_tuple: Option<ObjectId>,
     cached_scalar_ids: Option<Box<[u32]>>,
@@ -168,14 +170,23 @@ pub(super) struct ObjectGraph<'a> {
 impl<'a> ObjectGraph<'a> {
     pub(super) fn for_code(code: &'a CodeObject) -> Self {
         let mut explicitly_interned = FxHashSet::default();
-        collect_explicitly_interned(code, &mut explicitly_interned);
+        let frozenset_recreation_need = collect_explicitly_interned(code, &mut explicitly_interned);
         let mut recreated_frozensets = FxHashSet::default();
-        collect_recreated_frozensets(code, &mut recreated_frozensets);
+        collect_recreated_frozensets(code, frozenset_recreation_need, &mut recreated_frozensets);
         let explicitly_interned = (!explicitly_interned.is_empty()).then_some(&explicitly_interned);
         let recreated_frozensets =
             (!recreated_frozensets.is_empty()).then_some(&recreated_frozensets);
+        let metadata_slots = code
+            .marshal_provenance
+            .metadata_ids
+            .as_ref()
+            .and_then(|ids| usize::try_from(ids.domain_len).ok())
+            .filter(|len| *len <= MAX_DENSE_METADATA_SLOTS)
+            .map(|len| vec![None; len].into_boxed_slice())
+            .unwrap_or_default();
         let mut graph = Self {
             cache_scalars: code.constants.len() >= MIN_CACHED_SCALAR_CONSTANTS,
+            metadata_slots,
             ..Self::default()
         };
         traverse_code(
@@ -222,8 +233,41 @@ impl<'a> ObjectGraph<'a> {
     }
 
     fn record_interned_string(&mut self, kind: OccurrenceKind, value: &'a str) -> bool {
+        let (id, first) = self.interned_string(value);
+        self.occurrences.push(Occurrence { object: id, kind });
+        first
+    }
+
+    fn record_metadata_string(
+        &mut self,
+        kind: OccurrenceKind,
+        value: &'a str,
+        metadata_id: Option<u32>,
+    ) -> bool {
+        let slot_index = metadata_id.map(|id| id as usize);
+        if let Some((stored, id)) = slot_index
+            .and_then(|index| self.metadata_slots.get(index).copied())
+            .flatten()
+            && metadata_values_equal(stored, value)
+        {
+            self.objects_by_id[id.index()].shared = true;
+            self.occurrences.push(Occurrence { object: id, kind });
+            return false;
+        }
+
+        // Seed the ordinary value table even for hinted strings: an equal interned constant can
+        // be traversed before or after this metadata and must retain the same object identity.
+        let (id, first) = self.interned_string(value);
+        if let Some(slot) = slot_index.and_then(|index| self.metadata_slots.get_mut(index)) {
+            *slot = Some((value, id));
+        }
+        self.occurrences.push(Occurrence { object: id, kind });
+        first
+    }
+
+    fn interned_string(&mut self, value: &'a str) -> (ObjectId, bool) {
         let next_id = ObjectId::from_index(self.objects_by_id.len());
-        let (id, first) = match self.interned_strings.entry(value) {
+        match self.interned_strings.entry(value) {
             Entry::Occupied(entry) => {
                 let id = *entry.get();
                 self.objects_by_id[id.index()].shared = true;
@@ -238,9 +282,7 @@ impl<'a> ObjectGraph<'a> {
                 });
                 (next_id, true)
             }
-        };
-        self.occurrences.push(Occurrence { object: id, kind });
-        first
+        }
     }
 
     fn record_cached_value(&mut self, kind: OccurrenceKind, cached: CachedObject) -> bool {
@@ -433,9 +475,60 @@ impl<'a> ObjectGraph<'a> {
     }
 }
 
-fn collect_explicitly_interned<'a>(code: &'a CodeObject, values: &mut FxHashSet<&'a str>) {
-    if !collect_interning_provenance(code, values) {
-        return;
+/// Compares metadata exactly while keeping the overwhelmingly common short-name path inline.
+#[inline]
+pub(super) fn metadata_values_equal(left: &str, right: &str) -> bool {
+    let left = left.as_bytes();
+    let right = right.as_bytes();
+    let length = left.len();
+    if length != right.len() {
+        return false;
+    }
+
+    match length {
+        0 => true,
+        1 => left[0] == right[0],
+        2..=3 => {
+            let left_start = u16::from_ne_bytes(left[..2].try_into().expect("two bytes"));
+            let right_start = u16::from_ne_bytes(right[..2].try_into().expect("two bytes"));
+            let left_end = u16::from_ne_bytes(left[length - 2..].try_into().expect("two bytes"));
+            let right_end = u16::from_ne_bytes(right[length - 2..].try_into().expect("two bytes"));
+            left_start == right_start && left_end == right_end
+        }
+        4..=7 => {
+            let left_start = u32::from_ne_bytes(left[..4].try_into().expect("four bytes"));
+            let right_start = u32::from_ne_bytes(right[..4].try_into().expect("four bytes"));
+            let left_end = u32::from_ne_bytes(left[length - 4..].try_into().expect("four bytes"));
+            let right_end = u32::from_ne_bytes(right[length - 4..].try_into().expect("four bytes"));
+            left_start == right_start && left_end == right_end
+        }
+        8..=16 => {
+            let left_start = u64::from_ne_bytes(left[..8].try_into().expect("eight bytes"));
+            let right_start = u64::from_ne_bytes(right[..8].try_into().expect("eight bytes"));
+            let left_end = u64::from_ne_bytes(left[length - 8..].try_into().expect("eight bytes"));
+            let right_end =
+                u64::from_ne_bytes(right[length - 8..].try_into().expect("eight bytes"));
+            left_start == right_start && left_end == right_end
+        }
+        _ => left == right,
+    }
+}
+
+fn collect_explicitly_interned<'a>(
+    code: &'a CodeObject,
+    values: &mut FxHashSet<&'a str>,
+) -> FrozensetRecreationNeed {
+    let (has_qualified_name_constant, frozenset_recreation_need) =
+        if code.marshal_provenance.subtree_has_frozenset_constants == Some(false) {
+            (
+                collect_interning_provenance_without_frozensets(code, values),
+                FrozensetRecreationNeed::None,
+            )
+        } else {
+            collect_interning_provenance(code, values)
+        };
+    if !has_qualified_name_constant {
+        return frozenset_recreation_need;
     }
 
     // A class body normally loads the same qualified-name object that becomes its interned code
@@ -458,9 +551,13 @@ fn collect_explicitly_interned<'a>(code: &'a CodeObject, values: &mut FxHashSet<
         &mut ordinary_first,
     );
     values.extend(qualified_name_values.difference(&ordinary_first).copied());
+    frozenset_recreation_need
 }
 
-fn collect_interning_provenance<'a>(code: &'a CodeObject, values: &mut FxHashSet<&'a str>) -> bool {
+fn collect_interning_provenance_without_frozensets<'a>(
+    code: &'a CodeObject,
+    values: &mut FxHashSet<&'a str>,
+) -> bool {
     values.extend(
         code.marshal_provenance
             .explicitly_interned_strings
@@ -473,10 +570,41 @@ fn collect_interning_provenance<'a>(code: &'a CodeObject, values: &mut FxHashSet
         .is_some();
     for constant in &code.constants {
         if let Constant::Code(code) = constant {
-            has_qualified_name_constant |= collect_interning_provenance(code, values);
+            has_qualified_name_constant |=
+                collect_interning_provenance_without_frozensets(code, values);
         }
     }
     has_qualified_name_constant
+}
+
+fn collect_interning_provenance<'a>(
+    code: &'a CodeObject,
+    values: &mut FxHashSet<&'a str>,
+) -> (bool, FrozensetRecreationNeed) {
+    values.extend(
+        code.marshal_provenance
+            .explicitly_interned_strings
+            .iter()
+            .map(String::as_str),
+    );
+    let mut has_qualified_name_constant = code
+        .marshal_provenance
+        .qualified_name_constant_index
+        .is_some();
+    // Reuse the provenance walk to classify frozenset recreation for code trees that can contain
+    // one (and for hand-built objects without a conservative compiler hint).
+    let mut frozenset_recreation_need = FrozensetRecreationNeed::None;
+    for constant in &code.constants {
+        if let Constant::Code(code) = constant {
+            let (has_qualified_name, recreation_need) = collect_interning_provenance(code, values);
+            has_qualified_name_constant |= has_qualified_name;
+            frozenset_recreation_need = frozenset_recreation_need.max(recreation_need);
+        } else {
+            frozenset_recreation_need =
+                frozenset_recreation_need.max(constant_frozenset_recreation_need(constant));
+        }
+    }
+    (has_qualified_name_constant, frozenset_recreation_need)
 }
 
 fn collect_qualified_name_constants<'a>(
@@ -582,8 +710,11 @@ enum FrozensetRecreationNeed {
     IdentifierDependent,
 }
 
-fn collect_recreated_frozensets(code: &CodeObject, values: &mut FxHashSet<usize>) {
-    let need = frozenset_recreation_need(code);
+fn collect_recreated_frozensets(
+    code: &CodeObject,
+    need: FrozensetRecreationNeed,
+    values: &mut FxHashSet<usize>,
+) {
     match need {
         FrozensetRecreationNeed::None => return,
         FrozensetRecreationNeed::PreinternedOnly if !has_explicit_interns(code) => {
@@ -995,6 +1126,8 @@ struct GraphVisitor<'graph, 'code> {
 }
 
 impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
+    const USES_METADATA_IDS: bool = true;
+
     #[inline]
     fn code(&mut self, code: &'code CodeObject, _reference_mode: ReferenceMode) -> bool {
         self.graph.reserve_for_code(code);
@@ -1065,7 +1198,7 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
     }
 
     #[inline]
-    fn metadata_string(&mut self, value: &'code str) {
+    fn metadata_string(&mut self, value: &'code str, metadata_id: Option<u32>) {
         if self.graph.cache_scalars
             && let Some(character) = CachedObject::character(value)
         {
@@ -1073,7 +1206,7 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
                 .record_cached_value(OccurrenceKind::MetadataString, character);
         } else {
             self.graph
-                .record_interned_string(OccurrenceKind::MetadataString, value);
+                .record_metadata_string(OccurrenceKind::MetadataString, value, metadata_id);
         }
     }
 

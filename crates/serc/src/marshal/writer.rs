@@ -55,14 +55,44 @@ impl Writer<'_, '_, '_> {
         self.output.extend_from_slice(&value.to_le_bytes());
     }
 
+    fn byte_and_long(&mut self, byte: u8, value: u32) {
+        let [a, b, c, d] = value.to_le_bytes();
+        self.output.extend_from_slice(&[byte, a, b, c, d]);
+    }
+
+    fn byte_and_float(&mut self, byte: u8, value: f64) {
+        let mut bytes = [0; 9];
+        bytes[0] = byte;
+        bytes[1..].copy_from_slice(&value.to_le_bytes());
+        self.output.extend_from_slice(&bytes);
+    }
+
+    fn byte_and_complex(&mut self, byte: u8, real: f64, imag: f64) {
+        let mut bytes = [0; 17];
+        bytes[0] = byte;
+        bytes[1..9].copy_from_slice(&real.to_le_bytes());
+        bytes[9..].copy_from_slice(&imag.to_le_bytes());
+        self.output.extend_from_slice(&bytes);
+    }
+
+    fn code_header(&mut self, flag: u8, code: &CodeObject) {
+        let mut header = [0; 21];
+        header[0] = TYPE_CODE | flag;
+        header[1..5].copy_from_slice(&code.arg_count.to_le_bytes());
+        header[5..9].copy_from_slice(&code.positional_only_arg_count.to_le_bytes());
+        header[9..13].copy_from_slice(&code.keyword_only_arg_count.to_le_bytes());
+        header[13..17].copy_from_slice(&code.stack_size.to_le_bytes());
+        header[17..21].copy_from_slice(&code.flags.to_le_bytes());
+        self.output.extend_from_slice(&header);
+    }
+
     fn begin_object(&mut self, object: ObjectId, reference_mode: ReferenceMode) -> Option<u8> {
         if reference_mode == ReferenceMode::IfShared && !self.graph.is_shared_object(object) {
             return Some(0);
         }
         let index = self.references[object.index()];
         if index != UNSEEN_REFERENCE {
-            self.byte(TYPE_REF);
-            self.long(index);
+            self.byte_and_long(TYPE_REF, index);
             return None;
         }
         let index = u32::try_from(self.reference_count).expect("marshal reference limit exceeded");
@@ -75,8 +105,10 @@ impl Writer<'_, '_, '_> {
         let Some(flag) = self.begin_object(object, reference_mode) else {
             return;
         };
-        self.byte(TYPE_STRING | flag);
-        self.long(value.len().try_into().expect("marshal value exceeds 4 GiB"));
+        self.byte_and_long(
+            TYPE_STRING | flag,
+            value.len().try_into().expect("marshal value exceeds 4 GiB"),
+        );
         self.output.extend_from_slice(value);
     }
 
@@ -92,16 +124,16 @@ impl Writer<'_, '_, '_> {
         };
         let bytes = value.as_bytes();
         if value.is_ascii() && bytes.len() < 256 {
-            self.byte(
+            self.output.extend_from_slice(&[
                 if interned {
                     TYPE_SHORT_ASCII_INTERNED
                 } else {
                     TYPE_SHORT_ASCII
                 } | flag,
-            );
-            self.byte(u8::try_from(bytes.len()).expect("short ASCII string length fits in u8"));
+                u8::try_from(bytes.len()).expect("short ASCII string length fits in u8"),
+            ]);
         } else {
-            self.byte(
+            self.byte_and_long(
                 if value.is_ascii() {
                     if interned {
                         TYPE_ASCII_INTERNED
@@ -113,8 +145,6 @@ impl Writer<'_, '_, '_> {
                 } else {
                     TYPE_UNICODE
                 } | flag,
-            );
-            self.long(
                 bytes
                     .len()
                     .try_into()
@@ -133,8 +163,8 @@ impl Writer<'_, '_, '_> {
         let Some(flag) = self.begin_object(object, reference_mode) else {
             return;
         };
-        self.byte(TYPE_UNICODE | flag);
-        self.long(
+        self.byte_and_long(
+            TYPE_UNICODE | flag,
             value
                 .len()
                 .try_into()
@@ -153,11 +183,13 @@ impl Writer<'_, '_, '_> {
             return false;
         };
         if let Ok(length) = u8::try_from(length) {
-            self.byte(TYPE_SMALL_TUPLE | flag);
-            self.byte(length);
+            self.output
+                .extend_from_slice(&[TYPE_SMALL_TUPLE | flag, length]);
         } else {
-            self.byte(TYPE_TUPLE | flag);
-            self.long(length.try_into().expect("marshal tuple exceeds 4 GiB"));
+            self.byte_and_long(
+                TYPE_TUPLE | flag,
+                length.try_into().expect("marshal tuple exceeds 4 GiB"),
+            );
         }
         true
     }
@@ -200,8 +232,7 @@ impl Writer<'_, '_, '_> {
                 let Some(flag) = self.begin_object(object, reference_mode) else {
                     return false;
                 };
-                self.byte(TYPE_BINARY_FLOAT | flag);
-                self.output.extend_from_slice(&float.to_le_bytes());
+                self.byte_and_float(TYPE_BINARY_FLOAT | flag, *float);
                 true
             }
             Constant::Complex { real, imag } => {
@@ -209,9 +240,7 @@ impl Writer<'_, '_, '_> {
                 let Some(flag) = self.begin_object(object, reference_mode) else {
                     return false;
                 };
-                self.byte(TYPE_BINARY_COMPLEX | flag);
-                self.output.extend_from_slice(&real.to_le_bytes());
-                self.output.extend_from_slice(&imag.to_le_bytes());
+                self.byte_and_complex(TYPE_BINARY_COMPLEX | flag, *real, *imag);
                 true
             }
             Constant::String(string) => {
@@ -237,8 +266,8 @@ impl Writer<'_, '_, '_> {
                 let Some(flag) = self.begin_object(object, reference_mode) else {
                     return false;
                 };
-                self.byte(TYPE_FROZENSET | flag);
-                self.long(
+                self.byte_and_long(
+                    TYPE_FROZENSET | flag,
                     values
                         .len()
                         .try_into()
@@ -264,12 +293,10 @@ impl Writer<'_, '_, '_> {
         match value {
             Constant::Int(value) => {
                 if let Ok(value) = i32::try_from(*value) {
-                    self.byte(TYPE_INT | flag);
-                    self.output.extend_from_slice(&value.to_le_bytes());
+                    self.byte_and_long(TYPE_INT | flag, value.cast_unsigned());
                 } else {
-                    self.byte(TYPE_LONG | flag);
                     let digit_count = (64 - value.leading_zeros()).div_ceil(15).max(1);
-                    self.long(digit_count);
+                    self.byte_and_long(TYPE_LONG | flag, digit_count);
                     let mut remaining = *value;
                     for _ in 0..digit_count {
                         self.output
@@ -280,13 +307,11 @@ impl Writer<'_, '_, '_> {
             }
             Constant::SignedInt(value) => {
                 if let Ok(value) = i32::try_from(*value) {
-                    self.byte(TYPE_INT | flag);
-                    self.output.extend_from_slice(&value.to_le_bytes());
+                    self.byte_and_long(TYPE_INT | flag, value.cast_unsigned());
                 } else {
-                    self.byte(TYPE_LONG | flag);
                     let magnitude = value.unsigned_abs();
                     let digit_count = (64 - magnitude.leading_zeros()).div_ceil(15).max(1);
-                    self.long(0_u32.wrapping_sub(digit_count));
+                    self.byte_and_long(TYPE_LONG | flag, 0_u32.wrapping_sub(digit_count));
                     let mut remaining = magnitude;
                     for _ in 0..digit_count {
                         self.output
@@ -296,41 +321,40 @@ impl Writer<'_, '_, '_> {
                 }
             }
             Constant::BigInt { negative, digits } => {
-                self.byte(TYPE_LONG | flag);
                 let digit_count =
                     u32::try_from(digits.len()).expect("marshal integer limit exceeded");
-                self.long(if *negative {
-                    0_u32.wrapping_sub(digit_count)
-                } else {
-                    digit_count
-                });
+                self.byte_and_long(
+                    TYPE_LONG | flag,
+                    if *negative {
+                        0_u32.wrapping_sub(digit_count)
+                    } else {
+                        digit_count
+                    },
+                );
                 for digit in digits {
                     self.output.extend_from_slice(&digit.to_le_bytes());
                 }
             }
             Constant::Float(value) => {
-                self.byte(TYPE_BINARY_FLOAT | flag);
-                self.output.extend_from_slice(&value.to_le_bytes());
+                self.byte_and_float(TYPE_BINARY_FLOAT | flag, *value);
             }
             Constant::Complex { real, imag } => {
-                self.byte(TYPE_BINARY_COMPLEX | flag);
-                self.output.extend_from_slice(&real.to_le_bytes());
-                self.output.extend_from_slice(&imag.to_le_bytes());
+                self.byte_and_complex(TYPE_BINARY_COMPLEX | flag, *real, *imag);
             }
             Constant::String(value) => {
                 let bytes = value.as_bytes();
                 if value.is_ascii() && bytes.len() < 256 {
-                    self.byte(TYPE_SHORT_ASCII | flag);
-                    self.byte(
+                    self.output.extend_from_slice(&[
+                        TYPE_SHORT_ASCII | flag,
                         u8::try_from(bytes.len()).expect("short ASCII string length fits in u8"),
-                    );
+                    ]);
                 } else {
-                    self.byte(if value.is_ascii() {
-                        TYPE_ASCII | flag
-                    } else {
-                        TYPE_UNICODE | flag
-                    });
-                    self.long(
+                    self.byte_and_long(
+                        if value.is_ascii() {
+                            TYPE_ASCII | flag
+                        } else {
+                            TYPE_UNICODE | flag
+                        },
                         bytes
                             .len()
                             .try_into()
@@ -340,8 +364,8 @@ impl Writer<'_, '_, '_> {
                 self.output.extend_from_slice(bytes);
             }
             Constant::SurrogateString(value) => {
-                self.byte(TYPE_UNICODE | flag);
-                self.long(
+                self.byte_and_long(
+                    TYPE_UNICODE | flag,
                     value
                         .len()
                         .try_into()
@@ -350,8 +374,10 @@ impl Writer<'_, '_, '_> {
                 self.output.extend_from_slice(value);
             }
             Constant::Bytes(value) => {
-                self.byte(TYPE_STRING | flag);
-                self.long(value.len().try_into().expect("marshal value exceeds 4 GiB"));
+                self.byte_and_long(
+                    TYPE_STRING | flag,
+                    value.len().try_into().expect("marshal value exceeds 4 GiB"),
+                );
                 self.output.extend_from_slice(value);
             }
             _ => unreachable!("only non-cached scalar slice members use identity keys"),
@@ -363,14 +389,12 @@ impl Writer<'_, '_, '_> {
             return;
         };
         if let Ok(value) = i32::try_from(value) {
-            self.byte(TYPE_INT | flag);
-            self.output.extend_from_slice(&value.to_le_bytes());
+            self.byte_and_long(TYPE_INT | flag, value.cast_unsigned());
             return;
         }
 
-        self.byte(TYPE_LONG | flag);
         let digit_count = (64 - value.leading_zeros()).div_ceil(15).max(1);
-        self.long(digit_count);
+        self.byte_and_long(TYPE_LONG | flag, digit_count);
         let mut remaining = value;
         for _ in 0..digit_count {
             self.output
@@ -384,15 +408,13 @@ impl Writer<'_, '_, '_> {
             return;
         };
         if let Ok(value) = i32::try_from(value) {
-            self.byte(TYPE_INT | flag);
-            self.output.extend_from_slice(&value.to_le_bytes());
+            self.byte_and_long(TYPE_INT | flag, value.cast_unsigned());
             return;
         }
 
-        self.byte(TYPE_LONG | flag);
         let magnitude = value.unsigned_abs();
         let digit_count = (64 - magnitude.leading_zeros()).div_ceil(15).max(1);
-        self.long(0_u32.wrapping_sub(digit_count));
+        self.byte_and_long(TYPE_LONG | flag, 0_u32.wrapping_sub(digit_count));
         let mut remaining = magnitude;
         for _ in 0..digit_count {
             self.output
@@ -411,13 +433,15 @@ impl Writer<'_, '_, '_> {
         let Some(flag) = self.begin_object(object, reference_mode) else {
             return;
         };
-        self.byte(TYPE_LONG | flag);
         let digit_count = u32::try_from(value.len()).expect("marshal integer limit exceeded");
-        self.long(if negative {
-            0_u32.wrapping_sub(digit_count)
-        } else {
-            digit_count
-        });
+        self.byte_and_long(
+            TYPE_LONG | flag,
+            if negative {
+                0_u32.wrapping_sub(digit_count)
+            } else {
+                digit_count
+            },
+        );
         for digit in value {
             self.output.extend_from_slice(&digit.to_le_bytes());
         }
@@ -425,18 +449,15 @@ impl Writer<'_, '_, '_> {
 }
 
 impl<'code> MarshalVisitor<'code> for Writer<'_, '_, 'code> {
+    const USES_METADATA_IDS: bool = false;
+
     #[inline]
     fn code(&mut self, code: &'code CodeObject, reference_mode: ReferenceMode) -> bool {
         let object = self.next_object(OccurrenceKind::Code);
         let Some(flag) = self.begin_object(object, reference_mode) else {
             return false;
         };
-        self.byte(TYPE_CODE | flag);
-        self.long(code.arg_count);
-        self.long(code.positional_only_arg_count);
-        self.long(code.keyword_only_arg_count);
-        self.long(code.stack_size);
-        self.long(code.flags);
+        self.code_header(flag, code);
         true
     }
 
@@ -471,7 +492,7 @@ impl<'code> MarshalVisitor<'code> for Writer<'_, '_, 'code> {
     }
 
     #[inline]
-    fn metadata_string(&mut self, value: &'code str) {
+    fn metadata_string(&mut self, value: &'code str, _metadata_id: Option<u32>) {
         let object = self.next_object(OccurrenceKind::MetadataString);
         self.string_with_object(object, value, ReferenceMode::IfShared);
     }

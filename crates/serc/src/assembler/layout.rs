@@ -1,4 +1,5 @@
-use rustc_hash::FxHashSet;
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 
 use super::{
     EXTENDED_ARG, Item, LOAD_FAST_BORROW_LOAD_FAST_BORROW, LOAD_FAST_LOAD_FAST, LOAD_GLOBAL,
@@ -9,6 +10,8 @@ use crate::CompileError;
 use crate::assembler::{
     Instruction, Label, LayoutAssembler, NormalizedExceptionOwner, SourceLocation,
 };
+
+type FinalArtifacts = (Vec<u8>, Vec<u8>, u32);
 
 impl LayoutAssembler {
     pub(in crate::assembler) fn exception_table(
@@ -45,17 +48,42 @@ impl LayoutAssembler {
             })
             .collect::<Result<Vec<_>, CompileError>>()?;
         let mut late_exception_exclusions = Vec::new();
-        let mut block_labels = self.preserved_block_boundaries.clone();
-        let mut setup_labels = FxHashSet::default();
+        let mut block_labels = vec![false; labels.len()];
+        let mut setup_labels = vec![false; labels.len()];
         for region in &self.exception_regions {
-            block_labels.insert(region.target);
-            setup_labels.insert(region.start);
+            if let Some(block_label) =
+                block_labels.get_mut(usize::try_from(region.target.0).unwrap())
+            {
+                *block_label = true;
+            }
+            if let Some(setup_label) =
+                setup_labels.get_mut(usize::try_from(region.start.0).unwrap())
+            {
+                *setup_label = true;
+            }
         }
         for item in &self.items {
-            if let Item::Instruction(instruction) = item
-                && let Operand::Forward(label) | Operand::Backward(label) = instruction.operand()
-            {
-                block_labels.insert(label);
+            match item {
+                Item::Label(label) if self.preserved_block_boundaries.contains(label) => {
+                    if let Some(block_label) =
+                        block_labels.get_mut(usize::try_from(label.0).unwrap())
+                    {
+                        *block_label = true;
+                    }
+                }
+                Item::Instruction(instruction) => {
+                    let (Operand::Forward(label) | Operand::Backward(label)) =
+                        instruction.operand()
+                    else {
+                        continue;
+                    };
+                    if let Some(block_label) =
+                        block_labels.get_mut(usize::try_from(label.0).unwrap())
+                    {
+                        *block_label = true;
+                    }
+                }
+                Item::Label(_) => {}
             }
         }
         let mut position = 0;
@@ -69,13 +97,14 @@ impl LayoutAssembler {
         for item in &self.items {
             match item {
                 Item::Label(label) => {
-                    if block_has_instruction && block_labels.contains(label) {
+                    let label = usize::try_from(label.0).unwrap();
+                    if block_has_instruction && block_labels.get(label).copied().unwrap_or(false) {
                         block_has_instruction = false;
                         block_has_stale_exception_owner = false;
                         block_has_applied_comprehension_swap = false;
                         previous_instruction = None;
                     }
-                    if setup_labels.contains(label) {
+                    if setup_labels.get(label).copied().unwrap_or(false) {
                         block_has_stale_exception_owner = true;
                     }
                 }
@@ -217,6 +246,15 @@ impl LayoutAssembler {
         boundaries.sort_unstable();
         boundaries.dedup();
 
+        let mut region_starts = (0..regions.len()).collect::<Vec<_>>();
+        region_starts.sort_by_key(|index| regions[*index].0);
+        let mut exclusion_starts = late_exception_exclusions;
+        exclusion_starts.sort_unstable_by_key(|(start, _)| *start);
+        let mut next_region = 0;
+        let mut next_exclusion = 0;
+        let mut excluded_through = 0;
+        let mut active_regions = BinaryHeap::<Reverse<(u32, usize, usize)>>::new();
+
         let mut flattened = Vec::<(u32, u32, u32, u32, bool)>::new();
         for boundary in boundaries.windows(2) {
             let start = boundary[0];
@@ -224,35 +262,44 @@ impl LayoutAssembler {
             if end <= start {
                 continue;
             }
-            if late_exception_exclusions
-                .iter()
-                .any(|(excluded_start, excluded_end)| {
-                    *excluded_start <= start && *excluded_end >= end
-                })
+            while next_exclusion < exclusion_starts.len()
+                && exclusion_starts[next_exclusion].0 <= start
             {
+                excluded_through = excluded_through.max(exclusion_starts[next_exclusion].1);
+                next_exclusion += 1;
+            }
+            if excluded_through >= end {
                 continue;
             }
-            let Some((_, _, target, depth, preserve_lasti, _)) = regions
-                .iter()
-                .filter(|(region_start, region_end, _, _, _, _)| {
-                    *region_start <= start && *region_end >= end
-                })
-                .min_by_key(|(region_start, region_end, _, _, _, index)| {
-                    (region_end - region_start, *index)
-                })
-            else {
+            while next_region < region_starts.len()
+                && regions[region_starts[next_region]].0 <= start
+            {
+                let region = region_starts[next_region];
+                let (region_start, region_end, _, _, _, original_index) = regions[region];
+                active_regions.push(Reverse((region_end - region_start, original_index, region)));
+                next_region += 1;
+            }
+            while active_regions
+                .peek()
+                .is_some_and(|Reverse((_, _, region))| regions[*region].1 <= start)
+            {
+                active_regions.pop();
+            }
+            let Some(Reverse((_, _, region))) = active_regions.peek().copied() else {
                 continue;
             };
+            let (_, region_end, target, depth, preserve_lasti, _) = regions[region];
+            debug_assert!(region_end >= end);
             if let Some((_, previous_end, previous_target, previous_depth, previous_lasti)) =
                 flattened.last_mut()
                 && *previous_end == start
-                && *previous_target == *target
-                && *previous_depth == *depth
-                && *previous_lasti == *preserve_lasti
+                && *previous_target == target
+                && *previous_depth == depth
+                && *previous_lasti == preserve_lasti
             {
                 *previous_end = end;
             } else {
-                flattened.push((start, end, *target, *depth, *preserve_lasti));
+                flattened.push((start, end, target, depth, preserve_lasti));
             }
         }
 
@@ -274,7 +321,7 @@ impl LayoutAssembler {
         first_line_number: u32,
     ) -> (Vec<u8>, Vec<u8>, u32) {
         let mut bytecode = vec![0; usize::try_from(code_units).unwrap().saturating_mul(2)];
-        let mut line_table = Vec::with_capacity(extended_args.len().saturating_mul(2));
+        let mut line_table = Vec::with_capacity(extended_args.len().saturating_mul(3));
         let mut byte_offset = 0;
         let mut current_line = i32::try_from(first_line_number).unwrap_or(i32::MAX);
         let mut run = None::<(SourceLocation, u32)>;
@@ -318,6 +365,81 @@ impl LayoutAssembler {
         debug_assert_eq!(byte_offset, bytecode.len());
 
         (bytecode, line_table, max_depth)
+    }
+
+    pub(in crate::assembler) fn encode_unextended_final_artifacts(
+        &self,
+        labels: &[Option<u32>],
+        code_units: u32,
+        first_line_number: u32,
+    ) -> Result<Option<FinalArtifacts>, CompileError> {
+        let mut bytecode = vec![0; usize::try_from(code_units).unwrap().saturating_mul(2)];
+        let mut line_table = Vec::with_capacity(self.items.len().saturating_mul(3));
+        let mut byte_offset = 0;
+        let mut position = 0;
+        let mut current_line = i32::try_from(first_line_number).unwrap_or(i32::MAX);
+        let mut run = None::<(SourceLocation, u32)>;
+        let mut max_depth = 0;
+
+        for item in &self.items {
+            let Item::Instruction(instruction) = *item else {
+                continue;
+            };
+            let jump_base = position + 1 + u32::from(instruction.opcode.caches());
+            let argument = match instruction.operand() {
+                Operand::Value(argument) => argument,
+                Operand::Deferred(id) => {
+                    return Err(CompileError::Internal(format!(
+                        "unresolved operand patch {} reached final layout",
+                        id.0
+                    )));
+                }
+                Operand::Forward(label) => {
+                    let target = label_position(labels, label).ok_or_else(|| {
+                        CompileError::Internal("unbound forward jump label".to_string())
+                    })?;
+                    target.checked_sub(jump_base).ok_or_else(|| {
+                        CompileError::Internal("forward jump points backward".to_string())
+                    })?
+                }
+                Operand::Backward(label) => {
+                    let target = label_position(labels, label).ok_or_else(|| {
+                        CompileError::Internal("unbound backward jump label".to_string())
+                    })?;
+                    jump_base.checked_sub(target).ok_or_else(|| {
+                        CompileError::Internal("backward jump points forward".to_string())
+                    })?
+                }
+            };
+            let Ok(argument) = u8::try_from(argument) else {
+                return Ok(None);
+            };
+
+            bytecode[byte_offset] = instruction.opcode.code();
+            bytecode[byte_offset + 1] = argument;
+            let size = 1 + u32::from(instruction.opcode.caches());
+            byte_offset += usize::try_from(size).unwrap() * 2;
+            position = jump_base;
+
+            if let Some((location, length)) = &mut run
+                && *location == instruction.location
+            {
+                *length += size;
+            } else {
+                if let Some((location, length)) = run {
+                    write_location_run(&mut line_table, location, length, &mut current_line);
+                }
+                run = Some((instruction.location, size));
+            }
+            max_depth = max_depth.max(instruction.depth_after().unwrap_or(0));
+        }
+
+        if let Some((location, length)) = run {
+            write_location_run(&mut line_table, location, length, &mut current_line);
+        }
+        debug_assert_eq!(byte_offset, bytecode.len());
+
+        Ok(Some((bytecode, line_table, max_depth)))
     }
 
     pub(in crate::assembler) fn label_positions(
@@ -391,18 +513,19 @@ fn write_location(
         if line_delta == 0 && location.column < 80 && (0..16).contains(&column_width) {
             let column_group = location.column >> 3;
             let column_low_bits = location.column & 7;
-            write_location_start(output, column_group, length);
-            output.push(
+            output.extend_from_slice(&[
+                location_start(column_group, length),
                 u8::try_from((column_low_bits << 4) | column_width)
                     .expect("short-form location columns fit in one byte"),
-            );
+            ]);
             return;
         }
         if (0..3).contains(&line_delta) && location.column < 128 && location.end_column < 128 {
-            write_location_start(output, 10 + line_delta, length);
-            output.push(u8::try_from(location.column).expect("one-line column fits in one byte"));
-            output
-                .push(u8::try_from(location.end_column).expect("one-line column fits in one byte"));
+            output.extend_from_slice(&[
+                location_start(10 + line_delta, length),
+                u8::try_from(location.column).expect("one-line column fits in one byte"),
+                u8::try_from(location.end_column).expect("one-line column fits in one byte"),
+            ]);
             *current_line = location.line;
             return;
         }
@@ -417,9 +540,13 @@ fn write_location(
 }
 
 fn write_location_start(output: &mut Vec<u8>, code: i32, length: u32) {
+    output.push(location_start(code, length));
+}
+
+fn location_start(code: i32, length: u32) -> u8 {
     let code = u8::try_from(code).expect("location code is four bits");
     let length = u8::try_from(length).expect("location run is at most eight code units");
-    output.push(0x80 | (code << 3) | (length - 1));
+    0x80 | (code << 3) | (length - 1)
 }
 
 fn write_signed_varint(output: &mut Vec<u8>, value: i32) {
@@ -466,5 +593,180 @@ fn write_exception_varint(output: &mut Vec<u8>, value: u32, mark_entry_start: bo
             break;
         }
         shift -= 6;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rustc_hash::FxHashSet;
+
+    use super::*;
+    use crate::assembler::{ExceptionPolicy, ExceptionRegion, NOP};
+
+    fn instruction(policy: ExceptionPolicy) -> Item {
+        let mut instruction = Instruction::new(NOP, Operand::Value(0), SourceLocation::NONE, None);
+        instruction.exception_policy = policy;
+        Item::Instruction(instruction)
+    }
+
+    fn layout(items: Vec<Item>, exception_regions: Vec<ExceptionRegion>) -> LayoutAssembler {
+        LayoutAssembler {
+            items,
+            exception_regions,
+            preserved_block_boundaries: FxHashSet::default(),
+            removed_max_depth: None,
+            next_label: 0,
+            has_next_location: false,
+        }
+    }
+
+    fn region(
+        start: u32,
+        end: u32,
+        target: u32,
+        depth: u32,
+        preserve_lasti: bool,
+    ) -> ExceptionRegion {
+        ExceptionRegion {
+            start: Label(start),
+            end: Label(end),
+            target: Label(target),
+            depth,
+            preserve_lasti,
+        }
+    }
+
+    fn read_varint(table: &[u8], index: &mut usize) -> u32 {
+        let mut byte = table[*index];
+        *index += 1;
+        let mut value = u32::from(byte & 0x3f);
+        while byte & 0x40 != 0 {
+            byte = table[*index];
+            *index += 1;
+            value = (value << 6) | u32::from(byte & 0x3f);
+        }
+        value
+    }
+
+    fn entries(table: &[u8]) -> Vec<(u32, u32, u32, u32, bool)> {
+        let mut index = 0;
+        let mut entries = Vec::new();
+        while index < table.len() {
+            assert_ne!(table[index] & 0x80, 0);
+            let start = read_varint(table, &mut index);
+            let length = read_varint(table, &mut index);
+            let target = read_varint(table, &mut index);
+            let depth_and_lasti = read_varint(table, &mut index);
+            entries.push((
+                start,
+                start + length,
+                target,
+                depth_and_lasti >> 1,
+                depth_and_lasti & 1 != 0,
+            ));
+        }
+        entries
+    }
+
+    #[test]
+    fn exception_sweep_prefers_innermost_then_original_order_and_keeps_adjacent_entries() {
+        let assembler = layout(
+            vec![instruction(ExceptionPolicy::default()); 8],
+            vec![
+                region(0, 3, 5, 1, false),
+                region(1, 2, 6, 2, true),
+                region(1, 2, 7, 3, false),
+                region(3, 4, 8, 4, true),
+            ],
+        );
+        let labels = [
+            Some(0),
+            Some(1),
+            Some(4),
+            Some(6),
+            Some(8),
+            Some(20),
+            Some(21),
+            Some(22),
+            Some(23),
+        ];
+
+        let table = assembler.exception_table(&[0; 8], &labels).unwrap();
+
+        assert_eq!(
+            entries(&table),
+            [
+                (0, 1, 20, 1, false),
+                (1, 4, 21, 2, true),
+                (4, 6, 20, 1, false),
+                (6, 8, 23, 4, true),
+            ]
+        );
+    }
+
+    #[test]
+    fn exception_sweep_respects_always_and_extended_exclusions_as_half_open_ranges() {
+        let assembler = layout(
+            vec![
+                instruction(ExceptionPolicy::default()),
+                instruction(ExceptionPolicy::default()),
+                instruction(ExceptionPolicy::EXCLUDE_ALWAYS),
+                instruction(ExceptionPolicy::default()),
+                instruction(ExceptionPolicy::EXCLUDE_IF_EXTENDED),
+                instruction(ExceptionPolicy::default()),
+            ],
+            vec![region(0, 3, 4, 1, false), region(1, 2, 5, 2, true)],
+        );
+        let labels = [Some(0), Some(1), Some(6), Some(7), Some(20), Some(21)];
+
+        let table = assembler
+            .exception_table(&[0, 0, 0, 0, 1, 0], &labels)
+            .unwrap();
+
+        assert_eq!(
+            entries(&table),
+            [
+                (0, 1, 20, 1, false),
+                (1, 2, 21, 2, true),
+                (3, 4, 21, 2, true),
+                (6, 7, 20, 1, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn exception_sweep_keeps_late_inclusion_and_override_repairs_ordered() {
+        let included = layout(
+            vec![
+                instruction(ExceptionPolicy::default()),
+                instruction(ExceptionPolicy::default()),
+                instruction(ExceptionPolicy::normalized_owner(true)),
+            ],
+            vec![region(0, 1, 2, 1, true)],
+        );
+        let included_labels = [Some(0), Some(2), Some(10)];
+        let included_table = included.exception_table(&[0; 3], &included_labels).unwrap();
+        assert_eq!(entries(&included_table), [(0, 3, 10, 1, true)]);
+
+        let mut override_policy = ExceptionPolicy::default();
+        override_policy.set_owner(NormalizedExceptionOwner::OverridePresent);
+        let overridden = layout(
+            vec![
+                instruction(ExceptionPolicy::default()),
+                instruction(ExceptionPolicy::default()),
+                instruction(override_policy),
+                instruction(ExceptionPolicy::default()),
+            ],
+            vec![region(0, 1, 3, 1, false), region(1, 2, 4, 2, true)],
+        );
+        let overridden_labels = [Some(0), Some(2), Some(4), Some(10), Some(11)];
+        let overridden_table = overridden
+            .exception_table(&[0; 4], &overridden_labels)
+            .unwrap();
+
+        assert_eq!(
+            entries(&overridden_table),
+            [(0, 3, 10, 1, false), (3, 4, 11, 2, true)]
+        );
     }
 }

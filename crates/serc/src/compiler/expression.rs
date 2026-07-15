@@ -1196,7 +1196,7 @@ impl Compiler<'_> {
                     self.compile_expression(&attribute.value)?;
                     let index = self.name_index(attribute.attr.as_str())?;
                     self.assembler
-                        .set_location(self.source_location(self.attribute_opcode_range(attribute)));
+                        .set_location(self.attribute_opcode_location(attribute));
                     self.emit(LOAD_ATTR, index << 1, 0)?;
                 }
             }
@@ -1888,17 +1888,26 @@ impl Compiler<'_> {
             if self.compile_super_attribute(attribute, SuperAttributeKind::Method)?
                 == SpecializedLowering::NotApplicable
             {
-                self.compile_expression(&attribute.value)?;
+                self.compile_simple_expression_operand(&attribute.value)?;
                 let index = self.name_index(attribute.attr.as_str())?;
                 self.assembler
-                    .set_location(self.source_location(self.attribute_opcode_range(attribute)));
+                    .set_location(self.attribute_opcode_location(attribute));
                 self.emit(LOAD_ATTR, (index << 1) | 1, 1)?;
             }
             true
         } else {
             false
         };
-        if !direct_method
+        if !direct_method && let Some(attribute) = shape.imported_module_callable {
+            self.compile_simple_expression_operand(&attribute.value)?;
+            let index = self.name_index(attribute.attr.as_str())?;
+            self.assembler
+                .set_location(self.attribute_opcode_location(attribute));
+            self.emit(LOAD_ATTR, index << 1, 0)?;
+            self.assembler
+                .set_location(self.source_location(call.func.range()));
+            self.emit(PUSH_NULL, 0, 1)?;
+        } else if !direct_method
             && self.compile_direct_global_callable(&call.func)?
                 == SpecializedLowering::NotApplicable
         {
@@ -1915,7 +1924,7 @@ impl Compiler<'_> {
             } else {
                 false
             };
-            self.compile_expression(&call.func)?;
+            self.compile_simple_expression_operand(&call.func)?;
             if newly_owned_callable && let Expr::Name(name) = call.func.as_ref() {
                 let name = self.required_name_id(name.id.as_str());
                 self.symbols.owned_load_locals.remove(name);
@@ -1924,8 +1933,7 @@ impl Compiler<'_> {
                 .set_location(self.source_location(call.func.range()));
             self.emit(PUSH_NULL, 0, 1)?;
         }
-        let call_location =
-            self.source_location(self.call_opcode_range_with_method(call, shape.direct_method));
+        let call_location = self.call_opcode_location_with_method(call, shape.direct_method);
         self.assembler.set_location(call_location);
 
         if !shape.has_starred
@@ -1933,10 +1941,10 @@ impl Compiler<'_> {
             && (direct_method || shape.positional_count + shape.keyword_count * 2 <= 30)
         {
             for argument in &call.arguments.args {
-                self.compile_expression(argument)?;
+                self.compile_simple_expression_operand(argument)?;
             }
             for keyword in &call.arguments.keywords {
-                self.compile_expression(&keyword.value)?;
+                self.compile_simple_expression_operand(&keyword.value)?;
             }
             let argument_count = call.arguments.args.len() + call.arguments.keywords.len();
             let argument_count = to_u32(argument_count, "call argument count")?;
@@ -1956,12 +1964,12 @@ impl Compiler<'_> {
                 .collect();
             let names = self.add_interned_string_tuple(keyword_names)?;
             if direct_method {
-                let range = if let Expr::Attribute(attribute) = call.func.as_ref() {
-                    self.attribute_opcode_range(attribute)
+                let location = if let Expr::Attribute(attribute) = call.func.as_ref() {
+                    self.attribute_opcode_location(attribute)
                 } else {
-                    call.func.range()
+                    self.source_location(call.func.range())
                 };
-                self.assembler.set_location(self.source_location(range));
+                self.assembler.set_location(location);
             }
             self.emit(LOAD_CONST, names, 1)?;
             self.assembler.set_location(call_location);
@@ -1983,7 +1991,7 @@ impl Compiler<'_> {
                 {
                     starred_argument_pushed_null = true;
                 } else {
-                    self.compile_expression(&starred.value)?;
+                    self.compile_simple_expression_operand(&starred.value)?;
                 }
             } else {
                 self.compile_collection(&call.arguments.args, CollectionKind::Tuple)?;
@@ -2015,7 +2023,7 @@ impl Compiler<'_> {
                     self.emit(BUILD_MAP, 0, 1)?;
                     have_dict = true;
                 }
-                self.compile_expression(&keyword.value)?;
+                self.compile_simple_expression_operand(&keyword.value)?;
                 self.assembler.set_location(call_location);
                 self.emit(DICT_MERGE, 1, -1)?;
                 named_start = index + 1;
@@ -2494,8 +2502,7 @@ impl Compiler<'_> {
         self.assembler.set_location(callable_location);
         self.emit(PUSH_NULL, 0, 1)?;
         self.compile_expression(&call.arguments.args[0])?;
-        self.assembler
-            .set_location(self.source_location(self.call_opcode_range(call)));
+        self.assembler.set_location(self.call_opcode_location(call));
         self.emit(CALL, 1, -2)?;
 
         self.assembler.mark(end);
@@ -2614,7 +2621,7 @@ impl Compiler<'_> {
             let attribute_location = self.source_location(attribute.range);
             if attribute_location.line != attribute_location.end_line {
                 self.assembler
-                    .set_location(self.source_location(self.attribute_opcode_range(attribute)));
+                    .set_location(self.source_location(attribute.attr.range()));
                 self.emit(NOP, 0, 0)?;
             } else {
                 // CPython removes the same-line specialized-call NOP before appending markers.
@@ -2674,7 +2681,7 @@ impl Compiler<'_> {
         let attribute_location = self.source_location(attribute.range);
         if attribute_location.line != attribute_location.end_line {
             self.assembler
-                .set_location(self.source_location(self.attribute_opcode_range(attribute)));
+                .set_location(self.source_location(attribute.attr.range()));
             self.emit(NOP, 0, 0)?;
         } else {
             // CPython removes the same-line specialized-call NOP before appending markers.
@@ -4730,6 +4737,7 @@ impl Compiler<'_> {
                 }
                 self.assembler.set_location(collection_location);
                 let constant = if kind == CollectionKind::Set {
+                    self.output.has_frozenset_constants = true;
                     let mut unique = Vec::with_capacity(constants.len());
                     for constant in constants {
                         if !unique
@@ -4785,6 +4793,7 @@ impl Compiler<'_> {
             }
             self.assembler.set_location(collection_location);
             let constant = if kind == CollectionKind::Set {
+                self.output.has_frozenset_constants = true;
                 let mut unique = Vec::with_capacity(constants.len());
                 for constant in constants {
                     if !unique
@@ -4906,6 +4915,7 @@ impl Compiler<'_> {
                     self.emit_folded_tuple_not_nops(element)?;
                 }
                 self.assembler.set_location(expression_location);
+                self.output.has_frozenset_constants = true;
                 self.emit_deferred_constant(Constant::FrozenSet(unique))?;
                 self.assembler
                     .add_last_hidden_exception_owner_slots(folded_elements_owner_slots(
@@ -5840,6 +5850,92 @@ impl Compiler<'_> {
         )
     }
 
+    pub(super) fn compile_linear_assert_condition(
+        &mut self,
+        expression: &Expr,
+        label: Label,
+    ) -> Result<(), CompileError> {
+        if matches!(expression, Expr::BoolOp(_) | Expr::If(_) | Expr::UnaryOp(_))
+            || jump_constant_truthiness(expression).is_some()
+            || self
+                .control
+                .is_ownerless_optimized_boolean_generator_test(expression.range())
+            || matches!(
+                expression,
+                Expr::Compare(comparison)
+                    if comparison.ops.len() != 1
+                        || matches!(comparison.comparators[0], Expr::NoneLiteral(_))
+                            && matches!(comparison.ops[0], CmpOp::Is | CmpOp::IsNot)
+            )
+        {
+            return self.compile_jump_if(expression, true, label);
+        }
+
+        let comparison_is_boolean = if let Expr::Compare(comparison) = expression {
+            self.compile_simple_expression_operand(&comparison.left)?;
+            if matches!(comparison.ops[0], CmpOp::In | CmpOp::NotIn) {
+                self.compile_iterable_expression(&comparison.comparators[0])?;
+            } else {
+                self.compile_simple_expression_operand(&comparison.comparators[0])?;
+            }
+            self.assembler
+                .set_location(self.source_location(expression.range()));
+            let (opcode, argument) = comparison_operator_boolean(comparison.ops[0]);
+            self.emit(opcode, argument, -1)?;
+            true
+        } else {
+            self.compile_simple_expression_operand(expression)?;
+            self.assembler
+                .set_location(self.source_location(expression.range()));
+            self.emit(TO_BOOL, 0, 0)?;
+            false
+        };
+        self.emit_jump_forward(POP_JUMP_IF_TRUE, label, -1)?;
+        self.emit_with_exception_policy(
+            NOT_TAKEN,
+            0,
+            0,
+            ExceptionPolicy::normalized_owner(comparison_is_boolean),
+        )
+    }
+
+    fn compile_simple_expression_operand(&mut self, expression: &Expr) -> Result<(), CompileError> {
+        let (name, attribute) = match expression {
+            Expr::Name(name)
+                if name.ctx == ExprContext::Load && name.id.as_str() != "__debug__" =>
+            {
+                (name, None)
+            }
+            Expr::Attribute(attribute)
+                if attribute.ctx == ExprContext::Load
+                    && matches!(attribute.value.as_ref(), Expr::Name(name)
+                        if name.ctx == ExprContext::Load && name.id.as_str() != "__debug__") =>
+            {
+                let Expr::Name(name) = attribute.value.as_ref() else {
+                    unreachable!();
+                };
+                (name, Some(attribute))
+            }
+            _ => return self.compile_expression(expression),
+        };
+
+        let previous = self.assembler.location();
+        self.assembler
+            .set_location(self.source_location(name.range()));
+        let result = (|| {
+            self.load_name(name.id.as_str())?;
+            if let Some(attribute) = attribute {
+                let index = self.name_index(attribute.attr.as_str())?;
+                self.assembler
+                    .set_location(self.attribute_opcode_location(attribute));
+                self.emit(LOAD_ATTR, index << 1, 0)?;
+            }
+            Ok(())
+        })();
+        self.assembler.set_location(previous);
+        result
+    }
+
     pub(super) fn compile_jump_if(
         &mut self,
         expression: &Expr,
@@ -6360,7 +6456,7 @@ impl Compiler<'_> {
                 self.compile_expression(&attribute.value)?;
                 let index = self.name_index(attribute.attr.as_str())?;
                 self.assembler
-                    .set_location(self.source_location(self.attribute_opcode_range(attribute)));
+                    .set_location(self.attribute_opcode_location(attribute));
                 self.emit(STORE_ATTR, index, -2)
             }
             Expr::Subscript(subscript) => {

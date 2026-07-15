@@ -118,6 +118,9 @@ impl OptimizationPipeline {
     /// adjacent stores target the same local on the same traced line.
     pub(in crate::assembler) fn optimize_redundant_store_fast(&mut self) {
         let graph = &mut self.graph;
+        if !graph.features().has_store_fast() {
+            return;
+        }
         graph.for_each_adjacent_instruction_pair_mut(|first, second| {
             if first.opcode == STORE_FAST
                 && second.opcode == STORE_FAST
@@ -176,6 +179,9 @@ impl OptimizationPipeline {
 
     pub(in crate::assembler) fn optimize_boolean_conversions(&mut self) {
         let graph = &mut self.graph;
+        if !graph.features().has_boolean_conversion() {
+            return;
+        }
         graph.for_each_adjacent_instruction_pair_mut(|current, next| {
             match (current.opcode, next.opcode) {
                 (TO_BOOL, TO_BOOL) => {
@@ -232,7 +238,7 @@ impl OptimizationPipeline {
         });
     }
 
-    pub(in crate::assembler) fn thread_forward_jumps(&mut self) {
+    pub(in crate::assembler) fn thread_forward_jumps(&mut self) -> bool {
         #[derive(Clone, Copy)]
         struct ConditionalTarget {
             opcode: Opcode,
@@ -276,31 +282,19 @@ impl OptimizationPipeline {
         // inner jump skips the redundant outer test and enters its POP_TOP
         // fallthrough path directly.
         let graph = &self.graph;
-        let mut has_forward_jump = false;
-        let mut has_forward_conditional = false;
-        for item in graph.iter_items() {
-            let Item::Instruction(instruction) = item else {
-                continue;
-            };
-            if !matches!(instruction.operand(), Operand::Forward(_)) {
-                continue;
-            }
-            match instruction.opcode {
-                JUMP_FORWARD => has_forward_jump = true,
-                POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE => has_forward_conditional = true,
-                _ => continue,
-            }
-            if has_forward_jump && has_forward_conditional {
-                break;
-            }
-        }
+        let features = graph.features();
+        let has_forward_jump = features.has_forward_jump();
+        let has_forward_conditional = features.has_forward_conditional();
         if !has_forward_jump && !has_forward_conditional {
-            return;
+            return false;
         }
+        let mut changed = false;
 
         if has_forward_conditional {
             let mut positions = graph.item_positions();
-            let mut conditional_targets = FxHashMap::default();
+            let mut conditional_targets =
+                vec![None; usize::try_from(self.next_label).expect("label count fits in usize")];
+            let mut conditional_target_count = 0;
             for (index, position) in positions.iter().copied().enumerate() {
                 let Item::Label(label) = *graph.item(position) else {
                     continue;
@@ -340,17 +334,20 @@ impl OptimizationPipeline {
                 {
                     continue;
                 }
-                conditional_targets.insert(
-                    label,
-                    ConditionalTarget {
-                        opcode: jump.opcode,
-                        operand: jump.operand(),
-                        fallthrough_index,
-                    },
+                let target = &mut conditional_targets
+                    [usize::try_from(label.0).expect("label index fits in usize")];
+                conditional_target_count += usize::from(
+                    target
+                        .replace(ConditionalTarget {
+                            opcode: jump.opcode,
+                            operand: jump.operand(),
+                            fallthrough_index,
+                        })
+                        .is_none(),
                 );
             }
 
-            if !conditional_targets.is_empty() {
+            if conditional_target_count > 0 {
                 let mut fallthrough_indices = positions
                     .iter()
                     .copied()
@@ -365,7 +362,10 @@ impl OptimizationPipeline {
                         let Operand::Forward(target) = instruction.operand() else {
                             return None;
                         };
-                        let target = conditional_targets.get(&target)?;
+                        let target = conditional_targets
+                            .get(usize::try_from(target.0).expect("label index fits in usize"))
+                            .copied()
+                            .flatten()?;
                         (instruction.opcode != target.opcode).then_some(target.fallthrough_index)
                     })
                     .collect::<Vec<_>>();
@@ -376,6 +376,7 @@ impl OptimizationPipeline {
                     .map(|index| (*index, self.label()))
                     .collect::<FxHashMap<_, _>>();
                 if !fallthrough_indices.is_empty() {
+                    changed = true;
                     let graph = &mut self.graph;
                     for index in fallthrough_indices.iter().rev().copied() {
                         graph
@@ -397,18 +398,23 @@ impl OptimizationPipeline {
                     let Operand::Forward(mut target) = instruction.operand() else {
                         continue;
                     };
-                    for _ in 0..conditional_targets.len() {
-                        let Some(next) = conditional_targets.get(&target) else {
+                    for _ in 0..conditional_target_count {
+                        let Some(next) = conditional_targets
+                            .get(usize::try_from(target.0).expect("label index fits in usize"))
+                            .copied()
+                            .flatten()
+                        else {
                             break;
                         };
                         if instruction.opcode == next.opcode {
-                            instruction.retarget(next.operand);
                             let Operand::Forward(next_target) = next.operand else {
                                 break;
                             };
                             if next_target == target {
                                 break;
                             }
+                            instruction.retarget(next.operand);
+                            changed = true;
                             target = next_target;
                         } else {
                             let Some(fallthrough) = fallthrough_labels.get(&next.fallthrough_index)
@@ -416,6 +422,7 @@ impl OptimizationPipeline {
                                 break;
                             };
                             instruction.retarget(Operand::Forward(*fallthrough));
+                            changed = true;
                             break;
                         }
                     }
@@ -424,11 +431,13 @@ impl OptimizationPipeline {
         }
 
         if !has_forward_jump {
-            return;
+            return changed;
         }
 
         let graph = &self.graph;
-        let mut jump_targets = FxHashMap::default();
+        let mut jump_targets =
+            vec![None; usize::try_from(self.next_label).expect("label count fits in usize")];
+        let mut jump_target_count = 0;
         let mut next_instruction = None;
         for block in graph.order().iter().rev().copied() {
             for item in graph[block].items().iter().rev() {
@@ -445,13 +454,16 @@ impl OptimizationPipeline {
                             && let operand @ (Operand::Forward(_) | Operand::Backward(_)) =
                                 instruction.operand()
                         {
-                            jump_targets.insert(
-                                *label,
-                                (
-                                    operand,
-                                    instruction.opcode,
-                                    instruction.no_location_policy.is_artificial_eval_break(),
-                                ),
+                            let target = &mut jump_targets
+                                [usize::try_from(label.0).expect("label index fits in usize")];
+                            jump_target_count += usize::from(
+                                target
+                                    .replace((
+                                        operand,
+                                        instruction.opcode,
+                                        instruction.no_location_policy.is_artificial_eval_break(),
+                                    ))
+                                    .is_none(),
                             );
                         }
                     }
@@ -467,13 +479,16 @@ impl OptimizationPipeline {
             let Operand::Forward(mut target) = instruction.operand() else {
                 return;
             };
+            let original_target = target;
             let mut operand = instruction.operand();
             let mut opcode = instruction.opcode;
             let mut artificial_eval_break =
                 instruction.no_location_policy.is_artificial_eval_break();
-            for _ in 0..jump_targets.len() {
-                let Some((next_operand, next_opcode, next_artificial_eval_break)) =
-                    jump_targets.get(&target).copied()
+            for _ in 0..jump_target_count {
+                let Some((next_operand, next_opcode, next_artificial_eval_break)) = jump_targets
+                    .get(usize::try_from(target.0).expect("label index fits in usize"))
+                    .copied()
+                    .flatten()
                 else {
                     break;
                 };
@@ -493,12 +508,14 @@ impl OptimizationPipeline {
                 }
                 target = next;
             }
+            changed |= target != original_target;
             instruction.retarget(operand);
             instruction.opcode = opcode;
             if artificial_eval_break {
                 instruction.no_location_policy.mark_artificial_eval_break();
             }
         });
+        changed
     }
 
     pub(in crate::assembler) fn remove_redundant_forward_jumps(
@@ -506,6 +523,9 @@ impl OptimizationPipeline {
         finalize_borrow_empty_blocks: bool,
     ) {
         let graph = &mut self.graph;
+        if !finalize_borrow_empty_blocks && !graph.features().has_forward_jump() {
+            return;
+        }
         let mut target = None;
         let mut has_work = false;
         for item in graph.iter_items() {

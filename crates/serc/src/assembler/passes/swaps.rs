@@ -7,9 +7,7 @@ use crate::assembler::block_graph::{BlockGraph, ItemPosition};
 impl OptimizationPipeline {
     pub(in crate::assembler) fn remove_redundant_swaps_before_pops(&mut self) {
         let graph = &self.graph;
-        if !graph.iter_items().any(
-            |item| matches!(item, Item::Instruction(instruction) if instruction.opcode == SWAP),
-        ) {
+        if !graph.features().has_swap() {
             return;
         }
         let instructions = graph
@@ -62,9 +60,7 @@ impl OptimizationPipeline {
         const VISITED: usize = usize::MAX;
 
         let graph = &self.graph;
-        if !graph.iter_items().any(
-            |item| matches!(item, Item::Instruction(instruction) if instruction.opcode == SWAP),
-        ) {
+        if !graph.features().has_swap() {
             return Vec::new();
         }
         let mut block_labels = FxHashSet::default();

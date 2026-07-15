@@ -860,6 +860,25 @@ impl Instruction {
         }
     }
 
+    pub(super) fn value_with_depth(
+        opcode: Opcode,
+        argument: u32,
+        location: SourceLocation,
+        depth_after: u32,
+    ) -> Self {
+        Self {
+            opcode,
+            operand_payload: argument,
+            location,
+            depth_after,
+            local_policy: LocalPolicy::default(),
+            no_location_policy: NoLocationPolicy::default(),
+            fusion_policy: FusionPolicy::default(),
+            jump_policy: JumpPolicy::default(),
+            exception_policy: ExceptionPolicy::default(),
+        }
+    }
+
     pub(super) const fn depth_after(&self) -> Option<u32> {
         if self.depth_after == Self::NO_DEPTH_AFTER {
             None
@@ -947,11 +966,8 @@ pub(super) enum UnoptimizedCode {
 #[derive(Debug)]
 pub(crate) struct Assembler {
     pub(super) code: UnoptimizedCode,
-    /// Maps emitted instruction offsets to their positions in the linear item stream.
-    ///
-    /// Labels do not consume instruction offsets, so keeping this index alongside `code` avoids
-    /// repeatedly scanning every preceding item while the compiler is still emitting code.
-    pub(super) instruction_item_indices: Vec<usize>,
+    /// Number of instructions in the linear item stream; labels do not consume offsets.
+    pub(super) instruction_count: usize,
     pub(super) emission_stream: EmissionStreamId,
     pub(super) operand_patches: Vec<OperandPatch>,
     pub(super) deferred_none_constant_index: Option<u32>,
@@ -1037,7 +1053,7 @@ impl Default for Assembler {
     fn default() -> Self {
         Self {
             code: UnoptimizedCode::Linear(Vec::new()),
-            instruction_item_indices: Vec::new(),
+            instruction_count: 0,
             emission_stream: EmissionStreamId::next(),
             operand_patches: Vec::new(),
             deferred_none_constant_index: None,

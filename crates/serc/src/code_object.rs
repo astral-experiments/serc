@@ -118,6 +118,20 @@ pub(crate) enum LocalsIdentity {
     Fresh,
 }
 
+/// Dense, module-wide name IDs that let marshal graph planning bypass repeated string lookups.
+///
+/// These hints never affect wire order or code-constant equality. Hand-built code objects can
+/// omit them, and graph planning validates every hinted value before reusing its object identity.
+#[derive(Clone, Debug)]
+pub(crate) struct MarshalMetadataIds {
+    pub(crate) domain_len: u32,
+    pub(crate) names: Vec<u32>,
+    pub(crate) locals: Vec<u32>,
+    pub(crate) filename: u32,
+    pub(crate) name: Option<u32>,
+    pub(crate) qualified_name: Option<u32>,
+}
+
 /// Non-wire compiler provenance needed to reproduce CPython's marshal object identities.
 ///
 /// Each nested code object retains its own provenance because marshal graph planning happens after
@@ -128,14 +142,18 @@ pub(crate) struct MarshalProvenance {
     pub(crate) explicitly_interned_strings: FxHashSet<String>,
     /// The class-body constant loaded into `__qualname__`, when present.
     pub(crate) qualified_name_constant_index: Option<u32>,
+    pub(crate) metadata_ids: Option<MarshalMetadataIds>,
+    /// Whether this code tree can contain a frozenset constant; `None` keeps legacy analysis.
+    pub(crate) subtree_has_frozenset_constants: Option<bool>,
 }
 
 impl MarshalProvenance {
     /// Compares the subset of marshal provenance that participates in code-constant equality.
     pub(crate) fn equal_for_constant_pool(&self, other: &Self) -> bool {
         // CPython gives annotation-scope locals fresh identity, which distinguishes otherwise
-        // equal code constants. Explicit interns and qualified-name origins only affect later
-        // marshal graph planning and are intentionally omitted from constant-pool equality.
+        // equal code constants. Explicit interns, qualified-name origins, metadata IDs, and the
+        // frozenset-presence hint only affect later marshal graph planning and are intentionally
+        // omitted from constant-pool equality.
         self.locals_identity == other.locals_identity
     }
 }
@@ -277,7 +295,7 @@ fn bytecode_length_invariant(bytes: usize) -> Option<CodeObjectInvariant> {
 mod tests {
     use super::{
         CodeObject, CodeObjectField, CodeObjectInvariant, CodeObjectValidationError, Constant,
-        MarshalProvenance, bytecode_length_invariant,
+        LocalsIdentity, MarshalMetadataIds, MarshalProvenance, bytecode_length_invariant,
     };
     use crate::CompileError;
     use crate::target::local_kinds::CO_FAST_FREE;
@@ -307,6 +325,27 @@ mod tests {
     #[test]
     fn accepts_a_valid_code_object() {
         code_object().validate().unwrap();
+    }
+
+    #[test]
+    fn marshal_metadata_ids_do_not_participate_in_constant_pool_equality() {
+        let first = MarshalProvenance::default();
+        let mut second = MarshalProvenance {
+            metadata_ids: Some(MarshalMetadataIds {
+                domain_len: 3,
+                names: vec![0, 1],
+                locals: vec![1],
+                filename: 2,
+                name: Some(0),
+                qualified_name: Some(1),
+            }),
+            subtree_has_frozenset_constants: Some(true),
+            ..MarshalProvenance::default()
+        };
+
+        assert!(first.equal_for_constant_pool(&second));
+        second.locals_identity = LocalsIdentity::Fresh;
+        assert!(!first.equal_for_constant_pool(&second));
     }
 
     #[test]

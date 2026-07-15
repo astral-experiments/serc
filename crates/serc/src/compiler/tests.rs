@@ -4,7 +4,7 @@ use ruff_python_parser::{Parsed, parse_module};
 use ruff_text_size::{Ranged, TextRange, TextSize};
 
 use crate::assembler::SourceLocation;
-use crate::code_object::Constant;
+use crate::code_object::{CodeObject, Constant};
 use crate::target::code_flags::{CO_FUTURE_ANNOTATIONS, CO_FUTURE_BARRY_AS_BDFL};
 use crate::target::opcodes::{
     BUILD_TUPLE, LOAD_CONST, NOP, NOT_TAKEN, RAISE_VARARGS, RERAISE, RETURN_VALUE,
@@ -152,6 +152,61 @@ fn module_compiler<'source>(
     parsed: &'source Parsed<ModModule>,
 ) -> Compiler<'source> {
     Compiler::module("example.py", source, parsed.tokens(), parsed.suite())
+}
+
+#[test]
+fn opcode_locations_preserve_multiline_attribute_and_call_ranges() {
+    let source =
+        "value.method(arg)\n(value\n .method)(arg)\n(imported\n .method)(arg)\n(value\n .field)\n";
+    let parsed = parse_module(source).unwrap();
+    let mut compiler = module_compiler(source, &parsed);
+    let imported = compiler.required_name_id("imported");
+    compiler.symbols.imported_scope_names.insert(imported);
+
+    let [
+        Stmt::Expr(same_line),
+        Stmt::Expr(split_method),
+        Stmt::Expr(split_import),
+        Stmt::Expr(split_attribute),
+    ] = parsed.suite().as_slice()
+    else {
+        panic!("expected four expression statements");
+    };
+    let Expr::Call(same_line) = same_line.value.as_ref() else {
+        panic!("expected a same-line call");
+    };
+    let Expr::Call(split_method) = split_method.value.as_ref() else {
+        panic!("expected a split method call");
+    };
+    let Expr::Call(split_import) = split_import.value.as_ref() else {
+        panic!("expected a split imported call");
+    };
+    let Expr::Attribute(split_attribute) = split_attribute.value.as_ref() else {
+        panic!("expected a split attribute");
+    };
+    let Expr::Attribute(split_method_attribute) = split_method.func.as_ref() else {
+        panic!("expected a method attribute");
+    };
+
+    assert_eq!(
+        compiler.call_opcode_location(same_line),
+        compiler.source_location(same_line.range)
+    );
+    assert_eq!(
+        compiler.call_opcode_location(split_method),
+        compiler.source_location(TextRange::new(
+            split_method_attribute.attr.range().start(),
+            split_method.range.end(),
+        ))
+    );
+    assert_eq!(
+        compiler.call_opcode_location(split_import),
+        compiler.source_location(split_import.range)
+    );
+    assert_eq!(
+        compiler.attribute_opcode_location(split_attribute),
+        compiler.source_location(split_attribute.attr.range())
+    );
 }
 
 #[test]
@@ -451,8 +506,8 @@ class Container:
     __value = 1
     _Container__value = 2
 
-    def method(self):
-        return self.__value
+    def method(self, __value):
+        return self.__value + __value
 ";
     let parsed = parse_module(source).unwrap();
     let module = module_compiler(source, &parsed)
@@ -476,6 +531,121 @@ class Container:
             .count(),
         1
     );
+
+    let method = class
+        .constants
+        .iter()
+        .find_map(|constant| match constant {
+            Constant::Code(code) if code.name == "method" => Some(code),
+            _ => None,
+        })
+        .expect("class should contain the method body");
+    let metadata_name_id = |code: &CodeObject, spelling: &str| {
+        let index = code
+            .names
+            .iter()
+            .position(|name| name == spelling)
+            .expect("metadata name should be present");
+        code.marshal_provenance
+            .metadata_ids
+            .as_ref()
+            .expect("compiled code should carry metadata IDs")
+            .names[index]
+    };
+    let module_container_id = metadata_name_id(&module, "Container");
+    let class_mangled_id = metadata_name_id(class, "_Container__value");
+    let method_mangled_id = metadata_name_id(method, "_Container__value");
+    let method_metadata = method
+        .marshal_provenance
+        .metadata_ids
+        .as_ref()
+        .expect("compiled method should carry metadata IDs");
+    let method_local = method
+        .locals
+        .iter()
+        .position(|name| name == "_Container__value")
+        .expect("private parameter should be mangled");
+    assert_eq!(class_mangled_id, method_mangled_id);
+    assert_eq!(method_metadata.locals[method_local], class_mangled_id);
+
+    let module_metadata = module.marshal_provenance.metadata_ids.as_ref().unwrap();
+    let class_metadata = class.marshal_provenance.metadata_ids.as_ref().unwrap();
+    assert_eq!(class_metadata.name, Some(module_container_id));
+    assert_eq!(class_metadata.qualified_name, Some(module_container_id));
+    assert_eq!(module_metadata.filename, class_metadata.filename);
+    assert_eq!(class_metadata.filename, method_metadata.filename);
+    for code in [&module, class, method] {
+        let metadata = code.marshal_provenance.metadata_ids.as_ref().unwrap();
+        assert_eq!(metadata.names.len(), code.names.len());
+        assert_eq!(metadata.locals.len(), code.locals.len());
+        assert!(metadata.filename < metadata.domain_len);
+        assert!(
+            metadata
+                .names
+                .iter()
+                .chain(&metadata.locals)
+                .all(|id| *id < metadata.domain_len)
+        );
+    }
+}
+
+#[test]
+fn marshal_frozenset_presence_hint_is_conservative_across_nested_code() {
+    fn nested_code<'a>(code: &'a CodeObject, name: &str) -> Option<&'a CodeObject> {
+        for constant in &code.constants {
+            if let Constant::Code(child) = constant {
+                if child.name == name {
+                    return Some(child);
+                }
+                if let Some(found) = nested_code(child, name) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+
+    let source = r"def outer(value):
+    def inner(item):
+        return (value, item, [1, 2, 3])
+    return inner
+";
+    let parsed = parse_module(source).unwrap();
+    let module = module_compiler(source, &parsed)
+        .compile_module(parsed.suite())
+        .unwrap();
+    let outer = nested_code(&module, "outer").unwrap();
+    let inner = nested_code(&module, "inner").unwrap();
+    for code in [&module, outer, inner] {
+        assert_eq!(
+            code.marshal_provenance.subtree_has_frozenset_constants,
+            Some(false)
+        );
+    }
+
+    for body in [
+        "return {1, 2, 3}",
+        "return {1, 2, 3, *items}",
+        "return value in {'alpha', 'beta'}",
+    ] {
+        let source = format!(
+            "def outer(value, items):\n    def inner(value, items):\n        {body}\n    return inner\n"
+        );
+        let parsed = parse_module(&source).unwrap();
+        let module = module_compiler(&source, &parsed)
+            .compile_module(parsed.suite())
+            .unwrap();
+        let outer = nested_code(&module, "outer").unwrap();
+        let inner = nested_code(&module, "inner").unwrap();
+        for code in [&module, outer, inner] {
+            assert_eq!(
+                code.marshal_provenance.subtree_has_frozenset_constants,
+                Some(true),
+                "missing frozenset hint for `{body}` in `{}`",
+                code.name
+            );
+        }
+    }
 }
 
 #[test]
