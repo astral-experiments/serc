@@ -14,7 +14,9 @@ use super::{
 };
 use crate::CompileError;
 use crate::assembler::{AssembledCode, Assembler, SourceLocation};
-use crate::code_object::{CodeObject, Constant, LocalsIdentity, MarshalProvenance};
+use crate::code_object::{
+    CodeObject, Constant, LocalsIdentity, MarshalMetadataIds, MarshalProvenance,
+};
 use crate::target::code_flags::{
     CO_ASYNC_GENERATOR, CO_COROUTINE, CO_FUTURE_ANNOTATIONS, CO_GENERATOR, CO_HAS_DOCSTRING,
     CO_NEWLOCALS, CO_OPTIMIZED, CO_VARARGS, CO_VARKEYWORDS,
@@ -300,6 +302,7 @@ impl<'source> Compiler<'source> {
     }
 
     pub(crate) fn compile_module(mut self, body: &Suite) -> Result<CodeObject, CompileError> {
+        self.assembler.reserve_items(body.len().saturating_mul(16));
         self.symbols
             .module_globals
             .clone_from(&self.context.module_plan().module_globals);
@@ -416,6 +419,7 @@ impl<'source> Compiler<'source> {
         mut self,
         body: &Suite,
     ) -> Result<CodeObject, CompileError> {
+        self.assembler.reserve_items(body.len().saturating_mul(16));
         self.emit_function_prologue()?;
 
         let body = if let Some(Stmt::Expr(expression)) = body.first() {
@@ -453,6 +457,7 @@ impl<'source> Compiler<'source> {
     }
 
     pub(super) fn compile_class_body(mut self, body: &Suite) -> Result<CodeObject, CompileError> {
+        self.assembler.reserve_items(body.len().saturating_mul(16));
         let has_classdict_cell = self.is_cell("__classdict__");
         let has_class_cell = self.is_cell("__class__");
         let has_conditional_annotations = self.is_cell("__conditional_annotations__");
@@ -753,12 +758,33 @@ impl<'source> Compiler<'source> {
                     }
             })
             .collect();
-        let output_locals = self
+        let (output_locals, local_ids) = self
             .symbols
             .locals
             .iter()
-            .map(|name| self.mangled_name(self.resolve_name(*name)))
-            .collect();
+            .map(|name_id| {
+                let spelling = self.resolve_name(*name_id);
+                let name = self.mangled_name(spelling);
+                let id = if name == spelling {
+                    name_id.0
+                } else {
+                    self.required_name_id(&name).0
+                };
+                (name, id)
+            })
+            .unzip();
+        let interner = &self.context.scopes.names;
+        let filename_id = to_u32(interner.len(), "marshal metadata name count")?;
+        let metadata_ids = MarshalMetadataIds {
+            domain_len: filename_id
+                .checked_add(1)
+                .ok_or_else(|| CompileError::Internal("too many marshal metadata names".into()))?,
+            names: self.output.name_ids,
+            locals: local_ids,
+            filename: filename_id,
+            name: interner.get(&self.unit.name).map(|id| id.0),
+            qualified_name: interner.get(&self.unit.qualified_name).map(|id| id.0),
+        };
         let parameter_count = usize::try_from(
             self.unit.arg_count
                 + self.unit.keyword_only_arg_count
@@ -817,6 +843,8 @@ impl<'source> Compiler<'source> {
                 },
                 explicitly_interned_strings: self.output.interned_constant_strings,
                 qualified_name_constant_index: self.output.qualified_name_constant_index,
+                metadata_ids: Some(metadata_ids),
+                subtree_has_frozenset_constants: Some(self.output.has_frozenset_constants),
             },
         };
         code.validate()?;

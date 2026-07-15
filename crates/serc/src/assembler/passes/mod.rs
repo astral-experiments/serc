@@ -240,12 +240,10 @@ impl OptimizationPipeline {
         self.optimize_boolean_conversions();
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::OptimizeBooleanConversions)?;
-        if !assertion_side_exits {
-            self.thread_forward_jumps();
-        }
+        let threaded_jumps = !assertion_side_exits && self.thread_forward_jumps();
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::ThreadForwardJumps)?;
-        if !assertion_side_exits {
+        if threaded_jumps {
             if let Some(depth) = self.remove_unreachable_instructions() {
                 removed_max_depth =
                     Some(removed_max_depth.map_or(depth, |current| current.max(depth)));
@@ -308,15 +306,20 @@ impl OptimizationPipeline {
         }
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::RemoveRedundantForwardJumpsLate)?;
+        let features = self.graph.features();
         let mut items = self.graph.into_items();
-        Self::optimize_load_fast(
-            &mut items,
-            &self.exception_regions,
-            &self.borrow_unreachable_blocks,
-            &self.preserved_block_boundaries,
-            assertion_side_exits,
-        );
-        Self::remove_borrow_empty_block_markers(&mut items);
+        if features.has_fast_load() {
+            Self::optimize_load_fast(
+                &mut items,
+                &self.exception_regions,
+                &self.borrow_unreachable_blocks,
+                &self.preserved_block_boundaries,
+                assertion_side_exits,
+            );
+        }
+        if features.has_borrow_empty_block() {
+            Self::remove_borrow_empty_block_markers(&mut items);
+        }
         #[cfg(any(test, debug_assertions))]
         validate_structure(
             &items,
@@ -360,14 +363,49 @@ impl LayoutAssembler {
         if self.has_next_location {
             self.resolve_next_locations();
         }
-        let instruction_count = self
-            .items
-            .iter()
-            .filter(|item| matches!(item, Item::Instruction(_)))
-            .count();
+        let mut labels = vec![None; usize::try_from(self.next_label).unwrap()];
+        let mut instruction_count = 0;
+        let mut code_units = 0;
+        let mut can_be_unextended = true;
+        for item in &self.items {
+            match *item {
+                Item::Instruction(instruction) => {
+                    instruction_count += 1;
+                    code_units += 1 + u32::from(instruction.opcode.caches());
+                    can_be_unextended &= match instruction.operand() {
+                        Operand::Value(argument) => u8::try_from(argument).is_ok(),
+                        Operand::Forward(_) | Operand::Backward(_) => true,
+                        Operand::Deferred(_) => false,
+                    };
+                }
+                Item::Label(label) => {
+                    labels[usize::try_from(label.0).unwrap()] = Some(code_units);
+                }
+            }
+        }
+
+        if can_be_unextended
+            && let Some((bytecode, line_table, max_depth)) =
+                self.encode_unextended_final_artifacts(&labels, code_units, first_line_number)?
+        {
+            #[cfg(any(test, debug_assertions))]
+            self.validate_structure(AssemblerStage::FinalLayout)?;
+            let exception_table = if self.exception_regions.is_empty() {
+                Vec::new()
+            } else {
+                self.exception_table(&vec![0; instruction_count], &labels)?
+            };
+            return Ok(AssembledCode {
+                bytecode,
+                line_table,
+                exception_table,
+                max_depth,
+                removed_max_depth: self.removed_max_depth,
+            });
+        }
+
         let mut extended_args = vec![0_u8; instruction_count];
         let mut resolved_arguments = vec![0_u32; instruction_count];
-        let mut labels = vec![None; usize::try_from(self.next_label).unwrap()];
 
         for _ in 0..8 {
             let code_units = self.label_positions(&extended_args, &mut labels);

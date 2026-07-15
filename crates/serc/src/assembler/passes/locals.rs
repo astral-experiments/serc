@@ -593,13 +593,7 @@ impl OptimizationPipeline {
         }
 
         let graph = &self.graph;
-        if !graph.iter_items().any(|item| {
-            matches!(
-                item,
-                Item::Instruction(instruction)
-                    if matches!(instruction.opcode, LOAD_FAST | LOAD_FAST_CHECK)
-            )
-        }) {
+        if !graph.features().has_fast_load() {
             return;
         }
         let order = graph.order().to_vec();
@@ -855,6 +849,9 @@ impl OptimizationPipeline {
     /// that local as initialized for subsequent instructions on the same path.
     pub(in crate::assembler) fn remove_redundant_checked_loads(&mut self) {
         let graph = &mut self.graph;
+        if !graph.features().has_fast_load() {
+            return;
+        }
         let checked_blocks = graph
             .order()
             .iter()
@@ -1423,6 +1420,11 @@ impl OptimizationPipeline {
                 *first,
                 *second,
             ))
+        }
+
+        let features = self.graph.features();
+        if !features.has_fast_load() && !features.has_store_fast() {
+            return;
         }
 
         let graph = &mut self.graph;

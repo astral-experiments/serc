@@ -72,6 +72,23 @@ fn instruction_constructors_set_audited_defaults() {
 }
 
 #[test]
+fn direct_value_instruction_constructor_matches_regular_instruction() {
+    let location = SourceLocation::new(3, 4, 2, 8);
+    let regular = Instruction::new(LOAD_CONST, Operand::Value(u32::MAX), location, Some(7));
+    let direct = Instruction::value_with_depth(LOAD_CONST, u32::MAX, location, 7);
+
+    assert_eq!(direct.opcode, regular.opcode);
+    assert_eq!(direct.operand(), regular.operand());
+    assert_eq!(direct.location, regular.location);
+    assert_eq!(direct.depth_after(), regular.depth_after());
+    assert_eq!(direct.local_policy, regular.local_policy);
+    assert_eq!(direct.no_location_policy, regular.no_location_policy);
+    assert_eq!(direct.fusion_policy, regular.fusion_policy);
+    assert_eq!(direct.jump_policy, regular.jump_policy);
+    assert_eq!(direct.exception_policy, regular.exception_policy);
+}
+
+#[test]
 fn packed_exception_policy_preserves_all_states() {
     let exclusions = [
         ExceptionExclusion::None,
@@ -1109,6 +1126,90 @@ fn fused_final_artifacts_preserve_cache_extended_argument_location_and_depth_sem
 }
 
 #[test]
+fn unextended_final_artifacts_preserve_jump_cache_location_and_depth_semantics() {
+    let first_location = SourceLocation::new(7, 7, 0, 1);
+    let second_location = SourceLocation::new(8, 8, 2, 4);
+    let target = super::Label(0);
+    let assembler = super::LayoutAssembler {
+        items: vec![
+            Item::Instruction(Instruction::new(
+                LOAD_GLOBAL,
+                Operand::Value(7),
+                first_location,
+                Some(3),
+            )),
+            Item::Instruction(Instruction::new(
+                POP_JUMP_IF_FALSE,
+                Operand::Forward(target),
+                first_location,
+                Some(2),
+            )),
+            Item::Instruction(Instruction::new(
+                LOAD_CONST,
+                Operand::Value(9),
+                second_location,
+                Some(12),
+            )),
+            Item::Instruction(Instruction::new(
+                LOAD_CONST,
+                Operand::Value(10),
+                SourceLocation::NONE,
+                Some(5),
+            )),
+            Item::Label(target),
+            Item::Instruction(Instruction::new(
+                JUMP_BACKWARD,
+                Operand::Backward(target),
+                second_location,
+                Some(1),
+            )),
+        ],
+        exception_regions: Vec::new(),
+        preserved_block_boundaries: rustc_hash::FxHashSet::default(),
+        removed_max_depth: None,
+        next_label: 1,
+        has_next_location: false,
+    };
+    let mut labels = vec![None];
+    let code_units = assembler.label_positions(&[0; 5], &mut labels);
+    let expected = assembler.encode_final_artifacts(&[0; 5], &[7, 2, 9, 10, 2], code_units, 7);
+
+    let actual = assembler
+        .encode_unextended_final_artifacts(&labels, code_units, 7)
+        .unwrap()
+        .expect("all arguments fit in one code unit");
+
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn extended_forward_jump_uses_the_iterative_layout_fallback() {
+    let mut assembler = Assembler::default();
+    let target = assembler.label();
+    assembler.emit(LOAD_CONST, 0);
+    assembler.emit_forward_with_depth(POP_JUMP_IF_FALSE, target, 0, ExceptionPolicy::default());
+    for _ in 0..=u8::MAX {
+        assembler.emit(RESUME, 0);
+    }
+    assembler.mark(target);
+    assembler.emit(RETURN_VALUE, 0);
+
+    let bytecode = assembler.finish().unwrap();
+
+    assert_eq!(
+        &bytecode[..6],
+        [
+            LOAD_CONST.code(),
+            0,
+            EXTENDED_ARG.code(),
+            1,
+            POP_JUMP_IF_FALSE.code(),
+            1,
+        ]
+    );
+}
+
+#[test]
 fn removes_an_overwritten_local_store() {
     let mut assembler = Assembler::default();
     assembler.emit(STORE_FAST, 1);
@@ -1165,6 +1266,80 @@ fn constant_pop_candidates_are_recorded_during_emission() {
                 && matches!(load.operand(), Operand::Value(1))
                 && return_value.opcode == RETURN_VALUE
     ));
+}
+
+#[test]
+fn discarded_value_emission_matches_handle_emission() {
+    fn assert_same_stream(expected: &Assembler, actual: &Assembler) {
+        assert_eq!(expected.instruction_count(), actual.instruction_count());
+        assert_eq!(
+            expected.has_constant_pop_candidate,
+            actual.has_constant_pop_candidate
+        );
+        assert_eq!(expected.linear_items().len(), actual.linear_items().len());
+        for (expected, actual) in expected.linear_items().iter().zip(actual.linear_items()) {
+            let (Item::Instruction(expected), Item::Instruction(actual)) = (expected, actual)
+            else {
+                panic!("emission streams should contain only instructions");
+            };
+            assert_eq!(actual.opcode, expected.opcode);
+            assert_eq!(actual.operand(), expected.operand());
+            assert_eq!(actual.location, expected.location);
+            assert_eq!(actual.depth_after(), expected.depth_after());
+            assert_eq!(actual.local_policy, expected.local_policy);
+            assert_eq!(actual.no_location_policy, expected.no_location_policy);
+            assert_eq!(actual.fusion_policy, expected.fusion_policy);
+            assert_eq!(actual.jump_policy, expected.jump_policy);
+            assert_eq!(actual.exception_policy, expected.exception_policy);
+        }
+    }
+
+    let location = SourceLocation::new(2, 2, 4, 12);
+    for constant in [LOAD_CONST, LOAD_COMMON_CONSTANT, LOAD_SMALL_INT] {
+        let mut expected = Assembler::default();
+        let mut actual = Assembler::default();
+        expected.set_location(location);
+        actual.set_location(location);
+        expected.emit_with_depth(constant, 3, 1, ExceptionPolicy::default());
+        actual.emit_value_with_depth_discard(constant, 3, 1, ExceptionPolicy::default());
+        expected.emit_with_depth(POP_TOP, 0, 0, ExceptionPolicy::default());
+        actual.emit_value_with_depth_discard(POP_TOP, 0, 0, ExceptionPolicy::default());
+
+        assert!(actual.has_constant_pop_candidate);
+        assert_same_stream(&expected, &actual);
+    }
+
+    for (disable_borrowing, strict_owned, forced_borrowed) in [
+        (false, false, false),
+        (true, false, false),
+        (false, true, false),
+        (false, false, true),
+    ] {
+        let mut expected = Assembler::default();
+        let mut actual = Assembler::default();
+        expected.set_location(location);
+        actual.set_location(location);
+        if disable_borrowing {
+            expected.disable_load_fast_borrowing();
+            actual.disable_load_fast_borrowing();
+        }
+        expected.set_strict_owned_loads(strict_owned);
+        actual.set_strict_owned_loads(strict_owned);
+        expected.set_forced_borrowed_loads(forced_borrowed);
+        actual.set_forced_borrowed_loads(forced_borrowed);
+        expected.emit_with_depth(LOAD_FAST, 2, 1, ExceptionPolicy::default());
+        actual.emit_value_with_depth_discard(LOAD_FAST, 2, 1, ExceptionPolicy::default());
+
+        assert_same_stream(&expected, &actual);
+    }
+
+    let mut expected = Assembler::default();
+    let mut actual = Assembler::default();
+    expected.set_location(location);
+    actual.set_location(location);
+    expected.emit_with_depth(LOAD_CONST, 2, 1, ExceptionPolicy::EXCLUDE_ALWAYS);
+    actual.emit_value_with_depth_discard(LOAD_CONST, 2, 1, ExceptionPolicy::EXCLUDE_ALWAYS);
+    assert_same_stream(&expected, &actual);
 }
 
 fn assembler_with_preserved_constant_boundary() -> Assembler {
@@ -1645,7 +1820,7 @@ fn threads_unconditional_forward_jumps_without_conditional_jumps() {
         pass_instruction(RETURN_VALUE, 0, 1),
     ]);
 
-    assembler.thread_forward_jumps();
+    assert!(assembler.thread_forward_jumps());
 
     let graph = &assembler.graph;
     let first = graph
@@ -1689,7 +1864,7 @@ fn threads_unconditional_forward_jumps_without_conditional_targets() {
         pass_instruction(RETURN_VALUE, 0, 1),
     ]);
 
-    assembler.thread_forward_jumps();
+    assert!(assembler.thread_forward_jumps());
 
     let graph = &assembler.graph;
     let first_jump = graph
@@ -1702,6 +1877,178 @@ fn threads_unconditional_forward_jumps_without_conditional_targets() {
         })
         .unwrap();
     assert!(matches!(first_jump.operand(), Operand::Forward(label) if label == final_target));
+}
+
+#[test]
+fn threads_opposite_conditional_jumps_through_a_new_fallthrough_label() {
+    let inner_target = super::Label(0);
+    let final_target = super::Label(1);
+    let mut assembler = optimization_pipeline(vec![
+        pass_instruction(COPY, 1, 1),
+        pass_instruction(TO_BOOL, 0, 1),
+        Item::Instruction(Instruction::new(
+            POP_JUMP_IF_TRUE,
+            Operand::Forward(inner_target),
+            SourceLocation::NONE,
+            None,
+        )),
+        pass_instruction(NOT_TAKEN, 0, 1),
+        pass_instruction(POP_TOP, 0, 1),
+        Item::Label(inner_target),
+        pass_instruction(COPY, 1, 2),
+        pass_instruction(TO_BOOL, 0, 2),
+        Item::Instruction(Instruction::new(
+            POP_JUMP_IF_FALSE,
+            Operand::Forward(final_target),
+            SourceLocation::NONE,
+            None,
+        )),
+        pass_instruction(NOT_TAKEN, 0, 2),
+        pass_instruction(POP_TOP, 0, 2),
+        Item::Label(final_target),
+        pass_instruction(RETURN_VALUE, 0, 3),
+    ]);
+
+    assert!(assembler.thread_forward_jumps());
+
+    let fallthrough = super::Label(2);
+    let items = assembler.graph.iter_items().copied().collect::<Vec<_>>();
+    let jumps = items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Instruction(instruction)
+                if matches!(instruction.opcode, POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE) =>
+            {
+                Some(instruction.operand())
+            }
+            Item::Instruction(_) | Item::Label(_) => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        jumps,
+        [
+            Operand::Forward(fallthrough),
+            Operand::Forward(final_target),
+        ]
+    );
+    assert!(
+        items
+            .windows(2)
+            .any(|items| matches!(items, [Item::Label(label), Item::Instruction(instruction)] if *label == fallthrough && instruction.opcode == POP_TOP))
+    );
+}
+
+#[test]
+fn threads_chained_conditional_jumps_to_the_final_target() {
+    let middle_target = super::Label(0);
+    let inner_target = super::Label(1);
+    let final_target = super::Label(2);
+    let mut assembler = optimization_pipeline(vec![
+        pass_instruction(COPY, 1, 1),
+        pass_instruction(TO_BOOL, 0, 1),
+        Item::Instruction(Instruction::new(
+            POP_JUMP_IF_FALSE,
+            Operand::Forward(middle_target),
+            SourceLocation::NONE,
+            None,
+        )),
+        pass_instruction(NOT_TAKEN, 0, 1),
+        pass_instruction(POP_TOP, 0, 1),
+        Item::Label(middle_target),
+        pass_instruction(COPY, 1, 2),
+        pass_instruction(TO_BOOL, 0, 2),
+        Item::Instruction(Instruction::new(
+            POP_JUMP_IF_FALSE,
+            Operand::Forward(inner_target),
+            SourceLocation::NONE,
+            None,
+        )),
+        pass_instruction(NOT_TAKEN, 0, 2),
+        pass_instruction(POP_TOP, 0, 2),
+        Item::Label(inner_target),
+        pass_instruction(COPY, 1, 3),
+        pass_instruction(TO_BOOL, 0, 3),
+        Item::Instruction(Instruction::new(
+            POP_JUMP_IF_FALSE,
+            Operand::Forward(final_target),
+            SourceLocation::NONE,
+            None,
+        )),
+        pass_instruction(NOT_TAKEN, 0, 3),
+        pass_instruction(POP_TOP, 0, 3),
+        Item::Label(final_target),
+        pass_instruction(RETURN_VALUE, 0, 4),
+    ]);
+
+    assert!(assembler.thread_forward_jumps());
+
+    let jumps = assembler
+        .graph
+        .iter_items()
+        .filter_map(|item| match item {
+            Item::Instruction(instruction) if instruction.opcode == POP_JUMP_IF_FALSE => {
+                Some(instruction.operand())
+            }
+            Item::Instruction(_) | Item::Label(_) => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(jumps, [Operand::Forward(final_target); 3]);
+}
+
+#[test]
+fn threading_reports_no_edge_change_for_terminal_targets() {
+    let target = super::Label(0);
+    let mut direct_jump = optimization_pipeline(vec![
+        Item::Instruction(Instruction::new(
+            JUMP_FORWARD,
+            Operand::Forward(target),
+            SourceLocation::NONE,
+            None,
+        )),
+        Item::Label(target),
+        pass_instruction(RETURN_VALUE, 0, 1),
+    ]);
+    assert!(!direct_jump.thread_forward_jumps());
+
+    let mut direct_condition = optimization_pipeline(vec![
+        Item::Instruction(Instruction::new(
+            POP_JUMP_IF_FALSE,
+            Operand::Forward(target),
+            SourceLocation::NONE,
+            None,
+        )),
+        pass_instruction(RETURN_VALUE, 0, 1),
+        Item::Label(target),
+        pass_instruction(RETURN_VALUE, 0, 2),
+    ]);
+    assert!(!direct_condition.thread_forward_jumps());
+}
+
+#[test]
+fn threaded_edge_change_retains_second_reachability_cleanup_and_removed_depth() {
+    let bypassed = super::Label(0);
+    let target = super::Label(1);
+    let mut assembler = optimization_pipeline(vec![
+        Item::Instruction(Instruction::new(
+            JUMP_FORWARD,
+            Operand::Forward(bypassed),
+            SourceLocation::NONE,
+            None,
+        )),
+        Item::Label(bypassed),
+        Item::Instruction(Instruction::new(
+            JUMP_FORWARD,
+            Operand::Forward(target),
+            SourceLocation::NONE,
+            Some(7),
+        )),
+        Item::Label(target),
+        pass_instruction(RETURN_VALUE, 0, 1),
+    ]);
+
+    assert!(assembler.thread_forward_jumps());
+    assert_eq!(assembler.remove_unreachable_instructions(), Some(7));
+    assert_eq!(graph_opcodes(&assembler), [JUMP_FORWARD, RETURN_VALUE]);
 }
 
 #[test]

@@ -2,6 +2,11 @@ use std::ops::Index;
 
 use rustc_hash::FxHashSet;
 
+use crate::target::opcodes::{
+    JUMP_FORWARD, LOAD_FAST, LOAD_FAST_BORROW, LOAD_FAST_CHECK, LOAD_FAST_LOAD_FAST,
+    POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE, STORE_FAST, SWAP, TO_BOOL, UNARY_NOT,
+};
+
 use super::{
     ExceptionRegion, Instruction, Item, Label, Operand, block_has_fallthrough, block_jump_target,
     ends_scope,
@@ -75,6 +80,73 @@ impl BasicBlock {
     }
 }
 
+/// Conservative opcode and IR-policy summary for gating assembler passes.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct PipelineFeatures(u8);
+
+impl PipelineFeatures {
+    const FORWARD_JUMP: u8 = 1 << 0;
+    const FORWARD_CONDITIONAL: u8 = 1 << 1;
+    const SWAP: u8 = 1 << 2;
+    const FAST_LOAD: u8 = 1 << 3;
+    const STORE_FAST: u8 = 1 << 4;
+    const BOOLEAN_CONVERSION: u8 = 1 << 5;
+    const BORROW_EMPTY_BLOCK: u8 = 1 << 6;
+
+    fn record(&mut self, instruction: &Instruction) {
+        self.0 |= match instruction.opcode {
+            JUMP_FORWARD if matches!(instruction.operand(), Operand::Forward(_)) => {
+                Self::FORWARD_JUMP
+            }
+            POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE
+                if matches!(instruction.operand(), Operand::Forward(_)) =>
+            {
+                Self::FORWARD_CONDITIONAL
+            }
+            SWAP => Self::SWAP,
+            LOAD_FAST | LOAD_FAST_CHECK | LOAD_FAST_BORROW | LOAD_FAST_LOAD_FAST => Self::FAST_LOAD,
+            STORE_FAST => Self::STORE_FAST,
+            TO_BOOL | UNARY_NOT => Self::BOOLEAN_CONVERSION,
+            _ => 0,
+        };
+        if instruction.jump_policy.borrow_empty_block() {
+            self.0 |= Self::BORROW_EMPTY_BLOCK;
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.0 |= other.0;
+    }
+
+    pub(super) const fn has_forward_jump(self) -> bool {
+        self.0 & Self::FORWARD_JUMP != 0
+    }
+
+    pub(super) const fn has_forward_conditional(self) -> bool {
+        self.0 & Self::FORWARD_CONDITIONAL != 0
+    }
+
+    pub(super) const fn has_swap(self) -> bool {
+        self.0 & Self::SWAP != 0
+    }
+
+    pub(super) const fn has_fast_load(self) -> bool {
+        self.0 & Self::FAST_LOAD != 0
+    }
+
+    pub(super) const fn has_store_fast(self) -> bool {
+        self.0 & Self::STORE_FAST != 0
+    }
+
+    pub(super) const fn has_boolean_conversion(self) -> bool {
+        self.0 & Self::BOOLEAN_CONVERSION != 0
+    }
+
+    pub(super) const fn has_borrow_empty_block(self) -> bool {
+        self.0 & Self::BORROW_EMPTY_BLOCK != 0
+    }
+}
+
 /// The assembler's block-aware intermediate representation.
 ///
 /// `blocks` is an append-only arena and `order` is the current emission order.
@@ -85,17 +157,22 @@ pub(super) struct BlockGraph {
     blocks: Vec<BasicBlock>,
     order: Vec<BasicBlockId>,
     label_blocks: Vec<BasicBlockId>,
+    features: PipelineFeatures,
 }
 
 fn normalized_segment_lengths<'a>(
     items: impl IntoIterator<Item = &'a Item>,
     item_count: usize,
     preserved_block_boundaries: &FxHashSet<Label>,
-) -> Vec<usize> {
+) -> (Vec<usize>, PipelineFeatures) {
     let mut lengths = Vec::with_capacity(item_count);
     let mut length = 0;
     let mut has_instruction = false;
+    let mut features = PipelineFeatures::default();
     for item in items {
+        if let Item::Instruction(instruction) = item {
+            features.record(instruction);
+        }
         if let Item::Label(label) = item
             && (has_instruction || (length > 0 && preserved_block_boundaries.contains(label)))
         {
@@ -117,7 +194,7 @@ fn normalized_segment_lengths<'a>(
     if length > 0 {
         lengths.push(length);
     }
-    lengths
+    (lengths, features)
 }
 
 fn collect_segments<T>(
@@ -149,10 +226,11 @@ impl BlockGraph {
     fn partition_items(
         items: Vec<Item>,
         preserved_block_boundaries: &FxHashSet<Label>,
-    ) -> Vec<Vec<Item>> {
-        let lengths = normalized_segment_lengths(&items, items.len(), preserved_block_boundaries);
+    ) -> (Vec<Vec<Item>>, PipelineFeatures) {
+        let (lengths, features) =
+            normalized_segment_lengths(&items, items.len(), preserved_block_boundaries);
         if lengths.len() == 1 {
-            return vec![items];
+            return (vec![items], features);
         }
         let mut remaining = items.as_slice();
         let mut segments = Vec::with_capacity(lengths.len());
@@ -163,22 +241,21 @@ impl BlockGraph {
             remaining = rest;
         }
         debug_assert!(remaining.is_empty());
-        segments
+        (segments, features)
     }
 
     pub(super) fn from_items(
         items: Vec<Item>,
         preserved_block_boundaries: &FxHashSet<Label>,
     ) -> Self {
-        let blocks = Self::partition_items(items, preserved_block_boundaries)
-            .into_iter()
-            .map(BasicBlock::new)
-            .collect::<Vec<_>>();
+        let (blocks, features) = Self::partition_items(items, preserved_block_boundaries);
+        let blocks = blocks.into_iter().map(BasicBlock::new).collect::<Vec<_>>();
         let order = (0..blocks.len()).map(BasicBlockId).collect();
         let mut graph = Self {
             blocks,
             order,
             label_blocks: Vec::new(),
+            features,
         };
         graph.rebuild_label_index();
         graph
@@ -186,6 +263,10 @@ impl BlockGraph {
 
     pub(super) fn len(&self) -> usize {
         self.order.len()
+    }
+
+    pub(super) const fn features(&self) -> PipelineFeatures {
+        self.features
     }
 
     /// Returns whether normalization would leave one jump-free block unchanged.
@@ -327,7 +408,9 @@ impl BlockGraph {
         items: Vec<Item>,
         preserved_block_boundaries: &FxHashSet<Label>,
     ) -> Vec<BasicBlockId> {
-        Self::partition_items(items, preserved_block_boundaries)
+        let (segments, features) = Self::partition_items(items, preserved_block_boundaries);
+        self.features.merge(features);
+        segments
             .into_iter()
             .map(|items| self.allocate_block(items))
             .collect()
@@ -345,8 +428,9 @@ impl BlockGraph {
             .iter()
             .map(|block| self[*block].items.len())
             .sum();
-        let segment_lengths =
+        let (segment_lengths, features) =
             normalized_segment_lengths(self.iter_items(), item_count, preserved_block_boundaries);
+        self.features.merge(features);
         let original_order = std::mem::take(&mut self.order);
         let items = original_order
             .iter()
@@ -1016,7 +1100,10 @@ impl Index<BasicBlockId> for BlockGraph {
 mod tests {
     use super::*;
     use crate::assembler::SourceLocation;
-    use crate::target::opcodes::{JUMP_FORWARD, NOP, RETURN_VALUE};
+    use crate::target::opcodes::{
+        JUMP_BACKWARD, JUMP_FORWARD, LOAD_FAST_CHECK, NOP, POP_JUMP_IF_NONE, POP_JUMP_IF_TRUE,
+        RETURN_VALUE, STORE_FAST, SWAP, TO_BOOL,
+    };
 
     fn instruction(opcode: crate::target::Opcode, operand: Operand) -> Item {
         Item::Instruction(Instruction::new(
@@ -1025,6 +1112,83 @@ mod tests {
             SourceLocation::NONE,
             None,
         ))
+    }
+
+    #[test]
+    fn graph_construction_summarizes_all_pass_triggers() {
+        let target = Label(0);
+        let mut borrow_marker =
+            Instruction::new(NOP, Operand::Value(0), SourceLocation::NONE, None);
+        borrow_marker.jump_policy.mark_borrow_empty_block();
+        let graph = BlockGraph::from_items(
+            vec![
+                instruction(JUMP_FORWARD, Operand::Forward(target)),
+                instruction(POP_JUMP_IF_TRUE, Operand::Forward(target)),
+                instruction(SWAP, Operand::Value(2)),
+                instruction(LOAD_FAST_CHECK, Operand::Value(0)),
+                instruction(STORE_FAST, Operand::Value(0)),
+                instruction(TO_BOOL, Operand::Value(0)),
+                Item::Instruction(borrow_marker),
+                Item::Label(target),
+                instruction(RETURN_VALUE, Operand::Value(0)),
+            ],
+            &FxHashSet::default(),
+        );
+        let features = graph.features();
+
+        assert!(features.has_forward_jump());
+        assert!(features.has_forward_conditional());
+        assert!(features.has_swap());
+        assert!(features.has_fast_load());
+        assert!(features.has_store_fast());
+        assert!(features.has_boolean_conversion());
+        assert!(features.has_borrow_empty_block());
+    }
+
+    #[test]
+    fn graph_construction_does_not_mark_non_threadable_jumps_as_forward_candidates() {
+        let target = Label(0);
+        let graph = BlockGraph::from_items(
+            vec![
+                instruction(JUMP_BACKWARD, Operand::Backward(target)),
+                instruction(POP_JUMP_IF_NONE, Operand::Forward(target)),
+                Item::Label(target),
+                instruction(RETURN_VALUE, Operand::Value(0)),
+            ],
+            &FxHashSet::default(),
+        );
+        let features = graph.features();
+
+        assert!(!features.has_forward_jump());
+        assert!(!features.has_forward_conditional());
+        assert!(!features.has_swap());
+        assert!(!features.has_fast_load());
+        assert!(!features.has_store_fast());
+        assert!(!features.has_boolean_conversion());
+        assert!(!features.has_borrow_empty_block());
+    }
+
+    #[test]
+    fn allocating_partitioned_blocks_keeps_the_feature_summary_conservative() {
+        let target = Label(0);
+        let mut graph = BlockGraph::from_items(
+            vec![instruction(RETURN_VALUE, Operand::Value(0))],
+            &FxHashSet::default(),
+        );
+        assert_eq!(graph.features(), PipelineFeatures::default());
+
+        graph.allocate_blocks_from_items(
+            vec![
+                instruction(JUMP_FORWARD, Operand::Forward(target)),
+                instruction(SWAP, Operand::Value(2)),
+                Item::Label(target),
+                instruction(RETURN_VALUE, Operand::Value(0)),
+            ],
+            &FxHashSet::default(),
+        );
+
+        assert!(graph.features().has_forward_jump());
+        assert!(graph.features().has_swap());
     }
 
     #[test]
@@ -1043,7 +1207,7 @@ mod tests {
             instruction(RETURN_VALUE, Operand::Value(0)),
         ];
 
-        let segments =
+        let (segments, _) =
             BlockGraph::partition_items(items.clone(), &FxHashSet::from_iter([preserved]));
 
         assert_eq!(
@@ -1071,7 +1235,7 @@ mod tests {
         items.push(instruction(RETURN_VALUE, Operand::Value(0)));
         let pointer = items.as_ptr();
 
-        let segments = BlockGraph::partition_items(items, &FxHashSet::default());
+        let (segments, _) = BlockGraph::partition_items(items, &FxHashSet::default());
 
         assert_eq!(segments.len(), 1);
         assert_eq!(segments[0].as_ptr(), pointer);
@@ -1314,6 +1478,7 @@ mod tests {
             blocks: Vec::new(),
             order: Vec::new(),
             label_blocks: Vec::new(),
+            features: PipelineFeatures::default(),
         };
         let first = graph.push_block(vec![
             Item::Label(first_label),
@@ -1359,12 +1524,14 @@ mod tests {
                 .enumerate()
                 .filter_map(|(index, label)| (boundary_mask & (1 << index) != 0).then_some(label))
                 .collect::<FxHashSet<_>>();
-            let normalized_lengths = normalized_segment_lengths(&items, items.len(), &boundaries);
+            let (normalized_lengths, _) =
+                normalized_segment_lengths(&items, items.len(), &boundaries);
             for split_mask in 0..(1 << (items.len() - 1)) {
                 let mut graph = BlockGraph {
                     blocks: Vec::new(),
                     order: Vec::new(),
                     label_blocks: Vec::new(),
+                    features: PipelineFeatures::default(),
                 };
                 let mut start = 0;
                 let mut physical_lengths = Vec::new();

@@ -58,6 +58,7 @@ pub(super) struct CallShape<'a> {
     pub(super) has_starred: bool,
     pub(super) has_keyword_unpack: bool,
     pub(super) direct_method: Option<&'a ruff_python_ast::ExprAttribute>,
+    pub(super) imported_module_callable: Option<&'a ruff_python_ast::ExprAttribute>,
 }
 
 impl<'source> CompilationContext<'source> {
@@ -385,28 +386,51 @@ impl Compiler<'_> {
         }
     }
 
-    pub(super) fn call_opcode_range(
+    pub(super) fn attribute_opcode_location(
         &self,
-        call: &ruff_python_ast::ExprCall,
-    ) -> ruff_text_size::TextRange {
-        self.call_opcode_range_with_method(call, self.call_shape(call).direct_method)
+        attribute: &ruff_python_ast::ExprAttribute,
+    ) -> SourceLocation {
+        let location = self.source_location(attribute.range);
+        if location.line == location.end_line {
+            location
+        } else {
+            self.source_location(attribute.attr.range())
+        }
     }
 
-    pub(super) fn call_opcode_range_with_method(
+    pub(super) fn call_opcode_location(&self, call: &ruff_python_ast::ExprCall) -> SourceLocation {
+        let Expr::Attribute(attribute) = call.func.as_ref() else {
+            return self.source_location(call.range);
+        };
+        let attribute_location = self.source_location(attribute.range);
+        if attribute_location.line == attribute_location.end_line {
+            return self.source_location(call.range);
+        }
+        if self.call_shape(call).direct_method.is_some() {
+            self.source_location(ruff_text_size::TextRange::new(
+                attribute.attr.range().start(),
+                call.range.end(),
+            ))
+        } else {
+            self.source_location(call.range)
+        }
+    }
+
+    pub(super) fn call_opcode_location_with_method(
         &self,
         call: &ruff_python_ast::ExprCall,
         direct_method: Option<&ruff_python_ast::ExprAttribute>,
-    ) -> ruff_text_size::TextRange {
+    ) -> SourceLocation {
         if let Some(attribute) = direct_method {
             let attribute_location = self.source_location(attribute.range);
             if attribute_location.line != attribute_location.end_line {
-                return ruff_text_size::TextRange::new(
+                return self.source_location(ruff_text_size::TextRange::new(
                     attribute.attr.range().start(),
                     call.range.end(),
-                );
+                ));
             }
         }
-        call.range
+        self.source_location(call.range)
     }
 
     pub(super) fn call_shape<'a>(&self, call: &'a ruff_python_ast::ExprCall) -> CallShape<'a> {
@@ -418,15 +442,18 @@ impl Compiler<'_> {
             .keywords
             .iter()
             .any(|keyword| keyword.arg.is_none());
-        let direct_method = if !has_starred
+        let (direct_method, imported_module_callable) = if !has_starred
             && !has_keyword_unpack
             && positional_count + keyword_count + usize::from(keyword_count > 0) < 30
             && let Expr::Attribute(attribute) = call.func.as_ref()
-            && !self.imported_module_attribute(attribute)
         {
-            Some(attribute)
+            if self.imported_module_attribute(attribute) {
+                (None, Some(attribute))
+            } else {
+                (Some(attribute), None)
+            }
         } else {
-            None
+            (None, None)
         };
         CallShape {
             positional_count,
@@ -434,6 +461,7 @@ impl Compiler<'_> {
             has_starred,
             has_keyword_unpack,
             direct_method,
+            imported_module_callable,
         }
     }
 }

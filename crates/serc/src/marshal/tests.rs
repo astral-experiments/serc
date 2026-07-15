@@ -1,7 +1,9 @@
-use crate::code_object::{CodeObject, Constant, LocalsIdentity, MarshalProvenance};
+use crate::code_object::{
+    CodeObject, Constant, LocalsIdentity, MarshalMetadataIds, MarshalProvenance,
+};
 
 use super::encode_code;
-use super::graph::{ObjectGraph, OccurrenceKind};
+use super::graph::{ObjectGraph, OccurrenceKind, metadata_values_equal};
 use super::key::{
     ObjectKey, code_bytes_key, code_key, constant_key, constant_sort_key, constants_tuple_key,
     local_kinds_key, locals_tuple_key, slice_member_uses_identity, strings_tuple_key,
@@ -187,6 +189,188 @@ fn tracks_interned_strings_from_constants_and_metadata() {
 }
 
 #[test]
+fn frozenset_free_provenance_walk_preserves_nested_interns_and_qualified_names() {
+    let mut nested = code_object(vec![Constant::String("Nested".to_string())]);
+    nested.name = "Nested".to_string();
+    nested.qualified_name = "Nested".to_string();
+    nested
+        .marshal_provenance
+        .explicitly_interned_strings
+        .insert("méthode".to_string());
+    nested.marshal_provenance.qualified_name_constant_index = Some(0);
+    nested.marshal_provenance.subtree_has_frozenset_constants = Some(false);
+    let mut hinted = code_object(vec![
+        Constant::Code(Box::new(nested)),
+        Constant::String("méthode".to_string()),
+    ]);
+    hinted.marshal_provenance.subtree_has_frozenset_constants = Some(false);
+
+    let mut fallback = hinted.clone();
+    fallback.marshal_provenance.subtree_has_frozenset_constants = None;
+    let Constant::Code(nested) = &mut fallback.constants[0] else {
+        unreachable!();
+    };
+    nested.marshal_provenance.subtree_has_frozenset_constants = None;
+
+    assert_eq!(encode_code(&hinted), encode_code(&fallback));
+    let graph = ObjectGraph::for_code(&hinted);
+    assert!(graph.is_interned("méthode"));
+    assert!(graph.is_interned("Nested"));
+}
+
+#[test]
+fn hand_built_frozenset_without_provenance_keeps_legacy_classification() {
+    let fallback = code_object(vec![Constant::FrozenSet(vec![Constant::String(
+        "identifier".to_string(),
+    )])]);
+    let mut conservative = fallback.clone();
+    conservative
+        .marshal_provenance
+        .subtree_has_frozenset_constants = Some(true);
+
+    assert_eq!(encode_code(&conservative), encode_code(&fallback));
+}
+
+#[test]
+fn dense_metadata_ids_preserve_nested_and_constant_string_identity() {
+    let mut nested = code_object(vec![Constant::String("shared_before".to_string())]);
+    nested.names = vec!["shared_after".to_string(), "nested_only".to_string()];
+    nested.locals = vec!["shared_local".to_string()];
+    nested.local_kinds = vec![1];
+    nested.name = "shared_before".to_string();
+    nested.qualified_name = "shared_after".to_string();
+    nested.marshal_provenance.metadata_ids = Some(MarshalMetadataIds {
+        domain_len: 8,
+        names: vec![1, 2],
+        locals: vec![3],
+        filename: 7,
+        name: Some(0),
+        qualified_name: Some(1),
+    });
+    let mut hinted = code_object(vec![
+        Constant::String("shared_before".to_string()),
+        Constant::Code(Box::new(nested)),
+        Constant::String("shared_after".to_string()),
+        Constant::String("shared_local".to_string()),
+    ]);
+    hinted.names = vec!["shared_before".to_string(), "shared_after".to_string()];
+    hinted.locals = vec!["shared_local".to_string()];
+    hinted.local_kinds = vec![1];
+    hinted.name = "shared_after".to_string();
+    hinted.qualified_name = "shared_before".to_string();
+    hinted.marshal_provenance.metadata_ids = Some(MarshalMetadataIds {
+        domain_len: 8,
+        names: vec![0, 1],
+        locals: vec![3],
+        filename: 7,
+        name: Some(1),
+        qualified_name: Some(0),
+    });
+
+    let mut fallback = hinted.clone();
+    fallback.marshal_provenance.metadata_ids = None;
+    let Constant::Code(nested) = &mut fallback.constants[1] else {
+        unreachable!();
+    };
+    nested.marshal_provenance.metadata_ids = None;
+
+    assert_eq!(encode_code(&hinted), encode_code(&fallback));
+    let graph = ObjectGraph::for_code(&hinted);
+    for value in [
+        "shared_before",
+        "shared_after",
+        "shared_local",
+        "nested_only",
+    ] {
+        assert!(
+            graph.is_interned(value),
+            "expected interned metadata {value}"
+        );
+        assert!(graph.is_shared(&ObjectKey::String(value), false));
+    }
+}
+
+#[test]
+fn malformed_metadata_ids_fall_back_without_aliasing_values() {
+    let mut hinted = code_object(vec![Constant::String("constant_name".to_string())]);
+    hinted.names = vec!["first_name".to_string(), "second_name".to_string()];
+    hinted.locals = vec!["first_local".to_string(), "second_local".to_string()];
+    hinted.local_kinds = vec![1, 1];
+    hinted.name = "constant_name".to_string();
+    hinted.qualified_name = "different_qualified_name".to_string();
+    hinted.marshal_provenance.metadata_ids = Some(MarshalMetadataIds {
+        domain_len: 2,
+        // A mismatched name-vector shape disables those hints; the local and scalar hints then
+        // deliberately collide and exercise per-value validation plus the out-of-range path.
+        names: vec![0],
+        locals: vec![0, 0],
+        filename: 0,
+        name: Some(1),
+        qualified_name: Some(42),
+    });
+    let mut fallback = hinted.clone();
+    fallback.marshal_provenance.metadata_ids = None;
+    assert_eq!(encode_code(&hinted), encode_code(&fallback));
+
+    hinted
+        .marshal_provenance
+        .metadata_ids
+        .as_mut()
+        .unwrap()
+        .domain_len = u32::MAX;
+    assert_eq!(encode_code(&hinted), encode_code(&fallback));
+}
+
+#[test]
+fn inline_metadata_equality_is_exact_at_short_string_boundaries() {
+    for length in 0..=40 {
+        let value = "a".repeat(length);
+        assert!(metadata_values_equal(&value, &value));
+        assert!(!metadata_values_equal(&value, &format!("{value}b")));
+        for index in [0, length / 2, length.saturating_sub(1)] {
+            if index >= length {
+                continue;
+            }
+            let mut different = value.clone().into_bytes();
+            different[index] = b'b';
+            let different = String::from_utf8(different).unwrap();
+            assert!(
+                !metadata_values_equal(&value, &different),
+                "accepted byte mismatch at {index} of {length}"
+            );
+        }
+    }
+    for characters in 1..=20 {
+        let first = "é".repeat(characters);
+        let equal = "é".repeat(characters);
+        let different = "à".repeat(characters);
+        assert!(metadata_values_equal(&first, &equal));
+        assert!(!metadata_values_equal(&first, &different));
+    }
+}
+
+#[test]
+fn colliding_short_metadata_ids_never_alias_distinct_values() {
+    let mut hinted = code_object(Vec::new());
+    hinted.names = [2, 3, 4, 7, 8, 15, 16, 17]
+        .into_iter()
+        .map(|length| "a".repeat(length))
+        .collect();
+    hinted.marshal_provenance.metadata_ids = Some(MarshalMetadataIds {
+        domain_len: 1,
+        names: vec![0; hinted.names.len()],
+        locals: Vec::new(),
+        filename: 0,
+        name: Some(0),
+        qualified_name: Some(0),
+    });
+    let mut fallback = hinted.clone();
+    fallback.marshal_provenance.metadata_ids = None;
+
+    assert_eq!(encode_code(&hinted), encode_code(&fallback));
+}
+
+#[test]
 fn keeps_identity_and_value_keys_separate() {
     let mut first = code_object(Vec::new());
     let mut second = first.clone();
@@ -368,6 +552,8 @@ impl<'a> RecordingVisitor<'a> {
 }
 
 impl<'a> MarshalVisitor<'a> for RecordingVisitor<'a> {
+    const USES_METADATA_IDS: bool = false;
+
     fn code(&mut self, code: &'a CodeObject, reference_mode: ReferenceMode) -> bool {
         self.push(RecordedValue::Code(code), reference_mode);
         true
@@ -392,7 +578,7 @@ impl<'a> MarshalVisitor<'a> for RecordingVisitor<'a> {
 
     fn local_kinds(&mut self, _code: &'a CodeObject) {}
 
-    fn metadata_string(&mut self, _value: &'a str) {}
+    fn metadata_string(&mut self, _value: &'a str, _metadata_id: Option<u32>) {}
 
     fn first_line(&mut self, _value: u32) {}
 

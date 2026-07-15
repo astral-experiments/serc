@@ -1168,6 +1168,34 @@ impl Compiler<'_> {
             .current_statement_propagates_following_to_suites
             && (self.control.statements.current_statement_has_following
                 || self.control.statements.inherited_statement_has_following);
+        let plain_function_suite = matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && self.control.loops.contexts.is_empty()
+            && !self.control.loops.suite_fallthrough_to_loop_backedge
+            && self.control.withs.active_with_region_exclusions.is_empty()
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            && self
+                .control
+                .comprehensions
+                .active_comprehension_region_exclusions
+                .is_empty()
+            && self
+                .control
+                .comprehensions
+                .direct_comprehension_assignment_results
+                .iter_unordered()
+                .next()
+                .is_none()
+            && self.control.generators.generator_region_start.is_none()
+            && !inherited_statement_has_following
+            && !self
+                .control
+                .statements
+                .current_statement_propagates_following_to_suites;
         for (index, statement) in body.iter().enumerate() {
             let is_final = index + 1 == body.len();
             if is_final && final_expression_becomes_return {
@@ -1346,6 +1374,22 @@ impl Compiler<'_> {
                         }
                     }
                 }
+            } else if plain_function_suite
+                && !is_final
+                && is_plain_function_statement(statement)
+                && body
+                    .get(index.wrapping_sub(1))
+                    .is_none_or(is_plain_function_statement)
+                && body.get(index + 1).is_none_or(is_plain_function_statement)
+            {
+                let previous_current_statement_has_following = std::mem::replace(
+                    &mut self.control.statements.current_statement_has_following,
+                    true,
+                );
+                let result = self.compile_statement(statement);
+                self.control.statements.current_statement_has_following =
+                    previous_current_statement_has_following;
+                result?;
             } else {
                 // CPython drops this end NOP when async-with is the innermost protected owner;
                 // an intervening exception region still retains it.
@@ -1490,90 +1534,89 @@ impl Compiler<'_> {
                         .current_statement_propagates_following_to_suites,
                     matches!(statement, Stmt::If(_) | Stmt::With(_)),
                 );
-                let result = self.with_control_override(
-                    |control| &mut control.loops.emit_protected_async_for_end_nop,
+                let previous_emit_protected_async_for_end_nop = std::mem::replace(
+                    &mut self.control.loops.emit_protected_async_for_end_nop,
                     emit_protected_async_for_end_nop,
-                    |compiler| {
-                        compiler.with_control_override(
-                            |control| &mut control.statements.current_statement_has_following,
-                            !is_final,
-                            |compiler| {
-                                compiler.with_control_override(
-                                    |control| &mut control.statements.current_statement_followed_by_break,
-                                    followed_by_break,
-                                    |compiler| {
-                                compiler.with_control_override(
-                                    |control| {
-                                        &mut control.statements.current_statement_followed_by_name_return
-                                    },
-                                    followed_by_name_return,
-                                    |compiler| {
-                                        compiler.with_control_override(
-                                            |control| {
-                                                &mut control
-                                                    .statements.current_statement_followed_by_literal_return
-                                            },
-                                            followed_by_literal_return,
-                                            |compiler| {
-                                                compiler.with_control_override(
-                                                    |control| {
-                                                        &mut control.statements.current_statement_followed_by_tuple_return
-                                                    },
-                                                    followed_by_tuple_return,
-                                                    |compiler| {
-                                                compiler.with_control_override(
-                                                    |control| {
-                                                        &mut control
-                                                    .statements.current_statement_followed_by_return_or_raise
-                                                    },
-                                                    followed_by_return_or_raise,
-                                                    |compiler| {
-                                                        compiler.with_control_override(
-                                                            |control| {
-                                                                &mut control
-                                                                    .statements.current_statement_followed_by_try
-                                                            },
-                                                            followed_by_try,
-                                                            |compiler| {
-                                                                compiler.with_control_override(
-                                                                    |control| {
-                                                                        &mut control
-                                                                            .loops.suite_fallthrough_to_loop_backedge
-                                                                    },
-                                                                    suite_fallthrough_to_loop_backedge,
-                                                                    |compiler| {
-                                                                        compiler.with_control_override(
-                                                                            |control| {
-                                                                                &mut control
-                                                                                    .statements.branch_join_successor
-                                                                            },
-                                                                            preceded_by_branch_join
-                                                                                .then_some(statement.range()),
-                                                                            |compiler| {
-                                                                                compiler.compile_with_strict_owned_loads(
-                                                                                    constant_false_assert_after_if,
-                                                                                    |compiler| compiler.compile_statement(statement),
-                                                                                )
-                                                                            },
-                                                                        )
-                                                                    },
-                                                                )
-                                                            },
-                                                        )
-                                                    },
-                                                )
-                                                    },
-                                                )
-                                            },
-                                        )
-                                    },
-                                )
-                                    },
-                                )
-                            },
-                        )
-                    },
                 );
+                let previous_current_statement_has_following = std::mem::replace(
+                    &mut self.control.statements.current_statement_has_following,
+                    !is_final,
+                );
+                let previous_current_statement_followed_by_break = std::mem::replace(
+                    &mut self.control.statements.current_statement_followed_by_break,
+                    followed_by_break,
+                );
+                let previous_current_statement_followed_by_name_return = std::mem::replace(
+                    &mut self
+                        .control
+                        .statements
+                        .current_statement_followed_by_name_return,
+                    followed_by_name_return,
+                );
+                let previous_current_statement_followed_by_literal_return = std::mem::replace(
+                    &mut self
+                        .control
+                        .statements
+                        .current_statement_followed_by_literal_return,
+                    followed_by_literal_return,
+                );
+                let previous_current_statement_followed_by_tuple_return = std::mem::replace(
+                    &mut self
+                        .control
+                        .statements
+                        .current_statement_followed_by_tuple_return,
+                    followed_by_tuple_return,
+                );
+                let previous_current_statement_followed_by_return_or_raise = std::mem::replace(
+                    &mut self
+                        .control
+                        .statements
+                        .current_statement_followed_by_return_or_raise,
+                    followed_by_return_or_raise,
+                );
+                let previous_current_statement_followed_by_try = std::mem::replace(
+                    &mut self.control.statements.current_statement_followed_by_try,
+                    followed_by_try,
+                );
+                let previous_suite_fallthrough_to_loop_backedge = std::mem::replace(
+                    &mut self.control.loops.suite_fallthrough_to_loop_backedge,
+                    suite_fallthrough_to_loop_backedge,
+                );
+                let previous_branch_join_successor = std::mem::replace(
+                    &mut self.control.statements.branch_join_successor,
+                    preceded_by_branch_join.then_some(statement.range()),
+                );
+                let result = self
+                    .compile_with_strict_owned_loads(constant_false_assert_after_if, |compiler| {
+                        compiler.compile_statement(statement)
+                    });
+                self.control.statements.branch_join_successor = previous_branch_join_successor;
+                self.control.loops.suite_fallthrough_to_loop_backedge =
+                    previous_suite_fallthrough_to_loop_backedge;
+                self.control.statements.current_statement_followed_by_try =
+                    previous_current_statement_followed_by_try;
+                self.control
+                    .statements
+                    .current_statement_followed_by_return_or_raise =
+                    previous_current_statement_followed_by_return_or_raise;
+                self.control
+                    .statements
+                    .current_statement_followed_by_tuple_return =
+                    previous_current_statement_followed_by_tuple_return;
+                self.control
+                    .statements
+                    .current_statement_followed_by_literal_return =
+                    previous_current_statement_followed_by_literal_return;
+                self.control
+                    .statements
+                    .current_statement_followed_by_name_return =
+                    previous_current_statement_followed_by_name_return;
+                self.control.statements.current_statement_followed_by_break =
+                    previous_current_statement_followed_by_break;
+                self.control.statements.current_statement_has_following =
+                    previous_current_statement_has_following;
+                self.control.loops.emit_protected_async_for_end_nop =
+                    previous_emit_protected_async_for_end_nop;
                 self.control.statements.inherited_statement_has_following =
                     previous_inherited_statement_has_following;
                 self.control
@@ -2890,20 +2933,21 @@ impl Compiler<'_> {
                 if preserve_no_location || optimized_generator_call {
                     self.assembler.set_location(SourceLocation::NONE);
                 } else {
-                    let discard_range = match expression.value.as_ref() {
-                        Expr::Named(named) => named.target.range(),
-                        Expr::Attribute(attribute) => self.attribute_opcode_range(attribute),
-                        Expr::Call(call) => self.call_opcode_range(call),
-                        Expr::FString(fstring) => Self::fstring_result_range(fstring),
-                        expression => expression.range(),
-                    };
                     if matches!(expression.value.as_ref(), Expr::BinOp(binary) if optimized_percent_format(binary).is_some())
                         && let Some(location) = self.assembler.last_instruction_location()
                     {
                         self.assembler.set_location(location);
                     } else {
-                        self.assembler
-                            .set_location(self.source_location(discard_range));
+                        let discard_location = match expression.value.as_ref() {
+                            Expr::Named(named) => self.source_location(named.target.range()),
+                            Expr::Attribute(attribute) => self.attribute_opcode_location(attribute),
+                            Expr::Call(call) => self.call_opcode_location(call),
+                            Expr::FString(fstring) => {
+                                self.source_location(Self::fstring_result_range(fstring))
+                            }
+                            expression => self.source_location(expression.range()),
+                        };
+                        self.assembler.set_location(discard_location);
                     }
                 }
                 let loop_tail_boolean = self.control.loops.suite_fallthrough_to_loop_backedge
@@ -6799,7 +6843,7 @@ impl Compiler<'_> {
                     .set_location(self.source_location(target.range));
                 self.emit(COPY, 1, 1)?;
                 let index = self.name_index(target.attr.as_str())?;
-                let attribute_location = self.source_location(self.attribute_opcode_range(target));
+                let attribute_location = self.attribute_opcode_location(target);
                 self.assembler.set_location(attribute_location);
                 self.emit(LOAD_ATTR, index << 1, 0)?;
                 self.compile_expression(&assignment.value)?;
@@ -7019,6 +7063,50 @@ impl Compiler<'_> {
             self.assembler
                 .set_location(self.source_location(statement.test.range()));
             return self.emit(NOP, 0, 0);
+        }
+        if condition_truthiness.is_none()
+            && statement.msg.is_none()
+            && !split_success_return
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && self.control.loops.contexts.is_empty()
+            && self.control.withs.active_with_region_exclusions.is_empty()
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            && !self.control.conditions.include_assert_none_condition_owner
+            && self
+                .control
+                .conditions
+                .retained_chained_comparison_exit
+                .is_none()
+            && self
+                .control
+                .conditions
+                .retained_multiline_assert_ifexp_exit
+                .is_none()
+            && self
+                .control
+                .generators
+                .pre_suspension_coroutine_boolean_assertion
+                .is_none()
+            && !matches!(statement.test.as_ref(), Expr::If(_))
+            && !matches!(statement.test.as_ref(), Expr::Compare(comparison) if comparison.ops.len() > 1)
+        {
+            let base_depth = self.control.stack.depth;
+            let end = self.assembler.label();
+            self.assembler.mark_assertion_side_exit_candidate();
+            self.compile_linear_assert_condition(&statement.test, end)?;
+            self.assembler
+                .set_location(self.source_location(statement.range));
+            self.emit_common_constant(CommonConstant::ASSERTIONERROR)?;
+            self.assembler
+                .set_location(self.source_location(statement.test.range()));
+            self.emit(RAISE_VARARGS, 1, -1)?;
+            self.assembler.mark(end);
+            self.set_depth(base_depth);
+            return Ok(());
         }
         let base_depth = self.control.stack.depth;
         let end = self.assembler.label();
@@ -12939,6 +13027,13 @@ fn is_unreachable_call_kw_debug_leaf(expression: &Expr) -> bool {
         Expr::Attribute(attribute) => is_unreachable_call_kw_debug_leaf(&attribute.value),
         _ => false,
     }
+}
+
+fn is_plain_function_statement(statement: &Stmt) -> bool {
+    matches!(
+        statement,
+        Stmt::Assign(_) | Stmt::AnnAssign(_) | Stmt::AugAssign(_) | Stmt::Assert(_) | Stmt::Expr(_)
+    )
 }
 
 fn statement_terminates(statement: &Stmt) -> bool {

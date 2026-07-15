@@ -23,13 +23,15 @@ pub(super) enum ReferenceMode {
 }
 
 pub(super) trait MarshalVisitor<'a> {
+    const USES_METADATA_IDS: bool;
+
     fn code(&mut self, code: &'a CodeObject, reference_mode: ReferenceMode) -> bool;
     fn code_bytes(&mut self, code: &'a CodeObject);
     fn constants(&mut self, values: &'a [Constant], reference_mode: ReferenceMode) -> bool;
     fn strings(&mut self, values: &'a [String]) -> bool;
     fn locals(&mut self, code: &'a CodeObject) -> bool;
     fn local_kinds(&mut self, code: &'a CodeObject);
-    fn metadata_string(&mut self, value: &'a str);
+    fn metadata_string(&mut self, value: &'a str, metadata_id: Option<u32>);
     fn first_line(&mut self, value: u32);
     fn bytes(&mut self, value: &'a [u8]);
     fn constant(&mut self, value: &'a Constant, reference_mode: ReferenceMode) -> bool;
@@ -61,12 +63,24 @@ fn traverse_code_with_mode<'a, V>(
     }
     visitor.code_bytes(code);
     traverse_constants(&code.constants, ReferenceMode::IfShared, visitor);
-    traverse_strings(&code.names, visitor);
-    traverse_locals(code, visitor);
+    let metadata_ids = if V::USES_METADATA_IDS {
+        code.marshal_provenance.metadata_ids.as_ref()
+    } else {
+        None
+    };
+    traverse_strings(
+        &code.names,
+        metadata_ids.map(|ids| ids.names.as_slice()),
+        visitor,
+    );
+    traverse_locals(code, metadata_ids.map(|ids| ids.locals.as_slice()), visitor);
     visitor.local_kinds(code);
-    visitor.metadata_string(&code.filename);
-    visitor.metadata_string(&code.name);
-    visitor.metadata_string(&code.qualified_name);
+    visitor.metadata_string(&code.filename, metadata_ids.map(|ids| ids.filename));
+    visitor.metadata_string(&code.name, metadata_ids.and_then(|ids| ids.name));
+    visitor.metadata_string(
+        &code.qualified_name,
+        metadata_ids.and_then(|ids| ids.qualified_name),
+    );
     visitor.first_line(code.first_line_number);
     visitor.bytes(&code.line_table);
     visitor.bytes(&code.exception_table);
@@ -85,25 +99,37 @@ where
 }
 
 #[inline]
-fn traverse_strings<'a, V>(values: &'a [String], visitor: &mut V)
+fn traverse_strings<'a, V>(values: &'a [String], metadata_ids: Option<&[u32]>, visitor: &mut V)
 where
     V: MarshalVisitor<'a>,
 {
     if visitor.strings(values) {
-        for value in values {
-            visitor.metadata_string(value);
+        if let Some(metadata_ids) = metadata_ids.filter(|ids| ids.len() == values.len()) {
+            for (value, metadata_id) in values.iter().zip(metadata_ids) {
+                visitor.metadata_string(value, Some(*metadata_id));
+            }
+        } else {
+            for value in values {
+                visitor.metadata_string(value, None);
+            }
         }
     }
 }
 
 #[inline]
-fn traverse_locals<'a, V>(code: &'a CodeObject, visitor: &mut V)
+fn traverse_locals<'a, V>(code: &'a CodeObject, metadata_ids: Option<&[u32]>, visitor: &mut V)
 where
     V: MarshalVisitor<'a>,
 {
     if visitor.locals(code) {
-        for value in &code.locals {
-            visitor.metadata_string(value);
+        if let Some(metadata_ids) = metadata_ids.filter(|ids| ids.len() == code.locals.len()) {
+            for (value, metadata_id) in code.locals.iter().zip(metadata_ids) {
+                visitor.metadata_string(value, Some(*metadata_id));
+            }
+        } else {
+            for value in &code.locals {
+                visitor.metadata_string(value, None);
+            }
         }
     }
 }

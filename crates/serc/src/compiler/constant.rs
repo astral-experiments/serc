@@ -243,9 +243,11 @@ pub(super) struct OutputState {
     pub(super) deferred_constants: Vec<(Option<OperandPatchId>, Constant)>,
     pub(super) deferred_names: Vec<(OperandPatchId, String)>,
     pub(super) names: Vec<String>,
+    pub(super) name_ids: Vec<u32>,
     name_indices: FxHashMap<NameId, u32>,
     pub(super) interned_constant_strings: FxHashSet<String>,
     pub(super) qualified_name_constant_index: Option<u32>,
+    pub(super) has_frozenset_constants: bool,
 }
 
 impl Compiler<'_> {
@@ -422,6 +424,7 @@ impl Compiler<'_> {
             Entry::Vacant(entry) => {
                 let index = to_u32(self.output.names.len(), "name count")?;
                 self.output.names.push(name.into_owned());
+                self.output.name_ids.push(name_id.0);
                 entry.insert(index);
                 Ok(index)
             }
@@ -440,6 +443,12 @@ impl Compiler<'_> {
     }
 
     pub(super) fn add_constant(&mut self, constant: Constant) -> Result<u32, CompileError> {
+        if let Constant::Code(code) = &constant {
+            self.output.has_frozenset_constants |= code
+                .marshal_provenance
+                .subtree_has_frozenset_constants
+                .unwrap_or(true);
+        }
         self.output.constants.intern(constant)
     }
 
@@ -2307,6 +2316,9 @@ mod tests {
         with_graph_provenance
             .marshal_provenance
             .qualified_name_constant_index = Some(0);
+        with_graph_provenance
+            .marshal_provenance
+            .subtree_has_frozenset_constants = Some(true);
 
         assert!(ConstantEquality::PoolKey.equal(
             &Constant::Code(Box::new(plain)),

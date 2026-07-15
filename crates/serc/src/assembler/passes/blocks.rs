@@ -939,6 +939,14 @@ impl OptimizationPipeline {
         let mut copied_exception_regions = Vec::new();
         let mut drop_blocks = vec![false; positions.len()];
         let mut remaining_predecessors = predecessors.clone();
+        let mut jump_sources = vec![Vec::<BasicBlockId>::new(); positions.len()];
+        for source in order.iter().copied() {
+            if let Some(target) =
+                block_jump_target(graph[source].items()).and_then(|label| graph.label_block(label))
+            {
+                jump_sources[target.index()].push(source);
+            }
+        }
         let mut sources = order.clone();
         let mut source_cursor = 0;
         while let Some(&source) = sources.get(source_cursor) {
@@ -1046,15 +1054,18 @@ impl OptimizationPipeline {
                 && target_is_small_exit
                 && remaining_predecessors[target.index()] > 1
                 && !exception_handler_blocks[target.index()];
-            let later_jump_predecessor = order[source_position + 1..].iter().any(|predecessor| {
-                block_jump_target(graph[*predecessor].items())
-                    .and_then(|label| graph.label_block(label))
-                    == Some(target)
-            });
             if exit_without_unique_predecessor[target.index()]
                 && target_pre_fusion_size > 4
                 && remaining_predecessors[target.index()] > 1
-                && later_jump_predecessor
+                && jump_sources[target.index()]
+                    .iter()
+                    .copied()
+                    .any(|predecessor| {
+                        positions[predecessor.index()] > source_position
+                            && block_jump_target(graph[predecessor].items())
+                                .and_then(|label| graph.label_block(label))
+                                == Some(target)
+                    })
             {
                 // CPython's second exit-duplication pass runs after cold blocks move. For a
                 // large class footer shared by warm and cold jumps, that makes the cold, later
@@ -1305,15 +1316,51 @@ impl OptimizationPipeline {
             // CPython copies a direct local return through the first branch before revisiting an
             // optimized tuple guard in that branch. The guard is already earlier in block order,
             // so honor the compiler's narrow marker when this source is exactly STORE/LOAD/RETURN.
-            let transitive_predecessors = if inline_small_exit {
-                order
+            let transitive_copy = if inline_small_exit {
+                let source_jump_position = graph[source]
+                    .items()
+                    .iter()
+                    .rposition(|item| matches!(item, Item::Instruction(_)))
+                    .expect("an exit-copy source must end in a jump");
+                let mut source_instructions = graph[source].items()[..source_jump_position]
+                    .iter()
+                    .filter_map(|item| match item {
+                        Item::Instruction(instruction) => Some(instruction),
+                        Item::Label(_) => None,
+                    });
+                let mut copied_instructions = copied.iter().filter_map(|item| match item {
+                    Item::Instruction(instruction) => Some(instruction),
+                    Item::Label(_) => None,
+                });
+                match (
+                    source_instructions.next(),
+                    source_instructions.next(),
+                    copied_instructions.next(),
+                    copied_instructions.next(),
+                    copied_instructions.next(),
+                ) {
+                    (Some(store), None, Some(load), Some(return_value), None)
+                        if store.opcode == STORE_FAST
+                            && load.opcode == LOAD_FAST
+                            && return_value.opcode == RETURN_VALUE
+                            && store.operand() == load.operand() =>
+                    {
+                        Some([*store, *load, *return_value])
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            if let Some(transitive_copy) = transitive_copy {
+                let transitive_predecessors = jump_sources[source.index()]
                     .iter()
                     .copied()
-                    .take(source_position)
                     .filter(|predecessor| {
-                        block_jump_target(graph[*predecessor].items())
-                            .and_then(|label| graph.label_block(label))
-                            == Some(source)
+                        positions[predecessor.index()] < source_position
+                            && block_jump_target(graph[*predecessor].items())
+                                .and_then(|label| graph.label_block(label))
+                                == Some(source)
                             && graph[*predecessor]
                                 .last_instruction()
                                 .is_some_and(|instruction| {
@@ -1326,63 +1373,23 @@ impl OptimizationPipeline {
                                         == membership.contains(&positions[target.index()])
                             })
                     })
-                    .collect::<Vec<_>>()
-            } else {
-                Vec::new()
-            };
-            if !transitive_predecessors.is_empty() {
-                let source_jump_position = graph[source]
-                    .items()
-                    .iter()
-                    .rposition(|item| matches!(item, Item::Instruction(_)))
-                    .expect("an exit-copy source must end in a jump");
-                let source_instructions = graph[source].items()[..source_jump_position]
-                    .iter()
-                    .filter_map(|item| match item {
-                        Item::Instruction(instruction) => Some(*instruction),
-                        Item::Label(_) => None,
-                    })
                     .collect::<Vec<_>>();
-                let copied_instructions = copied
-                    .iter()
-                    .filter_map(|item| match item {
-                        Item::Instruction(instruction) => Some(*instruction),
-                        Item::Label(_) => None,
-                    })
-                    .collect::<Vec<_>>();
-                let transitive_copy = match (
-                    source_instructions.as_slice(),
-                    copied_instructions.as_slice(),
-                ) {
-                    ([store], [load, return_value])
-                        if store.opcode == STORE_FAST
-                            && load.opcode == LOAD_FAST
-                            && return_value.opcode == RETURN_VALUE
-                            && store.operand() == load.operand() =>
-                    {
-                        Some([*store, *load, *return_value])
-                    }
-                    _ => None,
-                };
-                if let Some(transitive_copy) = transitive_copy {
-                    for predecessor in transitive_predecessors {
-                        let copied_label = Label(self.next_label);
-                        self.next_label += 1;
-                        let mut predecessor_copy = vec![Item::Label(copied_label)];
-                        predecessor_copy
-                            .extend(transitive_copy.iter().copied().map(Item::Instruction));
-                        let jump_position = graph[predecessor]
-                            .items()
-                            .iter()
-                            .rposition(|item| matches!(item, Item::Instruction(_)))
-                            .expect("a transitive exit-copy predecessor must end in a jump");
-                        graph.remove_item_at(predecessor, jump_position);
-                        inline_copies
-                            .entry(predecessor)
-                            .or_default()
-                            .push(predecessor_copy);
-                        remaining_predecessors[source.index()] -= 1;
-                    }
+                for predecessor in transitive_predecessors {
+                    let copied_label = Label(self.next_label);
+                    self.next_label += 1;
+                    let mut predecessor_copy = vec![Item::Label(copied_label)];
+                    predecessor_copy.extend(transitive_copy.iter().copied().map(Item::Instruction));
+                    let jump_position = graph[predecessor]
+                        .items()
+                        .iter()
+                        .rposition(|item| matches!(item, Item::Instruction(_)))
+                        .expect("a transitive exit-copy predecessor must end in a jump");
+                    graph.remove_item_at(predecessor, jump_position);
+                    inline_copies
+                        .entry(predecessor)
+                        .or_default()
+                        .push(predecessor_copy);
+                    remaining_predecessors[source.index()] -= 1;
                 }
             }
             if inline_small_exit || inline_no_location_block {
@@ -1438,6 +1445,14 @@ impl OptimizationPipeline {
                 if let Some(copied_jump_target) = copied_jump_target {
                     remaining_predecessors[copied_jump_target.index()] += 1;
                     drop_blocks[copied_jump_target.index()] = false;
+                    let copied_jump_sources = &mut jump_sources[copied_jump_target.index()];
+                    if let Err(position) = copied_jump_sources
+                        .binary_search_by_key(&source_position, |predecessor| {
+                            positions[predecessor.index()]
+                        })
+                    {
+                        copied_jump_sources.insert(position, source);
+                    }
                 }
                 // CPython repeats no-line block inlining to a fixed point. The copied block can
                 // itself end in a jump to another synthetic cleanup block, so revisit this source
@@ -1445,10 +1460,11 @@ impl OptimizationPipeline {
                 sources.push(source);
                 // The copied jump can turn this source into another eligible unlocated block.
                 // Revisit earlier jump predecessors until the chain reaches a fixed point.
-                for predecessor in order.iter().copied().take(source_position) {
-                    if block_jump_target(graph[predecessor].items())
-                        .and_then(|label| graph.label_block(label))
-                        == Some(source)
+                for predecessor in jump_sources[source.index()].iter().copied() {
+                    if positions[predecessor.index()] < source_position
+                        && block_jump_target(graph[predecessor].items())
+                            .and_then(|label| graph.label_block(label))
+                            == Some(source)
                     {
                         sources.push(predecessor);
                     }
@@ -1570,7 +1586,7 @@ impl OptimizationPipeline {
                 && first.fusion_policy.is_converted_pop_block()
                 && first.location.line < 0
                 && !first.no_location_policy.preserves_location()
-                && let Some(location) = order.iter().find_map(|source| {
+                && let Some(location) = jump_sources[target.index()].iter().find_map(|source| {
                     block_jump_target(graph[*source].items())
                         .and_then(|label| graph.label_block(label))
                         .filter(|block| *block == target)
@@ -1598,7 +1614,7 @@ impl OptimizationPipeline {
             {
                 Some(order[target_position - 1])
             } else {
-                order.iter().copied().find(|source| {
+                jump_sources[target.index()].iter().copied().find(|source| {
                     block_jump_target(graph[*source].items())
                         .and_then(|label| graph.label_block(label))
                         == Some(target)

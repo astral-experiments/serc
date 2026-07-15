@@ -269,7 +269,8 @@ impl Compiler<'_> {
                     let index = self.name_index_with_id(name, name_id)?;
                     return self.emit(LOAD_GLOBAL, index << 1, 1);
                 }
-                if indices.contains_key(&name_id)
+                let local_index = indices.get(&name_id).copied();
+                if local_index.is_some()
                     && let Some(index) = free_indices.get(&name_id).copied()
                 {
                     // An inlined comprehension can use a temporary fast-local slot with the
@@ -283,7 +284,7 @@ impl Compiler<'_> {
                     }
                     return self.emit(LOAD_DEREF, index, 1);
                 }
-                if let Some(index) = indices.get(&name_id).copied() {
+                if let Some(index) = local_index {
                     if cells.contains(name_id) {
                         if let Some(classdict) = annotation_classdict_index
                             && name != "__classdict__"
@@ -1021,7 +1022,7 @@ impl Compiler<'_> {
         exception_policy: ExceptionPolicy,
     ) -> Result<(), CompileError> {
         self.apply_compiler_stack_effect(opcode, argument, effect)?;
-        self.assembler.emit_with_depth(
+        self.assembler.emit_value_with_depth_discard(
             opcode,
             argument,
             self.control.stack.depth.cast_unsigned(),
@@ -1033,7 +1034,7 @@ impl Compiler<'_> {
     pub(super) fn emit_reraise(&mut self, state: ReraiseStackState) -> Result<(), CompileError> {
         let (argument, effect) = state.argument_and_effect();
         self.apply_stack_effect(effect)?;
-        self.assembler.emit_with_depth(
+        self.assembler.emit_value_with_depth_discard(
             RERAISE,
             argument,
             self.control.stack.depth.cast_unsigned(),
