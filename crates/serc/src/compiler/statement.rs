@@ -13,7 +13,7 @@ use super::{
     TO_BOOL, WITH_EXCEPT_START, YIELD_VALUE,
 };
 use crate::CompileError;
-use crate::assembler::{ExceptionPolicy, Label, SourceLocation};
+use crate::assembler::{EmittedJump, ExceptionPolicy, Label, SourceLocation};
 use crate::code_object::Constant;
 use crate::target::code_flags::{
     CO_ASYNC_GENERATOR, CO_COROUTINE, CO_FUTURE_ANNOTATIONS, CO_GENERATOR,
@@ -2316,8 +2316,8 @@ impl Compiler<'_> {
             self.set_depth(base_depth);
             return Ok(());
         }
-        self.emit_jump_forward(JUMP_FORWARD, body, 0)?;
-        self.assembler.prevent_last_jump_inlining();
+        let body_entry = self.emit_jump_forward_instruction(JUMP_FORWARD, body)?;
+        self.assembler.prevent_jump_inlining(body_entry);
 
         self.assembler.mark(cleanup);
         self.set_depth(base_depth + 1);
@@ -3007,25 +3007,26 @@ impl Compiler<'_> {
                         start
                     });
                     let has_no_emitted_cleanup = self.assembler.instruction_count() == marker_end;
-                    self.emit_jump_forward(JUMP_FORWARD, context.break_label, 0)?;
-                    self.assembler.mark_last_jump_as_authored_break();
+                    let break_jump =
+                        self.emit_jump_forward_instruction(JUMP_FORWARD, context.break_label)?;
+                    self.assembler.mark_jump_as_authored_break(break_jump);
                     if context.prevent_break_exit_inlining {
-                        self.assembler.prevent_last_jump_inlining();
+                        self.assembler.prevent_jump_inlining(break_jump);
                     } else if context.break_policy.preserves_jump_exit() {
                         // CPython inlines small exit blocks before removing a jump to the next
                         // block. Keep this terminal protected-loop break through that pass so
                         // the following finally return is copied onto the edge.
-                        self.assembler.defer_last_jump_removal();
-                        self.assembler.preserve_last_inlined_jump_nop();
+                        self.assembler.defer_jump_removal(break_jump);
+                        self.assembler.preserve_inlined_jump_nop(break_jump);
                     } else if has_no_emitted_cleanup {
                         // CPython keeps the break marker when it replaces a jump with a small
                         // inlined exit block. A break that is the first emitted body instruction
                         // also owns the line event after early direct-jump removal; later
                         // same-line body instructions do not. Cleanup edges retain neither NOP.
                         if is_first_emitted_body_instruction {
-                            self.assembler.preserve_last_inlined_jump_nop();
+                            self.assembler.preserve_inlined_jump_nop(break_jump);
                         } else {
-                            self.assembler.preserve_last_direct_inlined_jump_nop();
+                            self.assembler.preserve_direct_inlined_jump_nop(break_jump);
                         }
                     }
                     if let Some(jump_exclusion_start) = jump_exclusion_start {
@@ -3084,10 +3085,11 @@ impl Compiler<'_> {
                 };
                 self.emit_loop_control_exception_unwind(self.control.loops.contexts.len())?;
                 let with_unwind_starts = self.emit_active_with_unwind(context.with_depth, false)?;
-                self.emit_jump_backward(JUMP_BACKWARD, context.continue_label, 0)?;
+                let continue_jump =
+                    self.emit_jump_backward_instruction(JUMP_BACKWARD, context.continue_label)?;
                 // CPython emits a temporary NOP before loop control, so an incoming jump sees
                 // the NOP instead of threading through this backward jump.
-                self.assembler.prevent_last_jump_threading_target();
+                self.assembler.prevent_jump_threading_target(continue_jump);
                 if exclusion_start.is_some() || !with_unwind_starts.is_empty() {
                     let exclusion_end = self.assembler.label();
                     self.assembler.mark(exclusion_end);
@@ -4732,7 +4734,7 @@ impl Compiler<'_> {
                     } else {
                         self.set_branch_end_location(body, body_start);
                     }
-                    if direct_try_body_exit
+                    let branch_exit = if direct_try_body_exit
                         && self.control.in_iterator_loop()
                         && self
                             .control
@@ -4743,19 +4745,18 @@ impl Compiler<'_> {
                         && self.control.generators.generator_region_start.is_none()
                         && self.control.withs.active_with_region_exclusions.is_empty()
                     {
-                        self.emit_jump_forward_with_exception_policy(
+                        self.emit_jump_forward_instruction_with_exception_policy(
                             JUMP_FORWARD,
                             end,
-                            0,
                             ExceptionPolicy::EXCLUDE_ALWAYS,
-                        )?;
+                        )?
                     } else {
                         let direct_try_body_exit_start = direct_try_body_exit.then(|| {
                             let start = self.assembler.label();
                             self.assembler.mark(start);
                             start
                         });
-                        self.emit_jump_forward(JUMP_FORWARD, end, 0)?;
+                        let branch_exit = self.emit_jump_forward_instruction(JUMP_FORWARD, end)?;
                         if let Some(start) = direct_try_body_exit_start {
                             let exclusion_end = self.assembler.label();
                             self.assembler.mark(exclusion_end);
@@ -4766,7 +4767,8 @@ impl Compiler<'_> {
                                 .expect("direct try-body branch exit requires an active try")
                                 .push((start, exclusion_end));
                         }
-                    }
+                        branch_exit
+                    };
                     // CPython retains the first assertion branch's source jump when it copies a
                     // nonterminal join onto that edge. A directly following return or raise
                     // copies the function-exit block onto later clauses too. Without a copied
@@ -4779,14 +4781,15 @@ impl Compiler<'_> {
                             .current_statement_followed_by_return_or_raise)
                         && matches!(body.last(), Some(Stmt::Assert(_)));
                     if nested_if_ends_in_break && has_terminating_else {
-                        self.assembler.preserve_last_inlined_jump_nop();
+                        self.assembler.preserve_inlined_jump_nop(branch_exit);
                     } else if matches!(nested_if_exit, Some(NestedIfExitLocation::Unlocated)) {
-                        self.assembler.preserve_last_no_location();
+                        self.assembler
+                            .preserve_no_location(branch_exit.instruction());
                     } else if pass_only_body && is_none_pass_assignment_branch(statement) {
                         self.assembler
-                            .preserve_last_redundant_jump_nop_after_threading();
+                            .preserve_redundant_jump_nop_after_threading(branch_exit);
                     } else if pass_only_body || retain_assertion_exit {
-                        self.assembler.preserve_last_direct_inlined_jump_nop();
+                        self.assembler.preserve_direct_inlined_jump_nop(branch_exit);
                     } else if let Some(Stmt::If(nested)) = body.last() {
                         // CPython emits this jump in the nested if's empty join block. When
                         // small-exit inlining replaces it with a NOP, no preceding instruction
@@ -4818,9 +4821,9 @@ impl Compiler<'_> {
                                 }))
                         {
                             self.assembler
-                                .preserve_last_redundant_jump_nop_after_threading();
+                                .preserve_redundant_jump_nop_after_threading(branch_exit);
                         } else {
-                            self.assembler.preserve_last_direct_inlined_jump_nop();
+                            self.assembler.preserve_direct_inlined_jump_nop(branch_exit);
                         }
                     }
                 }
@@ -5314,16 +5317,17 @@ impl Compiler<'_> {
         if !inline_try_tail {
             self.set_branch_end_location(body, body_start);
         }
-        self.emit_jump_backward(JUMP_BACKWARD, restart, 0)?;
+        let backedge = self.emit_jump_backward_instruction(JUMP_BACKWARD, restart)?;
         if inline_try_tail {
-            self.assembler.prepare_last_no_location_block_for_inlining();
+            self.assembler
+                .prepare_no_location_block_for_inlining(backedge);
         }
         if body
             .last()
             .is_some_and(try_has_conditional_shared_loop_exit)
         {
             // CPython copies this shared backedge onto each conditional fallthrough.
-            self.assembler.mark_last_as_artificial_eval_break();
+            self.assembler.mark_as_artificial_eval_break(backedge);
         }
         Ok(())
     }
@@ -5465,13 +5469,13 @@ impl Compiler<'_> {
         &mut self,
         restart: Label,
         exclude_from_innermost_exception: bool,
-    ) -> Result<(), CompileError> {
+    ) -> Result<EmittedJump, CompileError> {
         let exclusion_start = exclude_from_innermost_exception.then(|| {
             let start = self.assembler.label();
             self.assembler.mark(start);
             start
         });
-        self.emit_jump_backward(JUMP_BACKWARD, restart, 0)?;
+        let backedge = self.emit_jump_backward_instruction(JUMP_BACKWARD, restart)?;
         if let Some(exclusion_start) = exclusion_start {
             let exclusion_end = self.assembler.label();
             self.assembler.mark(exclusion_end);
@@ -5482,7 +5486,7 @@ impl Compiler<'_> {
                 .expect("try-body loop tail requires an active exception region")
                 .push((exclusion_start, exclusion_end));
         }
-        Ok(())
+        Ok(backedge)
     }
 
     fn compile_loop_tail_if(
@@ -5568,9 +5572,9 @@ impl Compiler<'_> {
                         self.source_location(condition_fallthrough_range(&statement.test)),
                     );
                 }
-                self.emit_loop_tail_backedge(restart, protected_try_normal_exit)?;
+                let backedge = self.emit_loop_tail_backedge(restart, protected_try_normal_exit)?;
                 if copy_iterator_branch_exit {
-                    self.assembler.mark_last_as_artificial_eval_break();
+                    self.assembler.mark_as_artificial_eval_break(backedge);
                 }
                 return Ok(());
             }
@@ -5984,10 +5988,10 @@ impl Compiler<'_> {
             );
             self.assembler
                 .set_location(self.source_location(fallthrough_range));
-            self.emit_loop_tail_backedge(restart, try_body_normal_exit)?;
+            let backedge = self.emit_loop_tail_backedge(restart, try_body_normal_exit)?;
             if copied_protected_fallthrough.is_some() {
                 // CPython copies a protected loop-tail exit onto each short-circuit edge.
-                self.assembler.mark_last_as_artificial_eval_break();
+                self.assembler.mark_as_artificial_eval_break(backedge);
             }
         }
         Ok(())
@@ -6117,13 +6121,13 @@ impl Compiler<'_> {
         self.set_depth(base_depth);
         self.assembler
             .set_location(self.source_location(comparison.range));
-        self.emit_jump_forward(JUMP_FORWARD, body, 0)?;
+        let success_exit = self.emit_jump_forward_instruction(JUMP_FORWARD, body)?;
         if negated
             || (preserve_return_nop && matches!(statement.body.as_slice(), [Stmt::Return(_)]))
         {
             // CPython retains the successful chained-comparison edge when a terminal return is
             // copied onto it; a non-final loop branch has a separate fallback layout.
-            self.assembler.preserve_last_inlined_jump_nop();
+            self.assembler.preserve_inlined_jump_nop(success_exit);
         }
 
         self.assembler.mark(cleanup);
@@ -6546,17 +6550,17 @@ impl Compiler<'_> {
             if loop_tail_boolean {
                 self.assembler.set_location(SourceLocation::NONE);
             }
-            self.emit_jump_backward(JUMP_BACKWARD, start, 0)?;
+            let backedge = self.emit_jump_backward_instruction(JUMP_BACKWARD, start)?;
             if loop_tail_boolean {
                 // CPython duplicates this unlocated loop exit onto every short-circuit edge.
-                self.assembler.mark_last_as_artificial_eval_break();
+                self.assembler.mark_as_artificial_eval_break(backedge);
             }
             if statement
                 .body
                 .last()
                 .is_some_and(try_has_conditional_shared_loop_exit)
             {
-                self.assembler.mark_last_as_artificial_eval_break();
+                self.assembler.mark_as_artificial_eval_break(backedge);
             }
         }
 
@@ -8113,18 +8117,23 @@ impl Compiler<'_> {
             } else {
                 ExceptionPolicy::default()
             };
-            self.emit_jump_forward_with_exception_policy(JUMP_FORWARD, end, 0, exception_policy)?;
+            let normal_exit = self.emit_jump_forward_instruction_with_exception_policy(
+                JUMP_FORWARD,
+                end,
+                exception_policy,
+            )?;
             if drop_multi_condition_exit_nop {
                 // CPython removes the normal try exit fed by multiple condition fallthroughs.
-                self.assembler.defer_last_jump_removal();
-                self.assembler.mark_last_borrow_empty_block();
+                self.assembler.defer_jump_removal(normal_exit);
+                self.assembler.mark_borrow_empty_block(normal_exit);
             }
             if self.control.exceptions.copied_split_return_try == Some(statement.range) {
-                self.assembler.allow_last_split_return_copy();
+                self.assembler.allow_split_return_copy(normal_exit);
             }
             if following_try_threads_conditional_exit {
                 self.assembler.prevent_borrow_reachability(end);
-                self.assembler.preserve_last_no_location();
+                self.assembler
+                    .preserve_no_location(normal_exit.instruction());
             }
             if let Some(start) = trailing_handler_exit_exclusion_start {
                 let exclusion_end = self.assembler.label();
@@ -8138,20 +8147,24 @@ impl Compiler<'_> {
             }
             if copy_break_only_loop_exit {
                 // Copy the following try exit directly onto the only reachable loop break.
-                self.assembler.prepare_last_no_location_block_for_inlining();
+                self.assembler
+                    .prepare_no_location_block_for_inlining(normal_exit);
             }
             if unlocated_direct_exit_before_break {
-                self.assembler.preserve_last_no_location();
+                self.assembler
+                    .preserve_no_location(normal_exit.instruction());
             }
             if unlocated_conditional_exit {
                 self.assembler.prevent_borrow_reachability(end);
-                self.assembler.preserve_last_no_location();
+                self.assembler
+                    .preserve_no_location(normal_exit.instruction());
             }
             if nested_handler_tail_if_with_terminal_handlers {
-                self.assembler.preserve_last_no_location();
+                self.assembler
+                    .preserve_no_location(normal_exit.instruction());
             }
             if normal_exit_starts_in_empty_block {
-                self.assembler.mark_last_borrow_empty_block();
+                self.assembler.mark_borrow_empty_block(normal_exit);
             }
             if (handlers_terminate
                 && !self
@@ -8164,43 +8177,45 @@ impl Compiler<'_> {
                 // the barrier on the source edge so a shared target can still be reached from
                 // an enclosing branch or loop. A direct following name return is copied onto
                 // the normal edge first, so its load remains reachable and borrowed.
-                self.assembler.mark_last_borrow_fallthrough_barrier();
+                self.assembler
+                    .mark_borrow_fallthrough_barrier(normal_exit.instruction());
             }
             if !statement.orelse.is_empty()
                 && suite_ends_in_retained_try_exit_join(&statement.orelse)
                 && relocated_try_else_exit.is_none()
             {
                 self.assembler
-                    .preserve_last_redundant_jump_nop_after_threading();
+                    .preserve_redundant_jump_nop_after_threading(normal_exit);
                 if pass_only_handlers
                     && matches!(self.unit.scope, Scope::Function { .. })
                     && suite_retained_try_exit_has_normal_fallthrough(&statement.orelse)
                 {
-                    self.assembler.mark_last_retained_nop_borrow_fallthrough();
+                    self.assembler
+                        .mark_retained_nop_borrow_fallthrough(normal_exit);
                 }
             }
             if direct_exit_location.is_some() {
-                self.assembler.preserve_last_direct_inlined_jump_nop();
+                self.assembler.preserve_direct_inlined_jump_nop(normal_exit);
             }
             if statement.orelse.is_empty() && retained_assertion_exit {
-                self.assembler.prevent_last_jump_threading_target();
+                self.assembler.prevent_jump_threading_target(normal_exit);
             }
             if statement.orelse.is_empty()
                 && suite_ends_in_retained_try_body_exit_join(&statement.body)
             {
                 self.assembler
-                    .preserve_last_redundant_jump_nop_after_threading();
+                    .preserve_redundant_jump_nop_after_threading(normal_exit);
             }
             if body_ends_with_break_loop {
                 // CPython's `POP_BLOCK` initially prevents the loop break from threading
                 // through this normal try exit. Once `POP_BLOCK` disappears, the exit jump
                 // is retained as the loop cleanup's source-position NOP.
                 self.assembler
-                    .preserve_last_redundant_jump_nop_after_threading();
+                    .preserve_redundant_jump_nop_after_threading(normal_exit);
             }
             if statement.orelse.is_empty() && body_noop_location.is_some() {
                 // Keep the pass line when direct exit duplication replaces this jump.
-                self.assembler.preserve_last_direct_inlined_jump_nop();
+                self.assembler.preserve_direct_inlined_jump_nop(normal_exit);
             }
             if let Some(exit_exclusion_start) = exit_exclusion_start {
                 let exit_exclusion_end = self.assembler.label();
@@ -8210,7 +8225,7 @@ impl Compiler<'_> {
                 }
             }
             if self.control.exceptions.prevent_try_exit_inlining {
-                self.assembler.prevent_last_jump_inlining();
+                self.assembler.prevent_jump_inlining(normal_exit);
             }
         }
         self.add_exception_regions_with_exclusions(
@@ -8395,8 +8410,9 @@ impl Compiler<'_> {
                 if context.break_policy.returns() {
                     self.emit_implicit_return()?;
                 } else {
-                    self.emit_jump_forward(JUMP_BACKWARD, context.break_label, 0)?;
-                    self.assembler.mark_last_jump_as_authored_break();
+                    let break_jump =
+                        self.emit_jump_forward_instruction(JUMP_BACKWARD, context.break_label)?;
+                    self.assembler.mark_jump_as_authored_break(break_jump);
                 }
                 self.set_depth(unreachable_depth);
                 self.assembler.mark(next_handler);
@@ -8992,9 +9008,11 @@ impl Compiler<'_> {
                             self.delete_name_id(name)?;
                         }
                     }
-                    self.emit_jump_backward(JUMP_BACKWARD, context.continue_label, 0)?;
+                    let backedge =
+                        self.emit_jump_backward_instruction(JUMP_BACKWARD, context.continue_label)?;
                     if copy_nested_loop_handler_backedge {
-                        self.assembler.prepare_last_no_location_block_for_inlining();
+                        self.assembler
+                            .prepare_no_location_block_for_inlining(backedge);
                     }
                     let unwind_end = self.assembler.label();
                     self.assembler.mark(unwind_end);
@@ -9063,10 +9081,9 @@ impl Compiler<'_> {
                     } else {
                         ExceptionPolicy::default()
                     };
-                    self.emit_jump_forward_with_exception_policy(
+                    let handler_exit = self.emit_jump_forward_instruction_with_exception_policy(
                         JUMP_FORWARD,
                         end,
-                        0,
                         exception_policy,
                     )?;
                     if let Some(start) = trailing_handler_exit_exclusion_start {
@@ -9082,16 +9099,18 @@ impl Compiler<'_> {
                     if handler_ends_with_inlineable_cleanup {
                         // The cleanup is larger than a small exit, but is still eligible because
                         // it has no line number and cannot fall through.
-                        self.assembler.prepare_last_no_location_block_for_inlining();
+                        self.assembler
+                            .prepare_no_location_block_for_inlining(handler_exit);
                         if handler_ends_with_nonterminal_with {
-                            self.assembler.make_last_no_location_copy_interruptible();
+                            self.assembler
+                                .make_no_location_copy_interruptible(handler_exit);
                         }
                     }
                     let return_is_overridden =
                         self.control.finally.active_overriding_finally_returns > 0
                             && matches!(handler.body.last(), Some(Stmt::Return(_)));
                     if self.control.exceptions.prevent_try_exit_inlining && !return_is_overridden {
-                        self.assembler.prevent_last_jump_inlining();
+                        self.assembler.prevent_jump_inlining(handler_exit);
                     }
                 }
             }
@@ -10216,15 +10235,19 @@ impl Compiler<'_> {
                 self.assembler.mark(start);
                 start
             });
-            self.emit_jump_forward_with_exception_policy(JUMP_FORWARD, end, 0, exception_policy)?;
+            let normal_exit = self.emit_jump_forward_instruction_with_exception_policy(
+                JUMP_FORWARD,
+                end,
+                exception_policy,
+            )?;
             if drop_expression_if_exit_nop {
                 // Keep the normal-finally exit through CPython's exit-copy pass, then remove it
                 // instead of retaining the redundant jump as a source-position NOP.
-                self.assembler.defer_last_jump_removal();
-                self.assembler.mark_last_borrow_empty_block();
+                self.assembler.defer_jump_removal(normal_exit);
+                self.assembler.mark_borrow_empty_block(normal_exit);
             } else if preserve_exit_nop {
                 self.assembler
-                    .preserve_last_redundant_jump_nop_after_threading();
+                    .preserve_redundant_jump_nop_after_threading(normal_exit);
                 let linear_finalbody = matches!(
                     statement.finalbody.as_slice(),
                     [Stmt::Expr(_)] | [Stmt::Expr(_), Stmt::Expr(_)]
@@ -10233,7 +10256,8 @@ impl Compiler<'_> {
                     && retained_assertion_test
                         .is_some_and(|test| early_condition_truthiness(test) != Some(true))
                 {
-                    self.assembler.mark_last_retained_nop_borrow_fallthrough();
+                    self.assembler
+                        .mark_retained_nop_borrow_fallthrough(normal_exit);
                 }
             }
             if let Some(exit_exclusion_start) = exit_exclusion_start {
@@ -10449,8 +10473,9 @@ impl Compiler<'_> {
         if context.break_policy.returns() {
             self.emit_implicit_return()?;
         } else {
-            self.emit_jump_forward(JUMP_FORWARD, context.break_label, 0)?;
-            self.assembler.mark_last_jump_as_authored_break();
+            let break_jump =
+                self.emit_jump_forward_instruction(JUMP_FORWARD, context.break_label)?;
+            self.assembler.mark_jump_as_authored_break(break_jump);
         }
 
         self.assembler.mark(handler);
@@ -10469,8 +10494,9 @@ impl Compiler<'_> {
         if context.break_policy.returns() {
             self.emit_implicit_return()?;
         } else {
-            self.emit_jump_forward(JUMP_FORWARD, context.break_label, 0)?;
-            self.assembler.mark_last_jump_as_authored_break();
+            let break_jump =
+                self.emit_jump_forward_instruction(JUMP_FORWARD, context.break_label)?;
+            self.assembler.mark_jump_as_authored_break(break_jump);
         }
         self.assembler.add_exception_region(
             handler,
@@ -10958,9 +10984,9 @@ impl Compiler<'_> {
             if terminal {
                 self.emit_implicit_return()?;
             } else {
-                self.emit_jump_forward(JUMP_FORWARD, end, 0)?;
+                let normal_exit = self.emit_jump_forward_instruction(JUMP_FORWARD, end)?;
                 if self.control.finally.active_finally_try_bodies > 0 {
-                    self.assembler.prevent_last_jump_inlining();
+                    self.assembler.prevent_jump_inlining(normal_exit);
                 }
             }
         }
@@ -11016,9 +11042,9 @@ impl Compiler<'_> {
                 self.assembler.mark(start);
                 start
             });
-            self.emit_jump_forward(JUMP_FORWARD, end, 0)?;
+            let handler_exit = self.emit_jump_forward_instruction(JUMP_FORWARD, end)?;
             if self.control.finally.active_finally_try_bodies > 0 {
-                self.assembler.prevent_last_jump_inlining();
+                self.assembler.prevent_jump_inlining(handler_exit);
             }
             if let Some(start) = outer_exception_exit_start {
                 let exclusion_end = self.assembler.label();

@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use rustc_hash::FxHashSet;
 
 use super::block_graph::BlockGraph;
@@ -80,6 +82,36 @@ pub(crate) struct Label(pub(super) u32);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct OperandPatchId(pub(super) u32);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct EmissionStreamId(u64);
+
+impl EmissionStreamId {
+    pub(super) fn next() -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        assert_ne!(id, 0, "assembler emission stream IDs exhausted");
+        Self(id)
+    }
+}
+
+/// Identifies an instruction while compiler emission is still in progress.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct EmittedInstruction {
+    pub(super) stream: EmissionStreamId,
+    pub(super) item_index: u32,
+}
+
+/// Identifies an emitted jump without allowing ordinary instructions at call sites.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct EmittedJump(pub(super) EmittedInstruction);
+
+impl EmittedJump {
+    pub(crate) const fn instruction(self) -> EmittedInstruction {
+        self.0
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Operand {
@@ -920,6 +952,7 @@ pub(crate) struct Assembler {
     /// Labels do not consume instruction offsets, so keeping this index alongside `code` avoids
     /// repeatedly scanning every preceding item while the compiler is still emitting code.
     pub(super) instruction_item_indices: Vec<usize>,
+    pub(super) emission_stream: EmissionStreamId,
     pub(super) operand_patches: Vec<OperandPatch>,
     pub(super) deferred_none_constant_index: Option<u32>,
     pub(super) next_label: u32,
@@ -1005,6 +1038,7 @@ impl Default for Assembler {
         Self {
             code: UnoptimizedCode::Linear(Vec::new()),
             instruction_item_indices: Vec::new(),
+            emission_stream: EmissionStreamId::next(),
             operand_patches: Vec::new(),
             deferred_none_constant_index: None,
             next_label: 0,

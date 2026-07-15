@@ -32,7 +32,8 @@ use crate::target::{
 #[cfg(any(test, debug_assertions))]
 use ir::AssemblerStage;
 pub(crate) use ir::{
-    AssembledCode, Assembler, ExceptionPolicy, Label, OperandPatchId, SourceLocation,
+    AssembledCode, Assembler, EmittedInstruction, EmittedJump, ExceptionPolicy, Label,
+    OperandPatchId, SourceLocation,
 };
 use ir::{
     BorrowFallthrough, ExceptionExclusion, ExceptionRegion, Instruction, Item, LayoutAssembler,
@@ -276,6 +277,41 @@ impl Assembler {
                 Operand::Forward(_) | Operand::Backward(_)
             ),
             "{operation} requires a jump instruction"
+        );
+        instruction
+    }
+
+    fn emitted_instruction_mut(
+        &mut self,
+        emitted: EmittedInstruction,
+        operation: &str,
+    ) -> &mut Instruction {
+        assert_eq!(
+            emitted.stream, self.emission_stream,
+            "{operation} received a handle from a different assembler"
+        );
+        let index = usize::try_from(emitted.item_index)
+            .expect("emitted instruction index should fit in usize");
+        assert_eq!(
+            self.instruction_item_indices.last().copied(),
+            Some(index),
+            "{operation} received a stale emitted-instruction handle"
+        );
+        let items = self.linear_items_mut();
+        let Some(Item::Instruction(instruction)) = items.get_mut(index) else {
+            panic!("{operation} received a stale emitted-instruction handle");
+        };
+        instruction
+    }
+
+    fn emitted_jump_mut(&mut self, emitted: EmittedJump, operation: &str) -> &mut Instruction {
+        let instruction = self.emitted_instruction_mut(emitted.instruction(), operation);
+        assert!(
+            matches!(
+                instruction.operand(),
+                Operand::Forward(_) | Operand::Backward(_)
+            ),
+            "{operation} requires an emitted jump"
         );
         instruction
     }
@@ -658,16 +694,23 @@ impl Assembler {
             .set_borrow_fallthrough(BorrowFallthrough::Barrier);
     }
 
+    /// Stops borrowed-load analysis at a specifically identified emitted instruction.
+    pub(crate) fn mark_borrow_fallthrough_barrier(&mut self, emitted: EmittedInstruction) {
+        self.emitted_instruction_mut(emitted, "marking a borrow fallthrough barrier")
+            .no_location_policy
+            .set_borrow_fallthrough(BorrowFallthrough::Barrier);
+    }
+
     /// Keeps borrowed-load traversal connected through a retained redundant-jump NOP.
-    pub(crate) fn mark_last_retained_nop_borrow_fallthrough(&mut self) {
-        self.last_jump_instruction_mut("marking retained NOP borrow fallthrough")
+    pub(crate) fn mark_retained_nop_borrow_fallthrough(&mut self, emitted: EmittedJump) {
+        self.emitted_jump_mut(emitted, "marking retained NOP borrow fallthrough")
             .no_location_policy
             .set_borrow_fallthrough(BorrowFallthrough::RetainedNopReachable);
     }
 
     /// Retains a redundant jump as an analysis-only marker for CPython's empty CFG block.
-    pub(crate) fn mark_last_borrow_empty_block(&mut self) {
-        self.last_jump_instruction_mut("marking an empty borrowed-load block")
+    pub(crate) fn mark_borrow_empty_block(&mut self, emitted: EmittedJump) {
+        self.emitted_jump_mut(emitted, "marking an empty borrowed-load block")
             .jump_policy
             .mark_borrow_empty_block();
     }
@@ -785,65 +828,82 @@ impl Assembler {
             .prevent_with_next();
     }
 
-    /// Prevents fusion with the previous instruction without introducing a CFG boundary.
-    pub(crate) fn prevent_last_instruction_fusion_with_previous(&mut self) {
-        self.required_last_instruction_mut("preventing fusion with the previous instruction")
+    /// Prevents a specifically identified instruction from fusing with its successor.
+    pub(crate) fn prevent_instruction_fusion(&mut self, emitted: EmittedInstruction) {
+        self.emitted_instruction_mut(emitted, "preventing fusion with the next instruction")
+            .fusion_policy
+            .prevent_with_next();
+    }
+
+    /// Prevents a specifically identified instruction from fusing with its predecessor.
+    pub(crate) fn prevent_instruction_fusion_with_previous(&mut self, emitted: EmittedInstruction) {
+        self.emitted_instruction_mut(emitted, "preventing fusion with the previous instruction")
             .fusion_policy
             .prevent_with_previous();
     }
 
-    /// Records that the last `STORE_FAST` restores a value saved by an inlined comprehension.
+    /// Records that a `STORE_FAST` restores a value saved by an inlined comprehension.
     /// The saved stack slot may contain NULL, unlike an ordinary local store.
-    pub(crate) fn mark_last_store_fast_as_maybe_null_comprehension_restore(&mut self) {
-        let instruction = self.required_last_instruction_mut("marking a maybe-null local restore");
-        assert_eq!(instruction.opcode, STORE_FAST);
+    pub(crate) fn mark_store_fast_as_maybe_null_comprehension_restore(
+        &mut self,
+        emitted: EmittedInstruction,
+    ) {
+        let instruction = self.emitted_instruction_mut(emitted, "marking a maybe-null restore");
+        assert_eq!(
+            instruction.opcode, STORE_FAST,
+            "marking a maybe-null restore requires STORE_FAST"
+        );
         instruction
             .local_policy
             .mark_maybe_null_comprehension_restore();
     }
 
-    pub(crate) fn mark_last_load_fast_as_post_analysis_closure(&mut self) {
+    pub(crate) fn mark_load_fast_as_post_analysis_closure(&mut self, emitted: EmittedInstruction) {
         let instruction =
-            self.required_last_instruction_mut("marking a post-analysis closure load");
-        assert_eq!(instruction.opcode, LOAD_FAST);
+            self.emitted_instruction_mut(emitted, "marking a post-analysis closure load");
+        assert_eq!(
+            instruction.opcode, LOAD_FAST,
+            "marking a post-analysis closure load requires LOAD_FAST"
+        );
         instruction.local_policy.mark_post_analysis_closure_load();
     }
 
-    pub(crate) fn mark_last_load_fast_as_known_initialized(&mut self) {
-        let instruction = self.required_last_instruction_mut("marking an initialized local load");
-        assert_eq!(instruction.opcode, LOAD_FAST);
+    pub(crate) fn mark_load_fast_as_known_initialized(&mut self, emitted: EmittedInstruction) {
+        let instruction = self.emitted_instruction_mut(emitted, "marking an initialized load");
+        assert_eq!(
+            instruction.opcode, LOAD_FAST,
+            "marking an initialized load requires LOAD_FAST"
+        );
         instruction.local_policy.mark_known_initialized_load();
     }
 
     /// Defers a redundant jump until the pass after exit-block duplication.
-    pub(crate) fn defer_last_jump_removal(&mut self) {
-        self.last_jump_instruction_mut("deferring redundant jump removal")
+    pub(crate) fn defer_jump_removal(&mut self, emitted: EmittedJump) {
+        self.emitted_jump_mut(emitted, "deferring redundant jump removal")
             .jump_policy
             .defer_removal();
     }
-    pub(crate) fn allow_last_transitive_small_exit_inlining(&mut self) {
-        self.last_jump_instruction_mut("allowing transitive small-exit inlining")
+    pub(crate) fn allow_transitive_small_exit_inlining(&mut self, emitted: EmittedJump) {
+        self.emitted_jump_mut(emitted, "allowing transitive small-exit inlining")
             .fusion_policy
             .allow_transitive_small_exit_inlining();
     }
 
-    /// Allows incoming jumps to thread through the last jump before retaining it as a NOP.
-    pub(crate) fn preserve_last_redundant_jump_nop_after_threading(&mut self) {
-        let policy = &mut self
-            .last_jump_instruction_mut("retaining a redundant jump NOP after threading")
-            .jump_policy;
-        policy.retain_redundant_nop_after_threading();
+    pub(crate) fn preserve_redundant_jump_nop_after_threading(&mut self, emitted: EmittedJump) {
+        self.emitted_jump_mut(emitted, "retaining a redundant jump NOP after threading")
+            .jump_policy
+            .retain_redundant_nop_after_threading();
     }
 
-    pub(crate) fn prevent_last_jump_inlining(&mut self) {
-        self.last_jump_instruction_mut("preventing jump inlining")
+    pub(crate) fn prevent_jump_inlining(&mut self, emitted: EmittedJump) {
+        self.emitted_jump_mut(emitted, "preventing jump inlining")
             .jump_policy
             .prevent_small_exit_inlining();
     }
 
     /// Allows a direct jump to copy a return split by an exception-region boundary.
-    pub(crate) fn allow_last_split_return_copy(&mut self) {
-        self.last_jump_instruction_mut("allowing a split return copy")
+    pub(crate) fn allow_split_return_copy(&mut self, emitted: EmittedJump) {
+        self.emitted_jump_mut(emitted, "allowing a split return copy")
             .no_location_policy
             .allow_split_return_exit_copy();
     }
@@ -878,36 +938,42 @@ impl Assembler {
             .retain_nop();
     }
 
-    pub(crate) fn preserve_last_direct_inlined_jump_nop(&mut self) {
-        let instruction = self.last_jump_instruction_mut("retaining a directly inlined jump NOP");
+    pub(crate) fn preserve_inlined_jump_nop(&mut self, emitted: EmittedJump) {
+        self.emitted_jump_mut(emitted, "retaining an inlined jump NOP")
+            .jump_policy
+            .retain_nop();
+    }
+
+    pub(crate) fn preserve_direct_inlined_jump_nop(&mut self, emitted: EmittedJump) {
+        let instruction = self.emitted_jump_mut(emitted, "retaining a directly inlined jump NOP");
         let Operand::Forward(_) = instruction.operand() else {
             panic!("retaining a directly inlined jump NOP requires a forward jump");
         };
         instruction.jump_policy.retain_nop_for_direct_target();
     }
 
-    pub(crate) fn prevent_last_jump_threading_target(&mut self) {
-        self.last_jump_instruction_mut("preventing jump threading through a target")
+    pub(crate) fn prevent_jump_threading_target(&mut self, emitted: EmittedJump) {
+        self.emitted_jump_mut(emitted, "preventing jump threading through a target")
             .jump_policy
             .prevent_threading_target();
     }
 
-    pub(crate) fn mark_last_jump_as_authored_break(&mut self) {
-        self.last_jump_instruction_mut("marking an authored break jump")
+    pub(crate) fn mark_jump_as_authored_break(&mut self, emitted: EmittedJump) {
+        self.emitted_jump_mut(emitted, "marking an authored break jump")
             .fusion_policy
             .mark_authored_break();
     }
 
-    pub(crate) fn prepare_last_no_location_block_for_inlining(&mut self) {
+    pub(crate) fn prepare_no_location_block_for_inlining(&mut self, emitted: EmittedJump) {
         let instruction =
-            self.last_jump_instruction_mut("preparing a no-location block for inlining");
+            self.emitted_jump_mut(emitted, "preparing a no-location block for inlining");
         instruction.location = SourceLocation::NONE;
         instruction.jump_policy.prevent_threading_target();
         instruction.no_location_policy.allow_block_inlining();
     }
 
-    pub(crate) fn make_last_no_location_copy_interruptible(&mut self) {
-        self.last_jump_instruction_mut("making a no-location copy interruptible")
+    pub(crate) fn make_no_location_copy_interruptible(&mut self, emitted: EmittedJump) {
+        self.emitted_jump_mut(emitted, "making a no-location copy interruptible")
             .no_location_policy
             .make_first_copy_interruptible();
     }
@@ -922,17 +988,22 @@ impl Assembler {
         .make_copy_inherit_shared_predecessor();
     }
 
-    /// Records that the provisional source location on the last eval-break instruction was
-    /// propagated from an artificial CPython instruction emitted with `NO_LOCATION`.
-    pub(crate) fn mark_last_as_artificial_eval_break(&mut self) {
+    /// Records that an eval-break location came from an artificial `NO_LOCATION` instruction.
+    pub(crate) fn mark_as_artificial_eval_break(&mut self, emitted: EmittedJump) {
         let instruction =
-            self.required_last_instruction_mut("marking an artificial eval-break instruction");
+            self.emitted_jump_mut(emitted, "marking an artificial eval-break instruction");
         debug_assert_eq!(instruction.opcode, JUMP_BACKWARD);
         instruction.no_location_policy.mark_artificial_eval_break();
     }
 
     pub(crate) fn preserve_last_no_location(&mut self) {
         self.required_last_instruction_mut("preserving a no-location instruction")
+            .no_location_policy
+            .preserve_location();
+    }
+
+    pub(crate) fn preserve_no_location(&mut self, emitted: EmittedInstruction) {
+        self.emitted_instruction_mut(emitted, "preserving a no-location instruction")
             .no_location_policy
             .preserve_location();
     }
@@ -1007,6 +1078,9 @@ impl Assembler {
         };
         items.remove(index);
         self.instruction_item_indices.pop();
+        // A later emission can reuse the removed item's index. Start a fresh stream so a copied
+        // handle to the NOP cannot alias the replacement instruction.
+        self.emission_stream = ir::EmissionStreamId::next();
         Some((instruction.location, exclusion))
     }
 
@@ -1031,8 +1105,8 @@ impl Assembler {
         });
     }
 
-    pub(crate) fn emit(&mut self, opcode: Opcode, argument: u32) {
-        self.emit_operand(opcode, Operand::Value(argument));
+    pub(crate) fn emit(&mut self, opcode: Opcode, argument: u32) -> EmittedInstruction {
+        self.emit_operand(opcode, Operand::Value(argument))
     }
 
     pub(crate) fn emit_with_depth(
@@ -1041,23 +1115,27 @@ impl Assembler {
         argument: u32,
         depth_after: u32,
         exception_policy: ExceptionPolicy,
-    ) {
+    ) -> EmittedInstruction {
         self.emit_operand_with_depth_and_exception_policy(
             opcode,
             Operand::Value(argument),
             Some(depth_after),
             exception_policy,
-        );
+        )
     }
 
-    pub(crate) fn emit_owned_fast_with_depth(&mut self, argument: u32, depth_after: u32) {
+    pub(crate) fn emit_owned_fast_with_depth(
+        &mut self,
+        argument: u32,
+        depth_after: u32,
+    ) -> EmittedInstruction {
         self.emit_operand_with_depth_and_ownership(
             LOAD_FAST,
             Operand::Value(argument),
             Some(depth_after),
             true,
             ExceptionPolicy::default(),
-        );
+        )
     }
 
     pub(crate) fn emit_placeholder_with_depth(
@@ -1348,17 +1426,17 @@ impl Assembler {
         label: Label,
         depth_after: u32,
         exception_policy: ExceptionPolicy,
-    ) {
-        self.emit_operand_with_depth_and_exception_policy(
+    ) -> EmittedJump {
+        EmittedJump(self.emit_operand_with_depth_and_exception_policy(
             opcode,
             Operand::Forward(label),
             Some(depth_after),
             exception_policy,
-        );
+        ))
     }
 
-    pub(crate) fn emit_backward(&mut self, opcode: Opcode, label: Label) {
-        self.emit_operand(opcode, Operand::Backward(label));
+    pub(crate) fn emit_backward(&mut self, opcode: Opcode, label: Label) -> EmittedJump {
+        EmittedJump(self.emit_operand(opcode, Operand::Backward(label)))
     }
 
     pub(crate) fn emit_backward_with_depth_and_exception_policy(
@@ -1367,17 +1445,17 @@ impl Assembler {
         label: Label,
         depth_after: u32,
         exception_policy: ExceptionPolicy,
-    ) {
-        self.emit_operand_with_depth_and_exception_policy(
+    ) -> EmittedJump {
+        EmittedJump(self.emit_operand_with_depth_and_exception_policy(
             opcode,
             Operand::Backward(label),
             Some(depth_after),
             exception_policy,
-        );
+        ))
     }
 
-    fn emit_operand(&mut self, opcode: Opcode, operand: Operand) {
-        self.emit_operand_with_depth(opcode, operand, None);
+    fn emit_operand(&mut self, opcode: Opcode, operand: Operand) -> EmittedInstruction {
+        self.emit_operand_with_depth(opcode, operand, None)
     }
 
     fn emit_operand_with_depth(
@@ -1385,13 +1463,13 @@ impl Assembler {
         opcode: Opcode,
         operand: Operand,
         depth_after: Option<u32>,
-    ) {
+    ) -> EmittedInstruction {
         self.emit_operand_with_depth_and_exception_policy(
             opcode,
             operand,
             depth_after,
             ExceptionPolicy::default(),
-        );
+        )
     }
 
     fn emit_operand_with_depth_and_exception_policy(
@@ -1400,14 +1478,14 @@ impl Assembler {
         operand: Operand,
         depth_after: Option<u32>,
         exception_policy: ExceptionPolicy,
-    ) {
+    ) -> EmittedInstruction {
         self.emit_operand_with_depth_and_ownership(
             opcode,
             operand,
             depth_after,
             false,
             exception_policy,
-        );
+        )
     }
 
     fn emit_operand_with_depth_and_ownership(
@@ -1417,7 +1495,7 @@ impl Assembler {
         depth_after: Option<u32>,
         explicitly_owned: bool,
         exception_policy: ExceptionPolicy,
-    ) {
+    ) -> EmittedInstruction {
         let strict_owned_load = self.strict_owned_loads && opcode == LOAD_FAST;
         let force_owned_load = explicitly_owned
             || strict_owned_load
@@ -1438,7 +1516,13 @@ impl Assembler {
         {
             self.has_constant_pop_candidate = true;
         }
+        let emitted = EmittedInstruction {
+            stream: self.emission_stream,
+            item_index: u32::try_from(self.linear_items().len())
+                .expect("assembler item index should fit in u32"),
+        };
         self.push_linear_item(Item::Instruction(instruction));
+        emitted
     }
 }
 

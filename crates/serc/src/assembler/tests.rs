@@ -3,8 +3,8 @@ use super::ir::{
     RetainedJumpNop, UnoptimizedCode,
 };
 use super::{
-    Assembler, AssemblerStage, ExceptionExclusion, Instruction, Item, NormalizedExceptionOwner,
-    Operand, OperandPatchId, SourceLocation,
+    Assembler, AssemblerStage, EmittedJump, ExceptionExclusion, Instruction, Item,
+    NormalizedExceptionOwner, Operand, OperandPatchId, SourceLocation,
 };
 use crate::target::opcodes::*;
 use crate::target::operands::{CommonConstant, ResumeLocation};
@@ -236,9 +236,32 @@ fn deferred_jump_removal_promotes_post_threading_nop_retention() {
 }
 
 #[test]
-#[should_panic(expected = "deferring redundant jump removal requires a preceding instruction")]
-fn jump_policy_mutation_requires_a_preceding_instruction() {
-    Assembler::default().defer_last_jump_removal();
+#[should_panic(expected = "stale emitted-instruction handle")]
+fn emitted_instruction_handles_reject_stale_instructions() {
+    let mut assembler = Assembler::default();
+    let target = assembler.label();
+    let jump =
+        assembler.emit_forward_with_depth(JUMP_FORWARD, target, 0, ExceptionPolicy::default());
+    assembler.emit(NOP, 0);
+    assembler.defer_jump_removal(jump);
+}
+
+#[test]
+fn emitted_instruction_handles_reject_reused_item_indices() {
+    let mut assembler = Assembler::default();
+    let removed = assembler.emit(NOP, 0);
+    assert!(assembler.take_trailing_nop_location().is_some());
+    assembler.emit(LOAD_CONST, 0);
+
+    let mutation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assembler.prevent_instruction_fusion(removed);
+    }));
+
+    assert!(mutation.is_err());
+    let Some(Item::Instruction(replacement)) = assembler.linear_items().last() else {
+        panic!("replacement instruction was not emitted");
+    };
+    assert!(!replacement.fusion_policy.prevents_with_next());
 }
 
 #[test]
@@ -250,11 +273,22 @@ fn instruction_policy_mutation_requires_a_preceding_instruction() {
 }
 
 #[test]
-#[should_panic(expected = "preventing jump inlining requires a jump instruction")]
-fn jump_policy_mutation_requires_a_jump() {
+#[should_panic(expected = "handle from a different assembler")]
+fn emitted_instruction_handles_reject_a_different_assembler() {
+    let mut first = Assembler::default();
+    let emitted = first.emit(NOP, 0);
+
+    let mut second = Assembler::default();
+    second.emit(NOP, 0);
+    second.prevent_instruction_fusion(emitted);
+}
+
+#[test]
+#[should_panic(expected = "preventing jump inlining requires an emitted jump")]
+fn typed_jump_policy_mutation_rejects_a_non_jump_handle() {
     let mut assembler = Assembler::default();
-    assembler.emit(NOP, 0);
-    assembler.prevent_last_jump_inlining();
+    let instruction = assembler.emit(NOP, 0);
+    assembler.prevent_jump_inlining(EmittedJump(instruction));
 }
 
 #[test]
@@ -262,17 +296,17 @@ fn jump_policy_mutation_requires_a_jump() {
 fn direct_jump_nop_provenance_requires_a_forward_jump() {
     let mut assembler = Assembler::default();
     let target = assembler.label();
-    assembler.emit_backward(JUMP_BACKWARD, target);
-    assembler.preserve_last_direct_inlined_jump_nop();
+    let jump = assembler.emit_backward(JUMP_BACKWARD, target);
+    assembler.preserve_direct_inlined_jump_nop(jump);
 }
 
 #[test]
 fn borrow_fallthrough_barrier_stays_on_predecessor_across_labels_and_emission() {
     let mut assembler = Assembler::default();
-    assembler.emit(LOAD_CONST, 0);
+    let predecessor = assembler.emit(LOAD_CONST, 0);
     let boundary = assembler.label();
     assembler.mark(boundary);
-    assembler.mark_last_borrow_fallthrough_barrier();
+    assembler.mark_borrow_fallthrough_barrier(predecessor);
     assembler.emit(LOAD_CONST, 1);
 
     let [
@@ -298,12 +332,19 @@ fn borrow_fallthrough_barrier_stays_on_predecessor_across_labels_and_emission() 
 }
 
 #[test]
-#[should_panic(expected = "borrow fallthrough barrier requires a preceding instruction")]
-fn borrow_fallthrough_barrier_requires_a_predecessor() {
+fn jump_policy_handles_remain_valid_across_trailing_labels() {
     let mut assembler = Assembler::default();
-    let boundary = assembler.label();
-    assembler.mark(boundary);
-    assembler.mark_last_borrow_fallthrough_barrier();
+    let target = assembler.label();
+    let jump =
+        assembler.emit_forward_with_depth(JUMP_FORWARD, target, 0, ExceptionPolicy::default());
+    assembler.mark(target);
+
+    assembler.prevent_jump_inlining(jump);
+
+    let Some(Item::Instruction(instruction)) = assembler.linear_items().first() else {
+        panic!("jump was not emitted");
+    };
+    assert!(!instruction.jump_policy.inline_small_exit());
 }
 
 #[test]

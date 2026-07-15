@@ -393,11 +393,11 @@ impl Compiler<'_> {
                     if terminal {
                         self.emit_deferred_implicit_return()?;
                     } else {
-                        self.emit_jump_forward(JUMP_FORWARD, end, 0)?;
+                        let success_exit = self.emit_jump_forward_instruction(JUMP_FORWARD, end)?;
                         if index + 1 == matched_cases && !context.fail_pop.is_empty() {
                             // CPython duplicates small exits before removing this jump across
                             // the empty final pattern-failure block.
-                            self.assembler.defer_last_jump_removal();
+                            self.assembler.defer_jump_removal(success_exit);
                         }
                         let subject_pop_is_optimized_away = !copied_subject
                             && context.stores.is_empty()
@@ -408,12 +408,12 @@ impl Compiler<'_> {
                                 location.line == self.assembler.location().line
                             });
                         if irrefutable_true_guard {
-                            self.assembler.preserve_last_inlined_jump_nop();
+                            self.assembler.preserve_inlined_jump_nop(success_exit);
                         } else if self.assembler.instruction_count() == body_start + 1
                             && !previous_instruction_covers_branch
                             && !matches!(self.unit.scope, Scope::Class { .. })
                         {
-                            self.assembler.preserve_last_inlined_jump_nop();
+                            self.assembler.preserve_inlined_jump_nop(success_exit);
                             // CPython keeps this retained success-exit NOP on the physical
                             // fallthrough for irrefutable explicit-global captures. Refutable
                             // and local captures keep the ordinary borrowed-load barrier.
@@ -425,7 +425,8 @@ impl Compiler<'_> {
                                         if context.stores.iter().all(|name| globals.contains(*name))
                                 )
                             {
-                                self.assembler.mark_last_retained_nop_borrow_fallthrough();
+                                self.assembler
+                                    .mark_retained_nop_borrow_fallthrough(success_exit);
                             }
                         }
                     }
@@ -515,10 +516,11 @@ impl Compiler<'_> {
         self.set_depth(base_depth);
         self.assembler
             .set_location(self.source_location(synthetic_condition_exit_range(&statement.test)));
-        self.emit_jump_forward(JUMP_FORWARD, match_end, 0)?;
+        let false_case_exit = self.emit_jump_forward_instruction(JUMP_FORWARD, match_end)?;
         // CPython leaves the condition's false edge pointing at this case-exit block, even
         // though the block itself immediately jumps to the match join.
-        self.assembler.prevent_last_jump_threading_target();
+        self.assembler
+            .prevent_jump_threading_target(false_case_exit);
         Ok(())
     }
 
@@ -2481,9 +2483,10 @@ impl Compiler<'_> {
             let result = self.add_constant(Constant::Bool(initial_result))?;
             self.emit(LOAD_CONST, result, 1)?;
         }
-        self.emit_jump_forward(JUMP_FORWARD, end, 0)?;
+        let exhausted_exit = self.emit_jump_forward_instruction(JUMP_FORWARD, end)?;
         if collect_tuple && self.control.generators.copy_optimized_tuple_branch_exit {
-            self.assembler.allow_last_transitive_small_exit_inlining();
+            self.assembler
+                .allow_transitive_small_exit_inlining(exhausted_exit);
         }
 
         self.assembler.mark(fallback);
@@ -3196,9 +3199,9 @@ impl Compiler<'_> {
         }
 
         let normal_cleanup = self.assembler.label();
-        self.emit_jump_forward(JUMP_FORWARD, normal_cleanup, 0)?;
+        let normal_exit = self.emit_jump_forward_instruction(JUMP_FORWARD, normal_cleanup)?;
         if discard_result && generators.iter().any(|generator| generator.is_async) {
-            self.assembler.prevent_last_jump_inlining();
+            self.assembler.prevent_jump_inlining(normal_exit);
         }
         self.assembler.mark(cleanup);
         self.set_depth(base_depth + i32::try_from(temporary_indices.len()).unwrap() + 2);
@@ -3257,18 +3260,18 @@ impl Compiler<'_> {
                     if position > 0 {
                         self.assembler.fusion_barrier();
                     }
-                    self.emit_comprehension_restore(restore)?;
+                    let emitted = self.emit_comprehension_restore(restore)?;
                     self.assembler
-                        .prevent_last_instruction_fusion_with_previous();
+                        .prevent_instruction_fusion_with_previous(emitted);
                 }
             } else {
                 for (position, restore) in temporary_restores.iter().rev().copied().enumerate() {
                     if position > 0 {
                         self.assembler.fusion_barrier();
                     }
-                    self.emit_comprehension_restore(restore)?;
+                    let emitted = self.emit_comprehension_restore(restore)?;
                     self.assembler
-                        .prevent_last_instruction_fusion_with_previous();
+                        .prevent_instruction_fusion_with_previous(emitted);
                 }
                 // The SWAP/STORE_FAST_MAYBE_NULL restore contracts by one CFG slot.
                 self.assembler.add_last_hidden_exception_owner_slots(1);
@@ -5280,12 +5283,12 @@ impl Compiler<'_> {
             self.assembler.set_location(SourceLocation::NONE);
             false
         };
-        self.emit_jump_forward(JUMP_FORWARD, end, 0)?;
+        let body_exit = self.emit_jump_forward_instruction(JUMP_FORWARD, end)?;
         if self.control.statements.terminal_if_call_expression {
-            self.assembler.prevent_last_jump_inlining();
+            self.assembler.prevent_jump_inlining(body_exit);
         }
         if matches!(expression.body.as_ref(), Expr::BoolOp(_)) || preserve_nested_no_location {
-            self.assembler.preserve_last_no_location();
+            self.assembler.preserve_no_location(body_exit.instruction());
         }
         self.assembler.mark(else_label);
         self.set_depth(base_depth);
@@ -5886,8 +5889,8 @@ impl Compiler<'_> {
             self.assembler
                 .set_location(self.source_location(expression.range()));
             if truthiness == jump_on {
-                self.emit_jump_forward(JUMP_FORWARD, label, 0)?;
-                self.assembler.preserve_last_inlined_jump_nop();
+                let exit = self.emit_jump_forward_instruction(JUMP_FORWARD, label)?;
+                self.assembler.preserve_inlined_jump_nop(exit);
             } else {
                 let exclusion_start = self.assembler.label();
                 self.assembler.mark(exclusion_start);
@@ -5977,11 +5980,11 @@ impl Compiler<'_> {
             self.compile_jump_if(&conditional.test, false, otherwise)?;
             self.compile_jump_if(&conditional.body, jump_on, label)?;
             self.assembler.set_location(SourceLocation::NONE);
-            self.emit_jump_forward(JUMP_FORWARD, end, 0)?;
+            let body_exit = self.emit_jump_forward_instruction(JUMP_FORWARD, end)?;
             if self.control.conditions.retained_multiline_assert_ifexp_exit
                 == Some(conditional.range)
             {
-                self.assembler.preserve_last_inlined_jump_nop();
+                self.assembler.preserve_inlined_jump_nop(body_exit);
             }
             self.assembler.mark(otherwise);
             if self
@@ -6066,26 +6069,26 @@ impl Compiler<'_> {
                 )?;
             }
             self.emit(NOT_TAKEN, 0, 0)?;
-            self.emit_jump_forward(JUMP_FORWARD, end, 0)?;
+            let comparison_exit = self.emit_jump_forward_instruction(JUMP_FORWARD, end)?;
             if self.control.conditions.retained_chained_comparison_exit == Some(comparison.range) {
                 // CPython retains this final comparison fallthrough jump as a NOP when its
                 // neighboring terminal exit is copied through the optimized CFG.
-                self.assembler.preserve_last_inlined_jump_nop();
+                self.assembler.preserve_inlined_jump_nop(comparison_exit);
             } else if !jump_on {
-                self.assembler.prevent_last_jump_inlining();
+                self.assembler.prevent_jump_inlining(comparison_exit);
             }
 
             self.assembler.mark(cleanup);
             self.set_depth(base_depth + 1);
             self.emit(POP_TOP, 0, -1)?;
             if !jump_on {
-                self.emit_jump_forward(JUMP_FORWARD, label, 0)?;
+                let cleanup_exit = self.emit_jump_forward_instruction(JUMP_FORWARD, label)?;
                 if self.control.statements.in_terminal_if_branch_suite
                     && self.control.conditions.retained_chained_comparison_exit
                         == Some(comparison.range)
                 {
                     // The cleanup and false edges must continue sharing a small following exit.
-                    self.assembler.prevent_last_jump_inlining();
+                    self.assembler.prevent_jump_inlining(cleanup_exit);
                 }
             }
 
