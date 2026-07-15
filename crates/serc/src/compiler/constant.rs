@@ -226,7 +226,7 @@ fn constant_pool_fingerprint(constant: &Constant) -> Option<u64> {
                 code.qualified_name.hash(&mut hasher);
                 code.line_table.hash(&mut hasher);
                 code.exception_table.hash(&mut hasher);
-                std::mem::discriminant(&code.marshal_hints.locals_identity).hash(&mut hasher);
+                std::mem::discriminant(&code.marshal_provenance.locals_identity).hash(&mut hasher);
             }
         }
         Some(hasher.finish())
@@ -905,8 +905,8 @@ fn code_objects_equal(left: &CodeObject, right: &CodeObject) -> bool {
         && left.line_table == right.line_table
         && left.exception_table == right.exception_table
         && left
-            .marshal_hints
-            .equal_for_constant_pool(&right.marshal_hints)
+            .marshal_provenance
+            .equal_for_constant_pool(&right.marshal_provenance)
 }
 pub(super) fn literal_constant(expression: &Expr) -> Option<Constant> {
     match expression {
@@ -2113,7 +2113,7 @@ mod tests {
         CONSTANT_INDEX_THRESHOLD, ConstantEquality, ConstantIndices, ConstantPool,
         constant_pool_fingerprint,
     };
-    use crate::code_object::{CodeObject, Constant, LocalsIdentity, MarshalHints};
+    use crate::code_object::{CodeObject, Constant, LocalsIdentity, MarshalProvenance};
 
     fn code_object(constants: Vec<Constant>) -> CodeObject {
         CodeObject {
@@ -2133,7 +2133,7 @@ mod tests {
             first_line_number: 1,
             line_table: Vec::new(),
             exception_table: Vec::new(),
-            marshal_hints: MarshalHints::default(),
+            marshal_provenance: MarshalProvenance::default(),
         }
     }
 
@@ -2203,19 +2203,23 @@ mod tests {
         assert_eq!(pool.intern(nested).unwrap(), 15);
         assert_eq!(pool.intern(reordered).unwrap(), 15);
 
-        let unhinted = code_object(vec![Constant::String("méthode".to_string())]);
-        let mut hinted = unhinted.clone();
-        hinted
-            .marshal_hints
+        let plain = code_object(vec![Constant::String("méthode".to_string())]);
+        let mut with_intern_provenance = plain.clone();
+        with_intern_provenance
+            .marshal_provenance
             .explicitly_interned_strings
             .insert("méthode".to_string());
-        let mut different = unhinted.clone();
+        let mut different = plain.clone();
         different.bytecode.push(1);
-        let mut fresh = unhinted.clone();
-        fresh.marshal_hints.locals_identity = LocalsIdentity::Fresh;
+        let mut fresh = plain.clone();
+        fresh.marshal_provenance.locals_identity = LocalsIdentity::Fresh;
 
-        assert_eq!(pool.intern(Constant::Code(Box::new(unhinted))).unwrap(), 16);
-        assert_eq!(pool.intern(Constant::Code(Box::new(hinted))).unwrap(), 16);
+        assert_eq!(pool.intern(Constant::Code(Box::new(plain))).unwrap(), 16);
+        assert_eq!(
+            pool.intern(Constant::Code(Box::new(with_intern_provenance)))
+                .unwrap(),
+            16
+        );
         assert_eq!(
             pool.intern(Constant::Code(Box::new(different.clone())))
                 .unwrap(),
@@ -2284,7 +2288,7 @@ mod tests {
     fn code_constant_equality_includes_locals_identity() {
         let by_value = code_object(Vec::new());
         let mut fresh = by_value.clone();
-        fresh.marshal_hints.locals_identity = LocalsIdentity::Fresh;
+        fresh.marshal_provenance.locals_identity = LocalsIdentity::Fresh;
 
         assert!(!ConstantEquality::PoolKey.equal(
             &Constant::Code(Box::new(by_value)),
@@ -2293,17 +2297,20 @@ mod tests {
     }
 
     #[test]
-    fn code_constant_equality_ignores_explicit_intern_hints() {
-        let unhinted = code_object(vec![Constant::String("méthode".to_string())]);
-        let mut hinted = unhinted.clone();
-        hinted
-            .marshal_hints
+    fn code_constant_equality_ignores_graph_only_marshal_provenance() {
+        let plain = code_object(vec![Constant::String("méthode".to_string())]);
+        let mut with_graph_provenance = plain.clone();
+        with_graph_provenance
+            .marshal_provenance
             .explicitly_interned_strings
             .insert("méthode".to_string());
+        with_graph_provenance
+            .marshal_provenance
+            .qualified_name_constant_index = Some(0);
 
         assert!(ConstantEquality::PoolKey.equal(
-            &Constant::Code(Box::new(unhinted)),
-            &Constant::Code(Box::new(hinted))
+            &Constant::Code(Box::new(plain)),
+            &Constant::Code(Box::new(with_graph_provenance))
         ));
     }
 }

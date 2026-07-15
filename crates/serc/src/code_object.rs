@@ -118,20 +118,24 @@ pub(crate) enum LocalsIdentity {
     Fresh,
 }
 
+/// Non-wire compiler provenance needed to reproduce CPython's marshal object identities.
+///
+/// Each nested code object retains its own provenance because marshal graph planning happens after
+/// the compiler has assembled the complete constant tree.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct MarshalHints {
+pub(crate) struct MarshalProvenance {
     pub(crate) locals_identity: LocalsIdentity,
     pub(crate) explicitly_interned_strings: FxHashSet<String>,
     /// The class-body constant loaded into `__qualname__`, when present.
     pub(crate) qualified_name_constant_index: Option<u32>,
 }
 
-impl MarshalHints {
-    /// Compares the subset of marshal hints that participates in code-constant equality.
+impl MarshalProvenance {
+    /// Compares the subset of marshal provenance that participates in code-constant equality.
     pub(crate) fn equal_for_constant_pool(&self, other: &Self) -> bool {
         // CPython gives annotation-scope locals fresh identity, which distinguishes otherwise
-        // equal code constants. Explicit intern hints only affect the later marshal traversal and
-        // are intentionally omitted from constant-pool equality.
+        // equal code constants. Explicit interns and qualified-name origins only affect later
+        // marshal graph planning and are intentionally omitted from constant-pool equality.
         self.locals_identity == other.locals_identity
     }
 }
@@ -183,7 +187,8 @@ pub(crate) struct CodeObject {
     pub(crate) first_line_number: u32,
     pub(crate) line_table: Vec<u8>,
     pub(crate) exception_table: Vec<u8>,
-    pub(crate) marshal_hints: MarshalHints,
+    /// Identity provenance consumed by marshal graph planning, not a serialized code-object field.
+    pub(crate) marshal_provenance: MarshalProvenance,
 }
 
 impl CodeObject {
@@ -272,7 +277,7 @@ fn bytecode_length_invariant(bytes: usize) -> Option<CodeObjectInvariant> {
 mod tests {
     use super::{
         CodeObject, CodeObjectField, CodeObjectInvariant, CodeObjectValidationError, Constant,
-        MarshalHints, bytecode_length_invariant,
+        MarshalProvenance, bytecode_length_invariant,
     };
     use crate::CompileError;
     use crate::target::local_kinds::CO_FAST_FREE;
@@ -295,7 +300,7 @@ mod tests {
             first_line_number: 1,
             line_table: Vec::new(),
             exception_table: Vec::new(),
-            marshal_hints: MarshalHints::default(),
+            marshal_provenance: MarshalProvenance::default(),
         }
     }
 

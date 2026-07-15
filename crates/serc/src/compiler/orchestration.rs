@@ -14,7 +14,7 @@ use super::{
 };
 use crate::CompileError;
 use crate::assembler::{AssembledCode, Assembler, SourceLocation};
-use crate::code_object::{CodeObject, Constant, LocalsIdentity, MarshalHints};
+use crate::code_object::{CodeObject, Constant, LocalsIdentity, MarshalProvenance};
 use crate::target::code_flags::{
     CO_ASYNC_GENERATOR, CO_COROUTINE, CO_FUTURE_ANNOTATIONS, CO_GENERATOR, CO_HAS_DOCSTRING,
     CO_NEWLOCALS, CO_OPTIMIZED, CO_VARARGS, CO_VARKEYWORDS,
@@ -805,7 +805,7 @@ impl<'source> Compiler<'source> {
             first_line_number: self.unit.first_line_number,
             line_table,
             exception_table,
-            marshal_hints: MarshalHints {
+            marshal_provenance: MarshalProvenance {
                 locals_identity: if self.unit.annotation_thunk {
                     LocalsIdentity::Fresh
                 } else {

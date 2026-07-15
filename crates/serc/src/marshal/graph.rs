@@ -434,7 +434,7 @@ impl<'a> ObjectGraph<'a> {
 }
 
 fn collect_explicitly_interned<'a>(code: &'a CodeObject, values: &mut FxHashSet<&'a str>) {
-    if !collect_explicit_intern_hints(code, values) {
+    if !collect_interning_provenance(code, values) {
         return;
     }
 
@@ -460,21 +460,20 @@ fn collect_explicitly_interned<'a>(code: &'a CodeObject, values: &mut FxHashSet<
     values.extend(qualified_name_values.difference(&ordinary_first).copied());
 }
 
-fn collect_explicit_intern_hints<'a>(
-    code: &'a CodeObject,
-    values: &mut FxHashSet<&'a str>,
-) -> bool {
+fn collect_interning_provenance<'a>(code: &'a CodeObject, values: &mut FxHashSet<&'a str>) -> bool {
     values.extend(
-        code.marshal_hints
+        code.marshal_provenance
             .explicitly_interned_strings
             .iter()
             .map(String::as_str),
     );
-    let mut has_qualified_name_constant =
-        code.marshal_hints.qualified_name_constant_index.is_some();
+    let mut has_qualified_name_constant = code
+        .marshal_provenance
+        .qualified_name_constant_index
+        .is_some();
     for constant in &code.constants {
         if let Constant::Code(code) = constant {
-            has_qualified_name_constant |= collect_explicit_intern_hints(code, values);
+            has_qualified_name_constant |= collect_interning_provenance(code, values);
         }
     }
     has_qualified_name_constant
@@ -485,7 +484,7 @@ fn collect_qualified_name_constants<'a>(
     constants: &mut FxHashSet<usize>,
     values: &mut FxHashSet<&'a str>,
 ) {
-    if let Some(index) = code.marshal_hints.qualified_name_constant_index {
+    if let Some(index) = code.marshal_provenance.qualified_name_constant_index {
         let index = usize::try_from(index).expect("constant index always fits in usize");
         if let Some(constant @ Constant::String(value)) = code.constants.get(index) {
             constants.insert(std::ptr::from_ref(constant).addr());
@@ -587,7 +586,7 @@ fn collect_recreated_frozensets(code: &CodeObject, values: &mut FxHashSet<usize>
     let need = frozenset_recreation_need(code);
     match need {
         FrozensetRecreationNeed::None => return,
-        FrozensetRecreationNeed::PreinternedOnly if !has_explicit_intern_hints(code) => {
+        FrozensetRecreationNeed::PreinternedOnly if !has_explicit_interns(code) => {
             collect_preinterned_recreated_frozensets(code, values);
             return;
         }
@@ -615,10 +614,13 @@ fn collect_recreated_frozensets(code: &CodeObject, values: &mut FxHashSet<usize>
     );
 }
 
-fn has_explicit_intern_hints(code: &CodeObject) -> bool {
-    !code.marshal_hints.explicitly_interned_strings.is_empty()
+fn has_explicit_interns(code: &CodeObject) -> bool {
+    !code
+        .marshal_provenance
+        .explicitly_interned_strings
+        .is_empty()
         || code.constants.iter().any(|constant| match constant {
-            Constant::Code(code) => has_explicit_intern_hints(code),
+            Constant::Code(code) => has_explicit_interns(code),
             _ => false,
         })
 }
@@ -780,7 +782,7 @@ fn constant_contains_identifier_or_explicit_dependent_string(
 }
 
 fn code_tree_interns_string(code: &CodeObject, value: &str) -> bool {
-    code.marshal_hints
+    code.marshal_provenance
         .explicitly_interned_strings
         .iter()
         .any(|interned| interned == value)
@@ -873,11 +875,16 @@ fn collect_code_interning<'a>(
         }
     }
 
-    // _PyCode_New interns names before constants. Explicit import/fromlist hints identify constant
-    // strings that are the exact same objects as those names, rather than merely equal values.
-    if !code.marshal_hints.explicitly_interned_strings.is_empty() {
+    // _PyCode_New interns names before constants. Explicit import/fromlist provenance identifies
+    // constant strings that are the exact same objects as those names, rather than merely equal
+    // values.
+    if !code
+        .marshal_provenance
+        .explicitly_interned_strings
+        .is_empty()
+    {
         let mut explicit_interns: Vec<_> = code
-            .marshal_hints
+            .marshal_provenance
             .explicitly_interned_strings
             .iter()
             .collect();

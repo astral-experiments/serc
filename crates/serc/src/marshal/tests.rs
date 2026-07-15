@@ -1,4 +1,4 @@
-use crate::code_object::{CodeObject, Constant, LocalsIdentity, MarshalHints};
+use crate::code_object::{CodeObject, Constant, LocalsIdentity, MarshalProvenance};
 
 use super::encode_code;
 use super::graph::{ObjectGraph, OccurrenceKind};
@@ -26,7 +26,7 @@ fn code_object(constants: Vec<Constant>) -> CodeObject {
         first_line_number: 1,
         line_table: Vec::new(),
         exception_table: Vec::new(),
-        marshal_hints: MarshalHints::default(),
+        marshal_provenance: MarshalProvenance::default(),
     }
 }
 
@@ -170,7 +170,7 @@ fn tracks_interned_strings_from_constants_and_metadata() {
         Constant::String("méthode".to_string()),
         Constant::String("not interned".to_string()),
     ]);
-    code.marshal_hints
+    code.marshal_provenance
         .explicitly_interned_strings
         .insert("méthode".to_string());
     code.names.push("metadata name with spaces".to_string());
@@ -201,9 +201,9 @@ fn keeps_identity_and_value_keys_separate() {
     first.locals.push("value".to_string());
     second.locals.push("value".to_string());
     assert_eq!(locals_tuple_key(&first), locals_tuple_key(&second));
-    second.marshal_hints.locals_identity = LocalsIdentity::Fresh;
+    second.marshal_provenance.locals_identity = LocalsIdentity::Fresh;
     assert_ne!(locals_tuple_key(&first), locals_tuple_key(&second));
-    first.marshal_hints.locals_identity = LocalsIdentity::Fresh;
+    first.marshal_provenance.locals_identity = LocalsIdentity::Fresh;
     assert_ne!(locals_tuple_key(&first), locals_tuple_key(&second));
 }
 
@@ -217,7 +217,7 @@ fn bypasses_value_lookup_for_structurally_unique_objects() {
     inner.bytecode.push(0);
     inner.locals.push("value".to_string());
     inner.local_kinds.push(1);
-    inner.marshal_hints.locals_identity = LocalsIdentity::Fresh;
+    inner.marshal_provenance.locals_identity = LocalsIdentity::Fresh;
 
     let code = code_object(vec![Constant::Code(Box::new(inner))]);
     let graph = ObjectGraph::for_code(&code);
