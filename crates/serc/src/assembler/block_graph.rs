@@ -87,9 +87,9 @@ pub(super) struct PipelineFeatures(u8);
 impl PipelineFeatures {
     const FORWARD_JUMP: u8 = 1 << 0;
     const FORWARD_CONDITIONAL: u8 = 1 << 1;
-    const SWAP: u8 = 1 << 2;
+    const SWAP_TRIGGER: u8 = 1 << 2;
     const FAST_LOAD: u8 = 1 << 3;
-    const STORE_FAST: u8 = 1 << 4;
+    const STORE_FAST_TRIGGER: u8 = 1 << 4;
     const BOOLEAN_CONVERSION: u8 = 1 << 5;
     const BORROW_EMPTY_BLOCK: u8 = 1 << 6;
 
@@ -103,9 +103,9 @@ impl PipelineFeatures {
             {
                 Self::FORWARD_CONDITIONAL
             }
-            SWAP => Self::SWAP,
+            SWAP => Self::SWAP_TRIGGER,
             LOAD_FAST | LOAD_FAST_CHECK | LOAD_FAST_BORROW | LOAD_FAST_LOAD_FAST => Self::FAST_LOAD,
-            STORE_FAST => Self::STORE_FAST,
+            STORE_FAST => Self::STORE_FAST_TRIGGER,
             TO_BOOL | UNARY_NOT => Self::BOOLEAN_CONVERSION,
             _ => 0,
         };
@@ -127,7 +127,7 @@ impl PipelineFeatures {
     }
 
     pub(super) const fn has_swap(self) -> bool {
-        self.0 & Self::SWAP != 0
+        self.0 & Self::SWAP_TRIGGER != 0
     }
 
     pub(super) const fn has_fast_load(self) -> bool {
@@ -135,7 +135,7 @@ impl PipelineFeatures {
     }
 
     pub(super) const fn has_store_fast(self) -> bool {
-        self.0 & Self::STORE_FAST != 0
+        self.0 & Self::STORE_FAST_TRIGGER != 0
     }
 
     pub(super) const fn has_boolean_conversion(self) -> bool {

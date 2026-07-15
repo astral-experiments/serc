@@ -1189,7 +1189,7 @@ fn extended_forward_jump_uses_the_iterative_layout_fallback() {
     assembler.emit(LOAD_CONST, 0);
     assembler.emit_forward_with_depth(POP_JUMP_IF_FALSE, target, 0, ExceptionPolicy::default());
     for _ in 0..=u8::MAX {
-        assembler.emit(RESUME, 0);
+        assembler.emit(RESUME, ResumeLocation::AT_FUNC_START.argument());
     }
     assembler.mark(target);
     assembler.emit(RETURN_VALUE, 0);
