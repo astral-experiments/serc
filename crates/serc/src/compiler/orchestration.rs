@@ -390,7 +390,8 @@ impl<'source> Compiler<'source> {
         let body_start = self.assembler.instruction_count();
         let add_implicit_return = !suite_terminates(body);
         self.compile_suite_inner(body, add_implicit_return)?;
-        let add_implicit_return = add_implicit_return && !self.control.emitted_fallthrough_return;
+        let add_implicit_return =
+            add_implicit_return && !self.control.statements.emitted_fallthrough_return;
         if add_implicit_return
             && body
                 .last()
@@ -432,7 +433,8 @@ impl<'source> Compiler<'source> {
         let body_start = self.assembler.instruction_count();
         let add_implicit_return = !suite_terminates(body);
         self.compile_suite_inner(body, add_implicit_return)?;
-        let add_implicit_return = add_implicit_return && !self.control.emitted_fallthrough_return;
+        let add_implicit_return =
+            add_implicit_return && !self.control.statements.emitted_fallthrough_return;
         if add_implicit_return
             && body
                 .last()
@@ -658,11 +660,13 @@ impl<'source> Compiler<'source> {
         {
             self.add_constant(Constant::None)?;
         }
-        if let Some(start) = self.control.generator_region_start {
+        if let Some(start) = self.control.generators.generator_region_start {
             let handler = self.assembler.label();
             self.assembler.mark(handler);
             let mut region_start = start;
-            for (exclusion_start, exclusion_end) in &self.control.generator_region_exclusions {
+            for (exclusion_start, exclusion_end) in
+                &self.control.generators.generator_region_exclusions
+            {
                 self.assembler.add_exception_region(
                     region_start,
                     *exclusion_start,
@@ -680,10 +684,10 @@ impl<'source> Compiler<'source> {
             self.emit_reraise(ReraiseStackState::StopIterationHandler)?;
         }
 
-        if self.control.depth != 0 {
+        if self.control.stack.depth != 0 {
             return Err(CompileError::Internal(format!(
                 "compiler finished with stack depth {}",
-                self.control.depth
+                self.control.stack.depth
             )));
         }
 
@@ -773,16 +777,16 @@ impl<'source> Compiler<'source> {
             self.symbols.fast_local_count,
             parameter_count,
         )?;
-        let max_depth = if removed_max_depth == Some(self.control.max_depth)
-            && assembled_max_depth < self.control.max_depth
+        let max_depth = if removed_max_depth == Some(self.control.stack.max_depth)
+            && assembled_max_depth < self.control.stack.max_depth
         {
             assembled_max_depth
         } else {
-            self.control.max_depth
+            self.control.stack.max_depth
         };
         let stack_size = if self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
             != 0
-            && self.control.generator_region_start.is_some()
+            && self.control.generators.generator_region_start.is_some()
         {
             max_depth.max(2)
         } else {
@@ -850,7 +854,7 @@ impl<'source> Compiler<'source> {
             self.assembler.emit(POP_TOP, 0);
             let start = self.assembler.label();
             self.assembler.mark(start);
-            self.control.generator_region_start = Some(start);
+            self.control.generators.generator_region_start = Some(start);
         }
         let line = i32::try_from(self.unit.first_line_number).unwrap_or(i32::MAX);
         self.assembler

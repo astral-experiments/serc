@@ -493,7 +493,7 @@ impl Compiler<'_> {
         self.apply_compiler_stack_effect(LOAD_CONST, 0, 1)?;
         let instruction = self
             .assembler
-            .emit_placeholder_with_depth(LOAD_CONST, self.control.depth.cast_unsigned());
+            .emit_placeholder_with_depth(LOAD_CONST, self.control.stack.depth.cast_unsigned());
         self.output
             .deferred_constants
             .push((Some(instruction), constant));
@@ -507,7 +507,7 @@ impl Compiler<'_> {
         self.apply_compiler_stack_effect(LOAD_CONST, 0, 1)?;
         let instruction = self
             .assembler
-            .emit_placeholder_with_depth(LOAD_CONST, self.control.depth.cast_unsigned());
+            .emit_placeholder_with_depth(LOAD_CONST, self.control.stack.depth.cast_unsigned());
         self.output
             .deferred_constants_before_return
             .push((instruction, constant));
@@ -518,7 +518,7 @@ impl Compiler<'_> {
         self.apply_compiler_stack_effect(STORE_NAME, 0, -1)?;
         let instruction = self
             .assembler
-            .emit_placeholder_with_depth(STORE_NAME, self.control.depth.cast_unsigned());
+            .emit_placeholder_with_depth(STORE_NAME, self.control.stack.depth.cast_unsigned());
         self.output
             .deferred_names
             .push((instruction, name.to_string()));
