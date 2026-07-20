@@ -1230,12 +1230,29 @@ impl OptimizationPipeline {
                 }
             }
             if inline_small_exit || inline_no_location_block {
+                let coroutine_owner_targets = self
+                    .exception_regions
+                    .iter()
+                    .zip(&region_memberships)
+                    .filter(|(region, membership)| {
+                        region.depth == 0
+                            && region.preserve_lasti
+                            && membership.contains(&positions[target.index()])
+                    })
+                    .map(|(region, _)| region.target)
+                    .collect::<FxHashSet<_>>();
                 let entirely_excluded_regions = region_memberships
                     .iter()
                     .enumerate()
                     .filter_map(|(index, membership)| {
+                        let region = &self.exception_regions[index];
                         (membership.contains(&positions[source.index()])
-                            && !membership.contains(&positions[target.index()]))
+                            && !membership.contains(&positions[target.index()])
+                            // Generator-region exclusions can split one logical coroutine owner.
+                            // Keep the copied exit protected when the target is in its sibling.
+                            && !(region.depth == 0
+                                && region.preserve_lasti
+                                && coroutine_owner_targets.contains(&region.target)))
                         .then_some(index)
                     })
                     .collect::<Vec<_>>();
