@@ -11455,29 +11455,14 @@ impl Compiler<'_> {
         for exclusions in &mut self.control.withs.active_with_region_exclusions {
             exclusions.push((not_taken_start, not_taken_end));
         }
-        let tuple_handler_assignment_pair = self
-            .control
-            .exceptions
-            .active_tuple_handler_try_bodies
-            .last()
-            .is_some_and(|tuple_handler| *tuple_handler)
-            && matches!(
-                body,
-                [Stmt::Assign(first), Stmt::Assign(second)]
-                    if matches!(first.value.as_ref(), Expr::Call(_))
-                        && matches!(second.value.as_ref(), Expr::Await(awaited)
-                            if matches!(awaited.value.as_ref(), Expr::Call(_)))
-            );
-        // CPython leaves this marker ownerless for small protected async-with exits. Keep
-        // pass-only finalizers and shifted tuple-handler assignment pairs on their existing path.
+        // CPython leaves this marker ownerless for protected async-with exits. Keep pass-only
+        // finalizers on their existing path.
         if outer_exception_owns_exit
-            || (self
+            || self
                 .control
                 .finally
                 .active_pass_finally_locations
                 .is_empty()
-                && self.assembler.item_count() <= 201
-                && !tuple_handler_assignment_pair)
         {
             for exclusions in &mut self.control.exceptions.active_exception_region_exclusions {
                 exclusions.push((not_taken_start, not_taken_end));
