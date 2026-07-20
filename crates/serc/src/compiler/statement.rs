@@ -529,6 +529,14 @@ impl ControlFlowState {
             .is_some_and(|context| !context.is_async)
     }
 
+    pub(super) fn current_synchronous_with_body_start_item(&self) -> Option<usize> {
+        self.withs
+            .active_with_exits
+            .last()
+            .filter(|context| !context.is_async)
+            .map(|context| context.body_start_item)
+    }
+
     pub(super) fn active_with_count(&self) -> usize {
         self.withs.active_with_exits.len()
     }
@@ -550,6 +558,14 @@ impl ControlFlowState {
     pub(super) fn in_async_with_nested_exception_region(&self) -> bool {
         self.withs.active_with_exits.last().is_some_and(|context| {
             context.is_async
+                && self.exceptions.active_exception_region_exclusions.len()
+                    > context.exception_region_depth
+        })
+    }
+
+    pub(super) fn in_synchronous_with_nested_exception_region(&self) -> bool {
+        self.withs.active_with_exits.last().is_some_and(|context| {
+            !context.is_async
                 && self.exceptions.active_exception_region_exclusions.len()
                     > context.exception_region_depth
         })

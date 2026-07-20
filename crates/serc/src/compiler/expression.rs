@@ -2102,6 +2102,41 @@ impl Compiler<'_> {
                         })
             ))
         .then_some(ExceptionPolicy::EXCLUDE_ALWAYS);
+        let plain_try_boolean_loop_policy = (!collect_tuple
+            && self.context.target_specific_rules_enabled()
+            && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR | CO_GENERATOR) == 0
+            && !self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            && self.control.withs.active_with_region_exclusions.is_empty()
+            && self
+                .control
+                .comprehensions
+                .active_comprehension_region_exclusions
+                .is_empty()
+            && !self.control.in_exception_handler()
+            && self.control.exceptions.active_exception_group_handlers == 0
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
+            && matches!(
+                call.arguments.args.as_ref(),
+                [Expr::Generator(generator)]
+                    if !expression_suspends_current_scope(&generator.elt)
+                        && generator.generators.iter().enumerate().all(|(index, generator)| {
+                            !generator.is_async
+                                && (index == 0
+                                    || !expression_suspends_current_scope(&generator.iter))
+                                && !generator
+                                    .ifs
+                                    .iter()
+                                    .any(expression_suspends_current_scope)
+                        })
+            ))
+        .then_some(ExceptionPolicy::EXCLUDE_ALWAYS);
+        let plain_try_boolean_dispatch_policy =
+            plain_try_boolean_loop_policy.filter(|_| !self.control.in_loop());
         // Keep prior manager-owner holes and terminal handler returns out of scope: adding the
         // correct loop-owner split there worsens the table while earlier gaps remain unmatched.
         let preserve_synchronous_with_boolean_loop_owner = !collect_tuple
@@ -2157,18 +2192,6 @@ impl Compiler<'_> {
         // retain their first marker, so keep this range-scoped and separate from the loop policy.
         let synchronous_with_boolean_dispatch_policy = (synchronous_with_boolean_loop_policy
             .is_some()
-            && self.control.conditions.include_assert_none_condition_owner
-            && (self
-                .control
-                .withs
-                .shifted_sync_with_boolean_dispatch_calls
-                .contains(&call.range)
-                || self
-                    .control
-                    .current_with_suspension_epoch()
-                    .is_some_and(|epoch| {
-                        self.control.generators.coroutine_suspension_epoch > epoch
-                    }))
             && !self.control.in_loop()
             && self
                 .control
@@ -2183,8 +2206,26 @@ impl Compiler<'_> {
             && !self.control.in_exception_handler()
             && self.control.exceptions.active_exception_group_handlers == 0
             && self.control.finally.active_normal_finally_bodies == 0
-            && self.control.finally.active_finally_end_blocks == 0)
-            .then_some(ExceptionPolicy::EXCLUDE_ALWAYS);
+            && self.control.finally.active_finally_end_blocks == 0
+            && ((self.control.conditions.include_assert_none_condition_owner
+                && (self
+                    .control
+                    .withs
+                    .shifted_sync_with_boolean_dispatch_calls
+                    .contains(&call.range)
+                    || self
+                        .control
+                        .current_with_suspension_epoch()
+                        .is_some_and(|epoch| {
+                            self.control.generators.coroutine_suspension_epoch > epoch
+                        })))
+                || self
+                    .control
+                    .current_synchronous_with_body_start_item()
+                    .is_some_and(|start| {
+                        self.assembler.contains_opcode_since_item(NOT_TAKEN, start)
+                    })))
+        .then_some(ExceptionPolicy::EXCLUDE_ALWAYS);
         // CPython appends the Boolean-loop marker and backedge after the coroutine assertion's
         // stop-iteration target is labeled. The dispatch marker keeps its ordinary owner.
         let pre_suspension_coroutine_boolean_loop_policy = (matches!(callable, "all" | "any")
@@ -2302,6 +2343,7 @@ impl Compiler<'_> {
                         .filter(|_| self.assembler.contains_opcode(NOT_TAKEN))
                 })
                 .or(generator_guard_exception_policy)
+                .or(plain_try_boolean_dispatch_policy)
                 .or_else(|| {
                     coroutine_boolean_loop_policy.map(|_| {
                         if self.assembler.current_block_has_dynamic_exception_owner() {
@@ -2448,6 +2490,7 @@ impl Compiler<'_> {
                 handler_boolean_loop_policy
                     .or(coroutine_boolean_loop_policy)
                     .or(synchronous_with_boolean_loop_policy)
+                    .or(plain_try_boolean_loop_policy)
                     .or(pre_suspension_coroutine_boolean_loop_policy)
                     .unwrap_or_default(),
             )?;
@@ -2458,6 +2501,7 @@ impl Compiler<'_> {
                 handler_boolean_loop_policy
                     .or(coroutine_boolean_loop_policy)
                     .or(synchronous_with_boolean_loop_policy)
+                    .or(plain_try_boolean_loop_policy)
                     .or(pre_suspension_coroutine_boolean_loop_policy)
                     .unwrap_or_default(),
             )?;
@@ -6249,8 +6293,22 @@ impl Compiler<'_> {
             // reuse a stale protected slot in the current block.
             let marker_reuses_exception_owner =
                 self.assembler.current_block_has_dynamic_exception_owner();
+            let preserve_sync_with_short_circuit_none_owner = self
+                .control
+                .current_synchronous_with_body_start_item()
+                .is_some_and(|start| {
+                    self.context.target_specific_rules_enabled()
+                        && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR | CO_GENERATOR) == 0
+                        && !self.control.in_loop()
+                        && !self.control.in_synchronous_with_nested_exception_region()
+                        && self.assembler.contains_opcode_since_item(NOT_TAKEN, start)
+                });
             let policy = ConditionMarkerPolicy {
-                excluded: ExceptionPolicy::default(),
+                excluded: if preserve_sync_with_short_circuit_none_owner {
+                    ExceptionPolicy::normalized_owner(true)
+                } else {
+                    ExceptionPolicy::default()
+                },
                 ordinary: ExceptionPolicy::normalized_owner(
                     self.control.generators.generator_region_start.is_some()
                         || self.control.conditions.include_assert_none_condition_owner
@@ -6261,6 +6319,7 @@ impl Compiler<'_> {
                         || self
                             .control
                             .finally_try_body_preserves_none_condition_owner()
+                        || preserve_sync_with_short_circuit_none_owner
                         || self.control.in_first_unnamed_exception_handler()
                         || self.control.finally.active_normal_finally_bodies > 0
                         || self
