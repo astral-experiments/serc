@@ -6689,6 +6689,166 @@ def keyword_unpacking():
     }
 
     #[test]
+    fn matches_cpython_marshal_for_optimized_boolean_generators_in_protected_bodies() {
+        let source = r"def try_assignment(values, touch):
+    try:
+        result = any(value.ready for value in values)
+        touch(result)
+    except Error:
+        pass
+
+def try_condition(values, touch):
+    try:
+        if any(value.ready for value in values):
+            touch(values)
+    except Error:
+        pass
+
+def try_boolean_conditions(values, state, touch):
+    try:
+        if state.active and any(value.ready for value in values):
+            touch(state)
+        if state.active or all(value.ready for value in values):
+            touch(state)
+    except Error:
+        pass
+
+def try_finally(values, touch, cleanup):
+    try:
+        if any(value.ready for value in values):
+            touch(values)
+    finally:
+        cleanup()
+
+def try_loop(groups, touch):
+    try:
+        for values in groups:
+            result = any(value.ready for value in values)
+            touch(result)
+    except Error:
+        pass
+
+def with_direct(manager, values, touch):
+    with manager:
+        result = any(value.ready for value in values)
+        touch(result)
+
+def condition_before_with(manager, values, flag, touch):
+    if flag:
+        touch(flag)
+    with manager:
+        result = any(value.ready for value in values)
+        touch(result)
+
+def with_boolean_assignment(manager, values, state, touch):
+    with manager:
+        result = state.active and any(value.ready for value in values)
+        touch(result)
+
+def with_boolean_condition(manager, values, state, touch):
+    with manager:
+        if state.active or all(value.ready for value in values):
+            touch(state)
+
+def with_prior_condition(manager, values, state, touch):
+    with manager:
+        if state.active:
+            touch(state)
+        result = any(value.ready for value in values)
+        touch(result)
+
+def with_loop(manager, groups, touch):
+    with manager:
+        for values in groups:
+            result = any(value.ready for value in values)
+            touch(result)
+";
+        assert_matches_cpython_marshal(source, "optimized_boolean_protected.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_synchronous_with_short_circuit_none_markers() {
+        let source = r"def two_operands(manager, value, touch):
+    with manager:
+        if value.ready and value is not None:
+            touch(value)
+
+def three_operands(manager, value, touch):
+    with manager:
+        if value.ready and value is not None and value.active:
+            touch(value)
+
+def nested_body(manager, value, fallback, touch):
+    with manager:
+        if value.ready and value is not None and value.active:
+            if fallback(value):
+                touch(value)
+
+def none_last(manager, value, fallback, touch):
+    with manager:
+        if value.ready and value.active and value is not None:
+            if fallback(value):
+                touch(value)
+
+def disjunction(manager, value, fallback, touch):
+    with manager:
+        if value.ready or value is None or value.active:
+            if fallback(value):
+                touch(value)
+
+def prior_condition(manager, value, flag, fallback, touch):
+    with manager:
+        if flag:
+            touch(value)
+        if value.ready and value is not None and value.active:
+            if fallback(value):
+                touch(value)
+
+def following_statement(manager, value, touch):
+    with manager:
+        if value.ready and value is not None and value.active:
+            touch(value)
+        touch(value)
+
+def nested_manager(first, second, value, fallback, touch):
+    with first:
+        with second:
+            if value.ready and value is not None and value.active:
+                if fallback(value):
+                    touch(value)
+
+def try_around_with(manager, value, fallback, touch):
+    try:
+        with manager:
+            if value.ready and value is not None and value.active:
+                if fallback(value):
+                    touch(value)
+    except Error:
+        pass
+
+def none_first_control(manager, value, touch):
+    with manager:
+        if value is not None and value.ready and value.active:
+            touch(value)
+
+def loop_control(manager, values, touch):
+    with manager:
+        for value in values:
+            if value.ready and value is not None and value.active:
+                touch(value)
+
+def nested_try_control(manager, value, touch):
+    with manager:
+        try:
+            if value.ready and value is not None and value.active:
+                touch(value)
+        except Error:
+            pass
+";
+        assert_matches_cpython_marshal(source, "sync_with_short_circuit_none.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_generator_guard_marker_owners() {
         let source = r"def after_resume(values):
     yield before()
