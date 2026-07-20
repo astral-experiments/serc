@@ -3917,7 +3917,10 @@ impl Compiler<'_> {
                                     )
                                 }))
                                 || (self.context.target_specific_rules_enabled()
-                                    && matches!(self.unit.scope, Scope::Function { .. })
+                                    && matches!(
+                                        self.unit.scope,
+                                        Scope::Function { .. } | Scope::Module
+                                    )
                                     && self.unit.flags
                                         & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
                                         == 0
@@ -3928,8 +3931,11 @@ impl Compiler<'_> {
                                         .is_empty()
                                     && matches!(body, [Stmt::Continue(_)])
                                     && matches!(test, Expr::UnaryOp(unary)
-                                        if unary.op == UnaryOp::Not
-                                            && matches!(unary.operand.as_ref(), Expr::Name(_)))
+                                    if unary.op == UnaryOp::Not
+                                        && matches!(
+                                            unary.operand.as_ref(),
+                                            Expr::Name(_) | Expr::Attribute(_)
+                                        ))
                                     && self.control.loops.contexts.last().is_some_and(
                                         |context| {
                                             context.iterator_cleanup == IteratorCleanup::Sync
@@ -3951,6 +3957,35 @@ impl Compiler<'_> {
                                                     )
                                         },
                                     )))));
+                let preserve_sync_with_simple_condition_owner = branch_index == 0
+                    && self.control.statements.current_statement_has_following
+                    && self.control.in_iterator_loop()
+                    && direct_sync_with_iterator
+                    && self.context.target_specific_rules_enabled()
+                    && matches!(self.unit.scope, Scope::Function { .. } | Scope::Module)
+                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                    && self.control.exceptions.active_exception_handlers.is_empty()
+                    && (matches!(test, Expr::Name(_))
+                        || matches!(test, Expr::UnaryOp(unary)
+                        if unary.op == UnaryOp::Not
+                            && matches!(
+                                unary.operand.as_ref(),
+                                Expr::Name(_) | Expr::Attribute(_)
+                            )))
+                    && self.control.loops.contexts.last().is_some_and(|context| {
+                        context.iterator_cleanup == IteratorCleanup::Sync
+                            && context.exception_region_depth
+                                == self
+                                    .control
+                                    .exceptions
+                                    .active_exception_region_exclusions
+                                    .len()
+                            && context.finally_end_depth
+                                == self.control.finally.active_finally_end_blocks
+                            && !self
+                                .assembler
+                                .contains_terminal_with_barrier_since_item(context.body_start_item)
+                    });
                 let preserve_first_sync_iterator_condition_owner = branch_index == 0
                     && self.context.target_specific_rules_enabled()
                     && self.control.loops.contexts.len() == 1
@@ -4264,7 +4299,7 @@ impl Compiler<'_> {
                     && self.control.in_first_unnamed_exception_handler();
                 let protected_iterator_continue_condition = (branch_index == 0
                     && matches!(test, Expr::BoolOp(_))
-                    && ((matches!(body, [Stmt::Continue(_)])
+                    && ((matches!(body, [Stmt::Continue(_) | Stmt::Break(_)])
                         && self.control.in_iterator_loop()
                         && !self.control.withs.active_with_region_exclusions.is_empty()
                         && self
@@ -4284,6 +4319,13 @@ impl Compiler<'_> {
                             !self
                                 .assembler
                                 .contains_opcode_since(NOT_TAKEN, context.body_start)
+                                // An in-loop await leaves the leading break marker ownerless;
+                                // plain generator yields still reuse the protected owner.
+                                && (!matches!(body, [Stmt::Break(_)])
+                                    || self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                                    || !self
+                                        .assembler
+                                        .contains_opcode_since(SEND, context.body_start))
                         }))
                         || (self.context.target_specific_rules_enabled()
                             && self.unit.flags
@@ -4557,7 +4599,7 @@ impl Compiler<'_> {
                     self.assembler.allow_last_condition_split_return_copy();
                 }
 
-                if preserve_sync_with_continue_owner {
+                if preserve_sync_with_continue_owner || preserve_sync_with_simple_condition_owner {
                     // CPython keeps the protected CFG owner when normalization reuses a removed
                     // loop-control block slot.
                     self.assembler.preserve_last_not_taken_exception_owner();
