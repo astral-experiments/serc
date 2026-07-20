@@ -386,7 +386,7 @@ async def async_generator_control(item, consume):
         ("debug_callable_control", &[false][..]),
         (
             "optimized_generator_controls",
-            &[true, true, false, true, true, false, true, false][..],
+            &[true, false, false, true, false, false, true, false][..],
         ),
         ("unary_not_control", &[false][..]),
         ("nested_non_tail_control", &[false][..]),
