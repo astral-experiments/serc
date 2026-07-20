@@ -3620,6 +3620,39 @@ def name_condition(manager, lines, initial):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_async_with_awaited_assignment_exits() {
+        let source = r"async def simple(manager):
+    async with manager() as value:
+        await value()
+
+async def returned(manager):
+    async with manager() as value:
+        result = await value()
+    return result
+
+async def preceded(manager, item):
+    async with manager() as value:
+        value.prepare(item)
+        result = await value()
+    return result
+
+async def two_calls(manager, item):
+    initial = item.prepare()
+    async with manager() as value:
+        value.first(initial)
+        value.second(initial, flag=True)
+        left, right = await value()
+    return left
+
+async def tuple_target(manager):
+    async with manager() as (first, second):
+        result = await second(first)
+    return result
+";
+        assert_matches_cpython_marshal(source, "async_with_awaited_assignment_exits.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_loop_control_unwinding() {
         let source = "def sync_context(manager, items):\n    for item in items:\n        with manager:\n            if item > 0:\n                continue\n            break\n\ndef exception_handler(items):\n    for item in items:\n        try:\n            consume(item)\n        except Exception:\n            handle(item)\n            continue\n        use(item)\n\ntry:\n    for item in items:\n        consume(item)\n        break\nexcept TypeError:\n    handle()\nafter()\n";
         assert_matches_cpython_marshal(source, "loop_control_unwind.py");
