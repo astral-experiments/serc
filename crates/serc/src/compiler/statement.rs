@@ -3603,14 +3603,18 @@ impl Compiler<'_> {
                 } else {
                     None
                 };
-                // A literal returned through the direct final `with` in a normal try body is
+                // A literal returned through a synchronous `with` in a normal try body is
                 // reloaded after manager cleanup. CPython excludes that reload and return from
                 // the surrounding try's handler.
                 if !preserve_tos
                     && !return_is_overridden
                     && !with_unwind_starts.is_empty()
-                    && self.control.withs.terminal_with_condition.is_some()
-                    && self.control.withs.direct_final_sync_with_try_body.is_some()
+                    && self
+                        .control
+                        .withs
+                        .active_with_exits
+                        .last()
+                        .is_some_and(|context| !context.is_async)
                     && exception_unwind_start.is_none()
                     && finally_unwind_start.is_none()
                     && !self
