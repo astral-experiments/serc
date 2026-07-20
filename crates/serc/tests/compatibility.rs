@@ -7626,6 +7626,113 @@ def call_control(condition):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_conditional_call_returns_in_try_bodies() {
+        let source = r#"def direct(flag):
+    try:
+        return build(value="a" if flag else "b")
+    except Error:
+        return failure()
+
+
+def named_handler(flag):
+    try:
+        return build(value="a" if flag else "b")
+    except Error as error:
+        return failure(error)
+
+
+def preceding_call(flag):
+    try:
+        prepare()
+        return build(value="a" if flag else "b")
+    except Error:
+        return failure()
+
+
+def positional(flag):
+    try:
+        return build("a" if flag else "b")
+    except Error:
+        return failure()
+
+
+def trailing_argument_control(flag, value):
+    try:
+        return build(first=value, selected="a" if flag else "b", final=value)
+    except Error:
+        return failure()
+
+
+def outside_try_control(flag):
+    return build(value="a" if flag else "b")
+
+
+async def awaited_control(client, flag):
+    try:
+        value = await client.load()
+        return build(value="a" if flag else "b", loaded=value)
+    except Error as error:
+        return failure(error)
+
+
+def protected_with_control(manager, flag):
+    try:
+        with manager:
+            return build(value="a" if flag else "b")
+    except Error:
+        return failure()
+
+
+def formatted_return(flag):
+    try:
+        return f"Selected: {'yes' if flag else 'no'}"
+    except Error:
+        return failure()
+
+
+def same_line_components(flag, value):
+    try:
+        if value:
+            return f"Value: {value}\\n" f"Attribute: {value.attribute}\\n" f"Selected: {'yes' if flag else 'no'}"
+        return "missing"
+    except Error:
+        return failure()
+
+
+def multiline_call_arguments(flag):
+    try:
+        return build(
+            value="a" if flag else "b",
+        )
+    except Error:
+        return failure()
+
+
+def parenthesized_call_control(flag):
+    try:
+        return (
+            build(value="a" if flag else "b")
+        )
+    except Error:
+        return failure()
+
+
+def multi_component_format_control(flag, value):
+    try:
+        if value:
+            return (
+                f"Value: {value}\\n"
+                f"Attribute: {value.attribute}\\n"
+                f"Selected: {'yes' if flag else 'no'}"
+            )
+        return "missing"
+    except Error:
+        return failure()
+"#;
+        assert_matches_cpython_marshal(source, "conditional_call_returns_in_try_bodies.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_unpacked_class_arguments() {
         let source = "class C1(Generic[T], str, **{'metaclass': type}):\n    ...\n\nclass C2(Generic[T], str, metaclass=type):\n    ...\n\nclass C3(Generic[T], metaclass=type, *[str]):\n    ...\n\nclass C4(x=1, **y):\n    ...\n";
         assert_matches_cpython_marshal(source, "class_arguments.py");

@@ -5342,6 +5342,28 @@ impl Compiler<'_> {
         if self.control.statements.terminal_if_call_expression {
             self.assembler.prevent_jump_inlining(body_exit);
         }
+        if self
+            .control
+            .exceptions
+            .active_exception_region_exclusions
+            .len()
+            == 1
+            && self.control.withs.active_with_region_exclusions.is_empty()
+            && self
+                .control
+                .comprehensions
+                .active_comprehension_region_exclusions
+                .is_empty()
+            && self.control.generators.generator_region_start.is_none()
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
+            && !self.control.in_exception_handler()
+            && !self.control.statements.suppress_split_return_copy
+        {
+            // CPython can copy a small call/return tail onto this branch even when the
+            // enclosing try splits the shared exit at an exception-region boundary.
+            self.assembler.allow_split_return_copy(body_exit);
+        }
         if matches!(expression.body.as_ref(), Expr::BoolOp(_)) || preserve_nested_no_location {
             self.assembler.preserve_no_location(body_exit.instruction());
         }

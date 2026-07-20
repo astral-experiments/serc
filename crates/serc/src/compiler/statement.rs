@@ -453,6 +453,8 @@ pub(super) struct StatementState {
     split_terminal_assert_success: bool,
     // A terminal-if expression statement whose call suffix must remain shared across an ifexp.
     pub(super) terminal_if_call_expression: bool,
+    // A protected return whose value begins on a later line keeps its conditional exit shared.
+    pub(super) suppress_split_return_copy: bool,
     copied_nested_handler_join_successor: bool,
     // Whether that successor is a direct loop break.
     current_statement_followed_by_break: bool,
@@ -3242,7 +3244,23 @@ impl Compiler<'_> {
                     self.assembler.set_location(self.source_location(range));
                     self.emit(NOP, 0, 0)?;
                 } else if let Some(value) = &statement.value {
-                    self.compile_expression(value)?;
+                    let suppress_split_return_copy = self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .len()
+                        == 1
+                        && self.line_number(u32::from(statement.range.start()))
+                            != self.line_number(u32::from(value.range().start()));
+                    if suppress_split_return_copy {
+                        self.with_control_override(
+                            |control| &mut control.statements.suppress_split_return_copy,
+                            true,
+                            |compiler| compiler.compile_expression(value),
+                        )?;
+                    } else {
+                        self.compile_expression(value)?;
+                    }
                     let location = self.source_location(statement.range);
                     // CPython converts a synchronous `with` POP_BLOCK following a multiline
                     // `and` return into a NOP carrying the whole return statement's range.
