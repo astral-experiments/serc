@@ -350,6 +350,7 @@ pub(super) struct FinallyState {
     pub(super) exceptional_finally_condition: bool,
     active_conditional_cleanup_finally_try_bodies: usize,
     active_finally_try_bodies: usize,
+    innermost_finally_exception_exclusion_depth: Option<usize>,
     active_pass_finally_locations: Vec<SourceLocation>,
     active_overriding_finally_returns: usize,
     preserve_finally_break_exit_loop_range: Option<ruff_text_size::TextRange>,
@@ -1042,6 +1043,11 @@ impl Compiler<'_> {
         );
         let previous_try_bodies = self.control.finally.active_finally_try_bodies;
         self.control.finally.active_finally_try_bodies = previous_try_bodies + 1;
+        let previous_finally_exception_exclusion_depth = self
+            .control
+            .finally
+            .innermost_finally_exception_exclusion_depth
+            .replace(exclusion_depth + 1);
         let previous_conditional_cleanup_bodies = self
             .control
             .finally
@@ -1057,6 +1063,10 @@ impl Compiler<'_> {
             .finally
             .active_conditional_cleanup_finally_try_bodies = previous_conditional_cleanup_bodies;
         self.control.finally.active_finally_try_bodies = previous_try_bodies;
+        self.control
+            .finally
+            .innermost_finally_exception_exclusion_depth =
+            previous_finally_exception_exclusion_depth;
         self.control.finally.preserve_finally_break_exit_loop_range =
             previous_break_exit_loop_range;
         self.control.finally.active_overriding_finally_returns = previous_overriding_returns;
@@ -11255,7 +11265,13 @@ impl Compiler<'_> {
                 statement.range,
             ));
         }
-        self.compile_async_with_items(&statement.items, &statement.body, terminal)
+        let direct_try_range = (statement.items.len() == 1).then_some(statement.range);
+        self.compile_async_with_items(
+            &statement.items,
+            &statement.body,
+            terminal,
+            direct_try_range,
+        )
     }
 
     fn compile_async_with_items(
@@ -11263,6 +11279,7 @@ impl Compiler<'_> {
         items: &[ruff_python_ast::WithItem],
         body: &[Stmt],
         terminal: bool,
+        direct_try_range: Option<TextRange>,
     ) -> Result<(), CompileError> {
         let Some((item, remaining)) = items.split_first() else {
             return self.compile_suite(body);
@@ -11368,7 +11385,7 @@ impl Compiler<'_> {
                                     }
                                 }
                             } else {
-                                compiler.compile_async_with_items(remaining, body, false)?;
+                                compiler.compile_async_with_items(remaining, body, false, None)?;
                             }
                             Ok(())
                         },
@@ -11494,7 +11511,36 @@ impl Compiler<'_> {
         if terminal {
             self.emit_implicit_return()?;
         } else {
+            let finally_depth = (!self.control.statements.current_statement_has_following
+                && self.control.exceptions.direct_try_body_statements.last()
+                    == direct_try_range.as_ref())
+            .then_some(
+                self.control
+                    .finally
+                    .innermost_finally_exception_exclusion_depth,
+            )
+            .flatten();
+            let outer_exception_exit_start = finally_depth.map(|_| {
+                let start = self.assembler.label();
+                self.assembler.mark(start);
+                start
+            });
             self.emit_jump_forward(JUMP_FORWARD, end, 0)?;
+            if let Some(start) = outer_exception_exit_start {
+                let exclusion_end = self.assembler.label();
+                self.assembler.mark(exclusion_end);
+                let finally_depth =
+                    finally_depth.expect("finally exception exclusion depth remains active");
+                for exclusions in self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .iter_mut()
+                    .skip(finally_depth)
+                {
+                    exclusions.push((start, exclusion_end));
+                }
+            }
         }
 
         self.assembler.mark(cleanup);
