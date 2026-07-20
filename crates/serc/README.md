@@ -33,7 +33,7 @@ cargo run --release -p serc-cli -- compile path/to/package
 Paths default to the current directory. Pass `--check` to compile without writing cache files and
 `--quiet` to suppress the success summary. Compilation is sequential so the command can be
 compared directly with single-worker CPython `compileall`. Source files may use UTF-8 or a
-CPython-compatible encoding cookie for Latin-1, EUC-JP, KOI8-R, or Windows-1251; other source
+CPython-compatible encoding cookie for Latin-1, Latin-9, EUC-JP, KOI8-R, or Windows-1251; other source
 encodings are unsupported.
 
 ## Library source API

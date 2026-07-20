@@ -3239,7 +3239,8 @@ impl Compiler<'_> {
         let deferred_normal_restore = self
             .control
             .comprehensions
-            .defer_async_comprehension_restore;
+            .defer_async_comprehension_restore
+            && generators.iter().any(|generator| generator.is_async);
         self.set_depth(base_depth + i32::try_from(temporary_names.len()).unwrap() + 1);
         self.assembler.set_location(comprehension_location);
         if deferred_normal_restore {

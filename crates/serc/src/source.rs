@@ -3,7 +3,7 @@ use std::error::Error;
 use std::fmt;
 use std::str::Utf8Error;
 
-use encoding_rs::{EUC_JP, KOI8_R, WINDOWS_1251};
+use encoding_rs::{EUC_JP, ISO_8859_15, KOI8_R, WINDOWS_1251};
 
 const UTF8_BOM: &[u8] = b"\xef\xbb\xbf";
 
@@ -60,6 +60,7 @@ impl Error for SourceDecodeError {
 enum SourceEncoding {
     Utf8(Utf8Encoding),
     Latin1,
+    Iso885915,
     EucJp,
     Koi8R,
     Windows1251,
@@ -74,9 +75,9 @@ enum Utf8Encoding {
 /// Decode Python source bytes and normalize them for parsing.
 ///
 /// Serc accepts UTF-8 source, including a single UTF-8 BOM and CPython-compatible UTF-8
-/// encoding cookies on the first or second physical line. Latin-1, EUC-JP, KOI8-R, and Windows
-/// 1251 cookies are also decoded with CPython-compatible aliases and strict mappings. Newlines are
-/// normalized to `\n`. The returned value borrows `bytes` for unchanged UTF-8 source.
+/// encoding cookies on the first or second physical line. Latin-1, Latin-9, EUC-JP, KOI8-R, and
+/// Windows 1251 cookies are also decoded with CPython-compatible aliases and strict mappings.
+/// Newlines are normalized to `\n`. The returned value borrows `bytes` for unchanged UTF-8 source.
 pub fn decode_source(bytes: &[u8]) -> Result<Cow<'_, str>, SourceDecodeError> {
     if bytes.contains(&0) {
         return Err(SourceDecodeError::NullByte);
@@ -106,7 +107,10 @@ pub fn decode_source(bytes: &[u8]) -> Result<Cow<'_, str>, SourceDecodeError> {
             Cow::Borrowed(std::str::from_utf8(bytes).map_err(SourceDecodeError::InvalidUtf8)?)
         }
         SourceEncoding::Latin1 => Cow::Owned(bytes.iter().copied().map(char::from).collect()),
-        SourceEncoding::EucJp | SourceEncoding::Koi8R | SourceEncoding::Windows1251 => {
+        SourceEncoding::Iso885915
+        | SourceEncoding::EucJp
+        | SourceEncoding::Koi8R
+        | SourceEncoding::Windows1251 => {
             let encoding_name = declared.expect("legacy source encoding has a cookie");
             decode_legacy(encoding, bytes)
                 .ok_or_else(|| SourceDecodeError::InvalidEncoding(encoding_name.to_string()))?
@@ -117,6 +121,9 @@ pub fn decode_source(bytes: &[u8]) -> Result<Cow<'_, str>, SourceDecodeError> {
 
 fn decode_legacy(encoding: SourceEncoding, bytes: &[u8]) -> Option<Cow<'_, str>> {
     match encoding {
+        SourceEncoding::Iso885915 => {
+            ISO_8859_15.decode_without_bom_handling_and_without_replacement(bytes)
+        }
         SourceEncoding::EucJp => decode_euc_jp(bytes),
         SourceEncoding::Koi8R => KOI8_R.decode_without_bom_handling_and_without_replacement(bytes),
         SourceEncoding::Windows1251 if !bytes.contains(&0x98) => {
@@ -228,6 +235,7 @@ fn classify_source_encoding(name: &str) -> Option<SourceEncoding> {
         | "iso_8859_1_1987" | "iso_ir_100" | "l1" | "latin" | "latin1" | "latin_1" => {
             Some(SourceEncoding::Latin1)
         }
+        "iso8859_15" | "iso_8859_15" | "l9" | "latin9" => Some(SourceEncoding::Iso885915),
         "euc_jp" | "eucjp" | "ujis" | "u_jis" => Some(SourceEncoding::EucJp),
         "koi8_r" | "cskoi8r" => Some(SourceEncoding::Koi8R),
         "windows_1251" | "cp1251" | "1251" => Some(SourceEncoding::Windows1251),
@@ -242,6 +250,7 @@ fn classify_dotted_codec_alias(name: &str) -> Option<SourceEncoding> {
         "iso8859_1" | "iso_8859_1" | "iso_8859_1_1987" | "iso_ir_100" => {
             Some(SourceEncoding::Latin1)
         }
+        "iso8859_15" | "iso_8859_15" => Some(SourceEncoding::Iso885915),
         "u_jis" => Some(SourceEncoding::EucJp),
         "windows_1251" => Some(SourceEncoding::Windows1251),
         _ => None,
@@ -455,6 +464,11 @@ mod tests {
             "# coding: latin-1\nvalue = '\u{e9}'\n"
         );
         assert_eq!(
+            decode_source(b"# coding: iso-8859-15\nvalue = '\xa4\xa6\xa8\xb4\xb8\xbc\xbd\xbe'\n")
+                .unwrap(),
+            "# coding: iso-8859-15\nvalue = '\u{20ac}\u{0160}\u{0161}\u{017d}\u{017e}\u{0152}\u{0153}\u{0178}'\n"
+        );
+        assert_eq!(
             decode_source(b"# coding: euc-jp\nvalue = '\xa4\xa2'\n").unwrap(),
             "# coding: euc-jp\nvalue = '\u{3042}'\n"
         );
@@ -611,6 +625,20 @@ mod tests {
             assert_eq!(
                 classify_source_encoding(encoding),
                 Some(SourceEncoding::EucJp),
+                "{encoding}"
+            );
+        }
+        for encoding in [
+            "iso-8859-15",
+            "iso8859_15",
+            "iso_8859_15",
+            "iso.8859.15",
+            "latin9",
+            "l9",
+        ] {
+            assert_eq!(
+                classify_source_encoding(encoding),
+                Some(SourceEncoding::Iso885915),
                 "{encoding}"
             );
         }
