@@ -2060,18 +2060,31 @@ impl Compiler<'_> {
         // CPython appends the optimized Boolean loop's artificial control-flow instructions
         // after exception-handler regions are labeled, so they do not inherit handler cleanup.
         let handler_boolean_loop_policy = (!collect_tuple
-            && self
+            && self.control.in_exception_handler()
+            && (self
                 .control
                 .generators
                 .optimized_generator_boolean_condition
-            && self.control.in_exception_handler())
+                || (!self.control.in_synchronous_with()
+                    && matches!(
+                        call.arguments.args.as_ref(),
+                        [Expr::Generator(generator)]
+                            if !expression_suspends_current_scope(&generator.elt)
+                                && generator.generators.iter().enumerate().all(|(index, generator)| {
+                                    !generator.is_async
+                                        && (index == 0
+                                            || !expression_suspends_current_scope(&generator.iter))
+                                        && !generator
+                                            .ifs
+                                            .iter()
+                                            .any(expression_suspends_current_scope)
+                                })
+                    ))))
         .then_some(ExceptionPolicy::EXCLUDE_ALWAYS);
         let coroutine_boolean_loop_policy = (!collect_tuple
-            && self.unit.flags & CO_COROUTINE != 0
+            && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR | CO_GENERATOR) != 0
             && self.context.target_specific_rules_enabled()
             && self.control.generators.generator_region_start.is_some()
-            && self.control.stack.depth == 0
-            && self.control.generators.coroutine_suspension_epoch > 0
             && self
                 .control
                 .exceptions
@@ -2091,6 +2104,10 @@ impl Compiler<'_> {
                 call.arguments.args.as_ref(),
                 [Expr::Generator(generator)]
                     if !expression_suspends_current_scope(&generator.elt)
+                        && (self.control.stack.depth == 0
+                            || generator.generators.first().is_some_and(|generator| {
+                                !expression_suspends_current_scope(&generator.iter)
+                            }))
                         && generator.generators.iter().enumerate().all(|(index, generator)| {
                             !generator.is_async
                                 && (index == 0
@@ -2102,6 +2119,11 @@ impl Compiler<'_> {
                         })
             ))
         .then_some(ExceptionPolicy::EXCLUDE_ALWAYS);
+        let coroutine_boolean_dispatch_policy = coroutine_boolean_loop_policy.filter(|_| {
+            self.unit.flags & CO_COROUTINE != 0
+                && self.control.generators.coroutine_suspension_epoch > 0
+                && (!self.control.in_loop() || self.control.stack.depth == 0)
+        });
         let plain_try_boolean_loop_policy = (!collect_tuple
             && self.context.target_specific_rules_enabled()
             && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR | CO_GENERATOR) == 0
@@ -2345,7 +2367,7 @@ impl Compiler<'_> {
                 .or(generator_guard_exception_policy)
                 .or(plain_try_boolean_dispatch_policy)
                 .or_else(|| {
-                    coroutine_boolean_loop_policy.map(|_| {
+                    coroutine_boolean_dispatch_policy.map(|_| {
                         if self.assembler.current_block_has_dynamic_exception_owner() {
                             ExceptionPolicy::normalized_owner(true)
                         } else {
