@@ -67,13 +67,17 @@ mod tests {
 
     #[test]
     fn matches_cpython_marshal_for_supported_source_encodings() {
-        let cases: [(&str, &[u8]); 8] = [
+        let cases: [(&str, &[u8]); 9] = [
             ("latin_1.py", b"# coding: latin-1\nvalue = '\xe9'\n"),
             ("euc_jp.py", b"# coding: euc-jp\nvalue = '\xa1\xc1'\n"),
             ("koi8_r.py", b"# coding: koi8-r\nvalue = '\xe1'\n"),
             ("cp1251.py", b"# coding: cp1251\nvalue = '\xc0'\n"),
             ("iso_8859_1.py", b"# coding: iso.8859.1\nvalue = '\xe9'\n"),
             ("iso_ir_100.py", b"# coding: iso.ir.100\nvalue = '\xe9'\n"),
+            (
+                "iso_8859_15.py",
+                b"#!/usr/bin/env python\n# -*- coding: iso-8859-15 -*-\nvalue = '\xa4\xa6\xa8\xb4\xb8\xbc\xbd\xbe'\n",
+            ),
             ("u_jis.py", b"# coding: u.jis\nvalue = '\xa1\xc1'\n"),
             (
                 "windows_1251.py",
@@ -83,6 +87,11 @@ mod tests {
         for (filename, source) in cases {
             assert_matches_cpython_marshal_bytes(source, filename);
         }
+
+        let mut latin9 = b"# coding: latin9\nvalue = '".to_vec();
+        latin9.extend(0x80..=0xff);
+        latin9.extend_from_slice(b"'\n");
+        assert_matches_cpython_marshal_bytes(&latin9, "latin9_all_bytes.py");
     }
 
     #[test]
@@ -4142,6 +4151,31 @@ def direct_assertion_control(items):
         let source =
             "async def test(): return [[x async for x in elements(n)] async for n in range(3)]\n";
         assert_matches_cpython_marshal(source, "nested_async_comprehension.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_assigned_async_comprehension_with_sync_iterable() {
+        let source = r"async def positional(values, source):
+    result = [item async for item in source([value for value in values])]
+    return result
+
+async def keyword(values, source):
+    result = [item async for item in source(values=[value for value in values])]
+    return result
+
+async def dictionary(values, source):
+    result = {item: item async for item in source([value for value in values])}
+    return result
+
+async def nested_call(values, source, wrap):
+    result = [item async for item in source(wrap([value for value in values]))]
+    return result
+
+async def conditional(values, source, enabled):
+    result = [item async for item in source([value for value in values] if enabled else [])]
+    return result
+";
+        assert_matches_cpython_marshal(source, "assigned_async_comprehension_sync_iterable.py");
     }
 
     #[test]
