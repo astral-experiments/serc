@@ -5732,7 +5732,16 @@ impl Compiler<'_> {
                 && operand_index == 0
                 && !nested_leading_group
                 && self.control.in_synchronous_with()
-                && self.control.statements.current_statement_preceded_by_try
+                && (self.control.statements.current_statement_preceded_by_try
+                    || (self
+                        .control
+                        .statements
+                        .current_statement_preceded_by_terminating_if
+                        && self
+                            .control
+                            .exceptions
+                            .active_exception_region_exclusions
+                            .is_empty()))
                 && !marker_reuses_exception_owner;
             let preserve_exception_type_owner =
                 exception_type_marker_owner == Some(true) && !follows_sync_with_branch_join;
