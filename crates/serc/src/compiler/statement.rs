@@ -4417,9 +4417,15 @@ impl Compiler<'_> {
                         .statements
                         .current_statement_preceded_by_terminating_if
                     && (matches!(test, Expr::Name(_) | Expr::Attribute(_))
+                        || matches!(test, Expr::Call(call)
+                            if matches!(call.func.as_ref(), Expr::Attribute(attribute)
+                                if is_sync_with_post_return_call_receiver(&attribute.value)))
                         || matches!(test, Expr::UnaryOp(unary)
                             if unary.op == UnaryOp::Not
-                                && matches!(unary.operand.as_ref(), Expr::Name(_) | Expr::Attribute(_)))
+                                && (matches!(unary.operand.as_ref(), Expr::Name(_) | Expr::Attribute(_))
+                                    || matches!(unary.operand.as_ref(), Expr::Call(call)
+                                        if matches!(call.func.as_ref(), Expr::Attribute(attribute)
+                                            if is_sync_with_post_return_call_receiver(&attribute.value)))))
                         || matches!(test, Expr::BoolOp(boolean)
                         if boolean.op == BoolOp::And
                             && boolean.values.first().is_some_and(|first| {
@@ -12124,6 +12130,15 @@ fn is_coroutine_try_else_attribute_chain(expression: &Expr) -> bool {
     match expression {
         Expr::Name(_) => true,
         Expr::Attribute(attribute) => is_coroutine_try_else_attribute_chain(&attribute.value),
+        _ => false,
+    }
+}
+
+fn is_sync_with_post_return_call_receiver(expression: &Expr) -> bool {
+    match expression {
+        Expr::Name(_) => true,
+        Expr::Attribute(attribute) => is_sync_with_post_return_call_receiver(&attribute.value),
+        Expr::Call(call) => is_sync_with_post_return_call_receiver(&call.func),
         _ => false,
     }
 }
