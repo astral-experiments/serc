@@ -452,6 +452,8 @@ pub(super) struct StatementState {
     current_statement_followed_by_try: bool,
     // Whether this statement directly follows a try in the same suite.
     current_statement_preceded_by_try: bool,
+    // Whether this statement directly follows a conditional whose body terminates in a return.
+    current_statement_preceded_by_terminating_if: bool,
     branch_join_successor: Option<TextRange>,
     // Whether the current statement is nested directly in a terminal if branch suite.
     pub(super) in_terminal_if_branch_suite: bool,
@@ -1484,9 +1486,23 @@ impl Compiler<'_> {
                 let followed_by_try = matches!(body.get(index + 1), Some(Stmt::Try(_)));
                 let previous_statement = body[..index].last();
                 let preceded_by_try = matches!(previous_statement, Some(Stmt::Try(_)));
+                let preceded_by_terminating_if = matches!(
+                    previous_statement,
+                    Some(Stmt::If(previous))
+                        if previous.elif_else_clauses.is_empty()
+                            && matches!(previous.body.last(), Some(Stmt::Return(_)))
+                            && suite_terminates(&previous.body)
+                );
                 let previous_statement_preceded_by_try = std::mem::replace(
                     &mut self.control.statements.current_statement_preceded_by_try,
                     preceded_by_try,
+                );
+                let previous_statement_preceded_by_terminating_if = std::mem::replace(
+                    &mut self
+                        .control
+                        .statements
+                        .current_statement_preceded_by_terminating_if,
+                    preceded_by_terminating_if,
                 );
                 let post_async_with_condition_marker =
                     (matches!(
@@ -1660,6 +1676,10 @@ impl Compiler<'_> {
                     previous_copied_nested_handler_join_successor;
                 self.control.statements.current_statement_preceded_by_try =
                     previous_statement_preceded_by_try;
+                self.control
+                    .statements
+                    .current_statement_preceded_by_terminating_if =
+                    previous_statement_preceded_by_terminating_if;
                 self.control.withs.post_async_with_condition_marker =
                     previous_post_async_with_condition_marker;
                 self.control
@@ -4331,9 +4351,24 @@ impl Compiler<'_> {
                             |range| (range.start(), range.end()),
                         )
                         .is_ok();
+                let exclude_sync_with_condition_after_return = branch_index == 0
+                    && self.context.target_specific_rules_enabled()
+                    && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR | CO_GENERATOR) == 0
+                    && self.control.loops.contexts.is_empty()
+                    && self.control.in_synchronous_with()
+                    && !self.control.in_synchronous_with_nested_exception_region()
+                    && self
+                        .control
+                        .statements
+                        .current_statement_preceded_by_terminating_if
+                    && (matches!(test, Expr::Name(_) | Expr::Attribute(_))
+                        || matches!(test, Expr::UnaryOp(unary)
+                            if unary.op == UnaryOp::Not
+                                && matches!(unary.operand.as_ref(), Expr::Name(_) | Expr::Attribute(_))));
                 let exclude_not_taken = self.control.conditions.exclude_terminal_if_not_taken
                     || exclude_normal_finally_short_circuit
                     || exclude_later_async_with_terminal
+                    || exclude_sync_with_condition_after_return
                     || (!self.control.withs.active_with_region_exclusions.is_empty()
                         && branch_index > 0
                         && suite_terminates(body));
