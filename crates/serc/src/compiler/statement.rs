@@ -350,6 +350,8 @@ pub(super) struct FinallyState {
     active_return_finally_contexts: Vec<ReturnFinallyContext>,
     // A sole copied finally condition can duplicate the preserved return onto its false edge.
     copy_return_finally_condition_exit: bool,
+    // Return values kept on the stack while an enclosing finally body is copied.
+    copied_return_finally_preserved_values: usize,
     // CPython's normalized `NOT_TAKEN` can reuse a normal-finally CFG slot that still owns the
     // coroutine stop-iteration handler.
     pub(super) active_normal_finally_bodies: usize,
@@ -3799,6 +3801,13 @@ impl Compiler<'_> {
                     self.control.finally.copy_return_finally_condition_exit =
                         finally_context.preserves_conditional_exit_owner;
                     let initialized_locals = self.symbols.initialized_locals.clone();
+                    let unwound_exception_handlers = (handler_count > 0).then(|| {
+                        std::mem::take(&mut self.control.exceptions.active_exception_handlers)
+                    });
+                    let copied_return_finally_preserved_values =
+                        self.control.finally.copied_return_finally_preserved_values;
+                    self.control.finally.copied_return_finally_preserved_values +=
+                        usize::from(preserve_tos);
                     let result = if context_index > 0 {
                         self.with_region_exclusion_collector(
                             |control| &mut control.exceptions.active_exception_region_exclusions,
@@ -3808,6 +3817,12 @@ impl Compiler<'_> {
                         self.compile_suite(&finally_context.body)
                             .map(|()| ((), Vec::new()))
                     };
+                    if let Some(unwound_exception_handlers) = unwound_exception_handlers {
+                        self.control.exceptions.active_exception_handlers =
+                            unwound_exception_handlers;
+                    }
+                    self.control.finally.copied_return_finally_preserved_values =
+                        copied_return_finally_preserved_values;
                     self.control.finally.copy_return_finally_condition_exit =
                         previous_copy_return_finally_condition_exit;
                     self.symbols.initialized_locals = initialized_locals;
@@ -3871,6 +3886,14 @@ impl Compiler<'_> {
                     let start = self.assembler.label();
                     self.assembler.mark(start);
                     exception_unwind_start = Some(start);
+                }
+                if !return_is_overridden {
+                    for _ in 0..self.control.finally.copied_return_finally_preserved_values {
+                        if preserve_tos {
+                            self.emit(SWAP, 2, 0)?;
+                        }
+                        self.emit(POP_TOP, 0, -1)?;
+                    }
                 }
                 if self
                     .control

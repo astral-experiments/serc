@@ -12145,6 +12145,12 @@ def filled(action, self, mask, result):
     }
 
     #[test]
+    fn executes_copied_finally_handler_returns() {
+        let source = include_str!("fixtures/execution/copied_finally_handler_returns.py");
+        assert_executes(source, "ok\n");
+    }
+
+    #[test]
     fn executes_control_flow() {
         let source = r#"
 x = 3
