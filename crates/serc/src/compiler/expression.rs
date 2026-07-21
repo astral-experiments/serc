@@ -2238,6 +2238,10 @@ impl Compiler<'_> {
         let preserve_synchronous_with_boolean_loop_owner = !collect_tuple
             && self.context.target_specific_rules_enabled()
             && self.control.in_synchronous_with()
+            && !self
+                .control
+                .statements
+                .current_statement_follows_sync_with_return_join
             && !self.control.conditions.include_assert_none_condition_owner
             && ((self.control.statements.current_statement_has_following
                 && !self.control.in_loop()
