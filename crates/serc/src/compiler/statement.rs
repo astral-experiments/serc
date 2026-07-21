@@ -467,7 +467,7 @@ pub(super) struct StatementState {
     // Whether two of this statement's three immediately preceding siblings assign a call.
     current_statement_preceded_by_call_assignments: bool,
     // Whether this statement directly follows a conditional whose body terminates in a return.
-    current_statement_preceded_by_terminating_if: bool,
+    pub(super) current_statement_preceded_by_terminating_if: bool,
     branch_join_successor: Option<TextRange>,
     // Whether the current statement is nested directly in a terminal if branch suite.
     pub(super) in_terminal_if_branch_suite: bool,
