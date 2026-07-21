@@ -4802,7 +4802,7 @@ impl Compiler<'_> {
                             }))
                         || matches!(test, Expr::BoolOp(boolean)
                         if boolean.op == BoolOp::Or
-                            && boolean.values.len() == 3
+                            && matches!(boolean.values.len(), 2 | 3)
                             && boolean.values.first().is_some_and(|first| {
                                 matches!(first, Expr::Name(_) | Expr::Attribute(_))
                                     || matches!(first, Expr::UnaryOp(unary)
