@@ -4131,7 +4131,24 @@ impl Compiler<'_> {
                         self.assembler.mark(end);
                         end
                     });
-                self.emit_loop_iterator_cleanup(0, protected_iterator_start, preserve_tos)?;
+                let deferred_outer_iterator_depth = self
+                    .context
+                    .target_specific_rules_enabled()
+                    .then(|| self.control.withs.active_with_exits.first().copied())
+                    .flatten()
+                    .filter(|outer| {
+                        self.control
+                            .withs
+                            .active_with_exits
+                            .iter()
+                            .all(|context| context.loop_depth == outer.loop_depth)
+                    })
+                    .map_or(0, |outer| outer.loop_depth.min(protected_iterator_start));
+                self.emit_loop_iterator_cleanup(
+                    deferred_outer_iterator_depth,
+                    protected_iterator_start,
+                    preserve_tos,
+                )?;
                 if delay_boolean_iterator_exception_unwind_start
                     && delay_iterator_exception_unwind_start
                     && exception_unwind_start.is_none()
@@ -4156,6 +4173,24 @@ impl Compiler<'_> {
                     exception_unwind_start = Some(start);
                 }
                 let with_unwind_starts = self.emit_active_with_unwind(0, preserve_tos)?;
+                if deferred_outer_iterator_depth > 0 {
+                    if exception_unwind_start.is_none()
+                        && !self
+                            .control
+                            .exceptions
+                            .active_exception_region_exclusions
+                            .is_empty()
+                    {
+                        let start = self.assembler.label();
+                        self.assembler.mark(start);
+                        exception_unwind_start = Some(start);
+                    }
+                    self.emit_loop_iterator_cleanup(
+                        0,
+                        deferred_outer_iterator_depth,
+                        preserve_tos,
+                    )?;
+                }
                 let finally_unwind_start = if unwinds_pass_finally {
                     let start = if let Some(start) = pass_finally_edge_start {
                         start
@@ -11798,7 +11833,27 @@ impl Compiler<'_> {
                 .control
                 .withs
                 .direct_final_sync_with_protected_handler_try_body
-                == Some(statement.range);
+                == Some(statement.range)
+            || (self.context.target_specific_rules_enabled()
+                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                && self
+                    .control
+                    .loops
+                    .contexts
+                    .last()
+                    .is_some_and(|context| context.iterator_cleanup != IteratorCleanup::None)
+                && self.control.withs.active_with_exits.is_empty()
+                && self.control.exceptions.active_exception_handlers.is_empty()
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .len()
+                    == 1
+                && self.control.finally.active_finally_try_bodies == 0
+                && self.control.finally.active_normal_finally_bodies == 0
+                && self.control.finally.active_finally_end_blocks == 0
+                && suite_terminates(&statement.body));
         self.compile_with_items(
             &statement.items,
             &statement.body,
