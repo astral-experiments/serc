@@ -7708,6 +7708,12 @@ def with_loop(manager, groups, touch):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_protected_coroutine_boolean_generators() {
+        let source = include_str!("fixtures/protected_coroutine_boolean_generators.py");
+        assert_matches_cpython_marshal(source, "protected_coroutine_boolean_generators.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_synchronous_with_short_circuit_none_markers() {
         let source = r"def two_operands(manager, value, touch):
     with manager:

@@ -2096,11 +2096,12 @@ impl Compiler<'_> {
             && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR | CO_GENERATOR) != 0
             && self.context.target_specific_rules_enabled()
             && self.control.generators.generator_region_start.is_some()
-            && self
+            && (self
                 .control
                 .exceptions
                 .active_exception_region_exclusions
                 .is_empty()
+                || self.unit.flags & CO_COROUTINE != 0)
             && self.control.withs.active_with_region_exclusions.is_empty()
             && self
                 .control
