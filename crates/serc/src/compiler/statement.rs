@@ -3623,6 +3623,25 @@ impl Compiler<'_> {
                 } else {
                     None
                 };
+                // A copied finally body can add narrower exclusions while it is compiled. The
+                // return unwind starts before that copy and subsumes those ranges for surrounding
+                // protected regions when the return has no inherited continuation.
+                let copied_return_exclusion_lengths = (!self
+                    .control
+                    .finally
+                    .active_return_finally_contexts
+                    .is_empty()
+                    && !self.control.statements.inherited_statement_has_following
+                    && exception_unwind_start.is_some()
+                    && self.context.target_specific_rules_enabled())
+                .then(|| {
+                    self.control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .iter()
+                        .map(Vec::len)
+                        .collect::<Vec<_>>()
+                });
                 let unwinds_handler_before_sync_with =
                     !self.control.withs.active_with_exits.is_empty()
                         && !self.control.exceptions.active_exception_handlers.is_empty()
@@ -4100,6 +4119,12 @@ impl Compiler<'_> {
                                 },
                                 |(_, start)| start,
                             );
+                        if let Some(length) = copied_return_exclusion_lengths
+                            .as_ref()
+                            .and_then(|lengths| lengths.get(index))
+                        {
+                            exclusions.truncate(*length);
+                        }
                         exclusions.push((exclusion_start, return_exclusion_end));
                     }
                 }
