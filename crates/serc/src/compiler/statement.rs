@@ -451,6 +451,9 @@ pub(super) struct GeneratorState {
     pub(super) pre_suspension_coroutine_boolean_assertion: Option<TextRange>,
     pub(super) generator_region_start: Option<Label>,
     pub(super) generator_region_exclusions: Vec<(Label, Label)>,
+    // Whether the next Boolean-value marker follows an inlined comprehension restore before
+    // the resumable code unit's first suspension.
+    pub(super) pre_suspension_inline_comprehension_restore: bool,
 }
 
 #[derive(Debug, Default)]
@@ -3169,6 +3172,30 @@ impl Compiler<'_> {
                         }
                     }
                     self.emit_pending_comprehension_restores()?;
+                    if matches!(
+                        assignment.value.as_ref(),
+                        Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_)
+                    ) && matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                        && self.context.target_specific_rules_enabled()
+                        && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR | CO_GENERATOR) != 0
+                        && self.control.generators.coroutine_suspension_epoch == 0
+                        && !self.control.generators.emitted_yield_value
+                        && self.control.generators.generator_region_start.is_some()
+                        && self.control.withs.active_with_region_exclusions.is_empty()
+                        && self
+                            .control
+                            .exceptions
+                            .active_exception_region_exclusions
+                            .is_empty()
+                        && self.control.finally.active_normal_finally_bodies == 0
+                        && self.control.finally.active_finally_end_blocks == 0
+                        && self.control.exceptions.active_exception_group_handlers == 0
+                        && !self.control.in_loop()
+                    {
+                        self.control
+                            .generators
+                            .pre_suspension_inline_comprehension_restore = true;
+                    }
                 }
             }
             Stmt::AugAssign(assignment) => {
