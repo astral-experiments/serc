@@ -461,6 +461,8 @@ pub(super) struct StatementState {
     current_statement_followed_by_try: bool,
     // Whether this statement directly follows a try in the same suite.
     pub(super) current_statement_preceded_by_try: bool,
+    // Whether that try retains a synchronous suffix or cleanup after its suspension.
+    current_statement_preceded_by_suffixed_try: bool,
     // Whether two of this statement's three immediately preceding siblings assign a call.
     current_statement_preceded_by_call_assignments: bool,
     // Whether this statement directly follows a conditional whose body terminates in a return.
@@ -1520,6 +1522,46 @@ impl Compiler<'_> {
                 let followed_by_try = matches!(body.get(index + 1), Some(Stmt::Try(_)));
                 let previous_statement = body[..index].last();
                 let preceded_by_try = matches!(previous_statement, Some(Stmt::Try(_)));
+                let preceded_by_suffixed_try = preceded_by_try
+                    && matches!(statement, Stmt::If(_))
+                    && self.context.target_specific_rules_enabled()
+                    && self.unit.flags & CO_COROUTINE != 0
+                    && self.control.generators.generator_region_start.is_some()
+                    && previous_statement.is_some_and(|previous| {
+                        let Stmt::Try(previous) = previous else {
+                            return false;
+                        };
+                        if previous.body.len() <= 1
+                            && previous.finalbody.is_empty()
+                            && !previous
+                                .body
+                                .iter()
+                                .any(|statement| matches!(statement, Stmt::With(_)))
+                        {
+                            return false;
+                        }
+                        let [_, Stmt::Assign(assignment)] = previous.body.as_slice() else {
+                            return true;
+                        };
+                        let Expr::Call(call) = assignment.value.as_ref() else {
+                            return true;
+                        };
+                        let Expr::Name(name) = call.func.as_ref() else {
+                            return true;
+                        };
+                        let name = self.required_name_id(name.id.as_str());
+                        !matches!(
+                            &self.unit.scope,
+                            Scope::Function {
+                                indices,
+                                free_indices,
+                                globals,
+                                ..
+                            } if !globals.contains(name)
+                                && (indices.contains_key(&name)
+                                    || free_indices.contains_key(&name))
+                        )
+                    });
                 let preceded_by_call_assignments = self.context.target_specific_rules_enabled()
                     && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR | CO_GENERATOR) != 0
                     && matches!(statement, Stmt::Try(_))
@@ -1549,6 +1591,13 @@ impl Compiler<'_> {
                 let previous_statement_preceded_by_try = std::mem::replace(
                     &mut self.control.statements.current_statement_preceded_by_try,
                     preceded_by_try,
+                );
+                let previous_statement_preceded_by_suffixed_try = std::mem::replace(
+                    &mut self
+                        .control
+                        .statements
+                        .current_statement_preceded_by_suffixed_try,
+                    preceded_by_suffixed_try,
                 );
                 let previous_statement_preceded_by_call_assignments = std::mem::replace(
                     &mut self
@@ -1763,6 +1812,10 @@ impl Compiler<'_> {
                     previous_copied_nested_handler_join_successor;
                 self.control.statements.current_statement_preceded_by_try =
                     previous_statement_preceded_by_try;
+                self.control
+                    .statements
+                    .current_statement_preceded_by_suffixed_try =
+                    previous_statement_preceded_by_suffixed_try;
                 self.control
                     .statements
                     .current_statement_preceded_by_call_assignments =
@@ -4555,6 +4608,35 @@ impl Compiler<'_> {
                         if boolean.op == BoolOp::And
                             && matches!(boolean.values.as_slice(),
                                 [Expr::Named(_), Expr::Named(_)]));
+                let exclude_direct_post_try_coroutine_return_condition = branch_index == 0
+                    && self.context.target_specific_rules_enabled()
+                    && self
+                        .control
+                        .statements
+                        .current_statement_preceded_by_suffixed_try
+                    && self.unit.flags & CO_COROUTINE != 0
+                    && self.control.generators.generator_region_start.is_some()
+                    && self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .is_empty()
+                    && self.control.withs.active_with_region_exclusions.is_empty()
+                    && self.control.finally.active_normal_finally_bodies == 0
+                    && self.control.finally.active_finally_end_blocks == 0
+                    && self.control.exceptions.active_exception_group_handlers == 0
+                    && !self.control.in_exception_handler()
+                    && matches!(body.last(), Some(Stmt::Return(_)))
+                    && (matches!(test, Expr::Name(_) | Expr::Attribute(_) | Expr::Call(_))
+                        || matches!(test, Expr::UnaryOp(unary)
+                            if unary.op == UnaryOp::Not
+                                && matches!(unary.operand.as_ref(), Expr::Name(_) | Expr::Attribute(_) | Expr::Call(_))))
+                    && !matches!(test, Expr::Call(call)
+                        if matches!(call.func.as_ref(), Expr::Name(_)))
+                    && !matches!(test, Expr::UnaryOp(unary)
+                        if unary.op == UnaryOp::Not
+                            && matches!(unary.operand.as_ref(), Expr::Call(call)
+                                if matches!(call.func.as_ref(), Expr::Name(_))));
                 // CPython appends the first simple condition marker after the protected body
                 // of a generator or coroutine while-loop try has been labeled.
                 let exclude_generator_while_try_condition = branch_index == 0
@@ -4929,6 +5011,7 @@ impl Compiler<'_> {
                                                     || exclude_handler_condition_after_return
                                                     || exclude_direct_try_while_return_marker
                                                     || exclude_direct_post_try_coroutine_walrus_and
+                                                    || exclude_direct_post_try_coroutine_return_condition
                                                     || exclude_generator_while_try_condition;
                                                 compiler.with_control_override(
                                                     |control| &mut control.conditions.exclude_condition_not_taken_from_exception,
