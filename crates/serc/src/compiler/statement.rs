@@ -3318,7 +3318,7 @@ impl Compiler<'_> {
                 let finally_end_unwind_start = self.emit_finally_end_unwind(0, preserve_tos)?;
                 // A result returned from a loop that was already protected by this try keeps the
                 // iterator cleanup protected. For a Boolean literal, start the exclusion before
-                // loading the returned constant; a call already has its value on the stack.
+                // loading the returned constant; other returned values are already on the stack.
                 let delay_boolean_iterator_exception_unwind_start =
                     matches!(statement.value.as_deref(), Some(Expr::BooleanLiteral(_)))
                         && self.control.protects_boolean_return_iterator_cleanup();
@@ -3337,7 +3337,10 @@ impl Compiler<'_> {
                         .active_return_finally_contexts
                         .is_empty()
                     && (delay_boolean_iterator_exception_unwind_start
-                        || (matches!(statement.value.as_deref(), Some(Expr::Call(_)))
+                        || ((matches!(statement.value.as_deref(), Some(Expr::Call(_)))
+                            || (self.context.target_specific_rules_enabled()
+                                && preserve_tos
+                                && !matches!(statement.value.as_deref(), Some(Expr::If(_)))))
                             && self.control.in_exception_protected_iterator_loop()));
                 let delay_exception_unwind_start = delay_iterator_exception_unwind_start
                     || (overriding_unwind_start.is_none()
