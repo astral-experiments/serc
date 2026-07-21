@@ -7749,6 +7749,10 @@ def nested_ordinary_generator_iterable_control(values):
 
 async def coroutine_ordinary_generator_iterable_control(values):
     assert all(sum(item for item in any(value for value in row)) for row in values)
+
+
+async def asynchronous_generator_iterable_control(values):
+    return all(sum(item async for item in any(value for value in row)) for row in values)
 ";
         assert_matches_cpython_marshal(source, "nested_boolean_generator_dispatch.py");
     }
