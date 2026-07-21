@@ -4420,20 +4420,16 @@ impl Compiler<'_> {
                                         },
                                     )))));
                 let preserve_sync_with_simple_condition_owner = branch_index == 0
-                    && self.control.statements.current_statement_has_following
+                    && (self.control.statements.current_statement_has_following
+                        || self.control.loops.synthesized_loop_tail_predecessor
+                            == Some(statement.range))
                     && self.control.in_iterator_loop()
                     && direct_sync_with_iterator
                     && self.context.target_specific_rules_enabled()
                     && matches!(self.unit.scope, Scope::Function { .. } | Scope::Module)
                     && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
                     && self.control.exceptions.active_exception_handlers.is_empty()
-                    && (matches!(test, Expr::Name(_))
-                        || matches!(test, Expr::UnaryOp(unary)
-                        if unary.op == UnaryOp::Not
-                            && matches!(
-                                unary.operand.as_ref(),
-                                Expr::Name(_) | Expr::Attribute(_)
-                            )))
+                    && is_sync_with_simple_iterator_condition(test)
                     && self.control.loops.contexts.last().is_some_and(|context| {
                         context.iterator_cleanup == IteratorCleanup::Sync
                             && context.exception_region_depth
@@ -12850,6 +12846,43 @@ fn is_coroutine_try_else_attribute_chain(expression: &Expr) -> bool {
         Expr::Attribute(attribute) => is_coroutine_try_else_attribute_chain(&attribute.value),
         _ => false,
     }
+}
+
+fn is_sync_with_simple_iterator_condition(expression: &Expr) -> bool {
+    let expression = match expression {
+        Expr::UnaryOp(unary) if unary.op == UnaryOp::Not => unary.operand.as_ref(),
+        expression => expression,
+    };
+    match expression {
+        Expr::Name(_) => true,
+        Expr::Attribute(attribute) => is_coroutine_try_else_attribute_chain(&attribute.value),
+        Expr::Call(_) => is_sync_with_simple_iterator_method_call(expression),
+        Expr::Subscript(subscript) => {
+            is_sync_with_simple_iterator_method_call(&subscript.value)
+                && (matches!(subscript.slice.as_ref(), Expr::Name(_))
+                    || is_literal_constant(&subscript.slice)
+                    || matches!(subscript.slice.as_ref(), Expr::Attribute(attribute)
+                        if is_coroutine_try_else_attribute_chain(&attribute.value)))
+        }
+        _ => false,
+    }
+}
+
+fn is_sync_with_simple_iterator_method_call(expression: &Expr) -> bool {
+    let Expr::Call(call) = expression else {
+        return false;
+    };
+    call.arguments.keywords.is_empty()
+        && call.arguments.args.len() <= 1
+        && matches!(call.func.as_ref(), Expr::Attribute(attribute)
+            if is_coroutine_try_else_attribute_chain(&attribute.value))
+        && call.arguments.args.first().is_none_or(|argument| {
+            matches!(argument, Expr::Name(_))
+                || is_literal_constant(argument)
+                || matches!(argument, Expr::Subscript(subscript)
+                    if matches!(subscript.value.as_ref(), Expr::Name(_))
+                        && is_literal_constant(&subscript.slice))
+        })
 }
 
 fn is_sync_with_post_return_call_receiver(expression: &Expr) -> bool {
