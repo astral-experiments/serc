@@ -11139,6 +11139,12 @@ def final_elif(action, first, second):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_iterator_handler_return_owners() {
+        let source = include_str!("fixtures/iterator_handler_return_owners.py");
+        assert_matches_cpython_marshal(source, "iterator_handler_return_owners.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_sync_with_none_condition_owners() {
         let source = include_str!("fixtures/sync_with_none_condition_owners.py");
         assert_matches_cpython_marshal(source, "sync_with_none_condition_owners.py");
