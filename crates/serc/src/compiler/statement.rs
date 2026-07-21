@@ -4239,6 +4239,34 @@ impl Compiler<'_> {
                     && !matches!(test, Expr::BoolOp(_) | Expr::If(_))
                     && !expression_suspends_current_scope(test)
                     && !expression_contains_generator(test);
+                let preserve_generator_iterator_branch_condition_owner = branch_index == 0
+                    && self.context.target_specific_rules_enabled()
+                    && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) != 0
+                    && self.control.generators.generator_region_start.is_some()
+                    && self.control.in_iterator_loop()
+                    && self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .is_empty()
+                    && self.control.finally.active_normal_finally_bodies == 0
+                    && self.control.finally.active_finally_try_bodies == 0
+                    && matches!(body, [Stmt::Continue(_)])
+                    && !is_specialized_none_condition(test)
+                    && !matches!(test, Expr::BoolOp(_) | Expr::If(_))
+                    && !expression_contains_eager_suspension(test)
+                    && !expression_suspends_current_scope(test)
+                    && !expression_contains_generator(test)
+                    && !expression_contains_inline_branch(test)
+                    && self.control.loops.contexts.last().is_some_and(|context| {
+                        (self.unit.flags & CO_ASYNC_GENERATOR == 0
+                            || !self
+                                .assembler
+                                .contains_opcode_since_item(SEND, context.body_start_item))
+                            && !self
+                                .assembler
+                                .contains_opcode_since_item(NOT_TAKEN, context.body_start_item)
+                    });
                 let preserve_sync_with_none_owner = branch_index == 0
                     && !suite_terminates(body)
                     && matches!(statement.elif_else_clauses.as_slice(), [clause]
@@ -4948,6 +4976,7 @@ impl Compiler<'_> {
                 if preserve_first_sync_iterator_condition_owner
                     || preserve_first_coroutine_iterator_condition_owner
                     || preserve_first_async_generator_iterator_condition_owner
+                    || preserve_generator_iterator_branch_condition_owner
                 {
                     // CPython removes the synthetic NOP before an iterator target.
                     // The first direct body condition reuses its protected CFG slot.
