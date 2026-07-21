@@ -8370,6 +8370,17 @@ impl Compiler<'_> {
                     .statements
                     .current_statement_followed_by_name_return)
                 || (has_bare_handler && self.control.statements.current_statement_has_following)
+                || (!statement.is_star
+                    && self.context.target_specific_rules_enabled()
+                    && !self
+                        .control
+                        .statements
+                        .current_statement_followed_by_return_or_raise
+                    && matches!(statement.handlers.as_slice(), [handler]
+                    if handler.as_except_handler().is_some_and(|handler| {
+                        matches!(handler.body.as_slice(), [Stmt::Assert(assertion)]
+                            if early_condition_truthiness(&assertion.test) == Some(false))
+                    })))
             {
                 // CPython removes this normal-exit edge before borrowed-load traversal. Keep
                 // the barrier on the source edge so a shared target can still be reached from
