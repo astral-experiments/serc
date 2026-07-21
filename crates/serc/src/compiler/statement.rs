@@ -6448,6 +6448,25 @@ impl Compiler<'_> {
                                     .active_exception_region_exclusions
                                     .len()
                     });
+                let preserve_generator_iterator_tail_condition_owner = branch_index == 0
+                    && has_else
+                    && !try_body_normal_exit
+                    && !non_final_branch
+                    && self.context.target_specific_rules_enabled()
+                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) != 0
+                    && self.control.generators.generator_region_start.is_some()
+                    && matches!(test, Expr::Name(_) | Expr::Attribute(_) | Expr::Call(_))
+                    && condition_jump_target_count(test, false) == 1
+                    && !expression_contains_eager_suspension(test)
+                    && !expression_suspends_current_scope(test)
+                    && !expression_contains_generator(test)
+                    && !expression_contains_inline_branch(test)
+                    && self.control.loops.contexts.last().is_some_and(|context| {
+                        context.iterator_cleanup != IteratorCleanup::None
+                            && !self
+                                .assembler
+                                .contains_iterator_tail_barrier_since_item(context.body_start_item)
+                    });
                 let exclude_from_control_flow_regions = has_outer_exception_region
                     || protected_nested_branch
                     || self.control.loops.loop_tail_final_elif_nested_condition
@@ -6539,6 +6558,7 @@ impl Compiler<'_> {
                 )?;
                 if preserve_first_sync_iterator_owner
                     || preserve_first_protected_iterator_condition_owner
+                    || preserve_generator_iterator_tail_condition_owner
                 {
                     self.assembler.preserve_last_not_taken_exception_owner();
                 }
