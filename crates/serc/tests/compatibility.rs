@@ -12265,6 +12265,12 @@ def filled(action, self, mask, result):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_terminal_while_break_normalization() {
+        let source = include_str!("fixtures/terminal_while_break_normalization.py");
+        assert_matches_cpython_marshal(source, "terminal_while_break_normalization.py");
+    }
+
+    #[test]
     fn executes_control_flow() {
         let source = r#"
 x = 3

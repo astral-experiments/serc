@@ -2274,7 +2274,9 @@ impl Compiler<'_> {
                         || (self.unit.flags & CO_GENERATOR != 0
                             && matches!(tail.body.as_slice(), [Stmt::Break(_)])
                             && matches!(tail.test.as_ref(), Expr::BoolOp(boolean)
-                                if boolean.op == BoolOp::Or && boolean.values.len() == 2)))
+                                if boolean.op == BoolOp::Or && boolean.values.len() == 2))
+                        || (matches!(tail.body.as_slice(), [Stmt::Break(_)])
+                            && terminal_break_test_is_runtime(&tail.test)))
         );
         if normalize_final_condition {
             // CPython normalizes a backward conditional jump by reversing it around an explicit
@@ -14387,6 +14389,21 @@ fn statement_terminates(statement: &Stmt) -> bool {
         }
         Stmt::Try(statement) => suite_terminates(&statement.finalbody),
         _ => false,
+    }
+}
+
+fn terminal_break_test_is_runtime(expression: &Expr) -> bool {
+    if early_condition_truthiness(expression).is_some() || fold_constant(expression).is_some() {
+        return false;
+    }
+
+    match expression {
+        Expr::UnaryOp(unary) if unary.op == UnaryOp::Not => {
+            terminal_break_test_is_runtime(&unary.operand)
+        }
+        Expr::BoolOp(boolean) => boolean.values.iter().all(terminal_break_test_is_runtime),
+        Expr::If(_) => false,
+        _ => true,
     }
 }
 
