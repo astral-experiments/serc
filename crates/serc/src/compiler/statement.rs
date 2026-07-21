@@ -1271,16 +1271,26 @@ impl Compiler<'_> {
                 .control
                 .statements
                 .current_statement_propagates_following_to_suites;
+        let track_sync_with_return_joins =
+            self.context.target_specific_rules_enabled() && self.control.in_synchronous_with();
         let mut pending_sync_with_return_join = false;
+        let mut seen_sync_with_return = false;
         for (index, statement) in body.iter().enumerate() {
-            if self.control.in_synchronous_with()
+            if track_sync_with_return_joins
                 && let Some(previous) = index.checked_sub(1).and_then(|index| body.get(index))
             {
                 match previous {
                     Stmt::Assign(_) | Stmt::AnnAssign(_) | Stmt::AugAssign(_) | Stmt::Expr(_) => {}
                     Stmt::If(previous) => {
-                        pending_sync_with_return_join =
+                        let contains_return =
                             synchronous_with_conditional_contains_return(previous);
+                        pending_sync_with_return_join = contains_return
+                            || (self.unit.flags
+                                & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                                == 0
+                                && !seen_sync_with_return
+                                && synchronous_with_conditional_contains_raise(previous));
+                        seen_sync_with_return |= contains_return;
                     }
                     _ => pending_sync_with_return_join = false,
                 }
@@ -1606,7 +1616,7 @@ impl Compiler<'_> {
                             && suite_terminates(&previous.body)
                 );
                 let follows_sync_with_return_join =
-                    self.control.in_synchronous_with() && pending_sync_with_return_join;
+                    track_sync_with_return_joins && pending_sync_with_return_join;
                 let previous_statement_preceded_by_try = std::mem::replace(
                     &mut self.control.statements.current_statement_preceded_by_try,
                     preceded_by_try,
@@ -14575,6 +14585,28 @@ fn synchronous_with_conditional_contains_return(statement: &ruff_python_ast::Stm
             .elif_else_clauses
             .iter()
             .any(|clause| contains_return(&clause.body))
+}
+
+fn synchronous_with_conditional_contains_raise(statement: &ruff_python_ast::StmtIf) -> bool {
+    fn contains_raise(body: &[Stmt]) -> bool {
+        body.iter().any(|statement| match statement {
+            Stmt::Raise(_) => true,
+            Stmt::If(statement) => {
+                contains_raise(&statement.body)
+                    || statement
+                        .elif_else_clauses
+                        .iter()
+                        .any(|clause| contains_raise(&clause.body))
+            }
+            _ => false,
+        })
+    }
+
+    contains_raise(&statement.body)
+        || statement
+            .elif_else_clauses
+            .iter()
+            .any(|clause| contains_raise(&clause.body))
 }
 
 fn shifted_sync_with_none_owner_statements(body: &[Stmt]) -> Vec<TextRange> {
