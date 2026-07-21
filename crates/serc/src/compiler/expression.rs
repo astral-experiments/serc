@@ -2052,6 +2052,17 @@ impl Compiler<'_> {
             "tuple" => (CommonConstant::BUILTIN_TUPLE, false, true),
             _ => unreachable!("optimized generator call must use all, any, or tuple"),
         };
+        let generator_expression_boolean_dispatch_eligible = (self
+            .context
+            .target_specific_rules_enabled()
+            && !collect_tuple
+            && matches!(call.arguments.args.as_ref(), [Expr::Generator(generator)]
+                if generator
+                    .generators
+                    .iter()
+                    .all(|generator| matches!(generator.target, Expr::Name(_)))
+                    && !matches!(generator.elt.as_ref(), Expr::UnaryOp(unary) if unary.op == UnaryOp::Not)))
+            .then_some(call.arguments.args[0].range());
         let callable_location = self.source_location(call.func.range());
         let base_depth = self.control.stack.depth;
         let fallback = self.assembler.label();
@@ -2131,6 +2142,16 @@ impl Compiler<'_> {
                     .generators
                     .optimized_generator_later_boolean_operand
         });
+        let generator_expression_boolean_dispatch_policy = (!collect_tuple
+            && self.context.target_specific_rules_enabled()
+            && self.control.generators.generator_expression
+            && !self.control.generators.generator_filter_expression
+            && self
+                .control
+                .generators
+                .generator_expression_boolean_dispatch_eligible
+                .is_some())
+        .then_some(ExceptionPolicy::EXCLUDE_ALWAYS);
         let plain_try_boolean_loop_policy = (!collect_tuple
             && self.context.target_specific_rules_enabled()
             && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR | CO_GENERATOR) == 0
@@ -2374,6 +2395,7 @@ impl Compiler<'_> {
                 .or(generator_guard_exception_policy)
                 .or(plain_try_boolean_dispatch_policy)
                 .or(iterator_boolean_dispatch_policy)
+                .or(generator_expression_boolean_dispatch_policy)
                 .or_else(|| {
                     coroutine_boolean_dispatch_policy.map(|_| {
                         if self.assembler.current_block_has_dynamic_exception_owner() {
@@ -2473,7 +2495,25 @@ impl Compiler<'_> {
         if collect_tuple {
             self.emit(BUILD_LIST, 0, 1)?;
         }
-        self.compile_expression(&call.arguments.args[0])?;
+        if generator_expression_boolean_dispatch_eligible.is_some()
+            || self
+                .control
+                .generators
+                .generator_expression_boolean_dispatch_eligible
+                .is_some()
+        {
+            self.with_control_override(
+                |control| {
+                    &mut control
+                        .generators
+                        .generator_expression_boolean_dispatch_eligible
+                },
+                generator_expression_boolean_dispatch_eligible,
+                |compiler| compiler.compile_expression(&call.arguments.args[0]),
+            )?;
+        } else {
+            self.compile_expression(&call.arguments.args[0])?;
+        }
 
         let loop_start = self.assembler.label();
         let exhausted = self.assembler.label();
@@ -2575,7 +2615,25 @@ impl Compiler<'_> {
         self.set_depth(base_depth + 1);
         self.assembler.set_location(callable_location);
         self.emit(PUSH_NULL, 0, 1)?;
-        self.compile_expression(&call.arguments.args[0])?;
+        if generator_expression_boolean_dispatch_eligible.is_some()
+            || self
+                .control
+                .generators
+                .generator_expression_boolean_dispatch_eligible
+                .is_some()
+        {
+            self.with_control_override(
+                |control| {
+                    &mut control
+                        .generators
+                        .generator_expression_boolean_dispatch_eligible
+                },
+                generator_expression_boolean_dispatch_eligible,
+                |compiler| compiler.compile_expression(&call.arguments.args[0]),
+            )?;
+        } else {
+            self.compile_expression(&call.arguments.args[0])?;
+        }
         self.assembler.set_location(self.call_opcode_location(call));
         self.emit(CALL, 1, -2)?;
 
@@ -3499,6 +3557,14 @@ impl Compiler<'_> {
             flags,
         )?;
         child.control.generators.generator_expression = true;
+        child
+            .control
+            .generators
+            .generator_expression_boolean_dispatch_eligible = self
+            .control
+            .generators
+            .generator_expression_boolean_dispatch_eligible
+            .filter(|range| *range == generator.range);
         child.unit.private_name.clone_from(&self.unit.private_name);
         child
             .symbols
@@ -3529,7 +3595,28 @@ impl Compiler<'_> {
         if !closure_names.is_empty() {
             self.emit_function_attribute(FunctionAttribute::CLOSURE)?;
         }
-        if generator.generators[0].is_async {
+        if self
+            .control
+            .generators
+            .generator_expression_boolean_dispatch_eligible
+            .is_some_and(|range| range != generator.range)
+        {
+            self.with_control_override(
+                |control| {
+                    &mut control
+                        .generators
+                        .generator_expression_boolean_dispatch_eligible
+                },
+                None,
+                |compiler| {
+                    if generator.generators[0].is_async {
+                        compiler.compile_expression(&generator.generators[0].iter)
+                    } else {
+                        compiler.compile_iterable_expression(&generator.generators[0].iter)
+                    }
+                },
+            )?;
+        } else if generator.generators[0].is_async {
             self.compile_expression(&generator.generators[0].iter)?;
         } else {
             self.compile_iterable_expression(&generator.generators[0].iter)?;
