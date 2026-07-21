@@ -425,6 +425,8 @@ pub(super) struct GeneratorState {
     pub(super) copy_optimized_tuple_branch_exit: bool,
     // Whether the current expression is being lowered as one atom of a Boolean condition.
     pub(super) optimized_generator_boolean_condition: bool,
+    // Whether the current expression is a later operand of a short-circuit Boolean expression.
+    pub(super) optimized_generator_later_boolean_operand: bool,
     // The direct `all(genexpr)` or `any(genexpr)` test of a message-free coroutine assertion,
     // or the `any(genexpr)` test in a direct `assert not any(...)` with or without a message,
     // before suspension.
@@ -4372,15 +4374,21 @@ impl Compiler<'_> {
                                         && !expression_contains_inline_branch(first)
                                 }))
                             && !expression_suspends_current_scope(test)
-                            && !expression_contains_generator(test)
+                            && (!expression_contains_generator(test)
+                                || matches!(test, Expr::BoolOp(boolean)
+                                    if matches!(boolean.values.last(), Some(Expr::Call(call))
+                                        if matches!(optimized_generator_callable(call), Some("all" | "any")))))
                             && self.control.loops.contexts.last().is_some_and(|context| {
                                 context.iterator_cleanup == IteratorCleanup::Sync
                                     && (self.assembler.instruction_count() == context.body_start
                                         || (matches!(body, [Stmt::Continue(_)])
-                                            && self
+                                            && (self
                                                 .control
                                                 .loops.first_iterator_assignment_condition
-                                                == Some(test.range())))
+                                                == Some(test.range())
+                                                || self
+                                                    .assembler
+                                                    .current_block_resumes_after_yield())))
                                     && context.with_depth == self.control.withs.active_with_exits.len()
                                     && context.finally_end_depth
                                         == self.control.finally.active_finally_end_blocks
@@ -5932,7 +5940,10 @@ impl Compiler<'_> {
                             && !expression_contains_inline_branch(first)
                     }))
                     && !expression_suspends_current_scope(test)
-                    && !expression_contains_generator(test)
+                    && (!expression_contains_generator(test)
+                        || matches!(test, Expr::BoolOp(boolean)
+                            if matches!(boolean.values.last(), Some(Expr::Call(call))
+                                if matches!(optimized_generator_callable(call), Some("all" | "any")))))
                     && self.control.loops.contexts.last().is_some_and(|context| {
                         context.iterator_cleanup == IteratorCleanup::Sync
                             && self.assembler.instruction_count() == context.body_start
