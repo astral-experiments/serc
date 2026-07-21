@@ -11085,6 +11085,12 @@ def final_elif(action, first, second):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_pre_suspension_try_boolean_value_owners() {
+        let source = include_str!("fixtures/pre_suspension_try_boolean_value_owners.py");
+        assert_matches_cpython_marshal(source, "pre_suspension_try_boolean_value_owners.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_try_exits_after_if_joins() {
         let source = "def retained(flag):\n    try:\n        action()\n    except Exception:\n        failed()\n    else:\n        if flag:\n            good()\n        else:\n            other()\n    after()\n\ndef ordinary(flag):\n    try:\n        action()\n    except Exception:\n        failed()\n    else:\n        if flag:\n            good()\n    after()\n";
         assert_matches_cpython_marshal(source, "try_if_join.py");
