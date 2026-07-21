@@ -417,6 +417,9 @@ pub(super) struct GeneratorState {
     // filter conditions before the generator element, so their internal markers do not use the
     // element expression's post-compaction stop-iteration owner rule.
     pub(super) generator_filter_expression: bool,
+    // Whether the current generator expression is the direct argument of an optimized all/any
+    // call with only simple-name targets and no root `not` element.
+    pub(super) generator_expression_boolean_dispatch_eligible: Option<TextRange>,
     // Whether the current expression is the complete value of an ordinary assignment and is an
     // optimized all/any/tuple generator call.
     pub(super) direct_optimized_generator_assignment: bool,
