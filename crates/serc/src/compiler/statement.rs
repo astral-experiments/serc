@@ -2250,7 +2250,11 @@ impl Compiler<'_> {
             statement.body.last(),
             Some(Stmt::If(tail))
                 if tail.elif_else_clauses.is_empty()
-                    && !suite_contains_loop_break(&tail.body)
+                    && (!suite_contains_loop_break(&tail.body)
+                        || (self.unit.flags & CO_GENERATOR != 0
+                            && matches!(tail.body.as_slice(), [Stmt::Break(_)])
+                            && matches!(tail.test.as_ref(), Expr::BoolOp(boolean)
+                                if boolean.op == BoolOp::Or && boolean.values.len() == 2)))
         );
         if normalize_final_condition {
             // CPython normalizes a backward conditional jump by reversing it around an explicit

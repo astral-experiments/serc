@@ -12241,6 +12241,12 @@ def filled(action, self, mask, result):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_generator_terminal_while_break_owners() {
+        let source = include_str!("fixtures/generator_terminal_while_break_owners.py");
+        assert_matches_cpython_marshal(source, "generator_terminal_while_break_owners.py");
+    }
+
+    #[test]
     fn executes_control_flow() {
         let source = r#"
 x = 3
