@@ -3518,9 +3518,35 @@ impl Compiler<'_> {
                         .len()
                         > self.control.finally.active_return_finally_contexts.len()
                         || !self.control.exceptions.active_exception_handlers.is_empty());
+                let bare_call_finally_return = self.context.target_specific_rules_enabled()
+                    && overriding_unwind_start.is_none()
+                    && statement.value.is_none()
+                    && self.control.loops.contexts.is_empty()
+                    && self.control.withs.active_with_exits.is_empty()
+                    && self.control.exceptions.active_exception_handlers.is_empty()
+                    && self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .len()
+                        == 1
+                    && self.control.finally.active_return_finally_contexts.len() == 1
+                    && self
+                        .control
+                        .finally
+                        .active_return_finally_contexts
+                        .last()
+                        .is_some_and(|context| {
+                            matches!(context.body.as_slice(), [Stmt::Expr(expression)]
+                                if matches!(expression.value.as_ref(), Expr::Call(call)
+                                    if call.arguments.args.is_empty()
+                                        && call.arguments.keywords.is_empty()
+                                        && matches!(call.func.as_ref(), Expr::Attribute(attribute)
+                                            if is_coroutine_try_else_attribute_chain(&attribute.value))))
+                        });
                 let return_finally_unwind_start = (overriding_unwind_start.is_none()
                     && !preserve_tos
-                    && nested_call_finally_return
+                    && (nested_call_finally_return || bare_call_finally_return)
                     && self.control.exceptions.active_exception_handlers.is_empty())
                 .then(|| {
                     let start = self.assembler.label();
@@ -3535,6 +3561,19 @@ impl Compiler<'_> {
                         .map_or(statement.range, Ranged::range);
                     self.assembler.set_location(self.source_location(range));
                     self.emit(NOP, 0, 0)?;
+                    if bare_call_finally_return
+                        && self.control.generators.generator_region_start.is_some()
+                        && let Some(noop_start) = return_finally_unwind_start
+                    {
+                        // CPython excludes the synthetic bare-return NOP from the generator's
+                        // outer handler while keeping the copied finally call protected.
+                        let noop_end = self.assembler.label();
+                        self.assembler.mark(noop_end);
+                        self.control
+                            .generators
+                            .generator_region_exclusions
+                            .push((noop_start, noop_end));
+                    }
                 } else if let Some(value) = &statement.value {
                     let suppress_split_return_copy = self
                         .control
