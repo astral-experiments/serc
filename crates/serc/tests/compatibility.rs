@@ -12259,6 +12259,12 @@ def filled(action, self, mask, result):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_iterator_with_return_unwind() {
+        let source = include_str!("fixtures/iterator_with_return_unwind.py");
+        assert_matches_cpython_marshal(source, "iterator_with_return_unwind.py");
+    }
+
+    #[test]
     fn executes_control_flow() {
         let source = r#"
 x = 3
