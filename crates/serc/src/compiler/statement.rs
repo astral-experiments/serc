@@ -1302,6 +1302,20 @@ impl Compiler<'_> {
                         pending_sync_with_return_join_after_gap = false;
                         pending_sync_with_nonterminal_join = true;
                     }
+                    Stmt::Try(previous)
+                        if !previous.is_star
+                            && previous.finalbody.is_empty()
+                            && previous.handlers.len() == 1
+                            && previous.handlers.iter().all(|handler| {
+                                handler.as_except_handler().is_some_and(|handler| {
+                                    !matches!(handler.body.last(), Some(Stmt::Return(_)))
+                                })
+                            }) =>
+                    {
+                        pending_sync_with_return_join = false;
+                        pending_sync_with_return_join_after_gap = false;
+                        pending_sync_with_nonterminal_join = true;
+                    }
                     Stmt::If(previous) => {
                         let contains_return =
                             synchronous_with_conditional_contains_return(previous);
