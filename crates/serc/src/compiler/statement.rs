@@ -4364,7 +4364,15 @@ impl Compiler<'_> {
                     && (matches!(test, Expr::Name(_) | Expr::Attribute(_))
                         || matches!(test, Expr::UnaryOp(unary)
                             if unary.op == UnaryOp::Not
-                                && matches!(unary.operand.as_ref(), Expr::Name(_) | Expr::Attribute(_))));
+                                && matches!(unary.operand.as_ref(), Expr::Name(_) | Expr::Attribute(_)))
+                        || matches!(test, Expr::BoolOp(boolean)
+                        if boolean.op == BoolOp::And
+                            && boolean.values.first().is_some_and(|first| {
+                                matches!(first, Expr::Name(_) | Expr::Attribute(_))
+                                    || matches!(first, Expr::UnaryOp(unary)
+                                        if unary.op == UnaryOp::Not
+                                            && matches!(unary.operand.as_ref(), Expr::Name(_) | Expr::Attribute(_)))
+                            })));
                 let exclude_not_taken = self.control.conditions.exclude_terminal_if_not_taken
                     || exclude_normal_finally_short_circuit
                     || exclude_later_async_with_terminal
@@ -4664,6 +4672,7 @@ impl Compiler<'_> {
                                             include_scoped_none_condition_owner,
                                             |compiler| {
                                                 let exclude_condition = compiler.control.conditions.exclude_condition_not_taken_from_exception
+                                                    || (exclude_sync_with_condition_after_return && matches!(test, Expr::BoolOp(_)))
                                                     || compiler.control.loops.loop_tail_final_elif_nested_condition
                                                         == Some(test.range())
                                                     || exclude_later_handler_leading_marker
@@ -7365,6 +7374,24 @@ impl Compiler<'_> {
             }
             _ => None,
         };
+        let exclude_post_suspension_coroutine_assertion_owner = self.unit.flags & CO_COROUTINE != 0
+            && self.context.target_specific_rules_enabled()
+            && self.control.generators.coroutine_suspension_epoch > 0
+            && self.control.withs.active_with_region_exclusions.is_empty()
+            && (self.control.statements.in_terminal_if_branch_suite
+                || !self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .is_empty())
+            && self.control.exceptions.active_exception_handlers.is_empty()
+            && !split_success_return
+            && statement.msg.is_none()
+            && matches!(statement.test.as_ref(), Expr::Call(call)
+                if call.arguments.args.is_empty()
+                    && call.arguments.keywords.is_empty()
+                    && matches!(call.func.as_ref(), Expr::Attribute(attribute)
+                        if matches!(attribute.value.as_ref(), Expr::Name(_))));
         let split_success = split_success_return.then(|| self.assembler.label());
         self.with_control_override(
             |control| &mut control.conditions.include_assert_none_condition_owner,
@@ -7411,10 +7438,20 @@ impl Compiler<'_> {
                                                     )?;
                                                     compiler.compile_jump_if(second, true, end)
                                                 } else {
-                                                    compiler.compile_jump_if(
-                                                        &statement.test,
-                                                        true,
-                                                        end,
+                                                    compiler.with_control_override(
+                                                        |control| {
+                                                            &mut control
+                                                                .conditions
+                                                                .exclude_condition_not_taken_from_exception
+                                                        },
+                                                        exclude_post_suspension_coroutine_assertion_owner,
+                                                        |compiler| {
+                                                            compiler.compile_jump_if(
+                                                                &statement.test,
+                                                                true,
+                                                                end,
+                                                            )
+                                                        },
                                                     )
                                                 }
                                             },
