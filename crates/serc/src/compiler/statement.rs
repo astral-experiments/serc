@@ -1412,7 +1412,7 @@ impl Compiler<'_> {
                         continue;
                     }
                     Stmt::With(statement) if !statement.is_async => {
-                        self.compile_with_statement(statement, true)?;
+                        self.compile_with_statement(statement, true, None)?;
                         self.control.statements.emitted_fallthrough_return = true;
                         continue;
                     }
@@ -1588,6 +1588,21 @@ impl Compiler<'_> {
                     Some(Stmt::Return(statement))
                         if statement.value.as_deref().is_none_or(is_literal_constant)
                 );
+                let followed_by_sync_with_return = match (statement, body.get(index + 1)) {
+                    (Stmt::With(with), Some(Stmt::Return(statement))) if !with.is_async => {
+                        statement
+                            .value
+                            .as_deref()
+                            .is_none_or(|value| {
+                                matches!(value, Expr::Name(_))
+                                    || (is_literal_constant(value)
+                                        && self.line_number(u32::from(statement.range.start()))
+                                            == self.line_number(u32::from(value.range().start())))
+                            })
+                            .then_some(statement)
+                    }
+                    _ => None,
+                };
                 let followed_by_tuple_return = matches!(
                     body.get(index + 1),
                     Some(Stmt::Return(statement))
@@ -1877,10 +1892,15 @@ impl Compiler<'_> {
                     &mut self.control.statements.branch_join_successor,
                     preceded_by_branch_join.then_some(statement.range()),
                 );
-                let result = self
-                    .compile_with_strict_owned_loads(constant_false_assert_after_if, |compiler| {
-                        compiler.compile_statement(statement)
-                    });
+                let result = self.compile_with_strict_owned_loads(
+                    constant_false_assert_after_if,
+                    |compiler| {
+                        compiler.compile_statement_with_return_successor(
+                            statement,
+                            followed_by_sync_with_return,
+                        )
+                    },
+                );
                 self.control.statements.branch_join_successor = previous_branch_join_successor;
                 self.control.loops.suite_fallthrough_to_loop_backedge =
                     previous_suite_fallthrough_to_loop_backedge;
@@ -3072,15 +3092,27 @@ impl Compiler<'_> {
     }
 
     fn compile_statement(&mut self, statement: &Stmt) -> Result<(), CompileError> {
+        self.compile_statement_with_return_successor(statement, None)
+    }
+
+    fn compile_statement_with_return_successor(
+        &mut self,
+        statement: &Stmt,
+        following_return: Option<&ruff_python_ast::StmtReturn>,
+    ) -> Result<(), CompileError> {
         let previous = self.assembler.location();
         self.assembler
             .set_location(self.source_location(statement.range()));
-        let result = self.compile_statement_inner(statement);
+        let result = self.compile_statement_inner(statement, following_return);
         self.assembler.set_location(previous);
         result
     }
 
-    fn compile_statement_inner(&mut self, statement: &Stmt) -> Result<(), CompileError> {
+    fn compile_statement_inner(
+        &mut self,
+        statement: &Stmt,
+        following_return: Option<&ruff_python_ast::StmtReturn>,
+    ) -> Result<(), CompileError> {
         let starting_depth = self.control.stack.depth;
         match statement {
             Stmt::Assign(assignment) => {
@@ -4319,7 +4351,9 @@ impl Compiler<'_> {
             Stmt::With(statement) if statement.is_async => {
                 self.compile_async_with(statement, false)?;
             }
-            Stmt::With(statement) => self.compile_with(statement)?,
+            Stmt::With(statement) => {
+                self.compile_with_statement(statement, false, following_return)?;
+            }
             Stmt::IpyEscapeCommand(_) => {
                 return Err(unsupported(statement_name(statement)));
             }
@@ -11749,14 +11783,11 @@ impl Compiler<'_> {
         Ok(handler_end)
     }
 
-    fn compile_with(&mut self, statement: &ruff_python_ast::StmtWith) -> Result<(), CompileError> {
-        self.compile_with_statement(statement, false)
-    }
-
     fn compile_with_statement(
         &mut self,
         statement: &ruff_python_ast::StmtWith,
         terminal: bool,
+        following_return: Option<&ruff_python_ast::StmtReturn>,
     ) -> Result<(), CompileError> {
         // A direct try/except omits its owner from the suppressed handler exit. A sole synthetic
         // try/finally owner remains, while a handler-form try nested in its protected body omits
@@ -11773,6 +11804,7 @@ impl Compiler<'_> {
             &statement.body,
             terminal,
             exclude_handler_exit,
+            following_return,
         )
     }
 
@@ -11780,6 +11812,7 @@ impl Compiler<'_> {
         &mut self,
         remaining: &[ruff_python_ast::WithItem],
         body: &[Stmt],
+        following_return: Option<&ruff_python_ast::StmtReturn>,
     ) -> Result<Option<WithBodyExitNoop>, CompileError> {
         let mut body_noop = None;
         if remaining.is_empty() {
@@ -11954,7 +11987,7 @@ impl Compiler<'_> {
                 }
             }
         } else {
-            self.compile_with_items(remaining, body, false, false)?;
+            self.compile_with_items(remaining, body, false, false, following_return)?;
         }
         Ok(body_noop)
     }
@@ -11965,6 +11998,7 @@ impl Compiler<'_> {
         body: &[Stmt],
         terminal: bool,
         exclude_handler_exit: bool,
+        following_return: Option<&ruff_python_ast::StmtReturn>,
     ) -> Result<(), CompileError> {
         let Some((item, remaining)) = items.split_first() else {
             return self.compile_suite(body);
@@ -12063,7 +12097,13 @@ impl Compiler<'_> {
                                                 .current_sync_with_boolean_value_marker_scan
                                         },
                                         Some(BooleanValueMarkerScan::new(with_body_start_item)),
-                                        |compiler| compiler.compile_with_body(remaining, body),
+                                        |compiler| {
+                                            compiler.compile_with_body(
+                                                remaining,
+                                                body,
+                                                following_return,
+                                            )
+                                        },
                                     )
                                 },
                             )
@@ -12230,26 +12270,49 @@ impl Compiler<'_> {
         if terminal {
             self.emit_implicit_return()?;
         } else {
-            let outer_exception_exit_start = exclude_handler_exit.then(|| {
-                let start = self.assembler.label();
-                self.assembler.mark(start);
-                start
-            });
-            let handler_exit = self.emit_jump_forward_instruction(JUMP_FORWARD, end)?;
-            if self.control.finally.active_finally_try_bodies > 0 {
-                self.assembler.prevent_jump_inlining(handler_exit);
-            }
-            if let Some(start) = outer_exception_exit_start {
-                let exclusion_end = self.assembler.label();
-                self.assembler.mark(exclusion_end);
-                // Only the direct try omits this owner; an enclosing try still covers the exit.
-                if let Some(exclusions) = self
+            let inline_following_return = self.context.target_specific_rules_enabled()
+                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                && following_return.is_some()
+                && self.control.loops.contexts.is_empty()
+                && self.control.withs.active_with_exits.is_empty()
+                && self.control.exceptions.active_exception_handlers.is_empty()
+                && self
                     .control
                     .exceptions
                     .active_exception_region_exclusions
-                    .last_mut()
-                {
-                    exclusions.push((start, exclusion_end));
+                    .len()
+                    == 1
+                && self.control.finally.active_finally_try_bodies == 0
+                && self.control.finally.active_normal_finally_bodies == 0
+                && self.control.finally.active_finally_end_blocks == 0
+                && self.control.exceptions.active_exception_group_handlers == 0;
+            if inline_following_return {
+                let statement = following_return
+                    .expect("selected synchronous with has a return successor")
+                    .clone();
+                self.compile_statement(&Stmt::Return(statement))?;
+            } else {
+                let outer_exception_exit_start = exclude_handler_exit.then(|| {
+                    let start = self.assembler.label();
+                    self.assembler.mark(start);
+                    start
+                });
+                let handler_exit = self.emit_jump_forward_instruction(JUMP_FORWARD, end)?;
+                if self.control.finally.active_finally_try_bodies > 0 {
+                    self.assembler.prevent_jump_inlining(handler_exit);
+                }
+                if let Some(start) = outer_exception_exit_start {
+                    let exclusion_end = self.assembler.label();
+                    self.assembler.mark(exclusion_end);
+                    // Only the direct try omits this owner; an enclosing try still covers the exit.
+                    if let Some(exclusions) = self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .last_mut()
+                    {
+                        exclusions.push((start, exclusion_end));
+                    }
                 }
             }
         }

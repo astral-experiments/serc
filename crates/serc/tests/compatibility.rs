@@ -12253,6 +12253,12 @@ def filled(action, self, mask, result):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_sync_with_split_return_handlers() {
+        let source = include_str!("fixtures/sync_with_split_return_handlers.py");
+        assert_matches_cpython_marshal(source, "sync_with_split_return_handlers.py");
+    }
+
+    #[test]
     fn executes_control_flow() {
         let source = r#"
 x = 3
