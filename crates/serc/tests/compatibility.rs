@@ -2910,6 +2910,12 @@ def preceding_call(manager, first, second):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_post_try_sync_with_boolean_value_owners() {
+        let source = include_str!("fixtures/post_try_sync_with_boolean_value_owners.py");
+        assert_matches_cpython_marshal(source, "post_try_sync_with_boolean_value_owners.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_multiline_nested_with_terminal_try_exits() {
         let source = r"def else_path(outer):
     with (

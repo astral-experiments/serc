@@ -5642,7 +5642,7 @@ impl Compiler<'_> {
             BoolOp::Or => POP_JUMP_IF_TRUE,
         };
 
-        for value in leading {
+        for (operand_index, value) in leading.iter().enumerate() {
             if let Expr::BoolOp(inner) = value
                 && inner.op == expression.op
             {
@@ -5674,6 +5674,13 @@ impl Compiler<'_> {
                 .exception_type_bool_marker_preserves_owner(current_block);
             let follows_sync_with_branch_join = self.control.in_synchronous_with()
                 && self.control.follows_copied_nested_handler_join();
+            let follows_sync_with_try_join = self.context.target_specific_rules_enabled()
+                && expression.op == BoolOp::Or
+                && operand_index == 0
+                && !nested_leading_group
+                && self.control.in_synchronous_with()
+                && self.control.statements.current_statement_preceded_by_try
+                && !marker_reuses_exception_owner;
             let preserve_exception_type_owner =
                 exception_type_marker_owner == Some(true) && !follows_sync_with_branch_join;
             let exclude_exception_type_owner =
@@ -5764,6 +5771,7 @@ impl Compiler<'_> {
                 || exclude_inlined_comprehension_owner
                 || exclude_after_coroutine_suspension
                 || exclude_from_plain_try
+                || follows_sync_with_try_join
                 || follows_sync_with_branch_join;
             let marker_start = (!exclude_inlined_comprehension_owner
                 && (exclude_generator_region_owner
