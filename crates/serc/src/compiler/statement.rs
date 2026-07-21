@@ -3935,11 +3935,20 @@ impl Compiler<'_> {
                     });
                 let preserve_sync_with_continue_owner = branch_index == 0
                     && self.control.in_iterator_loop()
-                    && direct_sync_with_iterator
+                    && (direct_sync_with_iterator
+                        || (negated_method_call_condition
+                            && self
+                                .control
+                                .withs
+                                .active_with_exits
+                                .last()
+                                .is_some_and(|context| !context.is_async)))
                     && ((negated_method_call_condition
                         && matches!(body, [Stmt::Continue(_)])
                         && self.control.loops.contexts.last().is_some_and(|context| {
-                            self.assembler.instruction_count() == context.body_start
+                            !self
+                                .assembler
+                                .contains_terminal_with_barrier_since_item(context.body_start_item)
                         }))
                         || (self.control.statements.current_statement_has_following
                             && matches!(body.last(), Some(Stmt::Continue(_)))
