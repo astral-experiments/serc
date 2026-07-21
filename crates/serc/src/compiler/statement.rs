@@ -6010,7 +6010,74 @@ impl Compiler<'_> {
                 }
                 let body = statement.body.as_slice();
                 let body_label = self.assembler.label();
-                self.compile_loop_tail_condition(&statement.test, true, body_label, restart)?;
+                let preserve_first_yielding_iterator_boolean_owner = leading.is_empty()
+                    && self.context.target_specific_rules_enabled()
+                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) != 0
+                    && self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .is_empty()
+                    && self.control.withs.active_with_region_exclusions.is_empty()
+                    && self.control.loops.contexts.len() == 1
+                    && matches!(body.last(), Some(Stmt::Expr(expression))
+                        if matches!(expression.value.as_ref(), Expr::Yield(_) | Expr::YieldFrom(_) | Expr::Await(_)))
+                    && matches!(statement.test.as_ref(), Expr::BoolOp(boolean)
+                    if boolean.op == BoolOp::Or
+                        && boolean.values.first().is_some_and(|first| {
+                            !matches!(first, Expr::Named(_))
+                                && !matches!(first, Expr::Call(call)
+                                    if matches!(call.func.as_ref(), Expr::Name(_)))
+                    }))
+                    && !expression_suspends_current_scope(&statement.test)
+                    && self.control.loops.contexts.last().is_some_and(|context| {
+                        context.iterator_cleanup == IteratorCleanup::Sync
+                            && self.assembler.instruction_count() == context.body_start
+                            && context.with_depth == self.control.withs.active_with_exits.len()
+                            && context.finally_end_depth
+                                == self.control.finally.active_finally_end_blocks
+                            && context.exception_region_depth
+                                == self
+                                    .control
+                                    .exceptions
+                                    .active_exception_region_exclusions
+                                    .len()
+                    })
+                    && matches!(statement.test.as_ref(), Expr::BoolOp(boolean)
+                        if boolean.values.first().is_some_and(|first| {
+                            let mut root = first;
+                            while let Expr::Attribute(attribute) = root {
+                                root = attribute.value.as_ref();
+                            }
+                            matches!(root, Expr::Name(_))
+                                || (!expression_contains_inline_branch(first)
+                                    && !terminal_condition_contains_global_callable(first, |name| {
+                                        let name_id = self.required_name_id(name);
+                                        matches!(
+                                            &self.unit.scope,
+                                            Scope::Function {
+                                                indices,
+                                                free_indices,
+                                                globals,
+                                                ..
+                                            } if globals.contains(name_id)
+                                                || (!indices.contains_key(&name_id)
+                                                    && !free_indices.contains_key(&name_id))
+                                        )
+                                    }))
+                    }));
+                self.with_control_override(
+                    |control| &mut control.loops.protected_iterator_continue_condition,
+                    preserve_first_yielding_iterator_boolean_owner.then(|| statement.test.range()),
+                    |compiler| {
+                        compiler.compile_loop_tail_condition(
+                            &statement.test,
+                            true,
+                            body_label,
+                            restart,
+                        )
+                    },
+                )?;
                 self.assembler.mark(body_label);
                 self.set_depth(base_depth);
                 let body_start = self.assembler.instruction_count();
@@ -6445,8 +6512,19 @@ impl Compiler<'_> {
             };
             let short_circuit_value = boolean.op == BoolOp::Or;
             if short_circuit_value == jump_on {
-                for value in leading {
-                    self.compile_jump_if(value, jump_on, success)?;
+                if self.control.loops.protected_iterator_continue_condition
+                    == Some(expression.range())
+                    && let Some((first, remaining)) = leading.split_first()
+                {
+                    self.compile_jump_if(first, jump_on, success)?;
+                    self.assembler.preserve_last_not_taken_exception_owner();
+                    for value in remaining {
+                        self.compile_jump_if(value, jump_on, success)?;
+                    }
+                } else {
+                    for value in leading {
+                        self.compile_jump_if(value, jump_on, success)?;
+                    }
                 }
             } else {
                 for value in leading {
