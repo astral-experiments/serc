@@ -13,7 +13,9 @@ use super::{
     TO_BOOL, WITH_EXCEPT_START, YIELD_VALUE,
 };
 use crate::CompileError;
-use crate::assembler::{EmittedJump, ExceptionPolicy, Label, SourceLocation};
+use crate::assembler::{
+    BooleanValueMarkerScan, EmittedJump, ExceptionPolicy, Label, SourceLocation,
+};
 use crate::code_object::Constant;
 use crate::target::code_flags::{
     CO_ASYNC_GENERATOR, CO_COROUTINE, CO_FUTURE_ANNOTATIONS, CO_GENERATOR,
@@ -486,6 +488,8 @@ pub(super) struct StatementState {
     pub(super) terminal_if_call_expression: bool,
     // A protected return whose value begins on a later line keeps its conditional exit shared.
     pub(super) suppress_split_return_copy: bool,
+    // Incremental Boolean-value marker history for the return value currently being lowered.
+    pub(super) current_return_boolean_value_marker_scan: Option<BooleanValueMarkerScan>,
     copied_nested_handler_join_successor: bool,
     // Whether that successor is a direct loop break.
     current_statement_followed_by_break: bool,
@@ -3540,15 +3544,22 @@ impl Compiler<'_> {
                         == 1
                         && self.line_number(u32::from(statement.range.start()))
                             != self.line_number(u32::from(value.range().start()));
-                    if suppress_split_return_copy {
-                        self.with_control_override(
-                            |control| &mut control.statements.suppress_split_return_copy,
-                            true,
-                            |compiler| compiler.compile_expression(value),
-                        )?;
-                    } else {
-                        self.compile_expression(value)?;
-                    }
+                    let return_expression_start_item = self.assembler.item_count();
+                    self.with_control_override(
+                        |control| &mut control.statements.current_return_boolean_value_marker_scan,
+                        Some(BooleanValueMarkerScan::new(return_expression_start_item)),
+                        |compiler| {
+                            if suppress_split_return_copy {
+                                compiler.with_control_override(
+                                    |control| &mut control.statements.suppress_split_return_copy,
+                                    true,
+                                    |compiler| compiler.compile_expression(value),
+                                )
+                            } else {
+                                compiler.compile_expression(value)
+                            }
+                        },
+                    )?;
                     let location = self.source_location(statement.range);
                     // CPython converts a synchronous `with` POP_BLOCK following a multiline
                     // `and` return into a NOP carrying the whole return statement's range.

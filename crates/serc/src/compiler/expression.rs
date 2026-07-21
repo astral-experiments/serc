@@ -5822,6 +5822,42 @@ impl Compiler<'_> {
                             == 0
                         && !self.control.in_synchronous_with_nested_exception_region()))
                 && !marker_reuses_exception_owner;
+            let follows_sync_with_terminal_boolean_value =
+                self.context.target_specific_rules_enabled()
+                    && expression.op == BoolOp::Or
+                    && operand_index == 0
+                    && !nested_leading_group
+                    && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR | CO_GENERATOR) == 0
+                    && self.control.in_synchronous_with()
+                    && self.control.withs.active_with_region_exclusions.len() == 1
+                    && !self.control.in_exception_handler()
+                    && self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .is_empty()
+                    && self
+                        .control
+                        .comprehensions
+                        .active_comprehension_region_exclusions
+                        .is_empty()
+                    && !self.control.in_loop()
+                    && !self.control.statements.current_statement_has_following
+                    && !self.control.statements.inherited_statement_has_following
+                    && !self
+                        .control
+                        .statements
+                        .current_statement_follows_sync_with_return_join
+                    && !self
+                        .control
+                        .statements
+                        .current_statement_follows_sync_with_nonterminal_join
+                    && self
+                        .control
+                        .statements
+                        .current_return_boolean_value_marker_scan
+                        .as_mut()
+                        .is_some_and(|scan| self.assembler.advance_boolean_value_marker_scan(scan));
             let preserve_exception_type_owner =
                 exception_type_marker_owner == Some(true) && !follows_sync_with_branch_join;
             let exclude_exception_type_owner =
@@ -5936,6 +5972,7 @@ impl Compiler<'_> {
                 || exclude_from_plain_try
                 || follows_sync_with_try_join
                 || follows_sync_with_return_join
+                || follows_sync_with_terminal_boolean_value
                 || follows_sync_with_nonterminal_join
                 || follows_sync_with_branch_join;
             let marker_start = (!exclude_inlined_comprehension_owner

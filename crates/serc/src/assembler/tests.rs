@@ -3,8 +3,8 @@ use super::ir::{
     RetainedJumpNop, UnoptimizedCode,
 };
 use super::{
-    Assembler, AssemblerStage, EmittedJump, ExceptionExclusion, Instruction, Item,
-    NormalizedExceptionOwner, Operand, OperandPatchId, SourceLocation,
+    Assembler, AssemblerStage, BooleanValueMarkerScan, EmittedJump, ExceptionExclusion,
+    Instruction, Item, NormalizedExceptionOwner, Operand, OperandPatchId, SourceLocation,
 };
 use crate::target::opcodes::*;
 use crate::target::operands::{CommonConstant, ResumeLocation};
@@ -467,6 +467,37 @@ fn terminal_with_barrier_scan_ignores_prefix_and_labels() {
         assert!(assembler.contains_terminal_with_barrier_since_item(body_start));
         assert!(assembler.contains_opcode_since_item(opcode, body_start));
         assert!(!assembler.contains_terminal_with_barrier_since_item(assembler.item_count()));
+    }
+}
+
+#[test]
+fn boolean_value_marker_scan_ignores_prefix_and_stops_at_barriers() {
+    let mut assembler = Assembler::default();
+    assembler.emit(NOT_TAKEN, 0);
+    assembler.emit(POP_TOP, 0);
+    let mut scan = BooleanValueMarkerScan::new(assembler.item_count());
+    assert!(!assembler.advance_boolean_value_marker_scan(&mut scan));
+
+    let boundary = assembler.label();
+    assembler.emit(NOT_TAKEN, 0);
+    assert!(!assembler.advance_boolean_value_marker_scan(&mut scan));
+    assembler.mark(boundary);
+    assembler.emit(POP_TOP, 0);
+    assert!(assembler.advance_boolean_value_marker_scan(&mut scan));
+
+    for opcode in [LOAD_FAST_AND_CLEAR, FOR_ITER, PUSH_EXC_INFO] {
+        let mut assembler = Assembler::default();
+        let mut scan = BooleanValueMarkerScan::new(assembler.item_count());
+        assembler.emit(NOT_TAKEN, 0);
+        assembler.emit(POP_TOP, 0);
+        assert!(assembler.advance_boolean_value_marker_scan(&mut scan));
+        assembler.emit(opcode, 0);
+        assembler.emit(NOT_TAKEN, 0);
+        assembler.emit(POP_TOP, 0);
+        assert!(!assembler.advance_boolean_value_marker_scan(&mut scan));
+        assembler.emit(NOT_TAKEN, 0);
+        assembler.emit(POP_TOP, 0);
+        assert!(!assembler.advance_boolean_value_marker_scan(&mut scan));
     }
 }
 
