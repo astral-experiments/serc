@@ -14565,6 +14565,7 @@ fn synchronous_with_conditional_contains_return(statement: &ruff_python_ast::Stm
                         .iter()
                         .any(|clause| contains_return(&clause.body))
             }
+            Stmt::With(statement) if !statement.is_async => contains_return(&statement.body),
             _ => false,
         })
     }
