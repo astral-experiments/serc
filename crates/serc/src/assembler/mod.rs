@@ -41,6 +41,25 @@ use ir::{
     UnoptimizedCode,
 };
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BooleanValueMarkerScan {
+    cursor_item: usize,
+    previous_opcode: Option<Opcode>,
+    seen_marker: bool,
+    blocked: bool,
+}
+
+impl BooleanValueMarkerScan {
+    pub(crate) const fn new(cursor_item: usize) -> Self {
+        Self {
+            cursor_item,
+            previous_opcode: None,
+            seen_marker: false,
+            blocked: false,
+        }
+    }
+}
+
 fn reachable_constant_indices(
     graph: &block_graph::BlockGraph,
     reachable: &[bool],
@@ -409,6 +428,38 @@ impl Assembler {
             previous = Some(instruction.opcode);
         }
         false
+    }
+
+    /// Advances a Boolean-value marker scan over newly emitted items.
+    pub(crate) fn advance_boolean_value_marker_scan(
+        &self,
+        scan: &mut BooleanValueMarkerScan,
+    ) -> bool {
+        if scan.blocked {
+            return false;
+        }
+        let items = self.linear_items();
+        for instruction in items[scan.cursor_item..]
+            .iter()
+            .filter_map(|item| match item {
+                Item::Instruction(instruction) => Some(instruction),
+                Item::Label(_) => None,
+            })
+        {
+            if matches!(
+                instruction.opcode,
+                LOAD_FAST_AND_CLEAR | FOR_ITER | PUSH_EXC_INFO
+            ) {
+                scan.blocked = true;
+                break;
+            }
+            if scan.previous_opcode == Some(NOT_TAKEN) && instruction.opcode == POP_TOP {
+                scan.seen_marker = true;
+            }
+            scan.previous_opcode = Some(instruction.opcode);
+        }
+        scan.cursor_item = items.len();
+        scan.seen_marker && !scan.blocked
     }
 
     pub(crate) fn contains_opcode_since(&self, opcode: Opcode, instruction_offset: usize) -> bool {
