@@ -5730,6 +5730,14 @@ impl Compiler<'_> {
             BoolOp::And => POP_JUMP_IF_FALSE,
             BoolOp::Or => POP_JUMP_IF_TRUE,
         };
+        let follows_inline_comprehension = std::mem::take(
+            &mut self
+                .control
+                .generators
+                .pre_suspension_inline_comprehension_restore,
+        );
+        let has_nested_leading_boolean = follows_inline_comprehension
+            && leading.iter().any(|value| matches!(value, Expr::BoolOp(_)));
 
         for (operand_index, value) in leading.iter().enumerate() {
             if let Expr::BoolOp(inner) = value
@@ -5884,6 +5892,32 @@ impl Compiler<'_> {
                 || resumes_after_yield
                 || exception_group_handler;
             let suspension_epoch = self.control.generators.coroutine_suspension_epoch;
+            let follows_inline_comprehension_before_suspension = follows_inline_comprehension
+                && self.context.target_specific_rules_enabled()
+                && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR | CO_GENERATOR) != 0
+                && suspension_epoch == 0
+                && !self.control.generators.emitted_yield_value
+                && !resumes_after_yield
+                && operand_index == 0
+                && marker_owner_slots == 1
+                && self.control.generators.generator_region_start.is_some()
+                && self
+                    .control
+                    .comprehensions
+                    .active_comprehension_region_exclusions
+                    .is_empty()
+                && self.control.withs.active_with_region_exclusions.is_empty()
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .is_empty()
+                && self.control.finally.active_normal_finally_bodies == 0
+                && self.control.finally.active_finally_end_blocks == 0
+                && self.control.exceptions.active_exception_group_handlers == 0
+                && !self.control.in_loop()
+                && !nested_leading_group
+                && !has_nested_leading_boolean;
             let follows_marker_before_coroutine_suspension = self.unit.flags & CO_COROUTINE != 0
                 && suspension_epoch == 0
                 && self
@@ -5970,6 +6004,7 @@ impl Compiler<'_> {
                 || exclude_inlined_comprehension_owner
                 || exclude_after_coroutine_suspension
                 || exclude_from_plain_try
+                || follows_inline_comprehension_before_suspension
                 || follows_sync_with_try_join
                 || follows_sync_with_return_join
                 || follows_sync_with_terminal_boolean_value
