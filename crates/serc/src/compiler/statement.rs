@@ -3505,6 +3505,59 @@ impl Compiler<'_> {
                         statement.range,
                     ));
                 }
+                if self.context.target_specific_rules_enabled()
+                    && matches!(
+                        statement.value.as_deref(),
+                        Some(Expr::If(conditional))
+                            if matches!(conditional.orelse.as_ref(), Expr::If(_))
+                    )
+                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                    && self.control.loops.contexts.is_empty()
+                    && !self.control.loops.suite_fallthrough_to_loop_backedge
+                    && self.control.withs.active_with_exits.is_empty()
+                    && self.control.withs.active_with_region_exclusions.is_empty()
+                    && self.control.exceptions.active_exception_handlers.is_empty()
+                    && self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .is_empty()
+                    && self.control.exceptions.active_exception_group_handlers == 0
+                    && self
+                        .control
+                        .comprehensions
+                        .active_comprehension_region_exclusions
+                        .is_empty()
+                    && self
+                        .control
+                        .finally
+                        .active_return_finally_contexts
+                        .is_empty()
+                    && self.control.finally.active_normal_finally_bodies == 0
+                    && self.control.finally.active_finally_end_blocks == 0
+                    && self.control.finally.active_finally_try_bodies == 0
+                    && self
+                        .control
+                        .finally
+                        .active_pass_finally_locations
+                        .is_empty()
+                    && self.control.finally.active_overriding_finally_returns == 0
+                    && statement
+                        .value
+                        .as_deref()
+                        .is_some_and(is_unfolded_nested_else_return)
+                {
+                    let value = statement
+                        .value
+                        .as_deref()
+                        .expect("nested conditional return has a value");
+                    self.compile_tail_return_expression(
+                        value,
+                        self.source_location(statement.range),
+                    )?;
+                    self.set_depth(starting_depth);
+                    return Ok(());
+                }
                 let return_is_overridden =
                     self.control.finally.active_overriding_finally_returns > 0;
                 let preserve_tos = statement
@@ -14570,6 +14623,26 @@ fn suite_contains_loop_break(body: &[Stmt]) -> bool {
         Stmt::FunctionDef(_) | Stmt::ClassDef(_) => false,
         _ => false,
     })
+}
+
+fn is_unfolded_nested_else_return(expression: &Expr) -> bool {
+    let Expr::If(conditional) = expression else {
+        return false;
+    };
+    let mut conditional = conditional;
+    let mut nested = false;
+    loop {
+        if fold_constant(&conditional.test).is_some()
+            || matches!(conditional.body.as_ref(), Expr::If(_))
+        {
+            return false;
+        }
+        let Expr::If(next) = conditional.orelse.as_ref() else {
+            return nested;
+        };
+        conditional = next;
+        nested = true;
+    }
 }
 
 fn suite_contains_multiple_loop_breaks(body: &[Stmt]) -> bool {

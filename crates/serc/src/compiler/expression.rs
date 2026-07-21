@@ -5610,7 +5610,7 @@ impl Compiler<'_> {
         Ok(())
     }
 
-    fn compile_tail_return_expression(
+    pub(super) fn compile_tail_return_expression(
         &mut self,
         expression: &Expr,
         return_location: SourceLocation,
