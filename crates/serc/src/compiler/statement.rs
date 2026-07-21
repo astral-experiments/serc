@@ -7269,7 +7269,22 @@ impl Compiler<'_> {
         self.emit(CLEANUP_THROW, 0, -1)?;
         let cleanup_throw_end = self.assembler.label();
         self.assembler.mark(cleanup_throw_end);
-        self.emit_jump_backward(JUMP_BACKWARD_NO_INTERRUPT, send_end, 0)?;
+        let preserve_outer_exception_owner = self.context.target_specific_rules_enabled()
+            && !self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty();
+        self.emit_jump_backward_with_exception_policy(
+            JUMP_BACKWARD_NO_INTERRUPT,
+            send_end,
+            0,
+            if preserve_outer_exception_owner {
+                ExceptionPolicy::EXCLUDE_ALWAYS
+            } else {
+                ExceptionPolicy::default()
+            },
+        )?;
         self.assembler.add_exception_region(
             yielded,
             yielded_end,
@@ -7279,10 +7294,12 @@ impl Compiler<'_> {
         );
 
         self.assembler.mark(async_cleanup);
-        self.control
-            .generators
-            .generator_region_exclusions
-            .push((cleanup_throw, async_cleanup));
+        if !preserve_outer_exception_owner {
+            self.control
+                .generators
+                .generator_region_exclusions
+                .push((cleanup_throw, async_cleanup));
+        }
         for exclusions in &mut self.control.withs.active_with_region_exclusions {
             exclusions.push((cleanup_throw_end, async_cleanup));
         }
