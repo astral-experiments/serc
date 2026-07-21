@@ -12271,6 +12271,12 @@ def filled(action, self, mask, result):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_nested_iterator_tail_conditions() {
+        let source = include_str!("fixtures/nested_iterator_tail_conditions.py");
+        assert_matches_cpython_marshal(source, "nested_iterator_tail_conditions.py");
+    }
+
+    #[test]
     fn executes_control_flow() {
         let source = r#"
 x = 3

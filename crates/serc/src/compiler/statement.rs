@@ -6508,7 +6508,8 @@ impl Compiler<'_> {
                     .active_exception_region_exclusions
                     .is_empty();
             let copied_iterator_branch_exit = non_final_branch
-                && !self.has_active_control_flow_region()
+                && (!self.has_active_control_flow_region()
+                    || terminal_break_test_is_runtime(&statement.test))
                 && self.control.in_unprotected_iterator_loop_tail();
             let copied_iterator_branch_exit = copied_iterator_branch_exit
                 && !expression_contains_chained_comparison(&statement.test);
