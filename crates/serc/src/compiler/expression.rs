@@ -5918,6 +5918,45 @@ impl Compiler<'_> {
                 && !self.control.in_loop()
                 && !nested_leading_group
                 && !has_nested_leading_boolean;
+            let follows_sync_with_wrapped_boolean_value =
+                self.context.target_specific_rules_enabled()
+                    && operand_index == 0
+                    && marker_owner_slots == 1
+                    && !nested_leading_group
+                    && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR | CO_GENERATOR) == 0
+                    && self.control.withs.active_with_region_exclusions.len() == 1
+                    && self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .is_empty()
+                    && self
+                        .control
+                        .comprehensions
+                        .active_comprehension_region_exclusions
+                        .is_empty()
+                    && self.control.finally.active_normal_finally_bodies == 0
+                    && self.control.finally.active_finally_end_blocks == 0
+                    && self.control.exceptions.active_exception_group_handlers == 0
+                    && !self.control.in_loop()
+                    && matches!(
+                        expression.values.as_slice(),
+                        [
+                            Expr::Call(_),
+                            Expr::List(_)
+                                | Expr::Dict(_)
+                                | Expr::Tuple(_)
+                                | Expr::Set(_)
+                                | Expr::Name(_)
+                                | Expr::Attribute(_),
+                        ]
+                    )
+                    && self
+                        .control
+                        .withs
+                        .current_sync_with_boolean_value_marker_scan
+                        .as_mut()
+                        .is_some_and(|scan| self.assembler.advance_boolean_value_marker_scan(scan));
             let follows_marker_before_coroutine_suspension = self.unit.flags & CO_COROUTINE != 0
                 && suspension_epoch == 0
                 && self
@@ -6005,6 +6044,7 @@ impl Compiler<'_> {
                 || exclude_after_coroutine_suspension
                 || exclude_from_plain_try
                 || follows_inline_comprehension_before_suspension
+                || follows_sync_with_wrapped_boolean_value
                 || follows_sync_with_try_join
                 || follows_sync_with_return_join
                 || follows_sync_with_terminal_boolean_value
