@@ -3949,8 +3949,36 @@ impl Compiler<'_> {
             && !self.control.exceptions.direct_try_body_has_else
             && self.control.finally.active_finally_try_bodies == 0;
         let base_depth = self.control.stack.depth;
+        // A final multi-branch chain leaves each surviving branch jump outside the handler's
+        // protected range. Try-else and nested control-flow regions keep a different owner.
+        let direct_try_chain_exit = self.context.target_specific_rules_enabled()
+            && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR | CO_GENERATOR) == 0
+            && self.control.loops.contexts.is_empty()
+            && self.control.withs.active_with_region_exclusions.is_empty()
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .len()
+                == 1
+            && self.control.finally.active_finally_try_bodies == 0
+            && !self.control.in_exception_handler()
+            && !self.control.exceptions.direct_try_body_has_else
+            && !self.control.statements.current_statement_has_following
+            && self
+                .control
+                .exceptions
+                .direct_try_body_statements
+                .last()
+                .is_some_and(|direct| *direct == statement.range)
+            && statement.elif_else_clauses.len() >= 2
+            && statement
+                .elif_else_clauses
+                .last()
+                .is_some_and(|clause| clause.test.is_none());
         let direct_try_body_exit = direct_try_if_exit
-            || self.control.exceptions.direct_try_assignment_branch_exit == Some(statement.range);
+            || self.control.exceptions.direct_try_assignment_branch_exit == Some(statement.range)
+            || direct_try_chain_exit;
         let end = self.assembler.label();
         let mut branches: Vec<(Option<&Expr>, &[Stmt])> =
             vec![(Some(&statement.test), statement.body.as_slice())];

@@ -2904,6 +2904,12 @@ def preceding_call(manager, first, second):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_direct_try_branch_owners() {
+        let source = include_str!("fixtures/direct_try_branch_owners.py");
+        assert_matches_cpython_marshal(source, "direct_try_branch_owners.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_multiline_nested_with_terminal_try_exits() {
         let source = r"def else_path(outer):
     with (
