@@ -468,6 +468,9 @@ pub(super) struct StatementState {
     current_statement_preceded_by_call_assignments: bool,
     // Whether this statement directly follows a conditional whose body terminates in a return.
     pub(super) current_statement_preceded_by_terminating_if: bool,
+    // Whether a synchronous-with value expression follows a returning conditional through a
+    // straight-line prefix without crossing a later branch or protected region.
+    pub(super) current_statement_follows_sync_with_return_join: bool,
     branch_join_successor: Option<TextRange>,
     // Whether the current statement is nested directly in a terminal if branch suite.
     pub(super) in_terminal_if_branch_suite: bool,
@@ -1268,7 +1271,20 @@ impl Compiler<'_> {
                 .control
                 .statements
                 .current_statement_propagates_following_to_suites;
+        let mut pending_sync_with_return_join = false;
         for (index, statement) in body.iter().enumerate() {
+            if self.control.in_synchronous_with()
+                && let Some(previous) = index.checked_sub(1).and_then(|index| body.get(index))
+            {
+                match previous {
+                    Stmt::Assign(_) | Stmt::AnnAssign(_) | Stmt::AugAssign(_) | Stmt::Expr(_) => {}
+                    Stmt::If(previous) => {
+                        pending_sync_with_return_join =
+                            synchronous_with_conditional_contains_return(previous);
+                    }
+                    _ => pending_sync_with_return_join = false,
+                }
+            }
             let is_final = index + 1 == body.len();
             if is_final && final_expression_becomes_return {
                 match statement {
@@ -1589,6 +1605,8 @@ impl Compiler<'_> {
                             && matches!(previous.body.last(), Some(Stmt::Return(_)))
                             && suite_terminates(&previous.body)
                 );
+                let follows_sync_with_return_join =
+                    self.control.in_synchronous_with() && pending_sync_with_return_join;
                 let previous_statement_preceded_by_try = std::mem::replace(
                     &mut self.control.statements.current_statement_preceded_by_try,
                     preceded_by_try,
@@ -1613,6 +1631,13 @@ impl Compiler<'_> {
                         .statements
                         .current_statement_preceded_by_terminating_if,
                     preceded_by_terminating_if,
+                );
+                let previous_statement_follows_sync_with_return_join = std::mem::replace(
+                    &mut self
+                        .control
+                        .statements
+                        .current_statement_follows_sync_with_return_join,
+                    follows_sync_with_return_join,
                 );
                 let post_async_with_condition_marker = (self.unit.flags
                     & (CO_COROUTINE | CO_ASYNC_GENERATOR)
@@ -1825,6 +1850,10 @@ impl Compiler<'_> {
                     .statements
                     .current_statement_preceded_by_terminating_if =
                     previous_statement_preceded_by_terminating_if;
+                self.control
+                    .statements
+                    .current_statement_follows_sync_with_return_join =
+                    previous_statement_follows_sync_with_return_join;
                 self.control.withs.post_async_with_condition_marker =
                     previous_post_async_with_condition_marker;
                 self.control
@@ -14523,6 +14552,28 @@ fn with_suite_has_terminal_none_and_raise(body: &[Stmt]) -> bool {
                                 && matches!(first.comparators[0], Expr::NoneLiteral(_))
                                 && matches!(second.comparators[0], Expr::NoneLiteral(_))))
     )
+}
+
+fn synchronous_with_conditional_contains_return(statement: &ruff_python_ast::StmtIf) -> bool {
+    fn contains_return(body: &[Stmt]) -> bool {
+        body.iter().any(|statement| match statement {
+            Stmt::Return(_) => true,
+            Stmt::If(statement) => {
+                contains_return(&statement.body)
+                    || statement
+                        .elif_else_clauses
+                        .iter()
+                        .any(|clause| contains_return(&clause.body))
+            }
+            _ => false,
+        })
+    }
+
+    contains_return(&statement.body)
+        || statement
+            .elif_else_clauses
+            .iter()
+            .any(|clause| contains_return(&clause.body))
 }
 
 fn shifted_sync_with_none_owner_statements(body: &[Stmt]) -> Vec<TextRange> {

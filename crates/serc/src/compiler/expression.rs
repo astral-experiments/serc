@@ -5743,6 +5743,20 @@ impl Compiler<'_> {
                             .active_exception_region_exclusions
                             .is_empty()))
                 && !marker_reuses_exception_owner;
+            let follows_sync_with_return_join = self.context.target_specific_rules_enabled()
+                && operand_index == 0
+                && !nested_leading_group
+                && self.control.in_synchronous_with()
+                && self
+                    .control
+                    .statements
+                    .current_statement_follows_sync_with_return_join
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .is_empty()
+                && !marker_reuses_exception_owner;
             let preserve_exception_type_owner =
                 exception_type_marker_owner == Some(true) && !follows_sync_with_branch_join;
             let exclude_exception_type_owner =
@@ -5856,6 +5870,7 @@ impl Compiler<'_> {
                 || exclude_after_coroutine_suspension
                 || exclude_from_plain_try
                 || follows_sync_with_try_join
+                || follows_sync_with_return_join
                 || follows_sync_with_branch_join;
             let marker_start = (!exclude_inlined_comprehension_owner
                 && (exclude_generator_region_owner
