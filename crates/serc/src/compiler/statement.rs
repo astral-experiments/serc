@@ -6036,6 +6036,28 @@ impl Compiler<'_> {
                         .len()
                         > 1;
                 let protected_nested_branch = try_body_normal_exit && non_final_branch;
+                let preserve_first_protected_iterator_condition_owner = branch_index == 0
+                    && has_else
+                    && leading.is_empty()
+                    && !try_body_normal_exit
+                    && !non_final_branch
+                    && self.context.target_specific_rules_enabled()
+                    && matches!(test, Expr::Name(_) | Expr::Attribute(_) | Expr::Call(_))
+                    && !expression_contains_generator(test)
+                    && self.control.loops.contexts.len() == 1
+                    && self.control.loops.contexts.last().is_some_and(|context| {
+                        context.iterator_cleanup == IteratorCleanup::Sync
+                            && self.assembler.instruction_count() == context.body_start
+                            && context.with_depth == self.control.withs.active_with_exits.len()
+                            && context.finally_end_depth
+                                == self.control.finally.active_finally_end_blocks
+                            && context.exception_region_depth
+                                == self
+                                    .control
+                                    .exceptions
+                                    .active_exception_region_exclusions
+                                    .len()
+                    });
                 let exclude_from_control_flow_regions = has_outer_exception_region
                     || protected_nested_branch
                     || self.control.loops.loop_tail_final_elif_nested_condition
@@ -6049,7 +6071,8 @@ impl Compiler<'_> {
                             || self
                                 .control
                                 .loops
-                                .exclude_loop_tail_not_taken_from_control_flow_regions));
+                                .exclude_loop_tail_not_taken_from_control_flow_regions)
+                        && !preserve_first_protected_iterator_condition_owner);
                 let exclude_from_all_exception_regions = has_outer_exception_region
                     || (!try_body_normal_exit
                         && !self
@@ -6124,7 +6147,9 @@ impl Compiler<'_> {
                         )
                     },
                 )?;
-                if preserve_first_sync_iterator_owner {
+                if preserve_first_sync_iterator_owner
+                    || preserve_first_protected_iterator_condition_owner
+                {
                     self.assembler.preserve_last_not_taken_exception_owner();
                 }
                 if branch_index == 0
