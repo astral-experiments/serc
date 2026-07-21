@@ -418,6 +418,8 @@ pub(super) struct GeneratorState {
     // Avoid rescanning a large code unit for post-suspension comprehension filters.
     pub(super) emitted_yield_value: bool,
     pub(super) generator_expression: bool,
+    // Whether an active generator expression uses only simple-name iteration targets.
+    pub(super) generator_expression_has_simple_targets: bool,
     // Whether an expression is being evaluated as a generator-expression filter. CPython lowers
     // filter conditions before the generator element, so their internal markers do not use the
     // element expression's post-compaction stop-iteration owner rule.
