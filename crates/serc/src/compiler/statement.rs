@@ -85,7 +85,7 @@ struct ExceptionHandlerContext {
     first: bool,
     loop_depth: usize,
     try_body_depth: usize,
-    unwinds_before_sync_with: bool,
+    unwinds_before_with: bool,
     leading_statement: Option<TextRange>,
     trailing_statement: Option<TextRange>,
     ownerless_optimized_boolean_generator_test: Option<TextRange>,
@@ -278,9 +278,9 @@ pub(super) struct WithState {
     // The direct final synchronous `with` with a normal body fallthrough in a handler-form try
     // nested in an active try/finally protected body.
     direct_final_sync_with_protected_handler_try_body: Option<ruff_text_size::TextRange>,
-    // A try with a returning handler nested directly in a synchronous with unwinds that handler
-    // before running the surrounding manager exit.
-    direct_return_handler_try_inside_sync_with: bool,
+    // A try with a returning handler nested directly in context managers unwinds that handler
+    // before running the surrounding manager exits.
+    direct_return_handler_try_inside_with: bool,
     // Conditions nested within a fully terminating synchronous-with return chain retain the
     // manager's normalized exception owner.
     sync_with_direct_return_chain: bool,
@@ -3743,18 +3743,17 @@ impl Compiler<'_> {
                         .map(Vec::len)
                         .collect::<Vec<_>>()
                 });
-                let unwinds_handler_before_sync_with =
-                    !self.control.withs.active_with_exits.is_empty()
-                        && !self.control.exceptions.active_exception_handlers.is_empty()
-                        && self
-                            .control
-                            .exceptions
-                            .active_exception_handlers
-                            .iter()
-                            .all(|handler| handler.unwinds_before_sync_with);
+                let unwinds_handler_before_with = !self.control.withs.active_with_exits.is_empty()
+                    && !self.control.exceptions.active_exception_handlers.is_empty()
+                    && self
+                        .control
+                        .exceptions
+                        .active_exception_handlers
+                        .iter()
+                        .all(|handler| handler.unwinds_before_with);
                 let handler_count = if !return_is_overridden
                     && (self.control.withs.active_with_exits.is_empty()
-                        || unwinds_handler_before_sync_with)
+                        || unwinds_handler_before_with)
                     && !unwinds_pass_finally
                 {
                     self.control.exceptions.active_exception_handlers.len()
@@ -3853,7 +3852,7 @@ impl Compiler<'_> {
                             );
                         }
                     }
-                    if (delay_exception_unwind_start || unwinds_handler_before_sync_with)
+                    if (delay_exception_unwind_start || unwinds_handler_before_with)
                         && exception_unwind_start.is_none()
                     {
                         let start = self.assembler.label();
@@ -4058,10 +4057,7 @@ impl Compiler<'_> {
                         self.emit(POP_TOP, 0, -1)?;
                     }
                 }
-                if self
-                    .control
-                    .withs
-                    .direct_return_handler_try_inside_sync_with
+                if self.control.withs.direct_return_handler_try_inside_with
                     && exception_unwind_start.is_none()
                 {
                     let start = self.assembler.label();
@@ -8329,13 +8325,14 @@ impl Compiler<'_> {
         }
 
         let base_depth = self.control.stack.depth;
-        let direct_return_handler_try_inside_sync_with = self
+        let direct_return_handler_try_inside_with = self
             .control
             .exceptions
             .active_exception_region_exclusions
             .is_empty()
-            && self.control.withs.active_with_region_exclusions.len() == 1
-            && self.control.withs.active_with_exits.len() == 1
+            && !self.control.withs.active_with_exits.is_empty()
+            && self.control.withs.active_with_region_exclusions.len()
+                == self.control.withs.active_with_exits.len()
             && self
                 .control
                 .loops
@@ -8343,14 +8340,8 @@ impl Compiler<'_> {
                 .iter()
                 .all(|context| context.iterator_cleanup == IteratorCleanup::None)
             && self.control.finally.active_finally_try_bodies == 0
-            && self
-                .control
-                .withs
-                .active_with_exits
-                .last()
-                .is_some_and(|context| !context.is_async)
             && (is_direct_return_handler_try(statement)
-                || try_has_trailing_unnamed_literal_return_handler(statement)
+                || try_has_unnamed_literal_return_handler(statement)
                 || is_direct_return_raise_handler_try(statement));
         let nested_named_handler_ifexp_call_test = if self
             .control
@@ -8806,8 +8797,8 @@ impl Compiler<'_> {
             } else {
                 self.with_try_body_context(statement, |compiler| {
                     compiler.with_control_override(
-                        |control| &mut control.withs.direct_return_handler_try_inside_sync_with,
-                        direct_return_handler_try_inside_sync_with,
+                        |control| &mut control.withs.direct_return_handler_try_inside_with,
+                        direct_return_handler_try_inside_with,
                         |compiler| {
                             compiler.with_control_override(
                                 |control| &mut control.conditions.include_assert_none_condition_owner,
@@ -9618,7 +9609,7 @@ impl Compiler<'_> {
                         first: handler_index == 0,
                         loop_depth: self.control.loops.contexts.len(),
                         try_body_depth: self.control.exceptions.active_try_marker_slots.len(),
-                        unwinds_before_sync_with: direct_return_handler_try_inside_sync_with,
+                        unwinds_before_with: direct_return_handler_try_inside_with,
                         leading_statement: handler.body.first().map(Ranged::range),
                         trailing_statement: handler.body.last().map(Ranged::range),
                         common_cleanup,
@@ -13116,18 +13107,29 @@ fn is_direct_return_handler_try(statement: &ruff_python_ast::StmtTry) -> bool {
         )
 }
 
-fn try_has_trailing_unnamed_literal_return_handler(statement: &ruff_python_ast::StmtTry) -> bool {
+fn try_has_unnamed_literal_return_handler(statement: &ruff_python_ast::StmtTry) -> bool {
     !statement.is_star
-        && statement.orelse.is_empty()
         && statement.finalbody.is_empty()
         && statement.handlers.iter().any(|handler| {
             handler.as_except_handler().is_some_and(|handler| {
                 handler.name.is_none()
-                    && matches!(
-                        handler.body.last(),
-                        Some(Stmt::Return(statement))
-                            if statement.value.as_deref().is_none_or(is_literal_constant)
-                    )
+                    && handler.body.iter().any(|statement| {
+                        matches!(
+                            statement,
+                            Stmt::Return(statement)
+                                if statement.value.as_deref().is_none_or(is_literal_constant)
+                        ) || matches!(
+                            statement,
+                            Stmt::If(statement)
+                                if statement.body.iter().any(|statement| {
+                                    matches!(
+                                        statement,
+                                        Stmt::Return(statement)
+                                            if statement.value.as_deref().is_none_or(is_literal_constant)
+                                    )
+                                })
+                        )
+                    })
             })
         })
 }
