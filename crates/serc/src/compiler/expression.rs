@@ -5751,11 +5751,13 @@ impl Compiler<'_> {
                     .control
                     .statements
                     .current_statement_follows_sync_with_return_join
-                && self
+                && (self
                     .control
                     .exceptions
                     .active_exception_region_exclusions
                     .is_empty()
+                    || (self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR | CO_GENERATOR) == 0
+                        && !self.control.in_synchronous_with_nested_exception_region()))
                 && !marker_reuses_exception_owner;
             let preserve_exception_type_owner =
                 exception_type_marker_owner == Some(true) && !follows_sync_with_branch_join;
