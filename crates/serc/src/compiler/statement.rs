@@ -82,6 +82,7 @@ struct ExceptionHandlerContext {
     name: Option<NameId>,
     first: bool,
     loop_depth: usize,
+    try_body_depth: usize,
     unwinds_before_sync_with: bool,
     leading_statement: Option<TextRange>,
     trailing_statement: Option<TextRange>,
@@ -3556,6 +3557,35 @@ impl Compiler<'_> {
                 } else {
                     0
                 };
+                // CPython keeps a nested handler's return cleanup protected by its enclosing
+                // try body. A return compiled in a newer try body under an outer handler has a
+                // deeper marker stack and must keep the existing ownerless unwind instead.
+                let preserve_nested_handler_return_owner =
+                    self.context.target_specific_rules_enabled()
+                        && handler_count == 1
+                        && self
+                            .control
+                            .exceptions
+                            .active_exception_region_exclusions
+                            .len()
+                            == 2
+                        && self
+                            .control
+                            .exceptions
+                            .active_exception_handlers
+                            .last()
+                            .is_some_and(|handler| {
+                                handler.try_body_depth
+                                    == self.control.exceptions.active_try_marker_slots.len()
+                            })
+                        && self.control.withs.active_with_exits.is_empty()
+                        && !self.control.in_iterator_loop()
+                        && self
+                            .control
+                            .finally
+                            .active_return_finally_contexts
+                            .is_empty()
+                        && self.control.finally.active_finally_end_blocks == 0;
                 let mut protected_outer_pop_except_start = None;
                 let mut next_loop = self.control.loops.contexts.len();
                 for handler_index in (0..handler_count).rev() {
@@ -3685,6 +3715,12 @@ impl Compiler<'_> {
                     }
                     next_loop = loop_depth;
                 }
+                let nested_handler_return_owner_end =
+                    preserve_nested_handler_return_owner.then(|| {
+                        let end = self.assembler.label();
+                        self.assembler.mark(end);
+                        end
+                    });
                 let return_finally_contexts = if !return_is_overridden {
                     std::mem::take(&mut self.control.finally.active_return_finally_contexts)
                 } else {
@@ -3918,6 +3954,11 @@ impl Compiler<'_> {
                     let exclusion_start = exception_unwind_start
                         .or(return_exclusion_start)
                         .expect("return exclusion has a start");
+                    let region_count = self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .len();
                     for (index, exclusions) in self
                         .control
                         .exceptions
@@ -3927,7 +3968,14 @@ impl Compiler<'_> {
                     {
                         let exclusion_start = nested_finally_region_unwind_start
                             .filter(|(cutoff, _)| index >= *cutoff)
-                            .map_or(exclusion_start, |(_, start)| start);
+                            .map_or_else(
+                                || {
+                                    nested_handler_return_owner_end
+                                        .filter(|_| index + 1 < region_count)
+                                        .unwrap_or(exclusion_start)
+                                },
+                                |(_, start)| start,
+                            );
                         exclusions.push((exclusion_start, return_exclusion_end));
                     }
                 }
@@ -9290,6 +9338,7 @@ impl Compiler<'_> {
                         name: handler_name,
                         first: handler_index == 0,
                         loop_depth: self.control.loops.contexts.len(),
+                        try_body_depth: self.control.exceptions.active_try_marker_slots.len(),
                         unwinds_before_sync_with: direct_return_handler_try_inside_sync_with,
                         leading_statement: handler.body.first().map(Ranged::range),
                         trailing_statement: handler.body.last().map(Ranged::range),
