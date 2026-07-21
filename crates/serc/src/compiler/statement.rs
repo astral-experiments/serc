@@ -4799,6 +4799,19 @@ impl Compiler<'_> {
                                     || matches!(first, Expr::UnaryOp(unary)
                                         if unary.op == UnaryOp::Not
                                             && matches!(unary.operand.as_ref(), Expr::Name(_) | Expr::Attribute(_)))
+                            }))
+                        || matches!(test, Expr::BoolOp(boolean)
+                        if boolean.op == BoolOp::Or
+                            && boolean.values.len() == 3
+                            && boolean.values.first().is_some_and(|first| {
+                                matches!(first, Expr::Name(_) | Expr::Attribute(_))
+                                    || matches!(first, Expr::UnaryOp(unary)
+                                        if unary.op == UnaryOp::Not
+                                            && matches!(unary.operand.as_ref(), Expr::Name(_) | Expr::Attribute(_)))
+                            })
+                            && boolean.values.get(1).is_some_and(|second| {
+                                matches!(second, Expr::Call(call)
+                                    if matches!(call.func.as_ref(), Expr::Name(_)))
                             })));
                 let exclude_not_taken = self.control.conditions.exclude_terminal_if_not_taken
                     || exclude_normal_finally_short_circuit
@@ -5225,7 +5238,7 @@ impl Compiler<'_> {
                                             include_scoped_none_condition_owner,
                                             |compiler| {
                                                 let exclude_condition = compiler.control.conditions.exclude_condition_not_taken_from_exception
-                                                    || (exclude_sync_with_condition_after_return && matches!(test, Expr::BoolOp(_)))
+                                                    || (exclude_sync_with_condition_after_return && matches!(test, Expr::BoolOp(boolean) if boolean.op == BoolOp::And))
                                                     || compiler.control.loops.loop_tail_final_elif_nested_condition
                                                         == Some(test.range())
                                                     || exclude_later_handler_leading_marker
