@@ -471,6 +471,37 @@ fn terminal_with_barrier_scan_ignores_prefix_and_labels() {
 }
 
 #[test]
+fn iterator_tail_barrier_scan_ignores_prefix_and_labels() {
+    let mut assembler = Assembler::default();
+    assembler.emit(NOT_TAKEN, 0);
+    let prefix_boundary = assembler.label();
+    assembler.mark(prefix_boundary);
+    let body_start = assembler.item_count();
+    let body_boundary = assembler.label();
+    assembler.mark(body_boundary);
+    assembler.emit(NOP, 0);
+    assert!(!assembler.contains_iterator_tail_barrier_since_item(body_start));
+
+    for opcode in [NOT_TAKEN, SEND, FOR_ITER, PUSH_EXC_INFO] {
+        let mut assembler = Assembler::default();
+        assembler.emit(NOT_TAKEN, 0);
+        let prefix_boundary = assembler.label();
+        assembler.mark(prefix_boundary);
+        let body_start = assembler.item_count();
+        let body_boundary = assembler.label();
+        assembler.mark(body_boundary);
+        assembler.push_linear_item(Item::Instruction(Instruction::new(
+            opcode,
+            Operand::Value(0),
+            SourceLocation::NONE,
+            None,
+        )));
+        assert!(assembler.contains_iterator_tail_barrier_since_item(body_start));
+        assert!(!assembler.contains_iterator_tail_barrier_since_item(assembler.item_count()));
+    }
+}
+
+#[test]
 fn instruction_offsets_follow_label_insertions_and_trailing_removal() {
     let mut assembler = Assembler::default();
     assembler.emit(LOAD_CONST, 0);

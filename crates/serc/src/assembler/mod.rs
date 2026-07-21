@@ -438,6 +438,14 @@ impl Assembler {
         })
     }
 
+    /// Returns whether an iterator-tail condition-owner barrier was emitted since `item_offset`.
+    pub(crate) fn contains_iterator_tail_barrier_since_item(&self, item_offset: usize) -> bool {
+        self.linear_items().iter().skip(item_offset).any(|item| {
+            matches!(item, Item::Instruction(instruction)
+                    if matches!(instruction.opcode, NOT_TAKEN | SEND | FOR_ITER | PUSH_EXC_INFO))
+        })
+    }
+
     /// Returns how many instruction slots optimization can vacate before a normalized marker.
     ///
     /// CPython compacts instructions without clearing their exception-handler fields. Later
