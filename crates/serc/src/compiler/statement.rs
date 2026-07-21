@@ -1504,25 +1504,52 @@ impl Compiler<'_> {
                         .current_statement_preceded_by_terminating_if,
                     preceded_by_terminating_if,
                 );
-                let post_async_with_condition_marker =
-                    (matches!(
+                let post_async_with_condition_marker = (self.unit.flags
+                    & (CO_COROUTINE | CO_ASYNC_GENERATOR)
+                    != 0
+                    && matches!(statement, Stmt::If(_) | Stmt::Assert(_))
+                    && (matches!(
                         previous_statement,
                         Some(Stmt::With(previous)) if previous.is_async
-                    ) && self.context.target_specific_rules_enabled()
-                        && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR) != 0
-                        && self.control.generators.generator_region_start.is_some()
-                        && self.control.loops.contexts.is_empty()
-                        && self
-                            .control
-                            .exceptions
-                            .active_exception_region_exclusions
-                            .is_empty())
-                    .then(|| match statement {
+                    ) || matches!(
+                        previous_statement,
+                        Some(Stmt::Assign(_) | Stmt::AnnAssign(_) | Stmt::AugAssign(_))
+                    ))
+                    && self.context.target_specific_rules_enabled()
+                    && self.control.generators.generator_region_start.is_some()
+                    && self.control.loops.contexts.is_empty()
+                    && self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .is_empty())
+                .then(|| {
+                    let previous_non_assignment = if matches!(
+                        previous_statement,
+                        Some(Stmt::With(previous)) if previous.is_async
+                    ) {
+                        previous_statement
+                    } else {
+                        body[..index].iter().rev().find(|statement| {
+                            !matches!(
+                                statement,
+                                Stmt::Assign(_) | Stmt::AnnAssign(_) | Stmt::AugAssign(_)
+                            )
+                        })
+                    };
+                    if !matches!(
+                        previous_non_assignment,
+                        Some(Stmt::With(previous)) if previous.is_async
+                    ) {
+                        return None;
+                    }
+                    match statement {
                         Stmt::If(statement) => first_generic_condition_marker(&statement.test),
                         Stmt::Assert(statement) => first_generic_condition_marker(&statement.test),
                         _ => None,
-                    })
-                    .flatten();
+                    }
+                })
+                .flatten();
                 let previous_post_async_with_condition_marker = std::mem::replace(
                     &mut self.control.withs.post_async_with_condition_marker,
                     post_async_with_condition_marker,
