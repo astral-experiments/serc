@@ -2153,6 +2153,51 @@ impl Compiler<'_> {
                 .generator_expression_boolean_dispatch_eligible
                 .is_some())
         .then_some(ExceptionPolicy::EXCLUDE_ALWAYS);
+        let generator_expression_filter_dispatch_policy =
+            (self.context.target_specific_rules_enabled()
+                && self.unit.flags & CO_GENERATOR != 0
+                && self.control.generators.generator_expression
+                && self.control.generators.generator_filter_expression
+                && self
+                    .control
+                    .generators
+                    .generator_expression_has_simple_targets
+                && self.control.stack.depth == 1
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .is_empty()
+                && self.control.withs.active_with_region_exclusions.is_empty()
+                && self
+                    .control
+                    .comprehensions
+                    .active_comprehension_region_exclusions
+                    .is_empty()
+                && !self.control.in_exception_handler()
+                && self.control.exceptions.active_exception_group_handlers == 0
+                && self.control.finally.active_normal_finally_bodies == 0
+                && self.control.finally.active_finally_end_blocks == 0
+                && matches!(
+                    call.arguments.args.as_ref(),
+                    [Expr::Generator(generator)]
+                        if !expression_suspends_current_scope(&generator.elt)
+                            && !matches!(generator.elt.as_ref(), Expr::Compare(comparison)
+                                if comparison.ops.len() > 1)
+                            && generator.generators.first().is_none_or(|generator| {
+                                !matches!(generator.iter, Expr::Subscript(_))
+                            })
+                            && generator.generators.iter().enumerate().all(|(index, generator)| {
+                                !generator.is_async
+                                    && (index == 0
+                                        || !expression_suspends_current_scope(&generator.iter))
+                                    && !generator
+                                        .ifs
+                                        .iter()
+                                        .any(expression_suspends_current_scope)
+                            })
+                ))
+            .then_some(ExceptionPolicy::EXCLUDE_ALWAYS);
         let plain_try_boolean_loop_policy = (!collect_tuple
             && self.context.target_specific_rules_enabled()
             && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR | CO_GENERATOR) == 0
@@ -2397,6 +2442,7 @@ impl Compiler<'_> {
                 .or(plain_try_boolean_dispatch_policy)
                 .or(iterator_boolean_dispatch_policy)
                 .or(generator_expression_boolean_dispatch_policy)
+                .or(generator_expression_filter_dispatch_policy)
                 .or_else(|| {
                     coroutine_boolean_dispatch_policy.map(|_| {
                         if self.assembler.current_block_has_dynamic_exception_owner() {
@@ -3558,6 +3604,13 @@ impl Compiler<'_> {
             flags,
         )?;
         child.control.generators.generator_expression = true;
+        child
+            .control
+            .generators
+            .generator_expression_has_simple_targets = generator
+            .generators
+            .iter()
+            .all(|generator| matches!(generator.target, Expr::Name(_)));
         child
             .control
             .generators
