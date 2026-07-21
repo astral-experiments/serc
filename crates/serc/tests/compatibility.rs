@@ -12247,6 +12247,12 @@ def filled(action, self, mask, result):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_nested_conditional_expression_returns() {
+        let source = include_str!("fixtures/nested_conditional_expression_returns.py");
+        assert_matches_cpython_marshal(source, "nested_conditional_expression_returns.py");
+    }
+
+    #[test]
     fn executes_control_flow() {
         let source = r#"
 x = 3
