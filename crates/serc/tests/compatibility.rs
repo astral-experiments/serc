@@ -11079,6 +11079,12 @@ def final_elif(action, first, second):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_synchronous_while_with_cleanup_spans() {
+        let source = include_str!("fixtures/synchronous_while_with_cleanup_spans.py");
+        assert_matches_cpython_marshal(source, "synchronous_while_with_cleanup_spans.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_try_exits_after_if_joins() {
         let source = "def retained(flag):\n    try:\n        action()\n    except Exception:\n        failed()\n    else:\n        if flag:\n            good()\n        else:\n            other()\n    after()\n\ndef ordinary(flag):\n    try:\n        action()\n    except Exception:\n        failed()\n    else:\n        if flag:\n            good()\n    after()\n";
         assert_matches_cpython_marshal(source, "try_if_join.py");

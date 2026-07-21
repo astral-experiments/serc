@@ -775,7 +775,14 @@ impl Compiler<'_> {
             )
         });
         let direct_final_sync_with_try_body =
-            (self.control.statements.current_statement_has_following
+            ((self.control.statements.current_statement_has_following
+                || (self.context.target_specific_rules_enabled()
+                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                    && !statement.handlers.is_empty()
+                    && statement.finalbody.is_empty()
+                    && self.control.loops.contexts.last().is_some_and(|context| {
+                        context.iterator_cleanup == IteratorCleanup::None
+                    })))
                 && statement.orelse.is_empty())
             .then_some(final_sync_with_try_body)
             .flatten();
@@ -11376,9 +11383,34 @@ impl Compiler<'_> {
             if terminal {
                 self.emit_implicit_return()?;
             } else {
+                let outer_exception_exit_start =
+                    (exclude_handler_exit
+                        && self.context.target_specific_rules_enabled()
+                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                            == 0
+                        && self.control.loops.contexts.last().is_some_and(|context| {
+                            context.iterator_cleanup == IteratorCleanup::None
+                        }))
+                    .then(|| {
+                        let start = self.assembler.label();
+                        self.assembler.mark(start);
+                        start
+                    });
                 let normal_exit = self.emit_jump_forward_instruction(JUMP_FORWARD, end)?;
                 if self.control.finally.active_finally_try_bodies > 0 {
                     self.assembler.prevent_jump_inlining(normal_exit);
+                }
+                if let Some(start) = outer_exception_exit_start {
+                    let exclusion_end = self.assembler.label();
+                    self.assembler.mark(exclusion_end);
+                    if let Some(exclusions) = self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .last_mut()
+                    {
+                        exclusions.push((start, exclusion_end));
+                    }
                 }
             }
         }
