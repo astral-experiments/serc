@@ -7729,6 +7729,26 @@ def multiline_commented_nested_all_any(values):
         for row in values
         # outer after
     )
+
+
+def nested_iterable_all_any(values):
+    return all(any(item for item in all(value for value in row)) for row in values)
+
+
+def nested_iterable_any_all(values):
+    return any(all(item for item in any(value for value in row)) for row in values)
+
+
+def ordinary_generator_iterable_control(values):
+    return all(sum(item for item in any(value for value in row)) for row in values)
+
+
+def nested_ordinary_generator_iterable_control(values):
+    return any(sum(item for item in all(any(part for part in value) for value in row)) for row in values)
+
+
+async def coroutine_ordinary_generator_iterable_control(values):
+    assert all(sum(item for item in any(value for value in row)) for row in values)
 ";
         assert_matches_cpython_marshal(source, "nested_boolean_generator_dispatch.py");
     }

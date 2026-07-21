@@ -3595,7 +3595,28 @@ impl Compiler<'_> {
         if !closure_names.is_empty() {
             self.emit_function_attribute(FunctionAttribute::CLOSURE)?;
         }
-        if generator.generators[0].is_async {
+        if self
+            .control
+            .generators
+            .generator_expression_boolean_dispatch_eligible
+            .is_some_and(|range| range != generator.range)
+        {
+            self.with_control_override(
+                |control| {
+                    &mut control
+                        .generators
+                        .generator_expression_boolean_dispatch_eligible
+                },
+                None,
+                |compiler| {
+                    if generator.generators[0].is_async {
+                        compiler.compile_expression(&generator.generators[0].iter)
+                    } else {
+                        compiler.compile_iterable_expression(&generator.generators[0].iter)
+                    }
+                },
+            )?;
+        } else if generator.generators[0].is_async {
             self.compile_expression(&generator.generators[0].iter)?;
         } else {
             self.compile_iterable_expression(&generator.generators[0].iter)?;
