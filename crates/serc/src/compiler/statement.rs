@@ -474,7 +474,8 @@ pub(super) struct StatementState {
     // through assert and non-terminating conditional gaps.
     pub(super) current_statement_follows_sync_with_return_join: bool,
     pub(super) current_statement_follows_sync_with_return_join_after_gap: bool,
-    // Whether a synchronous-with value expression follows a non-terminating conditional or assert.
+    // Whether a synchronous-with value expression follows a non-terminating conditional, assert,
+    // or inner synchronous-with exit.
     pub(super) current_statement_follows_sync_with_nonterminal_join: bool,
     branch_join_successor: Option<TextRange>,
     // Whether the current statement is nested directly in a terminal if branch suite.
@@ -1290,6 +1291,15 @@ impl Compiler<'_> {
                     Stmt::Assign(_) | Stmt::AnnAssign(_) | Stmt::AugAssign(_) | Stmt::Expr(_) => {}
                     Stmt::Assert(_) => {
                         pending_sync_with_return_join_after_gap |= pending_sync_with_return_join;
+                        pending_sync_with_nonterminal_join = true;
+                    }
+                    Stmt::With(previous)
+                        if !previous.is_async
+                            && previous.items.len() == 1
+                            && !suite_terminates(&previous.body) =>
+                    {
+                        pending_sync_with_return_join = false;
+                        pending_sync_with_return_join_after_gap = false;
                         pending_sync_with_nonterminal_join = true;
                     }
                     Stmt::If(previous) => {
