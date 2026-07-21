@@ -3579,7 +3579,6 @@ impl Compiler<'_> {
                                     == self.control.exceptions.active_try_marker_slots.len()
                             })
                         && self.control.withs.active_with_exits.is_empty()
-                        && !self.control.in_iterator_loop()
                         && self
                             .control
                             .finally
@@ -3715,12 +3714,6 @@ impl Compiler<'_> {
                     }
                     next_loop = loop_depth;
                 }
-                let nested_handler_return_owner_end =
-                    preserve_nested_handler_return_owner.then(|| {
-                        let end = self.assembler.label();
-                        self.assembler.mark(end);
-                        end
-                    });
                 let return_finally_contexts = if !return_is_overridden {
                     std::mem::take(&mut self.control.finally.active_return_finally_contexts)
                 } else {
@@ -3805,7 +3798,33 @@ impl Compiler<'_> {
                 if !return_finally_contexts.is_empty() {
                     self.control.finally.active_return_finally_contexts = return_finally_contexts;
                 }
-                self.emit_loop_iterator_cleanup(0, next_loop, preserve_tos)?;
+                // Only iterators created inside the enclosing try keep its handler-return owner;
+                // cleanup for surrounding iterators starts after that protected range ends.
+                let protected_iterator_start = preserve_nested_handler_return_owner
+                    .then(|| {
+                        let outer_exception_depth = self
+                            .control
+                            .exceptions
+                            .active_exception_region_exclusions
+                            .len()
+                            .saturating_sub(1);
+                        self.control.loops.contexts[..next_loop]
+                            .iter()
+                            .position(|context| {
+                                context.iterator_cleanup != IteratorCleanup::None
+                                    && context.exception_region_depth >= outer_exception_depth
+                            })
+                    })
+                    .flatten()
+                    .unwrap_or(next_loop);
+                self.emit_loop_iterator_cleanup(protected_iterator_start, next_loop, preserve_tos)?;
+                let nested_handler_return_owner_end =
+                    preserve_nested_handler_return_owner.then(|| {
+                        let end = self.assembler.label();
+                        self.assembler.mark(end);
+                        end
+                    });
+                self.emit_loop_iterator_cleanup(0, protected_iterator_start, preserve_tos)?;
                 if delay_boolean_iterator_exception_unwind_start
                     && delay_iterator_exception_unwind_start
                     && exception_unwind_start.is_none()
