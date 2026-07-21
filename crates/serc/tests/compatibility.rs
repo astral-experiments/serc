@@ -11187,6 +11187,12 @@ def final_elif(action, first, second):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_sync_with_post_inner_try_boolean_owners() {
+        let source = include_str!("fixtures/sync_with_post_inner_try_boolean_owners.py");
+        assert_matches_cpython_marshal(source, "sync_with_post_inner_try_boolean_owners.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_sync_with_outer_try_boolean_owners() {
         let source = include_str!("fixtures/sync_with_outer_try_boolean_owners.py");
         assert_matches_cpython_marshal(source, "sync_with_outer_try_boolean_owners.py");
