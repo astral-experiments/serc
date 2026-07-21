@@ -470,9 +470,10 @@ pub(super) struct StatementState {
     current_statement_preceded_by_call_assignments: bool,
     // Whether this statement directly follows a conditional whose body terminates in a return.
     pub(super) current_statement_preceded_by_terminating_if: bool,
-    // Whether a synchronous-with value expression follows a returning conditional through a
-    // straight-line prefix without crossing a later branch or protected region.
+    // Whether a synchronous-with value expression follows a returning conditional, including
+    // through assert and non-terminating conditional gaps.
     pub(super) current_statement_follows_sync_with_return_join: bool,
+    pub(super) current_statement_follows_sync_with_return_join_after_gap: bool,
     branch_join_successor: Option<TextRange>,
     // Whether the current statement is nested directly in a terminal if branch suite.
     pub(super) in_terminal_if_branch_suite: bool,
@@ -1276,6 +1277,7 @@ impl Compiler<'_> {
         let track_sync_with_return_joins =
             self.context.target_specific_rules_enabled() && self.control.in_synchronous_with();
         let mut pending_sync_with_return_join = false;
+        let mut pending_sync_with_return_join_after_gap = false;
         let mut seen_sync_with_return = false;
         for (index, statement) in body.iter().enumerate() {
             if track_sync_with_return_joins
@@ -1283,18 +1285,27 @@ impl Compiler<'_> {
             {
                 match previous {
                     Stmt::Assign(_) | Stmt::AnnAssign(_) | Stmt::AugAssign(_) | Stmt::Expr(_) => {}
+                    Stmt::Assert(_) => {
+                        pending_sync_with_return_join_after_gap |= pending_sync_with_return_join;
+                    }
                     Stmt::If(previous) => {
                         let contains_return =
                             synchronous_with_conditional_contains_return(previous);
-                        pending_sync_with_return_join = contains_return
+                        let creates_return_join = contains_return
                             || (self.unit.flags
                                 & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
                                 == 0
                                 && !seen_sync_with_return
                                 && synchronous_with_conditional_contains_raise(previous));
+                        pending_sync_with_return_join_after_gap =
+                            pending_sync_with_return_join && !creates_return_join;
+                        pending_sync_with_return_join |= creates_return_join;
                         seen_sync_with_return |= contains_return;
                     }
-                    _ => pending_sync_with_return_join = false,
+                    _ => {
+                        pending_sync_with_return_join = false;
+                        pending_sync_with_return_join_after_gap = false;
+                    }
                 }
             }
             let is_final = index + 1 == body.len();
@@ -1619,6 +1630,8 @@ impl Compiler<'_> {
                 );
                 let follows_sync_with_return_join =
                     track_sync_with_return_joins && pending_sync_with_return_join;
+                let follows_sync_with_return_join_after_gap =
+                    track_sync_with_return_joins && pending_sync_with_return_join_after_gap;
                 let previous_statement_preceded_by_try = std::mem::replace(
                     &mut self.control.statements.current_statement_preceded_by_try,
                     preceded_by_try,
@@ -1650,6 +1663,13 @@ impl Compiler<'_> {
                         .statements
                         .current_statement_follows_sync_with_return_join,
                     follows_sync_with_return_join,
+                );
+                let previous_statement_follows_sync_with_return_join_after_gap = std::mem::replace(
+                    &mut self
+                        .control
+                        .statements
+                        .current_statement_follows_sync_with_return_join_after_gap,
+                    follows_sync_with_return_join_after_gap,
                 );
                 let post_async_with_condition_marker = (self.unit.flags
                     & (CO_COROUTINE | CO_ASYNC_GENERATOR)
@@ -1866,6 +1886,10 @@ impl Compiler<'_> {
                     .statements
                     .current_statement_follows_sync_with_return_join =
                     previous_statement_follows_sync_with_return_join;
+                self.control
+                    .statements
+                    .current_statement_follows_sync_with_return_join_after_gap =
+                    previous_statement_follows_sync_with_return_join_after_gap;
                 self.control.withs.post_async_with_condition_marker =
                     previous_post_async_with_condition_marker;
                 self.control

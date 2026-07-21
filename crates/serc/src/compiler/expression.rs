@@ -2238,10 +2238,19 @@ impl Compiler<'_> {
         let preserve_synchronous_with_boolean_loop_owner = !collect_tuple
             && self.context.target_specific_rules_enabled()
             && self.control.in_synchronous_with()
-            && !self
+            && (!self
                 .control
                 .statements
                 .current_statement_follows_sync_with_return_join
+                || (self
+                    .control
+                    .statements
+                    .current_statement_follows_sync_with_return_join_after_gap
+                    && !self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .is_empty()))
             && !self.control.conditions.include_assert_none_condition_owner
             && ((self.control.statements.current_statement_has_following
                 && !self.control.in_loop()
@@ -5749,6 +5758,11 @@ impl Compiler<'_> {
                 && !marker_reuses_exception_owner;
             let follows_sync_with_return_join = self.context.target_specific_rules_enabled()
                 && operand_index == 0
+                && (!self
+                    .control
+                    .statements
+                    .current_statement_follows_sync_with_return_join_after_gap
+                    || expression.values.len() == 2)
                 && !nested_leading_group
                 && self.control.in_synchronous_with()
                 && self
@@ -5760,7 +5774,12 @@ impl Compiler<'_> {
                     .exceptions
                     .active_exception_region_exclusions
                     .is_empty()
-                    || (self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR | CO_GENERATOR) == 0
+                    || (!self
+                        .control
+                        .statements
+                        .current_statement_follows_sync_with_return_join_after_gap
+                        && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR | CO_GENERATOR)
+                            == 0
                         && !self.control.in_synchronous_with_nested_exception_region()))
                 && !marker_reuses_exception_owner;
             let preserve_exception_type_owner =
