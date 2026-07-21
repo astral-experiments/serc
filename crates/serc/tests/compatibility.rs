@@ -4541,6 +4541,110 @@ def direct_assertion_control(items):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_filtered_async_comprehension_element_owners() {
+        let source = r"async def plain(stream):
+    values = [value async for value in stream]
+    return values
+
+
+async def attribute_filter(stream):
+    values = [value async for value in stream if value.ready]
+    return values
+
+
+async def method_filter(stream):
+    values = [value async for value in stream if value.ready()]
+    return values
+
+
+async def comparison_filter(stream, expected):
+    values = [value async for value in stream if value.kind == expected]
+    return values
+
+
+async def conjunction_filter(stream, expected):
+    values = [value async for value in stream if value.kind == expected and value.ready]
+    return values
+
+
+async def disjunction_filter(stream, expected):
+    values = [value async for value in stream if value.kind == expected or value.ready]
+    return values
+
+
+async def returned(stream):
+    return [value async for value in stream if value.ready]
+
+
+async def set_result(stream):
+    values = {value.name async for value in stream if value.ready}
+    return values
+
+
+async def dict_result(stream):
+    values = {value.name: value async for value in stream if value.ready}
+    return values
+
+
+async def initialized_target(stream):
+    value = None
+    values = [value async for value in stream if value.ready]
+    return values, value
+
+
+async def prior_assignment(factory, expected):
+    stream = factory()
+    values = [value async for value in stream if value.kind == expected]
+    return values
+
+
+async def prior_call(stream, expected, touch):
+    touch(stream)
+    values = [value async for value in stream if value.kind == expected]
+    return values
+
+
+async def prior_if(stream, expected, gate):
+    if gate:
+        return []
+    values = [value async for value in stream if value.kind == expected]
+    return values
+
+
+async def async_generator(stream, expected):
+    values = [value async for value in stream if value.kind == expected]
+    for value in values:
+        yield value
+
+
+async def sync_with(stream, expected, manager):
+    with manager:
+        values = [value async for value in stream if value.kind == expected]
+    return values
+
+
+async def await_iter_control(factory, expected):
+    values = [value async for value in await factory() if value.kind == expected]
+    return values
+
+
+async def async_with_control(stream, expected, manager):
+    async with manager:
+        values = [value async for value in stream if value.kind == expected]
+    return values
+
+
+async def sync_filter_control(values, expected):
+    return [value for value in values if value.kind == expected]
+
+
+async def async_generator_expression_control(stream, expected):
+    return (value async for value in stream if value.kind == expected)
+";
+        assert_matches_cpython_marshal(source, "filtered_async_comprehension_elements.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_nested_async_comprehension_cleanup_order() {
         let source =
             "async def test(): return [[x async for x in elements(n)] async for n in range(3)]\n";

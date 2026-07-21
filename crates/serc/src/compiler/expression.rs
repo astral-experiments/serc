@@ -4617,6 +4617,13 @@ impl Compiler<'_> {
             )?;
             self.assembler.mark(accepted);
         }
+        let filtered_element_exclusion_start = (!generator.ifs.is_empty()
+            && self.context.target_specific_rules_enabled())
+        .then(|| {
+            let start = self.assembler.label();
+            self.assembler.mark(start);
+            start
+        });
         if index + 1 < generators.len() {
             if generators[index + 1].is_async {
                 self.compile_expression(&generators[index + 1].iter)?;
@@ -4652,6 +4659,14 @@ impl Compiler<'_> {
             )?;
         }
         self.emit_jump_backward(JUMP_BACKWARD, start, 0)?;
+        if let Some(exclusion_start) = filtered_element_exclusion_start {
+            let exclusion_end = self.assembler.label();
+            self.assembler.mark(exclusion_end);
+            self.control
+                .generators
+                .generator_region_exclusions
+                .push((exclusion_start, exclusion_end));
+        }
         self.assembler.set_location(cleanup_location);
         if !reorder_cleanup {
             self.assembler.mark(cleanup_throw);
