@@ -2886,6 +2886,12 @@ def preceding_call(manager, first, second):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_synchronous_with_conditions_after_returns() {
+        let source = include_str!("fixtures/synchronous_with_conditions_after_returns.py");
+        assert_matches_cpython_marshal(source, "synchronous_with_conditions_after_returns.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_multiline_nested_with_terminal_try_exits() {
         let source = r"def else_path(outer):
     with (
