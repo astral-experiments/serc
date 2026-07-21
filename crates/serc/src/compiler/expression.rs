@@ -5782,7 +5782,8 @@ impl Compiler<'_> {
             let follows_sync_with_nonterminal_join = self.context.target_specific_rules_enabled()
                 && expression.op == BoolOp::Or
                 && operand_index == 0
-                && marker_owner_slots == 1
+                && (marker_owner_slots == 1
+                    || (marker_owner_slots == 2 && expression.values.len() == 2))
                 && !nested_leading_group
                 && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR | CO_GENERATOR) == 0
                 && self.control.withs.active_with_region_exclusions.len() == 1
