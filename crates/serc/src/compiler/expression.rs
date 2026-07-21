@@ -5723,7 +5723,7 @@ impl Compiler<'_> {
                 && self.control.finally.active_normal_finally_bodies == 0
                 && self.control.finally.active_finally_end_blocks == 0
                 && self.control.exceptions.active_exception_group_handlers == 0
-                && ((marker_owner_slots == 1
+                && (((1..=2).contains(&marker_owner_slots)
                     && self
                         .control
                         .generators
