@@ -5372,7 +5372,30 @@ impl Compiler<'_> {
             || (self
                 .control
                 .current_try_handler_starts_with_optimized_boolean_generator()
-                && matches!(expression.test.as_ref(), Expr::Name(_)));
+                && matches!(expression.test.as_ref(), Expr::Name(_)))
+            || (self
+                .control
+                .statements
+                .current_statement_preceded_by_terminating_if
+                && self.control.stack.depth == 2
+                && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+                && self.control.withs.active_with_region_exclusions.len() == 1
+                && self.control.in_synchronous_with()
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .is_empty()
+                && self
+                    .control
+                    .comprehensions
+                    .active_comprehension_region_exclusions
+                    .is_empty()
+                && self.control.finally.active_normal_finally_bodies == 0
+                && self.control.finally.active_finally_end_blocks == 0
+                && self.control.exceptions.active_exception_group_handlers == 0
+                && self.context.target_specific_rules_enabled()
+                && is_name_rooted_if_expression_condition(&expression.test));
         let preserve_none_condition_owner = (self.control.in_synchronous_with()
             || (self
                 .control
@@ -7000,6 +7023,14 @@ fn comprehension_condition_has_trailing_none(expression: &Expr) -> bool {
         }
         _ => false,
     }
+}
+
+fn is_name_rooted_if_expression_condition(expression: &Expr) -> bool {
+    let mut root = expression;
+    while let Expr::Attribute(attribute) = root {
+        root = attribute.value.as_ref();
+    }
+    matches!(root, Expr::Name(_))
 }
 
 fn filtered_comprehension_has_ownerless_truth_condition(
