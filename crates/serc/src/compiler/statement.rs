@@ -453,7 +453,7 @@ pub(super) struct StatementState {
     // Whether the statement currently entered by `compile_suite` has a sibling successor.
     pub(super) current_statement_has_following: bool,
     // Whether an enclosing statement has a sibling successor after its nested suite.
-    inherited_statement_has_following: bool,
+    pub(super) inherited_statement_has_following: bool,
     // Only conditional and with statements carry that continuation into their nested suites.
     current_statement_propagates_following_to_suites: bool,
     // Whether that successor is another try statement. A loop break that targets this sibling
@@ -4797,6 +4797,31 @@ impl Compiler<'_> {
                                     if comparison.ops.len() == 1
                                         && comparison.ops[0] == CmpOp::Is
                                         && matches!(comparison.comparators[0], Expr::NoneLiteral(_))))));
+                let exclude_handler_condition_after_return = branch_index == 0
+                    && self.control.in_exception_handler()
+                    && self.context.target_specific_rules_enabled()
+                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                    && self
+                        .control
+                        .statements
+                        .current_statement_preceded_by_terminating_if
+                    && self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .len()
+                        == 1
+                    && self.control.withs.active_with_region_exclusions.is_empty()
+                    && self.control.finally.active_normal_finally_bodies == 0
+                    && self.control.finally.active_finally_try_bodies == 0
+                    && matches!(body.last(), Some(Stmt::Raise(_)))
+                    && !matches!(test, Expr::Call(call)
+                        if matches!(call.func.as_ref(), Expr::Name(_)))
+                    && !matches!(test, Expr::UnaryOp(unary)
+                        if unary.op == UnaryOp::Not
+                            && matches!(unary.operand.as_ref(), Expr::Call(call)
+                                if matches!(call.func.as_ref(), Expr::Name(_))))
+                    && !is_specialized_none_condition(test);
                 let exclude_later_handler_leading_marker = branch_index == 0
                     && !is_specialized_none_condition(test)
                     && is_later_bare_raise_fallback_if(statement)
@@ -4873,6 +4898,7 @@ impl Compiler<'_> {
                                                     || compiler.control.loops.loop_tail_final_elif_nested_condition
                                                         == Some(test.range())
                                                     || exclude_later_handler_leading_marker
+                                                    || exclude_handler_condition_after_return
                                                     || exclude_direct_try_while_return_marker
                                                     || exclude_direct_post_try_coroutine_walrus_and
                                                     || exclude_generator_while_try_condition;

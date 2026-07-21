@@ -5793,6 +5793,18 @@ impl Compiler<'_> {
             let has_fresh_with_owner = after_coroutine_suspension
                 && self.control.has_with_suspension_epoch(suspension_epoch);
             let named_exception_handler = self.control.current_exception_handler_binds_name();
+            let exclude_nested_handler_boolean = self.control.in_exception_handler()
+                && self.control.statements.inherited_statement_has_following
+                && self.context.target_specific_rules_enabled()
+                && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR | CO_GENERATOR) == 0
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .len()
+                    == 1
+                && self.control.withs.active_with_region_exclusions.is_empty()
+                && self.control.finally.active_normal_finally_bodies == 0;
             let exclude_after_coroutine_suspension = after_coroutine_suspension
                 && !has_fresh_with_owner
                 && self.control.finally.active_finally_end_blocks == 0
@@ -5816,7 +5828,7 @@ impl Compiler<'_> {
                 && self.control.finally.active_normal_finally_bodies == 0
                 && self.control.finally.active_finally_end_blocks == 0
                 && !self.control.exceptions.same_line_try_body
-                && !named_exception_handler
+                && (!named_exception_handler || exclude_nested_handler_boolean)
                 && !exception_group_handler
                 && !marker_reuses_exception_owner
                 && exception_type_marker_owner.is_none()
