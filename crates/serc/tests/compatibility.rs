@@ -2892,6 +2892,12 @@ def preceding_call(manager, first, second):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_synchronous_with_and_conditions_after_returns() {
+        let source = include_str!("fixtures/synchronous_with_and_conditions_after_returns.py");
+        assert_matches_cpython_marshal(source, "synchronous_with_and_conditions_after_returns.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_multiline_nested_with_terminal_try_exits() {
         let source = r"def else_path(outer):
     with (
@@ -3654,6 +3660,12 @@ def ordinary_control(items):
     fn matches_cpython_marshal_for_terminal_assertions_in_with_bodies() {
         let source = "def simple(manager, condition):\n    with manager:\n        assert condition\n\ndef message(manager, condition):\n    with manager:\n        use()\n        assert condition, make_message()\n\ndef boolean(manager, first, second):\n    with manager:\n        assert first or second\n\ndef conjunction(manager, first, second):\n    with manager:\n        assert first and second\n\ndef conditional(manager, first, second, condition):\n    with manager:\n        assert first if condition else second\n\ndef constant_true():\n    with manager:\n        assert True\n\ndef constant_false():\n    with manager:\n        assert False\n\ndef followed(manager, condition):\n    with manager:\n        assert condition\n    use()\n\ndef same_line(manager, condition):\n    with manager: assert condition\n\ndef nested(outer, inner, condition):\n    try:\n        with outer:\n            with inner:\n                assert condition\n    finally:\n        cleanup()\n\nasync def asynchronous(manager, condition):\n    async with manager:\n        assert condition\n";
         assert_matches_cpython_marshal(source, "with_assert.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_protected_post_suspension_coroutine_assertions() {
+        let source = include_str!("fixtures/protected_post_suspension_coroutine_assertions.py");
+        assert_matches_cpython_marshal(source, "protected_post_suspension_coroutine_assertions.py");
     }
 
     #[test]
