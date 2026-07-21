@@ -5756,6 +5756,22 @@ impl Compiler<'_> {
                             .active_exception_region_exclusions
                             .is_empty()))
                 && !marker_reuses_exception_owner;
+            let follows_sync_with_nonterminal_join = self.context.target_specific_rules_enabled()
+                && expression.op == BoolOp::Or
+                && operand_index == 0
+                && marker_owner_slots == 1
+                && !nested_leading_group
+                && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR | CO_GENERATOR) == 0
+                && self.control.withs.active_with_region_exclusions.len() == 1
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .is_empty()
+                && self
+                    .control
+                    .statements
+                    .current_statement_follows_sync_with_nonterminal_join;
             let follows_sync_with_return_join = self.context.target_specific_rules_enabled()
                 && operand_index == 0
                 && (!self
@@ -5896,6 +5912,7 @@ impl Compiler<'_> {
                 || exclude_from_plain_try
                 || follows_sync_with_try_join
                 || follows_sync_with_return_join
+                || follows_sync_with_nonterminal_join
                 || follows_sync_with_branch_join;
             let marker_start = (!exclude_inlined_comprehension_owner
                 && (exclude_generator_region_owner
