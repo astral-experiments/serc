@@ -11115,6 +11115,12 @@ def final_elif(action, first, second):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_protected_async_iterator_owners() {
+        let source = include_str!("fixtures/protected_async_iterator_owners.py");
+        assert_matches_cpython_marshal(source, "protected_async_iterator_owners.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_sync_with_none_condition_owners() {
         let source = include_str!("fixtures/sync_with_none_condition_owners.py");
         assert_matches_cpython_marshal(source, "sync_with_none_condition_owners.py");
