@@ -4076,6 +4076,24 @@ impl Compiler<'_> {
                         .exceptions
                         .preserve_coroutine_try_else_condition
                         == Some(test.range());
+                let preserve_first_async_generator_iterator_condition_owner = branch_index == 0
+                    && self.context.target_specific_rules_enabled()
+                    && self.unit.flags & CO_ASYNC_GENERATOR != 0
+                    && self.control.generators.generator_region_start.is_some()
+                    && self.control.statements.current_statement_has_following
+                    && self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .is_empty()
+                    && self.control.withs.active_with_region_exclusions.is_empty()
+                    && self.control.loops.contexts.last().is_some_and(|context| {
+                        context.iterator_cleanup == IteratorCleanup::Async
+                            && self.assembler.instruction_count() == context.body_start
+                    })
+                    && !matches!(test, Expr::BoolOp(_) | Expr::If(_))
+                    && !expression_suspends_current_scope(test)
+                    && !expression_contains_generator(test);
                 let preserve_sync_with_none_owner = branch_index == 0
                     && !suite_terminates(body)
                     && matches!(statement.elif_else_clauses.as_slice(), [clause]
@@ -4655,8 +4673,9 @@ impl Compiler<'_> {
                 }
                 if preserve_first_sync_iterator_condition_owner
                     || preserve_first_coroutine_iterator_condition_owner
+                    || preserve_first_async_generator_iterator_condition_owner
                 {
-                    // CPython removes the synthetic NOP before a synchronous iterator target.
+                    // CPython removes the synthetic NOP before an iterator target.
                     // The first direct body condition reuses its protected CFG slot.
                     self.assembler.preserve_last_not_taken_exception_owner();
                 }
