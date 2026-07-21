@@ -285,8 +285,8 @@ pub(super) struct WithState {
 
 #[derive(Debug, Default)]
 pub(super) struct ExceptionState {
-    // A direct None-condition after an earlier branch in a plain try body can reuse the removed
-    // protected block slot. Keep the selected statements local to the innermost try body.
+    // A direct None-condition after an earlier branch or synchronous with in a plain try body
+    // can reuse the removed protected block slot. Keep selections local to the innermost try.
     shifted_try_none_owner_statements: Vec<TextRange>,
     // The complete final if whose fallthrough retains a converted POP_BLOCK before a terminal
     // try-else suite. The range keeps nested and preceding if statements from consuming it.
@@ -14389,15 +14389,17 @@ fn shifted_try_none_owner_statements(body: &[Stmt]) -> Vec<TextRange> {
             if self.found
                 || matches!(
                     statement,
-                    Stmt::FunctionDef(_) | Stmt::ClassDef(_) | Stmt::Try(_) | Stmt::With(_)
+                    Stmt::FunctionDef(_) | Stmt::ClassDef(_) | Stmt::Try(_)
                 )
+                || matches!(statement, Stmt::With(statement) if statement.is_async)
             {
                 return;
             }
             if matches!(
                 statement,
                 Stmt::If(_) | Stmt::Assert(_) | Stmt::For(_) | Stmt::While(_)
-            ) {
+            ) || matches!(statement, Stmt::With(statement) if !statement.is_async)
+            {
                 self.found = true;
                 return;
             }
