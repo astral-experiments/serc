@@ -2124,6 +2124,13 @@ impl Compiler<'_> {
                 && self.control.generators.coroutine_suspension_epoch > 0
                 && (!self.control.in_loop() || self.control.stack.depth == 0)
         });
+        let iterator_boolean_dispatch_policy = coroutine_boolean_loop_policy.filter(|_| {
+            self.control.in_iterator_loop()
+                && self
+                    .control
+                    .generators
+                    .optimized_generator_later_boolean_operand
+        });
         let plain_try_boolean_loop_policy = (!collect_tuple
             && self.context.target_specific_rules_enabled()
             && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR | CO_GENERATOR) == 0
@@ -2366,6 +2373,7 @@ impl Compiler<'_> {
                 })
                 .or(generator_guard_exception_policy)
                 .or(plain_try_boolean_dispatch_policy)
+                .or(iterator_boolean_dispatch_policy)
                 .or_else(|| {
                     coroutine_boolean_dispatch_policy.map(|_| {
                         if self.assembler.current_block_has_dynamic_exception_owner() {
@@ -5726,7 +5734,11 @@ impl Compiler<'_> {
             // leading groups instead share the surrounding expression's short-circuit marker.
             self.compile_bool_expression_at(inner, self.source_location(inner.range), false)?;
         } else {
-            self.compile_expression(last)?;
+            self.with_control_override(
+                |control| &mut control.generators.optimized_generator_later_boolean_operand,
+                !leading.is_empty(),
+                |compiler| compiler.compile_expression(last),
+            )?;
         }
         self.assembler.preserve_block_boundary_if_new(end);
         self.assembler.mark(end);
@@ -6137,7 +6149,11 @@ impl Compiler<'_> {
                         self.assembler.preserve_last_not_taken_exception_owner();
                     }
                 }
-                return self.compile_jump_if(last, jump_on, label);
+                return self.with_control_override(
+                    |control| &mut control.generators.optimized_generator_later_boolean_operand,
+                    !leading.is_empty(),
+                    |compiler| compiler.compile_jump_if(last, jump_on, label),
+                );
             }
             let end = self.assembler.label();
             for (operand_index, value) in leading.iter().enumerate() {
@@ -6154,7 +6170,11 @@ impl Compiler<'_> {
                     self.assembler.preserve_last_not_taken_exception_owner();
                 }
             }
-            self.compile_jump_if(last, jump_on, label)?;
+            self.with_control_override(
+                |control| &mut control.generators.optimized_generator_later_boolean_operand,
+                !leading.is_empty(),
+                |compiler| compiler.compile_jump_if(last, jump_on, label),
+            )?;
             self.assembler.preserve_block_boundary(end);
             self.assembler.mark(end);
             return Ok(());
