@@ -11115,6 +11115,12 @@ def final_elif(action, first, second):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_async_with_handler_cleanup_owners() {
+        let source = include_str!("fixtures/async_with_handler_cleanup_owners.py");
+        assert_matches_cpython_marshal(source, "async_with_handler_cleanup_owners.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_try_exits_after_if_joins() {
         let source = "def retained(flag):\n    try:\n        action()\n    except Exception:\n        failed()\n    else:\n        if flag:\n            good()\n        else:\n            other()\n    after()\n\ndef ordinary(flag):\n    try:\n        action()\n    except Exception:\n        failed()\n    else:\n        if flag:\n            good()\n    after()\n";
         assert_matches_cpython_marshal(source, "try_if_join.py");

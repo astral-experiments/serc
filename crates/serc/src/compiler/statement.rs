@@ -332,6 +332,8 @@ pub(super) struct ExceptionState {
     direct_try_assignment_branch_exit: Option<TextRange>,
     // Whether code follows the enclosing try statement in its current suite.
     direct_try_body_has_successor: bool,
+    // Whether that successor is a direct literal return that copies the try exit.
+    direct_try_body_has_literal_return_successor: bool,
     // Normal exits from a trailing if chain cross the innermost handler boundary.
     direct_try_if_exit: bool,
     // A direct assignment-only if/else whose assignment or loop-continue handler leaves the
@@ -852,7 +854,18 @@ impl Compiler<'_> {
                 None
             };
         let direct_try_body_has_successor = self.control.statements.current_statement_has_following;
-        self.with_control_override(
+        let direct_try_body_has_literal_return_successor = self
+            .control
+            .statements
+            .current_statement_followed_by_literal_return;
+        let previous_direct_try_body_literal_return_successor = std::mem::replace(
+            &mut self
+                .control
+                .exceptions
+                .direct_try_body_has_literal_return_successor,
+            direct_try_body_has_literal_return_successor,
+        );
+        let result = self.with_control_override(
             |control| &mut control.exceptions.same_line_try_body,
             same_line,
             |compiler| {
@@ -915,7 +928,12 @@ impl Compiler<'_> {
                     },
                 )
             },
-        )
+        );
+        self.control
+            .exceptions
+            .direct_try_body_has_literal_return_successor =
+            previous_direct_try_body_literal_return_successor;
+        result
     }
 
     fn with_loop_context<T>(
@@ -11973,7 +11991,33 @@ impl Compiler<'_> {
                     .innermost_finally_exception_exclusion_depth,
             )
             .flatten();
-            let outer_exception_exit_start = finally_depth.map(|_| {
+            let exception_exit_depth = finally_depth.or_else(|| {
+                (self.context.target_specific_rules_enabled()
+                    && self.unit.flags & CO_COROUTINE != 0
+                    && self.unit.flags & CO_ASYNC_GENERATOR == 0
+                    && !self.control.statements.current_statement_has_following
+                    && self.control.exceptions.direct_try_body_has_successor
+                    && !self
+                        .control
+                        .exceptions
+                        .direct_try_body_has_literal_return_successor
+                    && !self.control.exceptions.direct_try_body_has_else
+                    && self.control.exceptions.direct_try_body_statements.last()
+                        == direct_try_range.as_ref()
+                    && self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .len()
+                        == 1
+                    && self.control.exceptions.active_exception_handlers.is_empty()
+                    && self.control.withs.active_with_region_exclusions.is_empty()
+                    && self.control.loops.contexts.is_empty()
+                    && self.control.finally.active_normal_finally_bodies == 0
+                    && self.control.finally.active_finally_try_bodies == 0)
+                    .then_some(0)
+            });
+            let outer_exception_exit_start = exception_exit_depth.map(|_| {
                 let start = self.assembler.label();
                 self.assembler.mark(start);
                 start
@@ -11982,14 +12026,14 @@ impl Compiler<'_> {
             if let Some(start) = outer_exception_exit_start {
                 let exclusion_end = self.assembler.label();
                 self.assembler.mark(exclusion_end);
-                let finally_depth =
-                    finally_depth.expect("finally exception exclusion depth remains active");
+                let exception_exit_depth =
+                    exception_exit_depth.expect("exception exit exclusion depth remains active");
                 for exclusions in self
                     .control
                     .exceptions
                     .active_exception_region_exclusions
                     .iter_mut()
-                    .skip(finally_depth)
+                    .skip(exception_exit_depth)
                 {
                     exclusions.push((start, exclusion_end));
                 }
