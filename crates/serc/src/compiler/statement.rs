@@ -256,6 +256,8 @@ pub(super) struct WithState {
     // marker of a later terminal branch outside the manager's exception region.
     shifted_async_with_terminal_owner_statements: Vec<TextRange>,
     pub(super) active_with_region_exclusions: Vec<Vec<(Label, Label)>>,
+    // Incremental Boolean-value marker history scoped to the innermost synchronous-with body.
+    pub(super) current_sync_with_boolean_value_marker_scan: Option<BooleanValueMarkerScan>,
     active_terminal_withs: usize,
     // The final while statement in the innermost async-with body. Nested branch tails still
     // supply the location of their redundant exit jump to CPython's line table.
@@ -11982,6 +11984,7 @@ impl Compiler<'_> {
             } else {
                 Vec::new()
             };
+        let with_body_start_item = context.body_start_item;
         let (body_noop, region_exclusions) = self.with_region_exclusion_collector(
             |control| &mut control.withs.active_with_region_exclusions,
             |compiler| {
@@ -11995,7 +11998,17 @@ impl Compiler<'_> {
                                     &mut control.withs.shifted_sync_with_boolean_dispatch_calls
                                 },
                                 shifted_boolean_dispatch_calls,
-                                |compiler| compiler.compile_with_body(remaining, body),
+                                |compiler| {
+                                    compiler.with_control_override(
+                                        |control| {
+                                            &mut control
+                                                .withs
+                                                .current_sync_with_boolean_value_marker_scan
+                                        },
+                                        Some(BooleanValueMarkerScan::new(with_body_start_item)),
+                                        |compiler| compiler.compile_with_body(remaining, body),
+                                    )
+                                },
                             )
                         },
                     )
