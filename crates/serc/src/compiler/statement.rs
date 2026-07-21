@@ -301,6 +301,8 @@ pub(super) struct ExceptionState {
     // Whether the current try follows two call-valued assignments in its recent prefix.
     // Their retained exception-owner slot keeps a pre-suspension Boolean marker protected.
     pub(super) active_call_assignment_preceded_try_body: bool,
+    // Linear item offset and suspension epoch of the innermost ordinary try body.
+    active_try_body_start: Option<(usize, usize)>,
     active_try_marker_slots: Vec<Option<TryMarkerSlotContext>>,
     active_exception_handlers: Vec<ExceptionHandlerContext>,
     // Exception-group handlers retain their body marker owner after coroutine suspension.
@@ -4505,6 +4507,78 @@ impl Compiler<'_> {
                         if boolean.op == BoolOp::And
                             && matches!(boolean.values.as_slice(),
                                 [Expr::Named(_), Expr::Named(_)]));
+                // CPython appends the first simple condition marker after the protected body
+                // of a generator or coroutine while-loop try has been labeled.
+                let exclude_generator_while_try_condition = branch_index == 0
+                    && self.context.target_specific_rules_enabled()
+                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) != 0
+                    && self.control.generators.generator_region_start.is_some()
+                    && !self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .is_empty()
+                    && self.control.withs.active_with_region_exclusions.is_empty()
+                    && self.control.finally.active_normal_finally_bodies == 0
+                    && self.control.finally.active_finally_try_bodies == 0
+                    && self.control.finally.active_finally_end_blocks == 0
+                    && self.control.exceptions.active_exception_group_handlers == 0
+                    && !self.control.in_exception_handler()
+                    && self
+                        .control
+                        .exceptions
+                        .direct_try_body_statements
+                        .contains(&statement.range)
+                    && self.control.loops.contexts.last().is_some_and(|context| {
+                        context.iterator_cleanup == IteratorCleanup::None
+                            && context.exception_region_depth
+                                < self
+                                    .control
+                                    .exceptions
+                                    .active_exception_region_exclusions
+                                    .len()
+                    })
+                    && (matches!(test, Expr::Name(_) | Expr::Attribute(_) | Expr::Call(_))
+                        || matches!(test, Expr::UnaryOp(unary)
+                            if unary.op == UnaryOp::Not
+                                && matches!(unary.operand.as_ref(), Expr::Name(_) | Expr::Attribute(_) | Expr::Call(_)))
+                        || matches!(test, Expr::BoolOp(boolean)
+                        if boolean.values.first().is_some_and(|first| {
+                            matches!(first, Expr::Name(_) | Expr::Attribute(_) | Expr::Call(_))
+                                || matches!(first, Expr::UnaryOp(unary)
+                                    if unary.op == UnaryOp::Not
+                                        && matches!(unary.operand.as_ref(), Expr::Name(_) | Expr::Attribute(_) | Expr::Call(_)))
+                        })))
+                    && !terminal_condition_contains_global_callable(test, |name| {
+                        let name_id = self.required_name_id(name);
+                        matches!(
+                            &self.unit.scope,
+                            Scope::Function {
+                                indices,
+                                free_indices,
+                                globals,
+                                ..
+                            } if globals.contains(name_id)
+                                || (!indices.contains_key(&name_id)
+                                    && !free_indices.contains_key(&name_id))
+                        )
+                    })
+                    && self.control.exceptions.active_try_body_start.is_some_and(
+                        |(start, suspension_epoch)| {
+                            if self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR) != 0 {
+                                self.control.generators.coroutine_suspension_epoch
+                                    == suspension_epoch
+                            } else {
+                                !self
+                                    .assembler
+                                    .contains_opcode_since_item(YIELD_VALUE, start)
+                            }
+                        },
+                    )
+                    && !self.assembler.current_block_has_dynamic_exception_owner()
+                    && !self
+                        .assembler
+                        .fallthrough_has_concrete_dynamic_exception_owner();
                 let preserve_first_unnamed_handler_loop_owner = branch_index == 0
                     && self.control.loops.synthesized_loop_tail_predecessor
                         == Some(statement.range)
@@ -4780,7 +4854,8 @@ impl Compiler<'_> {
                                                         == Some(test.range())
                                                     || exclude_later_handler_leading_marker
                                                     || exclude_direct_try_while_return_marker
-                                                    || exclude_direct_post_try_coroutine_walrus_and;
+                                                    || exclude_direct_post_try_coroutine_walrus_and
+                                                    || exclude_generator_while_try_condition;
                                                 compiler.with_control_override(
                                                     |control| &mut control.conditions.exclude_condition_not_taken_from_exception,
                                                     exclude_condition,
@@ -7979,6 +8054,10 @@ impl Compiler<'_> {
             .exceptions
             .active_pass_only_try_bodies
             .push(pass_only_handlers);
+        let previous_try_body_start = self.control.exceptions.active_try_body_start.replace((
+            self.assembler.item_count(),
+            self.control.generators.coroutine_suspension_epoch,
+        ));
         self.control
             .exceptions
             .active_try_marker_slots
@@ -8313,6 +8392,7 @@ impl Compiler<'_> {
             .active_pass_only_try_bodies
             .pop()
             .expect("active try region has pass-only handler context");
+        self.control.exceptions.active_try_body_start = previous_try_body_start;
         let _tuple_handler_try_body = self
             .control
             .exceptions
