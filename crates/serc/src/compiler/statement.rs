@@ -451,7 +451,7 @@ pub(super) struct StatementState {
     // remains inside the current protected region instead of exiting through its normal edge.
     current_statement_followed_by_try: bool,
     // Whether this statement directly follows a try in the same suite.
-    current_statement_preceded_by_try: bool,
+    pub(super) current_statement_preceded_by_try: bool,
     // Whether this statement directly follows a conditional whose body terminates in a return.
     current_statement_preceded_by_terminating_if: bool,
     branch_join_successor: Option<TextRange>,
