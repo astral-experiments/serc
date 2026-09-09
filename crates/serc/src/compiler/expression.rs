@@ -1918,29 +1918,47 @@ impl Compiler<'_> {
         &mut self,
         tstring: &ruff_python_ast::ExprTString,
     ) -> Result<(), CompileError> {
-        let mut strings = vec![String::new()];
+        let mut strings = vec![None];
         let mut interpolations = Vec::new();
-        for element in tstring.value.elements() {
-            match element {
-                InterpolatedStringElement::Literal(literal) => {
-                    strings.last_mut().unwrap().push_str(&literal.value);
-                }
-                InterpolatedStringElement::Interpolation(interpolation) => {
-                    if let Some(debug) = &interpolation.debug_text {
-                        strings
-                            .last_mut()
-                            .unwrap()
-                            .push_str(&strip_expression_comments(debug.as_str()));
+        for part in &tstring.value {
+            for element in &part.elements {
+                match element {
+                    InterpolatedStringElement::Literal(literal) => {
+                        PendingInterpolatedLiteral::append(
+                            strings.last_mut().unwrap(),
+                            self.context.source,
+                            &literal.value,
+                            literal.range,
+                            literal.range,
+                            part.flags.prefix().is_raw(),
+                        );
                     }
-                    interpolations.push(interpolation);
-                    strings.push(String::new());
+                    InterpolatedStringElement::Interpolation(interpolation) => {
+                        if let Some(debug) = &interpolation.debug_text {
+                            PendingInterpolatedLiteral::append(
+                                strings.last_mut().unwrap(),
+                                self.context.source,
+                                &strip_expression_comments(debug.as_str()),
+                                debug_text_range(interpolation),
+                                debug_text_range(interpolation),
+                                true,
+                            );
+                        }
+                        interpolations.push(interpolation);
+                        strings.push(None);
+                    }
                 }
             }
         }
 
         let strings = strings
             .into_iter()
-            .map(Constant::String)
+            .map(|literal| {
+                literal.map_or_else(
+                    || Constant::String(String::new()),
+                    PendingInterpolatedLiteral::into_constant,
+                )
+            })
             .collect::<Vec<_>>();
         for string in &strings {
             self.add_constant(string.clone())?;
