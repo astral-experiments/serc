@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 use std::hash::{Hash, Hasher};
 
-use rustc_hash::FxHasher;
+use rustc_hash::{FxHashMap, FxHasher};
 use smallvec::SmallVec;
 
 use crate::code_object::{CodeObject, Constant, LocalsIdentity};
@@ -9,8 +9,8 @@ use crate::code_object::{CodeObject, Constant, LocalsIdentity};
 use super::v5::{
     FLAG_REF, TYPE_ASCII, TYPE_ASCII_INTERNED, TYPE_BINARY_COMPLEX, TYPE_BINARY_FLOAT, TYPE_CODE,
     TYPE_ELLIPSIS, TYPE_FALSE, TYPE_FROZENSET, TYPE_INT, TYPE_INTERNED, TYPE_LONG, TYPE_NONE,
-    TYPE_SHORT_ASCII, TYPE_SHORT_ASCII_INTERNED, TYPE_SLICE, TYPE_SMALL_TUPLE, TYPE_STRING,
-    TYPE_TRUE, TYPE_TUPLE, TYPE_UNICODE,
+    TYPE_REF, TYPE_SHORT_ASCII, TYPE_SHORT_ASCII_INTERNED, TYPE_SLICE, TYPE_SMALL_TUPLE,
+    TYPE_STRING, TYPE_TRUE, TYPE_TUPLE, TYPE_UNICODE,
 };
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -442,8 +442,53 @@ pub(super) type ConstantSortKey = SmallVec<[u8; 16]>;
 pub(super) type FrozenSetMembers<'a> = SmallVec<[(ConstantSortKey, &'a Constant); 4]>;
 
 pub(super) fn constant_sort_key(value: &Constant) -> ConstantSortKey {
-    fn append(output: &mut ConstantSortKey, value: &Constant, force_reference: bool) {
-        let flag = if force_reference { FLAG_REF } else { 0 };
+    constant_sort_key_with_properties(value, &|value| {
+        (
+            true,
+            matches!(value, Constant::String(value) if should_intern(value)),
+        )
+    })
+}
+
+/// Encodes an independent marshal stream, including references local to the sort key.
+fn constant_sort_key_with_properties<'a>(
+    value: &'a Constant,
+    properties: &impl Fn(&'a Constant) -> (bool, bool),
+) -> ConstantSortKey {
+    fn append<'a>(
+        output: &mut ConstantSortKey,
+        value: &'a Constant,
+        force_reference: bool,
+        properties: &impl Fn(&'a Constant) -> (bool, bool),
+        references: &mut FxHashMap<ObjectKey<'a>, u32>,
+    ) {
+        let (shared, interned) = properties(value);
+        let flag = if !matches!(
+            value,
+            Constant::None | Constant::Bool(_) | Constant::Ellipsis
+        ) && (force_reference || shared || interned)
+        {
+            // A scalar root cannot contain a reference, so keep the common scalar-set path free
+            // of reference-table allocations.
+            if !output.is_empty()
+                || matches!(
+                    value,
+                    Constant::Tuple(_) | Constant::FrozenSet(_) | Constant::Slice { .. }
+                )
+            {
+                let key = constant_key(value);
+                if let Some(index) = references.get(&key) {
+                    output.push(TYPE_REF);
+                    output.extend_from_slice(&index.to_le_bytes());
+                    return;
+                }
+                let index = u32::try_from(references.len()).expect("sort-key reference count fits");
+                references.insert(key, index);
+            }
+            FLAG_REF
+        } else {
+            0
+        };
         match value {
             Constant::None => output.push(TYPE_NONE),
             Constant::Bool(false) => output.push(TYPE_FALSE),
@@ -507,7 +552,6 @@ pub(super) fn constant_sort_key(value: &Constant) -> ConstantSortKey {
             }
             Constant::String(value) => {
                 let bytes = value.as_bytes();
-                let interned = should_intern(value);
                 if value.is_ascii() && bytes.len() < 256 {
                     output.push(
                         (if interned {
@@ -579,7 +623,7 @@ pub(super) fn constant_sort_key(value: &Constant) -> ConstantSortKey {
                     );
                 }
                 for value in values {
-                    append(output, value, true);
+                    append(output, value, false, properties, references);
                 }
             }
             Constant::FrozenSet(values) => {
@@ -589,22 +633,28 @@ pub(super) fn constant_sort_key(value: &Constant) -> ConstantSortKey {
                         .expect("sort-key frozenset length fits in u32")
                         .to_le_bytes(),
                 );
-                for (sort_key, _) in frozen_set_members_in_wire_order(values) {
-                    output.extend_from_slice(&sort_key);
+                for (_, value) in frozen_set_members_with_properties(values, properties) {
+                    append(output, value, true, properties, references);
                 }
             }
             Constant::Slice { lower, upper, step } => {
                 output.push(TYPE_SLICE | flag);
-                append(output, lower, false);
-                append(output, upper, false);
-                append(output, step, false);
+                append(output, lower, false, properties, references);
+                append(output, upper, false, properties, references);
+                append(output, step, false, properties, references);
             }
             Constant::Code(_) => output.push(TYPE_CODE | flag),
         }
     }
 
     let mut output = ConstantSortKey::new();
-    append(&mut output, value, true);
+    append(
+        &mut output,
+        value,
+        true,
+        properties,
+        &mut FxHashMap::default(),
+    );
     output
 }
 
@@ -612,6 +662,18 @@ pub(super) fn frozen_set_members_in_wire_order(values: &[Constant]) -> FrozenSet
     let mut members = FrozenSetMembers::new();
     for value in values {
         members.push((constant_sort_key(value), value));
+    }
+    members.sort_by(|(left, _), (right, _)| left.cmp(right));
+    members
+}
+
+pub(super) fn frozen_set_members_with_properties<'a>(
+    values: &'a [Constant],
+    properties: &impl Fn(&'a Constant) -> (bool, bool),
+) -> FrozenSetMembers<'a> {
+    let mut members = FrozenSetMembers::new();
+    for value in values {
+        members.push((constant_sort_key_with_properties(value, properties), value));
     }
     members.sort_by(|(left, _), (right, _)| left.cmp(right));
     members

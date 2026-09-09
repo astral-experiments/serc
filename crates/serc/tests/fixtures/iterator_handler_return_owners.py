@@ -118,3 +118,50 @@ def generator(values):
     except Exception:
         return None
     return True
+
+
+def handler_iterator_try(values, callback):
+    try:
+        return callback()
+    except ValueError:
+        for value in values:
+            try:
+                return callback(value)
+            except ValueError:
+                continue
+    return None
+
+
+def named_handler_nested_iterators(values, callback):
+    try:
+        return callback()
+    except ValueError as error:
+        for row in values:
+            for value in row:
+                try:
+                    return callback(value, error)
+                except ValueError:
+                    continue
+    return None
+
+
+def handler_iterator_literal_return(values, callback):
+    try:
+        return callback()
+    except ValueError:
+        for value in values:
+            try:
+                callback(value)
+                return None
+            except ValueError:
+                continue
+    return False
+
+
+def surrounding_iterator_handler_control(values, callback):
+    for value in values:
+        try:
+            callback(value)
+        except ValueError:
+            return callback()
+    return None

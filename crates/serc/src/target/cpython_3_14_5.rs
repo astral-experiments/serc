@@ -15,6 +15,7 @@
 // Include/patchlevel.h: sha256:f30189e4210673f7b25e7190d3af7c1462ffed972d206ce27563e2ad8559a3dd
 // Python/codegen.c: sha256:034c5f2c25c04814f6f48b0c61070f6ea7e7b2cb588bd45428bd9ad48b5ca8d3
 // Python/flowgraph.c: sha256:0322237308732ce84bad7611e2873bb7c9f0efe666569f99b2fb481f4ecdcb68
+// Python/Python-ast.c: sha256:b003242dda517788c2fc1d119da830d809a90be70d4d4d2389cf829e6656a8e7
 
 use super::Opcode;
 
@@ -27,128 +28,156 @@ pub(crate) const TARGET_MAGIC_NUMBER: [u8; 4] = [0x2b, 0x0e, 0x0d, 0x0a];
 pub(crate) mod opcodes {
     use super::Opcode;
 
-    pub(crate) const CACHE: Opcode = Opcode::new(0, 0);
-    pub(crate) const BINARY_SLICE: Opcode = Opcode::new(1, 0);
-    pub(crate) const BUILD_TEMPLATE: Opcode = Opcode::new(2, 0);
-    pub(crate) const BINARY_OP_INPLACE_ADD_UNICODE: Opcode = Opcode::new(3, 0);
-    pub(crate) const CALL_FUNCTION_EX: Opcode = Opcode::new(4, 0);
-    pub(crate) const CHECK_EG_MATCH: Opcode = Opcode::new(5, 0);
-    pub(crate) const CHECK_EXC_MATCH: Opcode = Opcode::new(6, 0);
-    pub(crate) const CLEANUP_THROW: Opcode = Opcode::new(7, 0);
-    pub(crate) const DELETE_SUBSCR: Opcode = Opcode::new(8, 0);
-    pub(crate) const END_FOR: Opcode = Opcode::new(9, 0);
-    pub(crate) const END_SEND: Opcode = Opcode::new(10, 0);
-    pub(crate) const EXIT_INIT_CHECK: Opcode = Opcode::new(11, 0);
-    pub(crate) const FORMAT_SIMPLE: Opcode = Opcode::new(12, 0);
-    pub(crate) const FORMAT_WITH_SPEC: Opcode = Opcode::new(13, 0);
-    pub(crate) const GET_AITER: Opcode = Opcode::new(14, 0);
-    pub(crate) const GET_ANEXT: Opcode = Opcode::new(15, 0);
-    pub(crate) const GET_ITER: Opcode = Opcode::new(16, 0);
-    pub(crate) const RESERVED: Opcode = Opcode::new(17, 0);
-    pub(crate) const GET_LEN: Opcode = Opcode::new(18, 0);
-    pub(crate) const GET_YIELD_FROM_ITER: Opcode = Opcode::new(19, 0);
-    pub(crate) const INTERPRETER_EXIT: Opcode = Opcode::new(20, 0);
-    pub(crate) const LOAD_BUILD_CLASS: Opcode = Opcode::new(21, 0);
-    pub(crate) const LOAD_LOCALS: Opcode = Opcode::new(22, 0);
-    pub(crate) const MAKE_FUNCTION: Opcode = Opcode::new(23, 0);
-    pub(crate) const MATCH_KEYS: Opcode = Opcode::new(24, 0);
-    pub(crate) const MATCH_MAPPING: Opcode = Opcode::new(25, 0);
-    pub(crate) const MATCH_SEQUENCE: Opcode = Opcode::new(26, 0);
-    pub(crate) const NOP: Opcode = Opcode::new(27, 0);
-    pub(crate) const NOT_TAKEN: Opcode = Opcode::new(28, 0);
-    pub(crate) const POP_EXCEPT: Opcode = Opcode::new(29, 0);
-    pub(crate) const POP_ITER: Opcode = Opcode::new(30, 0);
-    pub(crate) const POP_TOP: Opcode = Opcode::new(31, 0);
-    pub(crate) const PUSH_EXC_INFO: Opcode = Opcode::new(32, 0);
-    pub(crate) const PUSH_NULL: Opcode = Opcode::new(33, 0);
-    pub(crate) const RETURN_GENERATOR: Opcode = Opcode::new(34, 0);
-    pub(crate) const RETURN_VALUE: Opcode = Opcode::new(35, 0);
-    pub(crate) const SETUP_ANNOTATIONS: Opcode = Opcode::new(36, 0);
-    pub(crate) const STORE_SLICE: Opcode = Opcode::new(37, 0);
-    pub(crate) const STORE_SUBSCR: Opcode = Opcode::new(38, 1);
-    pub(crate) const TO_BOOL: Opcode = Opcode::new(39, 3);
-    pub(crate) const UNARY_INVERT: Opcode = Opcode::new(40, 0);
-    pub(crate) const UNARY_NEGATIVE: Opcode = Opcode::new(41, 0);
-    pub(crate) const UNARY_NOT: Opcode = Opcode::new(42, 0);
-    pub(crate) const WITH_EXCEPT_START: Opcode = Opcode::new(43, 0);
-    pub(crate) const BINARY_OP: Opcode = Opcode::new(44, 5);
-    pub(crate) const BUILD_INTERPOLATION: Opcode = Opcode::new(45, 0);
-    pub(crate) const BUILD_LIST: Opcode = Opcode::new(46, 0);
-    pub(crate) const BUILD_MAP: Opcode = Opcode::new(47, 0);
-    pub(crate) const BUILD_SET: Opcode = Opcode::new(48, 0);
-    pub(crate) const BUILD_SLICE: Opcode = Opcode::new(49, 0);
-    pub(crate) const BUILD_STRING: Opcode = Opcode::new(50, 0);
-    pub(crate) const BUILD_TUPLE: Opcode = Opcode::new(51, 0);
-    pub(crate) const CALL: Opcode = Opcode::new(52, 3);
-    pub(crate) const CALL_INTRINSIC_1: Opcode = Opcode::new(53, 0);
-    pub(crate) const CALL_INTRINSIC_2: Opcode = Opcode::new(54, 0);
-    pub(crate) const CALL_KW: Opcode = Opcode::new(55, 3);
-    pub(crate) const COMPARE_OP: Opcode = Opcode::new(56, 1);
-    pub(crate) const CONTAINS_OP: Opcode = Opcode::new(57, 1);
-    pub(crate) const CONVERT_VALUE: Opcode = Opcode::new(58, 0);
-    pub(crate) const COPY: Opcode = Opcode::new(59, 0);
-    pub(crate) const COPY_FREE_VARS: Opcode = Opcode::new(60, 0);
-    pub(crate) const DELETE_ATTR: Opcode = Opcode::new(61, 0);
-    pub(crate) const DELETE_DEREF: Opcode = Opcode::new(62, 0);
-    pub(crate) const DELETE_FAST: Opcode = Opcode::new(63, 0);
-    pub(crate) const DELETE_GLOBAL: Opcode = Opcode::new(64, 0);
-    pub(crate) const DELETE_NAME: Opcode = Opcode::new(65, 0);
-    pub(crate) const DICT_MERGE: Opcode = Opcode::new(66, 0);
-    pub(crate) const DICT_UPDATE: Opcode = Opcode::new(67, 0);
-    pub(crate) const END_ASYNC_FOR: Opcode = Opcode::new(68, 0);
-    pub(crate) const EXTENDED_ARG: Opcode = Opcode::new(69, 0);
-    pub(crate) const FOR_ITER: Opcode = Opcode::new(70, 1);
-    pub(crate) const GET_AWAITABLE: Opcode = Opcode::new(71, 0);
-    pub(crate) const IMPORT_FROM: Opcode = Opcode::new(72, 0);
-    pub(crate) const IMPORT_NAME: Opcode = Opcode::new(73, 0);
-    pub(crate) const IS_OP: Opcode = Opcode::new(74, 0);
-    pub(crate) const JUMP_BACKWARD: Opcode = Opcode::new(75, 1);
-    pub(crate) const JUMP_BACKWARD_NO_INTERRUPT: Opcode = Opcode::new(76, 0);
-    pub(crate) const JUMP_FORWARD: Opcode = Opcode::new(77, 0);
-    pub(crate) const LIST_APPEND: Opcode = Opcode::new(78, 0);
-    pub(crate) const LIST_EXTEND: Opcode = Opcode::new(79, 0);
-    pub(crate) const LOAD_ATTR: Opcode = Opcode::new(80, 9);
-    pub(crate) const LOAD_COMMON_CONSTANT: Opcode = Opcode::new(81, 0);
-    pub(crate) const LOAD_CONST: Opcode = Opcode::new(82, 0);
-    pub(crate) const LOAD_DEREF: Opcode = Opcode::new(83, 0);
-    pub(crate) const LOAD_FAST: Opcode = Opcode::new(84, 0);
-    pub(crate) const LOAD_FAST_AND_CLEAR: Opcode = Opcode::new(85, 0);
-    pub(crate) const LOAD_FAST_BORROW: Opcode = Opcode::new(86, 0);
-    pub(crate) const LOAD_FAST_BORROW_LOAD_FAST_BORROW: Opcode = Opcode::new(87, 0);
-    pub(crate) const LOAD_FAST_CHECK: Opcode = Opcode::new(88, 0);
-    pub(crate) const LOAD_FAST_LOAD_FAST: Opcode = Opcode::new(89, 0);
-    pub(crate) const LOAD_FROM_DICT_OR_DEREF: Opcode = Opcode::new(90, 0);
-    pub(crate) const LOAD_FROM_DICT_OR_GLOBALS: Opcode = Opcode::new(91, 0);
-    pub(crate) const LOAD_GLOBAL: Opcode = Opcode::new(92, 4);
-    pub(crate) const LOAD_NAME: Opcode = Opcode::new(93, 0);
-    pub(crate) const LOAD_SMALL_INT: Opcode = Opcode::new(94, 0);
-    pub(crate) const LOAD_SPECIAL: Opcode = Opcode::new(95, 0);
-    pub(crate) const LOAD_SUPER_ATTR: Opcode = Opcode::new(96, 1);
-    pub(crate) const MAKE_CELL: Opcode = Opcode::new(97, 0);
-    pub(crate) const MAP_ADD: Opcode = Opcode::new(98, 0);
-    pub(crate) const MATCH_CLASS: Opcode = Opcode::new(99, 0);
-    pub(crate) const POP_JUMP_IF_FALSE: Opcode = Opcode::new(100, 1);
-    pub(crate) const POP_JUMP_IF_NONE: Opcode = Opcode::new(101, 1);
-    pub(crate) const POP_JUMP_IF_NOT_NONE: Opcode = Opcode::new(102, 1);
-    pub(crate) const POP_JUMP_IF_TRUE: Opcode = Opcode::new(103, 1);
-    pub(crate) const RAISE_VARARGS: Opcode = Opcode::new(104, 0);
-    pub(crate) const RERAISE: Opcode = Opcode::new(105, 0);
-    pub(crate) const SEND: Opcode = Opcode::new(106, 1);
-    pub(crate) const SET_ADD: Opcode = Opcode::new(107, 0);
-    pub(crate) const SET_FUNCTION_ATTRIBUTE: Opcode = Opcode::new(108, 0);
-    pub(crate) const SET_UPDATE: Opcode = Opcode::new(109, 0);
-    pub(crate) const STORE_ATTR: Opcode = Opcode::new(110, 4);
-    pub(crate) const STORE_DEREF: Opcode = Opcode::new(111, 0);
-    pub(crate) const STORE_FAST: Opcode = Opcode::new(112, 0);
-    pub(crate) const STORE_FAST_LOAD_FAST: Opcode = Opcode::new(113, 0);
-    pub(crate) const STORE_FAST_STORE_FAST: Opcode = Opcode::new(114, 0);
-    pub(crate) const STORE_GLOBAL: Opcode = Opcode::new(115, 0);
-    pub(crate) const STORE_NAME: Opcode = Opcode::new(116, 0);
-    pub(crate) const SWAP: Opcode = Opcode::new(117, 0);
-    pub(crate) const UNPACK_EX: Opcode = Opcode::new(118, 0);
-    pub(crate) const UNPACK_SEQUENCE: Opcode = Opcode::new(119, 1);
-    pub(crate) const YIELD_VALUE: Opcode = Opcode::new(120, 0);
-    pub(crate) const RESUME: Opcode = Opcode::new(128, 0);
+    pub(crate) const CACHE: Opcode = Opcode::new(0);
+    pub(crate) const BINARY_SLICE: Opcode = Opcode::new(1);
+    pub(crate) const BUILD_TEMPLATE: Opcode = Opcode::new(2);
+    pub(crate) const BINARY_OP_INPLACE_ADD_UNICODE: Opcode = Opcode::new(3);
+    pub(crate) const CALL_FUNCTION_EX: Opcode = Opcode::new(4);
+    pub(crate) const CHECK_EG_MATCH: Opcode = Opcode::new(5);
+    pub(crate) const CHECK_EXC_MATCH: Opcode = Opcode::new(6);
+    pub(crate) const CLEANUP_THROW: Opcode = Opcode::new(7);
+    pub(crate) const DELETE_SUBSCR: Opcode = Opcode::new(8);
+    pub(crate) const END_FOR: Opcode = Opcode::new(9);
+    pub(crate) const END_SEND: Opcode = Opcode::new(10);
+    pub(crate) const EXIT_INIT_CHECK: Opcode = Opcode::new(11);
+    pub(crate) const FORMAT_SIMPLE: Opcode = Opcode::new(12);
+    pub(crate) const FORMAT_WITH_SPEC: Opcode = Opcode::new(13);
+    pub(crate) const GET_AITER: Opcode = Opcode::new(14);
+    pub(crate) const GET_ANEXT: Opcode = Opcode::new(15);
+    pub(crate) const GET_ITER: Opcode = Opcode::new(16);
+    pub(crate) const RESERVED: Opcode = Opcode::new(17);
+    pub(crate) const GET_LEN: Opcode = Opcode::new(18);
+    pub(crate) const GET_YIELD_FROM_ITER: Opcode = Opcode::new(19);
+    pub(crate) const INTERPRETER_EXIT: Opcode = Opcode::new(20);
+    pub(crate) const LOAD_BUILD_CLASS: Opcode = Opcode::new(21);
+    pub(crate) const LOAD_LOCALS: Opcode = Opcode::new(22);
+    pub(crate) const MAKE_FUNCTION: Opcode = Opcode::new(23);
+    pub(crate) const MATCH_KEYS: Opcode = Opcode::new(24);
+    pub(crate) const MATCH_MAPPING: Opcode = Opcode::new(25);
+    pub(crate) const MATCH_SEQUENCE: Opcode = Opcode::new(26);
+    pub(crate) const NOP: Opcode = Opcode::new(27);
+    pub(crate) const NOT_TAKEN: Opcode = Opcode::new(28);
+    pub(crate) const POP_EXCEPT: Opcode = Opcode::new(29);
+    pub(crate) const POP_ITER: Opcode = Opcode::new(30);
+    pub(crate) const POP_TOP: Opcode = Opcode::new(31);
+    pub(crate) const PUSH_EXC_INFO: Opcode = Opcode::new(32);
+    pub(crate) const PUSH_NULL: Opcode = Opcode::new(33);
+    pub(crate) const RETURN_GENERATOR: Opcode = Opcode::new(34);
+    pub(crate) const RETURN_VALUE: Opcode = Opcode::new(35);
+    pub(crate) const SETUP_ANNOTATIONS: Opcode = Opcode::new(36);
+    pub(crate) const STORE_SLICE: Opcode = Opcode::new(37);
+    pub(crate) const STORE_SUBSCR: Opcode = Opcode::new(38);
+    pub(crate) const TO_BOOL: Opcode = Opcode::new(39);
+    pub(crate) const UNARY_INVERT: Opcode = Opcode::new(40);
+    pub(crate) const UNARY_NEGATIVE: Opcode = Opcode::new(41);
+    pub(crate) const UNARY_NOT: Opcode = Opcode::new(42);
+    pub(crate) const WITH_EXCEPT_START: Opcode = Opcode::new(43);
+    pub(crate) const BINARY_OP: Opcode = Opcode::new(44);
+    pub(crate) const BUILD_INTERPOLATION: Opcode = Opcode::new(45);
+    pub(crate) const BUILD_LIST: Opcode = Opcode::new(46);
+    pub(crate) const BUILD_MAP: Opcode = Opcode::new(47);
+    pub(crate) const BUILD_SET: Opcode = Opcode::new(48);
+    pub(crate) const BUILD_SLICE: Opcode = Opcode::new(49);
+    pub(crate) const BUILD_STRING: Opcode = Opcode::new(50);
+    pub(crate) const BUILD_TUPLE: Opcode = Opcode::new(51);
+    pub(crate) const CALL: Opcode = Opcode::new(52);
+    pub(crate) const CALL_INTRINSIC_1: Opcode = Opcode::new(53);
+    pub(crate) const CALL_INTRINSIC_2: Opcode = Opcode::new(54);
+    pub(crate) const CALL_KW: Opcode = Opcode::new(55);
+    pub(crate) const COMPARE_OP: Opcode = Opcode::new(56);
+    pub(crate) const CONTAINS_OP: Opcode = Opcode::new(57);
+    pub(crate) const CONVERT_VALUE: Opcode = Opcode::new(58);
+    pub(crate) const COPY: Opcode = Opcode::new(59);
+    pub(crate) const COPY_FREE_VARS: Opcode = Opcode::new(60);
+    pub(crate) const DELETE_ATTR: Opcode = Opcode::new(61);
+    pub(crate) const DELETE_DEREF: Opcode = Opcode::new(62);
+    pub(crate) const DELETE_FAST: Opcode = Opcode::new(63);
+    pub(crate) const DELETE_GLOBAL: Opcode = Opcode::new(64);
+    pub(crate) const DELETE_NAME: Opcode = Opcode::new(65);
+    pub(crate) const DICT_MERGE: Opcode = Opcode::new(66);
+    pub(crate) const DICT_UPDATE: Opcode = Opcode::new(67);
+    pub(crate) const END_ASYNC_FOR: Opcode = Opcode::new(68);
+    pub(crate) const EXTENDED_ARG: Opcode = Opcode::new(69);
+    pub(crate) const FOR_ITER: Opcode = Opcode::new(70);
+    pub(crate) const GET_AWAITABLE: Opcode = Opcode::new(71);
+    pub(crate) const IMPORT_FROM: Opcode = Opcode::new(72);
+    pub(crate) const IMPORT_NAME: Opcode = Opcode::new(73);
+    pub(crate) const IS_OP: Opcode = Opcode::new(74);
+    pub(crate) const JUMP_BACKWARD: Opcode = Opcode::new(75);
+    pub(crate) const JUMP_BACKWARD_NO_INTERRUPT: Opcode = Opcode::new(76);
+    pub(crate) const JUMP_FORWARD: Opcode = Opcode::new(77);
+    pub(crate) const LIST_APPEND: Opcode = Opcode::new(78);
+    pub(crate) const LIST_EXTEND: Opcode = Opcode::new(79);
+    pub(crate) const LOAD_ATTR: Opcode = Opcode::new(80);
+    pub(crate) const LOAD_COMMON_CONSTANT: Opcode = Opcode::new(81);
+    pub(crate) const LOAD_CONST: Opcode = Opcode::new(82);
+    pub(crate) const LOAD_DEREF: Opcode = Opcode::new(83);
+    pub(crate) const LOAD_FAST: Opcode = Opcode::new(84);
+    pub(crate) const LOAD_FAST_AND_CLEAR: Opcode = Opcode::new(85);
+    pub(crate) const LOAD_FAST_BORROW: Opcode = Opcode::new(86);
+    pub(crate) const LOAD_FAST_BORROW_LOAD_FAST_BORROW: Opcode = Opcode::new(87);
+    pub(crate) const LOAD_FAST_CHECK: Opcode = Opcode::new(88);
+    pub(crate) const LOAD_FAST_LOAD_FAST: Opcode = Opcode::new(89);
+    pub(crate) const LOAD_FROM_DICT_OR_DEREF: Opcode = Opcode::new(90);
+    pub(crate) const LOAD_FROM_DICT_OR_GLOBALS: Opcode = Opcode::new(91);
+    pub(crate) const LOAD_GLOBAL: Opcode = Opcode::new(92);
+    pub(crate) const LOAD_NAME: Opcode = Opcode::new(93);
+    pub(crate) const LOAD_SMALL_INT: Opcode = Opcode::new(94);
+    pub(crate) const LOAD_SPECIAL: Opcode = Opcode::new(95);
+    pub(crate) const LOAD_SUPER_ATTR: Opcode = Opcode::new(96);
+    pub(crate) const MAKE_CELL: Opcode = Opcode::new(97);
+    pub(crate) const MAP_ADD: Opcode = Opcode::new(98);
+    pub(crate) const MATCH_CLASS: Opcode = Opcode::new(99);
+    pub(crate) const POP_JUMP_IF_FALSE: Opcode = Opcode::new(100);
+    pub(crate) const POP_JUMP_IF_NONE: Opcode = Opcode::new(101);
+    pub(crate) const POP_JUMP_IF_NOT_NONE: Opcode = Opcode::new(102);
+    pub(crate) const POP_JUMP_IF_TRUE: Opcode = Opcode::new(103);
+    pub(crate) const RAISE_VARARGS: Opcode = Opcode::new(104);
+    pub(crate) const RERAISE: Opcode = Opcode::new(105);
+    pub(crate) const SEND: Opcode = Opcode::new(106);
+    pub(crate) const SET_ADD: Opcode = Opcode::new(107);
+    pub(crate) const SET_FUNCTION_ATTRIBUTE: Opcode = Opcode::new(108);
+    pub(crate) const SET_UPDATE: Opcode = Opcode::new(109);
+    pub(crate) const STORE_ATTR: Opcode = Opcode::new(110);
+    pub(crate) const STORE_DEREF: Opcode = Opcode::new(111);
+    pub(crate) const STORE_FAST: Opcode = Opcode::new(112);
+    pub(crate) const STORE_FAST_LOAD_FAST: Opcode = Opcode::new(113);
+    pub(crate) const STORE_FAST_STORE_FAST: Opcode = Opcode::new(114);
+    pub(crate) const STORE_GLOBAL: Opcode = Opcode::new(115);
+    pub(crate) const STORE_NAME: Opcode = Opcode::new(116);
+    pub(crate) const SWAP: Opcode = Opcode::new(117);
+    pub(crate) const UNPACK_EX: Opcode = Opcode::new(118);
+    pub(crate) const UNPACK_SEQUENCE: Opcode = Opcode::new(119);
+    pub(crate) const YIELD_VALUE: Opcode = Opcode::new(120);
+    pub(crate) const RESUME: Opcode = Opcode::new(128);
+}
+
+impl Opcode {
+    /// Returns the inline-cache width generated from the pinned opcode metadata.
+    pub(crate) const fn caches(self) -> u8 {
+        match self {
+            opcodes::STORE_SUBSCR => 1,
+            opcodes::TO_BOOL => 3,
+            opcodes::BINARY_OP => 5,
+            opcodes::CALL => 3,
+            opcodes::CALL_KW => 3,
+            opcodes::COMPARE_OP => 1,
+            opcodes::CONTAINS_OP => 1,
+            opcodes::FOR_ITER => 1,
+            opcodes::JUMP_BACKWARD => 1,
+            opcodes::LOAD_ATTR => 9,
+            opcodes::LOAD_GLOBAL => 4,
+            opcodes::LOAD_SUPER_ATTR => 1,
+            opcodes::POP_JUMP_IF_FALSE => 1,
+            opcodes::POP_JUMP_IF_NONE => 1,
+            opcodes::POP_JUMP_IF_NOT_NONE => 1,
+            opcodes::POP_JUMP_IF_TRUE => 1,
+            opcodes::SEND => 1,
+            opcodes::STORE_ATTR => 4,
+            opcodes::UNPACK_SEQUENCE => 1,
+            _ => 0,
+        }
+    }
 }
 
 pub(crate) static PREINTERNED_STRINGS: &[&str] = &[
@@ -933,6 +962,99 @@ pub(crate) static PREINTERNED_STRINGS: &[&str] = &[
     "}}",
 ];
 
+// Builtin compile() initializes these AST identifiers before compiling source.
+#[cfg(test)]
+pub(crate) static COMPILER_INTERNED_STRINGS: &[&str] = &[
+    "__dict__",
+    "__doc__",
+    "__match_args__",
+    "__module__",
+    "_attributes",
+    "_fields",
+    "annotation",
+    "arg",
+    "args",
+    "argtypes",
+    "asname",
+    "ast",
+    "attr",
+    "bases",
+    "body",
+    "bound",
+    "cases",
+    "cause",
+    "cls",
+    "col_offset",
+    "comparators",
+    "context_expr",
+    "conversion",
+    "ctx",
+    "decorator_list",
+    "default_value",
+    "defaults",
+    "elt",
+    "elts",
+    "end_col_offset",
+    "end_lineno",
+    "exc",
+    "finalbody",
+    "format_spec",
+    "func",
+    "generators",
+    "guard",
+    "handlers",
+    "id",
+    "ifs",
+    "is_async",
+    "items",
+    "iter",
+    "key",
+    "keys",
+    "keywords",
+    "kind",
+    "kw_defaults",
+    "kwarg",
+    "kwd_attrs",
+    "kwd_patterns",
+    "kwonlyargs",
+    "left",
+    "level",
+    "lineno",
+    "lower",
+    "module",
+    "msg",
+    "name",
+    "names",
+    "op",
+    "operand",
+    "ops",
+    "optional_vars",
+    "orelse",
+    "pattern",
+    "patterns",
+    "posonlyargs",
+    "rest",
+    "returns",
+    "right",
+    "simple",
+    "slice",
+    "step",
+    "str",
+    "subject",
+    "tag",
+    "target",
+    "targets",
+    "test",
+    "type",
+    "type_comment",
+    "type_ignores",
+    "type_params",
+    "upper",
+    "value",
+    "values",
+    "vararg",
+];
+
 pub(crate) fn is_preinterned_string(value: &str) -> bool {
     let prefix = match value.as_bytes() {
         [] => return true,
@@ -960,7 +1082,9 @@ pub(crate) fn is_preinterned_string(value: &str) -> bool {
         0x4649 => (19, 20),
         0x4661 => (20, 21),
         0x4a53 => (21, 22),
+        0x4d49 => return value == "MISSING",
         0x4e41 => (22, 23),
+        0x4e6f => return value == "None",
         0x5045 => (23, 24),
         0x5079 => (24, 25),
         0x5465 => (25, 26),
@@ -968,11 +1092,21 @@ pub(crate) fn is_preinterned_string(value: &str) -> bool {
         0x5761 => (27, 28),
         0x5f57 => (28, 29),
         0x5f5f => (29, 195),
-        0x5f61 => (195, 202),
+        0x5f61 => {
+            if value == "_attributes" {
+                return true;
+            }
+            (195, 202)
+        }
         0x5f62 => (202, 204),
         0x5f63 => (204, 205),
         0x5f64 => (205, 206),
-        0x5f66 => (206, 214),
+        0x5f66 => {
+            if value == "_fields" {
+                return true;
+            }
+            (206, 214)
+        }
         0x5f67 => (214, 215),
         0x5f68 => (215, 216),
         0x5f69 => (216, 221),
@@ -991,82 +1125,186 @@ pub(crate) fn is_preinterned_string(value: &str) -> bool {
         0x6166 => (244, 246),
         0x6167 => (246, 247),
         0x616c => (247, 252),
-        0x616e => (252, 253),
+        0x616e => {
+            if value == "annotation" {
+                return true;
+            }
+            (252, 253)
+        }
         0x6170 => (253, 254),
-        0x6172 => (254, 259),
+        0x6172 => {
+            if value == "argtypes" {
+                return true;
+            }
+            (254, 259)
+        }
         0x6173 => {
-            if value == "ascii" {
+            if value == "ascii" || value == "asname" {
                 return true;
             }
             (259, 262)
         }
-        0x6174 => (262, 264),
+        0x6174 => {
+            if value == "attr" {
+                return true;
+            }
+            (262, 264)
+        }
         0x6175 => (264, 266),
-        0x6261 => (266, 268),
+        0x6261 => {
+            if value == "bases" {
+                return true;
+            }
+            (266, 268)
+        }
         0x6265 => (268, 269),
         0x6269 => (269, 273),
         0x626c => (273, 274),
-        0x626f => (274, 275),
+        0x626f => {
+            if value == "body" {
+                return true;
+            }
+            (274, 275)
+        }
         0x6275 => (275, 282),
         0x6279 => (282, 287),
         0x635f => (287, 291),
-        0x6361 => (291, 302),
+        0x6361 => {
+            if value == "cache"
+                || value == "cached"
+                || value == "candidate"
+                || value == "cases"
+                || value == "cause"
+            {
+                return true;
+            }
+            (291, 302)
+        }
         0x6362 => (302, 303),
         0x6365 => (303, 304),
         0x6368 => (304, 305),
-        0x636c => (305, 310),
-        0x636f => (310, 343),
+        0x636c => {
+            if value == "cls" {
+                return true;
+            }
+            (305, 310)
+        }
+        0x636f => {
+            if value == "comparators" || value == "context_expr" {
+                return true;
+            }
+            (310, 343)
+        }
+        0x6374 => return value == "ctx",
         0x6377 => (343, 344),
         0x645f => (344, 345),
         0x6461 => {
-            if value == "darwin" {
+            if value == "darwin" || value == "date" {
                 return true;
             }
             (345, 348)
         }
-        0x6465 => (348, 359),
+        0x6465 => {
+            if value == "decorator_list" || value == "default_value" || value == "defaults" {
+                return true;
+            }
+            (348, 359)
+        }
         0x6469 => (359, 369),
         0x646b => (369, 370),
         0x646f => (370, 373),
         0x6473 => (373, 375),
         0x6561 => (375, 376),
         0x6566 => (376, 377),
-        0x656c => (377, 378),
+        0x656c => {
+            if value == "elt" || value == "elts" {
+                return true;
+            }
+            (377, 378)
+        }
         0x656e => (378, 387),
-        0x6572 => (387, 388),
-        0x6576 => (388, 390),
-        0x6578 => (390, 399),
+        0x6572 => {
+            if value == "error" {
+                return true;
+            }
+            (387, 388)
+        }
+        0x6576 => {
+            if value == "eval" {
+                return true;
+            }
+            (388, 390)
+        }
+        0x6578 => {
+            if value == "exc" {
+                return true;
+            }
+            (390, 399)
+        }
         0x6661 => (399, 404),
         0x6664 => (404, 407),
         0x6667 => (407, 408),
-        0x6669 => (408, 420),
+        0x6669 => {
+            if value == "finalbody" {
+                return true;
+            }
+            (408, 420)
+        }
         0x666c => (420, 422),
         0x666f => (422, 426),
         0x6672 => (426, 431),
         0x6673 => (431, 432),
         0x6675 => (432, 434),
-        0x6765 => (434, 443),
+        0x6765 => {
+            if value == "generators" {
+                return true;
+            }
+            (434, 443)
+        }
         0x6769 => (443, 444),
         0x676c => (444, 445),
         0x6772 => (445, 447),
-        0x6861 => (447, 451),
+        0x6775 => return value == "guard",
+        0x6861 => {
+            if value == "handlers" {
+                return true;
+            }
+            (447, 451)
+        }
         0x6865 => (451, 453),
         0x6869 => (453, 454),
         0x686f => (454, 456),
         0x6964 => (456, 459),
+        0x6966 => return value == "ifs",
         0x6967 => (459, 460),
         0x696d => (460, 462),
         0x696e => (462, 484),
         0x696f => (484, 485),
-        0x6973 => (485, 494),
+        0x6973 => {
+            if value == "is_async" {
+                return true;
+            }
+            (485, 494)
+        }
         0x6974 => (494, 499),
         0x6a6f => (499, 500),
         0x6a73 => (500, 501),
         0x6a75 => (501, 502),
-        0x6b65 => (502, 506),
+        0x6b65 => {
+            if value == "keywords" {
+                return true;
+            }
+            (502, 506)
+        }
         0x6b69 => (506, 507),
         0x6b77 => {
-            if value == "kwargs" {
+            if value == "kw_defaults"
+                || value == "kwarg"
+                || value == "kwargs"
+                || value == "kwd_attrs"
+                || value == "kwd_patterns"
+                || value == "kwonlyargs"
+            {
                 return true;
             }
             (507, 511)
@@ -1074,21 +1312,56 @@ pub(crate) fn is_preinterned_string(value: &str) -> bool {
         0x6c31 => return value == "l1",
         0x6c32 => return value == "l2",
         0x6c61 => (511, 520),
-        0x6c65 => (520, 524),
-        0x6c69 => (524, 531),
-        0x6c6f => (531, 536),
-        0x6d61 => (536, 546),
+        0x6c65 => {
+            if value == "left" {
+                return true;
+            }
+            (520, 524)
+        }
+        0x6c69 => {
+            if value == "link" {
+                return true;
+            }
+            (524, 531)
+        }
+        0x6c6f => {
+            if value == "lower" {
+                return true;
+            }
+            (531, 536)
+        }
+        0x6d61 => {
+            if value == "map" {
+                return true;
+            }
+            (536, 546)
+        }
         0x6d65 => (546, 552),
-        0x6d69 => (552, 555),
+        0x6d69 => {
+            if value == "min" || value == "missing" {
+                return true;
+            }
+            (552, 555)
+        }
         0x6d6f => (555, 561),
         0x6d72 => (561, 562),
         0x6d73 => (562, 563),
         0x6d75 => (563, 564),
         0x6d79 => (564, 565),
         0x6e5f => (565, 569),
-        0x6e61 => (569, 574),
+        0x6e61 => {
+            if value == "names" || value == "nan" {
+                return true;
+            }
+            (569, 574)
+        }
         0x6e64 => (574, 575),
-        0x6e65 => (575, 581),
+        0x6e65 => {
+            if value == "new" {
+                return true;
+            }
+            (575, 581)
+        }
         0x6e6c => (581, 582),
         0x6e6f => (582, 584),
         0x6e73 => (584, 586),
@@ -1096,55 +1369,162 @@ pub(crate) fn is_preinterned_string(value: &str) -> bool {
         0x6e75 => (587, 589),
         0x6f62 => (589, 591),
         0x6f66 => (591, 594),
+        0x6f6c => return value == "old_value",
         0x6f6e => (594, 598),
-        0x6f70 => (598, 605),
-        0x6f72 => (605, 607),
-        0x6f75 => (607, 610),
+        0x6f70 => {
+            if value == "op" || value == "operand" || value == "ops" || value == "optional_vars" {
+                return true;
+            }
+            (598, 605)
+        }
+        0x6f72 => {
+            if value == "orelse" {
+                return true;
+            }
+            (605, 607)
+        }
+        0x6f74 => return value == "other",
+        0x6f75 => {
+            if value == "output" {
+                return true;
+            }
+            (607, 610)
+        }
         0x6f76 => (610, 611),
         0x6f77 => (611, 612),
-        0x7061 => (612, 618),
+        0x7061 => {
+            if value == "package" || value == "patterns" || value == "pause" {
+                return true;
+            }
+            (612, 618)
+        }
         0x7065 => (618, 622),
         0x7069 => (622, 624),
-        0x706f => (624, 629),
+        0x706f => {
+            if value == "posonlyargs" {
+                return true;
+            }
+            (624, 629)
+        }
         0x7072 => (629, 636),
         0x7073 => (636, 638),
-        0x7175 => (638, 640),
+        0x7079 => return value == "python",
+        0x7175 => {
+            if value == "quiet" {
+                return true;
+            }
+            (638, 640)
+        }
         0x7261 => (640, 641),
-        0x7265 => (641, 663),
+        0x7265 => {
+            if value == "remove" || value == "rest" || value == "returns" {
+                return true;
+            }
+            (641, 663)
+        }
+        0x7269 => return value == "right",
+        0x726f => return value == "root",
+        0x7275 => return value == "run",
         0x7361 => (663, 664),
         0x7363 => (664, 667),
         0x7365 => (667, 685),
         0x7368 => (685, 687),
-        0x7369 => (687, 690),
+        0x7369 => {
+            if value == "simple" {
+                return true;
+            }
+            (687, 690)
+        }
         0x736b => (690, 691),
-        0x736c => (691, 692),
+        0x736c => {
+            if value == "slice" {
+                return true;
+            }
+            (691, 692)
+        }
         0x736f => (692, 696),
         0x7370 => (696, 697),
         0x7372 => (697, 699),
-        0x7374 => (699, 714),
-        0x7375 => (714, 716),
-        0x7379 => (716, 717),
-        0x7461 => (717, 722),
+        0x7374 => {
+            if value == "str" {
+                return true;
+            }
+            (699, 714)
+        }
+        0x7375 => {
+            if value == "subject" || value == "sum" {
+                return true;
+            }
+            (714, 716)
+        }
+        0x7379 => {
+            if value == "system" {
+                return true;
+            }
+            (716, 717)
+        }
+        0x7461 => {
+            if value == "targets" {
+                return true;
+            }
+            (717, 722)
+        }
         0x7462 => (722, 726),
-        0x7465 => (726, 730),
+        0x7465 => {
+            if value == "test" {
+                return true;
+            }
+            (726, 730)
+        }
         0x7468 => (730, 732),
-        0x7469 => (732, 737),
+        0x7469 => {
+            if value == "timestamp" {
+                return true;
+            }
+            (732, 737)
+        }
         0x746f => (737, 738),
         0x7472 => (738, 744),
         0x7477 => (744, 745),
         0x7478 => (745, 746),
-        0x7479 => (746, 748),
+        0x7479 => {
+            if value == "type_comment" || value == "type_ignores" {
+                return true;
+            }
+            (746, 748)
+        }
         0x747a => (748, 751),
+        0x7537 => return value == "u7",
         0x7569 => (751, 752),
-        0x756e => (752, 754),
-        0x7570 => return value == "update",
+        0x756e => {
+            if value == "unknown" {
+                return true;
+            }
+            (752, 754)
+        }
+        0x7570 => return value == "update" || value == "upper",
         0x7572 => (754, 755),
-        0x7573 => (755, 756),
+        0x7573 => {
+            if value == "user" {
+                return true;
+            }
+            (755, 756)
+        }
         0x7574 => (756, 757),
-        0x7661 => (757, 759),
+        0x7661 => {
+            if value == "var" || value == "vararg" {
+                return true;
+            }
+            (757, 759)
+        }
         0x7665 => (759, 760),
         0x766f => (760, 761),
-        0x7761 => (761, 765),
+        0x7761 => {
+            if value == "warn" {
+                return true;
+            }
+            (761, 765)
+        }
         0x7762 => (765, 766),
         0x7765 => (766, 768),
         0x7768 => (768, 770),

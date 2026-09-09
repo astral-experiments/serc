@@ -1,0 +1,31 @@
+use crate::common;
+
+#[test]
+fn normalizes_tail_conditionals_in_terminal_and_while_loops() {
+    for definition in ["def", "async def"] {
+        for condition in ["a and b", "a and b and c"] {
+            for body in [
+                "        if flag:\n            pass\n",
+                "        if not flag:\n            use()\n",
+                "        if flag:\n            a = flag\n",
+                "        if flag:\n            return\n",
+            ] {
+                let source =
+                    format!("{definition} f(a, b, c, flag):\n    while {condition}:\n{body}");
+                common::assert_matches_cpython_marshal(&source, "terminal_and_while_tail.py");
+            }
+        }
+    }
+}
+
+#[test]
+fn preserves_folded_selectors_in_terminal_and_while_loops() {
+    for (definition, prefix) in [("def", ""), ("async def", ""), ("def", "    yield None\n")] {
+        for selector in ["True", "1", "1.0", "1j", "'yes'", "b'yes'"] {
+            let source = format!(
+                "{definition} f(a, b, flag):\n{prefix}    while a and b:\n        if {selector}:\n            use(flag)\n"
+            );
+            common::assert_matches_cpython_marshal(&source, "terminal_and_while_folded_tail.py");
+        }
+    }
+}

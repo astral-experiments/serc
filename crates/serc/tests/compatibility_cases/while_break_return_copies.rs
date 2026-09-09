@@ -1,0 +1,158 @@
+use crate::common;
+
+#[test]
+fn matches_cpython_small_return_copies_after_while_breaks() {
+    for prefix in ["", "async "] {
+        for condition in ["flag", "flag and value"] {
+            for body in [
+                "if value:\n    break",
+                "work()\nif value:\n    break",
+                "work(); break",
+            ] {
+                for returned in [
+                    "return",
+                    "return value",
+                    "return value + 1",
+                    "return value.method()",
+                    "return ready(value)",
+                ] {
+                    let source = format!(
+                        "{prefix}def f(flag, value):\n    while {condition}:\n        {}\n    {returned}\n",
+                        body.replace('\n', "\n        "),
+                    );
+                    common::assert_matches_cpython_marshal(&source, "while_break_return_copies.py");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn matches_cpython_shared_implicit_while_break_returns() {
+    for (prefix, suspension) in [
+        ("", ""),
+        ("async ", ""),
+        ("", "    yield value\n"),
+        ("async ", "    yield value\n"),
+    ] {
+        for condition in [
+            "flag and value",
+            "flag and value and other",
+            "(flag or value) and other",
+            "flag and (value or other)",
+            "not (flag or value)",
+            "flag and 0 < value < 4",
+            "(saved := flag) and value",
+            "flag or value",
+        ] {
+            for body in ["if other:\n    break", "if other:\n    break\nwork()"] {
+                let source = format!(
+                    "{prefix}def f(flag, value, other):\n{suspension}    while {condition}:\n        {}\n",
+                    body.replace('\n', "\n        "),
+                );
+                common::assert_matches_cpython_marshal(
+                    &source,
+                    "shared_implicit_while_break_returns.py",
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn matches_cpython_breaks_before_finalizers_and_outer_backedges() {
+    for (prefix, suspension) in [
+        ("", ""),
+        ("async ", ""),
+        ("", "    yield value\n"),
+        ("async ", "    yield value\n"),
+    ] {
+        let awaited = if prefix.is_empty() { "" } else { "await " };
+        for cleanup in [format!("{awaited}cleanup()"), "pass".to_owned()] {
+            let source = format!(
+                "{prefix}def f(value, flag):\n{suspension}    try:\n        while True:\n            {awaited}work()\n            if flag:\n                break\n    finally:\n        {cleanup}\n",
+            );
+            common::assert_matches_cpython_marshal(&source, "break_before_finalizer.py");
+        }
+
+        for loop_else in ["", "        else:\n            return\n"] {
+            let source = format!(
+                "{prefix}def f(value, values):\n{suspension}    for item in values:\n        work(item)\n        while True:\n            break\n{loop_else}",
+            );
+            common::assert_matches_cpython_marshal(&source, "break_before_outer_backedge.py");
+        }
+    }
+}
+
+#[test]
+fn matches_cpython_terminal_while_breaks_after_work() {
+    for (prefix, suspension) in [
+        ("", ""),
+        ("async ", "        await pause()\n"),
+        ("", "        yield\n"),
+        ("async ", "        yield\n"),
+    ] {
+        for loop_condition in ["True", "running"] {
+            for condition in ["value != limit", "value is None", "flag or running"] {
+                for body in ["report(value)", "result = value"] {
+                    let source = format!(
+                        "{prefix}def f(value, limit, flag, running):\n    while {loop_condition}:\n{suspension}        tick()\n        if flag:\n            break\n        if {condition}:\n            {body}\n            break\n"
+                    );
+                    common::assert_matches_cpython_marshal(
+                        &source,
+                        "terminal_while_break_after_work.py",
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn matches_cpython_terminal_while_breaks_after_compound_work() {
+    for condition in ["value", "value != limit"] {
+        for body in [
+            "if early:\n    report()",
+            "if early:\n    continue\nreport()",
+            "with manager:\n    report()",
+            "try:\n    report()\nfinally:\n    cleanup()",
+        ] {
+            let source = format!(
+                "def f(value, limit, early, manager):\n    while True:\n        tick()\n        if {condition}:\n            {}\n            break\n",
+                body.replace('\n', "\n            "),
+            );
+            common::assert_matches_cpython_marshal(
+                &source,
+                "terminal_while_break_after_compound_work.py",
+            );
+        }
+    }
+}
+
+#[test]
+fn matches_cpython_terminal_while_chained_breaks_after_work() {
+    for (prefix, suspension) in [
+        ("", ""),
+        ("async ", "        await pause()\n"),
+        ("", "        yield\n"),
+        ("async ", "        yield\n"),
+    ] {
+        for loop_condition in ["True", "running"] {
+            for condition in [
+                "left <= value < limit",
+                "not (left <= value < limit)",
+                "left is value is None",
+            ] {
+                for body in ["report(value)", "result = value"] {
+                    let source = format!(
+                        "{prefix}def f(left, value, limit, stop, running):\n    while {loop_condition}:\n{suspension}        tick()\n        if stop:\n            break\n        if {condition}:\n            {body}\n            break\n"
+                    );
+                    common::assert_matches_cpython_marshal(
+                        &source,
+                        "terminal_while_chained_break_after_work.py",
+                    );
+                }
+            }
+        }
+    }
+}

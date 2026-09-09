@@ -272,7 +272,7 @@ def direct_name(check, item):
 }
 
 #[test]
-fn generator_call_name_condition_owner_excludes_protected_and_folded_tests() {
+fn generator_call_condition_owners_preserve_original_while_blocks() {
     fn read_exception_varint(table: &[u8], index: &mut usize) -> u32 {
         let mut byte = table[*index];
         *index += 1;
@@ -386,19 +386,19 @@ async def async_generator_control(item, consume):
         ("debug_callable_control", &[false][..]),
         (
             "optimized_generator_controls",
-            &[true, false, false, true, false, false, true, false][..],
+            &[false, false, false, false, false, false, false, false][..],
         ),
-        ("unary_not_control", &[false][..]),
-        ("nested_non_tail_control", &[false][..]),
-        ("protected_try_control", &[false, true][..]),
-        ("handler_control", &[true, false][..]),
-        ("exception_group_handler_control", &[true, true, true][..]),
-        ("protected_with_control", &[false, true][..]),
-        ("finally_control", &[false, false][..]),
-        ("nested_finally_control", &[false, true][..]),
-        ("inline_controls", &[true, false, false, false][..]),
-        ("coroutine_control", &[false][..]),
-        ("async_generator_control", &[false][..]),
+        ("unary_not_control", &[true][..]),
+        ("nested_non_tail_control", &[true][..]),
+        ("protected_try_control", &[true, true][..]),
+        ("handler_control", &[true, true][..]),
+        ("exception_group_handler_control", &[true, true, false][..]),
+        ("protected_with_control", &[true, true][..]),
+        ("finally_control", &[true, true][..]),
+        ("nested_finally_control", &[true, true][..]),
+        ("inline_controls", &[false, false, false, false][..]),
+        ("coroutine_control", &[true][..]),
+        ("async_generator_control", &[true][..]),
     ] {
         let function = module
             .constants
@@ -1853,8 +1853,8 @@ async def iterator_keyword_gap(items, fallback, run):
         ("nested_region", &[true, true][..]),
         ("after_suspension", &[false][..]),
         ("one_slot_after_condition", &[true, false][..]),
-        ("iterator_one_slot_after_condition", &[true, true][..]),
-        ("iterator_keyword_gap", &[false, false, true][..]),
+        ("iterator_one_slot_after_condition", &[true, false][..]),
+        ("iterator_keyword_gap", &[true, false, false][..]),
     ] {
         let function = module
             .constants
@@ -2014,9 +2014,9 @@ async def nested_manager_inner_single(outer, inner, state, value):
             "hazardous_method_ifexp_arg",
             &[true, true, false, false][..],
         ),
-        ("later_nested_if_terminal", &[true, true, false, false][..]),
+        ("later_nested_if_terminal", &[true, false, false, false][..]),
         ("cap_16", &[true, false, false][..]),
-        ("cap_17", &[true, true, false][..]),
+        ("cap_17", &[true, false, false][..]),
         (
             "sibling_manager_reset",
             &[true, false, true, false, false][..],
@@ -2208,28 +2208,28 @@ def unfiltered_with(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, 
         .unwrap();
 
     for (name, expected) in [
-        ("multiline_set", &[false, false][..]),
-        ("multiline_dict", &[false, false][..]),
-        ("multiline_try", &[false, false, true][..]),
-        ("multiline_with", &[false, false, true][..]),
-        ("multiline_is_not", &[false, false][..]),
-        ("multiline_trailing_truth", &[false, false][..]),
-        ("multiline_leading_named", &[false, false][..]),
-        ("multiline_leading_subscript", &[false, false][..]),
-        ("multiline_three_arm", &[false, false, false][..]),
+        ("multiline_set", &[true, false][..]),
+        ("multiline_dict", &[true, false][..]),
+        ("multiline_try", &[true, false, true][..]),
+        ("multiline_with", &[true, false, true][..]),
+        ("multiline_is_not", &[true, false][..]),
+        ("multiline_trailing_truth", &[true, false][..]),
+        ("multiline_leading_named", &[true, false][..]),
+        ("multiline_leading_subscript", &[true, false][..]),
+        ("multiline_three_arm", &[true, true, false][..]),
         ("multiline_second_filter", &[false, true, false][..]),
         (
             "multiline_nested_comprehension_filter",
-            &[false, false, false][..],
+            &[true, false, false][..],
         ),
         (
             "multiline_singleton_after_outer_filter",
             &[false, true, false][..],
         ),
-        ("unfiltered_nested_inner", &[false, true][..]),
-        ("unfiltered_try", &[false, true, true][..]),
-        ("unfiltered_finally", &[false, true][..]),
-        ("unfiltered_with", &[false, true, true][..]),
+        ("unfiltered_nested_inner", &[true, true][..]),
+        ("unfiltered_try", &[true, true, true][..]),
+        ("unfiltered_finally", &[true, true][..]),
+        ("unfiltered_with", &[true, true, true][..]),
     ] {
         let function = module
             .constants
@@ -2422,14 +2422,14 @@ async def async_generator_control(values, get_state, use):
         .unwrap();
 
     for (name, expected) in [
-        ("protected_loop", &[false, true][..]),
-        ("with_loop", &[false, true][..]),
-        ("async_with_loop", &[false, false][..]),
-        ("handler_loop", &[true, false][..]),
-        ("finally_loop", &[true, false][..]),
-        ("async_for_control", &[true, false][..]),
-        ("generator_control", &[false][..]),
-        ("async_generator_control", &[false][..]),
+        ("protected_loop", &[true, true][..]),
+        ("with_loop", &[true, true][..]),
+        ("async_with_loop", &[true, false][..]),
+        ("handler_loop", &[true, true][..]),
+        ("finally_loop", &[true, true][..]),
+        ("async_for_control", &[true, true][..]),
+        ("generator_control", &[true][..]),
+        ("async_generator_control", &[true][..]),
     ] {
         let function = module
             .constants
@@ -2534,7 +2534,7 @@ def surrogate_filter(items):
 }
 
 #[test]
-fn copied_finally_exits_keep_multi_edge_condition_nops() {
+fn copied_finally_exits_keep_statement_and_assertion_nops() {
     let source = r"def boolean_condition(manager, left, right):
     with manager:
         try:
@@ -2583,7 +2583,9 @@ def negated_boolean_condition(manager, left, right):
             .filter(|instruction| instruction[0] == NOP.code())
             .count();
 
-        assert_eq!(nops, 3, "unexpected NOP count for {name}");
+        // CPython keeps the try-statement and assertion markers; the copied conditional
+        // fallthrough reaches an unlocated exit and does not retain another NOP.
+        assert_eq!(nops, 2, "unexpected NOP count for {name}");
     }
 }
 

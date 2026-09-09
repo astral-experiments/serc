@@ -24,6 +24,27 @@ def git(checkout: Path, *arguments: str) -> str:
 
 
 class ReadInputsTest(unittest.TestCase):
+    def test_parses_only_compiler_initialized_identifiers(self) -> None:
+        source = '''
+        static int init_identifiers(struct ast_state *state)
+        {
+            state->right = PyUnicode_InternFromString("right");
+            state->body = PyUnicode_InternFromString("body");
+            state->left = PyUnicode_InternFromString("left");
+            state->left = PyUnicode_InternFromString("left");
+            return 0;
+}
+        PyUnicode_InternFromString("unrelated");
+        '''
+        self.assertEqual(
+            generator.parse_compiler_interned_strings(source),
+            ["body", "left", "right"],
+        )
+        with self.assertRaisesRegex(ValueError, "incomplete"):
+            generator.parse_compiler_interned_strings(
+                source.replace('PyUnicode_InternFromString("body")', "NULL")
+            )
+
     def test_parses_preinterned_strings(self) -> None:
         source = """
         STRUCT_FOR_STR(anon_module, "<module>")

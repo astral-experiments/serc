@@ -30,6 +30,7 @@ TARGET_INPUTS = (
     "Include/patchlevel.h",
     "Python/codegen.c",
     "Python/flowgraph.c",
+    "Python/Python-ast.c",
 )
 MARSHAL_INPUTS = (
     "Include/marshal.h",
@@ -39,12 +40,45 @@ MARSHAL_INPUTS = (
 # compatibility oracle calls compile(). They are not part of the pinned static metadata.
 STARTUP_INTERNED_STRINGS = (
     "500",
+    "MISSING",
+    "None",
     "ascii",
+    "cache",
+    "cached",
+    "candidate",
     "darwin",
+    "date",
+    "error",
+    "eval",
     "kwargs",
     "l1",
     "l2",
+    "link",
+    "map",
+    "min",
+    "missing",
+    "nan",
+    "new",
+    "old_value",
+    "other",
+    "output",
+    "package",
+    "pause",
+    "python",
+    "quiet",
+    "remove",
+    "root",
+    "run",
+    "sum",
+    "system",
+    "test",
+    "timestamp",
+    "u7",
+    "unknown",
     "update",
+    "user",
+    "var",
+    "warn",
     "win32",
 )
 CRATE_ROOT = Path(__file__).resolve().parents[1]
@@ -145,6 +179,25 @@ def parse_preinterned_strings(source: str) -> list[str]:
     return sorted(strings)
 
 
+def parse_compiler_interned_strings(source: str) -> list[str]:
+    """Read names interned when builtin compile() initializes the AST types."""
+    identifiers = require_match(
+        r"static int init_identifiers\(struct ast_state \*state\)\s*\{([\s\S]*?)\n\}",
+        source,
+        "AST identifier initialization",
+    ).group(1)
+    literal_tokens = re.findall(
+        r'PyUnicode_InternFromString\(("(?:\\.|[^"\\])*")\)', identifiers
+    )
+    try:
+        strings = {ast.literal_eval(token) for token in literal_tokens}
+    except (SyntaxError, ValueError) as error:
+        raise ValueError("invalid AST identifier literal") from error
+    if not {"body", "left", "right"}.issubset(strings):
+        raise ValueError("compiler-interned string table is incomplete")
+    return sorted(strings)
+
+
 def rust_string_literal(value: str) -> str:
     escaped = []
     for character in value:
@@ -169,7 +222,9 @@ def rust_string_literal(value: str) -> str:
 
 
 def render_preinterned_lookup(
-    preinterned_strings: list[str], startup_strings: tuple[str, ...]
+    preinterned_strings: list[str],
+    startup_strings: tuple[str, ...],
+    compiler_strings: tuple[str, ...] = (),
 ) -> list[str]:
     def prefix(value: str) -> int:
         encoded = value.encode()
@@ -188,22 +243,23 @@ def render_preinterned_lookup(
         else:
             ranges[key] = (index, index + 1)
 
-    startup: dict[int, list[str]] = {}
-    for value in startup_strings:
+    supplemental: dict[int, list[str]] = {}
+    supplemental_strings = sorted(set(startup_strings) | set(compiler_strings))
+    for value in supplemental_strings:
         if value and value not in preinterned_strings:
-            startup.setdefault(prefix(value), []).append(value)
+            supplemental.setdefault(prefix(value), []).append(value)
 
     lines = [
         "pub(crate) fn is_preinterned_string(value: &str) -> bool {",
         "    let prefix = match value.as_bytes() {",
-        f"        [] => return {str('' in preinterned_strings or '' in startup_strings).lower()},",
+        f"        [] => return {str('' in preinterned_strings or '' in supplemental_strings).lower()},",
         "        [first] => u16::from(*first) << 8,",
         "        [first, second, ..] => u16::from_be_bytes([*first, *second]),",
         "    };",
         "    let (start, end) = match prefix {",
     ]
-    for key in sorted(ranges.keys() | startup.keys()):
-        candidates = startup.get(key, [])
+    for key in sorted(ranges.keys() | supplemental.keys()):
+        candidates = supplemental.get(key, [])
         condition = " || ".join(
             f"value == {rust_string_literal(value)}" for value in candidates
         )
@@ -447,6 +503,9 @@ def render(sources: dict[str, str]) -> str:
     flowgraph = sources["Python/flowgraph.c"]
 
     preinterned_strings = parse_preinterned_strings(global_strings)
+    compiler_interned_strings = parse_compiler_interned_strings(
+        sources["Python/Python-ast.c"]
+    )
     opcodes = parse_opcodes(opcode_ids)
     opcode_names = {name for name, _ in opcodes}
     caches = parse_caches(metadata)
@@ -696,13 +755,38 @@ def render(sources: dict[str, str]) -> str:
     )
     for name, code in opcodes:
         lines.append(
-            f"    pub(crate) const {name}: Opcode = Opcode::new({code}, {caches.get(name, 0)});"
+            f"    pub(crate) const {name}: Opcode = Opcode::new({code});"
         )
-    lines.extend(["}", "", "pub(crate) static PREINTERNED_STRINGS: &[&str] = &["])
+    lines.extend([
+        "}", "", "impl Opcode {",
+        "    /// Returns the inline-cache width generated from the pinned opcode metadata.",
+        "    pub(crate) const fn caches(self) -> u8 {",
+        "        match self {",
+    ])
+    for name, _ in opcodes:
+        if width := caches.get(name, 0):
+            lines.append(f"            opcodes::{name} => {width},")
+    lines.extend([
+        "            _ => 0,", "        }", "    }", "}", "",
+        "pub(crate) static PREINTERNED_STRINGS: &[&str] = &[",
+    ])
     lines.extend(f"    {rust_string_literal(value)}," for value in preinterned_strings)
     lines.extend(["];", ""])
+    lines.extend([
+        "// Builtin compile() initializes these AST identifiers before compiling source.",
+        "#[cfg(test)]",
+        "pub(crate) static COMPILER_INTERNED_STRINGS: &[&str] = &[",
+    ])
     lines.extend(
-        render_preinterned_lookup(preinterned_strings, STARTUP_INTERNED_STRINGS)
+        f"    {rust_string_literal(value)}," for value in compiler_interned_strings
+    )
+    lines.extend(["];", ""])
+    lines.extend(
+        render_preinterned_lookup(
+            preinterned_strings,
+            STARTUP_INTERNED_STRINGS,
+            tuple(compiler_interned_strings),
+        )
     )
     lines.extend(["", "#[allow(dead_code)]", "impl Opcode {"])
     for method, flag in (

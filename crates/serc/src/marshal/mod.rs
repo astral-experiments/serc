@@ -7,4 +7,6 @@ mod writer;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use writer::{encode_code, encode_code_into};
+#[cfg(test)]
+pub(crate) use writer::encode_code;
+pub(crate) use writer::{encode_code_into_with_intern_state, encode_code_with_intern_state};

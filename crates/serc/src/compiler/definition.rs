@@ -10,7 +10,7 @@ use rustc_hash::FxHashSet;
 use super::{
     BUILD_LIST, BUILD_MAP, BUILD_TUPLE, CALL, CALL_FUNCTION_EX, CALL_KW, CONTAINS_OP, COPY,
     DICT_MERGE, LIST_APPEND, LIST_EXTEND, LOAD_BUILD_CLASS, LOAD_CONST, LOAD_DEREF, LOAD_FAST,
-    LOAD_SMALL_INT, MAKE_FUNCTION, NOT_TAKEN, POP_JUMP_IF_FALSE, PUSH_NULL, RAISE_VARARGS,
+    LOAD_SMALL_INT, MAKE_FUNCTION, MAP_ADD, NOT_TAKEN, POP_JUMP_IF_FALSE, PUSH_NULL, RAISE_VARARGS,
     RETURN_VALUE, STORE_SUBSCR, SWAP, UNPACK_SEQUENCE,
 };
 use crate::CompileError;
@@ -27,7 +27,9 @@ use crate::target::operands::{
 use super::constant::{fold_constant, folded_constant_owner_slots};
 use super::scope::{
     LoweringFunctionPlan, NameId, ReferenceCollector, collect_conditional_simple_annotations,
-    collect_simple_annotations, expression_required_names, nested_expression_required_names,
+    collect_simple_annotations, expression_required_names,
+    expression_requirements_outside_comprehensions, inlined_comprehension_cell_names_in_expression,
+    inlined_comprehension_local_names_in_expression, nested_expression_required_names,
     type_parameter_required_names,
 };
 use super::source::unparse_annotation;
@@ -74,6 +76,8 @@ impl Compiler<'_> {
 
         self.assembler
             .set_location(self.source_location(statement.range));
+        self.context
+            .record_constant_string_origin(name.id.as_str(), true);
         self.load_string_constant(name.id.as_str())?;
         let none = self.add_constant(Constant::None)?;
         self.emit(LOAD_CONST, none, 1)?;
@@ -150,6 +154,10 @@ impl Compiler<'_> {
             .private_name
             .clone_from(&self.unit.private_name);
         wrapper
+            .unit
+            .mangled_names
+            .clone_from(&self.unit.mangled_names);
+        wrapper
             .symbols
             .imported_scope_names
             .clone_from(&self.symbols.imported_scope_names);
@@ -164,6 +172,7 @@ impl Compiler<'_> {
         wrapper
             .assembler
             .set_location(wrapper.source_location(statement.range));
+        wrapper.context.record_constant_string_origin(name, true);
         wrapper.load_string_constant(name)?;
         wrapper.compile_type_parameters(type_params)?;
         wrapper.compile_type_parameter_thunk(name, value, statement.range, true)?;
@@ -307,6 +316,10 @@ impl Compiler<'_> {
             .unit
             .private_name
             .clone_from(&self.unit.private_name);
+        wrapper
+            .unit
+            .mangled_names
+            .clone_from(&self.unit.mangled_names);
         wrapper
             .symbols
             .imported_scope_names
@@ -480,6 +493,10 @@ impl Compiler<'_> {
         )?;
         child.unit.private_name.clone_from(&self.unit.private_name);
         child
+            .unit
+            .mangled_names
+            .clone_from(&self.unit.mangled_names);
+        child
             .symbols
             .imported_scope_names
             .clone_from(&self.symbols.imported_scope_names);
@@ -552,13 +569,9 @@ impl Compiler<'_> {
                 None
             };
             if let Some(defaults) = folded_defaults {
-                let mut hidden_owner_slots = positional_defaults.len().min(3);
+                let mut hidden_owner_slots = positional_defaults.len();
                 for default in &positional_defaults {
-                    if hidden_owner_slots == 3 {
-                        break;
-                    }
-                    hidden_owner_slots =
-                        (hidden_owner_slots + folded_constant_owner_slots(default)).min(3);
+                    hidden_owner_slots += folded_constant_owner_slots(default);
                 }
                 for default in &positional_defaults {
                     self.record_folded_value(default)?;
@@ -589,7 +602,10 @@ impl Compiler<'_> {
         if !keyword_defaults.is_empty() {
             for (name, default) in &keyword_defaults {
                 self.assembler.set_location(definition_location);
-                let name = self.add_constant(Constant::String(self.mangled_name(name)))?;
+                let mangled = self.mangled_name(name);
+                self.context
+                    .record_identifier_constant_origin(name, &mangled);
+                let name = self.add_constant(Constant::String(mangled))?;
                 self.emit(LOAD_CONST, name, 1)?;
                 self.compile_expression(default)?;
             }
@@ -710,6 +726,12 @@ impl Compiler<'_> {
             wrapper_flags,
         )?;
         wrapper.unit.private_name = Some(definition.name.as_str().to_string());
+        wrapper.unit.mangled_names = Some(
+            type_params
+                .iter()
+                .map(|parameter| parameter.name().to_string())
+                .collect(),
+        );
         wrapper
             .symbols
             .imported_scope_names
@@ -786,15 +808,7 @@ impl Compiler<'_> {
                 Scope::Class { free_indices, .. } => {
                     self.symbols.cell_names.contains(*name) || free_indices.contains_key(name)
                 }
-                Scope::Function {
-                    indices,
-                    free_indices,
-                    cells,
-                    ..
-                } => {
-                    indices.contains_key(name) && cells.contains(*name)
-                        || free_indices.contains_key(name)
-                }
+                Scope::Function { .. } => self.can_provide_closure_id(*name),
             })
         {
             self.insert_lexical_name(&mut freevars, name);
@@ -831,6 +845,7 @@ impl Compiler<'_> {
             class_plan.nonlocals,
             &freevars,
             &class_plan.comprehension_targets,
+            &class_plan.comprehension_cells,
             class_plan.bound_names,
             class_plan.needs_class_closure,
             class_plan.needs_classdict,
@@ -866,6 +881,8 @@ impl Compiler<'_> {
         if !closure_names.is_empty() {
             self.emit_function_attribute(FunctionAttribute::CLOSURE)?;
         }
+        self.context
+            .record_constant_string_origin(definition.name.as_str(), true);
         let name = self.add_constant(Constant::String(definition.name.as_str().to_string()))?;
         self.emit(LOAD_CONST, name, 1)?;
         if is_generic {
@@ -884,13 +901,40 @@ impl Compiler<'_> {
         });
         let has_starred_arguments =
             arguments.is_some_and(|arguments| arguments.args.iter().any(Expr::is_starred_expr));
+        let large_call = arguments.is_some_and(|arguments| {
+            arguments.args.len() + arguments.keywords.len() * 2 > CPYTHON_STACK_USE_GUIDELINE
+        });
+        let large_positional_tuple =
+            arguments.map_or(0, |arguments| arguments.args.len()) + 2 + usize::from(is_generic)
+                > CPYTHON_STACK_USE_GUIDELINE;
         let argument_count = arguments.map_or(0, |arguments| {
             arguments.args.len() + arguments.keywords.len()
         }) + usize::from(is_generic);
-        if has_unpacking {
+        if has_unpacking || large_call {
             // Extended class calls include the body function and class name in their positional
-            // tuple. CPython packs those together with every base before the first starred base.
-            if has_starred_arguments {
+            // tuple. Large tuples accumulate bases one at a time to bound stack depth.
+            if large_positional_tuple {
+                self.assembler.set_location(definition_location);
+                self.emit_build(BUILD_LIST, 2)?;
+                if let Some(arguments) = arguments {
+                    for argument in &arguments.args {
+                        let (argument, opcode) = if let Expr::Starred(starred) = argument {
+                            (starred.value.as_ref(), LIST_EXTEND)
+                        } else {
+                            (argument, LIST_APPEND)
+                        };
+                        self.compile_expression(argument)?;
+                        self.assembler.set_location(definition_location);
+                        self.emit(opcode, 1, -1)?;
+                    }
+                }
+                if is_generic {
+                    self.load_name(".generic_base")?;
+                    self.assembler.set_location(definition_location);
+                    self.emit(LIST_APPEND, 1, -1)?;
+                }
+                self.emit_unary_intrinsic(UnaryIntrinsic::LIST_TO_TUPLE)?;
+            } else if has_starred_arguments {
                 let leading_count = arguments.map_or(0, |arguments| {
                     arguments
                         .args
@@ -1028,24 +1072,58 @@ impl Compiler<'_> {
         definition_location: SourceLocation,
     ) -> Result<(), CompileError> {
         debug_assert!(!keywords.is_empty() && keywords.iter().all(|keyword| keyword.arg.is_some()));
+        let large_map = keywords.len() * 2 > CPYTHON_STACK_USE_GUIDELINE;
+        if large_map {
+            self.assembler.set_location(SourceLocation::NONE);
+            self.emit(BUILD_MAP, 0, 1)?;
+        }
         for keyword in keywords {
             let name = keyword.arg.as_ref().unwrap();
+            self.context
+                .record_constant_string_origin(name.as_str(), true);
             let key = self.add_constant(Constant::String(name.as_str().to_string()))?;
+            if large_map {
+                self.assembler.set_location(definition_location);
+            }
             self.emit(LOAD_CONST, key, 1)?;
             self.compile_expression(&keyword.value)?;
+            if large_map {
+                self.assembler.set_location(SourceLocation::NONE);
+                self.emit(MAP_ADD, 1, -2)?;
+            }
         }
         self.assembler.set_location(definition_location);
-        self.emit_build_map(keywords.len())
+        if large_map {
+            Ok(())
+        } else {
+            self.emit_build_map(keywords.len())
+        }
     }
 
     fn compile_type_parameters(
         &mut self,
         type_params: &ruff_python_ast::TypeParams,
     ) -> Result<(), CompileError> {
+        // During symbol analysis, a generic class adds each declared private name to its
+        // mangling restriction before visiting that parameter's bound. An earlier bound sees
+        // a later private spelling as a global, although code generation uses the completed
+        // restriction and emits its mangled spelling.
+        if self.unit.mangled_names.is_some() {
+            self.unit.pending_private_type_parameters = type_params
+                .iter()
+                .map(|parameter| parameter.name().as_str())
+                .filter(|name| self.mangled_name(name) != *name)
+                .map(|name| self.required_name_id(name))
+                .collect();
+        }
         for parameter in type_params {
             let name = parameter.name().as_str();
+            self.unit
+                .pending_private_type_parameters
+                .remove(&self.required_name_id(name));
             self.assembler
                 .set_location(self.source_location(parameter.range()));
+            self.context.record_constant_string_origin(name, true);
             self.load_string_constant(name)?;
             match parameter {
                 TypeParam::TypeVar(parameter) => {
@@ -1093,17 +1171,33 @@ impl Compiler<'_> {
     ) -> Result<(), CompileError> {
         let mut references = ReferenceCollector::default();
         references.visit_expr(expression);
-        let required_names = self.name_ids(expression_required_names(expression));
-        let mut freevars: Vec<_> = required_names
-            .iter()
-            .filter(|name| self.is_type_parameter_id(**name) || self.can_provide_closure_id(**name))
-            .copied()
-            .collect();
         let can_see_class_scope = matches!(self.unit.scope, Scope::Class { .. })
             || self
                 .symbols
                 .free_names
                 .contains(&self.required_name_id("__classdict__"));
+        let mut local_names = vec![".format".to_string()];
+        let inlined_cellvars = if can_see_class_scope {
+            FxHashSet::default()
+        } else {
+            // The first iterable runs before its comprehension reserves fast locals. Reuse
+            // the function-scope collector so nested iterables retain that allocation order.
+            local_names.extend(inlined_comprehension_local_names_in_expression(expression));
+            inlined_comprehension_cell_names_in_expression(expression)
+        };
+        let mut seen = FxHashSet::default();
+        local_names.retain(|name| seen.insert(name.clone()));
+        let locals = self.name_ids(&local_names);
+        let required_names = self.name_ids(expression_required_names(expression));
+        let outside_requirements =
+            self.name_id_set(expression_requirements_outside_comprehensions(expression));
+        let mut freevars: Vec<_> = required_names
+            .iter()
+            .filter(|name| !locals.contains(name) || outside_requirements.contains(name))
+            .filter(|name| !self.unit.pending_private_type_parameters.contains(*name))
+            .filter(|name| self.is_type_parameter_id(**name) || self.can_provide_closure_id(**name))
+            .copied()
+            .collect();
         if can_see_class_scope {
             let classdict = self.required_name_id("__classdict__");
             self.insert_lexical_name(&mut freevars, classdict);
@@ -1115,10 +1209,13 @@ impl Compiler<'_> {
             .map(|name| self.required_name_id(name))
             .filter(|name| !freevar_set.contains(name))
             .collect();
+        let cellvars = self.name_id_set(inlined_cellvars);
         let plan = LoweringFunctionPlan {
-            locals: vec![self.required_name_id(".format")],
+            locals,
             globals,
             freevars,
+            inlined_comprehension_cellvars: cellvars.clone(),
+            cellvars,
             ..LoweringFunctionPlan::default()
         };
         let closure_names = plan.freevars.clone();
@@ -1154,6 +1251,10 @@ impl Compiler<'_> {
             (if nested { CO_NESTED } else { 0 }) | (self.unit.flags & SUPPORTED_FUTURE_FLAGS),
         )?;
         child.unit.private_name.clone_from(&self.unit.private_name);
+        child
+            .unit
+            .mangled_names
+            .clone_from(&self.unit.mangled_names);
         child
             .symbols
             .imported_scope_names
@@ -1260,8 +1361,28 @@ impl Compiler<'_> {
             let classdict = self.required_name_id("__classdict__");
             self.insert_lexical_name(&mut freevars, classdict);
         }
+        let mut local_names = vec!["format".to_string()];
+        let mut references = ReferenceCollector::default();
+        if self.unit.flags & CO_FUTURE_ANNOTATIONS == 0
+            && !can_see_class_scope
+            && !freevars.is_empty()
+        {
+            // Reserve comprehension locals before assigning the annotation thunk's free slots.
+            for (_, annotation) in &annotations {
+                references.visit_expr(annotation);
+                local_names.extend(inlined_comprehension_local_names_in_expression(annotation));
+            }
+        }
+        let mut seen = FxHashSet::default();
+        local_names.retain(|name| seen.insert(name.clone()));
+        let annotation_globals: FxHashSet<_> = references
+            .references
+            .iter()
+            .map(|name| self.required_name_id(name))
+            .filter(|name| !freevars.contains(name))
+            .collect();
         let plan = LoweringFunctionPlan {
-            locals: vec![self.required_name_id("format")],
+            locals: self.name_ids(&local_names),
             freevars,
             ..LoweringFunctionPlan::default()
         };
@@ -1293,7 +1414,13 @@ impl Compiler<'_> {
             0,
             parameter_flags,
         )?;
+        // Comprehension slots are synthetic locals, as when they were appended during lowering.
+        child.symbols.fast_local_count = 1;
         child.unit.private_name.clone_from(&self.unit.private_name);
+        child
+            .unit
+            .mangled_names
+            .clone_from(&self.unit.mangled_names);
         child
             .symbols
             .imported_scope_names
@@ -1312,12 +1439,19 @@ impl Compiler<'_> {
         child.assembler.set_location(location);
 
         child.emit_annotation_format_guard("format")?;
+        // The format guard reads its synthetic parameter; annotation expressions use their own globals.
+        if let Scope::Function { globals, .. } = &mut child.unit.scope {
+            globals.extend(annotation_globals);
+        }
 
         let future_annotations = self.unit.flags & CO_FUTURE_ANNOTATIONS != 0;
         for (name, annotation) in &annotations {
             child.assembler.set_location(location);
-            let name = child.mangled_name(name);
-            child.load_string_constant(&name)?;
+            let mangled = child.mangled_name(name);
+            child
+                .context
+                .record_identifier_constant_origin(name, &mangled);
+            child.load_string_constant(&mangled)?;
             if future_annotations {
                 child
                     .assembler
@@ -1409,6 +1543,10 @@ impl Compiler<'_> {
         )?;
         child.unit.private_name.clone_from(&self.unit.private_name);
         child
+            .unit
+            .mangled_names
+            .clone_from(&self.unit.mangled_names);
+        child
             .symbols
             .imported_scope_names
             .clone_from(&self.symbols.imported_scope_names);
@@ -1447,14 +1585,16 @@ impl Compiler<'_> {
                     .assembler
                     .set_location(child.source_location(annotation.range));
                 child.emit(COPY, 2, 1)?;
-                let target = child.mangled_name(
-                    annotation
-                        .target
-                        .as_name_expr()
-                        .ok_or_else(|| unsupported("simple annotation target"))?
-                        .id
-                        .as_str(),
-                );
+                let raw = annotation
+                    .target
+                    .as_name_expr()
+                    .ok_or_else(|| unsupported("simple annotation target"))?
+                    .id
+                    .as_str();
+                let target = child.mangled_name(raw);
+                child
+                    .context
+                    .record_identifier_constant_origin(raw, &target);
                 child.load_string_constant(&target)?;
                 child.assembler.set_location(setup_location);
                 child.emit(STORE_SUBSCR, 0, -3)?;
@@ -1473,8 +1613,11 @@ impl Compiler<'_> {
                 .assembler
                 .set_location(child.source_location(annotation.range));
             child.emit(COPY, 2, 1)?;
-            let target = child.mangled_name(target.id.as_str());
-            child.load_string_constant(&target)?;
+            let mangled = child.mangled_name(target.id.as_str());
+            child
+                .context
+                .record_identifier_constant_origin(target.id.as_str(), &mangled);
+            child.load_string_constant(&mangled)?;
             child.assembler.set_location(setup_location);
             child.emit(STORE_SUBSCR, 0, -3)?;
         }
@@ -1514,6 +1657,10 @@ impl Compiler<'_> {
         )?;
         child.unit.private_name.clone_from(&self.unit.private_name);
         child
+            .unit
+            .mangled_names
+            .clone_from(&self.unit.mangled_names);
+        child
             .symbols
             .imported_scope_names
             .clone_from(&self.symbols.imported_scope_names);
@@ -1550,6 +1697,9 @@ impl Compiler<'_> {
             child.compile_expression(&annotation.annotation)?;
             child.assembler.set_location(location);
             child.emit(COPY, 2, 1)?;
+            child
+                .context
+                .record_constant_string_origin(target.id.as_str(), true);
             child.load_string_constant(target.id.as_str())?;
             child.assembler.set_location(setup_location);
             child.emit(STORE_SUBSCR, 0, -3)?;

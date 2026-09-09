@@ -1,6 +1,9 @@
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+
 use ruff_python_ast::token::{TokenKind, Tokens};
 use ruff_python_ast::visitor::transformer::{Transformer, walk_expr as transform_expr};
-use ruff_python_ast::visitor::{Visitor, walk_expr};
+use ruff_python_ast::visitor::{Visitor, walk_expr, walk_stmt};
 use ruff_python_ast::{
     Expr, ExprContext, FStringPart, InterpolatedStringElement, Operator, Stmt, StringLiteralFlags,
     StringLiteralValue, Suite,
@@ -8,13 +11,17 @@ use ruff_python_ast::{
 use ruff_python_codegen::{Generator, Indentation, Mode as CodegenMode};
 use ruff_source_file::{LineEnding, LineIndex};
 use ruff_text_size::{Ranged, TextLen, TextSize};
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::assembler::SourceLocation;
-use crate::code_object::Constant;
+use crate::code_object::{
+    CodeInterningSummary, CodeObject, CompilationInterningEvent, CompilationInterningEventKind,
+    Constant,
+};
 
 use super::constant::{explicit_surrogate_string, fold_constant};
 use super::scope::{ModulePlan, ScopeArena};
+use super::symbol::mangle_name;
 use super::{CachedSourceLine, Compiler};
 
 #[derive(Debug)]
@@ -25,6 +32,13 @@ pub(super) struct CompilationContext<'source> {
     line_index: LineIndex,
     pub(super) scopes: ScopeArena,
     lowering_profile: LoweringProfile,
+    constant_string_origins: FxHashMap<String, AtomicU8>,
+    pub(super) generated_mangled_strings: FxHashSet<String>,
+    // Generated names can first become canonical when an otherwise discarded child assembles.
+    // Restricted generic-class identifiers also require real child lowering for key origins.
+    pub(super) requires_interning_trace: bool,
+    next_interning_order: AtomicUsize,
+    interning_events: Mutex<Vec<CompilationInterningEvent>>,
 }
 
 /// Selects which target-specific layout rules may run while lowering a parsed module.
@@ -69,6 +83,13 @@ impl<'source> CompilationContext<'source> {
         body: &Suite,
     ) -> Self {
         let scopes = ScopeArena::analyze(body);
+        let mut generated_mangled_strings = FxHashSet::default();
+        let mut requires_interning_trace = false;
+        let constant_string_origins = parser_interned_strings(
+            body,
+            &mut generated_mangled_strings,
+            &mut requires_interning_trace,
+        );
         Self {
             filename: filename.to_string(),
             source,
@@ -76,6 +97,11 @@ impl<'source> CompilationContext<'source> {
             line_index: LineIndex::from_source_text(source),
             scopes,
             lowering_profile: LoweringProfile::for_suite(body),
+            constant_string_origins,
+            generated_mangled_strings,
+            requires_interning_trace,
+            next_interning_order: AtomicUsize::new(0),
+            interning_events: Mutex::new(Vec::new()),
         }
     }
 
@@ -86,6 +112,338 @@ impl<'source> CompilationContext<'source> {
     pub(super) const fn module_plan(&self) -> &ModulePlan {
         self.scopes.module()
     }
+
+    /// Records the first object admitted to the compilation-wide constant cache for an
+    /// parser-interned name used as a constant. Later equal constants reuse that object's identity,
+    /// even when the first load is removed by control-flow optimization.
+    pub(super) fn record_constant_string_origin(&self, value: &str, interned: bool) {
+        if let Some(origin) = self.constant_string_origins.get(value) {
+            let _ = origin.compare_exchange(
+                0,
+                if interned { 2 } else { 1 },
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    pub(super) fn record_identifier_constant_origin(&self, raw: &str, mangled: &str) {
+        // `_Py_Mangle` returns a fresh string when the spelling changes, even if an equal
+        // identifier was already interned by the parser.
+        self.record_constant_string_origin(mangled, raw == mangled);
+    }
+
+    pub(super) fn record_constant_string_origins(&self, constant: &Constant, interned: bool) {
+        if self.constant_string_origins.is_empty() {
+            return;
+        }
+        match constant {
+            Constant::String(value) => self.record_constant_string_origin(value, interned),
+            Constant::Tuple(values) | Constant::FrozenSet(values) => {
+                if matches!(constant, Constant::Tuple(_)) {
+                    self.record_cached_string_tuple(values);
+                }
+                for value in values {
+                    self.record_constant_string_origins(value, interned);
+                }
+            }
+            // A nested code object's constants were recorded while compiling its body.
+            _ => {}
+        }
+    }
+
+    pub(super) fn record_cached_string_tuple(&self, values: &[Constant]) {
+        if self.generated_mangled_strings.is_empty() {
+            return;
+        }
+        let Some(values) = values
+            .iter()
+            .map(|value| match value {
+                Constant::String(value) => Some(value.clone()),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()
+        else {
+            return;
+        };
+        if values
+            .iter()
+            .any(|value| self.generated_mangled_strings.contains(value))
+        {
+            self.record_interning_event(CompilationInterningEventKind::CachedTuple(values));
+        }
+    }
+
+    fn record_interning_event(&self, kind: CompilationInterningEventKind) -> usize {
+        let order = self.next_interning_order.fetch_add(1, Ordering::Relaxed);
+        self.interning_events
+            .lock()
+            .unwrap()
+            .push(CompilationInterningEvent { order, kind });
+        order
+    }
+
+    pub(super) fn record_code_assembly(&self, code: &CodeObject) -> Option<usize> {
+        if !self.requires_interning_trace {
+            return None;
+        }
+        Some(
+            self.record_interning_event(CompilationInterningEventKind::CodeAssembly(
+                CodeInterningSummary::from_code(code),
+            )),
+        )
+    }
+
+    pub(super) fn interning_events(&self) -> Vec<CompilationInterningEvent> {
+        self.interning_events.lock().unwrap().clone()
+    }
+
+    pub(super) fn has_tracked_string_origins(&self) -> bool {
+        !self.constant_string_origins.is_empty()
+    }
+
+    pub(super) fn constant_string_provenance(&self) -> (FxHashSet<String>, FxHashSet<String>) {
+        let identifiers = self
+            .constant_string_origins
+            .keys()
+            .filter(|value| !self.generated_mangled_strings.contains(*value))
+            .cloned()
+            .collect();
+        let canonical = self
+            .constant_string_origins
+            .iter()
+            .filter(|(_, origin)| origin.load(Ordering::Relaxed) == 2)
+            .map(|(value, _)| value.clone())
+            .collect();
+        (identifiers, canonical)
+    }
+}
+
+fn parser_interned_strings(
+    body: &Suite,
+    generated_mangled_strings: &mut FxHashSet<String>,
+    requires_interning_trace: &mut bool,
+) -> FxHashMap<String, AtomicU8> {
+    #[derive(Default)]
+    struct ConstantIdentifiers {
+        origins: FxHashMap<String, AtomicU8>,
+        private_name: Option<String>,
+        mangled_names: Option<FxHashSet<String>>,
+        generated_mangled_strings: FxHashSet<String>,
+        raw_private_identifiers: FxHashSet<String>,
+        restricted_private_identifier: bool,
+    }
+
+    impl ConstantIdentifiers {
+        fn mangled_name(&self, name: &str) -> String {
+            if self
+                .mangled_names
+                .as_ref()
+                .is_some_and(|names| !names.contains(name))
+            {
+                name.to_string()
+            } else {
+                mangle_name(name, self.private_name.as_deref()).into_owned()
+            }
+        }
+
+        fn record_name(&mut self, name: &str) {
+            self.record_raw_name(name);
+            self.origins.entry(name.to_string()).or_default();
+            let mangled = self.mangled_name(name);
+            if mangled != name {
+                self.generated_mangled_strings.insert(mangled.clone());
+                self.origins.entry(mangled).or_default();
+            }
+        }
+
+        fn record_raw_name(&mut self, name: &str) {
+            self.origins.entry(name.to_string()).or_default();
+            if name.contains("__") {
+                self.restricted_private_identifier |= self.mangled_names.is_some();
+                self.raw_private_identifiers.insert(name.to_string());
+                let mangled = self.mangled_name(name);
+                if mangled != name {
+                    self.generated_mangled_strings.insert(mangled);
+                }
+            }
+        }
+    }
+
+    impl<'a> Visitor<'a> for ConstantIdentifiers {
+        fn visit_stmt(&mut self, statement: &'a Stmt) {
+            match statement {
+                Stmt::AnnAssign(assignment) => {
+                    if let Expr::Name(target) = assignment.target.as_ref() {
+                        self.record_name(target.id.as_str());
+                    }
+                }
+                Stmt::FunctionDef(definition) => {
+                    self.record_raw_name(definition.name.as_str());
+                    if definition.returns.is_some() {
+                        self.origins.entry("return".to_string()).or_default();
+                    }
+                }
+                Stmt::ClassDef(definition) => {
+                    self.record_raw_name(definition.name.as_str());
+                    self.origins.entry(definition.name.to_string()).or_default();
+                    for decorator in &definition.decorator_list {
+                        self.visit_decorator(decorator);
+                    }
+                    let previous = self.private_name.clone();
+                    let previous_mangled_names = self.mangled_names.clone();
+                    if let Some(type_params) = &definition.type_params {
+                        self.private_name = Some(definition.name.to_string());
+                        // `_Py_MaybeMangle` restricts generic-class annotation scopes to
+                        // declared type parameters. The class body has ordinary mangling.
+                        self.mangled_names = Some(
+                            type_params
+                                .iter()
+                                .map(|parameter| parameter.name().to_string())
+                                .collect(),
+                        );
+                        self.visit_type_params(type_params);
+                    }
+                    if let Some(arguments) = &definition.arguments {
+                        self.visit_arguments(arguments);
+                    }
+                    self.private_name = Some(definition.name.to_string());
+                    self.mangled_names = None;
+                    self.visit_body(&definition.body);
+                    self.private_name = previous;
+                    self.mangled_names = previous_mangled_names;
+                    return;
+                }
+                Stmt::ImportFrom(import) => {
+                    if let Some(module) = &import.module {
+                        for component in module.as_str().split('.') {
+                            self.record_raw_name(component);
+                            self.origins.entry(component.to_string()).or_default();
+                        }
+                    }
+                }
+                Stmt::Global(declaration) => {
+                    for name in &declaration.names {
+                        self.record_raw_name(name.as_str());
+                    }
+                }
+                Stmt::Nonlocal(declaration) => {
+                    for name in &declaration.names {
+                        self.record_raw_name(name.as_str());
+                    }
+                }
+                Stmt::Match(_) => {
+                    // The parser interns soft keywords through its identifier-token path.
+                    self.origins.entry("case".to_string()).or_default();
+                }
+                Stmt::TypeAlias(alias) => {
+                    if let Expr::Name(name) = alias.name.as_ref() {
+                        self.origins.entry(name.id.to_string()).or_default();
+                    }
+                }
+                _ => {}
+            }
+            walk_stmt(self, statement);
+        }
+
+        fn visit_parameters(&mut self, parameters: &'a ruff_python_ast::Parameters) {
+            for parameter in &parameters.kwonlyargs {
+                if parameter.default.is_some() {
+                    self.record_name(parameter.name().as_str());
+                }
+            }
+            ruff_python_ast::visitor::walk_parameters(self, parameters);
+        }
+
+        fn visit_parameter(&mut self, parameter: &'a ruff_python_ast::Parameter) {
+            self.record_raw_name(parameter.name.as_str());
+            if let Some(annotation) = &parameter.annotation {
+                self.record_name(parameter.name.as_str());
+                self.visit_expr(annotation);
+            }
+        }
+
+        fn visit_expr(&mut self, expression: &'a Expr) {
+            match expression {
+                Expr::Name(name) => self.record_raw_name(name.id.as_str()),
+                Expr::Attribute(attribute) => self.record_raw_name(attribute.attr.as_str()),
+                _ => {}
+            }
+            walk_expr(self, expression);
+        }
+
+        fn visit_except_handler(&mut self, handler: &'a ruff_python_ast::ExceptHandler) {
+            let ruff_python_ast::ExceptHandler::ExceptHandler(handler) = handler;
+            if let Some(name) = &handler.name {
+                self.record_raw_name(name.as_str());
+            }
+            if let Some(type_) = &handler.type_ {
+                self.visit_expr(type_);
+            }
+            self.visit_body(&handler.body);
+        }
+
+        fn visit_pattern(&mut self, pattern: &'a ruff_python_ast::Pattern) {
+            let capture = match pattern {
+                ruff_python_ast::Pattern::MatchAs(pattern) => pattern.name.as_ref(),
+                ruff_python_ast::Pattern::MatchStar(pattern) => pattern.name.as_ref(),
+                ruff_python_ast::Pattern::MatchMapping(pattern) => pattern.rest.as_ref(),
+                _ => None,
+            };
+            if let Some(name) = capture {
+                self.record_raw_name(name.as_str());
+            }
+            ruff_python_ast::visitor::walk_pattern(self, pattern);
+        }
+
+        fn visit_type_param(&mut self, parameter: &'a ruff_python_ast::TypeParam) {
+            let name = parameter.name().as_str();
+            if let Some(names) = &mut self.mangled_names {
+                names.insert(name.to_string());
+            }
+            self.record_raw_name(name);
+            self.origins.entry(name.to_string()).or_default();
+            ruff_python_ast::visitor::walk_type_param(self, parameter);
+        }
+
+        fn visit_keyword(&mut self, keyword: &'a ruff_python_ast::Keyword) {
+            if let Some(name) = &keyword.arg {
+                self.record_raw_name(name.as_str());
+                self.origins.entry(name.to_string()).or_default();
+            }
+            self.visit_expr(&keyword.value);
+        }
+
+        fn visit_alias(&mut self, alias: &'a ruff_python_ast::Alias) {
+            self.origins.entry(alias.name.to_string()).or_default();
+            for component in alias.name.as_str().split('.') {
+                self.record_raw_name(component);
+                self.origins.entry(component.to_string()).or_default();
+            }
+            if let Some(name) = &alias.asname {
+                self.record_raw_name(name.as_str());
+                self.origins.entry(name.to_string()).or_default();
+            }
+        }
+
+        fn visit_pattern_keyword(&mut self, keyword: &'a ruff_python_ast::PatternKeyword) {
+            self.record_raw_name(keyword.attr.as_str());
+            self.origins.entry(keyword.attr.to_string()).or_default();
+            self.visit_pattern(&keyword.pattern);
+        }
+    }
+
+    let mut visitor = ConstantIdentifiers::default();
+    for statement in body {
+        visitor.visit_stmt(statement);
+    }
+    visitor
+        .generated_mangled_strings
+        .retain(|name| !visitor.raw_private_identifiers.contains(name));
+    *requires_interning_trace =
+        visitor.restricted_private_identifier || !visitor.generated_mangled_strings.is_empty();
+    *generated_mangled_strings = visitor.generated_mangled_strings;
+    visitor.origins
 }
 
 fn suite_has_lazy_imports(body: &Suite) -> bool {
@@ -244,6 +602,10 @@ impl Compiler<'_> {
         let mut bytes = Vec::new();
         let mut has_surrogates = false;
         for part in &string.value {
+            if part.flags.prefix().is_raw() {
+                bytes.extend_from_slice(part.as_str().as_bytes());
+                continue;
+            }
             if let Some(part_bytes) =
                 explicit_surrogate_string(part.as_str(), self.source_text(part.range))
             {
@@ -270,16 +632,37 @@ impl Compiler<'_> {
                 .map(|element| self.source_aware_fold_constant(element))
                 .collect::<Option<Vec<_>>>()
                 .map(Constant::Tuple),
-            Expr::BinOp(binary) if binary.op == Operator::Mult => {
+            Expr::BinOp(binary) if matches!(binary.op, Operator::Add | Operator::Mult) => {
                 let folded = fold_constant(expression)?;
                 if !matches!(&folded, Constant::String(value) if value.contains('\u{fffd}')) {
                     return Some(folded);
                 }
                 let left = self.source_aware_fold_constant(&binary.left)?;
                 let right = self.source_aware_fold_constant(&binary.right)?;
-                match (left, right) {
-                    (Constant::SurrogateString(value), Constant::Int(times))
-                    | (Constant::Int(times), Constant::SurrogateString(value)) => {
+                match (left, binary.op, right) {
+                    (
+                        Constant::SurrogateString(mut left),
+                        Operator::Add,
+                        Constant::String(right),
+                    ) => {
+                        left.extend_from_slice(right.as_bytes());
+                        Some(Constant::SurrogateString(left))
+                    }
+                    (Constant::String(left), Operator::Add, Constant::SurrogateString(right)) => {
+                        let mut bytes = left.into_bytes();
+                        bytes.extend(right);
+                        Some(Constant::SurrogateString(bytes))
+                    }
+                    (
+                        Constant::SurrogateString(mut left),
+                        Operator::Add,
+                        Constant::SurrogateString(right),
+                    ) => {
+                        left.extend(right);
+                        Some(Constant::SurrogateString(left))
+                    }
+                    (Constant::SurrogateString(value), Operator::Mult, Constant::Int(times))
+                    | (Constant::Int(times), Operator::Mult, Constant::SurrogateString(value)) => {
                         let length = value.iter().filter(|byte| **byte & 0xc0 != 0x80).count();
                         let max_times = 4096_usize.checked_div(length).unwrap_or(usize::MAX);
                         let times = usize::try_from(times).ok()?;
@@ -569,7 +952,7 @@ pub(super) fn implicit_return_range(
             };
             last_discarded_annotation_slice_range(&subscript.slice)
         }
-        Stmt::While(statement) => condition_exit_range(&statement.test),
+        Stmt::While(statement) => super::statement::while_condition_exit_range(&statement.test),
         Stmt::For(statement) => statement.iter.range(),
         _ => statement.range(),
     }
@@ -688,18 +1071,44 @@ fn last_discarded_annotation_slice_range(expression: &Expr) -> ruff_text_size::T
     }
 }
 pub(super) fn unparse_annotation(expression: &Expr, source: &str) -> String {
-    struct AnnotationStringDetector(bool);
+    #[derive(Default)]
+    struct AnnotationStrings<'ast> {
+        needs_normalization: bool,
+        fstrings: Vec<&'ast ruff_python_ast::ExprFString>,
+        unpacked_keywords: Vec<&'ast ruff_python_ast::Keyword>,
+        templates: Vec<&'ast ruff_python_ast::ExprTString>,
+    }
 
-    impl<'ast> Visitor<'ast> for AnnotationStringDetector {
+    impl<'ast> Visitor<'ast> for AnnotationStrings<'ast> {
         fn visit_expr(&mut self, expression: &'ast Expr) {
-            if self.0 {
-                return;
+            match expression {
+                Expr::StringLiteral(_) => self.needs_normalization = true,
+                Expr::FString(string) => {
+                    self.needs_normalization = true;
+                    self.fstrings.push(string);
+                }
+                Expr::TString(string) => {
+                    self.needs_normalization = true;
+                    self.templates.push(string);
+                }
+                Expr::Call(call) => {
+                    self.needs_normalization |= call
+                        .arguments
+                        .args
+                        .last()
+                        .zip(call.arguments.keywords.first())
+                        .is_some_and(|(argument, keyword)| argument.start() > keyword.start());
+                    walk_expr(self, expression);
+                }
+                _ => walk_expr(self, expression),
             }
-            if matches!(expression, Expr::StringLiteral(_)) {
-                self.0 = true;
-            } else {
-                walk_expr(self, expression);
+        }
+
+        fn visit_keyword(&mut self, keyword: &'ast ruff_python_ast::Keyword) {
+            if keyword.arg.is_none() {
+                self.unpacked_keywords.push(keyword);
             }
+            self.visit_expr(&keyword.value);
         }
     }
 
@@ -729,8 +1138,35 @@ pub(super) fn unparse_annotation(expression: &Expr, source: &str) -> String {
                     StringLiteralFlags::empty()
                 };
                 string.value = StringLiteralValue::single(literal);
+            } else if let Expr::FString(string) = expression {
+                // The surrounding expression generator only needs an atomic string node.
+                // Its f-string rendering cannot represent CPython's whole-body repr, so
+                // replace this empty placeholder after generating the surrounding expression.
+                string.value = ruff_python_ast::FStringValue::single(ruff_python_ast::FString {
+                    range: string.range,
+                    node_index: string.node_index.clone(),
+                    elements: Vec::new().into(),
+                    flags: ruff_python_ast::FStringFlags::empty(),
+                });
+            } else if let Expr::TString(string) = expression {
+                string.value = ruff_python_ast::TStringValue::single(ruff_python_ast::TString {
+                    range: string.range,
+                    node_index: string.node_index.clone(),
+                    elements: Vec::new().into(),
+                    flags: ruff_python_ast::TStringFlags::empty(),
+                });
             } else {
                 transform_expr(self, expression);
+                if let Expr::Call(call) = expression {
+                    // The code generator merges arguments and keywords by their source
+                    // ranges, while CPython's annotation unparser prints the AST argument
+                    // list before its keyword list. These ranges only affect this clone's
+                    // formatting order; the expressions retain their original source ranges.
+                    let end = call.range.end();
+                    for keyword in &mut call.arguments.keywords {
+                        keyword.range = ruff_text_size::TextRange::empty(end);
+                    }
+                }
             }
         }
     }
@@ -747,9 +1183,16 @@ pub(super) fn unparse_annotation(expression: &Expr, source: &str) -> String {
         return annotation;
     }
 
-    let mut detector = AnnotationStringDetector(false);
-    detector.visit_expr(expression);
-    let normalized = detector.0.then(|| {
+    if let Expr::FString(string) = expression {
+        return unparse_annotation_fstring(string, source);
+    }
+    if let Expr::TString(string) = expression {
+        return unparse_annotation_tstring(string, source);
+    }
+
+    let mut original_strings = AnnotationStrings::default();
+    original_strings.visit_expr(expression);
+    let normalized = original_strings.needs_normalization.then(|| {
         let mut expression = expression.clone();
         AnnotationStringNormalizer { source }.visit_expr(&mut expression);
         expression
@@ -762,6 +1205,34 @@ pub(super) fn unparse_annotation(expression: &Expr, source: &str) -> String {
         &annotation,
         ruff_python_parser::ParseOptions::from(ruff_python_parser::Mode::ParenthesizedExpression),
     );
+    let mut generated_strings = AnnotationStrings::default();
+    if let ruff_python_ast::Mod::Expression(module) = parsed.syntax() {
+        generated_strings.visit_expr(&module.body);
+    }
+    let mut replacements = generated_strings
+        .fstrings
+        .iter()
+        .zip(original_strings.fstrings)
+        .map(|(generated, original)| {
+            (
+                std::ops::Range::<usize>::from(generated.range),
+                unparse_annotation_fstring(original, source),
+            )
+        })
+        .collect::<Vec<_>>();
+    replacements.extend(
+        generated_strings
+            .templates
+            .iter()
+            .zip(original_strings.templates)
+            .map(|(generated, original)| {
+                (
+                    std::ops::Range::<usize>::from(generated.range),
+                    unparse_annotation_tstring(original, source),
+                )
+            }),
+    );
+
     let mut stack = Vec::<(TokenKind, usize)>::new();
     let mut parenthesis_pairs = FxHashSet::default();
     let mut bracket_pairs = Vec::new();
@@ -809,11 +1280,218 @@ pub(super) fn unparse_annotation(expression: &Expr, source: &str) -> String {
         })
         .flatten()
         .collect::<Vec<_>>();
-    removals.sort_unstable_by(|left, right| right.cmp(left));
-    for index in removals {
-        annotation.remove(index);
+    // CPython accepts a conditional expression after **; the generator uses atom
+    // precedence and adds parentheses around these lower-precedence expressions.
+    for keyword in generated_strings.unpacked_keywords {
+        if matches!(
+            keyword.value,
+            Expr::BoolOp(_)
+                | Expr::BinOp(_)
+                | Expr::UnaryOp(_)
+                | Expr::Lambda(_)
+                | Expr::If(_)
+                | Expr::Compare(_)
+                | Expr::Await(_)
+        ) {
+            let opening = usize::from(keyword.start()) + 2;
+            let closing = usize::from(keyword.end()).saturating_sub(1);
+            if parenthesis_pairs.contains(&(opening, closing)) {
+                removals.extend([opening, closing]);
+            }
+        }
+    }
+    // CPython writes a space after lambda only when it has positional parameters.
+    for (previous, current) in parsed.tokens().iter().zip(parsed.tokens().iter().skip(1)) {
+        if previous.kind() == TokenKind::Lambda
+            && matches!(current.kind(), TokenKind::Star | TokenKind::DoubleStar)
+        {
+            removals.extend(usize::from(previous.end())..usize::from(current.start()));
+        }
+    }
+    removals.retain(|index| !replacements.iter().any(|(range, _)| range.contains(index)));
+    replacements.extend(
+        removals
+            .into_iter()
+            .map(|index| (index..index + 1, String::new())),
+    );
+    replacements.sort_unstable_by_key(|(range, _)| std::cmp::Reverse(range.start));
+    for (range, replacement) in replacements {
+        annotation.replace_range(range, &replacement);
+    }
+    if matches!(expression, Expr::Tuple(tuple) if !tuple.elts.is_empty()) {
+        annotation.insert(0, '(');
+        annotation.push(')');
     }
     annotation
+}
+
+/// CPython builds a complete `JoinedStr` body before applying string repr to it.
+fn unparse_annotation_fstring(string: &ruff_python_ast::ExprFString, source: &str) -> String {
+    let mut body = String::new();
+    for part in &string.value {
+        match part {
+            FStringPart::Literal(literal) => {
+                append_annotation_string_literal(&mut body, &literal.value);
+            }
+            FStringPart::FString(part) => {
+                append_annotation_interpolations(&mut body, &part.elements, source, None);
+            }
+        }
+    }
+    format!("f{}", python_string_repr(&body))
+}
+
+/// Template interpolations retain their authored text, including grouping parentheses.
+fn unparse_annotation_tstring(string: &ruff_python_ast::ExprTString, source: &str) -> String {
+    let parsed = ruff_python_parser::parse_unchecked(
+        &source[std::ops::Range::<usize>::from(string.range)],
+        ruff_python_parser::ParseOptions::from(ruff_python_parser::Mode::ParenthesizedExpression),
+    );
+    let mut body = String::new();
+    for part in &string.value {
+        append_annotation_interpolations(
+            &mut body,
+            &part.elements,
+            source,
+            Some((parsed.tokens(), string.start())),
+        );
+    }
+    format!("t{}", python_string_repr(&body))
+}
+
+fn append_annotation_string_literal(body: &mut String, value: &str) {
+    body.push_str(&value.replace('{', "{{").replace('}', "}}"));
+}
+
+fn append_annotation_interpolations(
+    body: &mut String,
+    elements: &[InterpolatedStringElement],
+    source: &str,
+    template_tokens: Option<(&Tokens, TextSize)>,
+) {
+    for element in elements {
+        match element {
+            InterpolatedStringElement::Literal(literal) => {
+                append_annotation_string_literal(body, &literal.value);
+            }
+            InterpolatedStringElement::Interpolation(interpolation) => {
+                if let Some(debug_text) = &interpolation.debug_text {
+                    append_annotation_string_literal(
+                        body,
+                        &annotation_interpolation_text(debug_text.as_str()),
+                    );
+                }
+                let value = if let Some((tokens, offset)) = template_tokens {
+                    let end = if interpolation.conversion.is_none() {
+                        interpolation
+                            .format_spec
+                            .as_deref()
+                            .map_or(interpolation.end(), Ranged::start)
+                            - TextSize::new(1)
+                    } else {
+                        tokens
+                            .iter()
+                            .find(|token| {
+                                token.kind() == TokenKind::Exclamation
+                                    && token.start() + offset >= interpolation.expression.end()
+                            })
+                            .expect("template conversion has an exclamation token")
+                            .start()
+                            + offset
+                    };
+                    annotation_interpolation_text(
+                        &source[usize::from(interpolation.start()) + 1..usize::from(end)],
+                    )
+                    .trim_end_matches(|character: char| {
+                        character.is_whitespace() || character == '='
+                    })
+                    .to_owned()
+                } else {
+                    let mut value = unparse_annotation(&interpolation.expression, source);
+                    if matches!(
+                        interpolation.expression.as_ref(),
+                        Expr::Lambda(_) | Expr::If(_)
+                    ) {
+                        value.insert(0, '(');
+                        value.push(')');
+                    }
+                    value
+                };
+                body.push('{');
+                if value.starts_with('{') {
+                    body.push(' ');
+                }
+                body.push_str(&value);
+                let conversion = interpolation.conversion.to_char().or_else(|| {
+                    (interpolation.debug_text.is_some() && interpolation.format_spec.is_none())
+                        .then_some('r')
+                });
+                if let Some(conversion) = conversion {
+                    body.push('!');
+                    body.push(conversion);
+                }
+                if let Some(spec) = &interpolation.format_spec {
+                    body.push(':');
+                    // CPython represents template format specs with FormattedValue nodes.
+                    append_annotation_interpolations(body, &spec.elements, source, None);
+                }
+                body.push('}');
+            }
+        }
+    }
+}
+
+/// Matches the pinned tokenizer's comment removal from interpolation metadata.
+fn annotation_interpolation_text(value: &str) -> String {
+    let mut quote = None;
+    let mut characters = value.chars();
+    let mut has_comment = false;
+    while let Some(character) = characters.next() {
+        match character {
+            '\\' => {
+                characters.next();
+            }
+            '\'' | '"' => {
+                if quote == Some(character) {
+                    quote = None;
+                } else if quote.is_none() {
+                    quote = Some(character);
+                }
+            }
+            '#' if quote.is_none() => {
+                has_comment = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    if !has_comment {
+        return value.to_owned();
+    }
+
+    // CPython's second pass handles quotes without skipping escaped characters.
+    let mut result = String::with_capacity(value.len());
+    let mut quote = None;
+    let mut characters = value.chars();
+    while let Some(character) = characters.next() {
+        match character {
+            '\'' | '"' => {
+                if quote == Some(character) {
+                    quote = None;
+                } else if quote.is_none() {
+                    quote = Some(character);
+                }
+                result.push(character);
+            }
+            '#' if quote.is_none() => {
+                if characters.any(|character| character == '\n') {
+                    result.push('\n');
+                }
+            }
+            _ => result.push(character),
+        }
+    }
+    result
 }
 
 fn python_string_repr(value: &str) -> String {

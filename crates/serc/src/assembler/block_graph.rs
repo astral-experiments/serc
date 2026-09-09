@@ -898,6 +898,16 @@ impl BlockGraph {
         }
     }
 
+    /// Retains an erased CFG boundary until borrowed-load analysis finishes.
+    pub(super) fn mark_borrow_empty_block(&mut self, position: ItemPosition) {
+        let instruction = self
+            .instruction_mut(position)
+            .expect("borrow boundary instruction");
+        instruction.jump_policy.mark_borrow_empty_block();
+        let instruction = *instruction;
+        self.features.record(&instruction);
+    }
+
     pub(super) fn insert_item(&mut self, position: ItemPosition, item: Item) {
         debug_assert!(self.order.contains(&position.block));
         if let Item::Label(label) = item {
@@ -926,24 +936,24 @@ impl BlockGraph {
             .filter_map(|region| {
                 let start = self.label_block(region.start)?;
                 let end = self.label_block(region.end)?;
+                let start_position = order_positions[start.index()];
+                let end_position = order_positions[end.index()];
+                // An empty protected body still has an original control-flow entry.
+                // Its handler is reachable only if that entry is reachable, including
+                // when a copied finally body has become dead before optimization.
                 Some((
-                    order_positions[start.index()],
-                    order_positions[end.index()],
+                    start_position,
+                    if start == end {
+                        start_position + 1
+                    } else {
+                        end_position
+                    },
                     self.label_block(region.target)?,
-                    start == end,
                 ))
             })
             .collect::<Vec<_>>();
         let mut pending = Vec::with_capacity(region_blocks.len().saturating_add(1));
         pending.push(entry);
-        region_blocks.retain(|(_, _, handler, empty)| {
-            if *empty {
-                pending.push(*handler);
-                false
-            } else {
-                true
-            }
-        });
         if region_blocks.len() <= 4 {
             while let Some(block) = pending.pop() {
                 if std::mem::replace(&mut reachable[block.index()], true) {
@@ -960,7 +970,7 @@ impl BlockGraph {
                 {
                     pending.push(target);
                 }
-                region_blocks.retain(|(start, end, handler, _)| {
+                region_blocks.retain(|(start, end, handler)| {
                     let is_protected = *start <= position && position < *end;
                     if is_protected {
                         pending.push(*handler);
@@ -999,7 +1009,7 @@ impl BlockGraph {
                 reachable_prefix[position + 1] =
                     reachable_prefix[position] + usize::from(reachable[block.index()]);
             }
-            region_blocks.retain(|(start, end, handler, _)| {
+            region_blocks.retain(|(start, end, handler)| {
                 if *start < *end && reachable_prefix[*start] < reachable_prefix[*end] {
                     pending.push(*handler);
                     false

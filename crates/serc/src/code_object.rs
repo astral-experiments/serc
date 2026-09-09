@@ -132,14 +132,95 @@ pub(crate) struct MarshalMetadataIds {
     pub(crate) qualified_name: Option<u32>,
 }
 
+/// A constant-cache admission or real code assembly in compilation order.
+#[derive(Clone, Debug)]
+pub(crate) struct CompilationInterningEvent {
+    pub(crate) order: usize,
+    pub(crate) kind: CompilationInterningEventKind,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum CompilationInterningEventKind {
+    CachedTuple(Vec<String>),
+    CodeAssembly(CodeInterningSummary),
+}
+
+/// The string effects of one assembled code object, without retaining its bytecode or children.
+#[derive(Clone, Debug)]
+pub(crate) struct CodeInterningSummary {
+    pub(crate) names: Vec<String>,
+    pub(crate) locals: Vec<String>,
+    pub(crate) constant_strings: Vec<String>,
+    pub(crate) explicitly_interned_strings: FxHashSet<String>,
+    pub(crate) constants_tuple: Option<Vec<String>>,
+    pub(crate) filename: String,
+    pub(crate) name: String,
+    pub(crate) qualified_name: String,
+}
+
+impl CodeInterningSummary {
+    pub(crate) fn from_code(code: &CodeObject) -> Self {
+        fn collect_strings(constant: &Constant, strings: &mut Vec<String>) {
+            match constant {
+                Constant::String(value) => strings.push(value.clone()),
+                Constant::Tuple(values) => {
+                    for value in values.iter().rev() {
+                        collect_strings(value, strings);
+                    }
+                }
+                Constant::FrozenSet(values) => {
+                    for value in values {
+                        collect_strings(value, strings);
+                    }
+                }
+                // Children have their own assembly events; slices do not intern their fields.
+                _ => {}
+            }
+        }
+
+        let mut constant_strings = Vec::new();
+        for constant in code.constants.iter().rev() {
+            collect_strings(constant, &mut constant_strings);
+        }
+        Self {
+            names: code.names.clone(),
+            locals: code.locals.clone(),
+            constant_strings,
+            explicitly_interned_strings: code
+                .marshal_provenance
+                .explicitly_interned_strings
+                .clone(),
+            constants_tuple: code
+                .constants
+                .iter()
+                .map(|constant| match constant {
+                    Constant::String(value) => Some(value.clone()),
+                    _ => None,
+                })
+                .collect(),
+            filename: code.filename.clone(),
+            name: code.name.clone(),
+            qualified_name: code.qualified_name.clone(),
+        }
+    }
+}
+
 /// Non-wire compiler provenance needed to reproduce CPython's marshal object identities.
 ///
 /// Each nested code object retains its own provenance because marshal graph planning happens after
 /// the compiler has assembled the complete constant tree.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct MarshalProvenance {
+    pub(crate) assembly_order: Option<usize>,
+    pub(crate) interning_events: Vec<CompilationInterningEvent>,
     pub(crate) locals_identity: LocalsIdentity,
     pub(crate) explicitly_interned_strings: FxHashSet<String>,
+    /// Parser-interned names used as constants, including names absent from emitted tables.
+    pub(crate) parser_interned_strings: FxHashSet<String>,
+    /// Fresh names produced by private-name mangling, interned only during code assembly.
+    pub(crate) generated_mangled_strings: FxHashSet<String>,
+    /// Strings whose first compiler-cache object was already interned.
+    pub(crate) canonical_constant_strings: FxHashSet<String>,
     /// The class-body constant loaded into `__qualname__`, when present.
     pub(crate) qualified_name_constant_index: Option<u32>,
     pub(crate) metadata_ids: Option<MarshalMetadataIds>,
@@ -151,9 +232,9 @@ impl MarshalProvenance {
     /// Compares the subset of marshal provenance that participates in code-constant equality.
     pub(crate) fn equal_for_constant_pool(&self, other: &Self) -> bool {
         // CPython gives annotation-scope locals fresh identity, which distinguishes otherwise
-        // equal code constants. Explicit interns, qualified-name origins, metadata IDs, and the
-        // frozenset-presence hint only affect later marshal graph planning and are intentionally
-        // omitted from constant-pool equality.
+        // equal code constants. String origins, qualified-name origins, metadata IDs,
+        // frozenset hints, and assembly events only affect graph planning and are omitted
+        // from constant-pool equality.
         self.locals_identity == other.locals_identity
     }
 }
@@ -185,6 +266,59 @@ pub(crate) enum Constant {
         step: Box<Self>,
     },
     Code(Box<CodeObject>),
+}
+
+impl Constant {
+    /// Applies Python numeric negation, leaving nonnumeric operands to raise at runtime.
+    pub(crate) fn negated(self) -> Option<Self> {
+        match self {
+            Self::Bool(false) | Self::Int(0) => Some(Self::Int(0)),
+            Self::Bool(true) => Some(Self::SignedInt(-1)),
+            Self::Int(value) => Some(match value.cmp(&i64::MIN.unsigned_abs()) {
+                std::cmp::Ordering::Less => Self::SignedInt(
+                    -i64::try_from(value).expect("magnitude below 2^63 fits in i64"),
+                ),
+                std::cmp::Ordering::Equal => Self::SignedInt(i64::MIN),
+                std::cmp::Ordering::Greater => {
+                    let mut magnitude = value;
+                    let mut digits = Vec::new();
+                    while magnitude != 0 {
+                        digits.push((magnitude & 0x7fff) as u16);
+                        magnitude >>= 15;
+                    }
+                    Self::BigInt {
+                        negative: true,
+                        digits,
+                    }
+                }
+            }),
+            Self::SignedInt(value) => Some(if value <= 0 {
+                Self::Int(value.unsigned_abs())
+            } else {
+                Self::SignedInt(-value)
+            }),
+            Self::BigInt { negative, digits } => {
+                if negative
+                    && let Some(value) = digits.iter().rev().try_fold(0_u64, |value, digit| {
+                        value.checked_mul(1 << 15)?.checked_add(u64::from(*digit))
+                    })
+                {
+                    Some(Self::Int(value))
+                } else {
+                    Some(Self::BigInt {
+                        negative: !negative,
+                        digits,
+                    })
+                }
+            }
+            Self::Float(value) => Some(Self::Float(-value)),
+            Self::Complex { real, imag } => Some(Self::Complex {
+                real: -real,
+                imag: -imag,
+            }),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

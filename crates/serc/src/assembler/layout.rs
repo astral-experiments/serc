@@ -10,6 +10,7 @@ use crate::CompileError;
 use crate::assembler::{
     Instruction, Label, LayoutAssembler, NormalizedExceptionOwner, SourceLocation,
 };
+use crate::target::opcodes::END_ASYNC_FOR;
 
 type FinalArtifacts = (Vec<u8>, Vec<u8>, u32);
 
@@ -37,30 +38,61 @@ impl LayoutAssembler {
                 let target = label_position(labels, region.target).ok_or_else(|| {
                     CompileError::Internal("unbound exception handler target".to_string())
                 })?;
+                let (priority_start, priority_end) = match region.priority {
+                    super::ExceptionRegionPriority::OriginalRange(start, end) => {
+                        let start = label_position(labels, start).ok_or_else(|| {
+                            CompileError::Internal(
+                                "unbound original exception region start".to_string(),
+                            )
+                        })?;
+                        let end = label_position(labels, end).ok_or_else(|| {
+                            CompileError::Internal(
+                                "unbound original exception region end".to_string(),
+                            )
+                        })?;
+                        (
+                            usize::try_from(start).unwrap(),
+                            usize::try_from(end).unwrap(),
+                        )
+                    }
+                    super::ExceptionRegionPriority::Resolved { start, end } => (start, end),
+                };
                 Ok((
                     start,
                     end,
                     target,
                     region.depth,
                     region.preserve_lasti,
-                    index,
+                    (
+                        region.is_scope_fallback,
+                        Reverse(priority_start),
+                        priority_end,
+                        index,
+                    ),
                 ))
             })
             .collect::<Result<Vec<_>, CompileError>>()?;
         let mut late_exception_exclusions = Vec::new();
         let mut block_labels = vec![false; labels.len()];
         let mut setup_labels = vec![false; labels.len()];
+        let mut first_region_starts = vec![None; labels.len()];
         for region in &self.exception_regions {
             if let Some(block_label) =
                 block_labels.get_mut(usize::try_from(region.target.0).unwrap())
             {
                 *block_label = true;
             }
-            if let Some(setup_label) =
-                setup_labels.get_mut(usize::try_from(region.start.0).unwrap())
-            {
-                *setup_label = true;
+            let target = usize::try_from(region.target.0).unwrap();
+            let start = label_position(labels, region.start).unwrap();
+            if first_region_starts[target].is_none_or(|(position, _)| start < position) {
+                first_region_starts[target] = Some((start, region.start));
             }
+        }
+        // Exclusions and cold-block placement split one protected region into multiple
+        // ranges. Only its initial setup can vacate an instruction slot; resuming a
+        // protected range does not emit another SETUP instruction in CPython.
+        for (_, label) in first_region_starts.into_iter().flatten() {
+            setup_labels[usize::try_from(label.0).unwrap()] = true;
         }
         for item in &self.items {
             match item {
@@ -86,6 +118,7 @@ impl LayoutAssembler {
                 Item::Label(_) => {}
             }
         }
+        let dynamic_exception_owners = self.dynamic_exception_owners();
         let mut position = 0;
         let mut instruction_index = 0;
         let mut block_has_instruction = false;
@@ -93,6 +126,7 @@ impl LayoutAssembler {
         let mut block_has_applied_comprehension_swap = false;
         let mut late_exception_inclusions = Vec::new();
         let mut late_exception_overrides = Vec::new();
+        let mut late_source_exception_owners = Vec::new();
         let mut previous_instruction = None;
         for item in &self.items {
             match item {
@@ -125,28 +159,56 @@ impl LayoutAssembler {
                         + u32::from(extended_args[instruction_index])
                         + 1
                         + u32::from(instruction.opcode.caches());
-                    if instruction
-                        .exception_policy
-                        .exclusion()
-                        .applies(extended_args[instruction_index])
+                    if let Some(region) = dynamic_exception_owners
+                        .get(&instruction_index)
+                        .and_then(|owner| owner.source_region)
                     {
-                        late_exception_exclusions.push((position, end));
-                    }
-                    if instruction.exception_policy.owner() == NormalizedExceptionOwner::Absent {
-                        if block_has_applied_comprehension_swap {
-                            late_exception_inclusions.push((position, end));
-                        }
-                        if !block_has_stale_exception_owner {
+                        late_source_exception_owners.push((position, end, region));
+                    } else {
+                        if instruction
+                            .exception_policy()
+                            .exclusion()
+                            .applies(extended_args[instruction_index])
+                        {
                             late_exception_exclusions.push((position, end));
                         }
-                    }
-                    if instruction.exception_policy.owner() == NormalizedExceptionOwner::Present {
-                        late_exception_inclusions.push((position, end));
-                    }
-                    if instruction.exception_policy.owner()
-                        == NormalizedExceptionOwner::OverridePresent
-                    {
-                        late_exception_overrides.push((position, end));
+                        if let Some(has_owner) = dynamic_exception_owners.get(&instruction_index) {
+                            if has_owner.has_owner {
+                                if has_owner.override_existing {
+                                    late_exception_overrides.push((position, end));
+                                }
+                                late_exception_inclusions.push((position, end));
+                            } else if has_owner.definitive {
+                                late_exception_exclusions.push((position, end));
+                            }
+                        }
+                        // Ordinary markers retain existing ownership rules if staged provenance
+                        // finds no additional vacancy. Boolean markers have fully modeled insertions.
+                        if instruction.exception_policy().owner()
+                            == NormalizedExceptionOwner::Absent
+                            || (instruction.exception_policy().owner()
+                                == NormalizedExceptionOwner::DynamicCondition
+                                && !dynamic_exception_owners
+                                    .get(&instruction_index)
+                                    .is_some_and(|owner| owner.has_owner))
+                        {
+                            if block_has_applied_comprehension_swap {
+                                late_exception_inclusions.push((position, end));
+                            }
+                            if !block_has_stale_exception_owner {
+                                late_exception_exclusions.push((position, end));
+                            }
+                        }
+                        if instruction.exception_policy().owner()
+                            == NormalizedExceptionOwner::Present
+                        {
+                            late_exception_inclusions.push((position, end));
+                        }
+                        if instruction.exception_policy().owner()
+                            == NormalizedExceptionOwner::OverridePresent
+                        {
+                            late_exception_overrides.push((position, end));
+                        }
                     }
                     if matches!(
                         instruction.opcode,
@@ -194,29 +256,25 @@ impl LayoutAssembler {
             {
                 continue;
             }
-            let Some((_, _, target, depth, preserve_lasti, index)) = regions
+            let Some((_, _, target, depth, preserve_lasti, priority)) = regions
                 .iter()
                 .filter(|(region_start, region_end, _, _, _, _)| {
                     *region_start < start && *region_end >= start
                 })
-                .min_by_key(|(region_start, region_end, _, _, _, index)| {
-                    (region_end - region_start, *index)
-                })
+                .min_by_key(|(_, _, _, _, _, priority)| *priority)
                 .copied()
             else {
                 continue;
             };
-            regions.push((start, end, target, depth, preserve_lasti, index));
+            regions.push((start, end, target, depth, preserve_lasti, priority));
         }
         for (start, end) in late_exception_overrides {
-            let Some((_, _, target, depth, preserve_lasti, index)) = regions
+            let Some((_, _, target, depth, preserve_lasti, priority)) = regions
                 .iter()
                 .filter(|(region_start, region_end, _, _, _, _)| {
                     *region_start < start && *region_end >= start
                 })
-                .min_by_key(|(region_start, region_end, _, _, _, index)| {
-                    (region_end - region_start, *index)
-                })
+                .min_by_key(|(_, _, _, _, _, priority)| *priority)
                 .copied()
             else {
                 continue;
@@ -232,7 +290,21 @@ impl LayoutAssembler {
             ) {
                 continue;
             }
-            regions.push((start, end, target, depth, preserve_lasti, index));
+            let priority = (priority.0, Reverse(usize::MAX), 0, priority.3);
+            regions.push((start, end, target, depth, preserve_lasti, priority));
+        }
+        for (start, end, source) in late_source_exception_owners {
+            let (_, _, target, depth, preserve_lasti, priority) = regions[source];
+            // This owner was proved against an earlier original-array prefix. Give the exact
+            // selected handler precedence over any scope fallback covering the marker today.
+            regions.push((
+                start,
+                end,
+                target,
+                depth,
+                preserve_lasti,
+                (false, Reverse(usize::MAX), 0, priority.3),
+            ));
         }
         let mut boundaries = regions
             .iter()
@@ -253,7 +325,8 @@ impl LayoutAssembler {
         let mut next_region = 0;
         let mut next_exclusion = 0;
         let mut excluded_through = 0;
-        let mut active_regions = BinaryHeap::<Reverse<(u32, usize, usize)>>::new();
+        let mut active_regions =
+            BinaryHeap::<Reverse<(bool, Reverse<usize>, usize, usize, usize)>>::new();
 
         let mut flattened = Vec::<(u32, u32, u32, u32, bool)>::new();
         for boundary in boundaries.windows(2) {
@@ -275,17 +348,30 @@ impl LayoutAssembler {
                 && regions[region_starts[next_region]].0 <= start
             {
                 let region = region_starts[next_region];
-                let (region_start, region_end, _, _, _, original_index) = regions[region];
-                active_regions.push(Reverse((region_end - region_start, original_index, region)));
+                let (
+                    _,
+                    _,
+                    _,
+                    _,
+                    _,
+                    (is_scope_fallback, priority_start, priority_end, original_index),
+                ) = regions[region];
+                active_regions.push(Reverse((
+                    is_scope_fallback,
+                    priority_start,
+                    priority_end,
+                    original_index,
+                    region,
+                )));
                 next_region += 1;
             }
             while active_regions
                 .peek()
-                .is_some_and(|Reverse((_, _, region))| regions[*region].1 <= start)
+                .is_some_and(|Reverse((_, _, _, _, region))| regions[*region].1 <= start)
             {
                 active_regions.pop();
             }
-            let Some(Reverse((_, _, region))) = active_regions.peek().copied() else {
+            let Some(Reverse((_, _, _, _, region))) = active_regions.peek().copied() else {
                 continue;
             };
             let (_, region_end, target, depth, preserve_lasti, _) = regions[region];
@@ -355,7 +441,7 @@ impl LayoutAssembler {
                 }
                 run = Some((instruction.location, size));
             }
-            max_depth = max_depth.max(instruction.depth_after().unwrap_or(0));
+            max_depth = max_depth.max(instruction.maximum_stack_depth());
             instruction_index += 1;
         }
 
@@ -406,9 +492,7 @@ impl LayoutAssembler {
                     let target = label_position(labels, label).ok_or_else(|| {
                         CompileError::Internal("unbound backward jump label".to_string())
                     })?;
-                    jump_base.checked_sub(target).ok_or_else(|| {
-                        CompileError::Internal("backward jump points forward".to_string())
-                    })?
+                    backward_argument(&instruction, jump_base, target)?
                 }
             };
             let Ok(argument) = u8::try_from(argument) else {
@@ -431,7 +515,7 @@ impl LayoutAssembler {
                 }
                 run = Some((instruction.location, size));
             }
-            max_depth = max_depth.max(instruction.depth_after().unwrap_or(0));
+            max_depth = max_depth.max(instruction.maximum_stack_depth());
         }
 
         if let Some((location, length)) = run {
@@ -466,6 +550,20 @@ impl LayoutAssembler {
 
         position
     }
+}
+
+/// Resolves CPython's SEND-relative monitoring offset for an async iterator exit.
+pub(super) fn backward_argument(
+    instruction: &Instruction,
+    jump_base: u32,
+    target: u32,
+) -> Result<u32, CompileError> {
+    // CPython's assembler uses the matching SEND plus five code units, even when
+    // cold-block collection leaves CLEANUP_THROW in that position instead of END_SEND.
+    let target = target + u32::from(instruction.opcode == END_ASYNC_FOR) * 5;
+    jump_base
+        .checked_sub(target)
+        .ok_or_else(|| CompileError::Internal("backward jump points forward".to_string()))
 }
 
 pub(super) fn label_position(labels: &[Option<u32>], label: Label) -> Option<u32> {
@@ -605,7 +703,7 @@ mod tests {
 
     fn instruction(policy: ExceptionPolicy) -> Item {
         let mut instruction = Instruction::new(NOP, Operand::Value(0), SourceLocation::NONE, None);
-        instruction.exception_policy = policy;
+        instruction.set_exception_policy(policy);
         Item::Instruction(instruction)
     }
 
@@ -613,6 +711,8 @@ mod tests {
         LayoutAssembler {
             items,
             exception_regions,
+            exception_owner_provenance:
+                crate::assembler::exception_owners::ExceptionOwnerProvenance::default(),
             preserved_block_boundaries: FxHashSet::default(),
             removed_max_depth: None,
             next_label: 0,
@@ -628,6 +728,11 @@ mod tests {
         preserve_lasti: bool,
     ) -> ExceptionRegion {
         ExceptionRegion {
+            is_scope_fallback: false,
+            priority: super::super::ExceptionRegionPriority::OriginalRange(
+                Label(start),
+                Label(end),
+            ),
             start: Label(start),
             end: Label(end),
             target: Label(target),
@@ -702,6 +807,62 @@ mod tests {
                 (6, 8, 23, 4, true),
             ]
         );
+    }
+
+    #[test]
+    fn exception_sweep_keeps_scope_fallback_outside_shorter_splits() {
+        let mut fallback_prefix = region(2, 3, 5, 0, true);
+        fallback_prefix.is_scope_fallback = true;
+        let mut fallback_suffix = region(1, 6, 5, 0, true);
+        fallback_suffix.is_scope_fallback = true;
+        let assembler = layout(
+            vec![instruction(ExceptionPolicy::default()); 10],
+            vec![region(0, 1, 4, 0, false), fallback_prefix, fallback_suffix],
+        );
+        let labels = [
+            Some(0),
+            Some(8),
+            Some(2),
+            Some(4),
+            Some(20),
+            Some(21),
+            Some(10),
+        ];
+
+        let table = assembler.exception_table(&[0; 10], &labels).unwrap();
+
+        assert_eq!(
+            entries(&table),
+            [(0, 8, 20, 0, false), (8, 10, 21, 0, true)]
+        );
+    }
+
+    #[test]
+    fn late_exception_owner_repairs_keep_scope_fallback_outside_nested_handlers() {
+        for owner in [
+            NormalizedExceptionOwner::Present,
+            NormalizedExceptionOwner::OverridePresent,
+        ] {
+            let mut policy = ExceptionPolicy::default();
+            policy.set_owner(owner);
+            let mut fallback = region(1, 2, 4, 0, true);
+            fallback.is_scope_fallback = true;
+            let assembler = layout(
+                vec![
+                    instruction(ExceptionPolicy::default()),
+                    instruction(ExceptionPolicy::default()),
+                    instruction(ExceptionPolicy::default()),
+                    instruction(ExceptionPolicy::default()),
+                    instruction(policy),
+                ],
+                vec![region(0, 2, 3, 0, false), fallback],
+            );
+            let labels = [Some(0), Some(2), Some(4), Some(20), Some(21)];
+
+            let table = assembler.exception_table(&[0; 5], &labels).unwrap();
+
+            assert_eq!(entries(&table), [(0, 5, 20, 0, false)]);
+        }
     }
 
     #[test]

@@ -2,11 +2,15 @@ use std::collections::hash_map::Entry;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::code_object::{CodeObject, Constant};
+use crate::InitialInternState;
+use crate::code_object::{
+    CodeInterningSummary, CodeObject, CompilationInterningEventKind, Constant,
+};
 use crate::target::is_preinterned_string;
 
 use super::key::{
-    HashedObjectKey, ObjectKey, code_bytes_key, code_key, constant_key, constants_tuple_key,
+    FrozenSetMembers, HashedObjectKey, ObjectKey, code_bytes_key, code_key, constant_key,
+    constants_tuple_key, frozen_set_members_in_wire_order, frozen_set_members_with_properties,
     is_cached_character, local_kinds_key, locals_tuple_key, should_intern, strings_tuple_key,
 };
 use super::plan::{MarshalVisitor, ObjectId, ReferenceMode, traverse_code};
@@ -161,6 +165,7 @@ pub(super) struct ObjectGraph<'a> {
     cached_empty_tuple: Option<ObjectId>,
     cached_scalar_ids: Option<Box<[u32]>>,
     cache_scalars: bool,
+    needs_reference_sorting: bool,
     objects_by_id: Vec<Object>,
     occurrences: Vec<Occurrence>,
     #[cfg(debug_assertions)]
@@ -168,11 +173,40 @@ pub(super) struct ObjectGraph<'a> {
 }
 
 impl<'a> ObjectGraph<'a> {
+    #[cfg(test)]
     pub(super) fn for_code(code: &'a CodeObject) -> Self {
+        Self::for_code_with_intern_state(code, &InitialInternState::default())
+    }
+
+    pub(super) fn for_code_with_intern_state(
+        code: &'a CodeObject,
+        initial_intern_state: &InitialInternState,
+    ) -> Self {
+        let graph = Self::build_for_code(code, initial_intern_state, None);
+        if graph.needs_reference_sorting {
+            // Tuple members sort by complete marshal streams: their descendants' reference flags
+            // depend on sharing across the entire code graph. Resolve that sharing before recording
+            // occurrences in the final member order. Scalar-only sets do not need this extra pass.
+            Self::build_for_code(code, initial_intern_state, Some(&graph))
+        } else {
+            graph
+        }
+    }
+
+    fn build_for_code(
+        code: &'a CodeObject,
+        initial_intern_state: &InitialInternState,
+        sort_graph: Option<&Self>,
+    ) -> Self {
         let mut explicitly_interned = FxHashSet::default();
         let frozenset_recreation_need = collect_explicitly_interned(code, &mut explicitly_interned);
         let mut recreated_frozensets = FxHashSet::default();
-        collect_recreated_frozensets(code, frozenset_recreation_need, &mut recreated_frozensets);
+        collect_recreated_frozensets(
+            code,
+            frozenset_recreation_need,
+            initial_intern_state,
+            &mut recreated_frozensets,
+        );
         let explicitly_interned = (!explicitly_interned.is_empty()).then_some(&explicitly_interned);
         let recreated_frozensets =
             (!recreated_frozensets.is_empty()).then_some(&recreated_frozensets);
@@ -195,9 +229,37 @@ impl<'a> ObjectGraph<'a> {
                 graph: &mut graph,
                 explicitly_interned,
                 recreated_frozensets,
+                sort_graph,
             },
         );
         graph
+    }
+
+    pub(super) fn frozen_set_members(&self, values: &'a [Constant]) -> FrozenSetMembers<'a> {
+        if self.needs_reference_sorting {
+            frozen_set_members_with_properties(values, &|value| self.sort_key_properties(value))
+        } else {
+            frozen_set_members_in_wire_order(values)
+        }
+    }
+
+    fn sort_key_properties(&self, value: &'a Constant) -> (bool, bool) {
+        if let Constant::String(value) = value {
+            if let Some(id) = self.objects.get(&ObjectKey::ConstantString(value).into()) {
+                return (self.is_shared_object(*id), false);
+            }
+            return (
+                true,
+                should_intern(value) || self.interned_strings.contains_key(value.as_str()),
+            );
+        }
+        let key = constant_key(value);
+        let shared = Self::is_cached(&key)
+            || self
+                .objects
+                .get(&key.into())
+                .is_some_and(|id| self.is_shared_object(*id));
+        (shared, false)
     }
 
     fn reserve_for_code(&mut self, code: &CodeObject) {
@@ -518,6 +580,14 @@ fn collect_explicitly_interned<'a>(
     code: &'a CodeObject,
     values: &mut FxHashSet<&'a str>,
 ) -> FrozensetRecreationNeed {
+    // Identifier objects can enter the compilation-wide constant cache before an equal
+    // ordinary string. Preserve that recorded origin when sharing constant and metadata strings.
+    values.extend(
+        code.marshal_provenance
+            .canonical_constant_strings
+            .iter()
+            .map(String::as_str),
+    );
     let (has_qualified_name_constant, frozenset_recreation_need) =
         if code.marshal_provenance.subtree_has_frozenset_constants == Some(false) {
             (
@@ -710,15 +780,51 @@ enum FrozensetRecreationNeed {
     IdentifierDependent,
 }
 
+/// Compilation-local additions layered over the immutable initial state. Keeping
+/// these separate avoids copying a complete bootstrap profile for every module.
+struct InternedStrings<'code, 'state> {
+    initial: &'state InitialInternState,
+    added: FxHashSet<&'code str>,
+}
+
+impl<'code, 'state> InternedStrings<'code, 'state> {
+    fn new(initial: &'state InitialInternState) -> Self {
+        Self {
+            initial,
+            added: FxHashSet::default(),
+        }
+    }
+
+    fn contains(&self, value: &str) -> bool {
+        self.initial.contains(value) || self.added.contains(value)
+    }
+
+    fn insert(&mut self, value: &'code str) {
+        self.added.insert(value);
+    }
+
+    fn extend(&mut self, values: impl IntoIterator<Item = &'code str>) {
+        self.added.extend(values);
+    }
+}
+
 fn collect_recreated_frozensets(
     code: &CodeObject,
     need: FrozensetRecreationNeed,
+    initial_intern_state: &InitialInternState,
     values: &mut FxHashSet<usize>,
 ) {
     match need {
         FrozensetRecreationNeed::None => return,
-        FrozensetRecreationNeed::PreinternedOnly if !has_explicit_interns(code) => {
-            collect_preinterned_recreated_frozensets(code, values);
+        FrozensetRecreationNeed::PreinternedOnly
+            if code.marshal_provenance.interning_events.is_empty()
+                && !has_explicit_interns(code)
+                && code
+                    .marshal_provenance
+                    .canonical_constant_strings
+                    .is_empty() =>
+        {
+            collect_preinterned_recreated_frozensets(code, initial_intern_state, values);
             return;
         }
         FrozensetRecreationNeed::PreinternedOnly | FrozensetRecreationNeed::IdentifierDependent => {
@@ -726,23 +832,47 @@ fn collect_recreated_frozensets(
     }
 
     if need == FrozensetRecreationNeed::IdentifierDependent
+        && code.marshal_provenance.interning_events.is_empty()
         && !has_identifier_or_explicit_dependent_frozenset(code)
+        && code
+            .marshal_provenance
+            .canonical_constant_strings
+            .is_empty()
     {
-        collect_preinterned_recreated_frozensets(code, values);
+        collect_preinterned_recreated_frozensets(code, initial_intern_state, values);
         return;
     }
 
-    let mut interned_strings = FxHashSet::default();
-    let mut interned_constant_strings = FxHashSet::default();
+    let mut interned_strings = InternedStrings::new(initial_intern_state);
+    let mut interned_constant_strings = code
+        .marshal_provenance
+        .canonical_constant_strings
+        .iter()
+        .map(String::as_str)
+        .collect();
     if need == FrozensetRecreationNeed::IdentifierDependent {
-        collect_identifier_strings(code, &mut interned_strings);
+        collect_identifier_strings(
+            code,
+            &code.marshal_provenance.generated_mangled_strings,
+            &mut interned_strings,
+        );
     }
-    collect_code_interning(
-        code,
-        values,
-        &mut interned_strings,
-        &mut interned_constant_strings,
-    );
+    if code.marshal_provenance.interning_events.is_empty() {
+        collect_code_interning(
+            code,
+            values,
+            &code.marshal_provenance.parser_interned_strings,
+            &mut interned_strings,
+            &mut interned_constant_strings,
+        );
+    } else {
+        collect_compilation_interning(
+            code,
+            values,
+            &mut interned_strings,
+            &mut interned_constant_strings,
+        );
+    }
 }
 
 fn has_explicit_interns(code: &CodeObject) -> bool {
@@ -796,6 +926,9 @@ fn constant_frozenset_recreation_need(constant: &Constant) -> FrozensetRecreatio
     }
 }
 
+// The isolated baseline is a conservative upper bound for supplemental profiles:
+// None covers only ineligible or cached strings. Newly preinterned members remain
+// IdentifierDependent, and both fast fallbacks and chronology consult the profile.
 fn constant_string_recreation_need(constant: &Constant) -> FrozensetRecreationNeed {
     match constant {
         Constant::String(value) => {
@@ -831,9 +964,13 @@ fn constant_string_recreation_need(constant: &Constant) -> FrozensetRecreationNe
     }
 }
 
-fn collect_preinterned_recreated_frozensets(code: &CodeObject, values: &mut FxHashSet<usize>) {
+fn collect_preinterned_recreated_frozensets(
+    code: &CodeObject,
+    initial_intern_state: &InitialInternState,
+    values: &mut FxHashSet<usize>,
+) {
     for constant in &code.constants {
-        collect_preinterned_recreated_constant(constant, values);
+        collect_preinterned_recreated_constant(constant, initial_intern_state, values);
     }
 }
 
@@ -914,9 +1051,13 @@ fn constant_contains_identifier_or_explicit_dependent_string(
 
 fn code_tree_interns_string(code: &CodeObject, value: &str) -> bool {
     code.marshal_provenance
-        .explicitly_interned_strings
-        .iter()
-        .any(|interned| interned == value)
+        .parser_interned_strings
+        .contains(value)
+        || code
+            .marshal_provenance
+            .explicitly_interned_strings
+            .iter()
+            .any(|interned| interned == value)
         || code.names.iter().any(|name| name == value)
         || code.locals.iter().any(|local| local == value)
         || code.name == value
@@ -928,6 +1069,7 @@ fn code_tree_interns_string(code: &CodeObject, value: &str) -> bool {
 
 fn collect_preinterned_recreated_constant(
     constant: &Constant,
+    initial_intern_state: &InitialInternState,
     recreated_frozensets: &mut FxHashSet<usize>,
 ) -> bool {
     match constant {
@@ -935,12 +1077,16 @@ fn collect_preinterned_recreated_constant(
             should_intern(value)
                 && !value.is_empty()
                 && !is_cached_character(value)
-                && is_preinterned_string(value)
+                && initial_intern_state.contains(value)
         }
         Constant::FrozenSet(members) => {
-            let recreated = members
-                .iter()
-                .any(|member| collect_preinterned_recreated_constant(member, recreated_frozensets));
+            let recreated = members.iter().any(|member| {
+                collect_preinterned_recreated_constant(
+                    member,
+                    initial_intern_state,
+                    recreated_frozensets,
+                )
+            });
             if recreated {
                 recreated_frozensets.insert(std::ptr::from_ref(constant).addr());
             }
@@ -948,12 +1094,20 @@ fn collect_preinterned_recreated_constant(
         }
         Constant::Tuple(constants) => {
             for constant in constants.iter().rev() {
-                collect_preinterned_recreated_constant(constant, recreated_frozensets);
+                collect_preinterned_recreated_constant(
+                    constant,
+                    initial_intern_state,
+                    recreated_frozensets,
+                );
             }
             false
         }
         Constant::Code(code) => {
-            collect_preinterned_recreated_frozensets(code, recreated_frozensets);
+            collect_preinterned_recreated_frozensets(
+                code,
+                initial_intern_state,
+                recreated_frozensets,
+            );
             false
         }
         Constant::None
@@ -970,20 +1124,30 @@ fn collect_preinterned_recreated_constant(
     }
 }
 
-fn collect_identifier_strings<'a>(code: &'a CodeObject, values: &mut FxHashSet<&'a str>) {
+fn collect_identifier_strings<'a>(
+    code: &'a CodeObject,
+    generated_mangled_strings: &FxHashSet<String>,
+    values: &mut InternedStrings<'a, '_>,
+) {
+    values.extend(
+        code.marshal_provenance
+            .parser_interned_strings
+            .iter()
+            .map(String::as_str),
+    );
     values.extend(
         code.names
             .iter()
             .chain(&code.locals)
             .map(String::as_str)
-            .filter(|value| should_intern(value)),
+            .filter(|value| should_intern(value) && !generated_mangled_strings.contains(*value)),
     );
-    if should_intern(&code.name) {
+    if should_intern(&code.name) && !generated_mangled_strings.contains(&code.name) {
         values.insert(&code.name);
     }
     for constant in &code.constants {
         if let Constant::Code(code) = constant {
-            collect_identifier_strings(code, values);
+            collect_identifier_strings(code, generated_mangled_strings, values);
         }
     }
 }
@@ -991,7 +1155,8 @@ fn collect_identifier_strings<'a>(code: &'a CodeObject, values: &mut FxHashSet<&
 fn collect_code_interning<'a>(
     code: &'a CodeObject,
     recreated_frozensets: &mut FxHashSet<usize>,
-    interned_strings: &mut FxHashSet<&'a str>,
+    tracked_string_origins: &FxHashSet<String>,
+    interned_strings: &mut InternedStrings<'a, '_>,
     interned_constant_strings: &mut FxHashSet<&'a str>,
 ) {
     // Nested scopes are assembled into code objects before the containing scope.
@@ -1000,33 +1165,157 @@ fn collect_code_interning<'a>(
             collect_code_interning(
                 code,
                 recreated_frozensets,
+                tracked_string_origins,
                 interned_strings,
                 interned_constant_strings,
             );
         }
     }
 
-    // _PyCode_New interns names before constants. Explicit import/fromlist provenance identifies
-    // constant strings that are the exact same objects as those names, rather than merely equal
-    // values.
-    if !code
-        .marshal_provenance
-        .explicitly_interned_strings
-        .is_empty()
-    {
-        let mut explicit_interns: Vec<_> = code
-            .marshal_provenance
-            .explicitly_interned_strings
-            .iter()
-            .collect();
-        explicit_interns.sort_unstable();
-        for value in explicit_interns {
-            interned_strings.insert(value);
+    intern_code_object(
+        code,
+        CodeTupleOrigins::default(),
+        recreated_frozensets,
+        tracked_string_origins,
+        interned_strings,
+        interned_constant_strings,
+    );
+}
+
+/// Whether a metadata tuple reuses strings from the compiler's ordinary constant cache.
+#[derive(Clone, Copy, Default)]
+struct CodeTupleOrigins {
+    names: bool,
+    locals: bool,
+}
+
+impl CodeTupleOrigins {
+    fn record<'a>(
+        summary: &'a CodeInterningSummary,
+        tuple_origins: &mut FxHashMap<Vec<&'a str>, bool>,
+    ) -> Self {
+        // assemble.c merges names, constants, then locals before _PyCode_New interns them.
+        let names = *tuple_origins
+            .entry(summary.names.iter().map(String::as_str).collect())
+            .or_insert(false);
+        if let Some(constants) = &summary.constants_tuple {
+            tuple_origins
+                .entry(constants.iter().map(String::as_str).collect())
+                .or_insert(true);
+        }
+        let locals = *tuple_origins
+            .entry(summary.locals.iter().map(String::as_str).collect())
+            .or_insert(false);
+        Self { names, locals }
+    }
+}
+
+fn collect_compilation_interning<'a>(
+    code: &'a CodeObject,
+    recreated_frozensets: &mut FxHashSet<usize>,
+    interned_strings: &mut InternedStrings<'a, '_>,
+    interned_constant_strings: &mut FxHashSet<&'a str>,
+) {
+    fn collect_surviving<'a>(code: &'a CodeObject, codes: &mut FxHashMap<usize, &'a CodeObject>) {
+        if let Some(order) = code.marshal_provenance.assembly_order {
+            codes.insert(order, code);
+        }
+        for constant in &code.constants {
+            if let Constant::Code(child) = constant {
+                collect_surviving(child, codes);
+            }
+        }
+    }
+
+    let mut surviving = FxHashMap::default();
+    collect_surviving(code, &mut surviving);
+    let mut events: Vec<_> = code.marshal_provenance.interning_events.iter().collect();
+    events.sort_unstable_by_key(|event| event.order);
+    let mut tuple_origins = FxHashMap::default();
+    for event in events {
+        match &event.kind {
+            CompilationInterningEventKind::CachedTuple(values) => {
+                tuple_origins
+                    .entry(values.iter().map(String::as_str).collect())
+                    .or_insert(true);
+            }
+            CompilationInterningEventKind::CodeAssembly(summary) => {
+                let origins = CodeTupleOrigins::record(summary, &mut tuple_origins);
+                if let Some(current) = surviving.get(&event.order) {
+                    intern_code_object(
+                        current,
+                        origins,
+                        recreated_frozensets,
+                        &code.marshal_provenance.parser_interned_strings,
+                        interned_strings,
+                        interned_constant_strings,
+                    );
+                } else {
+                    intern_code_summary(
+                        summary,
+                        origins,
+                        &code.marshal_provenance.parser_interned_strings,
+                        interned_strings,
+                        interned_constant_strings,
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn intern_explicit_constants<'a>(
+    explicitly_interned: &'a FxHashSet<String>,
+    tracked_string_origins: &FxHashSet<String>,
+    interned_strings: &mut InternedStrings<'a, '_>,
+    interned_constant_strings: &mut FxHashSet<&'a str>,
+) {
+    let mut explicit_interns: Vec<_> = explicitly_interned.iter().collect();
+    explicit_interns.sort_unstable();
+    for value in explicit_interns {
+        interned_strings.insert(value);
+        // A later key tuple must preserve an earlier ordinary literal's cache identity.
+        if !tracked_string_origins.contains(value) {
             interned_constant_strings.insert(value);
         }
     }
-    interned_strings.extend(code.names.iter().map(String::as_str));
+}
 
+fn intern_metadata_tuple<'a>(
+    values: &'a [String],
+    constant_origin: bool,
+    interned_strings: &mut InternedStrings<'a, '_>,
+    interned_constant_strings: &mut FxHashSet<&'a str>,
+) {
+    for value in values.iter().rev() {
+        if constant_origin {
+            intern_constant_string(value, interned_strings, interned_constant_strings);
+        } else {
+            interned_strings.insert(value);
+        }
+    }
+}
+
+fn intern_code_object<'a>(
+    code: &'a CodeObject,
+    origins: CodeTupleOrigins,
+    recreated_frozensets: &mut FxHashSet<usize>,
+    tracked_string_origins: &FxHashSet<String>,
+    interned_strings: &mut InternedStrings<'a, '_>,
+    interned_constant_strings: &mut FxHashSet<&'a str>,
+) {
+    intern_explicit_constants(
+        &code.marshal_provenance.explicitly_interned_strings,
+        tracked_string_origins,
+        interned_strings,
+        interned_constant_strings,
+    );
+    intern_metadata_tuple(
+        &code.names,
+        origins.names,
+        interned_strings,
+        interned_constant_strings,
+    );
     // CPython walks each code object's constants tuple backwards.
     for constant in code.constants.iter().rev() {
         intern_code_constant(
@@ -1036,18 +1325,55 @@ fn collect_code_interning<'a>(
             interned_constant_strings,
         );
     }
-
-    interned_strings.extend(code.locals.iter().map(String::as_str));
+    intern_metadata_tuple(
+        &code.locals,
+        origins.locals,
+        interned_strings,
+        interned_constant_strings,
+    );
     interned_strings.insert(&code.filename);
     interned_strings.insert(&code.name);
     interned_strings.insert(&code.qualified_name);
+}
+
+fn intern_code_summary<'a>(
+    summary: &'a CodeInterningSummary,
+    origins: CodeTupleOrigins,
+    tracked_string_origins: &FxHashSet<String>,
+    interned_strings: &mut InternedStrings<'a, '_>,
+    interned_constant_strings: &mut FxHashSet<&'a str>,
+) {
+    intern_explicit_constants(
+        &summary.explicitly_interned_strings,
+        tracked_string_origins,
+        interned_strings,
+        interned_constant_strings,
+    );
+    intern_metadata_tuple(
+        &summary.names,
+        origins.names,
+        interned_strings,
+        interned_constant_strings,
+    );
+    for value in &summary.constant_strings {
+        intern_constant_string(value, interned_strings, interned_constant_strings);
+    }
+    intern_metadata_tuple(
+        &summary.locals,
+        origins.locals,
+        interned_strings,
+        interned_constant_strings,
+    );
+    interned_strings.insert(&summary.filename);
+    interned_strings.insert(&summary.name);
+    interned_strings.insert(&summary.qualified_name);
 }
 
 /// Returns whether CPython replaces the constant while recursively interning code constants.
 fn intern_code_constant<'a>(
     constant: &'a Constant,
     recreated_frozensets: &mut FxHashSet<usize>,
-    interned_strings: &mut FxHashSet<&'a str>,
+    interned_strings: &mut InternedStrings<'a, '_>,
     interned_constant_strings: &mut FxHashSet<&'a str>,
 ) -> bool {
     match constant {
@@ -1098,7 +1424,7 @@ fn intern_code_constant<'a>(
 
 fn intern_constant_string<'a>(
     value: &'a str,
-    interned_strings: &mut FxHashSet<&'a str>,
+    interned_strings: &mut InternedStrings<'a, '_>,
     interned_constant_strings: &mut FxHashSet<&'a str>,
 ) -> bool {
     if value.is_empty() || is_cached_character(value) {
@@ -1110,7 +1436,7 @@ fn intern_constant_string<'a>(
         return false;
     }
 
-    let replaced = is_preinterned_string(value) || interned_strings.contains(value);
+    let replaced = interned_strings.contains(value);
     interned_strings.insert(value);
     if !replaced {
         // With no earlier canonical string, CPython interns the compiler constant-cache object
@@ -1123,6 +1449,7 @@ struct GraphVisitor<'graph, 'code> {
     graph: &'graph mut ObjectGraph<'code>,
     explicitly_interned: Option<&'graph FxHashSet<&'code str>>,
     recreated_frozensets: Option<&'graph FxHashSet<usize>>,
+    sort_graph: Option<&'graph ObjectGraph<'code>>,
 }
 
 impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
@@ -1233,6 +1560,11 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
 
     #[inline]
     fn constant(&mut self, value: &'code Constant, _reference_mode: ReferenceMode) -> bool {
+        if let Constant::FrozenSet(values) = value {
+            self.graph.needs_reference_sorting |= values
+                .iter()
+                .any(|value| matches!(value, Constant::Tuple(_) | Constant::FrozenSet(_)));
+        }
         match value {
             Constant::None | Constant::Bool(_) | Constant::Ellipsis => true,
             Constant::Tuple(_) | Constant::Code(_) => {
@@ -1299,6 +1631,14 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
             _ => self
                 .graph
                 .record_keyed(OccurrenceKind::Constant, constant_key(value)),
+        }
+    }
+
+    fn frozen_set_members(&self, values: &'code [Constant]) -> FrozenSetMembers<'code> {
+        if let Some(graph) = self.sort_graph {
+            graph.frozen_set_members(values)
+        } else {
+            frozen_set_members_in_wire_order(values)
         }
     }
 

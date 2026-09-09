@@ -32,8 +32,29 @@ for function in (loop_nested_return, loop_continue):
         if instruction.opname == 'NOP'
     ])
 ";
-    common::assert_executes(
-        source,
-        "[('RETURN_VALUE', 'LOAD_CONST')]\n[('NOT_TAKEN', 'LOAD_CONST'), ('JUMP_BACKWARD', 'LOAD_CONST')]\n",
-    );
+    common::assert_matches_cpython_marshal(source, "with_loop_condition_markers.py");
+    common::assert_executes(source, "[]\n[('NOT_TAKEN', 'LOAD_CONST')]\n");
+}
+
+#[test]
+fn matches_cpython_with_cleanup_markers_after_multiple_condition_exits() {
+    for prefix in ["", "async "] {
+        for loop_header in ["for item in values", "while flag"] {
+            for condition in ["value", "0 < value < 2", "first(value) and second(value)"] {
+                for body_prefix in ["", "import math\n"] {
+                    for exit in ["return value", "continue"] {
+                        let body = format!("{body_prefix}if {condition}:\n    {exit}");
+                        let source = format!(
+                            "{prefix}def f(manager, values, flag, first, second):\n    {loop_header}:\n        try:\n            with manager as value:\n                {}\n        except Error:\n            pass\n        work()\n",
+                            body.replace('\n', "\n                "),
+                        );
+                        common::assert_matches_cpython_marshal(
+                            &source,
+                            "with_cleanup_multiple_condition_exits.py",
+                        );
+                    }
+                }
+            }
+        }
+    }
 }

@@ -5,6 +5,8 @@ use ruff_python_ast::visitor::{Visitor, walk_expr, walk_pattern, walk_stmt};
 use ruff_python_ast::{Expr, ExprContext, Pattern, Stmt};
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use super::expression::{InterpolatedStringComponent, format_spec_components, fstring_components};
+use super::scope::collect_target_names;
 use super::{
     BINARY_OP, BUILD_TUPLE, CALL_INTRINSIC_1, CALL_INTRINSIC_2, COMPARE_OP, CONVERT_VALUE,
     DELETE_DEREF, DELETE_FAST, DELETE_GLOBAL, DELETE_NAME, LOAD_COMMON_CONSTANT, LOAD_DEREF,
@@ -15,7 +17,7 @@ use super::{
 use crate::CompileError;
 use crate::assembler::{EmittedInstruction, EmittedJump, ExceptionPolicy, Label, SourceLocation};
 use crate::code_object::Constant;
-use crate::target::code_flags::{CO_ASYNC_GENERATOR, CO_COROUTINE};
+use crate::target::code_flags::{CO_ASYNC_GENERATOR, CO_COROUTINE, CO_FUTURE_ANNOTATIONS};
 use crate::target::operands::{
     BinaryIntrinsic, BinaryOperation, CommonConstant, ComparisonOperation, Conversion,
     FunctionAttribute, ResumeLocation, SpecialMethod, UnaryIntrinsic,
@@ -25,11 +27,12 @@ use crate::target::{Opcode, is_unconditional_jump};
 
 use super::RETURN_VALUE;
 
-use super::constant::literal_constant;
+use super::constant::{DeferredConstantTarget, constant_slice, fold_constant, literal_constant};
 use super::scope::{NameId, NameSet, definitely_evaluated_references};
+use super::source::unparse_annotation;
 use super::{Compiler, Scope};
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(super) struct SymbolState {
     pub(super) locals: Vec<NameId>,
     pub(super) fast_local_count: usize,
@@ -39,6 +42,7 @@ pub(super) struct SymbolState {
     pub(super) hidden_names: NameSet,
     pub(super) active_temporaries: NameSet,
     pub(super) active_temporary_fast_cells: NameSet,
+    pub(super) active_temporary_free_cells: NameSet,
     pub(super) initialized_locals: NameSet,
     pub(super) owned_load_locals: NameSet,
     pub(super) imported_scope_names: NameSet,
@@ -183,15 +187,23 @@ impl Compiler<'_> {
             .and_then(|name| self.symbols.temporary_indices.get(&name).copied())
     }
 
+    fn active_temporary_index(&self, name: NameId) -> u32 {
+        if self.symbols.active_temporary_free_cells.contains(name)
+            && let Scope::Function { free_indices, .. } = &self.unit.scope
+        {
+            return free_indices[&name];
+        }
+        self.symbols
+            .temporary_indices
+            .get(&name)
+            .copied()
+            .expect("active temporary should have an index")
+    }
+
     pub(super) fn load_name(&mut self, name: &str) -> Result<(), CompileError> {
         let name_id = self.required_name_id(name);
         if self.symbols.active_temporaries.contains(name_id) {
-            let index = self
-                .symbols
-                .temporary_indices
-                .get(&name_id)
-                .copied()
-                .expect("active temporary should have an index");
+            let index = self.active_temporary_index(name_id);
             return self.emit(
                 if self.symbols.cell_names.contains(name_id)
                     && !self.symbols.active_temporary_fast_cells.contains(name_id)
@@ -226,7 +238,7 @@ impl Compiler<'_> {
                     if self
                         .control
                         .comprehensions
-                        .active_comprehension_cleanups
+                        .active_comprehension_local_names
                         .is_empty()
                     {
                         self.emit(LOAD_LOCALS, 0, 1)?;
@@ -239,7 +251,7 @@ impl Compiler<'_> {
                     if self
                         .control
                         .comprehensions
-                        .active_comprehension_cleanups
+                        .active_comprehension_local_names
                         .is_empty()
                     {
                         self.emit(LOAD_NAME, index, 1)
@@ -364,12 +376,7 @@ impl Compiler<'_> {
 
     fn store_name_with_id(&mut self, name: &str, name_id: NameId) -> Result<(), CompileError> {
         if self.symbols.active_temporaries.contains(name_id) {
-            let index = self
-                .symbols
-                .temporary_indices
-                .get(&name_id)
-                .copied()
-                .expect("active temporary should have an index");
+            let index = self.active_temporary_index(name_id);
             return self.emit(
                 if self.symbols.cell_names.contains(name_id)
                     && !self.symbols.active_temporary_fast_cells.contains(name_id)
@@ -420,15 +427,16 @@ impl Compiler<'_> {
                     let index = self.name_index_with_id(name, name_id)?;
                     return self.emit(STORE_GLOBAL, index, -1);
                 }
-                if let Some(index) = indices.get(&name_id).copied() {
+                // An inactive comprehension temporary does not replace a nonlocal binding.
+                if let Some(index) = free_indices.get(&name_id).copied() {
+                    self.emit(STORE_DEREF, index, -1)
+                } else if let Some(index) = indices.get(&name_id).copied() {
                     self.symbols.initialized_locals.insert(name_id);
                     if cells.contains(name_id) {
                         self.emit(STORE_DEREF, index, -1)
                     } else {
                         self.emit(STORE_FAST, index, -1)
                     }
-                } else if let Some(index) = free_indices.get(&name_id).copied() {
-                    self.emit(STORE_DEREF, index, -1)
                 } else {
                     Err(CompileError::Internal(format!(
                         "missing local variable `{name}`"
@@ -451,12 +459,7 @@ impl Compiler<'_> {
 
     fn delete_name_with_id(&mut self, name: &str, name_id: NameId) -> Result<(), CompileError> {
         if self.symbols.active_temporaries.contains(name_id) {
-            let index = self
-                .symbols
-                .temporary_indices
-                .get(&name_id)
-                .copied()
-                .expect("active temporary should have an index");
+            let index = self.active_temporary_index(name_id);
             return self.emit(
                 if self.symbols.cell_names.contains(name_id)
                     && !self.symbols.active_temporary_fast_cells.contains(name_id)
@@ -507,15 +510,15 @@ impl Compiler<'_> {
                     let index = self.name_index_with_id(name, name_id)?;
                     return self.emit(DELETE_GLOBAL, index, 0);
                 }
-                if let Some(index) = indices.get(&name_id).copied() {
+                if let Some(index) = free_indices.get(&name_id).copied() {
+                    self.emit(DELETE_DEREF, index, 0)
+                } else if let Some(index) = indices.get(&name_id).copied() {
                     self.symbols.initialized_locals.remove(name_id);
                     if cells.contains(name_id) {
                         self.emit(DELETE_DEREF, index, 0)
                     } else {
                         self.emit(DELETE_FAST, index, 0)
                     }
-                } else if let Some(index) = free_indices.get(&name_id).copied() {
-                    self.emit(DELETE_DEREF, index, 0)
                 } else {
                     Err(CompileError::Internal(format!(
                         "missing local variable `{name}`"
@@ -531,6 +534,11 @@ impl Compiler<'_> {
     }
 
     fn closure_index_id(&self, name: NameId) -> Result<u32, CompileError> {
+        if self.symbols.active_temporaries.contains(name)
+            && self.symbols.active_temporary_free_cells.contains(name)
+        {
+            return Ok(self.active_temporary_index(name));
+        }
         match &self.unit.scope {
             Scope::Module => self
                 .symbols
@@ -564,9 +572,11 @@ impl Compiler<'_> {
                 indices,
                 free_indices,
                 ..
-            } => indices
-                .get(&name)
-                .or_else(|| free_indices.get(&name))
+            } => (if self.symbols.active_temporaries.contains(name) {
+                indices.get(&name).or_else(|| free_indices.get(&name))
+            } else {
+                free_indices.get(&name).or_else(|| indices.get(&name))
+            })
                 .copied()
                 .ok_or_else(|| {
                     CompileError::Internal(format!(
@@ -586,17 +596,26 @@ impl Compiler<'_> {
 
     pub(super) fn can_provide_closure_id(&self, name: NameId) -> bool {
         match &self.unit.scope {
-            Scope::Module => self.symbols.cell_names.contains(name),
+            Scope::Module => {
+                // Module cells belong to active inlined comprehensions, not module bindings.
+                self.symbols.cell_names.contains(name)
+                    && self.symbols.active_temporaries.contains(name)
+            }
             Scope::Class { free_indices, .. } => {
-                self.symbols.cell_names.contains(name) || free_indices.contains_key(&name)
+                (self.symbols.cell_names.contains(name)
+                    && (!self.symbols.hidden_names.contains(name)
+                        || self.symbols.active_temporaries.contains(name)))
+                    || free_indices.contains_key(&name)
             }
             Scope::Function {
                 indices,
                 free_indices,
                 cells,
-                ..
+                globals,
             } => {
-                indices.contains_key(&name) && cells.contains(name)
+                indices.contains_key(&name)
+                    && cells.contains(name)
+                    && (!globals.contains(name) || self.symbols.active_temporaries.contains(name))
                     || free_indices.contains_key(&name)
             }
         }
@@ -622,7 +641,13 @@ impl Compiler<'_> {
         for (restores, location) in restores {
             self.assembler.set_location(location);
             let mut last_restore = None;
-            for (position, restore) in restores.iter().copied().enumerate() {
+            // Static SWAP elimination moves the assignment before the reversed restores,
+            // exchanging it with the last saved local's first restore instruction.
+            let (last, preceding) = restores
+                .split_last()
+                .expect("pending restores should not be empty");
+            let ordered_restores = preceding.iter().rev().chain(std::iter::once(last));
+            for (position, restore) in ordered_restores.copied().enumerate() {
                 self.assembler.fusion_barrier();
                 if position > 0 {
                     self.assembler.set_location(location);
@@ -721,27 +746,209 @@ impl Compiler<'_> {
     }
 
     pub(super) fn mangled_name(&self, name: &str) -> String {
+        if self
+            .unit
+            .mangled_names
+            .as_ref()
+            .is_some_and(|names| !names.contains(name))
+        {
+            return name.to_string();
+        }
         mangle_name(name, self.unit.private_name.as_deref()).into_owned()
     }
 
     pub(super) fn pre_register_suite_names(&mut self, body: &[Stmt]) -> Result<(), CompileError> {
-        self.pre_register_suite_names_filtered(body, false)
+        // CPython visits discarded branches before pruning their instructions. Constants reused
+        // by surviving code keep the position reserved by that first visit.
+        self.pre_register_suite_names_filtered(body, true, None)
+    }
+
+    pub(super) fn pre_register_conditionally_discarded_suite(
+        &mut self,
+        body: &[Stmt],
+    ) -> Result<(), CompileError> {
+        self.pre_register_suite_names_with_folds(body, true, true, None, None)
     }
 
     pub(super) fn pre_register_suite_names_filtered(
         &mut self,
         body: &[Stmt],
-        skip_debug: bool,
+        register_literals: bool,
+        first_expression: Option<&Expr>,
     ) -> Result<(), CompileError> {
-        #[derive(Default)]
-        struct Collector {
-            names: Vec<(String, bool)>,
-            skip_debug: bool,
+        self.pre_register_suite_names_with_folds(
+            body,
+            register_literals,
+            false,
+            first_expression,
+            None,
+        )
+    }
+
+    pub(super) fn pre_register_discarded_expression(
+        &mut self,
+        expression: &Expr,
+        admission: Option<Label>,
+    ) -> Result<(), CompileError> {
+        // Both arms are lowered before a constant condition is pruned. Literals and
+        // values folded in the discarded arm keep their original cache admission order.
+        let first_fold = self.output.deferred_constants.len();
+        self.pre_register_suite_names_with_folds(&[], true, true, None, Some(expression))?;
+        if self.output.deferred_constants.len() > first_fold {
+            let admission = admission.unwrap_or_else(|| {
+                let label = self.assembler.label();
+                self.assembler.mark(label);
+                label
+            });
+            for (target, _) in &mut self.output.deferred_constants[first_fold..] {
+                debug_assert!(target.is_none());
+                *target = Some(DeferredConstantTarget::DiscardedExpression(admission));
+            }
+        }
+        Ok(())
+    }
+
+    fn pre_register_suite_names_with_folds(
+        &mut self,
+        body: &[Stmt],
+        register_literals: bool,
+        register_folds: bool,
+        first_expression: Option<&Expr>,
+        expression_only: Option<&Expr>,
+    ) -> Result<(), CompileError> {
+        // Run cache admissions and real child builders in source order. Each child action owns
+        // its defaults, decorators, and nested scopes; the disposable parent is never assembled.
+        enum SkippedAction<'ast> {
+            Origins(Vec<(Constant, bool)>),
+            Statement(&'ast Stmt),
+            Expression(&'ast Expr),
+            FirstExpression(&'ast Expr),
         }
 
-        impl<'ast> Visitor<'ast> for Collector {
+        #[derive(Default)]
+        struct Collector<'source, 'ast> {
+            actions: Vec<SkippedAction<'ast>>,
+            build_discarded: bool,
+            names: Vec<(String, bool)>,
+            constants: Vec<Constant>,
+            folded_expressions: Vec<&'ast Expr>,
+            has_untracked_collection: bool,
+            register_literals: bool,
+            register_folds: bool,
+            string_origin_constants: Vec<(Constant, bool)>,
+            record_string_origins: bool,
+            private_name: Option<String>,
+            inlined_targets: Vec<String>,
+            future_annotations: bool,
+            source: &'source str,
+        }
+
+        impl<'ast> Collector<'_, 'ast> {
+            fn record_interpolated_constant(&mut self, constant: Constant) {
+                if self.record_string_origins {
+                    self.string_origin_constants.push((constant.clone(), false));
+                }
+                if self.register_literals {
+                    self.constants.push(constant);
+                }
+            }
+
+            fn visit_interpolated_components(
+                &mut self,
+                components: Vec<InterpolatedStringComponent<'ast>>,
+            ) {
+                if components.len() > 30 || components.is_empty() {
+                    self.record_interpolated_constant(Constant::String(String::new()));
+                }
+                if components.len() > 30 {
+                    self.names.push(("join".to_string(), true));
+                }
+                for component in components {
+                    match component {
+                        InterpolatedStringComponent::Literal(literal) => {
+                            self.record_interpolated_constant(literal.into_constant());
+                        }
+                        InterpolatedStringComponent::Interpolation(interpolation, is_raw) => {
+                            self.visit_expr(&interpolation.expression);
+                            if let Some(specification) = &interpolation.format_spec {
+                                self.visit_interpolated_components(format_spec_components(
+                                    &specification.elements,
+                                    is_raw,
+                                    self.source,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+
+            fn flush_origins(&mut self) {
+                if !self.string_origin_constants.is_empty() {
+                    self.actions.push(SkippedAction::Origins(std::mem::take(
+                        &mut self.string_origin_constants,
+                    )));
+                }
+            }
+
+            fn record_key_origin(&mut self, raw: &str) {
+                if self.record_string_origins {
+                    let mangled = mangle_name(raw, self.private_name.as_deref());
+                    let interned = mangled == raw;
+                    self.string_origin_constants
+                        .push((Constant::String(mangled.into_owned()), interned));
+                }
+            }
+
+            fn origin_collector(&self, private_name: Option<String>) -> Self {
+                Self {
+                    record_string_origins: true,
+                    private_name,
+                    future_annotations: self.future_annotations,
+                    source: self.source,
+                    ..Self::default()
+                }
+            }
+
+            fn record_annotation(&mut self, name: &str, annotation: &'ast Expr) {
+                self.record_key_origin(name);
+                if self.future_annotations {
+                    self.string_origin_constants.push((
+                        Constant::String(unparse_annotation(annotation, self.source)),
+                        false,
+                    ));
+                } else {
+                    self.visit_expr(annotation);
+                }
+            }
+
+            fn visit_scope_body(&mut self, body: &'ast [Stmt]) {
+                if let Some(Stmt::Expr(statement)) = body.first()
+                    && let Some(docstring @ Constant::String(_)) =
+                        literal_constant(&statement.value)
+                {
+                    self.string_origin_constants.push((docstring, false));
+                }
+                self.visit_body(body);
+            }
+        }
+
+        impl<'ast> Visitor<'ast> for Collector<'_, 'ast> {
+            fn visit_body(&mut self, body: &'ast [Stmt]) {
+                let register_folds = self.register_folds;
+                for statement in body {
+                    self.visit_stmt(statement);
+                    if super::statement::suite_terminates(std::slice::from_ref(statement)) {
+                        self.register_folds = false;
+                    }
+                }
+                self.register_folds = register_folds;
+            }
+
             fn visit_stmt(&mut self, statement: &'ast Stmt) {
                 match statement {
+                    Stmt::Expr(expression) if literal_constant(&expression.value).is_some() => {
+                        return;
+                    }
                     Stmt::AnnAssign(assignment) => {
                         if let Some(value) = &assignment.value {
                             self.visit_expr(value);
@@ -749,7 +956,25 @@ impl Compiler<'_> {
                         }
                         return;
                     }
+                    Stmt::For(statement) if statement.is_async => {
+                        self.visit_expr(&statement.iter);
+                        // GET_ANEXT loads None before assigning the yielded item, even when
+                        // the surrounding suite is removed by later reachability analysis.
+                        if self.register_literals {
+                            self.constants.push(Constant::None);
+                        }
+                        self.visit_expr(&statement.target);
+                        self.visit_body(&statement.body);
+                        self.visit_body(&statement.orelse);
+                        return;
+                    }
                     Stmt::FunctionDef(definition) => {
+                        let build = self.build_discarded && self.record_string_origins;
+                        if build {
+                            self.flush_origins();
+                            self.actions.push(SkippedAction::Statement(statement));
+                            self.record_string_origins = false;
+                        }
                         for decorator in &definition.decorator_list {
                             self.visit_expr(&decorator.expression);
                         }
@@ -758,19 +983,81 @@ impl Compiler<'_> {
                             .posonlyargs
                             .iter()
                             .chain(&definition.parameters.args)
-                            .chain(&definition.parameters.kwonlyargs)
                         {
                             if let Some(default) = &parameter.default {
                                 self.visit_expr(default);
                             }
+                        }
+                        for parameter in &definition.parameters.kwonlyargs {
+                            if let Some(default) = &parameter.default {
+                                self.record_key_origin(parameter.name().as_str());
+                                self.visit_expr(default);
+                            }
+                        }
+                        if self.record_string_origins {
+                            let mut child = self.origin_collector(self.private_name.clone());
+                            if let Some(parameters) = &definition.type_params {
+                                child.visit_type_params(parameters);
+                            }
+                            let parameters = &definition.parameters;
+                            for parameter in parameters
+                                .args
+                                .iter()
+                                .chain(&parameters.posonlyargs)
+                                .map(|parameter| &parameter.parameter)
+                                .chain(parameters.vararg.as_deref())
+                                .chain(
+                                    parameters
+                                        .kwonlyargs
+                                        .iter()
+                                        .map(|parameter| &parameter.parameter),
+                                )
+                                .chain(parameters.kwarg.as_deref())
+                            {
+                                if let Some(annotation) = &parameter.annotation {
+                                    child.record_annotation(parameter.name.as_str(), annotation);
+                                }
+                            }
+                            if let Some(annotation) = &definition.returns {
+                                child.record_annotation("return", annotation);
+                            }
+                            child.visit_scope_body(&definition.body);
+                            self.string_origin_constants
+                                .extend(child.string_origin_constants);
+                        }
+                        if build {
+                            self.record_string_origins = true;
+                            self.string_origin_constants.clear();
                         }
                         self.names
                             .push((definition.name.as_str().to_string(), false));
                         return;
                     }
                     Stmt::ClassDef(definition) => {
+                        let build = self.build_discarded && self.record_string_origins;
+                        if build {
+                            self.flush_origins();
+                            self.actions.push(SkippedAction::Statement(statement));
+                            self.record_string_origins = false;
+                        }
                         for decorator in &definition.decorator_list {
                             self.visit_expr(&decorator.expression);
+                        }
+                        if self.record_string_origins {
+                            let mut child =
+                                self.origin_collector(Some(definition.name.to_string()));
+                            if let Some(parameters) = &definition.type_params {
+                                child.visit_type_params(parameters);
+                            }
+                            child.visit_scope_body(&definition.body);
+                            self.string_origin_constants
+                                .extend(child.string_origin_constants);
+                            self.string_origin_constants
+                                .push((Constant::String(definition.name.to_string()), true));
+                        }
+                        if self.register_literals && definition.type_params.is_none() {
+                            self.constants
+                                .push(Constant::String(definition.name.to_string()));
                         }
                         if definition.type_params.is_none()
                             && let Some(arguments) = definition.arguments.as_deref()
@@ -782,13 +1069,45 @@ impl Compiler<'_> {
                                 self.visit_expr(&keyword.value);
                             }
                         }
+                        if build {
+                            self.record_string_origins = true;
+                            self.string_origin_constants.clear();
+                        }
                         self.names
                             .push((definition.name.as_str().to_string(), false));
+                        return;
+                    }
+                    Stmt::With(with_statement)
+                        if self.register_literals && !with_statement.is_async =>
+                    {
+                        walk_stmt(self, statement);
+                        self.constants.push(Constant::None);
+                        return;
+                    }
+                    Stmt::TypeAlias(alias)
+                        if self.build_discarded && self.record_string_origins =>
+                    {
+                        self.flush_origins();
+                        self.actions.push(SkippedAction::Statement(statement));
+                        if let Expr::Name(name) = alias.name.as_ref() {
+                            self.names.push((name.id.to_string(), false));
+                        }
                         return;
                     }
                     Stmt::TypeAlias(statement) => {
                         if let Expr::Name(name) = statement.name.as_ref() {
                             self.names.push((name.id.as_str().to_string(), false));
+                            if self.record_string_origins {
+                                self.string_origin_constants
+                                    .push((Constant::String(name.id.to_string()), true));
+                                let mut child = self.origin_collector(self.private_name.clone());
+                                if let Some(parameters) = &statement.type_params {
+                                    child.visit_type_params(parameters);
+                                }
+                                child.visit_expr(&statement.value);
+                                self.string_origin_constants
+                                    .extend(child.string_origin_constants);
+                            }
                         }
                         return;
                     }
@@ -796,6 +1115,11 @@ impl Compiler<'_> {
                         for alias in &import.names {
                             let imported = alias.name.as_str();
                             self.names.push((imported.to_string(), true));
+                            if alias.asname.is_some() {
+                                for component in imported.split('.').skip(1) {
+                                    self.names.push((component.to_string(), true));
+                                }
+                            }
                             let bound = alias.asname.as_ref().map_or_else(
                                 || imported.split('.').next().unwrap_or(imported),
                                 |name| name.as_str(),
@@ -805,6 +1129,18 @@ impl Compiler<'_> {
                         return;
                     }
                     Stmt::ImportFrom(import) => {
+                        if self.record_string_origins {
+                            self.string_origin_constants.push((
+                                Constant::Tuple(
+                                    import
+                                        .names
+                                        .iter()
+                                        .map(|alias| Constant::String(alias.name.to_string()))
+                                        .collect(),
+                                ),
+                                true,
+                            ));
+                        }
                         if let Some(module) = &import.module {
                             self.names.push((module.as_str().to_string(), true));
                         }
@@ -831,17 +1167,377 @@ impl Compiler<'_> {
                 if let Some(name) = &handler.name {
                     self.names.push((name.as_str().to_string(), false));
                 }
-                for statement in &handler.body {
-                    self.visit_stmt(statement);
+                self.visit_body(&handler.body);
+            }
+
+            fn visit_type_param(&mut self, parameter: &'ast ruff_python_ast::TypeParam) {
+                if self.record_string_origins {
+                    self.string_origin_constants
+                        .push((Constant::String(parameter.name().to_string()), true));
                 }
+                ruff_python_ast::visitor::walk_type_param(self, parameter);
             }
 
             fn visit_expr(&mut self, expression: &'ast Expr) {
+                let elements = match expression {
+                    Expr::Tuple(tuple) => Some(tuple.elts.as_slice()),
+                    Expr::List(list) => Some(list.elts.as_slice()),
+                    Expr::Set(set) => Some(set.elts.as_slice()),
+                    _ => None,
+                };
+                if elements.is_some_and(|elements| {
+                    elements
+                        .iter()
+                        .any(|element| fold_constant(element).is_none())
+                }) {
+                    self.has_untracked_collection = true;
+                }
+                if let Expr::Slice(slice) = expression
+                    && let Some(constant) = constant_slice(slice)
+                {
+                    // CPython constructs literal slices during code generation, before
+                    // flowgraph folds and before constants in later discarded statements.
+                    if self.record_string_origins {
+                        self.string_origin_constants.push((constant.clone(), false));
+                    }
+                    if self.register_literals {
+                        self.constants.push(constant);
+                    }
+                    return;
+                }
+                if self.register_folds
+                    && literal_constant(expression).is_none()
+                    && fold_constant(expression).is_some()
+                {
+                    self.folded_expressions.push(expression);
+                }
+                if let Expr::FString(fstring) = expression {
+                    self.visit_interpolated_components(fstring_components(fstring, self.source));
+                    return;
+                }
+                if self.record_string_origins
+                    && let Some(constant) = literal_constant(expression)
+                {
+                    // The constant cache sees the original operands before later folding.
+                    self.string_origin_constants.push((constant, false));
+                }
+                if self.register_literals
+                    && let Some(constant) = literal_constant(expression)
+                {
+                    self.constants.push(constant);
+                    return;
+                }
+                match expression {
+                    Expr::Call(call) if self.record_string_origins || self.register_literals => {
+                        self.visit_expr(&call.func);
+                        for argument in &call.arguments.args {
+                            self.visit_expr(argument);
+                        }
+                        let expanded = call.arguments.args.iter().any(Expr::is_starred_expr)
+                            || call
+                                .arguments
+                                .keywords
+                                .iter()
+                                .any(|keyword| keyword.arg.is_none())
+                            || (!matches!(call.func.as_ref(), Expr::Attribute(_))
+                                && call.arguments.args.len() + call.arguments.keywords.len() * 2
+                                    > 30);
+                        if expanded {
+                            for keyword in &call.arguments.keywords {
+                                if let Some(name) = &keyword.arg {
+                                    if self.register_literals {
+                                        self.constants.push(Constant::String(name.to_string()));
+                                    }
+                                    self.string_origin_constants
+                                        .push((Constant::String(name.to_string()), true));
+                                }
+                                self.visit_expr(&keyword.value);
+                            }
+                        } else {
+                            for keyword in &call.arguments.keywords {
+                                self.visit_expr(&keyword.value);
+                            }
+                            let names = Constant::Tuple(
+                                call.arguments
+                                    .keywords
+                                    .iter()
+                                    .map(|keyword| {
+                                        Constant::String(keyword.arg.as_ref().unwrap().to_string())
+                                    })
+                                    .collect(),
+                            );
+                            if self.register_literals && !call.arguments.keywords.is_empty() {
+                                self.constants.push(names.clone());
+                            }
+                            self.string_origin_constants.push((names, true));
+                        }
+                        return;
+                    }
+                    Expr::Name(name)
+                        if name.ctx == ExprContext::Load && name.id.as_str() == "__debug__" =>
+                    {
+                        // AST preprocessing rewrites this load before discarded code is
+                        // visited, so it reserves a boolean constant rather than a name.
+                        if self.register_literals {
+                            self.constants.push(Constant::Bool(true));
+                        }
+                    }
+                    Expr::Name(name) => {
+                        if !self
+                            .inlined_targets
+                            .iter()
+                            .any(|target| target == name.id.as_str())
+                        {
+                            self.names.push((name.id.as_str().to_string(), false));
+                        }
+                    }
+                    Expr::Attribute(attribute) => {
+                        self.visit_expr(&attribute.value);
+                        self.names.push((attribute.attr.as_str().to_string(), true));
+                        return;
+                    }
+                    Expr::Await(expression) if self.register_literals => {
+                        self.visit_expr(&expression.value);
+                        self.constants.push(Constant::None);
+                        return;
+                    }
+                    Expr::YieldFrom(expression) if self.register_literals => {
+                        // SEND starts with None, even when its block is later discarded.
+                        self.visit_expr(&expression.value);
+                        self.constants.push(Constant::None);
+                        return;
+                    }
+                    Expr::Yield(expression)
+                        if self.register_literals && expression.value.is_none() =>
+                    {
+                        self.constants.push(Constant::None);
+                        return;
+                    }
+                    Expr::Lambda(lambda) => {
+                        let build = self.build_discarded && self.record_string_origins;
+                        if build {
+                            self.flush_origins();
+                            self.actions.push(SkippedAction::Expression(expression));
+                            self.record_string_origins = false;
+                        }
+                        if let Some(parameters) = lambda.parameters.as_deref() {
+                            for parameter in parameters.posonlyargs.iter().chain(&parameters.args) {
+                                if let Some(default) = &parameter.default {
+                                    self.visit_expr(default);
+                                }
+                            }
+                            for parameter in &parameters.kwonlyargs {
+                                if let Some(default) = &parameter.default {
+                                    self.record_key_origin(parameter.name().as_str());
+                                    self.visit_expr(default);
+                                }
+                            }
+                        }
+                        if self.record_string_origins {
+                            let mut child = self.origin_collector(self.private_name.clone());
+                            child.visit_expr(&lambda.body);
+                            self.string_origin_constants
+                                .extend(child.string_origin_constants);
+                        }
+                        if build {
+                            self.record_string_origins = true;
+                            self.string_origin_constants.clear();
+                        }
+                        return;
+                    }
+                    Expr::Generator(generator) => {
+                        let build = self.build_discarded && self.record_string_origins;
+                        if build {
+                            self.flush_origins();
+                            self.actions.push(SkippedAction::Expression(expression));
+                            self.record_string_origins = false;
+                        }
+                        // Only the outer iterable runs in this scope; the generator body has
+                        // its own name table, even when its enclosing branch is eliminated.
+                        if let Some(first) = generator.generators.first() {
+                            self.visit_expr(&first.iter);
+                        }
+                        if build {
+                            self.record_string_origins = true;
+                            self.string_origin_constants.clear();
+                        }
+                        return;
+                    }
+                    _ => {}
+                }
+                let comprehension = match expression {
+                    Expr::ListComp(comprehension) => {
+                        Some((&comprehension.generators, None, comprehension.elt.as_ref()))
+                    }
+                    Expr::SetComp(comprehension) => {
+                        Some((&comprehension.generators, None, comprehension.elt.as_ref()))
+                    }
+                    Expr::DictComp(comprehension) => Some((
+                        &comprehension.generators,
+                        comprehension.key.as_deref(),
+                        comprehension.value.as_ref(),
+                    )),
+                    _ => None,
+                };
+                if let Some((generators, key, value)) = comprehension {
+                    let build = self.build_discarded && self.record_string_origins;
+                    if build {
+                        self.flush_origins();
+                        self.actions.push(SkippedAction::Expression(expression));
+                        self.record_string_origins = false;
+                    }
+                    if let Some(first) = generators.first() {
+                        self.visit_expr(&first.iter);
+                    }
+                    // Hidden fast locals apply only inside this comprehension. The same
+                    // spelling in a surrounding dead suite still belongs in its name table.
+                    let outer_target_count = self.inlined_targets.len();
+                    for generator in generators {
+                        collect_target_names(&generator.target, &mut self.inlined_targets);
+                    }
+                    for (index, generator) in generators.iter().enumerate() {
+                        if index > 0 {
+                            self.visit_expr(&generator.iter);
+                        }
+                        self.visit_expr(&generator.target);
+                        for condition in &generator.ifs {
+                            self.visit_expr(condition);
+                        }
+                    }
+                    if let Some(key) = key {
+                        self.visit_expr(key);
+                    }
+                    self.visit_expr(value);
+                    self.inlined_targets.truncate(outer_target_count);
+                    if build {
+                        self.record_string_origins = true;
+                        self.string_origin_constants.clear();
+                    }
+                    return;
+                }
+                walk_expr(self, expression);
+            }
+
+            fn visit_pattern(&mut self, pattern: &'ast Pattern) {
+                let capture = match pattern {
+                    Pattern::MatchAs(pattern) => pattern.name.as_ref(),
+                    Pattern::MatchStar(pattern) => pattern.name.as_ref(),
+                    Pattern::MatchMapping(pattern) => pattern.rest.as_ref(),
+                    _ => None,
+                };
+                if let Some(name) = capture {
+                    self.names.push((name.as_str().to_string(), false));
+                }
+                walk_pattern(self, pattern);
+            }
+        }
+
+        let mut collector = Collector {
+            register_literals,
+            register_folds,
+            build_discarded: self.context.requires_interning_trace,
+            record_string_origins: self.context.has_tracked_string_origins(),
+            private_name: self.unit.private_name.clone(),
+            future_annotations: self.unit.flags & CO_FUTURE_ANNOTATIONS != 0,
+            source: self.context.source,
+            ..Collector::default()
+        };
+        if let Some(expression) = expression_only {
+            collector.visit_expr(expression);
+        } else if let Some(expression) = first_expression {
+            // Compile this whole expression once: its first constant may come from a
+            // lambda default, or from a generator child before its outer iterable.
+            collector
+                .actions
+                .push(SkippedAction::FirstExpression(expression));
+            let record_string_origins = collector.record_string_origins;
+            collector.record_string_origins = false;
+            collector.visit_stmt(&body[0]);
+            collector.record_string_origins = record_string_origins;
+            collector.visit_body(&body[1..]);
+        } else {
+            collector.visit_body(body);
+        }
+        collector.flush_origins();
+        let mut builder = (collector.build_discarded || first_expression.is_some())
+            .then(|| self.discarded_builder());
+        for action in collector.actions {
+            match action {
+                SkippedAction::Origins(origins) => {
+                    for (constant, interned) in origins {
+                        self.context
+                            .record_constant_string_origins(&constant, interned);
+                    }
+                }
+                SkippedAction::Statement(statement) => {
+                    let builder = builder.as_mut().unwrap();
+                    match statement {
+                        Stmt::FunctionDef(definition) => {
+                            builder.compile_function_definition(definition)?;
+                        }
+                        Stmt::ClassDef(definition) => {
+                            builder.compile_class_definition(definition)?;
+                        }
+                        Stmt::TypeAlias(alias) => builder.compile_type_alias(alias)?,
+                        _ => unreachable!(),
+                    }
+                }
+                SkippedAction::Expression(expression) => {
+                    let builder = builder.as_mut().unwrap();
+                    builder.compile_expression(expression)?;
+                    builder.emit(super::POP_TOP, 0, -1)?;
+                }
+                SkippedAction::FirstExpression(expression) => {
+                    let builder = builder.as_mut().unwrap();
+                    builder.compile_expression(expression)?;
+                    self.retain_discarded_first_constant(builder)?;
+                    builder.emit(super::POP_TOP, 0, -1)?;
+                }
+            }
+        }
+        self.output.has_untracked_discarded_collection |= collector.has_untracked_collection;
+        for constant in collector.constants {
+            self.add_constant(constant)?;
+        }
+        // The first CFG reachability pass retains both edges of a constant condition.
+        // Its discarded branch can therefore create a folded value before the later
+        // reachability pass removes the branch; surviving uses retain that cache slot.
+        for expression in collector.folded_expressions {
+            self.record_folded_value(expression)?;
+        }
+        for (name, force_name) in collector.names {
+            let name_id = self.required_name_id(&name);
+            let is_local_or_free = matches!(
+                &self.unit.scope,
+                Scope::Function {
+                    indices,
+                    free_indices,
+                    globals,
+                    ..
+                } if indices.contains_key(&name_id) && !globals.contains(name_id)
+                    || free_indices.contains_key(&name_id)
+            );
+            if force_name || !is_local_or_free {
+                self.name_index(&name)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn pre_register_expression_names(
+        &mut self,
+        expression: &Expr,
+    ) -> Result<(), CompileError> {
+        #[derive(Default)]
+        struct Collector {
+            names: Vec<(String, bool)>,
+        }
+
+        impl<'ast> Visitor<'ast> for Collector {
+            fn visit_expr(&mut self, expression: &'ast Expr) {
                 match expression {
                     Expr::Name(name)
-                        if self.skip_debug
-                            && name.ctx == ExprContext::Load
-                            && name.id.as_str() == "__debug__" => {}
+                        if name.ctx == ExprContext::Load && name.id.as_str() == "__debug__" => {}
                     Expr::Name(name) => self.names.push((name.id.as_str().to_string(), false)),
                     Expr::Attribute(attribute) => {
                         self.visit_expr(&attribute.value);
@@ -863,67 +1559,10 @@ impl Compiler<'_> {
                         }
                         return;
                     }
-                    _ => {}
-                }
-                walk_expr(self, expression);
-            }
-
-            fn visit_pattern(&mut self, pattern: &'ast Pattern) {
-                let capture = match pattern {
-                    Pattern::MatchAs(pattern) => pattern.name.as_ref(),
-                    Pattern::MatchStar(pattern) => pattern.name.as_ref(),
-                    Pattern::MatchMapping(pattern) => pattern.rest.as_ref(),
-                    _ => None,
-                };
-                if let Some(name) = capture {
-                    self.names.push((name.as_str().to_string(), false));
-                }
-                walk_pattern(self, pattern);
-            }
-        }
-
-        let mut collector = Collector {
-            skip_debug,
-            ..Collector::default()
-        };
-        for statement in body {
-            collector.visit_stmt(statement);
-        }
-        for (name, force_name) in collector.names {
-            let name_id = self.required_name_id(&name);
-            let is_local_or_free = matches!(
-                &self.unit.scope,
-                Scope::Function {
-                    indices,
-                    free_indices,
-                    globals,
-                    ..
-                } if indices.contains_key(&name_id) && !globals.contains(name_id)
-                    || free_indices.contains_key(&name_id)
-            ) || self.temporary_index(&name).is_some();
-            if force_name || !is_local_or_free {
-                self.name_index(&name)?;
-            }
-        }
-        Ok(())
-    }
-
-    pub(super) fn pre_register_expression_names(
-        &mut self,
-        expression: &Expr,
-    ) -> Result<(), CompileError> {
-        #[derive(Default)]
-        struct Collector {
-            names: Vec<(String, bool)>,
-        }
-
-        impl<'ast> Visitor<'ast> for Collector {
-            fn visit_expr(&mut self, expression: &'ast Expr) {
-                match expression {
-                    Expr::Name(name) => self.names.push((name.id.as_str().to_string(), false)),
-                    Expr::Attribute(attribute) => {
-                        self.visit_expr(&attribute.value);
-                        self.names.push((attribute.attr.as_str().to_string(), true));
+                    Expr::Generator(generator) => {
+                        if let Some(first) = generator.generators.first() {
+                            self.visit_expr(&first.iter);
+                        }
                         return;
                     }
                     _ => {}
@@ -1174,19 +1813,24 @@ impl Compiler<'_> {
         label: Label,
         exception_policy: ExceptionPolicy,
     ) -> Result<EmittedJump, CompileError> {
-        if is_unconditional_jump(opcode)
-            && let Some(location) = self.take_trailing_nop_location()
-        {
+        self.control.clear_direct_comprehension_assignment_results();
+        let removed_nop = is_unconditional_jump(opcode)
+            .then(|| self.take_trailing_nop_location())
+            .flatten();
+        if let Some((location, _)) = removed_nop {
             self.assembler.set_location(location);
         }
         let effect = required_compiler_stack_effect(opcode, 0)?;
         self.apply_stack_effect(effect)?;
-        Ok(self.assembler.emit_forward_with_depth(
+        let jump = self.assembler.emit_forward_with_depth(
             opcode,
             label,
             self.control.stack.depth.cast_unsigned(),
             exception_policy,
-        ))
+        );
+        self.assembler
+            .add_last_original_block_slots(removed_nop.map_or(0, |(_, slots)| slots));
+        Ok(jump)
     }
 
     pub(super) fn emit_jump_forward_with_exception_policy(
@@ -1196,9 +1840,11 @@ impl Compiler<'_> {
         effect: i32,
         exception_policy: ExceptionPolicy,
     ) -> Result<(), CompileError> {
-        if is_unconditional_jump(opcode)
-            && let Some(location) = self.take_trailing_nop_location()
-        {
+        self.control.clear_direct_comprehension_assignment_results();
+        let removed_nop = is_unconditional_jump(opcode)
+            .then(|| self.take_trailing_nop_location())
+            .flatten();
+        if let Some((location, _)) = removed_nop {
             self.assembler.set_location(location);
         }
         self.apply_compiler_stack_effect(opcode, 0, effect)?;
@@ -1208,6 +1854,8 @@ impl Compiler<'_> {
             self.control.stack.depth.cast_unsigned(),
             exception_policy,
         );
+        self.assembler
+            .add_last_original_block_slots(removed_nop.map_or(0, |(_, slots)| slots));
         Ok(())
     }
 
@@ -1231,21 +1879,26 @@ impl Compiler<'_> {
         opcode: Opcode,
         label: Label,
     ) -> Result<EmittedJump, CompileError> {
-        if is_unconditional_jump(opcode)
-            && let Some(location) = self.take_trailing_nop_location()
-        {
+        self.control.clear_direct_comprehension_assignment_results();
+        let removed_nop = is_unconditional_jump(opcode)
+            .then(|| self.take_trailing_nop_location())
+            .flatten();
+        if let Some((location, _)) = removed_nop {
             self.assembler.set_location(location);
         }
         let effect = required_compiler_stack_effect(opcode, 0)?;
         self.apply_stack_effect(effect)?;
-        Ok(self
+        let jump = self
             .assembler
             .emit_backward_with_depth_and_exception_policy(
                 opcode,
                 label,
                 self.control.stack.depth.cast_unsigned(),
                 ExceptionPolicy::default(),
-            ))
+            );
+        self.assembler
+            .add_last_original_block_slots(removed_nop.map_or(0, |(_, slots)| slots));
+        Ok(jump)
     }
 
     pub(super) fn emit_jump_backward_with_exception_policy(
@@ -1255,9 +1908,11 @@ impl Compiler<'_> {
         effect: i32,
         exception_policy: ExceptionPolicy,
     ) -> Result<(), CompileError> {
-        if is_unconditional_jump(opcode)
-            && let Some(location) = self.take_trailing_nop_location()
-        {
+        self.control.clear_direct_comprehension_assignment_results();
+        let removed_nop = is_unconditional_jump(opcode)
+            .then(|| self.take_trailing_nop_location())
+            .flatten();
+        if let Some((location, _)) = removed_nop {
             self.assembler.set_location(location);
         }
         self.apply_compiler_stack_effect(opcode, 0, effect)?;
@@ -1268,12 +1923,14 @@ impl Compiler<'_> {
                 self.control.stack.depth.cast_unsigned(),
                 exception_policy,
             );
+        self.assembler
+            .add_last_original_block_slots(removed_nop.map_or(0, |(_, slots)| slots));
         Ok(())
     }
 
-    pub(super) fn take_trailing_nop_location(&mut self) -> Option<SourceLocation> {
-        let (location, exclusion) = self.assembler.take_trailing_nop_location()?;
-        if let Some(exclusion) = exclusion {
+    pub(super) fn take_trailing_nop_location(&mut self) -> Option<(SourceLocation, usize)> {
+        let removed = self.assembler.take_trailing_nop_location()?;
+        if let Some(exclusion) = removed.exclusion {
             self.control
                 .generators
                 .generator_region_exclusions
@@ -1292,7 +1949,7 @@ impl Compiler<'_> {
                 exclusions.retain(|candidate| *candidate != exclusion);
             }
         }
-        Some(location)
+        Some((removed.location, removed.original_slots))
     }
 
     pub(super) fn apply_compiler_stack_effect(
@@ -1460,4 +2117,30 @@ pub(super) fn expression_name(expression: &Expr) -> &'static str {
         Expr::Tuple(_) => "tuple store or delete",
         _ => "expression",
     }
+}
+
+/// Conservatively detects collections whose folded origins require CFG construction.
+pub(super) fn has_untracked_discarded_collection(body: &[Stmt]) -> bool {
+    struct RuntimeCollection(bool);
+    impl<'ast> Visitor<'ast> for RuntimeCollection {
+        fn visit_expr(&mut self, expression: &'ast Expr) {
+            let elements = match expression {
+                Expr::Tuple(tuple) => Some(tuple.elts.as_slice()),
+                Expr::List(list) => Some(list.elts.as_slice()),
+                Expr::Set(set) => Some(set.elts.as_slice()),
+                _ => None,
+            };
+            self.0 |= elements.is_some_and(|elements| {
+                elements
+                    .iter()
+                    .any(|element| fold_constant(element).is_none())
+            });
+            walk_expr(self, expression);
+        }
+    }
+    let mut visitor = RuntimeCollection(false);
+    for statement in body {
+        visitor.visit_stmt(statement);
+    }
+    visitor.0
 }

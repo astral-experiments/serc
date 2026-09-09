@@ -1,0 +1,117 @@
+use std::fmt::Write;
+
+use crate::common;
+
+#[test]
+fn preserves_specialized_none_owner_slots_after_source_joins() {
+    for (definition, tail) in [
+        ("def", ""),
+        ("async def", "    await done()\n"),
+        ("def", "    yield value\n"),
+        ("async def", "    yield value\n"),
+    ] {
+        for prefix in ["", "        scratch = value.attr\n"] {
+            for cases in [
+                "case None:\n    pass\ncase Other():\n    consume(value)\ncase _:\n    pass\n",
+                "case None:\n    pass\ncase _:\n    consume(value)\n",
+                "case True:\n    pass\ncase None:\n    consume(value)\ncase _:\n    pass\n",
+            ] {
+                let mut indented = String::new();
+                for line in cases.lines() {
+                    writeln!(indented, "            {line}").unwrap();
+                }
+                let source = format!(
+                    "{definition} f(value, enabled):\n    if enabled:\n{prefix}        match value:\n{indented}{tail}",
+                );
+                common::assert_matches_cpython_marshal(&source, "joined_none_pattern_owners.py");
+            }
+        }
+    }
+}
+
+#[test]
+fn specializes_none_patterns_in_class_keywords() {
+    let indent = |suite: &str| {
+        let mut output = String::new();
+        for line in suite.lines() {
+            writeln!(output, "    {line}").unwrap();
+        }
+        output
+    };
+    for kind in ["sync", "async", "generator"] {
+        for pattern in [
+            "Point(None)",
+            "Point(field=None)",
+            "Point(field=None, other=None)",
+            "Point(field=None as captured)",
+        ] {
+            for scope in ["plain", "try", "with"] {
+                let exits: &[&str] = if scope == "with" {
+                    &["return value"]
+                } else {
+                    &["return value", "consume(value)"]
+                };
+                for exit in exits {
+                    let body = format!(
+                        "match value:\n    case {pattern}:\n        {exit}\n    case _:\n        return None\n"
+                    );
+                    let mut body = match scope {
+                        "try" => format!("try:\n{}except Error:\n    return None\n", indent(&body)),
+                        "with" => format!("with manager:\n{}", indent(&body)),
+                        _ => body,
+                    };
+                    if kind == "generator" {
+                        body.push_str("yield None\n");
+                    }
+                    let definition = if kind == "async" { "async def" } else { "def" };
+                    let source = format!("{definition} f(value, manager):\n{}", indent(&body));
+                    common::assert_matches_cpython_marshal(&source, "class_keyword_none.py");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn specializes_none_patterns_after_protected_comprehensions() {
+    let indent = |suite: &str| {
+        let mut output = String::new();
+        for line in suite.lines() {
+            writeln!(output, "    {line}").unwrap();
+        }
+        output
+    };
+    for kind in ["sync", "async", "generator"] {
+        for pattern in ["None", "1 | None", "None | 1", "True | None"] {
+            for scope in ["try_for", "with_for", "finally"] {
+                let body = format!(
+                    "cached = [item for item in values]\nmatch value:\n    case {pattern}:\n        return value\n    case _:\n        result = 1\n"
+                );
+                let body = if scope == "finally" {
+                    format!("try:\n    process()\nfinally:\n{}", indent(&body))
+                } else {
+                    let body = format!("for value in values:\n{}", indent(&body));
+                    if scope == "with_for" {
+                        format!("with manager:\n{}", indent(&body))
+                    } else {
+                        format!(
+                            "try:\n{}except Exception:\n    return False\n",
+                            indent(&body)
+                        )
+                    }
+                };
+                let definition = if kind == "async" { "async def" } else { "def" };
+                let prefix = if kind == "generator" {
+                    "    yield None\n"
+                } else {
+                    ""
+                };
+                let source = format!(
+                    "{definition} f(value, values, manager, process):\n{prefix}{}",
+                    indent(&body)
+                );
+                common::assert_matches_cpython_marshal(&source, "protected_singleton_patterns.py");
+            }
+        }
+    }
+}

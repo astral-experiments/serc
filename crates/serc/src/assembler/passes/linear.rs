@@ -11,9 +11,15 @@ use crate::CompileError;
 use crate::target::opcodes::{POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE};
 use crate::target::operands::ComparisonOperation;
 
+use super::control_flow::clear_redundant_boolean_nop_location;
+use super::control_flow::redundant_copy_pop_indices;
 use super::locals::optimize_linear_assertion_load_fast;
 
 fn optimize_boolean_conversions_and_redundant_stores(items: &mut [Item]) {
+    let was_boolean_conversion = items
+        .iter()
+        .map(|item| matches!(item, Item::Instruction(instruction) if matches!(instruction.opcode, TO_BOOL | UNARY_NOT)))
+        .collect::<Vec<_>>();
     for index in 0..items.len().saturating_sub(1) {
         let (before, after) = items.split_at_mut(index + 1);
         let (Item::Instruction(current), Item::Instruction(next)) =
@@ -23,6 +29,9 @@ fn optimize_boolean_conversions_and_redundant_stores(items: &mut [Item]) {
         };
         if current.opcode == STORE_FAST
             && next.opcode == STORE_FAST
+            // STORE_FAST_MAYBE_NULL remains a distinct pseudo-op through this pass.
+            && !current.local_policy.may_store_null()
+            && !next.local_policy.may_store_null()
             && matches!(
                 (current.operand(), next.operand()),
                 (Operand::Value(current), Operand::Value(next)) if current == next
@@ -85,6 +94,17 @@ fn optimize_boolean_conversions_and_redundant_stores(items: &mut [Item]) {
         current.set_operand(Operand::Value(0));
         next.opcode = opcode;
         next.set_operand(Operand::Value(argument));
+    }
+    let mut previous_line = None;
+    for (item, was_boolean_conversion) in items.iter_mut().zip(was_boolean_conversion) {
+        match item {
+            Item::Instruction(instruction) => clear_redundant_boolean_nop_location(
+                instruction,
+                was_boolean_conversion,
+                &mut previous_line,
+            ),
+            Item::Label(_) => previous_line = None,
+        }
     }
 }
 
@@ -405,6 +425,15 @@ impl Assembler {
             None,
             AssemblerStage::DuplicateExitBlocks,
         )?;
+        let mut removed_max_depth = None;
+        for index in redundant_copy_pop_indices(&items).into_iter().rev() {
+            if let Item::Instruction(instruction) = items.remove(index)
+                && let Some(depth) = instruction.depth_after()
+            {
+                removed_max_depth =
+                    Some(removed_max_depth.map_or(depth, |current: u32| current.max(depth)));
+            }
+        }
         add_checks_for_uninitialized_loads(&mut items, local_count, parameter_count);
         #[cfg(any(test, debug_assertions))]
         super::validate_structure(
@@ -447,8 +476,9 @@ impl Assembler {
         Ok(LayoutAssembler {
             items,
             exception_regions: self.exception_regions,
+            exception_owner_provenance: self.exception_owner_provenance,
             preserved_block_boundaries: self.preserved_block_boundaries,
-            removed_max_depth: None,
+            removed_max_depth,
             next_label: self.next_label,
             has_next_location: self.has_next_location,
         })

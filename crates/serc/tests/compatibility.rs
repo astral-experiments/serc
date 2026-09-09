@@ -263,6 +263,12 @@ async def coroutine():
     }
 
     #[test]
+    fn matches_cpython_marshal_for_iterator_return_collector_lifetimes() {
+        let source = include_str!("fixtures/iterator_return_collector_lifetimes.py");
+        assert_matches_cpython_marshal(source, "iterator_return_collector_lifetimes.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_an_empty_module() {
         assert_matches_cpython_marshal("", "empty.py");
     }
@@ -5026,6 +5032,105 @@ def direct_assertion_control(items):
                 reject(item)
 ";
         assert_matches_cpython_marshal(source, "protected_loop_tail_first_branch_owners.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_async_comprehension_assignment_restores() {
+        for source in [
+            r"async def f(chunks, obj):
+    obj.value = [chunk async for chunk in chunks]
+    return obj
+",
+            r"async def f(chunks):
+    value = [chunk async for chunk in chunks]
+    return value
+",
+            r#"async def f(chunks, out):
+    out["value"] = [chunk async for chunk in chunks]
+    return out
+"#,
+            r"async def f(chunks):
+    chunk = [chunk async for chunk in chunks]
+    return chunk
+",
+            r"async def f(chunks):
+    value = (
+        [chunk async for chunk in chunks]
+    )
+    return value
+",
+            r"async def f(chunks):
+    value = [
+        chunk async for chunk in chunks
+    ]
+    return value
+",
+            r"async def f(chunks):
+    a = b = [chunk async for chunk in chunks]
+    return a, b
+",
+            r"async def f(chunks):
+    value, = [chunk async for chunk in chunks]
+    return value
+",
+            r"async def f(chunks):
+    [value] = [chunk async for chunk in chunks]
+    return value
+",
+            r"async def f(chunks):
+    global value
+    value = [chunk async for chunk in chunks]
+    return value
+",
+            r"def outer():
+    value = None
+    async def f(chunks):
+        nonlocal value
+        value = [chunk async for chunk in chunks]
+        return value
+    return f
+",
+            r"async def f(chunks):
+    value = [chunk async for chunk in chunks]
+    def read():
+        return value
+    return read
+",
+            r"async def f(chunks, obj):
+    obj.value = {chunk async for chunk in chunks}
+    return obj
+",
+            r"async def f(chunks, obj):
+    obj.value = {chunk: chunk async for chunk in chunks}
+    return obj
+",
+            r"async def f(chunks, obj):
+    obj.value = [chunk async for chunk in chunks]
+    yield obj
+",
+            r"async def f(chunks, obj):
+    try:
+        obj.value = [chunk async for chunk in chunks]
+    finally:
+        await obj.close()
+    return obj
+",
+            r"async def f(chunks):
+    a = [a async for a, b in chunks]
+    return a
+",
+            r"async def f(chunks):
+    inner = [[inner for inner in chunk] async for chunk in chunks]
+    return inner
+",
+            r"class C:
+    async def f(self, chunks):
+        __x = [__x async for __x in chunks]
+        return __x
+",
+        ] {
+            assert_matches_cpython_marshal(source, "async_comprehension_assignment.py");
+        }
     }
 
     #[test]
@@ -10629,9 +10734,10 @@ for function in (
 ):
     print(','.join(result_loads(function)))
 ";
+        assert_matches_cpython_marshal(source, "constant_loop_exit_shapes.py");
         assert_executes(
             source,
-            "LOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST_BORROW\nLOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST_BORROW\nLOAD_FAST,LOAD_FAST,LOAD_FAST,LOAD_FAST,LOAD_FAST,LOAD_FAST\nLOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST,LOAD_FAST,LOAD_FAST,LOAD_FAST,LOAD_FAST,LOAD_FAST\n",
+            "LOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST_BORROW\nLOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST_BORROW\nLOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST_BORROW\nLOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST,LOAD_FAST,LOAD_FAST,LOAD_FAST,LOAD_FAST,LOAD_FAST\n",
         );
     }
 
@@ -11008,7 +11114,7 @@ for function in (
 "#;
         assert_executes(
             source,
-            "LOAD_FAST_BORROW LOAD_FAST\nLOAD_FAST_BORROW LOAD_FAST\nLOAD_FAST LOAD_FAST\nLOAD_FAST_BORROW LOAD_FAST\nLOAD_FAST LOAD_FAST\nLOAD_FAST LOAD_FAST\nLOAD_FAST LOAD_FAST\nLOAD_FAST LOAD_FAST\nLOAD_FAST LOAD_FAST\n",
+            "LOAD_FAST_BORROW LOAD_FAST\nLOAD_FAST_BORROW LOAD_FAST\nLOAD_FAST LOAD_FAST\nLOAD_FAST_BORROW LOAD_FAST\nLOAD_FAST_BORROW LOAD_FAST\nLOAD_FAST LOAD_FAST\nLOAD_FAST LOAD_FAST\nLOAD_FAST LOAD_FAST\nLOAD_FAST LOAD_FAST\n",
         );
     }
 
@@ -11130,6 +11236,24 @@ def final_elif(action, first, second):
     fn matches_cpython_marshal_for_post_try_coroutine_condition_owners() {
         let source = include_str!("fixtures/post_try_coroutine_condition_owners.py");
         assert_matches_cpython_marshal(source, "post_try_coroutine_condition_owners.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_unpreserved_handler_enclosing_try_owners() {
+        let source = include_str!("fixtures/unpreserved_handler_enclosing_try_owners.py");
+        assert_matches_cpython_marshal(source, "unpreserved_handler_enclosing_try_owners.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_named_handler_enclosing_try_owners() {
+        let source = include_str!("fixtures/named_handler_enclosing_try_owners.py");
+        assert_matches_cpython_marshal(source, "named_handler_enclosing_try_owners.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_named_handler_finally_owner_slots() {
+        let source = include_str!("fixtures/named_handler_finally_owner_slots.py");
+        assert_matches_cpython_marshal(source, "named_handler_finally_owner_slots.py");
     }
 
     #[test]
@@ -11704,6 +11828,96 @@ huge_negative_right_shift = -1 >> 999999999999999999999999999999999999999
             "def constant_loop():\n    for item in [{constants}]:\n        consume(item)\n\n\ndef dynamic_loop(value):\n    for item in [{dynamic}]:\n        consume(item)\n\n\ndef constant_contains(item):\n    return item in [{constants}]\n\n\ndef dynamic_contains(item, value):\n    return item in [{dynamic}]\n"
         );
         assert_matches_cpython_marshal(&source, "large_list_iterables.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_large_starred_collections() {
+        for length in [30, 31, 32] {
+            for starred_index in [0, 3, length - 1] {
+                for element in ["value", "1"] {
+                    let elements = (0..length)
+                        .map(|index| {
+                            if index == starred_index {
+                                "*items"
+                            } else {
+                                element
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let source = format!(
+                        "def build(value, items):\n    a = [{elements}]\n    b = ({elements},)\n    c = {{{elements}}}\n    return a, b, c\n"
+                    );
+                    assert_matches_cpython_marshal(&source, "large_starred_collections.py");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_large_constant_set_iterables() {
+        for length in [30, 31, 32] {
+            let elements = (0..length)
+                .map(|index| format!("'value{index}'"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let source = format!(
+                "def check(value):\n    present = value in {{{elements}}}\n    for item in {{{elements}}}:\n        consume(item)\n    return present\n"
+            );
+            assert_matches_cpython_marshal(&source, "large_constant_set_iterables.py");
+        }
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_large_unpacked_dictionaries() {
+        for length in [15, 16, 17, 18, 34] {
+            for unpack_index in [0, 15, length] {
+                let mut items = (0..length)
+                    .map(|index| format!("{index}: value"))
+                    .collect::<Vec<_>>();
+                items.insert(unpack_index, "**mapping".to_string());
+                let items = items.join(", ");
+                let source = format!("def build(value, mapping):\n    return {{{items}}}\n");
+                assert_matches_cpython_marshal(&source, "large_unpacked_dictionaries.py");
+            }
+        }
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_multiline_large_keyword_calls() {
+        for count in [15, 16, 17] {
+            for (prefix, suffix) in [
+                ("", ""),
+                ("        *args,\n", ""),
+                ("        **mapping,\n", ""),
+                ("", "        **mapping,\n"),
+            ] {
+                for callee in ["consume", "obj.method"] {
+                    let mut keywords = String::new();
+                    for index in 0..count {
+                        writeln!(&mut keywords, "        k{index}=value.attr,").unwrap();
+                    }
+                    let source = format!(
+                        "def f(consume, obj, value, args, mapping):\n    return outer({callee}(\n{prefix}{keywords}{suffix}    ))\n"
+                    );
+                    assert_matches_cpython_marshal(&source, "multiline_large_keyword_calls.py");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_large_keyword_call_conditional_returns() {
+        let keywords = (0..16)
+            .map(|index| format!("p{index}=value"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        for expression in ["make() if flag else None", "value if flag else make()"] {
+            let source = format!(
+                "def build(flag, value):\n    return construct({keywords}, final={expression})\n"
+            );
+            assert_matches_cpython_marshal(&source, "large_keyword_call_conditional_returns.py");
+        }
     }
 
     #[test]
@@ -12792,3 +13006,33 @@ def generator(values, predicate):
         assert_matches_cpython_marshal(source, "linear_assert_conditions_and_fallbacks.py");
     }
 }
+
+#[path = "compatibility_cases/handler_loop_continuation_locations.rs"]
+mod handler_loop_continuation_locations;
+
+#[path = "compatibility_cases/optimized_generator_join_owners.rs"]
+mod optimized_generator_join_owners;
+
+#[path = "compatibility_cases/optimized_boolean_backedge_owners.rs"]
+mod optimized_boolean_backedge_owners;
+
+#[path = "compatibility_cases/async_for_exhaustion_owners.rs"]
+mod async_for_exhaustion_owners;
+
+#[path = "compatibility_cases/terminal_and_while_tail.rs"]
+mod terminal_and_while_tail;
+
+#[path = "compatibility_cases/sourceless_try_body_exit.rs"]
+mod sourceless_try_body_exit;
+
+#[path = "compatibility_cases/copied_finally_continue_tail.rs"]
+mod copied_finally_continue_tail;
+
+#[path = "compatibility_cases/sourceless_try_else_exit.rs"]
+mod sourceless_try_else_exit;
+
+#[path = "compatibility_cases/for_body_owner_slots.rs"]
+mod for_body_owner_slots;
+
+#[path = "compatibility_cases/handler_continue_cleanup_owners.rs"]
+mod handler_continue_cleanup_owners;

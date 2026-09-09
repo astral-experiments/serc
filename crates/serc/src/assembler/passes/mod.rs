@@ -2,16 +2,17 @@
 use rustc_hash::FxHashMap;
 
 use super::block_graph::BlockGraph;
-use super::layout::label_position;
+use super::layout::{backward_argument, label_position};
 use super::{
-    AssembledCode, Assembler, Item, Label, LayoutAssembler, Operand, OptimizationPipeline,
-    UnoptimizedCode, extended_arg_count,
+    AssembledCode, Assembler, ConstantTable, Item, Label, LayoutAssembler, Operand,
+    OptimizationPipeline, UnoptimizedCode, extended_arg_count,
 };
 #[cfg(any(test, debug_assertions))]
 use super::{AssemblerStage, ExceptionRegion};
 use crate::CompileError;
 
 mod blocks;
+mod constants;
 mod control_flow;
 mod linear;
 mod locals;
@@ -170,11 +171,22 @@ impl Assembler {
             .map(|assembled| assembled.bytecode)
     }
 
+    #[cfg(test)]
     pub(crate) fn finish_code(
+        self,
+        first_line_number: u32,
+        local_count: usize,
+        parameter_count: usize,
+    ) -> Result<AssembledCode, CompileError> {
+        self.finish_code_with_constants(first_line_number, local_count, parameter_count, None)
+    }
+
+    pub(crate) fn finish_code_with_constants(
         mut self,
         first_line_number: u32,
         local_count: usize,
         parameter_count: usize,
+        constants: Option<&mut dyn ConstantTable>,
     ) -> Result<AssembledCode, CompileError> {
         self.resolve_operand_patches()?;
         if self.has_only_linear_assertion_side_exits() {
@@ -183,11 +195,11 @@ impl Assembler {
                 .finish(first_line_number);
         }
         self.into_optimization_pipeline()
-            .optimize(local_count, parameter_count)?
+            .optimize(local_count, parameter_count, constants)?
             .finish(first_line_number)
     }
 
-    pub(in crate::assembler) fn into_optimization_pipeline(self) -> OptimizationPipeline {
+    pub(in crate::assembler) fn into_optimization_pipeline(mut self) -> OptimizationPipeline {
         let (graph, initial_reachable) = match self.code {
             UnoptimizedCode::Linear(items) => (
                 BlockGraph::from_items(items, &rustc_hash::FxHashSet::default()),
@@ -201,13 +213,54 @@ impl Assembler {
                 (graph, Some(reachable))
             }
         };
+        if !self.exception_regions.is_empty() {
+            // Original setup order expresses nesting even when copied cleanup code makes an
+            // inner range longer than its parent, or exclusions split the parent into fragments.
+            let label_positions = graph
+                .iter_items()
+                .enumerate()
+                .filter_map(|(index, item)| match item {
+                    Item::Label(label) => Some((*label, index)),
+                    Item::Instruction(_) => None,
+                })
+                .collect::<rustc_hash::FxHashMap<_, _>>();
+            for region in &mut self.exception_regions {
+                if let super::ExceptionRegionPriority::OriginalRange(start, end) = region.priority {
+                    region.priority = super::ExceptionRegionPriority::Resolved {
+                        start: label_positions[&start],
+                        end: label_positions[&end],
+                    };
+                }
+            }
+        }
+        for item in graph.iter_items() {
+            if let Item::Instruction(instruction) = item
+                && let Operand::Forward(label) | Operand::Backward(label) = instruction.operand()
+            {
+                self.exception_owner_provenance
+                    .block_boundaries
+                    .insert(label);
+            }
+        }
         OptimizationPipeline {
             graph,
+            discarded_fold_admissions: self.discarded_fold_admissions,
             initial_reachable,
             next_label: self.next_label,
             exception_regions: self.exception_regions,
+            exception_owner_provenance: self.exception_owner_provenance,
             preserved_block_boundaries: self.preserved_block_boundaries,
             borrow_unreachable_blocks: self.borrow_unreachable_blocks,
+            borrow_loop_exit_blocks: self.borrow_loop_exit_blocks,
+            borrow_block_aliases: self.borrow_block_aliases,
+            conditional_threading_targets: self.conditional_threading_targets,
+            original_nop_targets: self.original_nop_targets,
+            original_unlocated_cleanup_targets: self.original_unlocated_cleanup_targets,
+            original_unlocated_discard_targets: self.original_unlocated_discard_targets,
+            original_jump_head_targets: rustc_hash::FxHashSet::default(),
+            deferred_shared_jump_blocks: self.deferred_shared_jump_blocks,
+            shared_jump_copy_location_blocks: self.shared_jump_copy_location_blocks,
+            folded_condition_exit_targets: self.folded_condition_exit_targets,
             has_assertion_side_exit_candidate: self.has_assertion_side_exit_candidate,
             has_synthesized_percent_target_locations: self.has_synthesized_percent_target_locations,
             has_next_location: self.has_next_location,
@@ -226,7 +279,10 @@ impl OptimizationPipeline {
         mut self,
         local_count: usize,
         parameter_count: usize,
+        constants: Option<&mut dyn ConstantTable>,
     ) -> Result<LayoutAssembler, CompileError> {
+        self.record_original_jump_heads();
+        self.prepare_original_conditional_jump_targets();
         let assertion_side_exits = self.has_only_assertion_side_exits();
         let mut removed_max_depth = if assertion_side_exits {
             None
@@ -235,6 +291,7 @@ impl OptimizationPipeline {
         };
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::RemoveUnreachableInitial)?;
+        let original_location_absence = self.capture_original_location_absence();
         self.resolve_synthesized_conditional_target_locations();
         let synthesized_fallthrough_locations = self.defer_synthesized_fallthrough_locations();
         self.optimize_boolean_conversions();
@@ -265,13 +322,28 @@ impl OptimizationPipeline {
         self.apply_static_swaps(swap_blocks);
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::ApplyStaticSwaps)?;
-        if assertion_side_exits {
+        let copied_entry_labels = if assertion_side_exits {
             self.propagate_assertion_exit_locations();
+            Vec::new()
         } else {
-            self.duplicate_exit_blocks();
-        }
+            self.duplicate_exit_blocks(&original_location_absence)
+        };
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::DuplicateExitBlocks)?;
+        // CPython removes unreachable blocks after its per-block optimizations, including
+        // small-exit copying followed by conditional threading, before checking local loads.
+        // A terminating match arm can leave its original case jump newly unreachable here.
+        if self.thread_original_conditional_jump_targets()
+            && let Some(depth) = self.remove_unreachable_instructions()
+        {
+            removed_max_depth = Some(removed_max_depth.map_or(depth, |current| current.max(depth)));
+        }
+        if let Some(constants) = constants {
+            self.fold_copied_constants(constants, &copied_entry_labels)?;
+        }
+        if let Some(depth) = self.remove_redundant_copy_pop_pairs() {
+            removed_max_depth = Some(removed_max_depth.map_or(depth, |current| current.max(depth)));
+        }
         if assertion_side_exits {
             self.add_checks_for_assertion_side_exits(local_count, parameter_count);
         } else {
@@ -303,6 +375,8 @@ impl OptimizationPipeline {
         self.validate_structure(AssemblerStage::RemoveRedundantNops)?;
         if !assertion_side_exits {
             self.remove_redundant_forward_jumps(true);
+            // Manager exits can expose a redundant POP_BLOCK after their jump disappears.
+            self.remove_redundant_with_exit_nops();
         }
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::RemoveRedundantForwardJumpsLate)?;
@@ -313,7 +387,9 @@ impl OptimizationPipeline {
                 &mut items,
                 &self.exception_regions,
                 &self.borrow_unreachable_blocks,
+                &self.borrow_loop_exit_blocks,
                 &self.preserved_block_boundaries,
+                &self.borrow_block_aliases,
                 assertion_side_exits,
             );
         }
@@ -332,9 +408,26 @@ impl OptimizationPipeline {
             self.has_synthesized_percent_target_locations,
             &synthesized_fallthrough_locations,
         );
+        if !self.deferred_shared_jump_blocks.is_empty() {
+            let mut shared_jump = false;
+            for item in &mut items {
+                match item {
+                    Item::Label(label) => {
+                        shared_jump |= self.deferred_shared_jump_blocks.contains(label);
+                    }
+                    Item::Instruction(instruction) => {
+                        if shared_jump && crate::target::is_unconditional_jump(instruction.opcode) {
+                            instruction.location = super::SourceLocation::NONE;
+                        }
+                        shared_jump = false;
+                    }
+                }
+            }
+        }
         Ok(LayoutAssembler {
             items,
             exception_regions: self.exception_regions,
+            exception_owner_provenance: self.exception_owner_provenance,
             preserved_block_boundaries: self.preserved_block_boundaries,
             removed_max_depth,
             next_label: self.next_label,
@@ -384,6 +477,32 @@ impl LayoutAssembler {
             }
         }
 
+        // CPython initially stores instruction indices in jump operands. Their widths
+        // seed offset resolution, including self-dependent backward jumps at 255/256.
+        let initial_jump_arguments = if instruction_count > usize::from(u8::MAX) {
+            let mut indices = vec![None; labels.len()];
+            let mut index = 0_u32;
+            for item in &self.items {
+                match *item {
+                    Item::Instruction(_) => index += 1,
+                    Item::Label(label) => indices[usize::try_from(label.0).unwrap()] = Some(index),
+                }
+            }
+            can_be_unextended &= self.items.iter().all(|item| match item {
+                Item::Instruction(instruction) => match instruction.operand() {
+                    Operand::Forward(label) | Operand::Backward(label) => {
+                        label_position(&indices, label)
+                            .is_some_and(|index| u8::try_from(index).is_ok())
+                    }
+                    Operand::Value(_) | Operand::Deferred(_) => true,
+                },
+                Item::Label(_) => true,
+            });
+            Some(indices)
+        } else {
+            None
+        };
+
         if can_be_unextended
             && let Some((bytecode, line_table, max_depth)) =
                 self.encode_unextended_final_artifacts(&labels, code_units, first_line_number)?
@@ -404,7 +523,25 @@ impl LayoutAssembler {
             });
         }
 
-        let mut extended_args = vec![0_u8; instruction_count];
+        let mut extended_args = self
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Instruction(instruction) => {
+                    Some(extended_arg_count(match instruction.operand() {
+                        Operand::Value(argument) => argument,
+                        Operand::Forward(label) | Operand::Backward(label) => {
+                            initial_jump_arguments
+                                .as_ref()
+                                .and_then(|indices| label_position(indices, label))
+                                .unwrap_or(0)
+                        }
+                        Operand::Deferred(_) => 0,
+                    }))
+                }
+                Item::Label(_) => None,
+            })
+            .collect::<Vec<_>>();
         let mut resolved_arguments = vec![0_u32; instruction_count];
 
         for _ in 0..8 {
@@ -440,9 +577,7 @@ impl LayoutAssembler {
                         let target = label_position(&labels, label).ok_or_else(|| {
                             CompileError::Internal("unbound backward jump label".to_string())
                         })?;
-                        jump_base.checked_sub(target).ok_or_else(|| {
-                            CompileError::Internal("backward jump points forward".to_string())
-                        })?
+                        backward_argument(instruction, jump_base, target)?
                     }
                 };
                 resolved_arguments[instruction_index] = argument;

@@ -155,3 +155,30 @@ async def async_with_control(manager, value, record, finish):
         "synchronous_with_direct_none_condition_owner_compatibility.py",
     );
 }
+
+#[test]
+fn terminal_with_folded_none_condition_owners_match_cpython_marshal() {
+    let source = r"async def f(manager, work, write):
+    with manager:
+        value = await work()
+        if value is not None:
+            return value
+    return await write()
+
+async def g(manager, work, write):
+    with manager:
+        value = await work()
+        if value:
+            return value
+    return await write()
+
+def h(manager, work, write):
+    with manager:
+        value = work()
+        if value is not None:
+            return value
+    return write()
+";
+
+    common::assert_matches_cpython_marshal(source, "terminal_with_folded_none_condition_owners.py");
+}
