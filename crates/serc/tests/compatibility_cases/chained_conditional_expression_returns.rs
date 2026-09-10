@@ -176,3 +176,119 @@ fn matches_cpython_nested_body_join_threading_in_cleanup() {
         common::assert_matches_cpython_marshal(source, "nested_body_conditional_join.py");
     }
 }
+
+#[test]
+fn matches_cpython_conditional_test_join_nops() {
+    for source in [
+        r"def f(value, flag):
+    if check(value) if flag else False:
+        return None
+    return str(value)
+",
+        r"def f(value, flag):
+    if check(value) if flag else False:
+        return None
+    result = convert(value)
+    use(result)
+    return str(result)
+",
+        r"def f(value):
+    if check(value) if not isinstance(value, (list, tuple)) else False:
+        return None
+    return str(value)
+",
+        r"def f(value, other, flag):
+    if (
+        value.total == 0
+        if flag
+        else other.total == 0
+    ):
+        return False
+    return value.done()
+",
+        r"def f(value, other, flag):
+    if not (
+        value.total == 0
+        if flag
+        else other.total == 0
+    ):
+        return False
+    return value.done()
+",
+        r"def f(value, other, flag):
+    assert (
+        value.total == 0
+        if flag
+        else other.total == 0
+    )
+    return value.done()
+",
+        r"def f(value, flag):
+    if flag and check(value):
+        return None
+    return str(value)
+",
+        r"def f(value, flag, other, items, manager):
+    if (check(value) if flag else False): return None
+    return str(value)
+",
+    ] {
+        common::assert_matches_cpython_marshal(source, "conditional_test_join.py");
+    }
+}
+
+#[test]
+fn matches_cpython_conditional_test_join_in_cleanup() {
+    for source in [
+        r"def f(value, flag, other, items, manager):
+    for item in items:
+        if (check(value) if flag else False):
+            continue
+        work(item)
+    return other
+",
+        r"def f(value, flag, other, items, manager):
+    try:
+        if (check(value) if flag else False):
+            return None
+        work(value)
+    except Error:
+        return other
+    return value
+",
+        r"async def f(value, flag, other, items, manager):
+    if (check(value) if flag else False):
+        return None
+    return await work(value)
+",
+        r"def f(value, flag, other, items, manager):
+    yield value
+    if (check(value) if flag else False):
+        return None
+    yield other
+",
+        r"def f(value, flag, other, items, manager):
+    if (value == other if flag else other == flag):
+        raise Error
+    return other
+",
+        r"def f(value, flag, other, items, manager):
+    try:
+        work(value)
+    finally:
+        if (value == other if flag else other == flag):
+            return None
+    return other
+",
+        r"def f(value, flag, other, items, manager):
+    try:
+        work(value)
+    finally:
+        if ((value is None) if flag else (other is None)):
+            return None
+    return other
+",
+    ] {
+        common::assert_matches_cpython_marshal(source, "conditional_test_join.py");
+    }
+}

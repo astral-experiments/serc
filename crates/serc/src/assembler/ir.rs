@@ -1191,11 +1191,19 @@ pub(super) enum UnoptimizedCode {
     },
 }
 
+/// A call that keeps an original normal-cleanup entry nonempty.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct BorrowCleanupCall {
+    pub(super) argument: u32,
+    pub(super) location: SourceLocation,
+}
+
 /// Normal entries retained across an omitted loop backedge.
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct BorrowLoopExitPolicy {
     pub(super) allow_surviving_break: bool,
     pub(super) preserve_small_exit: bool,
+    pub(super) cleanup_call: Option<BorrowCleanupCall>,
 }
 
 #[derive(Debug)]
@@ -1210,11 +1218,15 @@ pub(crate) struct Assembler {
     pub(super) next_label: u32,
     pub(super) location: SourceLocation,
     pub(super) exception_regions: Vec<ExceptionRegion>,
+    /// Original tail location retained when lowering emits an already-reordered restore.
+    pub(super) original_fallthrough_location: Option<(EmittedInstruction, SourceLocation)>,
     pub(super) exception_owner_provenance: super::exception_owners::ExceptionOwnerProvenance,
     pub(super) preserved_block_boundaries: FxHashSet<Label>,
     pub(super) borrow_unreachable_blocks: FxHashSet<Label>,
     /// Disconnected loop exits and the normal entries that remain reachable.
     pub(super) borrow_loop_exit_blocks: FxHashMap<Label, BorrowLoopExitPolicy>,
+    /// Normal finally entries whose original nonempty cleanup can retain an explicit jump.
+    pub(super) borrow_finally_entries: FxHashMap<Label, Option<BorrowCleanupCall>>,
     pub(super) borrow_block_aliases: FxHashSet<Label>,
     /// Original ordinary jump blocks that can thread conditional predecessors after exit copying.
     pub(super) conditional_threading_targets: FxHashMap<Label, SourceLocation>,
@@ -1256,6 +1268,8 @@ pub(super) struct OptimizationPipeline {
     pub(super) preserved_block_boundaries: FxHashSet<Label>,
     pub(super) borrow_unreachable_blocks: FxHashSet<Label>,
     pub(super) borrow_loop_exit_blocks: FxHashMap<Label, BorrowLoopExitPolicy>,
+    pub(super) borrow_finally_entries: FxHashMap<Label, Option<BorrowCleanupCall>>,
+    pub(super) borrow_finally_jump_sources: FxHashMap<Label, bool>,
     pub(super) borrow_block_aliases: FxHashSet<Label>,
     /// Original ordinary jump blocks that can thread conditional predecessors after exit copying.
     pub(super) conditional_threading_targets: FxHashMap<Label, SourceLocation>,
@@ -1346,11 +1360,13 @@ impl Default for Assembler {
             next_label: 0,
             location: SourceLocation::NONE,
             exception_regions: Vec::new(),
+            original_fallthrough_location: None,
             exception_owner_provenance: super::exception_owners::ExceptionOwnerProvenance::default(
             ),
             preserved_block_boundaries: FxHashSet::default(),
             borrow_unreachable_blocks: FxHashSet::default(),
             borrow_loop_exit_blocks: FxHashMap::default(),
+            borrow_finally_entries: FxHashMap::default(),
             borrow_block_aliases: FxHashSet::default(),
             conditional_threading_targets: FxHashMap::default(),
             original_nop_targets: FxHashSet::default(),

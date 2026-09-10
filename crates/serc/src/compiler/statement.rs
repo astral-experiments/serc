@@ -227,6 +227,12 @@ pub(super) enum NestedIfExitLocation<'a> {
 }
 
 #[derive(Clone, Copy, Debug)]
+struct DirectTryBodyExitLocation<'a> {
+    test: &'a Expr,
+    chained_comparison_cleanup: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
 struct TryCompileOptions {
     terminal: bool,
     emit_statement_nop: bool,
@@ -470,6 +476,8 @@ pub(super) struct LoopState {
     // CPython threads that exit before jump normalization, which likewise moves `NOT_TAKEN`
     // into a fresh backward-jump block instead of reusing the condition block's stale slot.
     suite_fallthrough_to_loop_backedge: bool,
+    // Retain the original enclosing loop-tail context for this guarded-match try only.
+    guarded_match_try_loop_tail: Option<TextRange>,
     // This match's failure reaches the forward join of a non-final loop branch.
     pub(super) non_final_match_tail: Option<TextRange>,
     // The final source statement compiled before a split loop-tail `if`, if any.
@@ -1782,6 +1790,14 @@ impl Compiler<'_> {
                             .exceptions
                             .active_exception_region_exclusions
                             .is_empty());
+                let guarded_match_try_loop_tail =
+                    (self.control.loops.suite_fallthrough_to_loop_backedge
+                        && is_final
+                        && matches!(statement, Stmt::Try(statement)
+                        if statement.orelse.is_empty()
+                            && statement.finalbody.is_empty()
+                            && suite_has_shared_guarded_match_failure(&statement.body)))
+                    .then(|| statement.range());
                 let transparent_loop_tail = matches!(statement, Stmt::Match(_))
                     || matches!(statement, Stmt::While(statement) if statement.orelse.is_empty())
                     || matches!(statement, Stmt::If(statement)
@@ -2112,6 +2128,10 @@ impl Compiler<'_> {
                     &mut self.control.loops.suite_fallthrough_to_loop_backedge,
                     suite_fallthrough_to_loop_backedge,
                 );
+                let previous_guarded_match_try_loop_tail = std::mem::replace(
+                    &mut self.control.loops.guarded_match_try_loop_tail,
+                    guarded_match_try_loop_tail,
+                );
                 let previous_branch_join_successor = std::mem::replace(
                     &mut self.control.statements.branch_join_successor,
                     preceded_by_branch_join.then_some(statement.range()),
@@ -2126,6 +2146,8 @@ impl Compiler<'_> {
                     },
                 );
                 self.control.statements.branch_join_successor = previous_branch_join_successor;
+                self.control.loops.guarded_match_try_loop_tail =
+                    previous_guarded_match_try_loop_tail;
                 self.control.loops.suite_fallthrough_to_loop_backedge =
                     previous_suite_fallthrough_to_loop_backedge;
                 self.control.statements.current_statement_followed_by_try =
@@ -3132,23 +3154,24 @@ impl Compiler<'_> {
             self.emit_jump_forward(POP_JUMP_IF_FALSE, otherwise, -1)?;
         }
         self.emit(NOT_TAKEN, 0, 0)?;
-        self.emit(NOP, 0, 0)?;
-        self.assembler.preserve_last_nop();
-
-        self.assembler.mark(body);
-        self.set_depth(base_depth);
-        self.compile_suite(&statement.body)?;
+        // Emit the original success edge so the assembler applies CPython's four-slot
+        // exit-copy limit before retaining its NOP or relocating the true branch.
+        let success_exit = self.emit_jump_forward_instruction(JUMP_FORWARD, body)?;
+        self.assembler.preserve_inlined_jump_nop(success_exit);
 
         self.assembler.mark(cleanup);
         self.set_depth(base_depth + 1);
         self.assembler
             .set_location(self.source_location(comparison.range));
         self.emit(POP_TOP, 0, -1)?;
-        // Preserve CPython's cleanup-to-else edge until small exits have been copied,
-        // even though this layout places the else block immediately after cleanup.
+        // Preserve CPython's cleanup-to-else edge until small exits have been copied.
         self.assembler.set_location(SourceLocation::NONE);
         let cleanup_exit = self.emit_jump_forward_instruction(JUMP_FORWARD, otherwise)?;
         self.assembler.defer_jump_removal(cleanup_exit);
+
+        self.assembler.mark(body);
+        self.set_depth(base_depth);
+        self.compile_suite(&statement.body)?;
 
         self.assembler.mark(otherwise);
         self.set_depth(base_depth);
@@ -3575,7 +3598,10 @@ impl Compiler<'_> {
                             self.symbols.owned_load_locals.extend(names);
                         }
                     }
-                    self.emit_pending_comprehension_restores()?;
+                    self.emit_pending_comprehension_restores(matches!(
+                        assignment.targets.as_slice(),
+                        [Expr::Name(_)]
+                    ))?;
                     if matches!(
                         assignment.value.as_ref(),
                         Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_)
@@ -7358,18 +7384,10 @@ impl Compiler<'_> {
     }
 
     pub(super) fn set_branch_end_location(&mut self, body: &[Stmt], body_start: usize) {
-        if let Some(Stmt::Match(statement)) = body.last()
-            && let Some(case) = statement.cases.last()
-            && case.guard.is_none()
-            && matches!(
-                case.pattern,
-                Pattern::MatchValue(_) | Pattern::MatchSingleton(_)
-            )
-        {
+        if let Some(range) = suite_match_failure_range(body) {
             // The final pattern's failure falls through to this exit; successful cases
             // keep their own body locations.
-            self.assembler
-                .set_location(self.source_location(case.pattern.range()));
+            self.assembler.set_location(self.source_location(range));
         } else {
             self.set_fallthrough_end_location(body, body_start);
         }
@@ -9134,7 +9152,9 @@ impl Compiler<'_> {
                 },
             )?;
             if nested_tail == LoopBackedge::Required && !suite_terminates(body) {
-                if let Some(Stmt::Pass(statement)) = body.last() {
+                if let Some(range) = suite_match_failure_range(body) {
+                    self.assembler.set_location(self.source_location(range));
+                } else if let Some(Stmt::Pass(statement)) = body.last() {
                     self.assembler
                         .set_location(self.source_location(statement.range));
                 } else if let Some(Stmt::While(statement)) = body.last()
@@ -10488,6 +10508,8 @@ impl Compiler<'_> {
         split_success_return: bool,
     ) -> Result<(), CompileError> {
         let condition_truthiness = early_condition_truthiness(&statement.test);
+        let retained_chained_comparison_exit =
+            final_chained_comparison(&statement.test).map(|comparison| comparison.range);
         let empty_folded_failure_block =
             condition_truthiness == Some(false) && self.assembler.at_empty_borrow_block();
         if condition_truthiness == Some(true) {
@@ -10541,7 +10563,7 @@ impl Compiler<'_> {
                 .pre_suspension_coroutine_boolean_assertion
                 .is_none()
             && !matches!(statement.test.as_ref(), Expr::If(_))
-            && !matches!(statement.test.as_ref(), Expr::Compare(comparison) if comparison.ops.len() > 1)
+            && retained_chained_comparison_exit.is_none()
         {
             let base_depth = self.control.stack.depth;
             let end = self.assembler.label();
@@ -10573,10 +10595,6 @@ impl Compiler<'_> {
                     .conditions
                     .suppress_else_assert_none_condition_owner
                 && is_specialized_none_condition(&statement.test));
-        let retained_chained_comparison_exit = match statement.test.as_ref() {
-            Expr::Compare(comparison) if comparison.ops.len() > 1 => Some(comparison.range),
-            _ => None,
-        };
         if condition_truthiness.is_none()
             && statement.msg.is_none()
             && retained_chained_comparison_exit.is_none()
@@ -11691,13 +11709,22 @@ impl Compiler<'_> {
                             Some(NestedIfExitLocation::Unlocated)
                         )
                 );
+            let shared_guarded_match_exit = self.control.loops.guarded_match_try_loop_tail
+                == Some(statement.range)
+                && self.control.in_loop_tail_without_nested_cleanup()
+                && statement.orelse.is_empty()
+                && statement.finalbody.is_empty()
+                && suite_has_shared_guarded_match_failure(&statement.body);
             let loop_exit_location = statement
                 .orelse
                 .is_empty()
                 .then(|| match statement.body.last()? {
                     Stmt::While(loop_statement)
                         if loop_statement.orelse.is_empty()
-                            && condition_jump_target_count(&loop_statement.test, false) == 1 =>
+                            && (condition_jump_target_count(&loop_statement.test, false) == 1
+                                || (matches!(loop_statement.test.as_ref(), Expr::Compare(comparison)
+                                        if comparison.ops.len() > 1)
+                                    && !suite_contains_loop_break(&loop_statement.body))) =>
                     {
                         Some(while_condition_exit_range(&loop_statement.test))
                     }
@@ -11718,6 +11745,17 @@ impl Compiler<'_> {
                     && direct_try_body_exit_location(&statement.body).is_none();
             let direct_exit_location = (!unlocated_conditional_exit)
                 .then(|| direct_try_body_exit_location(normal_exit_suite))
+                .flatten();
+            let chained_assertion_exit_location = (!statement.orelse.is_empty())
+                .then(|| match normal_exit_suite.last()? {
+                    Stmt::Assert(assertion)
+                        if matches!(assertion.test.as_ref(), Expr::Compare(comparison)
+                            if comparison.ops.len() > 1) =>
+                    {
+                        Some(assertion.test.range())
+                    }
+                    _ => None,
+                })
                 .flatten();
             let drop_multi_condition_exit_nop = statement.orelse.is_empty()
                 && self.control.loops.contexts.is_empty()
@@ -11746,7 +11784,10 @@ impl Compiler<'_> {
             if let Some(test) = forwarded_conditional_exit {
                 self.assembler
                     .set_location(self.source_location(condition_fallthrough_range(test)));
-            } else if shared_conditional_exit || drop_multi_condition_exit_nop {
+            } else if shared_conditional_exit
+                || shared_guarded_match_exit
+                || drop_multi_condition_exit_nop
+            {
                 self.assembler.set_location(SourceLocation::NONE);
             } else if unlocated_direct_exit_before_break {
                 // A following break remains a separate CFG exit, so the converted `POP_BLOCK`
@@ -11758,7 +11799,9 @@ impl Compiler<'_> {
                 self.assembler.set_location(location);
             } else if let Some(location) = direct_exit_location {
                 self.assembler
-                    .set_location(self.source_location(location.range()));
+                    .set_location(self.source_location(location.test.range()));
+            } else if let Some(range) = chained_assertion_exit_location {
+                self.assembler.set_location(self.source_location(range));
             } else if unlocated_conditional_exit {
                 self.assembler.set_location(SourceLocation::NONE);
             } else if following_try_threads_conditional_exit {
@@ -11811,6 +11854,13 @@ impl Compiler<'_> {
                 // normal try exit inherits the assignment's final store in CPython.
                 self.assembler
                     .set_location(self.source_location(target.range));
+            } else if self.control.in_loop_tail_without_nested_cleanup()
+                && !self.control.statements.current_statement_has_following
+                && statement.orelse.is_empty()
+                && statement.finalbody.is_empty()
+                && let Some(range) = suite_match_failure_range(normal_exit_suite)
+            {
+                self.assembler.set_location(self.source_location(range));
             } else if let Some(location) = self.assembler.last_instruction_location() {
                 self.assembler.set_location(location);
             }
@@ -11874,6 +11924,12 @@ impl Compiler<'_> {
                 end,
                 exception_policy,
             )?;
+            if shared_guarded_match_exit {
+                // The original unlocated exit survives early jump threading and is
+                // copied before its conditional predecessors inherit separate locations.
+                self.assembler
+                    .prepare_no_location_block_for_inlining(normal_exit);
+            }
             if shared_conditional_exit {
                 // Preserve the original shared jump's missing location while allowing
                 // copied exits to inherit the location of their own predecessor.
@@ -12011,8 +12067,29 @@ impl Compiler<'_> {
                     }
                 }
             }
-            if direct_exit_location.is_some() || loop_exit_location.is_some() {
+            if direct_exit_location.is_some()
+                || loop_exit_location.is_some()
+                || chained_assertion_exit_location.is_some()
+            {
                 self.assembler.preserve_direct_inlined_jump_nop(normal_exit);
+            }
+            if direct_exit_location.is_some_and(|location| location.chained_comparison_cleanup)
+                || chained_assertion_exit_location.is_some()
+                || (loop_exit_location.is_some()
+                    && matches!(normal_exit_suite.last(), Some(Stmt::While(loop_statement))
+                        if matches!(loop_statement.test.as_ref(), Expr::Compare(comparison)
+                            if comparison.ops.len() > 1)))
+            {
+                // If the following block is too large to copy, cold-handler relocation
+                // removes this same located jump later. Retain its native NOP then too.
+                self.assembler
+                    .preserve_redundant_jump_nop_after_threading(normal_exit);
+            }
+            if chained_assertion_exit_location.is_some() {
+                // Cold-block relocation removes this jump after native borrowing has
+                // followed it into the continuation. Keep that traversal through its NOP.
+                self.assembler
+                    .mark_retained_nop_borrow_fallthrough_if_unblocked(normal_exit);
             }
             if statement.orelse.is_empty() && retained_assertion_exit {
                 self.assembler.prevent_jump_threading_target(normal_exit);
@@ -12213,7 +12290,20 @@ impl Compiler<'_> {
                     .record_exception_owner_continuation(body_start);
             }
             self.assembler.mark(body_start);
+            // Use ordinary handler unwinding while the target loop stays in the current
+            // finalizer context. Leaving a FINALLY_END also needs its cleanup interleaved
+            // with the handlers, so retain the existing path for those transfers.
+            let use_enclosing_handler_unwind =
+                self.control.loops.contexts.last().is_some_and(|context| {
+                    context.finally_end_depth == self.control.finally.active_finally_end_blocks
+                }) && self
+                    .control
+                    .exceptions
+                    .active_exception_handlers
+                    .iter()
+                    .any(|handler| handler.loop_depth >= self.control.loops.contexts.len());
             if matches!(handler.body.as_slice(), [Stmt::Continue(_)])
+                && !use_enclosing_handler_unwind
                 && self.control.loops.contexts.last().is_none_or(|context| {
                     context.with_depth == self.control.withs.active_with_exits.len()
                 })
@@ -12281,6 +12371,7 @@ impl Compiler<'_> {
             }
             if handler.name.is_none()
                 && matches!(handler.body.as_slice(), [Stmt::Break(_)])
+                && !use_enclosing_handler_unwind
                 && self.control.loops.contexts.last().is_none_or(|context| {
                     context.with_depth == self.control.withs.active_with_exits.len()
                 })
@@ -12562,7 +12653,10 @@ impl Compiler<'_> {
                                     && matches!(clause.body.last(), Some(Stmt::Raise(_)))))
                         })
                         && !suite_terminates(&tail.body)
-            );
+            )
+                || (terminal_for_break_exit_inherits_predecessor(&handler.body)
+                    && matches!(handler.body.last(), Some(Stmt::For(tail))
+                    if matches!(tail.orelse.last(), Some(Stmt::Raise(_)))));
             // A surrounding manager inserts its own cleanup before the following return,
             // so that continuation is no longer a small return exit.
             let cleanup_has_small_return_successor =
@@ -14245,7 +14339,8 @@ impl Compiler<'_> {
             // finally body. Breaks and trailing structured try-body exits can leave the same
             // boundary. Outside a synchronous with, ordinary typed fallthrough handlers keep
             // the normal finally body reachable, including a structured terminal body.
-            self.assembler.prevent_borrow_reachability(protected_end);
+            self.assembler
+                .prevent_borrow_finally_fallthrough(protected_end);
         }
         if !statement.handlers.is_empty()
             && matches!(statement.finalbody.first(), Some(Stmt::Try(_)))
@@ -16856,40 +16951,40 @@ fn expression_contains_chained_comparison(expression: &Expr) -> bool {
 }
 
 // Returns the final chained comparison that `compile_jump_if` lowers for this condition.
-// Only this final comparison can be adjacent to a copied terminal exit after CFG optimization.
-pub(super) fn final_chained_comparison_jump(expression: &Expr) -> Option<TextRange> {
+// Its fallthrough jump can become a located NOP when a small terminal exit is copied.
+fn final_chained_comparison(expression: &Expr) -> Option<&ruff_python_ast::ExprCompare> {
     if let Expr::UnaryOp(unary) = expression
         && unary.op == UnaryOp::Not
     {
-        return final_chained_comparison_jump(&unary.operand);
+        return final_chained_comparison(&unary.operand);
     }
     if let Expr::If(conditional) = expression
         && let Some(truthiness) = early_condition_truthiness(&conditional.test)
     {
-        return final_chained_comparison_jump(if truthiness {
+        return final_chained_comparison(if truthiness {
             &conditional.body
         } else {
             &conditional.orelse
         });
     }
     if let Expr::BoolOp(boolean) = expression {
-        return boolean
-            .values
-            .last()
-            .and_then(final_chained_comparison_jump);
+        return boolean.values.last().and_then(final_chained_comparison);
     }
     match expression {
-        Expr::Compare(comparison)
-            if comparison.ops.len() > 1
-                && !comparison
-                    .ops
-                    .iter()
-                    .any(|operator| matches!(operator, CmpOp::Is | CmpOp::IsNot)) =>
-        {
-            Some(comparison.range)
-        }
+        Expr::Compare(comparison) if comparison.ops.len() > 1 => Some(comparison),
         _ => None,
     }
+}
+
+pub(super) fn final_chained_comparison_jump(expression: &Expr) -> Option<TextRange> {
+    final_chained_comparison(expression)
+        .filter(|comparison| {
+            !comparison
+                .ops
+                .iter()
+                .any(|operator| matches!(operator, CmpOp::Is | CmpOp::IsNot))
+        })
+        .map(|comparison| comparison.range)
 }
 
 pub(super) fn suite_terminates(body: &[Stmt]) -> bool {
@@ -17522,7 +17617,7 @@ fn suite_retained_try_exit_has_normal_fallthrough(body: &[Stmt]) -> bool {
 // A terminal branch or nested try can leave the normal exit with one direct condition
 // predecessor. Cold handler blocks take separate exits. If this exit copies a small return
 // or raise, CPython retains the original jump's location.
-fn direct_try_body_exit_location(body: &[Stmt]) -> Option<&Expr> {
+fn direct_try_body_exit_location(body: &[Stmt]) -> Option<DirectTryBodyExitLocation<'_>> {
     let Some(Stmt::If(statement)) = body.last() else {
         return None;
     };
@@ -17539,7 +17634,24 @@ fn direct_try_body_exit_location(body: &[Stmt]) -> Option<&Expr> {
         NestedIfExitLocation::Unlocated => return None,
     };
     (early_condition_truthiness(&statement.test).is_none())
-        .then(|| unique_condition_jump_target(test, false))
+        .then(|| {
+            // Early CFG copying moves a chained comparison's POP_TOP cleanup edge
+            // into the unlocated try exit. The final comparison is then its sole
+            // predecessor and supplies the surviving normal jump's location.
+            let chained_comparison_cleanup =
+                matches!(test, Expr::Compare(comparison) if comparison.ops.len() > 1);
+            let location = if chained_comparison_cleanup {
+                Some(test)
+            } else {
+                unique_condition_jump_target(test, false)
+            };
+            // A negated chain contributes only its final success edge. The unique-target
+            // helper strips `not`, so retain its edge provenance separately from its range.
+            location.map(|test| DirectTryBodyExitLocation {
+                test,
+                chained_comparison_cleanup,
+            })
+        })
         .flatten()
 }
 
@@ -18958,6 +19070,37 @@ pub(super) fn nested_if_exit_location(
             NestedIfExitLocation::Unlocated
         },
     )
+}
+
+// A final value pattern and runtime guard share the original zero-pop failure
+// continuation. Keep that exit unlocated until each predecessor gets its own copy.
+fn suite_has_shared_guarded_match_failure(body: &[Stmt]) -> bool {
+    let [Stmt::Match(statement)] = body else {
+        return false;
+    };
+    let Some(case) = statement.cases.last() else {
+        return false;
+    };
+    matches!(case.pattern, Pattern::MatchValue(_))
+        && case.guard.as_deref().is_some_and(|guard| {
+            matches!(guard, Expr::Name(_)) && early_condition_truthiness(guard).is_none()
+        })
+        && matches!(case.body.as_slice(), [Stmt::Assign(_) | Stmt::Expr(_)])
+}
+
+// Once case-success exits have been copied, the last refutable pattern is the
+// sole predecessor of the original match-failure continuation.
+fn suite_match_failure_range(body: &[Stmt]) -> Option<TextRange> {
+    let Stmt::Match(statement) = body.last()? else {
+        return None;
+    };
+    let case = statement.cases.last()?;
+    (case.guard.is_none()
+        && matches!(
+            case.pattern,
+            Pattern::MatchValue(_) | Pattern::MatchSingleton(_)
+        ))
+    .then(|| case.pattern.range())
 }
 
 fn suite_unary_not_fallthrough_range(body: &[Stmt]) -> Option<TextRange> {

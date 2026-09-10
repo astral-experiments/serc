@@ -1012,6 +1012,14 @@ impl Compiler<'_> {
                     // consuming None jump. Register the constant before the specialization so
                     // its pool ordering follows the same source traversal. The removed
                     // LOAD_CONST and IS_OP leave a protected slot for the late NOT_TAKEN marker.
+                    // Swap optimization reconstructs rotations into those folded instruction
+                    // slots, retaining the None pattern's location on the surviving swaps.
+                    let preserve_swap_slots =
+                        self.assembler.current_block_ends_with_multiple_swaps();
+                    if preserve_swap_slots {
+                        self.emit(NOP, 0, 0)?;
+                        self.emit(NOP, 0, 0)?;
+                    }
                     let condition_start = self.assembler.item_count();
                     let result = self.jump_to_match_fail_with_marker_policy(
                         context,
@@ -1019,8 +1027,10 @@ impl Compiler<'_> {
                         -1,
                         ExceptionPolicy::normalized_owner(true),
                     );
-                    self.assembler
-                        .add_hidden_exception_owner_slots_at(condition_start, 2);
+                    if !preserve_swap_slots {
+                        self.assembler
+                            .add_hidden_exception_owner_slots_at(condition_start, 2);
+                    }
                     context.ownerless_markers_after_specialized_none = true;
                     result
                 } else {
@@ -7438,6 +7448,9 @@ impl Compiler<'_> {
                 == Some(conditional.range)
             {
                 self.assembler.preserve_inlined_jump_nop(body_exit);
+            } else {
+                // CPython copies the original unlocated join before small branch tails.
+                self.assembler.preserve_direct_inlined_jump_nop(body_exit);
             }
             self.assembler
                 .record_exception_owner_block_boundary(otherwise);

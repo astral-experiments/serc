@@ -11,7 +11,7 @@ use crate::assembler::OptimizationPipeline;
 use crate::assembler::block_graph::{BlockGraph, ItemMut, ItemPosition};
 use crate::target::Opcode;
 use crate::target::opcodes::{
-    LOAD_CONST, LOAD_GLOBAL, POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE, RAISE_VARARGS,
+    LOAD_CONST, LOAD_GLOBAL, POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE, RAISE_VARARGS, SWAP,
 };
 use crate::target::operands::ComparisonOperation;
 
@@ -882,6 +882,97 @@ impl OptimizationPipeline {
         changed
     }
 
+    /// Preserves the empty fallthrough boundary left when every jump-head entry is copied.
+    pub(in crate::assembler) fn record_borrow_empty_jump_heads(&mut self) {
+        let graph = &self.graph;
+        let order = graph.order();
+        let positions = order
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, block)| (block, index))
+            .collect::<FxHashMap<_, _>>();
+        let mut blocked = self
+            .exception_regions
+            .iter()
+            .filter_map(|region| graph.label_block(region.target))
+            .collect::<FxHashSet<_>>();
+        blocked.extend(order.first().copied());
+        for blocks in order.windows(2) {
+            if super::super::block_has_fallthrough(graph[blocks[0]].items()) {
+                blocked.insert(blocks[1]);
+            }
+        }
+        let mut incoming = FxHashSet::default();
+        for source in order.iter().copied() {
+            let last = graph[source]
+                .items()
+                .iter()
+                .rposition(|item| matches!(item, Item::Instruction(_)));
+            for (offset, item) in graph[source].items().iter().enumerate() {
+                let Item::Instruction(instruction) = item else {
+                    continue;
+                };
+                let (Operand::Forward(label) | Operand::Backward(label)) = instruction.operand()
+                else {
+                    continue;
+                };
+                let Some(target) = graph.label_block(label) else {
+                    continue;
+                };
+                incoming.insert(target);
+                // Every original entry must take the same unconditional-copy path.
+                // Conditional, backward, and retained-NOP entries can keep this block live.
+                if Some(offset) != last
+                    || instruction.opcode != JUMP_FORWARD
+                    || !matches!(instruction.operand(), Operand::Forward(_))
+                    || instruction.jump_policy.always_retains_nop()
+                    || positions[&source] >= positions[&target]
+                {
+                    blocked.insert(target);
+                }
+            }
+        }
+        let heads = order
+            .iter()
+            .copied()
+            .filter(|block| incoming.contains(block) && !blocked.contains(block))
+            .filter_map(|block| {
+                let items = graph[block].items();
+                let (Item::Instruction(jump), labels) = items.split_last()? else {
+                    return None;
+                };
+                if !labels.iter().all(|item| {
+                    matches!(item, Item::Label(label)
+                        if !self.original_nop_targets.contains(label)
+                            && !self.preserved_block_boundaries.contains(label))
+                }) || jump.opcode != JUMP_FORWARD
+                    || jump.location.line >= 0
+                    || jump.pre_fold_extra_instructions() != 0
+                    || !jump.jump_policy.allows_threading_target()
+                    || jump.jump_policy.always_retains_nop()
+                    || jump.jump_policy.preserves_nop_after_threading()
+                    || jump.jump_policy.is_interruptible()
+                    || jump.jump_policy.borrow_empty_block()
+                {
+                    return None;
+                }
+                let Operand::Forward(label) = jump.operand() else {
+                    return None;
+                };
+                let target = graph.label_block(label)?;
+                (positions[&block] < positions[&target])
+                    .then_some(ItemPosition::new(block, items.len() - 1))
+            })
+            .collect::<Vec<_>>();
+        for head in heads {
+            // Threading transfers this provenance to each predecessor jump. If that
+            // jump disappears later, its barrier remains at the original fallthrough
+            // site even when the emptied target's labels move with cold handlers.
+            self.graph.mark_borrow_empty_block(head);
+        }
+    }
+
     /// Records physical original JUMP heads before early copying can replace them with NOPs.
     pub(in crate::assembler) fn record_original_jump_heads(&mut self) {
         let conditional_targets = self
@@ -1473,11 +1564,13 @@ impl OptimizationPipeline {
                     let Item::Instruction(instruction) = item else {
                         return None;
                     };
-                    Some((ItemPosition::new(block, offset), instruction))
+                    Some((block, ItemPosition::new(block, offset), instruction))
                 })
         });
         let mut instructions = instructions.peekable();
         let mut previous = None;
+        let mut previous_graph_block = None;
+        let mut removed_unpack_line_block = None;
         let mut redundant = Vec::new();
         let mut borrow_empty_nops = Vec::new();
         let mut vacated_slots = Vec::new();
@@ -1487,7 +1580,7 @@ impl OptimizationPipeline {
         let mut certified_pop_boundaries = Vec::new();
         let mut certified_pop_widths = Vec::new();
         let mut pending_block = None;
-        while let Some((position, instruction)) = instructions.next() {
+        while let Some((graph_block, position, instruction)) = instructions.next() {
             let block = if track_exception_owners {
                 history_blocks[&position]
             } else {
@@ -1505,7 +1598,23 @@ impl OptimizationPipeline {
                 pending_pop_boundaries.clear();
                 pending_pop_slots = None;
             }
-            let next = instructions.peek().map(|(_, instruction)| *instruction);
+            let next = instructions.peek().map(|(_, _, instruction)| *instruction);
+            // A canceled rotation can leave both the unpack line and a later capture line.
+            // Record removal of the first so the legacy store rule keeps the latter.
+            let removes_unpack_line_nop = instruction.opcode == NOP
+                && instruction.location.line >= 0
+                && !instruction.fusion_policy.is_converted_pop_block()
+                && previous.is_some_and(|previous: &Instruction| {
+                    previous.opcode == UNPACK_SEQUENCE
+                        && previous_graph_block == Some(graph_block)
+                        && previous.location.line == instruction.location.line
+                })
+                && instructions.peek().is_some_and(|(next_block, _, next)| {
+                    *next_block == graph_block
+                        && next.opcode == NOP
+                        && next.location.line >= 0
+                        && next.location.line != instruction.location.line
+                });
             let remove = instruction.opcode == NOP
                 && (!with_exits_only
                     || (instruction.fusion_policy.is_converted_pop_block()
@@ -1526,15 +1635,24 @@ impl OptimizationPipeline {
                                     || is_unconditional_jump(previous.opcode))
                         }))
                     || next.is_some_and(|next| next.location.line == instruction.location.line)
-                    // A removed capture rotation is redundant only when the preceding
-                    // unpack already records its source line.
-                    || (previous.is_some_and(|previous: &Instruction| {
+                    || removes_unpack_line_nop
+                    // A rewritten rotation is redundant when UNPACK_SEQUENCE already
+                    // represents its line in this block, or local stores consume the unpack.
+                    || previous.is_some_and(|previous: &Instruction| {
                         previous.opcode == UNPACK_SEQUENCE
-                            && previous.location.line == instruction.location.line
-                    }) && next.is_some_and(|next| {
-                        matches!(next.opcode, STORE_FAST | STORE_FAST_STORE_FAST)
-                    })));
+                            && ((previous_graph_block == Some(graph_block)
+                                && previous.location.line == instruction.location.line
+                                && next.is_some_and(|next| next.opcode == SWAP))
+                                || (removed_unpack_line_block != Some(graph_block)
+                                    && previous.location.line == instruction.location.line
+                                    && next.is_some_and(|next| {
+                                        matches!(next.opcode, STORE_FAST | STORE_FAST_STORE_FAST)
+                                    })))
+                    }));
             if remove {
+                if removes_unpack_line_nop {
+                    removed_unpack_line_block = Some(graph_block);
+                }
                 pending_pop_slots = pending_pop_slots.and_then(|count| {
                     (instruction.fusion_policy.is_converted_pop_block()
                         && instruction.local_policy.hidden_exception_owner_slots() == 0
@@ -1591,6 +1709,8 @@ impl OptimizationPipeline {
                 }
                 pending_pop_slots = Some(0);
                 previous = Some(instruction);
+                previous_graph_block = Some(graph_block);
+                removed_unpack_line_block = None;
             }
         }
 

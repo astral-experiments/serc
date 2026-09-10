@@ -252,6 +252,8 @@ impl Assembler {
             preserved_block_boundaries: self.preserved_block_boundaries,
             borrow_unreachable_blocks: self.borrow_unreachable_blocks,
             borrow_loop_exit_blocks: self.borrow_loop_exit_blocks,
+            borrow_finally_entries: self.borrow_finally_entries,
+            borrow_finally_jump_sources: rustc_hash::FxHashMap::default(),
             borrow_block_aliases: self.borrow_block_aliases,
             conditional_threading_targets: self.conditional_threading_targets,
             original_nop_targets: self.original_nop_targets,
@@ -281,6 +283,8 @@ impl OptimizationPipeline {
         parameter_count: usize,
         constants: Option<&mut dyn ConstantTable>,
     ) -> Result<LayoutAssembler, CompileError> {
+        self.record_borrow_cleanup_calls();
+        self.record_borrow_empty_jump_heads();
         self.record_original_jump_heads();
         self.prepare_original_conditional_jump_targets();
         let assertion_side_exits = self.has_only_assertion_side_exits();
@@ -386,8 +390,12 @@ impl OptimizationPipeline {
             Self::optimize_load_fast(
                 &mut items,
                 &self.exception_regions,
-                &self.borrow_unreachable_blocks,
-                &self.borrow_loop_exit_blocks,
+                locals::BorrowEntryLabels {
+                    unreachable: &self.borrow_unreachable_blocks,
+                    loop_exits: &self.borrow_loop_exit_blocks,
+                    finally_entries: &self.borrow_finally_entries,
+                    finally_jump_sources: &self.borrow_finally_jump_sources,
+                },
                 &self.preserved_block_boundaries,
                 &self.borrow_block_aliases,
                 assertion_side_exits,

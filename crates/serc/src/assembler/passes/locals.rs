@@ -3,6 +3,7 @@ use std::ops::Range;
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 
+use super::super::ir::BorrowCleanupCall;
 use super::super::{
     BorrowFallthrough, BorrowLoopExitPolicy, CHECK_EXC_MATCH, COMPARE_OP, COPY, DELETE_DEREF,
     DELETE_FAST, DICT_MERGE, DICT_UPDATE, END_SEND, ExceptionRegion, FOR_ITER, FORMAT_SIMPLE,
@@ -18,6 +19,16 @@ use super::super::{
 };
 use crate::assembler::OptimizationPipeline;
 use crate::assembler::block_graph::ItemMut;
+use crate::target::{is_unconditional_jump, opcodes::CALL};
+
+/// Original block entries retained for CPython's final borrowing traversal.
+#[derive(Clone, Copy)]
+pub(in crate::assembler) struct BorrowEntryLabels<'a> {
+    pub(super) unreachable: &'a FxHashSet<Label>,
+    pub(super) loop_exits: &'a FxHashMap<Label, BorrowLoopExitPolicy>,
+    pub(super) finally_entries: &'a FxHashMap<Label, Option<BorrowCleanupCall>>,
+    pub(super) finally_jump_sources: &'a FxHashMap<Label, bool>,
+}
 
 /// Tracks which analysis markers will remain as physical instructions after borrowing.
 struct BorrowMarkerRetention {
@@ -1033,6 +1044,212 @@ impl OptimizationPipeline {
         }
     }
 
+    /// Retains original source entries when later threading changes a jump destination.
+    fn record_borrow_finally_jump_sources(&mut self) {
+        if self.borrow_finally_entries.is_empty() {
+            return;
+        }
+        // Empty original blocks and folded-assertion barriers stop the borrowing
+        // traversal. Exception-only entries do not establish a normal source path.
+        let order = self.graph.order();
+        let capacity = order
+            .iter()
+            .map(|block| block.index() + 1)
+            .max()
+            .unwrap_or(0);
+        let mut positions = vec![usize::MAX; capacity];
+        for (position, block) in order.iter().copied().enumerate() {
+            positions[block.index()] = position;
+        }
+        let mut borrowed = vec![false; capacity];
+        let mut pending = order.first().copied().into_iter().collect::<Vec<_>>();
+        while let Some(block) = pending.pop() {
+            if std::mem::replace(&mut borrowed[block.index()], true) {
+                continue;
+            }
+            let items = self.graph[block].items();
+            let Some(last) = items.iter().rev().find_map(|item| match item {
+                Item::Instruction(instruction) => Some(instruction),
+                Item::Label(_) => None,
+            }) else {
+                continue;
+            };
+            if block_has_fallthrough(items)
+                && last.no_location_policy.borrow_fallthrough() != BorrowFallthrough::Barrier
+                && let Some(next) = order.get(positions[block.index()] + 1)
+            {
+                pending.push(*next);
+            }
+            if let Some(target) = block_jump_target(items)
+                && let Some(target) = self.graph.label_block(target)
+            {
+                pending.push(target);
+            }
+        }
+        let mut sources = FxHashMap::default();
+        for block in order.iter().copied() {
+            let items = self.graph[block].items();
+            let Some(last) = items.iter().rev().find_map(|item| match item {
+                Item::Instruction(instruction) => Some(instruction),
+                Item::Label(_) => None,
+            }) else {
+                continue;
+            };
+            if !is_unconditional_jump(last.opcode)
+                || last.fusion_policy.is_authored_break()
+                || last.jump_policy.borrow_empty_block()
+            {
+                continue;
+            }
+            for item in items
+                .iter()
+                .take_while(|item| matches!(item, Item::Label(_)))
+            {
+                if let Item::Label(label) = item {
+                    sources.insert(*label, borrowed[block.index()]);
+                }
+            }
+        }
+        self.borrow_finally_jump_sources = sources;
+    }
+
+    /// Records nonempty cleanup targets before optimizer passes can merge their labels.
+    pub(in crate::assembler) fn record_borrow_cleanup_calls(&mut self) {
+        if self.borrow_loop_exit_blocks.is_empty() && self.borrow_finally_entries.is_empty() {
+            return;
+        }
+        self.record_borrow_finally_jump_sources();
+        let mut boundaries = self.preserved_block_boundaries.clone();
+        boundaries.extend(self.borrow_unreachable_blocks.iter().copied());
+        boundaries.extend(self.exception_regions.iter().map(|region| region.target));
+        for item in self.graph.iter_items() {
+            if let Item::Instruction(instruction) = item
+                && let Operand::Forward(label) | Operand::Backward(label) = instruction.operand()
+            {
+                boundaries.insert(label);
+            }
+        }
+        let preserved = self
+            .preserved_block_boundaries
+            .difference(&self.borrow_block_aliases)
+            .copied()
+            .collect();
+        let calls = self
+            .borrow_loop_exit_blocks
+            .keys()
+            .chain(self.borrow_finally_entries.keys())
+            .copied()
+            .collect::<FxHashSet<_>>()
+            .into_iter()
+            .map(|label| {
+                let call = (|| {
+                    // Capture inside this original physical block. Flattening the whole
+                    // graph could borrow a call from beyond a separate empty block.
+                    let original = self.graph.label_block(label)?;
+                    let items = self.graph[original].items();
+                    let (blocks, label_blocks, _) = borrow_block_ranges(
+                        items,
+                        &boundaries,
+                        &self.borrow_unreachable_blocks,
+                        &preserved,
+                    );
+                    let range =
+                        blocks.get(*label_blocks.get(usize::try_from(label.0).unwrap())?)?;
+                    let instructions = items[range.clone()]
+                        .iter()
+                        .filter_map(|item| match item {
+                            Item::Instruction(instruction) => Some(instruction),
+                            Item::Label(_) => None,
+                        })
+                        .collect::<Vec<_>>();
+                    let first = instructions.first()?;
+                    if first.opcode != NOP || !first.fusion_policy.is_converted_pop_block() {
+                        return None;
+                    }
+                    let live = instructions
+                        .iter()
+                        .copied()
+                        .filter(|instruction| instruction.opcode != NOP)
+                        .collect::<Vec<_>>();
+                    let scope_exit = live.last().is_some_and(|last| ends_scope(last.opcode));
+                    for (index, instruction) in instructions.iter().enumerate() {
+                        if instruction.opcode != CALL || instruction.location.line < 0 {
+                            continue;
+                        }
+                        let Operand::Value(argument) = instruction.operand() else {
+                            continue;
+                        };
+                        // These five operations survive constant/NOP folding before exit copying:
+                        // LOAD_FAST, LOAD_ATTR, CALL, POP_TOP, and the scope exit. The receiver
+                        // load cannot form a fast-fast fusion with LOAD_ATTR. Small return calls
+                        // lack POP_TOP and retain the existing empty-exit behavior.
+                        if scope_exit
+                            && !(live.first().is_some_and(|first| first.opcode == LOAD_FAST)
+                                && live.get(1).is_some_and(|second| second.opcode == LOAD_ATTR)
+                                && instructions
+                                    .get(index + 1)
+                                    .is_some_and(|next| next.opcode == POP_TOP))
+                        {
+                            continue;
+                        }
+                        if instructions[..index].iter().any(|candidate| {
+                            candidate.jump_policy.borrow_empty_block()
+                                || candidate.no_location_policy.borrow_fallthrough()
+                                    != BorrowFallthrough::Reachable
+                        }) {
+                            continue;
+                        }
+                        let aliases = items[range.clone()]
+                            .iter()
+                            .take_while(|item| matches!(item, Item::Label(_)))
+                            .filter_map(|item| match item {
+                                Item::Label(label) => Some(*label),
+                                Item::Instruction(_) => None,
+                            })
+                            .collect::<Vec<_>>();
+                        return Some((
+                            BorrowCleanupCall {
+                                argument,
+                                location: instruction.location,
+                            },
+                            aliases,
+                        ));
+                    }
+                    None
+                })();
+                (label, call)
+            })
+            .collect::<Vec<_>>();
+        let mut finally_entries = FxHashMap::default();
+        for (label, entry) in calls {
+            if let Some(policy) = self.borrow_loop_exit_blocks.get_mut(&label) {
+                policy.cleanup_call = entry.as_ref().map(|(call, _)| *call);
+            }
+            if self.borrow_finally_entries.contains_key(&label) {
+                let (call, aliases) =
+                    entry.map_or((None, vec![label]), |(call, aliases)| (Some(call), aliases));
+                for alias in aliases {
+                    // An independent unreachable marker keeps its own barrier even when
+                    // it shares this original physical block with normal cleanup.
+                    if self.borrow_unreachable_blocks.contains(&alias)
+                        && !self.borrow_finally_entries.contains_key(&alias)
+                    {
+                        continue;
+                    }
+                    finally_entries
+                        .entry(alias)
+                        .and_modify(|prior| {
+                            if *prior != call {
+                                *prior = None;
+                            }
+                        })
+                        .or_insert(call);
+                }
+            }
+        }
+        self.borrow_finally_entries = finally_entries;
+    }
+
     /// Mirrors CPython's final `optimize_load_fast` CFG pass.
     ///
     /// An owned local load can become a borrowed load only when its value is
@@ -1041,8 +1258,7 @@ impl OptimizationPipeline {
     pub(in crate::assembler) fn optimize_load_fast(
         items: &mut [Item],
         exception_regions: &[ExceptionRegion],
-        borrow_unreachable_labels: &FxHashSet<Label>,
-        borrow_loop_exit_labels: &FxHashMap<Label, BorrowLoopExitPolicy>,
+        entries: BorrowEntryLabels<'_>,
         preserved_block_boundaries: &FxHashSet<Label>,
         borrow_block_aliases: &FxHashSet<Label>,
         assertion_side_exits: bool,
@@ -1215,6 +1431,13 @@ impl OptimizationPipeline {
             }
         }
 
+        let BorrowEntryLabels {
+            unreachable: borrow_unreachable_labels,
+            loop_exits: borrow_loop_exit_labels,
+            finally_entries: borrow_finally_entries,
+            finally_jump_sources: borrow_finally_jump_sources,
+        } = entries;
+
         if !items.iter().any(|item| {
             matches!(
                 item,
@@ -1297,9 +1520,15 @@ impl OptimizationPipeline {
                         let mut policy = BorrowLoopExitPolicy {
                             allow_surviving_break: true,
                             preserve_small_exit: true,
+                            cleanup_call: None,
                         };
                         for label in labels {
                             let entry = borrow_loop_exit_labels.get(label)?;
+                            if !has_loop_exit {
+                                policy.cleanup_call = entry.cleanup_call;
+                            } else if policy.cleanup_call != entry.cleanup_call {
+                                policy.cleanup_call = None;
+                            }
                             has_loop_exit = true;
                             policy.allow_surviving_break &= entry.allow_surviving_break;
                             policy.preserve_small_exit &= entry.preserve_small_exit;
@@ -1308,26 +1537,71 @@ impl OptimizationPipeline {
                     })
                     .collect::<Vec<_>>()
             };
-            let surviving_instruction_offsets = items
-                .iter()
-                .any(|item| {
+            // A normal finally entry is eligible only when every collapsed unreachable
+            // marker names the same original cleanup. An adjacent empty join remains a
+            // barrier even when later optimization merges its labels into this range.
+            let finally_entry_calls = if borrow_finally_entries.is_empty() {
+                Vec::new()
+            } else {
+                blocks
+                    .iter()
+                    .map(|range| {
+                        let mut call = None;
+                        for item in &items[range.clone()] {
+                            if let Item::Label(label) = item
+                                && borrow_unreachable_labels.contains(label)
+                            {
+                                let entry = (*borrow_finally_entries.get(label)?)?;
+                                if call.is_some_and(|prior| prior != entry) {
+                                    return None;
+                                }
+                                call = Some(entry);
+                            }
+                        }
+                        call
+                    })
+                    .collect::<Vec<_>>()
+            };
+            // Threaded destinations do not change whether the original source could
+            // reach the jump. Every surviving source marker must agree; copied heads
+            // are explicitly uncertified and cannot inherit a predecessor's marker.
+            let finally_jump_sources = if borrow_finally_jump_sources.is_empty() {
+                Vec::new()
+            } else {
+                blocks
+                    .iter()
+                    .map(|range| {
+                        let mut source = None;
+                        for item in &items[range.clone()] {
+                            if let Item::Label(label) = item
+                                && let Some(reachable) = borrow_finally_jump_sources.get(label)
+                            {
+                                source = Some(source.unwrap_or(true) && *reachable);
+                            }
+                        }
+                        source.unwrap_or(false)
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let surviving_instruction_offsets = (!borrow_finally_entries.is_empty()
+                || items.iter().any(|item| {
                     matches!(item, Item::Instruction(instruction)
                         if instruction.jump_policy.borrow_empty_block()
                             && !matches!(instruction.operand(), Operand::Value(_)))
-                })
-                .then(|| {
-                    let mut retention = BorrowMarkerRetention::new(items);
-                    let mut offsets = Vec::with_capacity(items.len() + 1);
-                    let mut count = 0;
-                    offsets.push(count);
-                    for item in items.iter() {
-                        if retention.keeps(item) && matches!(item, Item::Instruction(_)) {
-                            count += 1;
-                        }
-                        offsets.push(count);
+                }))
+            .then(|| {
+                let mut retention = BorrowMarkerRetention::new(items);
+                let mut offsets = Vec::with_capacity(items.len() + 1);
+                let mut count = 0;
+                offsets.push(count);
+                for item in items.iter() {
+                    if retention.keeps(item) && matches!(item, Item::Instruction(_)) {
+                        count += 1;
                     }
-                    offsets
-                });
+                    offsets.push(count);
+                }
+                offsets
+            });
             let mut reachable = vec![false; blocks.len()];
             let mut pending = (!blocks.is_empty())
                 .then_some((0, false))
@@ -1419,7 +1693,82 @@ impl OptimizationPipeline {
                         .is_some_and(|policy| {
                             policy.allow_surviving_break || !last.fusion_policy.is_authored_break()
                         });
-                    pending.push((target, shared_break || independent_loop_entry));
+                    // A surviving authored jump can enter its original nonempty cleanup.
+                    // The label supplies identity; the matching call checks that its body
+                    // survived. Copied exits rename labels, and other unreachable markers
+                    // keep the merged range ineligible through loop_exit_entry_policies.
+                    let cleanup_entry = is_unconditional_jump(last.opcode)
+                        && last.fusion_policy.is_authored_break()
+                        && !last.jump_policy.borrow_empty_block()
+                        && borrow_loop_exit_labels
+                            .get(&label)
+                            .and_then(|entry| entry.cleanup_call)
+                            .is_some_and(|call| {
+                                loop_exit_entry_policies
+                                    .get(target)
+                                    .copied()
+                                    .flatten()
+                                    .is_some_and(|entry| entry.cleanup_call == Some(call))
+                                    && {
+                                        let mut at_target = false;
+                                        items[blocks[target].clone()].iter().any(
+                                            |item| match item {
+                                                Item::Label(candidate) => {
+                                                    at_target |= *candidate == label;
+                                                    false
+                                                }
+                                                Item::Instruction(instruction) => {
+                                                    at_target
+                                                        && instruction.opcode == CALL
+                                                        && instruction.operand()
+                                                            == Operand::Value(call.argument)
+                                                        && instruction.location == call.location
+                                                }
+                                            },
+                                        )
+                                    }
+                            });
+                    // Unlike the fallthrough and conditional paths, a surviving ordinary
+                    // jump can enter the original nonempty normal-finally block directly.
+                    // Only aliases captured before label merging identify that entry.
+                    let finally_entry = is_unconditional_jump(last.opcode)
+                        // A zero-distance surrogate can represent an empty native
+                        // block, so it cannot certify an independent entry.
+                        && surviving_instruction_offsets.as_ref().is_some_and(|offsets| {
+                            offsets[blocks[block].end] != offsets[blocks[target].start]
+                        })
+                        && finally_jump_sources.get(block).copied().unwrap_or(false)
+                        && !last.fusion_policy.is_authored_break()
+                        && !last.jump_policy.borrow_empty_block()
+                        && borrow_finally_entries
+                            .get(&label)
+                            .copied()
+                            .flatten()
+                            .is_some_and(|call| {
+                                finally_entry_calls.get(target).copied().flatten() == Some(call)
+                                    && {
+                                        let mut at_target = false;
+                                        items[blocks[target].clone()].iter().any(
+                                            |item| match item {
+                                                Item::Label(candidate) => {
+                                                    at_target |= *candidate == label;
+                                                    false
+                                                }
+                                                Item::Instruction(instruction) => {
+                                                    at_target
+                                                        && instruction.opcode == CALL
+                                                        && instruction.operand()
+                                                            == Operand::Value(call.argument)
+                                                        && instruction.location == call.location
+                                                }
+                                            },
+                                        )
+                                    }
+                            });
+                    pending.push((
+                        target,
+                        shared_break || independent_loop_entry || cleanup_entry || finally_entry,
+                    ));
                 }
             }
 
@@ -1784,13 +2133,18 @@ mod tests {
                     BorrowLoopExitPolicy {
                         allow_surviving_break: false,
                         preserve_small_exit,
+                        cleanup_call: None,
                     },
                 )]);
                 super::OptimizationPipeline::optimize_load_fast(
                     &mut items,
                     &[],
-                    &FxHashSet::from_iter([exit]),
-                    &exits,
+                    super::BorrowEntryLabels {
+                        unreachable: &FxHashSet::from_iter([exit]),
+                        loop_exits: &exits,
+                        finally_entries: &FxHashMap::default(),
+                        finally_jump_sources: &FxHashMap::default(),
+                    },
                     &FxHashSet::default(),
                     &FxHashSet::default(),
                     false,

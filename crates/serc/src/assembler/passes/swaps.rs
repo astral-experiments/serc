@@ -287,6 +287,26 @@ impl OptimizationPipeline {
                     }
                 }
 
+                if first_instruction.local_policy.may_store_null()
+                    && last_instruction.opcode == STORE_FAST
+                    && !last_instruction.local_policy.may_store_null()
+                {
+                    // Native resolves unlocated successors before exchanging the target
+                    // store with a comprehension restore. Retain that original origin.
+                    for position in &positions[last + 1..] {
+                        let Some(next) = graph.instruction_mut(*position) else {
+                            break;
+                        };
+                        if next.location.line >= 0 || next.no_location_policy.preserves_location() {
+                            break;
+                        }
+                        next.location = last_instruction.location;
+                        if !matches!(next.operand(), Operand::Value(_)) || ends_scope(next.opcode) {
+                            break;
+                        }
+                    }
+                }
+
                 let Some(swap) = graph.instruction_mut(positions[index]) else {
                     unreachable!();
                 };

@@ -3238,6 +3238,111 @@ fn retained_setup_nop_identity_survives_consecutive_labels_without_aliasing_remo
 }
 
 #[test]
+fn unpack_rotation_nop_removal_does_not_expose_capture_store_cascades() {
+    let cases = [
+        (
+            vec![
+                pass_instruction(UNPACK_SEQUENCE, 3, 1),
+                pass_instruction(NOP, 0, 1),
+                pass_instruction(SWAP, 3, 2),
+            ],
+            vec![UNPACK_SEQUENCE, SWAP],
+        ),
+        (
+            vec![
+                pass_instruction(UNPACK_SEQUENCE, 3, 1),
+                pass_instruction(NOP, 0, 2),
+                pass_instruction(SWAP, 3, 3),
+            ],
+            vec![UNPACK_SEQUENCE, NOP, SWAP],
+        ),
+        (
+            vec![
+                pass_instruction(UNPACK_SEQUENCE, 1, 1),
+                pass_instruction(NOP, 0, 1),
+                pass_instruction(NOP, 0, 2),
+                pass_instruction(STORE_FAST_STORE_FAST, 1, 3),
+            ],
+            vec![UNPACK_SEQUENCE, NOP, STORE_FAST_STORE_FAST],
+        ),
+        (
+            vec![
+                pass_instruction(UNPACK_SEQUENCE, 1, 1),
+                pass_instruction(NOP, 0, 2),
+                pass_instruction(STORE_FAST, 0, 3),
+            ],
+            vec![UNPACK_SEQUENCE, NOP, STORE_FAST],
+        ),
+    ];
+    for (items, expected) in cases {
+        let mut assembler = optimization_pipeline(items);
+        assembler.remove_redundant_nops();
+        assert_eq!(graph_opcodes(&assembler), expected);
+    }
+}
+
+#[test]
+fn canceled_unpack_rotations_preserve_distinct_capture_nop_lines() {
+    let cases = [
+        (
+            vec![
+                (UNPACK_SEQUENCE, 5),
+                (NOP, 5),
+                (NOP, 5),
+                (NOP, 6),
+                (NOP, 6),
+                (STORE_FAST, 3),
+            ],
+            vec![(UNPACK_SEQUENCE, 5), (NOP, 6), (STORE_FAST, 3)],
+        ),
+        (
+            vec![(UNPACK_SEQUENCE, 5), (NOP, 5), (NOP, 6), (STORE_FAST, 6)],
+            vec![(UNPACK_SEQUENCE, 5), (STORE_FAST, 6)],
+        ),
+        (
+            vec![(UNPACK_SEQUENCE, 5), (NOP, 6), (NOP, 7), (STORE_FAST, 3)],
+            vec![(UNPACK_SEQUENCE, 5), (NOP, 6), (NOP, 7), (STORE_FAST, 3)],
+        ),
+        (
+            vec![
+                (UNPACK_SEQUENCE, 5),
+                (NOP, 5),
+                (NOP, 6),
+                (UNPACK_SEQUENCE, 7),
+                (NOP, 8),
+                (STORE_FAST, 9),
+            ],
+            vec![
+                (UNPACK_SEQUENCE, 5),
+                (NOP, 6),
+                (UNPACK_SEQUENCE, 7),
+                (NOP, 8),
+                (STORE_FAST, 9),
+            ],
+        ),
+    ];
+    for (input, expected) in cases {
+        let items = input
+            .into_iter()
+            .map(|(opcode, line)| pass_instruction(opcode, 0, line))
+            .collect();
+        let mut assembler = optimization_pipeline(items);
+        assembler.remove_redundant_nops();
+        let actual = assembler
+            .graph
+            .iter_items()
+            .filter_map(|item| match item {
+                Item::Instruction(instruction) => {
+                    Some((instruction.opcode, instruction.location.line))
+                }
+                Item::Label(_) => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+}
+
+#[test]
 fn cleanup_prefix_locations_retain_original_donors_through_late_writers() {
     for full_copy_path in [false, true] {
         for original_donor in [false, true] {

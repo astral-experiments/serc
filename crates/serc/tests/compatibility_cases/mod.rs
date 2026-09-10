@@ -127,6 +127,7 @@ mod large_class_arguments;
 mod literal_return_finally_locations;
 mod loop_branch_exit_locations;
 mod loop_branch_source_owner_boundaries;
+mod loop_finally_call_entries;
 mod loop_tail_chained_compare_compatibility;
 mod loop_tail_handler_backedges;
 mod loop_tail_value_patterns;
@@ -160,6 +161,7 @@ mod nested_boolean_continuation_locations;
 mod nested_finally_entry_markers;
 mod nested_finally_exit_copies;
 mod nested_generator_dispatch_owners;
+mod nested_handler_loop_transfers;
 mod nested_handler_return_swap_owner_compatibility;
 mod nested_if_continuation_locations;
 mod nested_loop_handler_backedges;
@@ -363,3 +365,8 @@ mod match_capture_nop_lines;
 mod shared_try_exit_nops;
 
 mod manager_try_borrow_successors;
+
+mod match_failure_loop_exit_locations;
+
+mod match_canceled_rotation_nop_lines;
+mod match_none_capture_swap_locations;

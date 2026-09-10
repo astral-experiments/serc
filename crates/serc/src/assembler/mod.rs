@@ -228,6 +228,7 @@ impl Assembler {
         };
         if matches!(item, Item::Instruction(_)) {
             self.instruction_count += 1;
+            self.original_fallthrough_location = None;
         }
         items.push(item);
     }
@@ -318,7 +319,54 @@ impl Assembler {
         let Item::Instruction(instruction) = items[index] else {
             unreachable!("instruction index points to a label");
         };
-        Some(instruction.location)
+        Some(
+            self.original_fallthrough_location
+                .filter(|(emitted, _)| emitted.item_index as usize == index)
+                .map_or(instruction.location, |(_, location)| location),
+        )
+    }
+
+    /// Returns an ordinary fast-local store that can precede deferred restores.
+    pub(crate) fn last_fast_store_location(&self) -> Option<(u32, SourceLocation)> {
+        let instruction = self
+            .linear_items()
+            .iter()
+            .rev()
+            .find_map(|item| match item {
+                Item::Instruction(instruction) => Some(instruction),
+                Item::Label(_) => None,
+            })?;
+        if instruction.opcode != STORE_FAST || instruction.local_policy.may_store_null() {
+            return None;
+        }
+        match instruction.operand() {
+            Operand::Value(index) => Some((index, instruction.location)),
+            _ => None,
+        }
+    }
+
+    /// Retains the original final store's location after deferred static reordering.
+    pub(crate) fn record_original_fallthrough_location(
+        &mut self,
+        emitted: EmittedInstruction,
+        location: SourceLocation,
+    ) {
+        let instruction = self.emitted_instruction_mut(emitted, "recording original fallthrough");
+        debug_assert_eq!(instruction.opcode, STORE_FAST);
+        self.original_fallthrough_location = Some((emitted, location));
+    }
+
+    /// Returns whether the current block ends in a run that swap optimization rewrites.
+    pub(crate) fn current_block_ends_with_multiple_swaps(&self) -> bool {
+        self.linear_items()
+            .iter()
+            .rev()
+            .take_while(
+                |item| matches!(item, Item::Instruction(instruction) if instruction.opcode == SWAP),
+            )
+            .take(2)
+            .count()
+            == 2
     }
 
     pub(crate) fn last_instruction_is_nop(&self) -> bool {
@@ -1229,6 +1277,12 @@ impl Assembler {
     /// Keeps CPython's block-local borrowed-load optimizer from visiting this block.
     pub(crate) fn prevent_borrow_reachability(&mut self, label: Label) {
         self.borrow_unreachable_blocks.insert(label);
+    }
+
+    /// Stops empty handler exits while allowing surviving jumps into normal cleanup.
+    pub(crate) fn prevent_borrow_finally_fallthrough(&mut self, label: Label) {
+        self.prevent_borrow_reachability(label);
+        self.borrow_finally_entries.insert(label, None);
     }
 
     /// Preserves empty original loop headers only when their leading NOPs are erased.

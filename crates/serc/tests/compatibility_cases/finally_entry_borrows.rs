@@ -292,3 +292,123 @@ fn matches_cpython_raising_else_finally_context_boundaries() {
         common::assert_matches_cpython_marshal(source, &format!("raising_else_{name}.py"));
     }
 }
+
+#[test]
+fn matches_cpython_finally_calls_reached_from_nested_arms() {
+    for (prefix, cleanup) in [("", "x.close()"), ("async ", "await x.close()")] {
+        for (name, body) in [
+            (
+                "nested_then",
+                "if pred:\n    if cond:\n        x.work()\nelse:\n    x.wait()",
+            ),
+            (
+                "inner_try",
+                "if pred:\n    try:\n        x.work()\n    except E:\n        pass\nelse:\n    x.wait()",
+            ),
+            (
+                "conditional_return",
+                "if pred:\n    if cond:\n        return\n    x.work()\nelse:\n    x.wait()",
+            ),
+            (
+                "folded_assert",
+                "if pred:\n    if cond:\n        assert True\n    else:\n        x.work()\nelse:\n    x.wait()",
+            ),
+        ] {
+            let source = format!(
+                "{prefix}def f(x, pred, cond):\n    try:\n        {}\n    except E:\n        pass\n    finally:\n        {cleanup}\n",
+                body.replace('\n', "\n        "),
+            );
+            common::assert_matches_cpython_marshal(
+                &source,
+                &format!("nested_finally_call_{name}.py"),
+            );
+        }
+    }
+}
+
+#[test]
+fn preserves_cpython_finally_entries_after_conditional_and_empty_paths() {
+    for (prefix, cleanup) in [("", "x.close()"), ("async ", "await x.close()")] {
+        for (name, body) in [
+            ("plain_if", "if pred:\n    x.work()"),
+            ("no_outer_else", "if pred:\n    if cond:\n        x.work()"),
+            (
+                "nested_else",
+                "if pred:\n    x.work()\nelse:\n    if cond:\n        x.wait()",
+            ),
+        ] {
+            let source = format!(
+                "{prefix}def f(x, pred, cond):\n    try:\n        {}\n    except E:\n        pass\n    finally:\n        {cleanup}\n",
+                body.replace('\n', "\n        "),
+            );
+            common::assert_matches_cpython_marshal(
+                &source,
+                &format!("conditional_finally_call_{name}.py"),
+            );
+        }
+    }
+}
+
+#[test]
+fn preserves_owned_finally_loads_after_removed_zero_distance_jumps() {
+    // Inspect these functions without calling their bodies. An additional call after
+    // the nested with keeps the native predecessor nonempty and allows borrowing.
+    for (source, expected) in [
+        (
+            r"def probe(active, outer, inner, manager, touch, report, pause):
+    while active():
+        try:
+            if outer():
+                if inner():
+                    with manager():
+                        touch()
+        except Exception:
+            report()
+        finally:
+            pause()
+",
+            "LOAD_FAST LOAD_FAST\n",
+        ),
+        (
+            r"def probe(active, outer, inner, manager, touch, report, pause):
+    while active():
+        try:
+            if outer():
+                if inner():
+                    with manager():
+                        touch()
+            touch()
+        except Exception:
+            report()
+        finally:
+            pause()
+",
+            "LOAD_FAST_BORROW LOAD_FAST\n",
+        ),
+        (
+            r"def probe(active, outer, inner, manager, touch, report, pause):
+    while active():
+        try:
+            with manager():
+                touch()
+        except Exception:
+            report()
+        finally:
+            pause()
+",
+            "LOAD_FAST LOAD_FAST\n",
+        ),
+    ] {
+        let source = format!(
+            r#"import dis
+{source}
+print(" ".join(
+    instruction.opname
+    for instruction in dis.get_instructions(probe)
+    if instruction.argval == "pause" and instruction.opname.startswith("LOAD_FAST")
+))
+"#
+        );
+        common::assert_executes(&source, expected);
+    }
+}

@@ -1793,6 +1793,10 @@ impl OptimizationPipeline {
                         })));
             let copied_label = Label(self.next_label);
             self.next_label += 1;
+            if !self.borrow_finally_jump_sources.is_empty() {
+                // A copied terminal jump has no independent original source certificate.
+                self.borrow_finally_jump_sources.insert(copied_label, false);
+            }
             let mut replaced_entry_label = false;
             let mut copied_labels = FxHashMap::default();
             for item in &mut copied {
@@ -1978,6 +1982,39 @@ impl OptimizationPipeline {
                 }
             }
             if inline_small_exit || inline_no_location_block {
+                if inline_no_location_block && target_chain_end > target_position {
+                    let copied_positions = copied
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(position, item)| match item {
+                            Item::Label(label) => Some((*label, position)),
+                            Item::Instruction(_) => None,
+                        })
+                        .collect::<FxHashMap<_, _>>();
+                    for (index, exclusions) in copied_region_exclusions.iter_mut().enumerate() {
+                        let region = &self.exception_regions[index];
+                        let membership = &region_memberships[index];
+                        if region.is_scope_fallback
+                            || !membership.contains(&source_position)
+                            || !membership.contains(&target_position)
+                            || !membership.contains(&target_chain_end)
+                        {
+                            continue;
+                        }
+                        // A previously expanded cleanup can contain holes in this enclosing
+                        // owner. Copy both boundaries with the instructions they delimit.
+                        let inherited = exclusions
+                            .iter()
+                            .filter_map(|(start, end)| {
+                                let start = *copied_labels.get(start)?;
+                                let end = *copied_labels.get(end)?;
+                                (copied_positions[&start] < copied_positions[&end])
+                                    .then_some((start, end))
+                            })
+                            .collect::<Vec<_>>();
+                        exclusions.extend(inherited);
+                    }
+                }
                 let target_region_owners = self
                     .exception_regions
                     .iter()
@@ -2370,6 +2407,35 @@ impl OptimizationPipeline {
                     exclusions.sort_by_key(|(start, _)| {
                         label_positions.get(start).copied().unwrap_or(usize::MAX)
                     });
+                } else if !region.is_scope_fallback && exclusions.len() > 1 {
+                    // Revisited predecessors can add excluded ranges out of emission order.
+                    // Reorder only disjoint holes whose complete ranges are already present
+                    // inside the original protected region.
+                    let Some((&region_start, &region_end)) = label_positions
+                        .get(&region.start)
+                        .zip(label_positions.get(&region.end))
+                    else {
+                        continue;
+                    };
+                    let Some(mut ranges) = exclusions
+                        .iter()
+                        .map(|(start, end)| {
+                            Some((*label_positions.get(start)?, *label_positions.get(end)?))
+                        })
+                        .collect::<Option<Vec<_>>>()
+                    else {
+                        continue;
+                    };
+                    if ranges.iter().any(|&(start, end)| {
+                        start < region_start || start >= end || end > region_end
+                    }) {
+                        continue;
+                    }
+                    ranges.sort_unstable();
+                    if ranges.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+                        continue;
+                    }
+                    exclusions.sort_by_key(|(start, _)| label_positions[start]);
                 }
             }
             let original_regions = std::mem::take(&mut self.exception_regions);

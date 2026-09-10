@@ -41,3 +41,19 @@ fn matches_cpython_shared_async_try_exit_locations() {
         common::assert_matches_cpython_marshal(&source, "shared_async_try_exit_locations.py");
     }
 }
+
+#[test]
+fn matches_cpython_guarded_match_async_comprehension_try_exit() {
+    let source = r"async def probe(values, stream, permit):
+    for value in values:
+        try:
+            match value:
+                case 0:
+                    result = [item async for item in stream]
+                case Kind.VALUE if permit:
+                    result = [item async for item in stream]
+        except Error:
+            recover()
+";
+    common::assert_matches_cpython_marshal(source, "guarded_match_async_try_exit.py");
+}

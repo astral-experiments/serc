@@ -635,9 +635,20 @@ impl Compiler<'_> {
         self.emit_build(BUILD_TUPLE, names.len())
     }
 
-    pub(super) fn emit_pending_comprehension_restores(&mut self) -> Result<(), CompileError> {
+    pub(super) fn emit_pending_comprehension_restores(
+        &mut self,
+        single_name_target: bool,
+    ) -> Result<(), CompileError> {
         let restores =
             std::mem::take(&mut self.control.comprehensions.pending_comprehension_restores);
+        let original_tail_location = if single_name_target && restores.len() == 1 {
+            self.assembler
+                .last_fast_store_location()
+                .filter(|(index, _)| restores[0].0.iter().all(|restore| restore.index != *index))
+                .map(|(_, location)| location)
+        } else {
+            None
+        };
         for (restores, location) in restores {
             self.assembler.set_location(location);
             let mut last_restore = None;
@@ -662,6 +673,10 @@ impl Compiler<'_> {
             self.assembler.add_last_hidden_exception_owner_slots(1);
             // CPython converts STORE_FAST_MAYBE_NULL only after inserting superinstructions.
             self.assembler.prevent_instruction_fusion(last_restore);
+            if let Some(location) = original_tail_location {
+                self.assembler
+                    .record_original_fallthrough_location(last_restore, location);
+            }
         }
         Ok(())
     }
