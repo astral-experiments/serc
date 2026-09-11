@@ -37,3 +37,152 @@ fn preserves_mapping_literal_key_registration_order() {
         }
     }
 }
+
+#[test]
+fn folds_capture_rotation_after_multiline_mapping_checks() {
+    let source = r#"def f(subject):
+    match subject:
+        case {
+            "kind": "target",
+            "value": value,
+        }:
+            return value
+        case _:
+            return None
+"#;
+    common::assert_matches_cpython_marshal(source, "multiline_mapping_capture_rotation.py");
+}
+
+#[test]
+fn folds_guarded_capture_rotation_after_mapping_checks() {
+    let source = r#"def f(subject, accept):
+    match subject:
+        case {
+            "kind": "target",
+            "value": value,
+        } if accept(value):
+            return value
+        case _:
+            return None
+"#;
+    common::assert_matches_cpython_marshal(source, "guarded_mapping_capture_rotation.py");
+}
+
+#[test]
+fn folds_each_mapping_capture_rotation_in_a_match() {
+    let source = r#"def f(subject, consume):
+    match subject:
+        case {
+            "kind": "first",
+            "value": value,
+        }:
+            consume(value)
+        case {
+            "kind": "second",
+            "value": value,
+        }:
+            consume(value)
+        case _:
+            return None
+    return value
+"#;
+    common::assert_matches_cpython_marshal(source, "repeated_mapping_capture_rotations.py");
+}
+
+#[test]
+fn mapping_global_capture_keeps_nonlocal_store_order() {
+    let source = r#"def f(subject):
+    global value
+    match subject:
+        case {
+            "kind": "target",
+            "value": value,
+        }:
+            return value
+        case _:
+            return None
+"#;
+    common::assert_matches_cpython_marshal(source, "mapping_global_capture_order.py");
+}
+
+#[test]
+fn mapping_cell_capture_keeps_nonlocal_store_order() {
+    let source = r#"def f(subject):
+    def capture():
+        return value
+    match subject:
+        case {
+            "kind": "target",
+            "value": value,
+        }:
+            return capture()
+        case _:
+            return None
+"#;
+    common::assert_matches_cpython_marshal(source, "mapping_cell_capture_order.py");
+}
+
+#[test]
+fn sequence_capture_preserves_separate_wildcard_locations() {
+    let source = r"def f(subject):
+    match subject:
+        case [
+            value,
+            _,
+            _,
+        ]:
+            return value
+        case _:
+            return None
+";
+    common::assert_matches_cpython_marshal(source, "sequence_capture_wildcard_locations.py");
+}
+
+#[test]
+fn protected_mapping_capture_preserves_following_marker_owners() {
+    let source = r#"def f(manager, subject, accept, consume):
+    with manager:
+        match subject:
+            case {
+                "kind": "target",
+                "value": value,
+            }:
+                if accept(value):
+                    consume(value)
+            case _:
+                consume(None)
+"#;
+    common::assert_matches_cpython_marshal(source, "protected_mapping_capture_markers.py");
+}
+
+#[test]
+fn protected_single_line_mapping_capture_preserves_two_vacated_slots() {
+    let source = r#"def f(manager, subject, accept, consume):
+    with manager:
+        match subject:
+            case {"kind": "target", "value": value}:
+                if accept(value):
+                    consume(value)
+            case _:
+                consume(None)
+"#;
+    common::assert_matches_cpython_marshal(source, "single_line_mapping_capture_markers.py");
+}
+
+#[test]
+fn protected_multiple_mapping_captures_keep_longer_rotation_order() {
+    let source = r#"def f(manager, subject, accept, consume):
+    with manager:
+        match subject:
+            case {
+                "kind": "target",
+                "first": first,
+                "last": last,
+            }:
+                if accept(first):
+                    consume(first, last)
+            case _:
+                consume(None, None)
+"#;
+    common::assert_matches_cpython_marshal(source, "multiple_mapping_capture_markers.py");
+}

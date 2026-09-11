@@ -472,7 +472,9 @@ impl Compiler<'_> {
             if !copied_subject
                 && !has_default
                 && case.guard.is_none()
-                && matches!(case.body.as_slice(), [Stmt::Pass(_)])
+                && (matches!(case.body.as_slice(), [Stmt::Pass(_)])
+                    || (matches!(case.body.as_slice(), [Stmt::Continue(_)])
+                        && self.control.loops.non_final_match_tail != Some(statement.range)))
                 && matches!(&case.pattern, Pattern::MatchSingleton(pattern) if pattern.value == Singleton::None)
                 && self.control.falls_through_to_loop_backedge()
                 && self.control.generators.generator_region_start.is_none()
@@ -483,8 +485,9 @@ impl Compiler<'_> {
                     .is_empty()
                 && self.control.withs.active_with_region_exclusions.is_empty()
             {
-                // CPython's final empty case has two separately located loop exits. Retain
-                // both edges instead of combining its pass marker with the failure backedge.
+                // A final pass or direct-tail continue has separate failure and body exits.
+                // A non-final branch keeps its outer join and the ordinary failure layout.
+                // Keep the authored body location on the successful None branch.
                 self.add_constant(Constant::None)?;
                 let success = self.assembler.label();
                 self.assembler
@@ -606,7 +609,8 @@ impl Compiler<'_> {
                 };
                 let emitted_fallthrough = if emitted_case_exit {
                     false
-                } else if terminal && matches!(case.body.last(), Some(Stmt::If(_))) {
+                } else if terminal && matches!(case.body.last(), Some(Stmt::If(_) | Stmt::Match(_)))
+                {
                     let ((), emitted_fallthrough) = self.with_fallthrough_tracking(|compiler| {
                         compiler.compile_suite_inner(&case.body, true)
                     })?;
@@ -655,9 +659,13 @@ impl Compiler<'_> {
                         if original_unlocated_head {
                             self.assembler.mark_as_artificial_eval_break(success_exit);
                         }
-                        if index + 1 == matched_cases && !context.fail_pop.is_empty() {
+                        if index + 1 == matched_cases
+                            && (!context.fail_pop.is_empty()
+                                || context.direct_loop_failure.is_some())
+                        {
                             // CPython duplicates small exits before removing this jump across
-                            // the empty final pattern-failure block.
+                            // the empty final pattern-failure block. A directly normalized
+                            // loop failure still leaves the case-success exit to be copied.
                             self.assembler.defer_jump_removal(success_exit);
                         }
                         let subject_pop_is_optimized_away = !copied_subject
@@ -747,19 +755,32 @@ impl Compiler<'_> {
                 .set_location(self.source_location(case.pattern.range()));
             self.emit(NOP, 0, 0)?;
             if let Some(guard) = &case.guard {
-                self.compile_jump_if(guard, false, end)?;
+                if terminal && jump_constant_truthiness(guard) == Some(false) {
+                    self.record_folded_value(guard)?;
+                    self.assembler
+                        .set_location(self.source_location(guard.range()));
+                    let exit =
+                        self.emit_jump_forward_instruction_preserving_location(JUMP_FORWARD, end)?;
+                    self.assembler.preserve_inlined_jump_nop(exit);
+                    // Keep the folded guard's original edge through return duplication so
+                    // the copy inherits its span, rather than the wildcard NOP's span.
+                    self.assembler.defer_jump_removal(exit);
+                } else {
+                    self.compile_jump_if(guard, false, end)?;
+                }
                 failure_reaches_end = true;
             }
             let body_start = self.assembler.instruction_count();
-            let emitted_fallthrough = if terminal && matches!(case.body.last(), Some(Stmt::If(_))) {
-                let ((), emitted_fallthrough) = self.with_fallthrough_tracking(|compiler| {
-                    compiler.compile_suite_inner(&case.body, true)
-                })?;
-                emitted_fallthrough
-            } else {
-                self.compile_suite(&case.body)?;
-                false
-            };
+            let emitted_fallthrough =
+                if terminal && matches!(case.body.last(), Some(Stmt::If(_) | Stmt::Match(_))) {
+                    let ((), emitted_fallthrough) = self.with_fallthrough_tracking(|compiler| {
+                        compiler.compile_suite_inner(&case.body, true)
+                    })?;
+                    emitted_fallthrough
+                } else {
+                    self.compile_suite(&case.body)?;
+                    false
+                };
             if !terminal
                 && self.assembler.instruction_count() == body_start
                 && let [Stmt::Pass(pass)] = case.body.as_slice()
@@ -938,12 +959,13 @@ impl Compiler<'_> {
                 ExceptionPolicy::EXCLUDE_ALWAYS,
             )?;
             self.emit_with_exception_policy(NOT_TAKEN, 0, 0, ExceptionPolicy::EXCLUDE_ALWAYS)?;
-            self.emit_jump_forward_with_exception_policy(
+            let backedge = self.emit_jump_forward_instruction_with_exception_policy(
                 JUMP_FORWARD,
                 failure,
-                0,
                 ExceptionPolicy::EXCLUDE_ALWAYS,
             )?;
+            self.assembler
+                .mark_normalized_conditional_backedge(backedge);
             self.assembler.mark(success);
             return Ok(());
         }
@@ -1040,6 +1062,10 @@ impl Compiler<'_> {
                         // Unlike value and structural patterns, a following boolean singleton
                         // does not leave another protected slot for its late marker.
                         ExceptionPolicy::normalized_owner(false)
+                    } else if matches!(pattern.value, Singleton::True | Singleton::False) {
+                        // Keep the authored singleton origin without choosing an owner here.
+                        // The assembler must certify the original array and every later edit.
+                        ExceptionPolicy::NoneUnchangedBooleanSingleton
                     } else {
                         ExceptionPolicy::default()
                     };
@@ -1559,15 +1585,28 @@ impl Compiler<'_> {
     }
 
     pub(super) fn compile_expression(&mut self, expression: &Expr) -> Result<(), CompileError> {
+        self.compile_expression_with_boolean_continuation(expression, None)
+    }
+
+    /// Preserve the location of the Boolean test consuming this expression's value.
+    fn compile_expression_with_boolean_continuation(
+        &mut self,
+        expression: &Expr,
+        continuation: Option<(BoolOp, SourceLocation)>,
+    ) -> Result<(), CompileError> {
         let previous = self.assembler.location();
         self.assembler
             .set_location(self.source_location(expression.range()));
-        let result = self.compile_expression_inner(expression);
+        let result = self.compile_expression_inner(expression, continuation);
         self.assembler.set_location(previous);
         result
     }
 
-    fn compile_expression_inner(&mut self, expression: &Expr) -> Result<(), CompileError> {
+    fn compile_expression_inner(
+        &mut self,
+        expression: &Expr,
+        continuation: Option<(BoolOp, SourceLocation)>,
+    ) -> Result<(), CompileError> {
         let starting_depth = self.control.stack.depth;
         if matches!(expression, Expr::BoolOp(_))
             && let Some((origin, constant)) = folded_bool_operand(expression)
@@ -1733,8 +1772,8 @@ impl Compiler<'_> {
                     self.emit_binary_operation(BinaryOperation::SUBSCR)?;
                 }
             }
-            Expr::If(expression) => self.compile_if_expression(expression)?,
-            Expr::BoolOp(expression) => self.compile_bool_expression(expression)?,
+            Expr::If(expression) => self.compile_if_expression(expression, continuation)?,
+            Expr::BoolOp(expression) => self.compile_bool_expression(expression, continuation)?,
             Expr::Compare(expression) => self.compile_compare_expression(expression)?,
             Expr::Named(expression) => {
                 self.compile_expression(&expression.value)?;
@@ -3907,6 +3946,11 @@ impl Compiler<'_> {
         self.set_depth(base_depth + i32::try_from(temporary_names.len()).unwrap() + 1);
         self.assembler.set_location(comprehension_location);
         if deferred_normal_restore {
+            // The normal restore follows the asynchronous iterator's exception-only exit.
+            // A later independent branch entry can still make its continuation reachable.
+            if generators[0].is_async {
+                self.assembler.prevent_borrow_reachability(normal_cleanup);
+            }
             self.control
                 .comprehensions
                 .pending_comprehension_restores
@@ -3936,13 +3980,10 @@ impl Compiler<'_> {
                         .prevent_instruction_fusion_with_previous(emitted);
                 }
             } else {
-                for (position, restore) in temporary_restores.iter().rev().copied().enumerate() {
-                    if position > 0 {
-                        let barrier = self.assembler.fusion_barrier();
-                        // Native STORE_FAST_MAYBE_NULL restores share one original block;
-                        // their barrier only prevents premature local-store fusion.
-                        self.assembler.record_exception_owner_continuation(barrier);
-                    }
+                // STORE_FAST_MAYBE_NULL restores share one original CPython block.
+                // Per-instruction fusion policies below preserve their distinct opcodes
+                // without splitting that block before small-exit copying.
+                for restore in temporary_restores.iter().rev().copied() {
                     let emitted = self.emit_comprehension_restore(restore)?;
                     self.assembler
                         .prevent_instruction_fusion_with_previous(emitted);
@@ -5898,7 +5939,7 @@ impl Compiler<'_> {
                     ));
                 Ok(())
             }
-            _ => self.compile_expression_inner(expression),
+            _ => self.compile_expression_inner(expression, None),
         };
         self.assembler.set_location(previous);
         result
@@ -6007,6 +6048,7 @@ impl Compiler<'_> {
     fn compile_if_expression(
         &mut self,
         expression: &ruff_python_ast::ExprIf,
+        continuation: Option<(BoolOp, SourceLocation)>,
     ) -> Result<(), CompileError> {
         if let Some(truthiness) = early_condition_truthiness(&expression.test) {
             self.record_folded_value(&expression.test)?;
@@ -6034,7 +6076,8 @@ impl Compiler<'_> {
             self.assembler
                 .record_exception_owner_block_boundary(selected_entry);
             self.assembler.mark(selected_entry);
-            self.compile_expression(selected)?;
+            let selected_continuation = if truthiness { None } else { continuation };
+            self.compile_expression_with_boolean_continuation(selected, selected_continuation)?;
             let end = self.assembler.label();
             if truthiness {
                 self.pre_register_discarded_expression(&expression.orelse, Some(end))?;
@@ -6265,6 +6308,8 @@ impl Compiler<'_> {
             self.assembler.override_last_not_taken_exception_owner();
         }
         self.assembler.record_short_circuit_owner_continuation();
+        // The body reaches the join through an authored forward jump, so its Boolean
+        // tests keep their own locations. Only the else arm falls into the outer test.
         if enter_filtered_comprehension_conditional {
             self.with_control_override(
                 |control| {
@@ -6343,10 +6388,15 @@ impl Compiler<'_> {
                         .suppress_filtered_comprehension_none_owner
                 },
                 true,
-                |compiler| compiler.compile_expression(&expression.orelse),
+                |compiler| {
+                    compiler.compile_expression_with_boolean_continuation(
+                        &expression.orelse,
+                        continuation,
+                    )
+                },
             )?;
         } else {
-            self.compile_expression(&expression.orelse)?;
+            self.compile_expression_with_boolean_continuation(&expression.orelse, continuation)?;
         }
         self.assembler.preserve_block_boundary_if_new(end);
         self.assembler.record_exception_owner_block_boundary(end);
@@ -6439,8 +6489,9 @@ impl Compiler<'_> {
     fn compile_bool_expression(
         &mut self,
         expression: &ruff_python_ast::ExprBoolOp,
+        continuation: Option<(BoolOp, SourceLocation)>,
     ) -> Result<(), CompileError> {
-        self.compile_bool_expression_at(expression, None, false)
+        self.compile_bool_expression_at(expression, continuation, false)
     }
 
     fn compile_bool_expression_at(
@@ -6521,7 +6572,10 @@ impl Compiler<'_> {
                     inner.op == expression.op,
                 )?;
             } else {
-                self.compile_expression(value)?;
+                self.compile_expression_with_boolean_continuation(
+                    value,
+                    Some((expression.op, location)),
+                )?;
             }
             let original_location = self.source_location(expression.range);
             if original_location.line != location.line
@@ -6916,7 +6970,9 @@ impl Compiler<'_> {
             self.with_control_override(
                 |control| &mut control.generators.optimized_generator_later_boolean_operand,
                 !leading.is_empty(),
-                |compiler| compiler.compile_expression(last),
+                |compiler| {
+                    compiler.compile_expression_with_boolean_continuation(last, continuation)
+                },
             )?;
         }
         // Later expressions start in the Boolean value's original join array.
@@ -7134,7 +7190,20 @@ impl Compiler<'_> {
 
         let exclusion_start = self.assembler.label();
         self.assembler.mark(exclusion_start);
-        self.emit_with_exception_policy(NOT_TAKEN, 0, 0, policy.excluded)?;
+        // Terminal conditions can also reuse an owned original array slot.
+        // Resolve vacancies after cleanup, as for ordinary condition markers.
+        // Fallback modules retain their explicit exclusions instead of recovering
+        // owners from the pinned target's original instruction slots.
+        let exception_policy = if self.context.target_specific_rules_enabled()
+            && !exclude_normal_finally_not_taken_from_with
+        {
+            policy.excluded.defer_condition_owner()
+        } else {
+            // The normal finalizer's scoped marker exclusion remains authoritative.
+            // Proven compaction in its original array uses the earlier owner path.
+            policy.excluded
+        };
+        self.emit_with_exception_policy(NOT_TAKEN, 0, 0, exception_policy)?;
         let exclusion_end = self.assembler.label();
         self.assembler.mark(exclusion_end);
 
@@ -7332,33 +7401,33 @@ impl Compiler<'_> {
         }
         let constant_truthiness = jump_constant_truthiness(expression);
         if let Some(truthiness) = constant_truthiness {
+            let empty_folded_block = self.assembler.at_empty_borrow_block();
             self.record_folded_value(expression)?;
             self.assembler
                 .set_location(self.source_location(expression.range()));
             if truthiness == jump_on {
                 let exit = self.emit_jump_forward_instruction(JUMP_FORWARD, label)?;
                 self.assembler.preserve_inlined_jump_nop(exit);
+                self.assembler
+                    .mark_folded_jump_borrow_fallthrough(exit, empty_folded_block);
             } else {
+                // Native line resolution still sees this edge before constant folding.
+                self.assembler.record_folded_condition_predecessor(label);
                 let exclusion_start = self.assembler.label();
                 self.assembler.mark(exclusion_start);
                 self.emit(NOP, 0, 0)?;
+                if empty_folded_block {
+                    // Removing the sole folded condition empties its original array.
+                    // A retained line NOP still permits borrowing through that array.
+                    self.assembler.mark_last_nop_borrow_barrier_if_removed();
+                }
                 let exclusion_end = self.assembler.label();
                 // The folded conditional still leaves its original fallthrough block.
                 self.assembler
                     .record_exception_owner_block_boundary(exclusion_end);
                 self.assembler.mark(exclusion_end);
-                if self.control.generators.generator_region_start.is_some() {
-                    self.control
-                        .generators
-                        .generator_region_exclusions
-                        .push((exclusion_start, exclusion_end));
-                }
-                for exclusions in &mut self.control.withs.active_with_region_exclusions {
-                    exclusions.push((exclusion_start, exclusion_end));
-                }
-                for exclusions in &mut self.control.exceptions.active_exception_region_exclusions {
-                    exclusions.push((exclusion_start, exclusion_end));
-                }
+                // CPython assigns the condition's handler before folding its instructions.
+                // A surviving source-line NOP retains that owner.
             }
             return Ok(());
         }
@@ -7398,6 +7467,12 @@ impl Compiler<'_> {
                     } else {
                         self.compile_jump_if(value, jump_on, label)?;
                     }
+                    // Short-circuiting leaves the remaining operands as empty original
+                    // blocks. Stop borrowing at their destination while preserving the
+                    // constant NOP and any earlier edge that could alias this entry.
+                    if jump_constant_truthiness(value) == Some(matches!(boolean.op, BoolOp::Or)) {
+                        self.assembler.record_folded_condition_borrow_entry(label);
+                    }
                     if preserve_leading_protected_loop_owner && operand_index == 0 {
                         self.assembler.preserve_last_not_taken_exception_owner();
                     }
@@ -7419,6 +7494,9 @@ impl Compiler<'_> {
                     )?;
                 } else {
                     self.compile_jump_if(value, !jump_on, end)?;
+                }
+                if jump_constant_truthiness(value) == Some(matches!(boolean.op, BoolOp::Or)) {
+                    self.assembler.record_folded_condition_borrow_entry(end);
                 }
                 if preserve_leading_protected_loop_owner && operand_index == 0 {
                     self.assembler.preserve_last_not_taken_exception_owner();
@@ -7602,6 +7680,9 @@ impl Compiler<'_> {
             self.assembler.add_last_hidden_exception_owner_slots(
                 3 - usize::from(left_line != none_location.line),
             );
+            if left_line == none_location.line {
+                self.assembler.record_source_none_condition();
+            }
             // CPython keeps this specialized fallthrough in the surrounding generator's
             // stop-iteration region. Override the generic condition exclusion only when no
             // nested control-flow region can own the marker instead.
@@ -7638,7 +7719,7 @@ impl Compiler<'_> {
                 excluded: if preserve_sync_with_short_circuit_none_owner {
                     ExceptionPolicy::normalized_owner(true)
                 } else {
-                    ExceptionPolicy::default()
+                    ExceptionPolicy::NoneDynamicCondition
                 },
                 ordinary: ExceptionPolicy::normalized_owner(
                     self.control.generators.generator_region_start.is_some()
@@ -7710,6 +7791,16 @@ impl Compiler<'_> {
             label,
             -1,
         )?;
+        if matches!(
+            expression,
+            Expr::Name(_) | Expr::Attribute(_) | Expr::Call(_)
+        ) {
+            // The direct codegen_jump_if path ends an original CP array.
+            // Both its target and normalized backward fallthrough are original
+            // boundaries, unlike analysis-only labels or copied jump targets.
+            self.assembler
+                .record_original_primitive_condition_boundary(label);
+        }
         let comparison_marker_owner = if self.control.loops.loop_tail_while_condition {
             ExceptionPolicy::default()
         } else {

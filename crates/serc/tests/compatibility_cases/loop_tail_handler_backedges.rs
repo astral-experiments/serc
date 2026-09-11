@@ -76,3 +76,85 @@ fn matches_cpython_loop_tail_handler_backedges_with_else() {
         }
     }
 }
+
+#[test]
+fn matches_cpython_shared_handler_interrupt_checks() {
+    common::assert_matches_cpython_marshal(
+        r"async def f(stop, wait, record, value):
+    try:
+        while True:
+            try:
+                await wait(stop)
+                break
+            except TimeoutError:
+                value = stop.current()
+                if value is not None:
+                    record(value)
+    except RuntimeError:
+        pass
+",
+        "async_unnamed_loop.py",
+    );
+    common::assert_matches_cpython_marshal(
+        r"def f(stop, wait, record, value):
+    try:
+        while True:
+            try:
+                wait(stop)
+                break
+            except TimeoutError:
+                value = stop.current()
+                if value is not None:
+                    record(value)
+    except RuntimeError:
+        pass
+",
+        "sync_unnamed_loop.py",
+    );
+}
+
+#[test]
+fn matches_cpython_shared_protected_loop_interrupt_checks() {
+    common::assert_matches_cpython_marshal(
+        r"def f(items):
+    for item in items:
+        try:
+            if item is None:
+                continue
+            else:
+                consume(item)
+                if ready(item):
+                    emit(item)
+        except Exception as exc:
+            recover(exc)
+",
+        "protected_else_shared_tail.py",
+    );
+    common::assert_matches_cpython_marshal(
+        r"def f(manager, items, limit=None):
+    count = 0
+    seen = 0
+    errors = 0
+    with manager as stream:
+        for item in items:
+            if limit is not None and seen >= limit:
+                break
+            seen += 1
+            try:
+                result = process(item)
+                if result is None:
+                    skipped(item)
+                    errors += 1
+                    continue
+                else:
+                    stream.write(result)
+                    count += 1
+                    if count % 100 == 0:
+                        report(count)
+            except Exception as exc:
+                recover(exc)
+    complete(errors)
+",
+        "manager_protected_else_shared_tail.py",
+    );
+}

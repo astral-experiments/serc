@@ -60,3 +60,170 @@ fn distinguishes_original_loop_exits_before_try_else() {
         }
     }
 }
+
+#[test]
+fn retains_normal_try_pop_block_after_nested_handler_exit() {
+    for (prefix, body) in [
+        ("", "work(value)"),
+        ("async ", "await work(value)"),
+        ("", "yield value"),
+        ("async ", "yield value"),
+    ] {
+        let source = format!(
+            "{prefix}def f(value):\n    try:\n        try:\n            {body}\n        except InnerError:\n            raise\n    except OuterError:\n        raise\n    else:\n        record(value)\n    after()\n"
+        );
+        assert_matches_cpython_marshal(&source, "nested_handler_normal_pop_block.py");
+    }
+}
+
+#[test]
+fn preserves_copyable_else_exits_after_folded_finally_loops() {
+    for (otherwise, following) in [
+        ("return value", "after()"),
+        ("return 1", "after()"),
+        ("raise Error", "after()"),
+        ("del value", "raise"),
+    ] {
+        let source = format!(
+            "def f(value, other, items):\n    try:\n        if value:\n            try:\n                work()\n            finally:\n                while True:\n                    work()\n    except Error:\n        recover()\n    else:\n        {otherwise}\n    {following}\n"
+        );
+        assert_matches_cpython_marshal(&source, "copyable_else_after_finally_loop.py");
+    }
+}
+
+#[test]
+fn distinguishes_folded_loop_breaks_at_normal_try_exits() {
+    for (prefix, read, otherwise) in [
+        (
+            "async ",
+            "await read()",
+            "done = False\n        await finish()",
+        ),
+        ("", "read()", "done = False\n        finish()"),
+        ("", "read()", "return value"),
+        ("", "read()", "return 1"),
+    ] {
+        let source = format!(
+            "{prefix}def f():\n    try:\n        while True:\n            value = {read}\n            if not value:\n                break\n            consume(value)\n    except Error:\n        recover()\n    else:\n        {otherwise}\n    after()\n"
+        );
+        assert_matches_cpython_marshal(&source, "folded_loop_break_normal_exit.py");
+    }
+}
+
+fn assert_loop_break_before_else_condition(case: usize) {
+    let cases = [
+        (
+            "async ",
+            "await read()",
+            "True",
+            "",
+            "record(value)\n        if value:\n            consume(value)\n        else:\n            missing()",
+        ),
+        (
+            "",
+            "read()",
+            "True",
+            "",
+            "record(value)\n        if value:\n            consume(value)\n        else:\n            missing()",
+        ),
+        (
+            "",
+            "read()",
+            "1",
+            "",
+            "record(value)\n        if value:\n            consume(value)\n        else:\n            missing()",
+        ),
+        (
+            "",
+            "read()",
+            "running",
+            "",
+            "record(value)\n        if value:\n            consume(value)\n        else:\n            missing()",
+        ),
+        (
+            "",
+            "read()",
+            "True",
+            "        else:\n            exhausted()\n",
+            "record(value)\n        if value:\n            consume(value)\n        else:\n            missing()",
+        ),
+        ("", "read()", "True", "", "return value"),
+        ("", "read()", "True", "", "return 1"),
+        (
+            "",
+            "read()",
+            "True",
+            "",
+            "if value:\n            consume(value)",
+        ),
+        (
+            "",
+            "read()",
+            "True",
+            "        else:\n            return value\n",
+            "if value:\n            consume(value)",
+        ),
+        (
+            "",
+            "read()",
+            "True",
+            "        else:\n            raise OuterError()\n",
+            "if value:\n            consume(value)",
+        ),
+    ];
+    let (prefix, read, condition, loop_else, otherwise) = cases[case];
+    let source = format!(
+        "{prefix}def f(running):\n    try:\n        while {condition}:\n            try:\n                value = {read}\n                break\n            except InnerError as exc:\n                if retry(exc):\n                    recover()\n                else:\n                    raise\n{loop_else}    except OuterError:\n        failed()\n    else:\n        {otherwise}\n    after()\n"
+    );
+    assert_matches_cpython_marshal(&source, "folded_loop_break_else_condition.py");
+}
+
+#[test]
+fn preserves_async_folded_loop_break_before_else_condition() {
+    assert_loop_break_before_else_condition(0);
+}
+
+#[test]
+fn preserves_folded_loop_break_before_else_condition() {
+    assert_loop_break_before_else_condition(1);
+}
+
+#[test]
+fn preserves_integer_folded_loop_break_before_else_condition() {
+    assert_loop_break_before_else_condition(2);
+}
+
+#[test]
+fn preserves_dynamic_loop_break_before_else_condition() {
+    assert_loop_break_before_else_condition(3);
+}
+
+#[test]
+fn preserves_folded_loop_else_break_before_else_condition() {
+    assert_loop_break_before_else_condition(4);
+}
+
+#[test]
+fn preserves_folded_loop_break_before_else_name_return() {
+    assert_loop_break_before_else_condition(5);
+}
+
+#[test]
+fn preserves_folded_loop_break_before_else_constant_return() {
+    assert_loop_break_before_else_condition(6);
+}
+
+#[test]
+fn preserves_folded_loop_break_before_short_else_condition() {
+    assert_loop_break_before_else_condition(7);
+}
+
+#[test]
+fn preserves_folded_loop_returning_else_before_short_else_condition() {
+    assert_loop_break_before_else_condition(8);
+}
+
+#[test]
+fn preserves_folded_loop_raising_else_before_short_else_condition() {
+    assert_loop_break_before_else_condition(9);
+}

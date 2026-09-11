@@ -362,3 +362,13 @@ fn preserves_nested_match_case_jump_alias_small_returns() {
         }
     }
 }
+
+#[test]
+fn matches_cpython_terminal_false_match_guard_locations() {
+    for guard in ["False", "0", "None", "''"] {
+        let source = format!(
+            "def f(value):\n    match value:\n        case 1:\n            consume('first')\n        case _ if {guard}:\n            pass\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "terminal_false_match_guard_locations.py");
+    }
+}

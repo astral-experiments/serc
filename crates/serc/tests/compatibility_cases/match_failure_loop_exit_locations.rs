@@ -4,6 +4,18 @@ use crate::common;
 fn matches_cpython_final_pattern_loop_failure_locations() {
     let cases = [
         (
+            "match_failure_direct_none_continue.py",
+            r"def f(items):
+    for item in items:
+        match item:
+            case Entry(value=value):
+                consume(value)
+            case None:
+                continue
+    return None
+",
+        ),
+        (
             "match_failure_nested_if_continue.py",
             r"def f(xs, flag, other):
     for x in xs:

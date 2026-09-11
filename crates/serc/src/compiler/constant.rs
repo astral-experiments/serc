@@ -443,6 +443,15 @@ impl Compiler<'_> {
         {
             // Numeric negation removes its adjacent, equally owned literal load.
             self.assembler.record_last_uniform_fold_owner_slots(1);
+        } else if let Expr::BinOp(binary) = expression
+            && is_literal_constant(&binary.left)
+            && is_literal_constant(&binary.right)
+            && self.source_location(expression.range()).line
+                == self.source_location(expression.range()).end_line
+        {
+            // A folded primitive binary operation removes its two adjacent literal loads.
+            // A single source line leaves neither load behind as a location NOP.
+            self.assembler.record_last_uniform_fold_owner_slots(2);
         }
         Ok(())
     }

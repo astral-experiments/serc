@@ -469,3 +469,48 @@ fn matches_cpython_borrows_at_truthy_finally_while_headers_after_breaks() {
         }
     }
 }
+
+#[test]
+fn matches_cpython_local_fusion_at_copied_keyword_call_exits() {
+    let source = r"def conditional_keyword(flag, value, other):
+    return consume(value if flag else None, extra=other)
+
+def inverted_keyword(flag, value, other):
+    return consume(None if flag else value, extra=other)
+
+def multiline_keyword(flag, value, other):
+    return consume(value if flag else None,
+                   extra=other)
+";
+    common::assert_matches_cpython_marshal(source, "copied_keyword_local_fusion.py");
+}
+
+#[test]
+fn matches_cpython_local_fusion_at_copied_attribute_assignment_exits() {
+    let source = r"class Config:
+    def __init__(self, value):
+        self.value = value if value is not None else []
+
+    def replace(self, flag, value):
+        self.value = value if flag else None
+
+    def replace_and_return(self, flag, value):
+        self.value = value if flag else None
+        return value
+";
+    common::assert_matches_cpython_marshal(source, "copied_attribute_local_fusion.py");
+}
+
+#[test]
+fn matches_cpython_local_fusion_at_copied_operator_exits() {
+    let source = r#"def concatenate(flag, value, other):
+    return (value if flag else "") + other
+
+def identical(flag, value, other):
+    return (value if flag else None) is other
+
+def positional(flag, value, other):
+    return consume(value if flag else None, other)
+"#;
+    common::assert_matches_cpython_marshal(source, "copied_operator_local_fusion.py");
+}

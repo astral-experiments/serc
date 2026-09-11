@@ -305,3 +305,69 @@ fn matches_cpython_first_pass_finalizer_break_pop_marker() {
         }
     }
 }
+
+#[test]
+fn matches_cpython_constant_try_finally_pop_block_owners() {
+    for (source, filename) in [
+        ("try:\n    1\nfinally:\n    pass\n", "one_literal.py"),
+        (
+            "try:\n    1\n    2\nfinally:\n    pass\n",
+            "two_literals.py",
+        ),
+        (
+            "try:\n    work()\n    2\nfinally:\n    close()\n",
+            "call_then_literal.py",
+        ),
+        (
+            "try:\n    2\n    work()\nfinally:\n    close()\n",
+            "literal_then_call.py",
+        ),
+        (
+            "try:\n\x0c    1\n    2\nfinally:\n    pass\n",
+            "formfeed_body.py",
+        ),
+        ("\x0ctry:\n    1\nfinally:\n    pass\n", "formfeed_try.py"),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn matches_cpython_constant_try_finally_nested_owner_boundaries() {
+    for (source, filename) in [
+        (
+            "def f(flag):\n    try:\n        if flag:\n            1\n        work()\n    finally:\n        close()\n",
+            "nested_branch.py",
+        ),
+        (
+            "def f(items):\n    try:\n        for item in items:\n            1\n        work()\n    finally:\n        close()\n",
+            "nested_loop.py",
+        ),
+        (
+            "try:\n    try:\n        1\n    finally:\n        pass\nexcept Error:\n    recover()\n",
+            "outer_handler.py",
+        ),
+        (
+            "with manager:\n    try:\n        1\n    finally:\n        pass\n    work()\n",
+            "sync_with_following.py",
+        ),
+        (
+            "def f():\n    yield 0\n    try:\n        1\n        2\n    finally:\n        close()\n    yield 3\n",
+            "generator.py",
+        ),
+        (
+            "async def f():\n    try:\n        1\n    finally:\n        await close()\n",
+            "coroutine.py",
+        ),
+        (
+            "async def f(manager):\n    async with manager:\n        try:\n            1\n        finally:\n            pass\n",
+            "async_with.py",
+        ),
+        (
+            "try:\n    try:\n        1\n    finally:\n        pass\nfinally:\n    close()\n",
+            "inner_finally.py",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

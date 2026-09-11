@@ -7,13 +7,71 @@ use super::super::{
 };
 use crate::assembler::block_graph::{BasicBlockId, BlockGraph, ItemPosition};
 use crate::target::opcodes::{
-    BUILD_TUPLE, CALL, END_ASYNC_FOR, END_SEND, LOAD_CONST, LOAD_FAST, LOAD_GLOBAL, NOP,
-    POP_EXCEPT, POP_TOP, RAISE_VARARGS, RETURN_VALUE, STORE_ATTR, STORE_FAST, SWAP,
+    BUILD_TUPLE, CALL, END_ASYNC_FOR, END_SEND, FOR_ITER, LOAD_CONST, LOAD_FAST, LOAD_GLOBAL, NOP,
+    NOT_TAKEN, POP_EXCEPT, POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE,
+    POP_JUMP_IF_TRUE, POP_TOP, RAISE_VARARGS, RETURN_VALUE, STORE_ATTR, STORE_FAST, SWAP,
 };
 use crate::target::{is_conditional_jump, is_unconditional_jump};
 
+/// Recognizes an ordinary jump that retains CPython's interrupt check before layout.
+fn has_jump_eval_check(instruction: &Instruction) -> bool {
+    instruction.opcode == JUMP_BACKWARD
+        || (is_unconditional_jump(instruction.opcode) && instruction.jump_policy.is_interruptible())
+}
+
 const WARM_BLOCK: u8 = 1;
 const COLD_BLOCK: u8 = 2;
+
+/// Resolves a virtual interruptible jump when cold-block ordering does not run.
+///
+/// Item positions distinguish labels before and after a jump within the same block.
+fn normalize_unmoved_interruptible_jumps(graph: &mut BlockGraph) {
+    if !graph.features().has_forward_jump() {
+        return;
+    }
+    let items = graph
+        .order()
+        .iter()
+        .copied()
+        .flat_map(|block| {
+            graph[block]
+                .items()
+                .iter()
+                .enumerate()
+                .map(move |(offset, item)| (ItemPosition::new(block, offset), *item))
+        })
+        .collect::<Vec<_>>();
+    let labels = items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (_, item))| match item {
+            Item::Label(label) => Some((*label, index)),
+            Item::Instruction(_) => None,
+        })
+        .collect::<FxHashMap<_, _>>();
+    for (index, (position, item)) in items.iter().enumerate() {
+        let Item::Instruction(instruction) = item else {
+            continue;
+        };
+        if instruction.opcode != JUMP_BACKWARD {
+            continue;
+        }
+        let Operand::Forward(target) = instruction.operand() else {
+            continue;
+        };
+        let Some(&target_position) = labels.get(&target) else {
+            continue;
+        };
+        let instruction = graph
+            .instruction_mut(*position)
+            .expect("original virtual jump position");
+        if target_position <= index {
+            instruction.retarget(Operand::Backward(target));
+        } else {
+            instruction.opcode = JUMP_FORWARD;
+        }
+    }
+}
 
 // Preserve a pending value while discarding the item below it. Deferred source locations
 // must resolve through their own writers, which do not all honor PRESERVE.
@@ -74,6 +132,78 @@ fn block_is_bare_raise(items: &[Item], original_nop_targets: &FxHashSet<Label>) 
             && instruction.operand() == Operand::Value(0)
             && instruction.pre_fold_extra_instructions() == 0
     }) && instructions.next().is_none()
+}
+
+// Every restored POP_BLOCK is outside ordinary handlers but inside the scope fallback.
+// Reapply its exact one-slot hole after all source and copied regions have been formed.
+fn restore_normal_try_pop_holes(
+    graph: &BlockGraph,
+    regions: &mut Vec<ExceptionRegion>,
+    ranges: &[(Label, Label)],
+) {
+    if ranges.is_empty() {
+        return;
+    }
+    let mut offsets = FxHashMap::default();
+    let mut instructions = Vec::new();
+    for item in graph.iter_items() {
+        match item {
+            Item::Label(label) => {
+                offsets.insert(*label, instructions.len());
+            }
+            Item::Instruction(instruction) => instructions.push(instruction),
+        }
+    }
+    let mut holes = Vec::new();
+    for &(start, end) in ranges {
+        let (first, last) = match (offsets.get(&start), offsets.get(&end)) {
+            (Some(&first), Some(&last)) => (first, last),
+            // An entirely discarded original/copy has no remaining slot or range.
+            (None, None) => continue,
+            _ => panic!("original cleanup copy lost one POP_BLOCK boundary"),
+        };
+        // Dead originals can retain their labels for exception bookkeeping.
+        if first == last {
+            continue;
+        }
+        assert_eq!(last, first + 1, "original POP_BLOCK hole changed width");
+        let pop = instructions[first];
+        assert!(
+            pop.opcode == NOP && pop.fusion_policy.is_converted_pop_block(),
+            "original POP_BLOCK hole no longer contains its converted record"
+        );
+        holes.push((first, last, start, end));
+    }
+    holes.sort_by_key(|&(first, last, _, _)| (first, last));
+    assert!(
+        holes.windows(2).all(|pair| pair[0].1 <= pair[1].0),
+        "original POP_BLOCK holes overlap"
+    );
+    let original_regions = std::mem::take(regions);
+    for region in original_regions {
+        if region.is_scope_fallback {
+            regions.push(region);
+            continue;
+        }
+        let first = offsets[&region.start];
+        let last = offsets[&region.end];
+        let mut start = region.start;
+        for &(lo, hi, pop_start, pop_end) in &holes {
+            if lo < last && first < hi {
+                assert!(
+                    first <= lo && hi <= last,
+                    "region partly intersects original POP_BLOCK"
+                );
+                regions.push(ExceptionRegion {
+                    start,
+                    end: pop_start,
+                    ..region
+                });
+                start = pop_end;
+            }
+        }
+        regions.push(ExceptionRegion { start, ..region });
+    }
 }
 
 struct ExitBlockAnalysis {
@@ -150,7 +280,8 @@ fn exit_block_analysis(
         });
         let source_has_fallthrough = block_has_fallthrough(graph[source].items());
         let shared_exit = predecessors[target.index()] > 1
-            && ((target_has_no_location && ends_scope(target_last.opcode))
+            && ((target_has_no_location
+                && (ends_scope(target_last.opcode) || has_jump_eval_check(target_last)))
                 || target_last.no_location_policy.is_artificial_eval_break());
         let no_location_exit = target_has_no_location
             && !block_has_fallthrough(graph[target].items())
@@ -288,7 +419,11 @@ fn exit_block_analysis(
             && !block_has_fallthrough(graph[target_exit].items())
             && target_last.no_location_policy.allows_block_inlining();
         let shared_exit = predecessors[target.index()] > 1
-            && ((target_has_no_location && ends_scope(target_last.opcode))
+            && ((target_has_no_location
+                && (ends_scope(target_last.opcode)
+                    || graph[target_exit]
+                        .last_instruction()
+                        .is_some_and(has_jump_eval_check)))
                 || target_last.no_location_policy.is_artificial_eval_break());
         if inline_small_exit
             || copy_conditional_split_return
@@ -515,6 +650,113 @@ fn restore_copied_pop_block_locations(
     }
 }
 
+// A preserved owner boundary can split an original label-only prefix from its POP_BLOCK.
+// Follow only that captured prefix, after copying has fixed the reachable predecessors.
+fn restore_retained_pop_block_locations(
+    graph: &mut BlockGraph,
+    exception_regions: &[ExceptionRegion],
+    preserved_boundaries: &FxHashSet<Label>,
+    origins: &FxHashMap<Label, Vec<Label>>,
+) {
+    if origins.is_empty() {
+        return;
+    }
+    let reachable = graph.reachable_blocks(exception_regions);
+    let order = graph.order().to_vec();
+    let mut incoming = vec![(0usize, None); reachable.len()];
+    if let Some(entry) = order.first() {
+        incoming[entry.index()].0 = 1;
+    }
+    for (position, source) in order.iter().copied().enumerate() {
+        if !reachable[source.index()] {
+            continue;
+        }
+        let fallthrough = block_has_fallthrough(graph[source].items())
+            .then(|| order.get(position + 1).copied())
+            .flatten();
+        let jump =
+            block_jump_target(graph[source].items()).and_then(|label| graph.label_block(label));
+        for target in fallthrough.into_iter().chain(jump) {
+            incoming[target.index()].0 += 1;
+            incoming[target.index()].1 = Some(source);
+        }
+    }
+    let handlers = exception_regions
+        .iter()
+        .filter_map(|region| graph.label_block(region.target))
+        .collect::<FxHashSet<_>>();
+    let mut ordered_origins = origins.iter().collect::<Vec<_>>();
+    ordered_origins.sort_unstable_by_key(|(entry, _)| entry.0);
+    for (entry, prefix) in ordered_origins {
+        let Some(target) = graph.label_block(*entry) else {
+            continue;
+        };
+        if !reachable[target.index()]
+            || !preserved_boundaries.contains(entry)
+            || !graph[target]
+                .items()
+                .iter()
+                .take_while(|item| matches!(item, Item::Label(_)))
+                .any(|item| matches!(item, Item::Label(label) if label == entry))
+        {
+            continue;
+        }
+        let Some(first) = graph[target].items().iter().find_map(|item| match item {
+            Item::Instruction(instruction) => Some(instruction),
+            Item::Label(_) => None,
+        }) else {
+            continue;
+        };
+        if first.opcode != NOP
+            || !first.fusion_policy.is_converted_pop_block()
+            || !first.jump_policy.preserves_explicit_nop()
+            || first.jump_policy.borrow_empty_block()
+            || first.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
+            || first.location != SourceLocation::NONE
+            || first.no_location_policy.preserves_location()
+        {
+            continue;
+        }
+        let mut block = target;
+        let mut visited = FxHashSet::default();
+        let mut crossed_empty = false;
+        let location = loop {
+            if !visited.insert(block) || handlers.contains(&block) {
+                break None;
+            }
+            let (1, Some(source)) = incoming[block.index()] else {
+                break None;
+            };
+            if handlers.contains(&source) {
+                break None;
+            }
+            if let Some(instruction) = graph[source].last_instruction() {
+                break (crossed_empty
+                    && is_unconditional_jump(instruction.opcode)
+                    && block_jump_target(graph[source].items())
+                        .and_then(|label| graph.label_block(label))
+                        == Some(block)
+                    && instruction.location.line >= 0)
+                    .then_some(instruction.location);
+            }
+            if !graph[source]
+                .items()
+                .iter()
+                .all(|item| matches!(item, Item::Label(label) if prefix.contains(label)))
+            {
+                break None;
+            }
+            crossed_empty = true;
+            block = source;
+        };
+        if let Some(location) = location
+            && let Some(first) = graph.instructions_mut(target).next()
+        {
+            first.location = location;
+        }
+    }
+}
+
 // A shared head's temporary location must not seed a now-unique copied head.
 // Clear surviving shared originals before collecting predecessor locations.
 fn restore_pop_block_head_locations(
@@ -592,6 +834,67 @@ fn unlocated_prefix_has_located_continuation(
 
 // The original pass performs these location repairs even when it creates no copies, so the fast
 // path must preserve them before returning.
+
+/// Propagates a resolved `POP_BLOCK` line into its original following jump slot.
+fn propagate_normal_try_pop_continuations(
+    graph: &mut BlockGraph,
+    ranges: &[(Label, Label)],
+    forbidden_entries: &FxHashSet<Label>,
+) {
+    let mut offsets = FxHashMap::default();
+    let mut instructions = Vec::new();
+    let mut incoming = forbidden_entries.clone();
+    for (block, contents) in graph.iter() {
+        for (offset, item) in contents.items().iter().enumerate() {
+            match item {
+                Item::Label(label) => {
+                    offsets.insert(*label, instructions.len());
+                }
+                Item::Instruction(instruction) => {
+                    if let Operand::Forward(label) | Operand::Backward(label) =
+                        instruction.operand()
+                    {
+                        incoming.insert(label);
+                    }
+                    instructions.push((ItemPosition::new(block, offset), *instruction));
+                }
+            }
+        }
+    }
+    let mut updates = Vec::new();
+    for &(start, end) in ranges {
+        let (Some(&start), Some(&end)) = (offsets.get(&start), offsets.get(&end)) else {
+            continue;
+        };
+        if end != start + 1 {
+            continue;
+        }
+        let (_, pop) = instructions[start];
+        let Some(&(position, next)) = instructions.get(end) else {
+            continue;
+        };
+        if pop.opcode != NOP
+            || !pop.fusion_policy.is_converted_pop_block()
+            || pop.location.line < 0
+            || !(is_unconditional_jump(next.opcode) || next.opcode == NOP)
+            || next.location.line >= 0
+            || next.no_location_policy.preserves_location()
+            || offsets
+                .iter()
+                .any(|(label, offset)| *offset == end && incoming.contains(label))
+        {
+            continue;
+        }
+        updates.push((position, pop.location));
+    }
+    for (position, location) in updates {
+        graph
+            .instruction_mut(position)
+            .expect("original try continuation")
+            .location = location;
+    }
+}
+
 fn propagate_exit_block_locations(
     graph: &mut BlockGraph,
     order: &[BasicBlockId],
@@ -691,18 +994,33 @@ fn propagate_exit_block_locations(
 }
 
 impl OptimizationPipeline {
-    /// Resolves synthesized percent-format literals that begin a conditional target block.
+    /// Resolves synthesized percent-format literals before their location donors are optimized.
     ///
     /// CPython's early line-number propagation gives this leading constant the sole
     /// predecessor's condition location. Serc retains the eventual percent-expression
     /// location on some intervening jumps, so recover the earlier location from the jump's
     /// preceding instruction or, for a split jump block, its sole predecessor.
-    pub(in crate::assembler) fn resolve_synthesized_conditional_target_locations(&mut self) {
+    pub(in crate::assembler) fn resolve_synthesized_percent_locations(&mut self) {
         if !self.has_synthesized_percent_target_locations {
             return;
         }
 
         let order = self.graph.order().to_vec();
+        // CPython propagates locations before fusing adjacent local loads. Retain the
+        // second load's location for a following literal before fusion removes that donor.
+        for block in order.iter().copied() {
+            let mut previous = SourceLocation::NONE;
+            for instruction in self.graph.instructions_mut(block) {
+                if instruction.location.line >= 0 {
+                    previous = instruction.location;
+                } else if instruction.no_location_policy.percent_target_location == u8::MAX
+                    && previous.line >= 0
+                {
+                    instruction.location = previous;
+                    instruction.no_location_policy.percent_target_location = 0;
+                }
+            }
+        }
         let mut predecessors = FxHashMap::<BasicBlockId, (usize, SourceLocation)>::default();
         if let Some(entry) = order.first().copied() {
             predecessors.insert(entry, (1, SourceLocation::NONE));
@@ -892,13 +1210,137 @@ impl OptimizationPipeline {
         }
     }
 
-    pub(in crate::assembler) fn push_cold_blocks_to_end(&mut self) {
+    /// Reverses backward conditionals around a fresh interruptible backedge.
+    pub(in crate::assembler) fn normalize_backward_conditionals(
+        &mut self,
+    ) -> Result<(), crate::CompileError> {
+        let mut position = 0;
+        while position < self.graph.order().len() {
+            let block = self.graph.block_at(position);
+            let Some(instruction) = self.graph[block].last_instruction().copied() else {
+                position += 1;
+                continue;
+            };
+            let Operand::Backward(target) = instruction.operand() else {
+                position += 1;
+                continue;
+            };
+            let reversed = match instruction.opcode {
+                POP_JUMP_IF_FALSE => POP_JUMP_IF_TRUE,
+                POP_JUMP_IF_TRUE => POP_JUMP_IF_FALSE,
+                POP_JUMP_IF_NONE => POP_JUMP_IF_NOT_NONE,
+                POP_JUMP_IF_NOT_NONE => POP_JUMP_IF_NONE,
+                _ => {
+                    position += 1;
+                    continue;
+                }
+            };
+            // Code generation already emitted the forward form's marker. CPython
+            // instead creates it in the new backedge block at this late stage.
+            let marker = self.graph.order()[position + 1..].iter().find_map(|block| {
+                self.graph[*block].items().iter().enumerate().find_map(
+                    |(offset, item)| match item {
+                        Item::Instruction(marker) => {
+                            Some((*block, ItemPosition::new(*block, offset), marker.opcode))
+                        }
+                        Item::Label(_) => None,
+                    },
+                )
+            });
+            let Some((_marker_block, marker, NOT_TAKEN)) = marker else {
+                return Err(crate::CompileError::Internal(
+                    "backward conditional has no fallthrough marker".to_owned(),
+                ));
+            };
+            let successor = self.graph.block_at(position + 1);
+            let fallthrough =
+                if let Some(Item::Label(label)) = self.graph[successor].items().first() {
+                    *label
+                } else {
+                    let label = self.label();
+                    self.graph.insert_label(successor, 0, label);
+                    label
+                };
+            let fresh_entry = self.label();
+            self.graph.remove_item(marker);
+            let conditional = self.graph.instructions_mut(block).next_back().unwrap();
+            conditional.opcode = reversed;
+            conditional.retarget(Operand::Forward(fallthrough));
+            let mut marker = Instruction::synthetic(
+                NOT_TAKEN,
+                Operand::Value(0),
+                instruction.location,
+                instruction.depth_after(),
+            );
+            let mut backedge = Instruction::synthetic(
+                JUMP_BACKWARD,
+                Operand::Backward(target),
+                instruction.location,
+                instruction.depth_after(),
+            );
+            // The new CPython instruction array starts with null exception owners.
+            marker.set_exception_policy(ExceptionPolicy::AlwaysAbsent);
+            backedge.set_exception_policy(ExceptionPolicy::AlwaysAbsent);
+            self.preserved_block_boundaries.insert(fresh_entry);
+            self.graph.insert_block(
+                position + 1,
+                vec![
+                    Item::Label(fresh_entry),
+                    Item::Instruction(marker),
+                    Item::Instruction(backedge),
+                ],
+            );
+            position += 2;
+        }
+        Ok(())
+    }
+
+    pub(in crate::assembler) fn push_cold_blocks_to_end(&mut self) -> FxHashSet<Label> {
         if self.exception_regions.is_empty() {
-            return;
+            normalize_unmoved_interruptible_jumps(&mut self.graph);
+            return FxHashSet::default();
         }
         let graph = &mut self.graph;
         if graph.len() < 2 {
-            return;
+            normalize_unmoved_interruptible_jumps(graph);
+            return FxHashSet::default();
+        }
+
+        // Loop-tail lowering can omit the original array containing the final backedge.
+        // CPython keeps that array after its instructions disappear. A surviving FOR_ITER
+        // supplies provenance only when its cleanup target is an original recorded label.
+        let omitted_targets = graph
+            .iter()
+            .filter_map(|(_, block)| {
+                let last = block.last_instruction()?;
+                let Operand::Forward(target) = last.operand() else {
+                    return None;
+                };
+                (last.opcode == FOR_ITER && self.borrow_omitted_for_backedges.contains(&target))
+                    .then_some(target)
+            })
+            .collect::<FxHashSet<_>>();
+        let cleanup_positions = graph
+            .order()
+            .iter()
+            .enumerate()
+            .filter_map(|(position, block)| {
+                graph[*block]
+                    .items()
+                    .iter()
+                    .any(|item| matches!(item, Item::Label(label) if omitted_targets.contains(label)))
+                    .then_some(position)
+            })
+            .collect::<Vec<_>>();
+        let mut omitted_backedges = FxHashSet::default();
+        let mut omitted_markers = FxHashSet::default();
+        for position in cleanup_positions.into_iter().rev() {
+            let label = Label(self.next_label);
+            self.next_label += 1;
+            // Keep the array empty while physical jumps and locations are finalized.
+            let block = graph.insert_block(position, vec![Item::Label(label)]);
+            omitted_backedges.insert(block);
+            omitted_markers.insert(label);
         }
 
         let order = graph.order().to_vec();
@@ -985,7 +1427,8 @@ impl OptimizationPipeline {
             }
         }
         if !temperatures.contains(&COLD_BLOCK) {
-            return;
+            normalize_unmoved_interruptible_jumps(graph);
+            return omitted_markers;
         }
 
         let explicit_jumps = (0..order.len().saturating_sub(1))
@@ -1050,7 +1493,10 @@ impl OptimizationPipeline {
         for expected_cold in [false, true] {
             for block in graph.order().iter().copied() {
                 if (expected_cold && temperatures[block.index()] == COLD_BLOCK)
-                    || (!expected_cold && temperatures[block.index()] == WARM_BLOCK)
+                    || (!expected_cold
+                        && (temperatures[block.index()] == WARM_BLOCK
+                            || (temperatures[block.index()] == 0
+                                && omitted_backedges.contains(&block))))
                 {
                     order.push(block);
                 }
@@ -1070,6 +1516,14 @@ impl OptimizationPipeline {
         // CPython puts a terminal restore before the handlers. Move a direct local restore or
         // the outer restore of nested async loops back to END_ASYNC_FOR's fallthrough.
         let terminal_restore = (0..order.len().saturating_sub(1)).find_map(|position| {
+            // A conditional fallthrough starts ordinary code after the loop. Moving its
+            // target here would change that fallthrough and can reverse another conditional.
+            if !graph[order[position + 1]]
+                .last_instruction()
+                .is_some_and(|instruction| is_unconditional_jump(instruction.opcode))
+            {
+                return None;
+            }
             let target = graph[order[position]]
                 .items()
                 .iter()
@@ -1234,6 +1688,7 @@ impl OptimizationPipeline {
         if let Some(final_label) = final_label {
             graph.push_block(vec![Item::Label(final_label)]);
         }
+        omitted_markers
     }
 
     // CPython resolves locations before removing redundant jump blocks. A later shared entry
@@ -1310,6 +1765,7 @@ impl OptimizationPipeline {
     pub(in crate::assembler) fn duplicate_exit_blocks(
         &mut self,
         original_location_absence: &FxHashSet<Label>,
+        owner_retargets: &mut Vec<(Instruction, Instruction)>,
     ) -> Vec<Label> {
         let graph = &mut self.graph;
         if graph.is_normalized_jump_free_single_block(&self.preserved_block_boundaries) {
@@ -1318,6 +1774,39 @@ impl OptimizationPipeline {
 
         if !graph.is_normalized(&self.preserved_block_boundaries) {
             graph.normalize_blocks(&self.preserved_block_boundaries);
+        }
+        if !self
+            .exception_owner_provenance
+            .normal_try_copy_internal_labels
+            .is_empty()
+        {
+            let mut forbidden_entries = self.preserved_block_boundaries.clone();
+            forbidden_entries.extend(self.exception_regions.iter().map(|region| region.target));
+            forbidden_entries.extend(
+                self.exception_owner_provenance
+                    .setups
+                    .iter()
+                    .map(|(label, _)| *label),
+            );
+            forbidden_entries.extend(
+                self.exception_owner_provenance
+                    .normal_try_copy_internal_labels
+                    .iter()
+                    .copied()
+                    .filter(|label| {
+                        self.exception_owner_provenance
+                            .synchronous_with_setups
+                            .contains(label)
+                    }),
+            );
+            graph
+                .join_continuation_blocks(
+                    &self
+                        .exception_owner_provenance
+                        .normal_try_copy_internal_labels,
+                    &forbidden_entries,
+                )
+                .expect("certified original cleanup array continuations");
         }
         if graph.len() < 2 {
             return Vec::new();
@@ -1358,6 +1847,20 @@ impl OptimizationPipeline {
             })
             .collect::<Vec<_>>();
         if !analysis.requires_copy {
+            self.borrow_authored_finally_break_entries =
+                Self::take_pre_copy_authored_finally_break_entries(
+                    graph,
+                    &self.exception_owner_provenance.block_boundaries,
+                    &mut self.borrow_authored_finally_break_origins,
+                );
+            if !self.borrow_jump_entry_labels.is_empty() {
+                self.borrow_pre_copy_jump_entries =
+                    Self::take_pre_copy_borrow_entries_with_threaded(
+                        graph,
+                        &self.exception_owner_provenance.block_boundaries,
+                        &mut self.borrow_threaded_jump_entries,
+                    );
+            }
             propagate_exit_block_locations(
                 graph,
                 &order,
@@ -1371,6 +1874,12 @@ impl OptimizationPipeline {
                 .map(|(_, label)| *label)
                 .collect::<Vec<_>>();
             restore_shared_pop_block_locations(graph, &self.exception_regions, &heads);
+            restore_retained_pop_block_locations(
+                graph,
+                &self.exception_regions,
+                &self.preserved_block_boundaries,
+                &self.retained_pop_block_origins,
+            );
             return Vec::new();
         }
         let ExitBlockAnalysis {
@@ -1387,6 +1896,21 @@ impl OptimizationPipeline {
                 self.next_label += 1;
                 graph.insert_label(block, 0, label);
             }
+        }
+        self.borrow_authored_finally_break_entries =
+            Self::take_pre_copy_authored_finally_break_entries(
+                graph,
+                &self.exception_owner_provenance.block_boundaries,
+                &mut self.borrow_authored_finally_break_origins,
+            );
+        if !self.borrow_jump_entry_labels.is_empty() {
+            // These are still the pre-copy blocks, including labels just assigned to
+            // implicit entries. Every subsequently copied block receives fresh labels.
+            self.borrow_pre_copy_jump_entries = Self::take_pre_copy_borrow_entries_with_threaded(
+                graph,
+                &self.exception_owner_provenance.block_boundaries,
+                &mut self.borrow_threaded_jump_entries,
+            );
         }
         let mut exception_boundary_blocks = vec![false; positions.len()];
         for block in self
@@ -1425,7 +1949,9 @@ impl OptimizationPipeline {
                     })
                     && graph[block]
                         .last_instruction()
-                        .is_some_and(|instruction| ends_scope(instruction.opcode));
+                        .is_some_and(|instruction| {
+                            ends_scope(instruction.opcode) || has_jump_eval_check(instruction)
+                        });
             let mut original_unlocated_discard = false;
             let artificial_eval_break =
                 graph[block].last_instruction().is_some_and(|instruction| {
@@ -1451,13 +1977,26 @@ impl OptimizationPipeline {
         }
 
         let mut inline_copies = FxHashMap::<_, Vec<Vec<Item>>>::default();
+        let mut planned_inline_labels = FxHashSet::default();
         let mut copied_entry_labels = Vec::new();
         let mut copied_exit_or_eval_entry_labels = FxHashSet::default();
         let mut retained_unlocated_join_blocks = FxHashSet::default();
         let mut target_copies = FxHashMap::<_, Vec<Vec<Item>>>::default();
+        let mut copied_split_eval_starts = FxHashMap::default();
         let mut copied_region_exclusions =
             vec![Vec::<(Label, Label)>::new(); self.exception_regions.len()];
         let mut copied_exception_regions = Vec::new();
+        let mut original_pop_ranges = self
+            .exception_owner_provenance
+            .normal_try_copy_pop_ranges
+            .clone();
+        // The closed return-copy schedule owns its original slots and location repairs.
+        // These ordinary cleanup arrays were restored only when that schedule was absent.
+        let generic_original_arrays = self
+            .exception_owner_provenance
+            .normal_try_copy_steps
+            .is_empty()
+            && !original_pop_ranges.is_empty();
         let mut drop_blocks = vec![false; positions.len()];
         let mut remaining_predecessors = predecessors.clone();
         let mut jump_sources = vec![Vec::<BasicBlockId>::new(); positions.len()];
@@ -1472,9 +2011,38 @@ impl OptimizationPipeline {
             .iter()
             .copied()
             .partition(|source| block_has_fallthrough(graph[*source].items()));
+        let planned_blocks = self
+            .exception_owner_provenance
+            .normal_try_copy_blocks
+            .iter()
+            .filter_map(|label| graph.label_block(*label))
+            .collect::<FxHashSet<_>>();
+        let planned_steps = self
+            .exception_owner_provenance
+            .normal_try_copy_steps
+            .iter()
+            .map(|(source, target, width)| {
+                (
+                    graph.label_block(*source).expect("certified copy source"),
+                    graph.label_block(*target).expect("certified copy target"),
+                    *width,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut planned_cursor = 0;
         let mut source_cursor = 0;
         loop {
-            let Some(&source) = sources.get(source_cursor) else {
+            let planned_target = planned_steps
+                .get(planned_cursor)
+                .map(|(_, target, _)| *target);
+            let planned_width = planned_steps
+                .get(planned_cursor)
+                .map(|(_, _, width)| *width);
+            let selected_source = planned_steps
+                .get(planned_cursor)
+                .map(|(source, _, _)| source)
+                .or_else(|| sources.get(source_cursor));
+            let Some(&source) = selected_source else {
                 if conditional_sources.is_empty() {
                     break;
                 }
@@ -1489,20 +2057,71 @@ impl OptimizationPipeline {
                         !matches!(item, Item::Instruction(instruction) if instruction.location.line >= 0)
                     }) && graph[block]
                         .last_instruction()
-                        .is_some_and(|instruction| ends_scope(instruction.opcode));
+                        .is_some_and(|instruction| {
+                            ends_scope(instruction.opcode) || has_jump_eval_check(instruction)
+                        });
                     exit_without_unique_predecessor[block.index()] |=
                         remaining_predecessors[block.index()] > 1 && unlocated_scope_exit;
+                }
+                for block in order
+                    .iter()
+                    .copied()
+                    .filter(|block| planned_blocks.contains(block))
+                {
+                    let mut previous = None;
+                    let updates = graph[block]
+                        .items()
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(offset, item)| match item {
+                            Item::Label(label) => {
+                                if !planned_inline_labels.contains(label) {
+                                    previous = None;
+                                }
+                                None
+                            }
+                            Item::Instruction(instruction) => {
+                                if instruction.location.line >= 0
+                                    || instruction.no_location_policy.preserves_location()
+                                {
+                                    previous = Some(instruction.location);
+                                    None
+                                } else {
+                                    previous.map(|location| {
+                                        (ItemPosition::new(block, offset), location)
+                                    })
+                                }
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    for (position, location) in updates {
+                        graph
+                            .instruction_mut(position)
+                            .expect("planned array instruction")
+                            .location = location;
+                    }
                 }
                 sources.append(&mut conditional_sources);
                 continue;
             };
-            source_cursor += 1;
+            if planned_target.is_some() {
+                planned_cursor += 1;
+            } else {
+                source_cursor += 1;
+                if planned_blocks.contains(&source) {
+                    continue;
+                }
+            }
+            let planned_copy = planned_target.is_some();
             let Some(target_label) = block_jump_target(graph[source].items()) else {
                 continue;
             };
             let Some(target) = graph.label_block(target_label) else {
                 continue;
             };
+            if let Some(expected) = planned_target {
+                assert_eq!(target, expected, "original cleanup copy target changed");
+            }
             let source_position = positions[source.index()];
             let target_position = positions[target.index()];
             let source_has_fallthrough = block_has_fallthrough(graph[source].items());
@@ -1537,6 +2156,16 @@ impl OptimizationPipeline {
                     ),
                 })
                 .sum::<usize>();
+            if let Some(width) = planned_width {
+                assert_eq!(
+                    target_chain_end, target_position,
+                    "original cleanup target split"
+                );
+                assert_eq!(
+                    target_pre_fusion_size, width,
+                    "original cleanup array changed before copy"
+                );
+            }
             let target_terminal_opcode = target_blocks
                 .iter()
                 .rev()
@@ -1580,7 +2209,18 @@ impl OptimizationPipeline {
             let target_allows_no_location_block_inlining = graph[target_exit]
                 .last_instruction()
                 .is_some_and(|instruction| instruction.no_location_policy.allows_block_inlining());
+            let target_has_unlocated_jump_eval_check = target_has_no_location
+                && graph[target_exit]
+                    .last_instruction()
+                    .is_some_and(has_jump_eval_check);
+            let target_has_copied_jump_eval_check = target_has_unlocated_jump_eval_check
+                && target_blocks.iter().any(|block| {
+                    graph[*block].items().iter().any(|item| {
+                        matches!(item, Item::Label(label) if copied_exit_or_eval_entry_labels.contains(label))
+                    })
+                });
             if source_has_fallthrough
+                && !target_has_copied_jump_eval_check
                 && graph[target_exit]
                     .last_instruction()
                     .is_some_and(Instruction::only_allows_unconditional_inlining)
@@ -1621,6 +2261,12 @@ impl OptimizationPipeline {
                     });
             let inline_no_location_block =
                 !source_has_fallthrough && target_is_no_location_no_fallthrough;
+            if planned_copy {
+                assert!(
+                    inline_small_exit || inline_no_location_block,
+                    "certified cleanup copy lost eligibility"
+                );
+            }
             let copy_conditional_split_return = source_has_fallthrough
                 && source_copies_split_return
                 && target_is_small_exit
@@ -1661,6 +2307,7 @@ impl OptimizationPipeline {
             }
             if !(inline_small_exit || inline_no_location_block || copy_conditional_split_return)
                 && (!(exit_without_unique_predecessor[target.index()]
+                    || target_has_unlocated_jump_eval_check
                     || target_is_no_location_no_fallthrough)
                     || remaining_predecessors[target.index()] <= 1)
             {
@@ -1671,26 +2318,44 @@ impl OptimizationPipeline {
             // labels are renamed below and therefore cannot inherit that provenance either.
             if !self.deferred_shared_jump_blocks.is_empty()
                 || !self.shared_jump_copy_location_blocks.is_empty()
+                || !self.retained_pop_block_origins.is_empty()
+                || !self
+                    .exception_owner_provenance
+                    .retained_normal_pop_blocks
+                    .is_empty()
             {
                 for item in graph[source].items() {
                     if let Item::Label(label) = item {
                         self.deferred_shared_jump_blocks.remove(label);
                         self.shared_jump_copy_location_blocks.remove(label);
+                        self.retained_pop_block_origins.remove(label);
+                        self.exception_owner_provenance
+                            .retained_normal_pop_blocks
+                            .retain(|_, origin| {
+                                !origin.before.contains(label) && !origin.after.contains(label)
+                            });
                     }
                 }
             }
 
-            let source_location = graph[source]
-                .items()
-                .iter()
-                .rev()
-                .find_map(|item| match item {
-                    Item::Instruction(instruction) if instruction.location.line >= 0 => {
-                        Some(instruction.location)
-                    }
-                    Item::Instruction(_) | Item::Label(_) => None,
-                })
-                .unwrap_or(SourceLocation::NONE);
+            let source_location = if planned_copy {
+                graph[source]
+                    .last_instruction()
+                    .expect("planned terminal jump")
+                    .location
+            } else {
+                graph[source]
+                    .items()
+                    .iter()
+                    .rev()
+                    .find_map(|item| match item {
+                        Item::Instruction(instruction) if instruction.location.line >= 0 => {
+                            Some(instruction.location)
+                        }
+                        Item::Instruction(_) | Item::Label(_) => None,
+                    })
+                    .unwrap_or(SourceLocation::NONE)
+            };
             let mut copied = target_blocks
                 .iter()
                 .flat_map(|block| graph[*block].items().iter().copied())
@@ -1700,23 +2365,34 @@ impl OptimizationPipeline {
             // Read the original labels before they are renamed below.
             if !self.shared_jump_copy_location_blocks.is_empty() {
                 let mut shared_jump = false;
+                let mut original_pop = false;
                 for item in &mut copied {
                     match item {
                         Item::Label(label) => {
                             shared_jump |= self.shared_jump_copy_location_blocks.contains(label);
+                            original_pop |= original_pop_ranges
+                                .iter()
+                                .any(|(start, _)| *start == *label);
                         }
                         Item::Instruction(instruction) => {
                             if shared_jump && is_unconditional_jump(instruction.opcode) {
                                 instruction.no_location_policy.clear_preserved_location();
                             }
-                            shared_jump = false;
+                            // The planned original array restores its POP_BLOCK before the
+                            // shared JUMP. Carry this head only across that exact restored slot.
+                            shared_jump &= planned_copy
+                                && original_pop
+                                && instruction.opcode == NOP
+                                && instruction.fusion_policy.is_converted_pop_block();
+                            original_pop = false;
                         }
                     }
                 }
             }
             if inline_no_location_block
                 && graph[source].last_instruction().is_some_and(|instruction| {
-                    instruction.jump_policy.is_interruptible()
+                    instruction.opcode == JUMP_BACKWARD
+                        || instruction.jump_policy.is_interruptible()
                         || instruction.fusion_policy.is_authored_break()
                 })
                 && let Some(instruction) = copied.iter_mut().rev().find_map(|item| match item {
@@ -1727,7 +2403,16 @@ impl OptimizationPipeline {
             {
                 // CPython preserves the removed JUMP's eval-breaker check when replacing it
                 // with an unlocated cleanup block whose terminal jump has no such check.
-                instruction.jump_policy.mark_interruptible();
+                if matches!(
+                    instruction.jump_policy.retained_nop(),
+                    super::super::ir::RetainedJumpNop::None
+                ) {
+                    instruction.jump_policy.mark_interruptible();
+                } else {
+                    // The copied target still owns its retained jump NOP. Carry the
+                    // original JUMP kind in the opcode until cold ordering sets direction.
+                    instruction.opcode = JUMP_BACKWARD;
+                }
             }
             if inline_no_location_block
                 && let Some(instruction) = copied.iter_mut().rev().find_map(|item| match item {
@@ -1783,14 +2468,15 @@ impl OptimizationPipeline {
             if preserve_unlocated_join_nop {
                 retained_unlocated_join_blocks.insert(source);
             }
-            let preserve_inlined_jump_nop = inline_small_exit
-                && (preserve_unlocated_join_nop
-                    || (source_location.line >= 0
-                        && graph[source].last_instruction().is_some_and(|instruction| {
-                            instruction
-                                .jump_policy
-                                .retains_nop_for(instruction.operand())
-                        })));
+            let preserve_inlined_jump_nop = planned_copy
+                || (inline_small_exit
+                    && (preserve_unlocated_join_nop
+                        || (source_location.line >= 0
+                            && graph[source].last_instruction().is_some_and(|instruction| {
+                                instruction
+                                    .jump_policy
+                                    .retains_nop_for(instruction.operand())
+                            }))));
             let copied_label = Label(self.next_label);
             self.next_label += 1;
             if !self.borrow_finally_jump_sources.is_empty() {
@@ -1799,7 +2485,12 @@ impl OptimizationPipeline {
             }
             let mut replaced_entry_label = false;
             let mut copied_labels = FxHashMap::default();
+            let mut copied_jump_nop_successors = Vec::new();
+            let mut copied_previous_is_nop = false;
             for item in &mut copied {
+                if let Item::Instruction(instruction) = item {
+                    copied_previous_is_nop = instruction.opcode == NOP;
+                }
                 if let Item::Label(label) = item {
                     let original = *label;
                     if !replaced_entry_label {
@@ -1810,8 +2501,21 @@ impl OptimizationPipeline {
                         self.next_label += 1;
                     }
                     copied_labels.insert(original, *label);
+                    // A target beginning at this label does not include the source NOP.
+                    // Inherit its certificate only when that NOP is physically copied.
+                    if copied_previous_is_nop
+                        && self
+                            .exception_owner_provenance
+                            .normal_try_copy_jump_nop_successors
+                            .contains(&original)
+                    {
+                        copied_jump_nop_successors.push(*label);
+                    }
                 }
             }
+            self.exception_owner_provenance
+                .normal_try_copy_jump_nop_successors
+                .extend(copied_jump_nop_successors);
             if !replaced_entry_label {
                 copied.insert(0, Item::Label(copied_label));
             }
@@ -1835,6 +2539,77 @@ impl OptimizationPipeline {
                     Operand::Value(_) | Operand::Deferred(_) => {}
                 }
             }
+            if planned_copy {
+                // These freshly renamed labels are inside the array appended after the
+                // source jump's NOP. External region aliases below are not physical copies.
+                // Other copy kinds do not inherit this original-array certificate.
+                self.exception_owner_provenance
+                    .normal_try_copy_inline_labels
+                    .extend(copied.iter().filter_map(|item| match item {
+                        Item::Label(label) => Some(*label),
+                        Item::Instruction(_) => None,
+                    }));
+            }
+            // Conditional copies can also enter an expanded original cleanup array.
+            // Project its POP_BLOCK holes through physical labels before external exception
+            // region ends add synthetic aliases that do not copy those original endpoints.
+            let copied_pop_ranges = original_pop_ranges
+                .iter()
+                .filter_map(|(start, end)| {
+                    match (copied_labels.get(start), copied_labels.get(end)) {
+                        (Some(&start), Some(&end)) => Some((start, end)),
+                        (None, None) => None,
+                        _ => panic!("original cleanup copy split a POP_BLOCK range"),
+                    }
+                })
+                .collect::<Vec<_>>();
+            let generic_original_copy =
+                generic_original_arrays && !source_has_fallthrough && !copied_pop_ranges.is_empty();
+            if generic_original_copy {
+                // Only labels physically copied from the original array certify adjacency.
+                // The exception-end aliases added below have no original instruction slot.
+                self.exception_owner_provenance
+                    .normal_try_copy_inline_labels
+                    .extend(copied.iter().filter_map(|item| match item {
+                        Item::Label(label) => Some(*label),
+                        Item::Instruction(_) => None,
+                    }));
+            }
+            // A return inlined earlier in this pass can already contain holes in its
+            // enclosing handlers. A conditional copy preserves those original instruction
+            // owners too. Only physically copied endpoints certify a complete hole; the
+            // synthetic exception-end aliases below do not.
+            let mut inherited_conditional_exclusions = Vec::new();
+            if source_has_fallthrough {
+                let copied_positions = copied
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(position, item)| match item {
+                        Item::Label(label) => Some((*label, position)),
+                        Item::Instruction(_) => None,
+                    })
+                    .collect::<FxHashMap<_, _>>();
+                for (index, exclusions) in copied_region_exclusions.iter().enumerate() {
+                    let membership = &region_memberships[index];
+                    if !membership.contains(&target_position)
+                        || !membership.contains(&target_chain_end)
+                    {
+                        continue;
+                    }
+                    for (start, end) in exclusions {
+                        if let (Some(&start), Some(&end)) =
+                            (copied_labels.get(start), copied_labels.get(end))
+                            && copied_positions[&start] < copied_positions[&end]
+                        {
+                            inherited_conditional_exclusions.push((index, start, end));
+                        }
+                    }
+                }
+            }
+            let previous_copied_region_count = copied_exception_regions.len();
+            // The aliases below close copied regions without copying handler code.
+            // Only labels copied with instructions can redirect an exception target.
+            let copied_handler_labels = copied_labels.clone();
             let trailing_region_ends = self
                 .exception_regions
                 .iter()
@@ -1863,7 +2638,7 @@ impl OptimizationPipeline {
                     Some(ExceptionRegion {
                         start,
                         end: *copied_labels.get(&region.end)?,
-                        target: copied_labels
+                        target: copied_handler_labels
                             .get(&region.target)
                             .copied()
                             .unwrap_or(region.target),
@@ -1874,7 +2649,44 @@ impl OptimizationPipeline {
                     })
                 },
             ));
-            if preserve_inlined_jump_nop {
+            // When this copy creates a protected fragment, that fragment needs its own
+            // owner projection. Keep that separate path unchanged; a bare copied exit has
+            // no new region and can inherit the existing enclosing-region holes directly.
+            if copied_exception_regions.len() == previous_copied_region_count {
+                for (index, start, end) in inherited_conditional_exclusions {
+                    copied_region_exclusions[index].push((start, end));
+                }
+            }
+            if planned_copy || generic_original_copy {
+                // Keep the original jump slot until the ordinary NOP-removal pass.
+                // Its existing successor label provides identity without another IR item.
+                self.exception_owner_provenance
+                    .normal_try_copy_jump_nop_successors
+                    .insert(copied_label);
+                planned_inline_labels.extend(copied_labels.values().copied());
+                let position = graph[source]
+                    .items()
+                    .iter()
+                    .rposition(|item| matches!(item, Item::Instruction(_)))
+                    .expect("planned source jump");
+                let original = *graph[source]
+                    .last_instruction()
+                    .expect("planned source jump");
+                let mut marker = Instruction::synthetic(
+                    NOP,
+                    Operand::Value(0),
+                    original.location,
+                    original.depth_after(),
+                );
+                marker.set_exception_policy(original.exception_policy());
+                if !planned_copy {
+                    marker.add_pre_fold_extra_instructions(original.pre_fold_extra_instructions());
+                }
+                graph.insert_item(
+                    ItemPosition::new(source, position),
+                    Item::Instruction(marker),
+                );
+            } else if preserve_inlined_jump_nop {
                 let position = copied
                     .iter()
                     .position(|item| matches!(item, Item::Instruction(_)))
@@ -1890,6 +2702,7 @@ impl OptimizationPipeline {
                 );
             }
             if inline_unprotected_return
+                && !planned_copy
                 && let Some(instruction) = copied.iter_mut().find_map(|item| match item {
                     Item::Instruction(instruction) => Some(instruction),
                     Item::Label(_) => None,
@@ -1903,6 +2716,17 @@ impl OptimizationPipeline {
                 instruction.add_pre_fold_extra_instructions(
                     u8::from(!preserve_inlined_jump_nop).saturating_add(jump_extra),
                 );
+            }
+            if let Some(instruction) = copied.iter_mut().find_map(|item| match item {
+                Item::Instruction(instruction) => Some(instruction),
+                Item::Label(_) => None,
+            }) && instruction
+                .no_location_policy
+                .copy_inherits_shared_predecessor()
+            {
+                // The original shared cleanup can stay unlocated while its copies inherit
+                // their own predecessor, as CPython resolves each copied exit separately.
+                instruction.no_location_policy.clear_preserved_location();
             }
             let inherit_copied_locations = copied
                 .iter()
@@ -1937,7 +2761,7 @@ impl OptimizationPipeline {
                             }))
                         && !instruction.no_location_policy.preserves_location()
                 });
-            if inherit_copied_locations {
+            if inherit_copied_locations && !planned_copy {
                 // Exception boundaries split the IR into blocks after CPython has already treated
                 // the synthetic cleanup as one source-less exit. Every copied split therefore
                 // inherits the same predecessor location as the entry block.
@@ -2109,7 +2933,7 @@ impl OptimizationPipeline {
                         .nth(1)
                         .filter(|(_, opcode)| *opcode == NOP)
                         .map(|(position, _)| position);
-                    if let Some(position) = trailing_nop_position {
+                    if !planned_copy && let Some(position) = trailing_nop_position {
                         whole_copy_exclusion_start = Label(self.next_label);
                         self.next_label += 1;
                         graph.insert_label(source, position, whole_copy_exclusion_start);
@@ -2129,6 +2953,27 @@ impl OptimizationPipeline {
                     }
                 }
             }
+            if inline_no_location_block
+                && target_pre_fusion_size == 1
+                && target_terminal_opcode == Some(JUMP_BACKWARD)
+                && let Some(original) = graph[source].last_instruction().filter(|instruction| {
+                    instruction.jump_policy.is_normalized_conditional_backedge()
+                })
+            {
+                // This edge already represents CPython's late backward-conditional expansion.
+                // Replacing its bridge with the original backedge must retain the fresh slot
+                // owner policy; ordinary predecessors still copy the original owned jump.
+                for item in &mut copied {
+                    if let Item::Instruction(instruction) = item {
+                        instruction.set_exception_policy(original.exception_policy());
+                        instruction
+                            .jump_policy
+                            .mark_normalized_conditional_backedge();
+                    }
+                }
+            }
+            // Later rounds can copy arrays containing an earlier cloned POP_BLOCK.
+            original_pop_ranges.extend(copied_pop_ranges);
             // CPython copies a direct local return through the first branch before revisiting an
             // optimized tuple guard in that branch. The guard is already earlier in block order,
             // so honor the compiler's narrow marker when this source is exactly STORE/LOAD/RETURN.
@@ -2209,6 +3054,16 @@ impl OptimizationPipeline {
                 }
             }
             if inline_small_exit || inline_no_location_block {
+                if inline_small_exit
+                    && !target_has_no_location
+                    && copied.iter().any(|item| {
+                        matches!(item, Item::Instruction(instruction) if instruction.location.line >= 0)
+                    })
+                {
+                    // Exit duplication classifies the block after unconditional inlining.
+                    // A located exit replaces the old unlocated eval-check jump.
+                    exit_without_unique_predecessor[source.index()] = false;
+                }
                 // Inlining replaces the original ordinary jump, even when the copied block
                 // also starts with a jump. That replacement cannot thread its predecessors.
                 self.conditional_threading_targets
@@ -2232,7 +3087,12 @@ impl OptimizationPipeline {
                     graph.remove_item_at(source, position);
                 }
             } else if let Some(instruction) = graph.instructions_mut(source).next_back() {
+                let original = *instruction;
                 instruction.retarget(Operand::Forward(copied_label));
+                if is_conditional_jump(original.opcode) {
+                    // Copying the target leaves this original conditional array intact.
+                    owner_retargets.push((original, *instruction));
+                }
             }
             // CPython appends a small, unprotected exit to its predecessor before inserting
             // superinstructions. A tuple/call or attribute store followed by a direct name
@@ -2270,14 +3130,46 @@ impl OptimizationPipeline {
                             || (!membership.contains(&positions[source.index()])
                                 && !membership.contains(&positions[target.index()]))
                     });
-            if inline_borrowed_tuple_exit {
+            // A newly copied, unprotected straight-line exit has no native block boundary at
+            // this seam. Admit its local pair through the same predicate used by the fuser;
+            // the following operation does not determine whether CPython combines the loads.
+            // Keep all existing copying paths unchanged, and decline any exception-bearing
+            // unit or copy with another label or branch that could observe the entry offset.
+            let inline_unprotected_local_pair = inline_small_exit
+                && self.exception_regions.is_empty()
+                && copied_exception_regions.is_empty()
+                && copied_region_exclusions.iter().all(Vec::is_empty)
+                && self.borrow_finally_jump_sources.is_empty()
+                && !self.preserved_block_boundaries.contains(&copied_label)
+                && !self
+                    .exception_owner_provenance
+                    .block_boundaries
+                    .contains(&copied_label)
+                && copied.split_first().is_some_and(|(entry, tail)| {
+                    matches!(entry, Item::Label(label) if *label == copied_label)
+                        && tail.iter().all(|item| {
+                            matches!(item, Item::Instruction(instruction)
+                                if matches!(instruction.operand(), Operand::Value(_)))
+                        })
+                        && graph[source].last_instruction().is_some_and(|first| {
+                            let Some(Item::Instruction(second)) = tail.first() else {
+                                return false;
+                            };
+                            first.opcode == LOAD_FAST
+                                && second.opcode == LOAD_FAST
+                                && first.exception_policy() == ExceptionPolicy::default()
+                                && second.exception_policy() == ExceptionPolicy::default()
+                                && super::locals::fuse_pair(first, second).is_some()
+                        })
+                });
+            if inline_borrowed_tuple_exit || inline_unprotected_local_pair {
                 let first_instruction = copied
                     .iter()
                     .position(|item| matches!(item, Item::Instruction(_)))
                     .unwrap_or(copied.len());
                 copied.drain(..first_instruction);
                 graph.append_to_block(source, copied);
-            } else if inline_no_location_block || inline_unprotected_return {
+            } else if inline_no_location_block || inline_unprotected_return || planned_copy {
                 let copied_jump_target =
                     block_jump_target(&copied).and_then(|label| graph.label_block(label));
                 graph.append_to_block(source, copied);
@@ -2286,7 +3178,9 @@ impl OptimizationPipeline {
                         !matches!(item, Item::Instruction(instruction) if instruction.location.line >= 0)
                     }) && graph[source]
                         .last_instruction()
-                        .is_some_and(|instruction| ends_scope(instruction.opcode));
+                        .is_some_and(|instruction| {
+                            ends_scope(instruction.opcode) || has_jump_eval_check(instruction)
+                        });
                     exit_without_unique_predecessor[source.index()] |=
                         remaining_predecessors[source.index()] > 1 && unlocated_scope_exit;
                 }
@@ -2304,11 +3198,14 @@ impl OptimizationPipeline {
                 }
                 // CPython repeats block inlining to a fixed point. A copied cleanup can end
                 // in another jump, so revisit this source before its earlier predecessors.
-                sources.push(source);
+                if !planned_copy {
+                    sources.push(source);
+                }
                 // A completed return also makes earlier predecessors eligible for a small
                 // exit copy. Revisit them before beginning conditional exit duplication.
                 for predecessor in jump_sources[source.index()].iter().copied() {
-                    if positions[predecessor.index()] < source_position
+                    if !planned_copy
+                        && positions[predecessor.index()] < source_position
                         && block_jump_target(graph[predecessor].items())
                             .and_then(|label| graph.label_block(label))
                             == Some(source)
@@ -2317,6 +3214,24 @@ impl OptimizationPipeline {
                     }
                 }
             } else if source_has_fallthrough {
+                // Conditional threading follows exit copying in CPython. A copied original
+                // case jump retains the same threading certificate as its source label.
+                for item in target_blocks.iter().flat_map(|block| graph[*block].items()) {
+                    if let Item::Label(original) = item
+                        && let Some(&location) = self.conditional_threading_targets.get(original)
+                        && let Some(replacement) = copied_labels.get(original)
+                    {
+                        self.conditional_threading_targets
+                            .insert(*replacement, location);
+                    }
+                }
+                if let Some(location) = graph[target].items().iter().find_map(|item| match item {
+                    Item::Label(label) => self.conditional_threading_targets.get(label).copied(),
+                    Item::Instruction(_) => None,
+                }) {
+                    self.conditional_threading_targets
+                        .insert(copied_label, location);
+                }
                 for item in target_blocks.iter().flat_map(|block| graph[*block].items()) {
                     if let Item::Label(original) = item
                         && self.original_jump_head_targets.contains(original)
@@ -2330,7 +3245,12 @@ impl OptimizationPipeline {
                 }) {
                     self.original_jump_head_targets.insert(copied_label);
                 }
-                target_copies.entry(target).or_default().push(copied);
+                // Exception-region labels can split one original cleanup array. Insert its
+                // copies after the whole array so the original still reaches its own jump.
+                if target != target_exit && target_has_unlocated_jump_eval_check {
+                    copied_split_eval_starts.insert(target_exit, target_position);
+                }
+                target_copies.entry(target_exit).or_default().push(copied);
             } else {
                 inline_copies.entry(source).or_default().push(copied);
             }
@@ -2348,8 +3268,22 @@ impl OptimizationPipeline {
             // later cleanup block. Apply the resulting holes in final emission order; treating
             // discovery order as source order can extend an enclosing handler across the next
             // copied cleanup in a nested unwind chain.
-            let label_positions = graph
-                .iter_items()
+            let label_positions = order
+                .iter()
+                .flat_map(|block| {
+                    graph[*block]
+                        .items()
+                        .iter()
+                        .chain(inline_copies.get(block).into_iter().flatten().flatten())
+                        .chain(
+                            target_copies
+                                .get(block)
+                                .into_iter()
+                                .flatten()
+                                .rev()
+                                .flatten(),
+                        )
+                })
                 .enumerate()
                 .filter_map(|(position, item)| match item {
                     Item::Label(label) => Some((*label, position)),
@@ -2544,6 +3478,33 @@ impl OptimizationPipeline {
                 first.location = location;
                 continue;
             }
+            if remaining_predecessors[target.index()] == 1
+                && predecessors[target.index()] > 1
+                && let Some(instruction) = graph.instructions_mut(target).next()
+                && instruction
+                    .no_location_policy
+                    .copy_inherits_shared_predecessor()
+            {
+                // Duplicating another incoming edge also gives the original cleanup a
+                // unique predecessor; it follows the same location rule as the copies.
+                instruction.no_location_policy.clear_preserved_location();
+            }
+            if remaining_predecessors[target.index()] == 1
+                && predecessors[target.index()] > 1
+                && graph[target]
+                    .items()
+                    .iter()
+                    .take_while(|item| matches!(item, Item::Label(_)))
+                    .any(|item| {
+                        matches!(item, Item::Label(label) if self.shared_jump_copy_location_blocks.contains(label))
+                    })
+                && let Some(instruction) = graph.instructions_mut(target).next()
+                && has_jump_eval_check(instruction)
+            {
+                // A shared original jump becomes a private eval-check exit after its other
+                // predecessors receive copies. Resolve its remaining predecessor's line too.
+                instruction.no_location_policy.clear_preserved_location();
+            }
             let copied_exit_needs_location = remaining_predecessors[target.index()] == 1
                 && (predecessors[target.index()] > 1
                     || retained_unlocated_join_blocks.contains(&target))
@@ -2591,6 +3552,27 @@ impl OptimizationPipeline {
                 })
             };
             let Some(location) = predecessor.and_then(|source| {
+                if let Some(&start) = copied_split_eval_starts.get(&target)
+                    && remaining_predecessors[target.index()] == 1
+                    && positions[source.index()] + 1 == target_position
+                {
+                    // The original cleanup's prefix now has its predecessor's location,
+                    // but within-block propagation runs later. Cross only the table splits
+                    // already validated when copying this same unlocated eval-check array.
+                    return order[start..target_position]
+                        .iter()
+                        .flat_map(|block| graph[*block].items())
+                        .rev()
+                        .find_map(|item| match item {
+                            Item::Instruction(instruction)
+                                if instruction.location.line >= 0
+                                    || instruction.no_location_policy.preserves_location() =>
+                            {
+                                Some(instruction.location)
+                            }
+                            _ => None,
+                        });
+                }
                 graph[source]
                     .last_instruction()
                     .map(|instruction| instruction.location)
@@ -2689,10 +3671,14 @@ impl OptimizationPipeline {
             let first_added = final_order.len();
             if drop_blocks[block.index()] {
                 for item in graph[block].items() {
-                    if let Item::Label(label) = item
-                        && let Some(mut admissions) = self.discarded_fold_admissions.remove(label)
-                    {
-                        discarded_admissions.append(&mut admissions);
+                    if let Item::Label(label) = item {
+                        // Labels retained without their array cannot certify a later seam.
+                        self.exception_owner_provenance
+                            .normal_try_copy_inline_labels
+                            .remove(label);
+                        if let Some(mut admissions) = self.discarded_fold_admissions.remove(label) {
+                            discarded_admissions.append(&mut admissions);
+                        }
                     }
                 }
             }
@@ -2744,6 +3730,27 @@ impl OptimizationPipeline {
             &shared_pop_block_heads,
             &copied_pop_block_heads,
         );
+        restore_retained_pop_block_locations(
+            graph,
+            &self.exception_regions,
+            &self.preserved_block_boundaries,
+            &self.retained_pop_block_origins,
+        );
+        restore_normal_try_pop_holes(graph, &mut self.exception_regions, &original_pop_ranges);
+        if generic_original_arrays {
+            let handler_entries = self
+                .exception_regions
+                .iter()
+                .map(|region| region.target)
+                .chain(
+                    self.exception_owner_provenance
+                        .setups
+                        .iter()
+                        .map(|(label, _)| *label),
+                )
+                .collect();
+            propagate_normal_try_pop_continuations(graph, &original_pop_ranges, &handler_entries);
+        }
         copied_entry_labels
     }
 }
@@ -2782,6 +3789,175 @@ mod copied_pop_block_location_tests {
         };
         instruction.fusion_policy.mark_converted_pop_block();
         Item::Instruction(instruction)
+    }
+
+    fn retained_head() -> Item {
+        let Item::Instruction(mut instruction) = head() else {
+            unreachable!()
+        };
+        instruction.jump_policy.preserve_explicit_nop();
+        instruction.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS);
+        Item::Instruction(instruction)
+    }
+
+    fn check_retained(
+        items: Vec<Item>,
+        regions: &[ExceptionRegion],
+        entry: Label,
+        prefix: Vec<Label>,
+        expected_line: Option<i32>,
+    ) {
+        let boundaries = items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Label(label) => Some(*label),
+                Item::Instruction(_) => None,
+            })
+            .collect::<FxHashSet<_>>();
+        let mut actual = BlockGraph::from_items(items.clone(), &boundaries);
+        let mut expected = BlockGraph::from_items(items, &boundaries);
+        if let Some(line) = expected_line {
+            let target = expected.label_block(entry).unwrap();
+            expected.instructions_mut(target).next().unwrap().location =
+                SourceLocation::new(line, line, 12, 17);
+        }
+        restore_retained_pop_block_locations(
+            &mut actual,
+            regions,
+            &boundaries,
+            &[(entry, prefix)].into_iter().collect(),
+        );
+        assert_eq!(
+            format!("{:?}", actual.iter_items().collect::<Vec<_>>()),
+            format!("{:?}", expected.iter_items().collect::<Vec<_>>()),
+        );
+    }
+
+    #[test]
+    fn normal_try_pop_continuations_require_a_live_original_slot() {
+        for (empty, entered) in [(false, false), (true, false), (false, true)] {
+            let start = Label(1);
+            let end = Label(2);
+            let target = Label(3);
+            let Item::Instruction(mut pop) = head() else {
+                unreachable!();
+            };
+            pop.location = SourceLocation::new(7, 7, 12, 17);
+            let mut items = Vec::new();
+            if !empty {
+                items.push(Item::Label(start));
+            }
+            items.push(Item::Instruction(pop));
+            if empty {
+                items.push(Item::Label(start));
+            }
+            items.extend([
+                Item::Label(end),
+                jump(target),
+                Item::Label(target),
+                located(9),
+            ]);
+            let mut graph = BlockGraph::from_items(items, &FxHashSet::default());
+            let forbidden = if entered {
+                [end].into_iter().collect()
+            } else {
+                FxHashSet::default()
+            };
+            propagate_normal_try_pop_continuations(&mut graph, &[(start, end)], &forbidden);
+            let jump = graph
+                .iter_items()
+                .find_map(|item| match item {
+                    Item::Instruction(instruction) if instruction.opcode == JUMP_FORWARD => {
+                        Some(instruction)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(jump.location.line, if !empty && !entered { 7 } else { -1 });
+        }
+    }
+
+    #[test]
+    fn retained_pop_block_uses_only_its_original_empty_prefix() {
+        for empty_count in [1, 3] {
+            for omit_origin in [false, true] {
+                let entry = Label(empty_count + 1);
+                let mut items = vec![
+                    Item::Label(Label(0)),
+                    instruction(JUMP_FORWARD, Operand::Forward(Label(1)), 8),
+                ];
+                items.extend((1..=empty_count).map(|index| Item::Label(Label(index))));
+                items.extend([
+                    Item::Label(entry),
+                    retained_head(),
+                    located(20),
+                    instruction(RETURN_VALUE, Operand::Value(0), 20),
+                ]);
+                let prefix = ((if omit_origin { 2 } else { 1 })..=empty_count + 1)
+                    .map(Label)
+                    .collect();
+                check_retained(items, &[], entry, prefix, (!omit_origin).then_some(8));
+            }
+        }
+    }
+
+    #[test]
+    fn retained_pop_block_rejects_a_shared_empty_predecessor() {
+        let empty = Label(2);
+        let entry = Label(3);
+        check_retained(
+            vec![
+                Item::Label(Label(0)),
+                instruction(LOAD_FAST, Operand::Value(0), 1),
+                instruction(POP_JUMP_IF_FALSE, Operand::Forward(empty), 1),
+                Item::Label(Label(1)),
+                instruction(JUMP_FORWARD, Operand::Forward(empty), 8),
+                Item::Label(empty),
+                Item::Label(entry),
+                retained_head(),
+                located(20),
+                instruction(RETURN_VALUE, Operand::Value(0), 20),
+            ],
+            &[],
+            entry,
+            vec![empty, entry],
+            None,
+        );
+    }
+
+    #[test]
+    fn retained_pop_block_rejects_handler_and_unlocated_donors() {
+        for handler in [false, true] {
+            let empty = Label(1);
+            let entry = Label(2);
+            let end = Label(3);
+            let regions = if handler {
+                vec![region(Label(0), end, empty)]
+            } else {
+                Vec::new()
+            };
+            check_retained(
+                vec![
+                    Item::Label(Label(0)),
+                    located(8),
+                    instruction(
+                        JUMP_FORWARD,
+                        Operand::Forward(empty),
+                        if handler { 8 } else { -1 },
+                    ),
+                    Item::Label(empty),
+                    Item::Label(entry),
+                    retained_head(),
+                    located(20),
+                    instruction(RETURN_VALUE, Operand::Value(0), 20),
+                    Item::Label(end),
+                ],
+                &regions,
+                entry,
+                vec![empty, entry],
+                None,
+            );
+        }
     }
 
     fn region(start: Label, end: Label, target: Label) -> ExceptionRegion {

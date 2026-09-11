@@ -8,18 +8,33 @@ use super::super::{
     UNARY_NOT, UNPACK_SEQUENCE, UnoptimizedCode, ends_scope, is_unconditional_jump,
 };
 use crate::CompileError;
+use crate::assembler::ConstantTable;
+use crate::assembler::block_graph::ItemMut;
 use crate::target::opcodes::{POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE};
 use crate::target::operands::ComparisonOperation;
 
 use super::control_flow::clear_redundant_boolean_nop_location;
 use super::control_flow::redundant_copy_pop_indices;
+use super::control_flow::remove_none_comparison_boolean_conversions;
 use super::locals::optimize_linear_assertion_load_fast;
 
-fn optimize_boolean_conversions_and_redundant_stores(items: &mut [Item]) {
+fn optimize_boolean_conversions_and_redundant_stores(
+    items: &mut [Item],
+    constants: Option<&dyn ConstantTable>,
+) {
     let was_boolean_conversion = items
         .iter()
         .map(|item| matches!(item, Item::Instruction(instruction) if matches!(instruction.opcode, TO_BOOL | UNARY_NOT)))
         .collect::<Vec<_>>();
+    if let Some(constants) = constants {
+        remove_none_comparison_boolean_conversions(
+            items.iter_mut().map(|item| match item {
+                Item::Instruction(instruction) => ItemMut::Instruction(instruction),
+                Item::Label(_) => ItemMut::Label,
+            }),
+            constants,
+        );
+    }
     for index in 0..items.len().saturating_sub(1) {
         let (before, after) = items.split_at_mut(index + 1);
         let (Item::Instruction(current), Item::Instruction(next)) =
@@ -398,11 +413,12 @@ impl Assembler {
         self,
         local_count: usize,
         parameter_count: usize,
+        constants: Option<&dyn ConstantTable>,
     ) -> Result<LayoutAssembler, CompileError> {
         let UnoptimizedCode::Linear(mut items) = self.code else {
             unreachable!("linear assertion optimizer requires linear instructions");
         };
-        optimize_boolean_conversions_and_redundant_stores(&mut items);
+        optimize_boolean_conversions_and_redundant_stores(&mut items, constants);
         #[cfg(any(test, debug_assertions))]
         super::validate_structure(
             &items,

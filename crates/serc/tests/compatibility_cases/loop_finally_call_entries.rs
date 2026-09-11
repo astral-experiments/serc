@@ -88,3 +88,75 @@ fn matches_cpython_borrows_after_copied_async_manager_exits() {
         }
     }
 }
+
+#[test]
+fn matches_cpython_finally_borrows_after_prefixed_breaks() {
+    for (name, condition, prefix) in [
+        ("call", "True", "record()"),
+        ("assignment", "True", "value = 1"),
+        ("runtime_condition", "running()", "record()"),
+        ("standalone", "True", ""),
+    ] {
+        let source = format!(
+            r"async def f(manager, env):
+    async with manager:
+        try:
+            while {condition}:
+                if stop():
+                    {prefix}
+                    break
+                await work()
+        except Error:
+            report()
+        finally:
+            await env.close()
+"
+        );
+        common::assert_matches_cpython_marshal(
+            &source,
+            &format!("prefixed_break_finally_{name}.py"),
+        );
+    }
+}
+
+#[test]
+fn matches_cpython_nested_setup_finally_break_entries() {
+    let source = r"def f(queue, close, done):
+    try:
+        while True:
+            item = queue.get()
+            if item is None:
+                break
+            work(item)
+    except Error as exc:
+        report(exc)
+    finally:
+        try:
+            close()
+        finally:
+            done()
+";
+    for (name, source) in [
+        ("typed_handler", source.to_owned()),
+        (
+            "following_condition",
+            source.replace(
+                "            work(item)",
+                "            if ready():\n                prepare()\n            work(item)",
+            ),
+        ),
+        (
+            "same_line_setup",
+            source.replace("        try:\n            close()", "        try: close()"),
+        ),
+        (
+            "prefixed_break",
+            source.replace(
+                "                break",
+                "                report()\n                break",
+            ),
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(&source, &format!("nested_setup_finally_{name}.py"));
+    }
+}

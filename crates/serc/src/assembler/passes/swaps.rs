@@ -1,6 +1,9 @@
 use rustc_hash::FxHashSet;
 
-use super::super::{Instruction, Item, NOP, Operand, POP_TOP, STORE_FAST, SWAP, ends_scope};
+use super::super::{
+    Instruction, Item, NOP, Operand, POP_TOP, STORE_FAST, SWAP, ends_scope,
+    single_capture_cleanup_vacancies,
+};
 use crate::assembler::OptimizationPipeline;
 use crate::assembler::block_graph::{BlockGraph, ItemPosition};
 
@@ -31,9 +34,14 @@ impl OptimizationPipeline {
                     && instructions[index + 1..]
                         .get(..pop_count)
                         .is_some_and(|following| {
-                            following
-                                .iter()
-                                .all(|(_, instruction)| instruction.opcode == POP_TOP)
+                            // CPython cannot fold a rotation across distinct line events.
+                            let line = following
+                                .first()
+                                .map_or(-1, |(_, instruction)| instruction.location.line);
+                            following.iter().all(|(_, instruction)| {
+                                instruction.opcode == POP_TOP
+                                    && (line < 0 || instruction.location.line == line)
+                            })
                         })
             } else {
                 false
@@ -267,10 +275,20 @@ impl OptimizationPipeline {
                 };
                 let first_store = stored_local(&first_instruction);
                 let last_store = stored_local(&last_instruction);
-                // CPython sees locationless cleanup pops at this stage and
-                // therefore does not move a traced pop across them.
                 if first_store.is_none() && last_store.is_none() {
-                    continue;
+                    // A complete conditional-fallthrough capture rotation proves both pop
+                    // records are identical and its compacted-slot count is known at emission.
+                    let rotation = index
+                        .checked_sub(2)
+                        .and_then(|start| positions.get(start..index + 4))
+                        .map(|positions| {
+                            std::array::from_fn::<_, 6, _>(|index| *graph.item(positions[index]))
+                        });
+                    if !rotation.as_ref().is_some_and(|rotation| {
+                        single_capture_cleanup_vacancies(rotation).is_some()
+                    }) {
+                        continue;
+                    }
                 }
                 if first_store.is_some() || last_store.is_some() {
                     if first_store == last_store

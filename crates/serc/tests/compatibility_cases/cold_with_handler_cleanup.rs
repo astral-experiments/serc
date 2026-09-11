@@ -139,3 +139,50 @@ fn matches_cpython_nested_handler_pop_preserves_intervening_manager() {
         common::assert_matches_cpython_marshal(&source, "nested_handler_intervening_manager.py");
     }
 }
+
+#[test]
+fn matches_cpython_original_manager_pop_blocks_after_finally() {
+    common::assert_matches_cpython_marshal(
+        r"async def f(manager, items):
+    count = 0
+    with manager:
+        try:
+            async for item in items:
+                count += 1
+                yield item
+        finally:
+            report(count)
+",
+        "1814_async_for_finally.py",
+    );
+    common::assert_matches_cpython_marshal(
+        r"def f(manager, first, second):
+    with manager:
+        try:
+            prepare()
+            with first, second:
+                yield
+        finally:
+            try:
+                flush()
+                flush_other()
+            except Error:
+                pass
+            try:
+                restore()
+            finally:
+                close()
+",
+        "1688_nested_finally.py",
+    );
+    common::assert_matches_cpython_marshal(
+        r"def f(manager):
+    with manager:
+        try:
+            work()
+        finally:
+            close()
+",
+        "manager_pop_simple_control.py",
+    );
+}

@@ -4,6 +4,7 @@ mod async_comprehension_assignment_exit_locations;
 mod async_comprehension_restoration;
 mod async_with_literal_return_owners;
 mod async_with_terminal_condition_owner_compatibility;
+mod authored_pass_join_locations;
 mod boolean_negation_nops;
 mod boolean_value_end_owner_boundary;
 mod branch_expression_name_scopes;
@@ -28,6 +29,7 @@ mod conditional_generator_join_nops;
 mod conditional_handler_cleanup_compatibility;
 mod conditional_handler_cleanup_order;
 mod conditional_handler_none_admission;
+mod conditional_value_boolean_continuation;
 mod constant_assertion_exit_slots;
 mod constant_condition_admission;
 mod constant_false_comprehension_filters;
@@ -173,6 +175,8 @@ mod non_final_loop_branch_assert_location_compatibility;
 mod non_final_try_loop_backedges;
 mod normal_finally_join_owners;
 mod normal_finally_with_exit_owner;
+mod normal_handler_cleanup_copies;
+mod normal_try_loop_tail_owners;
 mod optimized_generator_loop_dispatch_owners;
 mod optimized_tuple_guard_owner_compatibility;
 mod ordinary_condition_owner_slots;
@@ -234,6 +238,7 @@ mod try_tail_iterator_pass_handler_compatibility;
 mod tuple_unpack_owner_slots;
 mod typed_handler_entry_owner_boundary;
 mod unfiltered_comprehension_none_condition_owner_compatibility;
+mod unlocated_handler_join;
 mod unreachable_literal_order;
 mod unreachable_plain_call_kw_constant_compatibility;
 mod unreachable_suspension_ellipsis_compatibility;
@@ -295,6 +300,7 @@ mod handler_exit_width_owners;
 mod loop_match_exit_locations;
 mod nested_match_exit_locations;
 mod removed_assertion_borrow_boundaries;
+mod terminal_nested_match_returns;
 mod tuple_exit_superinstructions;
 
 mod loop_exit_borrow_entries;
@@ -366,7 +372,53 @@ mod shared_try_exit_nops;
 
 mod manager_try_borrow_successors;
 
+mod try_except_omitted_for_backedges;
+mod try_except_shared_exit_borrows;
+
 mod match_failure_loop_exit_locations;
 
+mod computed_return_try_unwind_markers;
+mod conditional_manager_suppression_join;
 mod match_canceled_rotation_nop_lines;
 mod match_none_capture_swap_locations;
+
+mod retained_setup_null_slot;
+
+mod assert_success_finally_location;
+mod comprehension_restore_copy_boundary;
+mod folded_condition_borrow_boundary;
+mod terminal_assert_await_finally_nop;
+
+mod for_iter_original_cleanup;
+
+mod percent_format_pre_fusion_locations;
+mod retained_finally_nop_entries;
+
+mod handler_shared_exit_locations;
+
+mod normal_try_original_line_events;
+
+mod backward_conditionals_after_cold_blocks;
+
+mod dynamic_while_break_cleanup;
+
+mod copied_region_end_handlers;
+
+mod copied_return_exclusions;
+
+mod nt_missing_finally_reductions;
+mod nt_owner_family_reductions;
+
+mod copied_handler_cleanup_locations;
+mod folded_false_borrow_edges;
+mod nop_producer_owner_compatibility;
+
+mod specialized_none_terminal_owners;
+
+mod assertion_success_shared_finally;
+
+mod retained_pop_none_owners;
+
+mod protected_nested_try_loop_exit;
+
+mod ordinary_named_return_owner_slots;

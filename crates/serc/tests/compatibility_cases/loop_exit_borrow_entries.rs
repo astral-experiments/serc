@@ -232,3 +232,158 @@ fn protected_async_backedges_keep_surviving_conditional_breaks() {
         }
     }
 }
+
+#[test]
+fn protected_async_conditional_tail_break_keeps_following_loads_owned() {
+    let source = r"async def f(items, client, count):
+    try:
+        async for item in items:
+            consume(item)
+            count += 1
+            if count >= 10:
+                break
+        if count == 0:
+            consume(count)
+    finally:
+        await client.close()
+";
+    common::assert_matches_cpython_marshal(source, "async_conditional_tail_break.py");
+}
+
+#[test]
+fn protected_async_conditional_tail_break_with_work_keeps_cleanup_owned() {
+    let source = r"async def f(items, client):
+    try:
+        async for item in items:
+            if item.ready:
+                consume(item)
+            if item.done:
+                consume(item)
+                break
+    finally:
+        await client.close()
+";
+    common::assert_matches_cpython_marshal(source, "async_conditional_tail_break_work.py");
+}
+
+#[test]
+fn protected_async_conditional_break_before_work_keeps_live_cleanup() {
+    let source = r"async def f(items, client, flag):
+    try:
+        async for item in items:
+            if flag:
+                break
+            consume(item)
+    finally:
+        await client.close()
+";
+    common::assert_matches_cpython_marshal(source, "async_conditional_break_before_work.py");
+}
+
+#[test]
+fn protected_async_conditional_break_with_else_keeps_live_cleanup() {
+    let source = r"async def f(items, client, flag):
+    try:
+        async for item in items:
+            if flag:
+                break
+            else:
+                consume(item)
+    finally:
+        await client.close()
+";
+    common::assert_matches_cpython_marshal(source, "async_conditional_break_with_else.py");
+}
+
+#[test]
+fn named_guard_with_linear_recovery() {
+    common::assert_matches_cpython_marshal(
+        r"def f(value, local):
+    try:
+        result = work(value)
+    except Error as error:
+        if local:
+            raise error
+        report(error)
+        result = []
+    finally:
+        if not local:
+            sync()
+            finish()
+    return result
+",
+        "named_guard_linear_recovery.py",
+    );
+}
+
+#[test]
+fn named_guard_with_protected_for() {
+    common::assert_matches_cpython_marshal(
+        r"def f(items, local):
+    try:
+        for item in items:
+            result = work(item)
+    except Error as error:
+        if local:
+            raise error
+        report(error)
+        result = []
+    finally:
+        if not local:
+            sync()
+            finish()
+    return result
+",
+        "named_guard_protected_for.py",
+    );
+}
+
+#[test]
+fn borrows_after_async_manager_break_recovery() {
+    let source = r"async def f(manager, work, value):
+    processed = False
+    while True:
+        try:
+            with manager as item:
+                if item is None:
+                    break
+                processed = True
+                await work(item)
+        except Error as exc:
+            if isinstance(exc, Stop):
+                raise
+            await backoff(value)
+            break
+    if not processed:
+        await backoff(value)
+";
+    common::assert_matches_cpython_marshal(source, "async_manager_break_recovery.py");
+}
+
+#[test]
+fn borrows_after_nested_async_manager_break_recovery() {
+    let source = r"async def f(manager, work, value):
+    while True:
+        try:
+            processed = False
+            while True:
+                try:
+                    with manager as item:
+                        if item is None:
+                            break
+                        processed = True
+                        await work(item)
+                except Error as exc:
+                    if isinstance(exc, Stop):
+                        raise
+                    await backoff(value)
+                    break
+            if not processed:
+                await backoff(value)
+        except Stop:
+            raise
+        except Error:
+            await backoff(value)
+";
+    common::assert_matches_cpython_marshal(source, "nested_async_manager_break_recovery.py");
+}

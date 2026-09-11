@@ -412,3 +412,81 @@ print(" ".join(
         common::assert_executes(&source, expected);
     }
 }
+
+#[test]
+fn matches_cpython_finally_borrows_after_try_star_original_empty_exits() {
+    for body in [
+        "work(value)",
+        "with manager:\n            work(value)",
+        "async with manager:\n            await work(value)",
+    ] {
+        for successor in [
+            "consume(value)\n    consume(other)",
+            "return value",
+            "return None",
+        ] {
+            let source = format!(
+                "async def f(value, other, manager):\n    try:\n        {body}\n    except* Error:\n        recover(other)\n    {successor}\n"
+            );
+            common::assert_matches_cpython_marshal(&source, "try_star_normal_exit_borrows.py");
+        }
+        for orelse in ["", "    else:\n        consume(value)\n"] {
+            let source = format!(
+                "async def f(value, other, manager):\n    try:\n        {body}\n    except* Error:\n        recover(other)\n{orelse}    if value:\n        consume(other)\n    consume(value)\n"
+            );
+            common::assert_matches_cpython_marshal(&source, "try_star_else_exit_borrows.py");
+        }
+        let nested_body = body.replace('\n', "\n    ");
+        let source = format!(
+            "async def f(value, other, manager, flag):\n    try:\n        try:\n            {nested_body}\n        except* Error:\n            recover(other)\n        if flag:\n            work(value)\n        elif other:\n            work(other)\n    except Error:\n        raise\n    finally:\n        if value:\n            consume(value)\n        consume(other)\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "try_star_outer_finally_borrows.py");
+    }
+}
+
+#[test]
+fn matches_cpython_finally_borrows_after_authored_loop_breaks() {
+    for (prefix, suspend) in [("", ""), ("async ", "await ")] {
+        let source = format!(
+            r#"{prefix}def probe(resource, stream, active):
+    try:
+        prepare()
+        while True:
+            try:
+                {suspend}stream.read()
+            except Exception as error:
+                report(error)
+            if active():
+                break
+            {suspend}stream.write()
+    except Exception as error:
+        report(error)
+    finally:
+        report("closing")
+        {suspend}resource.close()
+"#
+        );
+        common::assert_matches_cpython_marshal(&source, "authored_break_finally_borrows.py");
+    }
+}
+
+#[test]
+fn matches_cpython_finally_borrows_after_exception_only_breaks() {
+    let source = r#"async def probe(resource, stream):
+    try:
+        prepare()
+        while True:
+            try:
+                await stream.read()
+            except Exception as error:
+                report(error)
+                break
+            await stream.write()
+    except Exception as error:
+        report(error)
+    finally:
+        report("closing")
+        await resource.close()
+"#;
+    common::assert_matches_cpython_marshal(source, "exception_only_break_finally_borrows.py");
+}

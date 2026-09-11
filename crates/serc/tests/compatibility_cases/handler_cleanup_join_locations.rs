@@ -230,3 +230,76 @@ fn matches_cpython_transitively_copied_handler_exclusions() {
         }
     }
 }
+
+#[test]
+fn linear_nested_handler_cleanup_inside_finally() {
+    let source = r"def f(primary, secondary, observe, cleanup):
+    try:
+        primary()
+    except ValueError:
+        try:
+            secondary()
+            observe()
+        except TypeError:
+            pass
+    finally:
+        cleanup()
+";
+    common::assert_matches_cpython_marshal(
+        source,
+        "linear_nested_handler_cleanup_inside_finally.py",
+    );
+}
+
+#[test]
+fn linear_nested_handler_cleanup_inside_another_handler() {
+    let source = r"def f(primary, secondary, observe):
+    try:
+        primary()
+    except ValueError:
+        try:
+            secondary()
+        except TypeError:
+            try:
+                value = secondary()
+                observe(value)
+            except RuntimeError:
+                pass
+    observe(None)
+";
+    common::assert_matches_cpython_marshal(
+        source,
+        "linear_nested_handler_cleanup_inside_another_handler.py",
+    );
+}
+
+#[test]
+fn linear_nested_handler_else_cleanup() {
+    let source = r"def f(primary, secondary, recover, observe):
+    try:
+        value = primary()
+    except ValueError:
+        try:
+            first = secondary()
+            second = secondary()
+        except TypeError:
+            value = recover()
+        else:
+            value = observe(first, second)
+    return value
+";
+    common::assert_matches_cpython_marshal(source, "linear_nested_handler_else_cleanup.py");
+}
+
+#[test]
+fn copies_named_match_handler_cleanup_before_threading_loop_conditions() {
+    for (definition, invocation) in [
+        ("def", "work(attempt)"),
+        ("async def", "await work(attempt)"),
+    ] {
+        let source = format!(
+            "{definition} retry(attempts, attempt, config):\n    for attempt in attempts:\n        try:\n            return {invocation}\n        except Error as error:\n            record(error)\n            match error.kind:\n                case 'first':\n                    if attempt >= config.retries:\n                        raise\n                case 'second':\n                    if not config.retry or attempt >= config.retries:\n                        raise\n                case _:\n                    raise\n    raise RuntimeError()\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "named_match_handler_loop_cleanup.py");
+    }
+}

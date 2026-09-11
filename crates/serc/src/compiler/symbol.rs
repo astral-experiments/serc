@@ -1822,17 +1822,38 @@ impl Compiler<'_> {
         )
     }
 
+    /// Emits a folded condition's jump without transferring a preceding NOP's location.
+    /// The removed NOP still contributes its original slots and exclusion bookkeeping.
+    pub(super) fn emit_jump_forward_instruction_preserving_location(
+        &mut self,
+        opcode: Opcode,
+        label: Label,
+    ) -> Result<EmittedJump, CompileError> {
+        self.emit_jump_forward_instruction_inner(opcode, label, ExceptionPolicy::default(), true)
+    }
+
     pub(super) fn emit_jump_forward_instruction_with_exception_policy(
         &mut self,
         opcode: Opcode,
         label: Label,
         exception_policy: ExceptionPolicy,
     ) -> Result<EmittedJump, CompileError> {
+        self.emit_jump_forward_instruction_inner(opcode, label, exception_policy, false)
+    }
+
+    /// Shares validated jump emission and NOP compaction between both location policies.
+    fn emit_jump_forward_instruction_inner(
+        &mut self,
+        opcode: Opcode,
+        label: Label,
+        exception_policy: ExceptionPolicy,
+        preserve_location: bool,
+    ) -> Result<EmittedJump, CompileError> {
         self.control.clear_direct_comprehension_assignment_results();
         let removed_nop = is_unconditional_jump(opcode)
             .then(|| self.take_trailing_nop_location())
             .flatten();
-        if let Some((location, _)) = removed_nop {
+        if !preserve_location && let Some((location, _)) = removed_nop {
             self.assembler.set_location(location);
         }
         let effect = required_compiler_stack_effect(opcode, 0)?;

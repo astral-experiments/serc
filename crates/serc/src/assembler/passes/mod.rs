@@ -2,10 +2,11 @@
 use rustc_hash::FxHashMap;
 
 use super::block_graph::BlockGraph;
+use super::fusion_owner_slots::FusionOwnerCertificates;
 use super::layout::{backward_argument, label_position};
 use super::{
-    AssembledCode, Assembler, ConstantTable, Item, Label, LayoutAssembler, Operand,
-    OptimizationPipeline, UnoptimizedCode, extended_arg_count,
+    AssembledCode, Assembler, ConstantTable, Instruction, Item, Label, LayoutAssembler, NOP,
+    Operand, OptimizationPipeline, SourceLocation, UnoptimizedCode, extended_arg_count,
 };
 #[cfg(any(test, debug_assertions))]
 use super::{AssemblerStage, ExceptionRegion};
@@ -16,6 +17,8 @@ mod constants;
 mod control_flow;
 mod linear;
 mod locals;
+mod normal_try_copies;
+mod normal_try_copy_plan;
 mod swaps;
 
 #[cfg(any(test, debug_assertions))]
@@ -189,9 +192,14 @@ impl Assembler {
         constants: Option<&mut dyn ConstantTable>,
     ) -> Result<AssembledCode, CompileError> {
         self.resolve_operand_patches()?;
+        self.resolve_folded_condition_borrow_entries();
         if self.has_only_linear_assertion_side_exits() {
             return self
-                .optimize_linear_assertion_side_exits(local_count, parameter_count)?
+                .optimize_linear_assertion_side_exits(
+                    local_count,
+                    parameter_count,
+                    constants.as_deref(),
+                )?
                 .finish(first_line_number);
         }
         self.into_optimization_pipeline()
@@ -200,6 +208,7 @@ impl Assembler {
     }
 
     pub(in crate::assembler) fn into_optimization_pipeline(mut self) -> OptimizationPipeline {
+        self.resolve_folded_condition_borrow_entries();
         let (graph, initial_reachable) = match self.code {
             UnoptimizedCode::Linear(items) => (
                 BlockGraph::from_items(items, &rustc_hash::FxHashSet::default()),
@@ -242,8 +251,17 @@ impl Assembler {
                     .insert(label);
             }
         }
+        self.exception_owner_provenance
+            .capture_uncompacted_conditional_arrays(
+                &graph.iter_items().copied().collect::<Vec<_>>(),
+            );
         OptimizationPipeline {
             graph,
+            folded_original_predecessor_targets: self
+                .folded_away_condition_targets
+                .union(&self.folded_away_loop_else_targets)
+                .copied()
+                .collect(),
             discarded_fold_admissions: self.discarded_fold_admissions,
             initial_reachable,
             next_label: self.next_label,
@@ -251,6 +269,14 @@ impl Assembler {
             exception_owner_provenance: self.exception_owner_provenance,
             preserved_block_boundaries: self.preserved_block_boundaries,
             borrow_unreachable_blocks: self.borrow_unreachable_blocks,
+            borrow_omitted_for_backedges: self.borrow_omitted_for_backedges,
+            borrow_jump_entry_labels: self.borrow_jump_entry_labels,
+            borrow_pre_copy_jump_entries: rustc_hash::FxHashMap::default(),
+            borrow_threaded_jump_targets: rustc_hash::FxHashMap::default(),
+            borrow_threaded_jump_entries: rustc_hash::FxHashMap::default(),
+            borrow_authored_finally_break_origins:
+                crate::assembler::ir::AuthoredFinallyBreakOrigins::default(),
+            borrow_authored_finally_break_entries: rustc_hash::FxHashMap::default(),
             borrow_loop_exit_blocks: self.borrow_loop_exit_blocks,
             borrow_finally_entries: self.borrow_finally_entries,
             borrow_finally_jump_sources: rustc_hash::FxHashMap::default(),
@@ -259,8 +285,10 @@ impl Assembler {
             original_nop_targets: self.original_nop_targets,
             original_unlocated_cleanup_targets: self.original_unlocated_cleanup_targets,
             original_unlocated_discard_targets: self.original_unlocated_discard_targets,
+            original_shared_unlocated_jump_entries: rustc_hash::FxHashMap::default(),
             original_jump_head_targets: rustc_hash::FxHashSet::default(),
             deferred_shared_jump_blocks: self.deferred_shared_jump_blocks,
+            retained_pop_block_origins: self.retained_pop_block_origins,
             shared_jump_copy_location_blocks: self.shared_jump_copy_location_blocks,
             folded_condition_exit_targets: self.folded_condition_exit_targets,
             has_assertion_side_exit_candidate: self.has_assertion_side_exit_candidate,
@@ -283,25 +311,57 @@ impl OptimizationPipeline {
         parameter_count: usize,
         constants: Option<&mut dyn ConstantTable>,
     ) -> Result<LayoutAssembler, CompileError> {
-        self.record_borrow_cleanup_calls();
+        self.preserve_shared_original_manager_pop_locations();
+        self.record_shared_unlocated_jump_entries();
+        let mut original_owners = FusionOwnerCertificates::capture_original_owners(&self);
+        let retained_finally_origins = self.capture_retained_finally_origins();
+        let setup_finally_origins = self.record_borrow_cleanup_calls_with_setups();
+        original_owners.retain_pipeline(&self);
         self.record_borrow_empty_jump_heads();
+        original_owners.retain_pipeline(&self);
+        if !self.borrow_jump_entry_labels.is_empty() {
+            self.borrow_jump_entry_labels = Self::nonempty_original_borrow_jump_entries(
+                &self.graph,
+                &self.exception_owner_provenance.block_boundaries,
+                &self.borrow_jump_entry_labels,
+            );
+        }
+        original_owners.retain_pipeline(&self);
+        if !self.borrow_jump_entry_labels.is_empty() {
+            self.borrow_threaded_jump_targets = Self::mark_initial_borrow_jump_entries(
+                &mut self.graph,
+                &self.exception_owner_provenance.block_boundaries,
+            );
+        }
+        original_owners.retain_pipeline(&self);
         self.record_original_jump_heads();
+        original_owners.retain_pipeline(&self);
         self.prepare_original_conditional_jump_targets();
+        original_owners.retain_pipeline(&self);
         let assertion_side_exits = self.has_only_assertion_side_exits();
         let mut removed_max_depth = if assertion_side_exits {
             None
         } else {
             self.remove_unreachable_instructions()
         };
+        original_owners.retain_pipeline(&self);
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::RemoveUnreachableInitial)?;
+        self.prepare_normal_try_copy_plan();
+        self.prepare_conditional_normal_try_joins();
+        original_owners.retain_pipeline(&self);
         let original_location_absence = self.capture_original_location_absence();
-        self.resolve_synthesized_conditional_target_locations();
+        self.resolve_synthesized_percent_locations();
+        original_owners.retain_pipeline(&self);
         let synthesized_fallthrough_locations = self.defer_synthesized_fallthrough_locations();
-        self.optimize_boolean_conversions();
+        original_owners.retain_pipeline(&self);
+        self.optimize_boolean_conversions(constants.as_deref());
+        original_owners.retain_pipeline(&self);
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::OptimizeBooleanConversions)?;
         let threaded_jumps = !assertion_side_exits && self.thread_forward_jumps();
+        self.borrow_threaded_jump_targets.clear();
+        original_owners.retain_pipeline(&self);
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::ThreadForwardJumps)?;
         if threaded_jumps {
@@ -310,84 +370,171 @@ impl OptimizationPipeline {
                     Some(removed_max_depth.map_or(depth, |current| current.max(depth)));
             }
         }
+        original_owners.retain_pipeline(&self);
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::RemoveUnreachableAfterThreading)?;
         if !assertion_side_exits {
             self.remove_redundant_forward_jumps(false);
         }
+        original_owners.retain_pipeline(&self);
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::RemoveRedundantForwardJumpsEarly)?;
         self.optimize_redundant_store_fast();
+        original_owners.retain_pipeline(&self);
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::OptimizeRedundantStoreFast)?;
         let swap_blocks = self.optimize_swap_runs();
+        original_owners.retain_pipeline(&self);
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::OptimizeSwapRuns)?;
         self.apply_static_swaps(swap_blocks);
+        original_owners.retain_pipeline(&self);
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::ApplyStaticSwaps)?;
+        let mut copied_exit_owner_retargets = Vec::new();
         let copied_entry_labels = if assertion_side_exits {
             self.propagate_assertion_exit_locations();
             Vec::new()
         } else {
-            self.duplicate_exit_blocks(&original_location_absence)
+            self.duplicate_exit_blocks(&original_location_absence, &mut copied_exit_owner_retargets)
         };
+        self.borrow_threaded_jump_entries.clear();
+        self.borrow_authored_finally_break_origins =
+            crate::assembler::ir::AuthoredFinallyBreakOrigins::default();
+        // Also clear scratch origins on assertion-only and duplicate-pass early-return paths.
+        Self::clear_initial_borrow_jump_entries(&mut self.graph);
+        original_owners.retain_after_exit_copy(&self, &copied_exit_owner_retargets);
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::DuplicateExitBlocks)?;
         // CPython removes unreachable blocks after its per-block optimizations, including
         // small-exit copying followed by conditional threading, before checking local loads.
         // A terminating match arm can leave its original case jump newly unreachable here.
-        if self.thread_original_conditional_jump_targets()
-            && let Some(depth) = self.remove_unreachable_instructions()
-        {
+        let threaded_original = self.thread_original_conditional_jump_targets();
+        original_owners.retain_pipeline(&self);
+        if threaded_original && let Some(depth) = self.remove_unreachable_instructions() {
             removed_max_depth = Some(removed_max_depth.map_or(depth, |current| current.max(depth)));
         }
+        original_owners.retain_pipeline(&self);
         if let Some(constants) = constants {
             self.fold_copied_constants(constants, &copied_entry_labels)?;
         }
+        original_owners.retain_pipeline(&self);
         if let Some(depth) = self.remove_redundant_copy_pop_pairs() {
             removed_max_depth = Some(removed_max_depth.map_or(depth, |current| current.max(depth)));
         }
+        original_owners.retain_pipeline(&self);
         if assertion_side_exits {
             self.add_checks_for_assertion_side_exits(local_count, parameter_count);
         } else {
             self.add_checks_for_uninitialized_loads(local_count, parameter_count);
         }
+        original_owners.retain_pipeline(&self);
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::AddChecksForUninitializedLoads)?;
+        let before_fusion = FusionOwnerCertificates::snapshot(&self);
         self.fuse_superinstructions();
+        original_owners.retain_after_fusion(&before_fusion, &self);
+        let mut fusion_owners = FusionOwnerCertificates::capture(&before_fusion, &self);
+        fusion_owners.extend_original_owners(original_owners);
+        drop(before_fusion);
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::FuseSuperinstructions)?;
-        if !assertion_side_exits {
-            self.push_cold_blocks_to_end();
-        }
+        let omitted_borrow_markers = if !assertion_side_exits {
+            let omitted = self.push_cold_blocks_to_end();
+            fusion_owners.retain_pipeline(&self);
+            omitted
+        } else {
+            rustc_hash::FxHashSet::default()
+        };
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::PushColdBlocksToEnd)?;
         if !assertion_side_exits {
             self.remove_redundant_checked_loads();
+            fusion_owners.retain_pipeline(&self);
         }
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::RemoveRedundantCheckedLoads)?;
         self.propagate_locations_within_blocks();
+        fusion_owners.retain_pipeline(&self);
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::PropagateLocationsWithinBlocks)?;
         self.remove_redundant_swaps_before_pops();
+        fusion_owners.retain_pipeline(&self);
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::RemoveRedundantSwapsBeforePops)?;
         self.remove_redundant_nops();
+        fusion_owners.retain_pipeline(&self);
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::RemoveRedundantNops)?;
         if !assertion_side_exits {
             self.remove_redundant_forward_jumps(true);
+            fusion_owners.retain_pipeline(&self);
             // Manager exits can expose a redundant POP_BLOCK after their jump disappears.
             self.remove_redundant_with_exit_nops();
+            fusion_owners.retain_pipeline(&self);
         }
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::RemoveRedundantForwardJumpsLate)?;
+        self.normalize_backward_conditionals()?;
+        fusion_owners.retain_pipeline(&self);
+        let retained_finally_entries = self.retained_finally_entries(&retained_finally_origins);
         let features = self.graph.features();
         let mut items = self.graph.into_items();
+        if !omitted_borrow_markers.is_empty() {
+            // Analysis-only boundaries must not obstruct physical jump or NOP cleanup.
+            let mut marked = Vec::with_capacity(items.len() + omitted_borrow_markers.len());
+            let mut remaining = omitted_borrow_markers.clone();
+            for item in items {
+                let marker_label = match item {
+                    Item::Label(label) if omitted_borrow_markers.contains(&label) => Some(label),
+                    _ => None,
+                };
+                marked.push(item);
+                if let Some(label) = marker_label {
+                    if !remaining.remove(&label) {
+                        return Err(CompileError::Internal(
+                            "deferred borrow marker label was duplicated".to_owned(),
+                        ));
+                    }
+                    let mut marker =
+                        Instruction::synthetic(NOP, Operand::Value(0), SourceLocation::NONE, None);
+                    marker.jump_policy.mark_borrow_empty_block();
+                    marked.push(Item::Instruction(marker));
+                }
+            }
+            if !remaining.is_empty() {
+                return Err(CompileError::Internal(
+                    "deferred borrow marker label was removed".to_owned(),
+                ));
+            }
+            items = marked;
+        }
+        Self::retain_setup_finally_origins(
+            &items,
+            &setup_finally_origins,
+            &mut self.borrow_finally_entries,
+            &mut self.borrow_block_aliases,
+        );
         if features.has_fast_load() {
-            Self::optimize_load_fast(
+            // These entries split only borrowed-reference analysis. They do not
+            // change earlier CFG copying, NOP removal or exception ownership.
+            let borrow_boundaries = if self
+                .exception_owner_provenance
+                .borrow_only_block_boundaries
+                .is_empty()
+            {
+                std::borrow::Cow::Borrowed(&self.preserved_block_boundaries)
+            } else {
+                let mut boundaries = self.preserved_block_boundaries.clone();
+                boundaries.extend(
+                    self.exception_owner_provenance
+                        .borrow_only_block_boundaries
+                        .iter()
+                        .copied(),
+                );
+                std::borrow::Cow::Owned(boundaries)
+            };
+            Self::optimize_load_fast_with_retained_entries(
                 &mut items,
                 &self.exception_regions,
                 locals::BorrowEntryLabels {
@@ -395,13 +542,18 @@ impl OptimizationPipeline {
                     loop_exits: &self.borrow_loop_exit_blocks,
                     finally_entries: &self.borrow_finally_entries,
                     finally_jump_sources: &self.borrow_finally_jump_sources,
+                    jump_entries: &self.borrow_jump_entry_labels,
+                    original_boundaries: &self.exception_owner_provenance.block_boundaries,
+                    pre_copy_jump_entries: &self.borrow_pre_copy_jump_entries,
+                    authored_finally_break_entries: &self.borrow_authored_finally_break_entries,
                 },
-                &self.preserved_block_boundaries,
+                &borrow_boundaries,
                 &self.borrow_block_aliases,
                 assertion_side_exits,
+                &retained_finally_entries,
             );
         }
-        if features.has_borrow_empty_block() {
+        if features.has_borrow_empty_block() || !omitted_borrow_markers.is_empty() {
             Self::remove_borrow_empty_block_markers(&mut items);
         }
         #[cfg(any(test, debug_assertions))]
@@ -432,6 +584,12 @@ impl OptimizationPipeline {
                 }
             }
         }
+        fusion_owners.apply(
+            &mut items,
+            &self.exception_regions,
+            &self.exception_owner_provenance,
+            &self.preserved_block_boundaries,
+        );
         Ok(LayoutAssembler {
             items,
             exception_regions: self.exception_regions,

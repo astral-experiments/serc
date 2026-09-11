@@ -63,3 +63,42 @@ fn indent(source: &str) -> String {
     }
     result
 }
+
+#[test]
+fn matches_cpython_with_return_iterator_exception_owners() {
+    for (filename, source) in [
+        (
+            "with_outer_iterator_try_finally.py",
+            r"def f(manager, items, done):
+    try:
+        for item in items:
+            try:
+                with manager:
+                    return item
+            except ValueError:
+                pass
+    finally:
+        if done:
+            done()
+",
+        ),
+        (
+            "with_two_outer_iterators_try_finally.py",
+            r"def f(manager, items, done):
+    try:
+        for item in items:
+            try:
+                for other in items:
+                    with manager:
+                        return item
+            except ValueError:
+                pass
+    finally:
+        if done:
+            done()
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

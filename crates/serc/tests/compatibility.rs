@@ -12485,6 +12485,12 @@ def filled(action, self, mask, result):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_nested_iterator_tail_conditions() {
+        let source = include_str!("fixtures/nested_iterator_tail_conditions.py");
+        assert_matches_cpython_marshal(source, "nested_iterator_tail_conditions.py");
+    }
+
+    #[test]
     fn executes_control_flow() {
         let source = r#"
 x = 3
@@ -13005,6 +13011,18 @@ def generator(values, predicate):
 ";
         assert_matches_cpython_marshal(source, "linear_assert_conditions_and_fallbacks.py");
     }
+
+    #[test]
+    fn matches_cpython_marshal_for_normal_async_for_pop_lineage() {
+        let source = include_str!("fixtures/normal_async_for_pop_lineage.py");
+        assert_matches_cpython_marshal(source, "normal_async_for_pop_lineage.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_folded_loop_with_pop_location() {
+        let source = include_str!("fixtures/folded_loop_with_pop_location.py");
+        assert_matches_cpython_marshal(source, "folded_loop_with_pop_location.py");
+    }
 }
 
 #[path = "compatibility_cases/handler_loop_continuation_locations.rs"]
@@ -13036,3 +13054,12 @@ mod for_body_owner_slots;
 
 #[path = "compatibility_cases/handler_continue_cleanup_owners.rs"]
 mod handler_continue_cleanup_owners;
+
+#[path = "compatibility_cases/shared_original_jump_aliases.rs"]
+mod shared_original_jump_aliases;
+
+#[path = "compatibility_cases/nested_async_terminal_conditionals.rs"]
+mod nested_async_terminal_conditionals;
+
+#[path = "compatibility_cases/original_empty_loop_backedge.rs"]
+mod original_empty_loop_backedge;
