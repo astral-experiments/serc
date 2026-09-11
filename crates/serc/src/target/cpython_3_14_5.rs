@@ -1393,7 +1393,7 @@ pub(crate) fn is_preinterned_string(value: &str) -> bool {
         0x6f76 => (610, 611),
         0x6f77 => (611, 612),
         0x7061 => {
-            if value == "package" || value == "patterns" || value == "pause" {
+            if value == "package" || value == "patterns" || (cfg!(unix) && value == "pause") {
                 return true;
             }
             (612, 618)

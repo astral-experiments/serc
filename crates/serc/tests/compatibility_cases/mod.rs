@@ -422,3 +422,5 @@ mod retained_pop_none_owners;
 mod protected_nested_try_loop_exit;
 
 mod ordinary_named_return_owner_slots;
+
+mod retained_finally_owner_slots;

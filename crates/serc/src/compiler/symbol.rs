@@ -782,7 +782,12 @@ impl Compiler<'_> {
         &mut self,
         body: &[Stmt],
     ) -> Result<(), CompileError> {
-        self.pre_register_suite_names_with_folds(body, true, true, None, None)
+        // CPython folds discarded conditional blocks before pruning them. Preserve
+        // those construction points when exit copying reorders deferred constants.
+        let first_fold = self.output.deferred_constants.len();
+        self.pre_register_suite_names_with_folds(body, true, true, None, None)?;
+        self.record_discarded_fold_admissions(first_fold, None);
+        Ok(())
     }
 
     pub(super) fn pre_register_suite_names_filtered(
@@ -809,6 +814,11 @@ impl Compiler<'_> {
         // values folded in the discarded arm keep their original cache admission order.
         let first_fold = self.output.deferred_constants.len();
         self.pre_register_suite_names_with_folds(&[], true, true, None, Some(expression))?;
+        self.record_discarded_fold_admissions(first_fold, admission);
+        Ok(())
+    }
+
+    fn record_discarded_fold_admissions(&mut self, first_fold: usize, admission: Option<Label>) {
         if self.output.deferred_constants.len() > first_fold {
             let admission = admission.unwrap_or_else(|| {
                 let label = self.assembler.label();
@@ -820,7 +830,6 @@ impl Compiler<'_> {
                 *target = Some(DeferredConstantTarget::DiscardedExpression(admission));
             }
         }
-        Ok(())
     }
 
     fn pre_register_suite_names_with_folds(

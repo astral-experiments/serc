@@ -78,3 +78,22 @@ fn keeps_nested_nonterminating_else_locations() {
         common::assert_matches_cpython_marshal(&source, "nested_nonterminating_else_control.py");
     }
 }
+
+#[test]
+fn preserves_nested_named_cleanup_copy_owners_at_loop_tail() {
+    // The second POP_EXCEPT leaves the outer handler. Its copied tail belongs
+    // to the scope fallback in an async function and has no owner in a normal one.
+    for (header, suspend, inner_binding, error) in [
+        ("def", "", "", "primary_error"),
+        ("def", "", " as repair_error", "repair_error"),
+        ("async def", "await ", " as repair_error", "repair_error"),
+    ] {
+        let source = format!(
+            "{header} f(values, retry, skip):\n    errors = {{}}\n    pending = []\n    for value in values:\n        try:\n            primary(value)\n        except ValueError as primary_error:\n            if skip:\n                errors[value] = primary_error\n                if retry:\n                    pending.append(value)\n                continue\n            try:\n                {suspend}repair(value)\n            except TypeError{inner_binding}:\n                errors[value] = {error}\n                if retry:\n                    pending.append(value)\n    return pending\n"
+        );
+        common::assert_matches_cpython_marshal(
+            &source,
+            "nested_named_cleanup_copy_owners_at_loop_tail.py",
+        );
+    }
+}

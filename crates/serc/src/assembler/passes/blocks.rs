@@ -346,6 +346,7 @@ fn exit_block_analysis(
         let mut target_chain_end = target_position;
         while target_chain_end + 1 < order.len()
             && block_has_fallthrough(graph[order[target_chain_end]].items())
+            && block_jump_target(graph[order[target_chain_end]].items()).is_none()
             && predecessors[order[target_chain_end + 1].index()] == 1
             && graph[order[target_chain_end + 1]].items().iter().any(
                 |item| matches!(item, Item::Label(label) if exception_split_labels.contains(label)),
@@ -1252,6 +1253,8 @@ impl OptimizationPipeline {
                     "backward conditional has no fallthrough marker".to_owned(),
                 ));
             };
+            // Remove the marker before inserting a successor label can shift its offset.
+            self.graph.remove_item(marker);
             let successor = self.graph.block_at(position + 1);
             let fallthrough =
                 if let Some(Item::Label(label)) = self.graph[successor].items().first() {
@@ -1262,7 +1265,6 @@ impl OptimizationPipeline {
                     label
                 };
             let fresh_entry = self.label();
-            self.graph.remove_item(marker);
             let conditional = self.graph.instructions_mut(block).next_back().unwrap();
             conditional.opcode = reversed;
             conditional.retarget(Operand::Forward(fallthrough));
@@ -2128,6 +2130,9 @@ impl OptimizationPipeline {
             let mut target_chain_end = target_position;
             while target_chain_end + 1 < order.len()
                 && block_has_fallthrough(graph[order[target_chain_end]].items())
+                // Exception-table splits can divide one original block, but a
+                // conditional jump always ends it and must not be copied with its fallthrough.
+                && block_jump_target(graph[order[target_chain_end]].items()).is_none()
                 && predecessors[order[target_chain_end + 1].index()] == 1
                 && graph[order[target_chain_end + 1]]
                     .items()
@@ -2219,6 +2224,29 @@ impl OptimizationPipeline {
                         matches!(item, Item::Label(label) if copied_exit_or_eval_entry_labels.contains(label))
                     })
                 });
+            let shared_original_loop_discard = remaining_predecessors[target.index()] > 1
+                && target_chain_end == target_position
+                && target_has_no_location
+                && !target_allows_no_location_block_inlining
+                && !target_has_artificial_eval_break
+                && !target_has_copied_jump_eval_check
+                && graph[target]
+                    .items()
+                    .iter()
+                    .filter_map(|item| match item {
+                        Item::Instruction(instruction) => Some(instruction.opcode),
+                        Item::Label(_) => None,
+                    })
+                    .eq([POP_TOP, JUMP_BACKWARD]);
+            if shared_original_loop_discard {
+                // Loop-tail lowering appends the enclosing if's backedge to this discard.
+                // The original discard falls through to that separate join, so it is not
+                // an exit block eligible for copying or predecessor-location propagation.
+                for instruction in graph.instructions_mut(target) {
+                    instruction.no_location_policy.preserve_location();
+                }
+                continue;
+            }
             if source_has_fallthrough
                 && !target_has_copied_jump_eval_check
                 && graph[target_exit]
@@ -2606,7 +2634,7 @@ impl OptimizationPipeline {
                     }
                 }
             }
-            let previous_copied_region_count = copied_exception_regions.len();
+            let mut protected_fragment_origins = FxHashSet::default();
             // The aliases below close copied regions without copying handler code.
             // Only labels copied with instructions can redirect an exception target.
             let copied_handler_labels = copied_labels.clone();
@@ -2635,9 +2663,11 @@ impl OptimizationPipeline {
                             && region_memberships[index].contains(&positions[target.index()]))
                         .then_some(copied_label)
                     })?;
+                    let end = *copied_labels.get(&region.end)?;
+                    protected_fragment_origins.insert(index);
                     Some(ExceptionRegion {
                         start,
-                        end: *copied_labels.get(&region.end)?,
+                        end,
                         target: copied_handler_labels
                             .get(&region.target)
                             .copied()
@@ -2649,11 +2679,11 @@ impl OptimizationPipeline {
                     })
                 },
             ));
-            // When this copy creates a protected fragment, that fragment needs its own
-            // owner projection. Keep that separate path unchanged; a bare copied exit has
-            // no new region and can inherit the existing enclosing-region holes directly.
-            if copied_exception_regions.len() == previous_copied_region_count {
-                for (index, start, end) in inherited_conditional_exclusions {
+            // A copied fragment only replaces the holes for its own original region.
+            // Other enclosing regions still need the copied exclusions even when this
+            // cleanup also introduces a separate protected fragment.
+            for (index, start, end) in inherited_conditional_exclusions {
+                if !protected_fragment_origins.contains(&index) {
                     copied_region_exclusions[index].push((start, end));
                 }
             }
@@ -2679,6 +2709,11 @@ impl OptimizationPipeline {
                     original.depth_after(),
                 );
                 marker.set_exception_policy(original.exception_policy());
+                // This marker still occupies the original shared jump slot. Its missing
+                // location remains independent of the cleanup copied after it.
+                if generic_original_copy && original.no_location_policy.preserves_location() {
+                    marker.no_location_policy.preserve_location();
+                }
                 if !planned_copy {
                     marker.add_pre_fold_extra_instructions(original.pre_fold_extra_instructions());
                 }

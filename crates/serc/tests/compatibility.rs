@@ -13063,3 +13063,6 @@ mod nested_async_terminal_conditionals;
 
 #[path = "compatibility_cases/original_empty_loop_backedge.rs"]
 mod original_empty_loop_backedge;
+
+#[path = "compatibility_cases/original_named_cleanup_join.rs"]
+mod original_named_cleanup_join;

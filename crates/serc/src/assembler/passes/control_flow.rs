@@ -1431,8 +1431,11 @@ impl OptimizationPipeline {
                 match item {
                     Item::Label(label) => labels.push(*label),
                     Item::Instruction(instruction) => {
-                        if instruction.opcode == JUMP_FORWARD
-                            && instruction.jump_policy.is_interruptible()
+                        // Only the compiler's common for-loop backedge can certify a
+                        // backward head. Per-arm and copied backedges have no such entry.
+                        if (instruction.opcode == JUMP_BACKWARD
+                            || (instruction.opcode == JUMP_FORWARD
+                                && instruction.jump_policy.is_interruptible()))
                             && instruction.pre_fold_extra_instructions() == 0
                         {
                             let original_cleanup_copy = match instruction.operand() {
@@ -1447,9 +1450,14 @@ impl OptimizationPipeline {
                                 self.original_jump_head_targets
                                     .extend(labels.into_iter().filter(|label| {
                                         conditional_targets.contains(label)
-                                            && !self
-                                                .conditional_threading_targets
-                                                .contains_key(label)
+                                            && if instruction.opcode == JUMP_BACKWARD {
+                                                self.conditional_threading_targets.get(label)
+                                                    == Some(&instruction.location)
+                                            } else {
+                                                !self
+                                                    .conditional_threading_targets
+                                                    .contains_key(label)
+                                            }
                                             && !self.original_nop_targets.contains(label)
                                     }));
                             }
@@ -1542,7 +1550,16 @@ impl OptimizationPipeline {
                         Item::Instruction(instruction) => Some(instruction),
                         Item::Label(_) => None,
                     })?;
-                (first.opcode == JUMP_FORWARD
+                ((first.opcode == JUMP_FORWARD
+                    || (first.opcode == JUMP_BACKWARD
+                        && self.original_jump_head_targets.contains(label)
+                        && self.conditional_threading_targets.get(label).is_some_and(
+                            |location| {
+                                // An original unlocated head can acquire its sole donor
+                                // after other incoming edges receive their own copies.
+                                *location == SourceLocation::NONE || *location == first.location
+                            },
+                        )))
                     && (!self.original_jump_head_targets.contains(label)
                         || first.pre_fold_extra_instructions() == 0))
                     .then_some((*label, first.operand()))
@@ -1731,7 +1748,7 @@ impl OptimizationPipeline {
                 let previous_at_block_entry = previous;
                 for offset in 0..graph[block].items().len() {
                     let position = ItemPosition::new(block, offset);
-                    let Item::Instruction(instruction) = *graph.item(position) else {
+                    let Item::Instruction(mut instruction) = *graph.item(position) else {
                         continue;
                     };
                     if redundant.contains(&position) {
@@ -1767,6 +1784,7 @@ impl OptimizationPipeline {
                     let mut target_is_next = false;
                     let mut crosses_exception_boundary = false;
                     let mut crosses_removed_line_event = false;
+                    let mut removed_line_events_are_unlocated = true;
                     let mut next = None;
                     'next: for (next_block_index, next_block) in
                         order.iter().copied().enumerate().skip(block_index)
@@ -1785,14 +1803,18 @@ impl OptimizationPipeline {
                                     crosses_exception_boundary |=
                                         exception_boundaries.contains(label);
                                 }
-                                Item::Instruction(_) => {
+                                Item::Instruction(removed) => {
                                     let position = ItemPosition::new(next_block, next_offset);
                                     if !redundant.contains(&position) {
                                         next = Some(position);
                                         break 'next;
                                     }
-                                    crosses_removed_line_event |=
-                                        removed_cross_block_line_events.contains(&position);
+                                    if removed_cross_block_line_events.contains(&position) {
+                                        crosses_removed_line_event = true;
+                                        removed_line_events_are_unlocated &= removed.location.line
+                                            < 0
+                                            && removed.no_location_policy.preserves_location();
+                                    }
                                 }
                             }
                         }
@@ -1806,13 +1828,21 @@ impl OptimizationPipeline {
                     }
                     revisit.remove(&position);
                     if !first_scan && crosses_removed_line_event {
-                        // CPython resets the previous line at each original block. A jump
-                        // removed only by its physical predecessor's line may still leave
-                        // a NOP in that block. Keep earlier jumps until that original line
-                        // event is represented. Preserved unlocated joins also keep their
-                        // boundary until the original line event is represented.
-                        previous = Some(position);
-                        continue;
+                        // An emptied original array can carry a separate line event.
+                        // Ordinary jumps wait for that event to be represented.
+                        if !instruction.fusion_policy.is_authored_break()
+                            || !removed_line_events_are_unlocated
+                        {
+                            previous = Some(position);
+                            continue;
+                        }
+                        // Preserve the authored break's own line through normal NOP cleanup,
+                        // while its erased successor still stops borrowed-load fallthrough.
+                        instruction
+                            .no_location_policy
+                            .set_borrow_fallthrough(BorrowFallthrough::Barrier);
+                        graph.instruction_mut(position).unwrap().no_location_policy =
+                            instruction.no_location_policy;
                     }
                     if !finalize_borrow_empty_blocks
                         && !crosses_exception_boundary

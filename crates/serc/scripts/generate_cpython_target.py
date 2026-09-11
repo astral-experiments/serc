@@ -63,7 +63,6 @@ STARTUP_INTERNED_STRINGS = (
     "other",
     "output",
     "package",
-    "pause",
     "python",
     "quiet",
     "remove",
@@ -81,6 +80,9 @@ STARTUP_INTERNED_STRINGS = (
     "warn",
     "win32",
 )
+# signal.pause is initialized only when CPython is built with HAVE_PAUSE.
+UNIX_STARTUP_INTERNED_STRINGS = ("pause",)
+
 CRATE_ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = CRATE_ROOT / "src" / "target" / "cpython_3_14_5.rs"
 MARSHAL_OUTPUT = CRATE_ROOT / "src" / "marshal" / "v5.rs"
@@ -261,7 +263,10 @@ def render_preinterned_lookup(
     for key in sorted(ranges.keys() | supplemental.keys()):
         candidates = supplemental.get(key, [])
         condition = " || ".join(
-            f"value == {rust_string_literal(value)}" for value in candidates
+            f"(cfg!(unix) && value == {rust_string_literal(value)})"
+            if value in UNIX_STARTUP_INTERNED_STRINGS
+            else f"value == {rust_string_literal(value)}"
+            for value in candidates
         )
         if key not in ranges:
             lines.append(f"        0x{key:04x} => return {condition},")
@@ -754,29 +759,39 @@ def render(sources: dict[str, str]) -> str:
         ]
     )
     for name, code in opcodes:
-        lines.append(
-            f"    pub(crate) const {name}: Opcode = Opcode::new({code});"
-        )
-    lines.extend([
-        "}", "", "impl Opcode {",
-        "    /// Returns the inline-cache width generated from the pinned opcode metadata.",
-        "    pub(crate) const fn caches(self) -> u8 {",
-        "        match self {",
-    ])
+        lines.append(f"    pub(crate) const {name}: Opcode = Opcode::new({code});")
+    lines.extend(
+        [
+            "}",
+            "",
+            "impl Opcode {",
+            "    /// Returns the inline-cache width generated from the pinned opcode metadata.",
+            "    pub(crate) const fn caches(self) -> u8 {",
+            "        match self {",
+        ]
+    )
     for name, _ in opcodes:
         if width := caches.get(name, 0):
             lines.append(f"            opcodes::{name} => {width},")
-    lines.extend([
-        "            _ => 0,", "        }", "    }", "}", "",
-        "pub(crate) static PREINTERNED_STRINGS: &[&str] = &[",
-    ])
+    lines.extend(
+        [
+            "            _ => 0,",
+            "        }",
+            "    }",
+            "}",
+            "",
+            "pub(crate) static PREINTERNED_STRINGS: &[&str] = &[",
+        ]
+    )
     lines.extend(f"    {rust_string_literal(value)}," for value in preinterned_strings)
     lines.extend(["];", ""])
-    lines.extend([
-        "// Builtin compile() initializes these AST identifiers before compiling source.",
-        "#[cfg(test)]",
-        "pub(crate) static COMPILER_INTERNED_STRINGS: &[&str] = &[",
-    ])
+    lines.extend(
+        [
+            "// Builtin compile() initializes these AST identifiers before compiling source.",
+            "#[cfg(test)]",
+            "pub(crate) static COMPILER_INTERNED_STRINGS: &[&str] = &[",
+        ]
+    )
     lines.extend(
         f"    {rust_string_literal(value)}," for value in compiler_interned_strings
     )
@@ -784,7 +799,7 @@ def render(sources: dict[str, str]) -> str:
     lines.extend(
         render_preinterned_lookup(
             preinterned_strings,
-            STARTUP_INTERNED_STRINGS,
+            STARTUP_INTERNED_STRINGS + UNIX_STARTUP_INTERNED_STRINGS,
             tuple(compiler_interned_strings),
         )
     )

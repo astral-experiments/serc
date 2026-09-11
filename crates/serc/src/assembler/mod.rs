@@ -596,7 +596,7 @@ impl Assembler {
         None
     }
 
-    /// Whether an incoming cleanup jump carries a located record after its original `POP_BLOCK`.
+    /// Whether a source NOP reaches this join by fallthrough or a compacted cleanup jump.
     pub(crate) fn current_join_has_located_compacted_predecessor(&self) -> bool {
         let labels = self
             .linear_items()
@@ -607,6 +607,16 @@ impl Assembler {
                 Item::Instruction(_) => None,
             })
             .collect::<Vec<_>>();
+        if let Some(Item::Instruction(instruction)) = self
+            .linear_items()
+            .get(self.linear_items().len().saturating_sub(labels.len() + 1))
+            && instruction.opcode == NOP
+            && instruction.location.line >= 0
+            && !instruction.fusion_policy.is_converted_pop_block()
+        {
+            // Incoming jumps retain their own locations; the fallthrough keeps this NOP.
+            return true;
+        }
         let mut follows_pop_block = false;
         for item in self.linear_items() {
             match item {
@@ -1344,6 +1354,43 @@ impl Assembler {
                 Item::Label(_) => None,
             })
             .nth(instruction_offset)
+    }
+
+    /// Counts the current original array before constant folding and global-call fusion.
+    pub(crate) fn current_original_block_pre_fusion_instruction_count(&self) -> usize {
+        let mut count = 0;
+        for item in self.linear_items().iter().rev() {
+            match item {
+                Item::Label(label) => {
+                    if self
+                        .exception_owner_provenance
+                        .block_boundaries
+                        .contains(label)
+                        || self.preserved_block_boundaries.contains(label)
+                    {
+                        break;
+                    }
+                }
+                Item::Instruction(instruction) => {
+                    if instruction.opcode == NOT_TAKEN
+                        || matches!(
+                            instruction.operand(),
+                            Operand::Forward(_) | Operand::Backward(_)
+                        )
+                        || ends_scope(instruction.opcode)
+                    {
+                        break;
+                    }
+                    count += 1
+                        + usize::from(instruction.pre_fold_extra_instructions())
+                        + usize::from(
+                            instruction.opcode == LOAD_GLOBAL
+                                && matches!(instruction.operand(), Operand::Value(argument) if argument & 1 != 0),
+                        );
+                }
+            }
+        }
+        count
     }
 
     /// Counts emitted instructions before constant folding and global-call fusion.
@@ -2704,6 +2751,30 @@ impl Assembler {
         self.conditional_threading_targets.insert(label, location);
     }
 
+    /// Records the common backedge emitted after a for-loop body, before optimization.
+    /// Per-arm backedges emitted by loop-tail lowering do not receive this certificate.
+    pub(crate) fn record_last_original_for_backedge(&mut self) {
+        let (last, head) = self
+            .linear_items()
+            .split_last()
+            .expect("original for backedge");
+        let Item::Instruction(instruction) = last else {
+            unreachable!("original for backedge must be the last instruction");
+        };
+        assert_eq!(instruction.opcode, JUMP_BACKWARD);
+        let location = instruction.location;
+        let labels = head
+            .iter()
+            .rev()
+            .map_while(|item| match item {
+                Item::Label(label) => Some(*label),
+                Item::Instruction(_) => None,
+            })
+            .collect::<Vec<_>>();
+        self.conditional_threading_targets
+            .extend(labels.into_iter().map(|label| (label, location)));
+    }
+
     pub(crate) fn prevent_jump_threading_target(&mut self, emitted: EmittedJump) {
         self.emitted_jump_mut(emitted, "preventing jump threading through a target")
             .jump_policy
@@ -2898,14 +2969,41 @@ impl Assembler {
         let Some(Item::Label(entry)) = items.get(begin) else {
             return;
         };
-        if !self
+        // One authored break establishes this original array independently of
+        // the range labels around its POP_BLOCK. Do not alter borrow boundaries.
+        let leading_labels = items[begin..index]
+            .iter()
+            .filter_map(|item| match item {
+                Item::Label(label) => Some(*label),
+                Item::Instruction(_) => None,
+            })
+            .collect::<rustc_hash::FxHashSet<_>>();
+        let incoming_to_entry = items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Instruction(jump)
+                    if matches!(jump.operand(), Operand::Forward(target) | Operand::Backward(target)
+                        if leading_labels.contains(&target)) =>
+                {
+                    Some(*jump)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let authored_break_entry = matches!(incoming_to_entry.as_slice(), [jump]
+            if is_unconditional_jump(jump.opcode)
+                && jump.operand() == Operand::Forward(*entry)
+                && jump.fusion_policy.is_authored_break()
+                && jump.location.line >= 0);
+        if ((!self
             .exception_owner_provenance
             .source_boundaries
             .contains(entry)
             || !self
                 .exception_owner_provenance
                 .block_boundaries
-                .contains(entry)
+                .contains(entry))
+            && !authored_break_entry)
             || !matches!(items.get(begin.wrapping_sub(1)), Some(Item::Instruction(previous))
                 if ends_scope(previous.opcode))
         {

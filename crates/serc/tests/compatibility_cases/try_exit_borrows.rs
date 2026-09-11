@@ -2948,3 +2948,907 @@ fn async_for_finally_manager_preserves_owned_continuation() {
         "async_for_finally_manager_global_cleanup.py",
     );
 }
+
+#[test]
+fn keeps_owned_loads_after_finalizer_with_nested_recovery() {
+    common::assert_matches_cpython_marshal(
+        r"def f(open_stream, proc):
+    selected = None
+    try:
+        with open_stream() as stream:
+            for value in stream:
+                if value:
+                    selected = value
+                    break
+    finally:
+        if selected is not None and proc.poll() is None:
+            proc.terminate()
+        if proc.stdout:
+            proc.stdout.close()
+        try:
+            _, stderr = proc.communicate()
+        except RuntimeError:
+            proc.kill()
+            _, stderr = proc.communicate()
+        code = proc.code
+    if selected is None and code != 0:
+        message = stderr.decode() if stderr else str(code)
+        raise RuntimeError(message, code)
+    return selected
+",
+        "finalizer_nested_recovery_tail.py",
+    );
+}
+
+#[test]
+fn reducer_finalizer_recovery_linear_protected_body() {
+    common::assert_matches_cpython_marshal(
+        r"def f(open_stream, proc):
+    selected = None
+    try:
+        selected = open_stream()
+    finally:
+        if selected is not None and proc.poll() is None:
+            proc.terminate()
+        if proc.stdout:
+            proc.stdout.close()
+        try:
+            _, stderr = proc.communicate()
+        except RuntimeError:
+            proc.kill()
+            _, stderr = proc.communicate()
+        code = proc.code
+    if selected is None and code != 0:
+        message = stderr.decode() if stderr else str(code)
+        raise RuntimeError(message, code)
+    return selected
+",
+        "reducer_finalizer_recovery_linear_protected_body.py",
+    );
+}
+
+#[test]
+fn reducer_finalizer_recovery_no_leading_conditions() {
+    common::assert_matches_cpython_marshal(
+        r"def f(open_stream, proc):
+    selected = None
+    try:
+        with open_stream() as stream:
+            for value in stream:
+                if value:
+                    selected = value
+                    break
+    finally:
+        try:
+            _, stderr = proc.communicate()
+        except RuntimeError:
+            proc.kill()
+            _, stderr = proc.communicate()
+        code = proc.code
+    if selected is None and code != 0:
+        message = stderr.decode() if stderr else str(code)
+        raise RuntimeError(message, code)
+    return selected
+",
+        "reducer_finalizer_recovery_no_leading_conditions.py",
+    );
+}
+
+#[test]
+fn reducer_finalizer_recovery_no_nested_recovery() {
+    common::assert_matches_cpython_marshal(
+        r"def f(open_stream, proc):
+    selected = None
+    try:
+        with open_stream() as stream:
+            for value in stream:
+                if value:
+                    selected = value
+                    break
+    finally:
+        if selected is not None and proc.poll() is None:
+            proc.terminate()
+        if proc.stdout:
+            proc.stdout.close()
+        _, stderr = proc.communicate()
+        code = proc.code
+    if selected is None and code != 0:
+        message = stderr.decode() if stderr else str(code)
+        raise RuntimeError(message, code)
+    return selected
+",
+        "reducer_finalizer_recovery_no_nested_recovery.py",
+    );
+}
+
+#[test]
+fn reducer_finalizer_copy_tail_long_attr() {
+    common::assert_matches_cpython_marshal(
+        r"def f(open_stream, proc):
+    selected = None
+    try:
+        with open_stream() as stream:
+            for value in stream:
+                if value:
+                    selected = value
+                    break
+    finally:
+        try:
+            _, stderr = proc.communicate()
+        except RuntimeError:
+            proc.kill()
+            _, stderr = proc.communicate()
+        code = proc.inner.code
+    if selected is None and code != 0:
+        message = stderr.decode() if stderr else str(code)
+        raise RuntimeError(message, code)
+    return selected
+",
+        "reducer_finalizer_copy_tail_long_attr.py",
+    );
+}
+
+#[test]
+fn reducer_finalizer_copy_tail_binary() {
+    common::assert_matches_cpython_marshal(
+        r"def f(open_stream, proc):
+    selected = None
+    try:
+        with open_stream() as stream:
+            for value in stream:
+                if value:
+                    selected = value
+                    break
+    finally:
+        try:
+            _, stderr = proc.communicate()
+        except RuntimeError:
+            proc.kill()
+            _, stderr = proc.communicate()
+        code = proc.code + 1
+    if selected is None and code != 0:
+        message = stderr.decode() if stderr else str(code)
+        raise RuntimeError(message, code)
+    return selected
+",
+        "reducer_finalizer_copy_tail_binary.py",
+    );
+}
+
+#[test]
+fn reducer_finalizer_copy_tail_short_const() {
+    common::assert_matches_cpython_marshal(
+        r"def f(open_stream, proc):
+    selected = None
+    try:
+        with open_stream() as stream:
+            for value in stream:
+                if value:
+                    selected = value
+                    break
+    finally:
+        try:
+            _, stderr = proc.communicate()
+        except RuntimeError:
+            proc.kill()
+            _, stderr = proc.communicate()
+        code = 0
+    if selected is None and code != 0:
+        message = stderr.decode() if stderr else str(code)
+        raise RuntimeError(message, code)
+    return selected
+",
+        "reducer_finalizer_copy_tail_short_const.py",
+    );
+}
+
+#[test]
+fn finalizer_copy_certificate_pass_nops() {
+    common::assert_matches_cpython_marshal(
+        r"def f(open_stream, proc):
+    selected = None
+    try:
+        with open_stream() as stream:
+            for value in stream:
+                if value:
+                    selected = value
+                    break
+    finally:
+        try:
+            _, stderr = proc.communicate()
+        except RuntimeError:
+            proc.kill()
+            _, stderr = proc.communicate()
+        code = 0
+        pass
+        pass
+    if selected is None and code != 0:
+        message = stderr.decode() if stderr else str(code)
+        raise RuntimeError(message, code)
+    return selected
+",
+        "finalizer_copy_certificate_pass_nops.py",
+    );
+}
+
+#[test]
+fn finalizer_copy_certificate_constant_nops() {
+    common::assert_matches_cpython_marshal(
+        r"def f(open_stream, proc):
+    selected = None
+    try:
+        with open_stream() as stream:
+            for value in stream:
+                if value:
+                    selected = value
+                    break
+    finally:
+        try:
+            _, stderr = proc.communicate()
+        except RuntimeError:
+            proc.kill()
+            _, stderr = proc.communicate()
+        code = 0
+        1
+        2
+    if selected is None and code != 0:
+        message = stderr.decode() if stderr else str(code)
+        raise RuntimeError(message, code)
+    return selected
+",
+        "finalizer_copy_certificate_constant_nops.py",
+    );
+}
+
+#[test]
+fn finalizer_copy_certificate_tuple_before_fold() {
+    common::assert_matches_cpython_marshal(
+        r"def f(open_stream, proc):
+    selected = None
+    try:
+        with open_stream() as stream:
+            for value in stream:
+                if value:
+                    selected = value
+                    break
+    finally:
+        try:
+            _, stderr = proc.communicate()
+        except RuntimeError:
+            proc.kill()
+            _, stderr = proc.communicate()
+        code = (1, 2, 3)
+    if selected is None and code != 0:
+        message = stderr.decode() if stderr else str(code)
+        raise RuntimeError(message, code)
+    return selected
+",
+        "finalizer_copy_certificate_tuple_before_fold.py",
+    );
+}
+
+#[test]
+fn finalizer_copy_certificate_await_assignment() {
+    common::assert_matches_cpython_marshal(
+        r"async def f(open_stream, proc):
+    selected = None
+    try:
+        with open_stream() as stream:
+            for value in stream:
+                if value:
+                    selected = value
+                    break
+    finally:
+        try:
+            _, stderr = proc.communicate()
+        except RuntimeError:
+            proc.kill()
+            _, stderr = proc.communicate()
+        code = await proc.finish()
+    if selected is None and code != 0:
+        message = stderr.decode() if stderr else str(code)
+        raise RuntimeError(message, code)
+    return selected
+",
+        "finalizer_copy_certificate_await_assignment.py",
+    );
+}
+
+#[test]
+fn finalizer_copy_certificate_yield_assignment() {
+    common::assert_matches_cpython_marshal(
+        r"def f(open_stream, proc):
+    selected = None
+    try:
+        with open_stream() as stream:
+            for value in stream:
+                if value:
+                    selected = value
+                    break
+    finally:
+        try:
+            _, stderr = proc.communicate()
+        except RuntimeError:
+            proc.kill()
+            _, stderr = proc.communicate()
+        code = yield proc.code
+    if selected is None and code != 0:
+        message = stderr.decode() if stderr else str(code)
+        raise RuntimeError(message, code)
+    return selected
+",
+        "finalizer_copy_certificate_yield_assignment.py",
+    );
+}
+
+#[test]
+fn finalizer_copy_certificate_yield_from_assignment() {
+    common::assert_matches_cpython_marshal(
+        r"def f(open_stream, proc):
+    selected = None
+    try:
+        with open_stream() as stream:
+            for value in stream:
+                if value:
+                    selected = value
+                    break
+    finally:
+        try:
+            _, stderr = proc.communicate()
+        except RuntimeError:
+            proc.kill()
+            _, stderr = proc.communicate()
+        code = yield from proc.values
+    if selected is None and code != 0:
+        message = stderr.decode() if stderr else str(code)
+        raise RuntimeError(message, code)
+    return selected
+",
+        "finalizer_copy_certificate_yield_from_assignment.py",
+    );
+}
+
+#[test]
+fn finalizer_copy_certificate_enclosing_try_constant_nops() {
+    common::assert_matches_cpython_marshal(
+        r"def f(open_stream, proc):
+    try:
+        selected = None
+        try:
+            with open_stream() as stream:
+                for value in stream:
+                    if value:
+                        selected = value
+                        break
+        finally:
+            try:
+                _, stderr = proc.communicate()
+            except RuntimeError:
+                proc.kill()
+                _, stderr = proc.communicate()
+            code = 0
+            1
+            2
+        if selected is None and code != 0:
+            message = stderr.decode() if stderr else str(code)
+            raise RuntimeError(message, code)
+        return selected
+    finally:
+        proc.close()
+",
+        "finalizer_copy_certificate_enclosing_try_constant_nops.py",
+    );
+}
+
+#[test]
+fn normal_finally_retry_break_preserves_owned_continuation() {
+    let source = r"async def f(value, emit):
+    task = None
+    result = None
+    error = None
+    try:
+        try:
+            task = await start(value)
+        except BaseError as exc:
+            error = exc
+            task = recover(value)
+    finally:
+        if task is not None:
+            while True:
+                try:
+                    result = await shield(task)
+                    break
+                except Cancel as exc:
+                    if task.cancelled():
+                        raise
+                    if error is None:
+                        error = exc
+                except Error as exc:
+                    if error is not None:
+                        raise error from exc
+                    raise
+    if error is not None:
+        raise error
+    assert result is not None
+    emit(result)
+    return result
+";
+    common::assert_matches_cpython_marshal(source, "normal_finally_retry_break.py");
+}
+
+#[test]
+fn normal_finally_retry_break_same_line() {
+    let source = r"async def f(value, emit):
+    task = None
+    result = None
+    error = None
+    try:
+        try:
+            task = await start(value)
+        except BaseError as exc:
+            error = exc
+            task = recover(value)
+    finally:
+        if task is not None:
+            while True:
+                try:
+                    result = await shield(task); break
+                except Cancel as exc:
+                    if task.cancelled():
+                        raise
+                    if error is None:
+                        error = exc
+                except Error as exc:
+                    if error is not None:
+                        raise error from exc
+                    raise
+    if error is not None:
+        raise error
+    assert result is not None
+    emit(result)
+    return result
+";
+    common::assert_matches_cpython_marshal(source, "normal_finally_retry_break_same_line.py");
+}
+
+#[test]
+fn normal_finally_retry_break_independent_early_entry() {
+    let source = r"async def f(value, emit, done):
+    task = None
+    result = None
+    error = None
+    try:
+        try:
+            task = await start(value)
+        except BaseError as exc:
+            error = exc
+            task = recover(value)
+    finally:
+        if task is not None:
+            while True:
+                if done:
+                    break
+                try:
+                    result = await shield(task)
+                    break
+                except Cancel as exc:
+                    if task.cancelled():
+                        raise
+                    if error is None:
+                        error = exc
+                except Error as exc:
+                    if error is not None:
+                        raise error from exc
+                    raise
+    if error is not None:
+        raise error
+    assert result is not None
+    emit(result)
+    return result
+";
+    common::assert_matches_cpython_marshal(
+        source,
+        "normal_finally_retry_break_independent_entry.py",
+    );
+}
+
+#[test]
+fn normal_finally_retry_break_outer_loop() {
+    let source = r"async def f(value, emit):
+    task = None
+    result = None
+    error = None
+    while again():
+        try:
+            try:
+                task = await start(value)
+            except BaseError as exc:
+                error = exc
+                task = recover(value)
+        finally:
+            if task is not None:
+                while True:
+                    try:
+                        result = await shield(task)
+                        break
+                    except Cancel as exc:
+                        if task.cancelled():
+                            raise
+                        if error is None:
+                            error = exc
+                    except Error as exc:
+                        if error is not None:
+                            raise error from exc
+                        raise
+    if error is not None:
+        raise error
+    assert result is not None
+    emit(result)
+    return result
+";
+    common::assert_matches_cpython_marshal(source, "normal_finally_retry_break_outer_loop.py");
+}
+
+#[test]
+fn normal_finally_retry_break_located_cleanup() {
+    let source = r"async def f(value, emit):
+    task = None
+    result = None
+    error = None
+    try:
+        try:
+            task = await start(value)
+        except BaseError as exc:
+            error = exc
+            task = recover(value)
+    finally:
+        if task is not None:
+            while True:
+                try:
+                    result = await shield(task)
+                    break
+                except Cancel as exc:
+                    if task.cancelled():
+                        raise
+                    if error is None:
+                        error = exc
+                except Error as exc:
+                    if error is not None:
+                        raise error from exc
+                    raise
+            emit(result)
+    if error is not None:
+        raise error
+    assert result is not None
+    emit(result)
+    return result
+";
+    common::assert_matches_cpython_marshal(source, "normal_finally_retry_break_located_cleanup.py");
+}
+
+#[test]
+fn normal_finally_conditional_recovery_boolean_cleanup() {
+    let source = r"def f(factory, exists, emit, value):
+    output = None
+    published = False
+    try:
+        output = factory()
+        emit(output, value)
+        output.close()
+        published = True
+    except Error:
+        if not exists():
+            raise
+        published = True
+    finally:
+        if output is not None and not published:
+            output.cancel()
+    emit(output, value)
+    return value, output
+";
+    common::assert_matches_cpython_marshal(
+        source,
+        "normal_finally_conditional_recovery_boolean_cleanup.py",
+    );
+}
+
+#[test]
+fn normal_finally_conditional_recovery_single_condition_cleanup() {
+    let source = r"def f(factory, exists, emit, value):
+    output = None
+    published = False
+    try:
+        output = factory()
+        emit(output, value)
+        output.close()
+        published = True
+    except Error:
+        if not exists():
+            raise
+        published = True
+    finally:
+        if output is not None:
+            output.cancel()
+    emit(output, value)
+    return value, output
+";
+    common::assert_matches_cpython_marshal(
+        source,
+        "normal_finally_conditional_recovery_single_condition_cleanup.py",
+    );
+}
+
+#[test]
+fn normal_finally_conditional_recovery_no_recovery_suffix() {
+    let source = r"def f(factory, exists, emit, value):
+    output = None
+    published = False
+    try:
+        output = factory()
+        emit(output, value)
+        output.close()
+        published = True
+    except Error:
+        if not exists():
+            raise
+    finally:
+        if output is not None and not published:
+            output.cancel()
+    emit(output, value)
+    return value, output
+";
+    common::assert_matches_cpython_marshal(
+        source,
+        "normal_finally_conditional_recovery_no_recovery_suffix.py",
+    );
+}
+
+#[test]
+fn normal_finally_conditional_recovery_handler_controls() {
+    common::assert_matches_cpython_marshal(
+        r"def f(factory, exists, emit, value):
+    output = None
+    published = False
+    try:
+        output = factory()
+        emit(output, value)
+        output.close()
+        published = True
+    except Error as error:
+        if not exists():
+            raise
+        published = True
+    finally:
+        if output is not None and not published:
+            output.cancel()
+    emit(output, value)
+    return value, output
+",
+        "normal_finally_conditional_recovery_named_boolean_cleanup.py",
+    );
+    common::assert_matches_cpython_marshal(
+        r"def f(factory, exists, emit, value):
+    output = None
+    published = False
+    try:
+        output = factory()
+        emit(output, value)
+        output.close()
+        published = True
+    except Error:
+        raise
+    finally:
+        if output is not None and not published:
+            output.cancel()
+    emit(output, value)
+    return value, output
+",
+        "normal_finally_conditional_recovery_terminal_handler.py",
+    );
+}
+
+#[test]
+fn runtime_while_handler_cleanup_shape_both_conditional() {
+    let source = r#"def fill(state):
+    try:
+        while not state.stopped():
+            try:
+                item = next(state.iterator)
+            except StopIteration:
+                state.buffer.put(STOP)
+                break
+            state.buffer.put(item)
+    except Exception as error:
+        if not state.stopped():
+            state.buffer.put(wrap(error))
+            state.buffer.put(STOP)
+    finally:
+        if hasattr(state.iterator, "close"):
+            state.iterator.close()
+"#;
+    common::assert_matches_cpython_marshal(source, "runtime_while_handler_cleanup_shape.py");
+}
+
+#[test]
+fn runtime_while_handler_cleanup_shape_linear_handler() {
+    let source = r#"def fill(state):
+    try:
+        while not state.stopped():
+            try:
+                item = next(state.iterator)
+            except StopIteration:
+                state.buffer.put(STOP)
+                break
+            state.buffer.put(item)
+    except Exception as error:
+        state.buffer.put(wrap(error))
+        state.buffer.put(STOP)
+    finally:
+        if hasattr(state.iterator, "close"):
+            state.iterator.close()
+"#;
+    common::assert_matches_cpython_marshal(source, "runtime_while_handler_cleanup_shape.py");
+}
+
+#[test]
+fn runtime_while_handler_cleanup_shape_linear_cleanup() {
+    let source = r"def fill(state):
+    try:
+        while not state.stopped():
+            try:
+                item = next(state.iterator)
+            except StopIteration:
+                state.buffer.put(STOP)
+                break
+            state.buffer.put(item)
+    except Exception as error:
+        if not state.stopped():
+            state.buffer.put(wrap(error))
+            state.buffer.put(STOP)
+    finally:
+        state.iterator.close()
+";
+    common::assert_matches_cpython_marshal(source, "runtime_while_handler_cleanup_shape.py");
+}
+
+#[test]
+fn runtime_while_handler_cleanup_shape_both_linear() {
+    let source = r"def fill(state):
+    try:
+        while not state.stopped():
+            try:
+                item = next(state.iterator)
+            except StopIteration:
+                state.buffer.put(STOP)
+                break
+            state.buffer.put(item)
+    except Exception as error:
+        state.buffer.put(wrap(error))
+        state.buffer.put(STOP)
+    finally:
+        state.iterator.close()
+";
+    common::assert_matches_cpython_marshal(source, "runtime_while_handler_cleanup_shape.py");
+}
+
+#[test]
+fn terminal_handler_borrow_named_then_unnamed_asserts() {
+    common::assert_matches_cpython_marshal(
+        r"def f(run, values):
+    try:
+        run()
+    except ValueError as error:
+        assert False, f'bad: {error}'
+    except TimeoutError:
+        assert False, 'late'
+    found = [value for value in values if value]
+    assert found, 'empty'
+    return values, found
+",
+        "terminal_handler_borrow_named_then_unnamed_asserts.py",
+    );
+}
+
+#[test]
+fn terminal_handler_borrow_single_named_assert() {
+    common::assert_matches_cpython_marshal(
+        r"def f(run, values):
+    try:
+        run()
+    except ValueError as error:
+        assert False, f'bad: {error}'
+    found = [value for value in values if value]
+    assert found, 'empty'
+    return values, found
+",
+        "terminal_handler_borrow_single_named_assert.py",
+    );
+}
+
+#[test]
+fn terminal_handler_borrow_explicit_raise_handlers() {
+    common::assert_matches_cpython_marshal(
+        r"def f(run, values):
+    try:
+        run()
+    except ValueError as error:
+        raise RuntimeError(f'bad: {error}')
+    except TimeoutError:
+        raise RuntimeError('late')
+    found = [value for value in values if value]
+    assert found, 'empty'
+    return values, found
+",
+        "terminal_handler_borrow_explicit_raise_handlers.py",
+    );
+}
+
+#[test]
+fn terminal_handler_borrow_mixed_live_handler() {
+    common::assert_matches_cpython_marshal(
+        r"def f(run, values):
+    try:
+        run()
+    except ValueError as error:
+        assert False, f'bad: {error}'
+    except TimeoutError:
+        values = []
+    found = [value for value in values if value]
+    assert found, 'empty'
+    return values, found
+",
+        "terminal_handler_borrow_mixed_live_handler.py",
+    );
+}
+
+#[test]
+fn terminal_handler_borrow_following_name_return() {
+    common::assert_matches_cpython_marshal(
+        r"def f(run, values):
+    try:
+        run()
+    except ValueError as error:
+        assert False, f'bad: {error}'
+    except TimeoutError:
+        assert False, 'late'
+    return values
+",
+        "terminal_handler_borrow_following_name_return.py",
+    );
+}
+
+#[test]
+fn terminal_handler_borrow_mixed_false_last() {
+    common::assert_matches_cpython_marshal(
+        r"def f(run, values):
+    try:
+        run()
+    except ValueError as error:
+        values = [error]
+    except TimeoutError:
+        assert False, 'late'
+    found = [value for value in values if value]
+    assert found, 'empty'
+    return values, found
+",
+        "terminal_handler_borrow_mixed_false_last.py",
+    );
+}
+
+#[test]
+fn terminal_handler_borrow_all_live_handlers() {
+    common::assert_matches_cpython_marshal(
+        r"def f(run, values):
+    try:
+        run()
+    except ValueError as error:
+        values = [error]
+    except TimeoutError:
+        values = []
+    found = [value for value in values if value]
+    assert found, 'empty'
+    return values, found
+",
+        "terminal_handler_borrow_all_live_handlers.py",
+    );
+}

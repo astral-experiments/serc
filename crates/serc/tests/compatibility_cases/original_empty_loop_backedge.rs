@@ -1,6 +1,48 @@
 use crate::common;
 
 #[test]
+fn nested_for_else_pass_backedge_location() {
+    common::assert_matches_cpython_marshal(
+        r"def f(items, attempts, ready):
+    for attempt in attempts:
+        for item in items:
+            work(item)
+            if ready():
+                break
+        else:
+            prepare()
+            if not ready():
+                return attempt
+            else:
+                pass
+    return None
+",
+        "nested_for_else_pass_backedge_location.py",
+    );
+}
+
+#[test]
+fn preserves_nested_for_else_backedge_donors() {
+    for (name, tail) in [
+        ("conditional_pass", "if ready():\n    pass"),
+        ("conditional_return", "if not ready():\n    return attempt"),
+        (
+            "located_else",
+            "if not ready():\n    return attempt\nelse:\n    finish()",
+        ),
+    ] {
+        let source = format!(
+            "def f(items, attempts, ready):\n    for attempt in attempts:\n        for item in items:\n            work(item)\n            if ready():\n                break\n        else:\n            prepare()\n            {}\n    return None\n",
+            tail.replace('\n', "\n            "),
+        );
+        common::assert_matches_cpython_marshal(
+            &source,
+            &format!("nested_for_else_backedge_{name}.py"),
+        );
+    }
+}
+
+#[test]
 fn match_or_pass() {
     common::assert_matches_cpython_marshal(
         r"def f(items):

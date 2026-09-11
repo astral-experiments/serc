@@ -1,6 +1,30 @@
 use crate::common;
 
 #[test]
+fn matches_cpython_sync_with_trailing_constant_owner() {
+    for (filename, source) in [
+        (
+            "sync_with_trailing_constant.py",
+            "with manager:\n    work()\n    '''comment\n    spanning lines\n    '''\n",
+        ),
+        (
+            "nested_sync_with_trailing_constant.py",
+            "def f(manager):\n    try:\n        with manager:\n            work()\n            'comment'\n    except Exception:\n        recover()\n",
+        ),
+        (
+            "nested_if_constant_keeps_owner.py",
+            "with manager:\n    if condition:\n        work()\n        'comment'\n",
+        ),
+        (
+            "async_with_constant_keeps_owner.py",
+            "async def f(manager):\n    async with manager:\n        work()\n        'comment'\n",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
 fn matches_cpython_nop39_assert_false_handler() {
     let source = r#"def f(items):
     for item in items:

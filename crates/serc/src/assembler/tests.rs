@@ -1812,6 +1812,54 @@ fn optimization_pipeline(items: Vec<Item>) -> super::OptimizationPipeline {
 }
 
 #[test]
+fn backward_conditional_normalization_preserves_successor_labels() {
+    for labelled_successor in [false, true] {
+        let restart = super::Label(0);
+        let mut items = vec![
+            Item::Label(restart),
+            pass_instruction(LOAD_FAST, 0, 1),
+            Item::Instruction(Instruction::new(
+                POP_JUMP_IF_FALSE,
+                Operand::Backward(restart),
+                SourceLocation::new(1, 1, 0, 1),
+                None,
+            )),
+        ];
+        if labelled_successor {
+            items.push(Item::Label(super::Label(1)));
+        }
+        items.extend([
+            pass_instruction(NOT_TAKEN, 0, 1),
+            pass_instruction(LOAD_CONST, 0, 2),
+            pass_instruction(RETURN_VALUE, 0, 2),
+        ]);
+        let mut pipeline = optimization_pipeline(items);
+
+        pipeline.normalize_backward_conditionals().unwrap();
+
+        pipeline.graph.validate().unwrap();
+        for item in pipeline.graph.iter_items() {
+            if let Item::Instruction(instruction) = item
+                && let Operand::Forward(target) | Operand::Backward(target) = instruction.operand()
+            {
+                assert!(pipeline.graph.label_block(target).is_some());
+            }
+        }
+        assert_eq!(
+            graph_opcodes(&pipeline),
+            [
+                LOAD_FAST,
+                POP_JUMP_IF_TRUE,
+                NOT_TAKEN,
+                JUMP_BACKWARD,
+                LOAD_CONST,
+                RETURN_VALUE
+            ],
+        );
+    }
+}
+
+#[test]
 fn assertion_side_exit_fast_path_accepts_all_conditional_directions() {
     let targets = [
         super::Label(0),

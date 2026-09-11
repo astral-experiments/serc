@@ -71,7 +71,6 @@ mod tests {
             "other",
             "output",
             "package",
-            "pause",
             "python",
             "quiet",
             "remove",
@@ -94,6 +93,7 @@ mod tests {
                 "missing startup string {value:?}"
             );
         }
+        assert_eq!(is_preinterned_string("pause"), cfg!(unix));
         for value in COMPILER_INTERNED_STRINGS {
             assert!(
                 is_preinterned_string(value),

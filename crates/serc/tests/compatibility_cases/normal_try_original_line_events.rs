@@ -1,6 +1,71 @@
 use crate::common;
 
 #[test]
+fn matches_cpython_shared_inner_try_exit_line_events() {
+    for (name, tail) in [
+        ("call", "if inner:\n    work(value)"),
+        ("assignment", "if inner:\n    value = inner"),
+        (
+            "nested_conditions",
+            "if inner:\n    if value:\n        work(value)",
+        ),
+    ] {
+        let source = format!(
+            "def f(outer, inner, value, work):\n    try:\n        if outer:\n            try:\n                {}\n            except ValueError:\n                pass\n    except Exception:\n        work(None)\n    work(value)\n    return value\n",
+            tail.replace('\n', "\n                "),
+        );
+        common::assert_matches_cpython_marshal(
+            &source,
+            &format!("shared_inner_try_exit_{name}.py"),
+        );
+    }
+}
+
+#[test]
+fn matches_cpython_suspended_shared_inner_try_exit() {
+    let source = r"async def f(outer, inner, value, work):
+    try:
+        if outer:
+            try:
+                await work(value)
+                if inner:
+                    await work(inner)
+            except ValueError:
+                await work(None)
+                raise
+    except Exception:
+        await work(None)
+    await work(value)
+    return value
+";
+    common::assert_matches_cpython_marshal(source, "suspended_shared_inner_try_exit.py");
+}
+
+#[test]
+fn matches_cpython_borrows_after_shared_inner_try_exit() {
+    let source = r"def f(outer, inner, value, work):
+    try:
+        value = work(value)
+        if outer:
+            try:
+                outer = work(outer)
+                if inner:
+                    if value is None:
+                        value = []
+                    value.append(work(inner))
+            except Exception:
+                pass
+    except Exception:
+        return None
+    if len(value) == 0:
+        return None
+    work(value)
+    return [work(value), value, value]
+";
+    common::assert_matches_cpython_marshal(source, "borrows_after_shared_inner_try_exit.py");
+}
+
+#[test]
 fn matches_cpython_original_normal_try_line_events() {
     for (filename, source) in [
         (

@@ -727,24 +727,33 @@ impl LayoutAssembler {
         &self,
         jump_targets: &FxHashSet<Label>,
     ) -> FxHashSet<usize> {
+        use crate::target::opcodes::{LOAD_FAST, LOAD_FAST_BORROW};
+
         let mut result = FxHashSet::default();
         for origin in &self
             .exception_owner_provenance
             .original_normal_finally_arrays
         {
+            let authored_break_location = match origin.incoming.as_slice() {
+                [jump] if jump.fusion_policy.is_authored_break() && jump.location.line >= 0 => {
+                    Some(jump.location)
+                }
+                _ => None,
+            };
             if origin.incoming.is_empty()
                 || origin.incoming.iter().any(|jump| {
                     !crate::target::is_unconditional_jump(jump.opcode)
                         || jump.operand() != Operand::Forward(origin.entry)
                 })
-                || !self
+                || ((!self
                     .exception_owner_provenance
                     .source_boundaries
                     .contains(&origin.entry)
-                || !self
-                    .exception_owner_provenance
-                    .block_boundaries
-                    .contains(&origin.entry)
+                    || !self
+                        .exception_owner_provenance
+                        .block_boundaries
+                        .contains(&origin.entry))
+                    && authored_break_location.is_none())
             {
                 continue;
             }
@@ -759,7 +768,8 @@ impl LayoutAssembler {
             if labels.iter().copied().collect::<FxHashSet<_>>().len() != labels.len()
                 || labels.first() != Some(&origin.entry)
                 || labels.iter().any(|label| {
-                    jump_targets.contains(label)
+                    (jump_targets.contains(label)
+                        && !(authored_break_location.is_some() && *label == origin.entry))
                         || self.preserved_block_boundaries.contains(label)
                         || self
                             .exception_regions
@@ -828,8 +838,61 @@ impl LayoutAssembler {
             let [start] = starts.as_slice() else {
                 continue;
             };
-            let Some(current) = self.items.get(*start..*start + origin.prefix.len()) else {
-                continue;
+            let (current, end) = if authored_break_location.is_some() {
+                let original_labels = labels.iter().copied().collect::<FxHashSet<_>>();
+                let mut cursor = *start;
+                let mut current = Vec::with_capacity(origin.prefix.len());
+                let mut valid = true;
+                for _ in &origin.prefix {
+                    while let Some(Item::Label(label)) = self.items.get(cursor)
+                        && !original_labels.contains(label)
+                    {
+                        // The graph can label the already-emitted marker's
+                        // fallthrough. Such aliases do not add original cells.
+                        if jump_targets.contains(label)
+                            || self
+                                .exception_owner_provenance
+                                .block_boundaries
+                                .contains(label)
+                            || self
+                                .exception_owner_provenance
+                                .source_boundaries
+                                .contains(label)
+                            || self.preserved_block_boundaries.contains(label)
+                            || self
+                                .exception_owner_provenance
+                                .setups
+                                .iter()
+                                .any(|(setup, _)| setup == label)
+                            || self
+                                .exception_regions
+                                .iter()
+                                .any(|region| region.target == *label)
+                        {
+                            valid = false;
+                            break;
+                        }
+                        cursor += 1;
+                    }
+                    if !valid {
+                        break;
+                    }
+                    let Some(item) = self.items.get(cursor) else {
+                        valid = false;
+                        break;
+                    };
+                    current.push(*item);
+                    cursor += 1;
+                }
+                if !valid {
+                    continue;
+                }
+                (current, cursor)
+            } else {
+                let Some(current) = self.items.get(*start..*start + origin.prefix.len()) else {
+                    continue;
+                };
+                (current.to_vec(), *start + origin.prefix.len())
             };
             let Some(marker_at) = origin
                 .prefix
@@ -846,6 +909,32 @@ impl LayoutAssembler {
             };
             // Location propagation changes the retained POP_BLOCK's line, not its record identity.
             original_marker.location = marker.location;
+            if let Some(location) = authored_break_location {
+                // CP propagates its sole jump predecessor's location before
+                // NOP removal. A distinct next line retains this original slot.
+                let next = current[marker_at + 1..].iter().find_map(|item| match item {
+                    Item::Instruction(instruction) => Some(instruction),
+                    Item::Label(_) => None,
+                });
+                if marker.location != location
+                    || next.is_none_or(|next| {
+                        next.location.line < 0 || next.location.line == location.line
+                    })
+                {
+                    continue;
+                }
+                for (expected, current) in expected.iter_mut().zip(&current) {
+                    if let (Item::Instruction(expected), Item::Instruction(current)) =
+                        (expected, current)
+                        && expected.opcode == LOAD_FAST
+                        && current.opcode == LOAD_FAST_BORROW
+                    {
+                        // Borrowing follows marker normalization and changes
+                        // only this opcode, not the original instruction cell.
+                        expected.opcode = LOAD_FAST_BORROW;
+                    }
+                }
+            }
             if current != expected
                 || marker.opcode != NOP
                 || !marker.fusion_policy.is_converted_pop_block()
@@ -889,12 +978,13 @@ impl LayoutAssembler {
             if let Some(Item::Instruction(last)) = current.last()
                 && last.opcode == NOT_TAKEN
                 && last.exception_policy().exclusion() == super::ExceptionExclusion::None
-                && matches!(
+                && (matches!(
                     last.exception_policy().owner(),
                     NormalizedExceptionOwner::Absent | NormalizedExceptionOwner::DynamicCondition
-                )
+                ) || (authored_break_location.is_some()
+                    && last.exception_policy().owner() == NormalizedExceptionOwner::Present))
             {
-                let logical_end = self.items[..*start + current.len()]
+                let logical_end = self.items[..end]
                     .iter()
                     .filter(|item| matches!(item, Item::Instruction(_)))
                     .count();
