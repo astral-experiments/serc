@@ -24,6 +24,8 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) fusion_boundaries: FxHashSet<Label>,
     pub(super) setup_nop_boundaries: FxHashSet<Label>,
     pub(super) setup_nop_ranges: Vec<(Label, Label)>,
+    // Retained SETUPs emitted directly into an authored primitive conditional fallthrough.
+    pub(super) original_fallthrough_setups: FxHashSet<Label>,
     // One authored normal POP_BLOCK, not an extra synthetic end record or a copied exit.
     pub(super) retained_normal_pop_blocks: FxHashMap<Label, RetainedNormalPopBlock>,
     pub(super) original_normal_finally_arrays: Vec<OriginalNormalFinallyArray>,
@@ -2234,16 +2236,33 @@ impl LayoutAssembler {
                         && tail.late_removals == 0
                         && tail.post_compaction_fusions == 0
                         && let Some((start, _, setup_label)) = protected_suffix
-                        && self
+                        && ((self
                             .exception_owner_provenance
                             .setups
                             .first()
                             .is_some_and(|(first, _)| *first == setup_label)
-                        && !self.exception_regions.iter().any(|region| {
-                            label_positions
-                                .get(&region.start)
-                                .is_some_and(|position| *position < start)
-                        })
+                            && !self.exception_regions.iter().any(|region| {
+                                label_positions
+                                    .get(&region.start)
+                                    .is_some_and(|position| *position < start)
+                            }))
+                            // A later SETUP also owns a fresh original array when its
+                            // retained NOP is the only record before the protected body.
+                            // Earlier arrays cannot contribute stale slots across this
+                            // authored boundary, even if an enclosing region began earlier.
+                            || (start == original_array_start + 1
+                                && self
+                                    .exception_owner_provenance
+                                    .block_boundaries
+                                    .iter()
+                                    .chain(
+                                        &self
+                                            .exception_owner_provenance
+                                            .original_fallthrough_setups,
+                                    )
+                                    .any(|label| {
+                                        label_positions.get(label) == Some(&original_array_start)
+                                    })))
                     {
                         pending_fresh_null_append = Some(instruction_index + 1);
                     }

@@ -387,3 +387,83 @@ fn borrows_after_nested_async_manager_break_recovery() {
 ";
     common::assert_matches_cpython_marshal(source, "nested_async_manager_break_recovery.py");
 }
+
+#[test]
+fn nested_async_break_preserves_owned_finalizer_receivers() {
+    common::assert_matches_cpython_marshal(
+        r"async def f(client, terminal, worker, events, value, choose, emit):
+    try:
+        async with client:
+            with terminal:
+                worker.start()
+                try:
+                    async for event in events:
+                        terminal.update(event)
+                        if event.changed:
+                            status = event.status
+                            if choose(status if isinstance(status, str) else None):
+                                break
+                finally:
+                    worker.cancel()
+                    await worker.wait()
+            emit(value.first)
+            emit(value.second)
+    finally:
+        await worker.stop()
+    emit(value.third)
+",
+        "nested_async_break_finalizer_receivers.py",
+    );
+}
+
+#[test]
+fn nested_async_break_reconverges_call_argument_conditions() {
+    for condition in ["choose(event)", "choose(event if ready else None)"] {
+        let source = format!(
+            "async def f(events, worker, ready, choose):\n    try:\n        async for event in events:\n            if ready:\n                if {condition}:\n                    break\n    finally:\n        worker.cancel()\n        await worker.wait()\n    emit(worker)\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "nested_async_break_call_condition.py");
+    }
+}
+
+#[test]
+fn nested_async_break_retains_earlier_break_control() {
+    assert_nested_async_break_exit_control(
+        "if ready:\n                break\n            if choose(event):\n                if flag:\n                    break",
+    );
+}
+
+#[test]
+fn nested_async_break_retains_explicit_else_control() {
+    assert_nested_async_break_exit_control(
+        "if ready:\n                if choose(event):\n                    break\n                else:\n                    emit(event)",
+    );
+}
+
+#[test]
+fn nested_async_break_retains_nonterminal_work_control() {
+    assert_nested_async_break_exit_control(
+        "if ready:\n                if choose(event):\n                    break\n            emit(event)",
+    );
+}
+
+#[test]
+fn nested_async_break_preserves_conditional_expression_entry() {
+    assert_nested_async_break_exit_control(
+        "if ready:\n                if choose(event) if flag else ready:\n                    break",
+    );
+}
+
+#[test]
+fn nested_async_break_preserves_boolean_expression_entry() {
+    assert_nested_async_break_exit_control(
+        "if ready:\n                if flag and choose(event):\n                    break",
+    );
+}
+
+fn assert_nested_async_break_exit_control(body: &str) {
+    let source = format!(
+        "async def f(events, worker, ready, choose, flag):\n    try:\n        async for event in events:\n            {body}\n    finally:\n        worker.cancel()\n        await worker.wait()\n    emit(worker)\n"
+    );
+    common::assert_matches_cpython_marshal(&source, "nested_async_break_exit_controls.py");
+}

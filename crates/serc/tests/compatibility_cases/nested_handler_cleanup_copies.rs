@@ -97,3 +97,13 @@ fn preserves_nested_named_cleanup_copy_owners_at_loop_tail() {
         );
     }
 }
+
+#[test]
+fn matches_cpython_fresh_condition_slot_in_nested_retained_try() {
+    for header in ["def", "async def"] {
+        let source = format!(
+            "{header} f(items, service, enabled):\n    for item in items:\n        try:\n            if enabled:\n                try:\n                    removed = service.remove(item)\n                    if not removed:\n                        service.failed(item)\n                    else:\n                        replacement = service.create(item)\n                        if replacement is None:\n                            service.failed(item)\n                        else:\n                            service.ready(replacement)\n                except Exception as error:\n                    service.failed(error)\n        except Exception as error:\n            service.failed(error)\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "nested_retained_try_condition.py");
+    }
+}

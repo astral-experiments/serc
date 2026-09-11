@@ -3265,6 +3265,32 @@ impl Assembler {
 
     /// Identifies range splits that only exclude an authored SETUP NOP.
     pub(crate) fn record_setup_nop_boundaries(&mut self, start: Label, end: Label) {
+        // Capture the original fallthrough before CFG threading can invert its
+        // predecessor. The SETUP NOP is the first record of this distinct CP array.
+        let original_fallthrough = {
+            let mut instructions = self.linear_items().iter().rev().filter_map(|item| {
+                if let Item::Instruction(instruction) = item {
+                    Some(*instruction)
+                } else {
+                    None
+                }
+            });
+            matches!(
+                (instructions.next(), instructions.next(), instructions.next()),
+                (Some(nop), Some(marker), Some(condition))
+                    if nop.opcode == NOP
+                        && marker.opcode == NOT_TAKEN
+                        && self
+                            .exception_owner_provenance
+                            .original_primitive_condition_boundaries
+                            .contains(&condition)
+            )
+        };
+        if original_fallthrough {
+            self.exception_owner_provenance
+                .original_fallthrough_setups
+                .insert(start);
+        }
         self.exception_owner_provenance
             .setup_nop_boundaries
             .extend([start, end]);

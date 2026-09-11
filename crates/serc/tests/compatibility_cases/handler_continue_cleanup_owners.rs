@@ -235,3 +235,17 @@ fn returning_finally_keeps_existing_loop_override() {
         "returning_finally_keeps_existing_loop_override.py",
     );
 }
+
+#[test]
+fn handler_breaks_end_enclosing_tries_after_exception_cleanup() {
+    // The handler cleanup retains the middle try's owner. Removing the loop
+    // iterator happens afterward, while only the outer try remains active.
+    for (prefix, suspend) in [("", ""), ("async ", "await ")] {
+        for (name, value) in [("", "item"), (" as error", "error")] {
+            let source = format!(
+                "{prefix}def f(items, stop):\n    try:\n        for item in items:\n            try:\n                try:\n                    {suspend}work(item)\n                except ValueError{name}:\n                    observe({value})\n                    if stop:\n                        break\n            except TypeError:\n                recover()\n        {suspend}finish()\n    except RuntimeError:\n        report()\n    return None\n"
+            );
+            common::assert_matches_cpython_marshal(&source, "handler_break_enclosing_try_owner.py");
+        }
+    }
+}

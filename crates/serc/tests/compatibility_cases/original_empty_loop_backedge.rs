@@ -122,3 +122,71 @@ fn for_runtime_if() {
         "for_runtime_if.py",
     );
 }
+
+#[test]
+fn copied_match_condition_backedges_keep_their_original_order() {
+    for (filename, source) in [
+        (
+            "match_and_assignment_backedges.py",
+            r"def f(values, left, right):
+    result = None
+    for value in values:
+        match value:
+            case 1:
+                if left and right:
+                    result = value
+                    left = False
+                    right = True
+    return result
+",
+        ),
+        (
+            "match_and_nested_return_backedges.py",
+            r"def f(values, left, right, accept):
+    for value in values:
+        match value:
+            case 0:
+                return False
+            case 1:
+                if left and right:
+                    if accept(value):
+                        return True
+    return False
+",
+        ),
+        (
+            "nested_match_or_and_yield_backedges.py",
+            r"def f(groups, left, right):
+    for group in groups:
+        for value in group:
+            match value:
+                case [*items] | (*items,):
+                    if any(left(item) for item in items) and not any(
+                        right(item) for item in items
+                    ):
+                        yield value
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn shared_original_for_return_backedges_keep_threading() {
+    common::assert_matches_cpython_marshal(
+        r"def f(items, attempts, first, second):
+    for attempt in attempts:
+        for item in items:
+            work(item)
+            if first():
+                break
+        else:
+            prepare()
+            if first() and second():
+                return attempt
+    return None
+",
+        "compound_conditional_return.py",
+    );
+}

@@ -3211,6 +3211,10 @@ impl Compiler<'_> {
                 self.assembler
                     .last_instruction_location()
                     .unwrap_or_else(|| self.source_location(last.range()))
+            } else if matches!(last, Stmt::If(_)) {
+                // The nested branches share CPython's unlocated implicit return. Let exit
+                // copying assign each branch's predecessor location before line propagation.
+                SourceLocation::NONE
             } else {
                 self.source_location(last.range())
             };
@@ -8300,8 +8304,7 @@ impl Compiler<'_> {
                 &mut with_unwind_starts,
                 &mut region_unwind_starts,
             )?;
-            if continue_target.is_some()
-                && handlers.len() > first_handler
+            if handlers.len() > first_handler
                 && region_unwind_starts
                     .iter()
                     .skip(loop_exception_region_depth)
@@ -8310,7 +8313,8 @@ impl Compiler<'_> {
                 // Only regions unwound by this loop exit can consume the fallback.
                 // An unused label would split the unlocated continue from its cleanup.
                 // Each handler retires its own collector before POP_EXCEPT. Enclosing try
-                // bodies remain active through that cleanup and unwind before the continue.
+                // bodies remain active through that cleanup, then unwind before the
+                // continue jump or the break's iterator cleanup.
                 let start = self.assembler.label();
                 self.assembler.mark(start);
                 for (index, region_start) in region_unwind_starts.iter_mut().enumerate() {
@@ -10649,15 +10653,7 @@ impl Compiler<'_> {
         if has_break {
             self.assembler.mark(end);
             let has_conditional_tail_break = statement.orelse.is_empty()
-                && matches!(statement.body.last(), Some(Stmt::If(tail))
-                if tail.elif_else_clauses.is_empty()
-                    && early_condition_truthiness(&tail.test).is_none()
-                    && !expression_contains_inline_branch(&tail.test)
-                    && tail.body.split_last().is_some_and(|(last, leading)| {
-                        matches!(last, Stmt::Break(_))
-                            && (leading.is_empty()
-                                || suite_has_linear_borrow_fallthrough(leading))
-                    }));
+                && suite_ends_in_terminal_conditional_break(&statement.body);
             if (self
                 .control
                 .exceptions
@@ -21209,6 +21205,56 @@ fn suite_has_live_try_before_conditional_break(body: &[Stmt]) -> bool {
         }
     }
     false
+}
+
+/// Certifies runtime condition edges that enter the async break's iterator discard.
+fn condition_reaches_async_break_entry(expression: &Expr) -> bool {
+    if early_condition_truthiness(expression).is_some() || fold_constant(expression).is_some() {
+        return false;
+    }
+    match expression {
+        Expr::BoolOp(boolean) => boolean
+            .values
+            .iter()
+            .all(condition_reaches_async_break_entry),
+        Expr::If(conditional) => {
+            condition_reaches_async_break_entry(&conditional.test)
+                && condition_reaches_async_break_entry(&conditional.body)
+                && condition_reaches_async_break_entry(&conditional.orelse)
+        }
+        Expr::UnaryOp(unary) if unary.op == UnaryOp::Not => {
+            condition_reaches_async_break_entry(&unary.operand)
+        }
+        // Short-circuit edges enter the located iterator POP_TOP before the break's
+        // outgoing jump. They cannot bypass it and enter the following empty exit.
+        // Call argument branches also finish before the result's condition jump.
+        Expr::Call(_) => true,
+        _ => !expression_contains_inline_branch(expression),
+    }
+}
+
+/// Finds a terminal break behind nested runtime conditions with no alternative suite.
+fn suite_ends_in_terminal_conditional_break(body: &[Stmt]) -> bool {
+    let Some(Stmt::If(first)) = body.last() else {
+        return false;
+    };
+    let mut tail = first;
+    loop {
+        if !tail.elif_else_clauses.is_empty() || !condition_reaches_async_break_entry(&tail.test) {
+            return false;
+        }
+        let Some((last, leading)) = tail.body.split_last() else {
+            return false;
+        };
+        if !leading.is_empty() && !suite_has_linear_borrow_fallthrough(leading) {
+            return false;
+        }
+        match last {
+            Stmt::Break(_) => return true,
+            Stmt::If(nested) => tail = nested,
+            _ => return false,
+        }
+    }
 }
 
 fn suite_contains_borrow_reachable_conditional_loop_break(body: &[Stmt]) -> bool {

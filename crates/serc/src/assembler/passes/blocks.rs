@@ -3280,6 +3280,23 @@ impl OptimizationPipeline {
                 }) {
                     self.original_jump_head_targets.insert(copied_label);
                 }
+                // A copied entry must not combine one alias's ordinary-jump head with
+                // another alias's common-loop location certificate. Both facts must come
+                // from the same original label before the copy can thread as a backedge.
+                if copied.iter().find_map(|item| match item {
+                    Item::Instruction(instruction) => Some(instruction.opcode),
+                    Item::Label(_) => None,
+                }) == Some(JUMP_BACKWARD)
+                    && self.original_jump_head_targets.contains(&copied_label)
+                    && let Some(&location) = self.conditional_threading_targets.get(&copied_label)
+                    && !graph[target].items().iter().any(|item| {
+                        matches!(item, Item::Label(original)
+                            if self.original_jump_head_targets.contains(original)
+                                && self.conditional_threading_targets.get(original) == Some(&location))
+                    })
+                {
+                    self.original_jump_head_targets.remove(&copied_label);
+                }
                 // Exception-region labels can split one original cleanup array. Insert its
                 // copies after the whole array so the original still reaches its own jump.
                 if target != target_exit && target_has_unlocated_jump_eval_check {
