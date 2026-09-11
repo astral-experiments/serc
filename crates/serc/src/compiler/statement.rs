@@ -4695,6 +4695,67 @@ impl Compiler<'_> {
                 } else {
                     0
                 };
+                // A plain chain of unnamed handlers exposes one outer cleanup at a time.
+                // Saved scope depths certify that no manager, loop, ordinary try, or finally
+                // must be interleaved between those handler cleanups.
+                let unwinds_plain_nested_handlers = !return_is_overridden
+                    && self.context.target_specific_rules_enabled()
+                    && handler_count > 1
+                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                    && self.control.exceptions.active_exception_group_handlers == 0
+                    && self.control.withs.active_with_exits.is_empty()
+                    && self.control.loops.contexts.is_empty()
+                    && self
+                        .control
+                        .finally
+                        .active_return_finally_contexts
+                        .is_empty()
+                    && self.control.finally.active_loop_finally_contexts.is_empty()
+                    && self
+                        .control
+                        .finally
+                        .active_pass_finally_locations
+                        .is_empty()
+                    && self
+                        .control
+                        .finally
+                        .preserved_return_value_contexts
+                        .is_empty()
+                    && self.control.finally.copied_return_finally_preserved_values == 0
+                    && self.control.finally.active_finally_try_bodies == 0
+                    && self.control.finally.active_normal_finally_bodies == 0
+                    && self.control.finally.active_copied_finally_bodies == 0
+                    && self.control.finally.active_finally_end_blocks == 0
+                    && self.control.finally.active_overriding_finally_returns == 0
+                    && self
+                        .control
+                        .exceptions
+                        .active_exception_handlers
+                        .first()
+                        .is_some_and(|handler| {
+                            handler.try_body_depth == 0 && handler.exception_region_depth == 0
+                        })
+                    && self
+                        .control
+                        .exceptions
+                        .active_exception_handlers
+                        .iter()
+                        .all(|handler| {
+                            handler.name.is_none()
+                                && handler.with_depth == 0
+                                && handler.loop_depth == 0
+                                && handler.finally_end_depth == 0
+                        })
+                    && self
+                        .control
+                        .exceptions
+                        .active_exception_handlers
+                        .windows(2)
+                        .all(|pair| {
+                            pair[1].try_body_depth == pair[0].try_body_depth
+                                && pair[0].exception_region_depth.checked_add(1)
+                                    == Some(pair[1].exception_region_depth)
+                        });
                 // CPython keeps a nested handler's return cleanup protected by its enclosing
                 // try body. A return compiled in a newer try body under an outer handler has a
                 // deeper marker stack and must keep the existing ownerless unwind instead.
@@ -5116,7 +5177,7 @@ impl Compiler<'_> {
                         }
                         if preserve_tos {
                             let common_cleanup_start = (name.is_some()
-                                || (handler_count == 1
+                                || ((handler_count == 1 || unwinds_plain_nested_handlers)
                                     && self
                                         .control
                                         .exceptions
@@ -5162,11 +5223,12 @@ impl Compiler<'_> {
                                     true,
                                 );
                             }
-                            if handler_index == 0
-                                && let Some(start) = protected_outer_pop_except_start.take()
+                            if let Some((target, start)) = protected_outer_pop_except_start
+                                && target == handler_index
                             {
-                                // The inner handler's POP_EXCEPT and this outer SWAP share one
-                                // protected region in CPython's nested unnamed-handler return path.
+                                protected_outer_pop_except_start = None;
+                                // The immediately inner POP_EXCEPT and this handler's SWAP
+                                // share the owner exposed by popping that inner handler.
                                 let end = self.assembler.label();
                                 self.assembler.mark(end);
                                 self.assembler.add_exception_region(
@@ -5232,7 +5294,8 @@ impl Compiler<'_> {
                                         .with_depth)
                                 || self.control.exceptions.active_exception_handlers
                                     [handler_index]
-                                    .protect_outer_return_pop);
+                                    .protect_outer_return_pop
+                                || unwinds_plain_nested_handlers);
                         let protected_pop_except = (protects_outer_handler
                             || (!return_is_overridden
                                 && !preserves_enclosing_try_return_owner
@@ -5275,13 +5338,14 @@ impl Compiler<'_> {
                         if let Some(start) = protected_pop_except {
                             if protects_outer_handler
                                 && preserve_tos
-                                && handler_count == 2
-                                && handler_index == 1
-                                && self.control.exceptions.active_exception_handlers[0]
-                                    .name
-                                    .is_none()
+                                && (unwinds_plain_nested_handlers
+                                    || (handler_count == 2
+                                        && handler_index == 1
+                                        && self.control.exceptions.active_exception_handlers[0]
+                                            .name
+                                            .is_none()))
                             {
-                                protected_outer_pop_except_start = Some(start);
+                                protected_outer_pop_except_start = Some((handler_index - 1, start));
                             } else {
                                 let end = self.assembler.label();
                                 self.assembler.mark(end);
@@ -14763,6 +14827,43 @@ impl Compiler<'_> {
                             && manager.items.len() == 1
                             && !expression_contains_inline_branch(&manager.items[0].context_expr)
                             && suite_has_linear_borrow_fallthrough(&manager.body)));
+        // A single false edge retains a located join after the inner manager.
+        // Linear cleanup before the condition does not turn that join into an
+        // unowned manager-pop marker, including in a synchronous generator.
+        let located_manager_exit = preserve_exit_nop
+            && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && self.control.loops.contexts.is_empty()
+            && self.control.withs.active_with_exits.len() == 1
+            && self.control.exceptions.active_exception_handlers.is_empty()
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
+            && statement.handlers.is_empty()
+            && statement.orelse.is_empty()
+            && statement.finalbody.split_last().is_some_and(|(last, leading)| {
+                (leading.is_empty() || suite_has_linear_borrow_fallthrough(leading))
+                    && !suite_contains_yield(leading)
+                    && matches!(last, Stmt::If(tail)
+                        if tail.elif_else_clauses.is_empty()
+                            && condition_has_only_runtime_tests(&tail.test)
+                            && !expression_suspends_current_scope(&tail.test)
+                            && condition_jump_target_count(&tail.test, false) == 1
+                            && matches!(nested_if_exit_location(tail, false),
+                                Some(NestedIfExitLocation::Located(_)))
+                            && matches!(tail.body.as_slice(), [Stmt::With(manager)]
+                                if !manager.is_async
+                                    && manager.items.len() == 1
+                                    && !expression_contains_inline_branch(&manager.items[0].context_expr)
+                                    && !expression_suspends_current_scope(&manager.items[0].context_expr)
+                                    && suite_has_linear_borrow_fallthrough(&manager.body)
+                                    && !suite_contains_yield(&manager.body)))
+            });
+        let shared_manager_exit = shared_manager_exit || located_manager_exit;
         // Boolean false edges can leave the shared join unlocated. A chained
         // comparison instead retains its located conditional NOP.
         let drop_shared_manager_exit_nop = shared_manager_exit

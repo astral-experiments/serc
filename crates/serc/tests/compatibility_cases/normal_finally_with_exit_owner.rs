@@ -67,3 +67,23 @@ fn preserves_finally_exits_with_one_reachable_arm() {
         }
     }
 }
+
+#[test]
+fn preserves_outer_manager_owner_on_conditional_finally_manager_joins() {
+    for body in ["work()", "yield value"] {
+        for leading in [
+            "",
+            "            cleanup()\n            flush()\n            seek(0)\n",
+        ] {
+            for condition in ["flag", "flag is not None"] {
+                let source = format!(
+                    "def f(outer, inner, flag, value):\n    with outer():\n        try:\n            {body}\n        finally:\n{leading}            if {condition}:\n                with inner() as resource:\n                    result = resource.read()\n                    work(result)\n"
+                );
+                common::assert_matches_cpython_marshal(
+                    &source,
+                    "conditional_finally_manager_join.py",
+                );
+            }
+        }
+    }
+}

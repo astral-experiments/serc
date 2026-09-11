@@ -136,3 +136,39 @@ fn preserves_direct_nested_handler_scope_boundaries() {
         common::assert_matches_cpython_marshal(source, "nested_handler_scope_boundary.py");
     }
 }
+
+#[test]
+fn matches_cpython_deeper_unnamed_handler_return_owners() {
+    for handler_depth in [2, 3] {
+        for returned in ["value", "None"] {
+            let mut body = format!("return {returned}\n");
+            for _ in 0..handler_depth {
+                body = format!("try:\n    work()\nexcept Error:\n{}", indent(&body));
+            }
+            let source = format!("def f(value):\n{}", indent(&body));
+            common::assert_matches_cpython_marshal(&source, "deeper_unnamed_handler_return.py");
+        }
+    }
+}
+
+#[test]
+fn matches_cpython_inner_try_returns_through_unnamed_handler_chain() {
+    for handler_depth in [2, 3] {
+        for conditional in [false, true] {
+            let returned = if conditional {
+                "if flag:\n    return read(value)\n"
+            } else {
+                "return read(value)\n"
+            };
+            let mut body = format!("try:\n{}except LastError:\n    raise\n", indent(returned));
+            for _ in 0..handler_depth {
+                body = format!(
+                    "try:\n    return read(value)\nexcept Error:\n{}",
+                    indent(&body),
+                );
+            }
+            let source = format!("def f(value, flag):\n{}", indent(&body));
+            common::assert_matches_cpython_marshal(&source, "unnamed_handler_inner_try_return.py");
+        }
+    }
+}
