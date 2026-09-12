@@ -204,3 +204,14 @@ fn handler_returns_keep_outer_try_owner_through_iterators() {
         }
     }
 }
+
+#[test]
+fn call_finally_preserves_inner_iterator_cleanup_owner() {
+    for source in [
+        "def f(items, value):\n    try:\n        for item in items:\n            return value\n    except ValueError:\n        recover()\n    finally:\n        cleanup()\n",
+        "async def f(items, value, manager):\n    try:\n        async with manager:\n            for item in items:\n                try:\n                    return value\n                except ValueError:\n                    recover()\n    finally:\n        cleanup()\n",
+        "def f(items, value):\n    try:\n        for item in items:\n            try:\n                return value\n            except ValueError:\n                recover()\n    finally:\n        cleanup()\n",
+    ] {
+        common::assert_matches_cpython_marshal(source, "call_finally_iterator_owner.py");
+    }
+}

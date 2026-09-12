@@ -5663,6 +5663,23 @@ impl Compiler<'_> {
                     // Managers already unwound above no longer surround these iterators.
                     let retained_managers_surround_finally =
                         remaining_with == finally_context.with_depth;
+                    // These iterators were created in the same manager that is
+                    // still pending here, before any inner ordinary try began.
+                    let retained_manager_surrounds_iterators = nested_call_finally_return
+                        && remaining_with > finally_context.with_depth
+                        && finally_context.loop_depth < next_loop
+                        && self.control.loops.contexts[finally_context.loop_depth..next_loop]
+                            .iter()
+                            .any(|context| context.iterator_cleanup != IteratorCleanup::None)
+                        && self.control.loops.contexts[finally_context.loop_depth..next_loop]
+                            .iter()
+                            .filter(|context| context.iterator_cleanup != IteratorCleanup::None)
+                            .all(|context| {
+                                context.with_depth == remaining_with
+                                    && context.exception_region_depth
+                                        == self.control.withs.active_with_exits[remaining_with - 1]
+                                            .exception_region_depth
+                            });
                     let iterator_cleanup_start = self.assembler.label();
                     self.assembler.mark(iterator_cleanup_start);
                     self.emit_return_loop_iterator_cleanup(
@@ -5673,7 +5690,8 @@ impl Compiler<'_> {
                             || (tracks_finally_region_unwinds
                                 && handler_count == 0
                                 && (self.control.withs.active_with_exits.is_empty()
-                                    || retained_managers_surround_finally)
+                                    || retained_managers_surround_finally
+                                    || retained_manager_surrounds_iterators)
                                 && self
                                     .control
                                     .finally
@@ -5694,6 +5712,22 @@ impl Compiler<'_> {
                         && self.control.exceptions.active_exception_handlers.is_empty()
                         && matches!(statement.value.as_deref(), Some(Expr::Name(_)))
                         && finally_context.loop_depth < next_loop
+                        // A deeper collector or a manager still awaiting its exit
+                        // owns these iterator cells. Do not cover that exact owner
+                        // with the synthetic outer-finally region. Mixed-owner
+                        // intervals and while-only contexts retain existing behavior.
+                        && !(self.control.loops.contexts[finally_context.loop_depth..next_loop]
+                            .iter()
+                            .any(|context| context.iterator_cleanup != IteratorCleanup::None)
+                            && self.control.loops.contexts[finally_context.loop_depth..next_loop]
+                                .iter()
+                                .filter(|context| context.iterator_cleanup != IteratorCleanup::None)
+                                .all(|context| {
+                                    context.exception_region_depth
+                                        > finally_context.exception_region_depth + 1
+                                        || (context.with_depth > finally_context.with_depth
+                                            && remaining_with >= context.with_depth)
+                                }))
                     {
                         self.assembler.add_exception_region(
                             iterator_cleanup_start,
@@ -11674,6 +11708,41 @@ impl Compiler<'_> {
             return Err(unsupported("try statement without handlers"));
         }
 
+        // This is the handler half of one outer try/finally. Its synchronous
+        // iterator exhaustion retains the located normal-exit NOP before cleanup.
+        let recovery_for_exit_reaches_finally = matches!(self.unit.scope, Scope::Function { .. })
+            && !statement.is_star
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && self.control.loops.contexts.is_empty()
+            && !self.control.in_exception_handler()
+            && self.control.withs.active_with_exits.is_empty()
+            && self.control.withs.active_with_region_exclusions.is_empty()
+            && self.control.finally.active_copied_finally_bodies == 0
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
+            && self.control.finally.active_finally_try_bodies == 1
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .len()
+                == 1
+            && statement.orelse.is_empty()
+            && matches!(statement.finalbody.as_slice(), [Stmt::Expr(_)])
+            && suite_has_linear_borrow_fallthrough(&statement.finalbody)
+            && matches!(statement.handlers.as_slice(), [handler]
+            if handler.as_except_handler().is_some_and(|handler| {
+                handler.type_.is_some()
+                    && handler.name.is_some()
+                    && suite_ends_in_linear_recovery_for(&handler.body)
+            }))
+            && matches!(statement.body.as_slice(), [Stmt::For(loop_statement)]
+                if !loop_statement.is_async
+                    && loop_statement.orelse.is_empty()
+                    && !expression_contains_inline_branch(&loop_statement.iter)
+                    && !expression_contains_inline_branch(&loop_statement.target)
+                    && suite_ends_in_recovery_handler_break(&loop_statement.body));
+
         let base_depth = self.control.stack.depth;
         let direct_return_handler_try_with_depth = (self
             .control
@@ -13130,11 +13199,13 @@ impl Compiler<'_> {
                 // is retained as the loop cleanup's source-position NOP.
                 self.assembler
                     .preserve_redundant_jump_nop_after_threading(normal_exit);
-                if matches!(statement.body.last(), Some(Stmt::For(loop_statement))
-                    if !loop_statement.orelse.is_empty()
-                        && suite_has_linear_borrow_fallthrough(&loop_statement.orelse))
+                if recovery_for_exit_reaches_finally
+                    || matches!(statement.body.last(), Some(Stmt::For(loop_statement))
+                        if !loop_statement.orelse.is_empty()
+                            && suite_has_linear_borrow_fallthrough(&loop_statement.orelse))
                 {
-                    // The else suite supplies a live fallthrough into the retained exit NOP.
+                    // Either certified iterator exhaustion or the else suite supplies
+                    // a live fallthrough into the retained exit NOP.
                     self.assembler
                         .mark_retained_nop_borrow_fallthrough_if_unblocked(normal_exit);
                 }
@@ -22099,6 +22170,56 @@ fn suite_has_structured_live_break(body: &[Stmt]) -> bool {
             && conditional_count == 1;
     }
     false
+}
+
+// A simple recovery loop leaves its located iterator cleanup before a following
+// named-handler exit. Its prefix cannot introduce another control-flow join.
+fn suite_ends_in_linear_recovery_for(body: &[Stmt]) -> bool {
+    let Some((Stmt::For(recovery), leading)) = body.split_last() else {
+        return false;
+    };
+    !recovery.is_async
+        && recovery.orelse.is_empty()
+        && matches!(recovery.iter.as_ref(), Expr::Name(_))
+        && matches!(recovery.target.as_ref(), Expr::Name(_))
+        && (leading.is_empty() || suite_has_linear_borrow_fallthrough(leading))
+        && matches!(recovery.body.as_slice(), [Stmt::Expr(expression)]
+            if simple_cleanup_call(&expression.value))
+}
+
+// This authored break exits the enclosing for after the inner named handler and
+// recovery iterator have retired. It can enter the separately certified cleanup.
+fn suite_ends_in_recovery_handler_break(body: &[Stmt]) -> bool {
+    let Some((Stmt::Try(protected), leading)) = body.split_last() else {
+        return false;
+    };
+    if protected.is_star
+        || !protected.orelse.is_empty()
+        || !protected.finalbody.is_empty()
+        || !(leading.is_empty() || suite_has_linear_borrow_fallthrough(leading))
+        || !suite_has_linear_borrow_fallthrough(&protected.body)
+    {
+        return false;
+    }
+    let [interrupted, other] = protected.handlers.as_slice() else {
+        return false;
+    };
+    let (Some(interrupted), Some(other)) =
+        (interrupted.as_except_handler(), other.as_except_handler())
+    else {
+        return false;
+    };
+    interrupted.type_.is_some()
+        && interrupted.name.is_some()
+        && other.type_.is_some()
+        && other.name.is_some()
+        && suite_has_linear_borrow_fallthrough(&other.body)
+        && interrupted
+            .body
+            .split_last()
+            .is_some_and(|(last, leading)| {
+                matches!(last, Stmt::Break(_)) && suite_ends_in_linear_recovery_for(leading)
+            })
 }
 
 // Certify a live, non-tail break without interpreting arbitrary control flow. The

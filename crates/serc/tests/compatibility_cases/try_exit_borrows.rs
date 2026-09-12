@@ -4211,3 +4211,19 @@ fn matches_cpython_iterator_break_before_split_try_loop_tail() {
         "unsplit_try_loop_tail.py",
     );
 }
+
+#[test]
+fn named_recovery_for_break_reaches_finally() {
+    common::assert_matches_cpython_marshal(
+        "def f(executor, futures, executions):\n    interruption = None\n    try:\n        for future in completed(futures):\n            name = futures[future]\n            try:\n                executions[name] = result(future.result())\n            except Interrupted as error:\n                executions[name] = failed(error)\n                interruption = error\n                for pending in futures:\n                    pending.cancel()\n                break\n            except BaseException as error:\n                executions[name] = failed(error)\n    except Interrupted as error:\n        interruption = error\n        for future in futures:\n            future.cancel()\n    finally:\n        executor.shutdown(wait=True, cancel_futures=interruption is not None)\n    return executions\n",
+        "named_recovery_for_break_reaches_finally.py",
+    );
+}
+
+#[test]
+fn named_recovery_for_break_with_linear_notification() {
+    common::assert_matches_cpython_marshal(
+        "def f(executor, futures, executions):\n    interruption = None\n    try:\n        for future in completed(futures):\n            name = futures[future]\n            try:\n                executions[name] = result(future.result())\n            except Interrupted as error:\n                executions[name] = failed(error)\n                interruption = error\n                notify()\n                for pending in futures:\n                    pending.cancel()\n                break\n            except BaseException as error:\n                executions[name] = failed(error)\n    except Interrupted as error:\n        interruption = error\n        notify()\n        for future in futures:\n            future.cancel()\n    finally:\n        executor.shutdown(wait=True, cancel_futures=interruption is not None)\n    return executions\n",
+        "named_recovery_for_break_with_linear_notification.py",
+    );
+}
