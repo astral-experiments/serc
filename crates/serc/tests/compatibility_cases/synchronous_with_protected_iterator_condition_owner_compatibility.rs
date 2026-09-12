@@ -225,3 +225,19 @@ fn atomic_loop_tail_exclusions_subsume_only_their_marker() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn normal_finally_none_marker_preserves_compacted_try_prefix() {
+    for (source, filename) in [
+        (
+            "def f(manager, flag, first, second, third):\n    def capture():\n        return flag\n    with manager:\n        try:\n            left = int(first.value)\n            middle = int(second.value)\n            right = int(third.value)\n        finally:\n            if flag is not None:\n                flag.close()\n    return left, middle, right, capture\n",
+            "normal_finally_prior_try_owner.py",
+        ),
+        (
+            "def f(manager, flag, metric, ready):\n    def capture():\n        return flag\n    with manager:\n        try:\n            if ready:\n                begin()\n            else:\n                prepare()\n            a = int(metric.value)\n            b = int(metric.value)\n            c = int(metric.value)\n            d = int(metric.value)\n            e = int(metric.value)\n            f = int(metric.value)\n            g = int(metric.value)\n        finally:\n            if flag is not None:\n                flag.close()\n    return a, b, c, d, e, f, g, capture\n",
+            "normal_finally_prior_try_join.py",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

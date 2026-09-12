@@ -2575,14 +2575,55 @@ impl LayoutAssembler {
                             },
                         );
                     }
+                    // Resolve the exact normal-finally None prefix before a marker's
+                    // range-end label can erase the preceding try's array certificate.
+                    let original_none_marker =
+                        if matches!(instruction.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+                            && owner_history_exact
+                            && retained_epoch_known
+                            && pop_slot_epoch_known
+                            && tail.insertions == 0
+                            && tail.late_removals == 0
+                            && tail.post_compaction_fusions == 0
+                            && instruction_index > 0
+                            && ended_owned_prefix.is_some_and(|(start, end, _, _)| {
+                                start >= original_array_start && end == instruction_index - 1
+                            })
+                            && ended_pop_slot.is_some_and(|(start, _, width)| {
+                                start == instruction_index - 1 && width == 1
+                            })
+                            && self
+                                .exception_owner_provenance
+                                .normal_finally_none_prefixes
+                                .iter()
+                                .any(|(_, original_load, original_condition)| {
+                                    let load = *indexed_instructions[instruction_index - 1];
+                                    let mut expected_load = *original_load;
+                                    expected_load
+                                        .local_policy
+                                        .add_hidden_exception_owner_slots(1);
+                                    if load.opcode == crate::target::opcodes::LOAD_FAST_BORROW {
+                                        expected_load.opcode = load.opcode;
+                                    }
+                                    instruction == original_condition && load == expected_load
+                                })
+                        {
+                            indexed_instructions
+                                .get(instruction_index + 1)
+                                .filter(|marker| marker.opcode == NOT_TAKEN)
+                                .map(|marker| (instruction_index + 1, **marker))
+                        } else {
+                            None
+                        };
                     // A normal cleanup can share its original array with the preceding try.
                     // If compaction skips the entire cleanup suffix, the marker reuses a slot
                     // in that earlier protected prefix, rather than its current condition.
-                    if instruction.opcode == NOT_TAKEN
-                        && instruction.exception_policy().exclusion()
-                            == super::ExceptionExclusion::None
+                    if let Some((marker_index, marker)) = (instruction.opcode == NOT_TAKEN)
+                        .then_some((instruction_index, *instruction))
+                        .or(original_none_marker)
+                        && marker.exception_policy().exclusion() == super::ExceptionExclusion::None
                         && matches!(
-                            instruction.exception_policy().owner(),
+                            marker.exception_policy().owner(),
                             NormalizedExceptionOwner::Absent
                                 | NormalizedExceptionOwner::Present
                                 | NormalizedExceptionOwner::DynamicCondition
@@ -2600,7 +2641,7 @@ impl LayoutAssembler {
                         {
                             (
                                 tail.post_compaction_fusions,
-                                instruction_index - end + tail.post_compaction_fusions
+                                marker_index - end + tail.post_compaction_fusions
                                     - end_tail.post_compaction_fusions,
                                 end - start + end_tail.post_compaction_fusions
                                     - start_tail.post_compaction_fusions,
@@ -2608,8 +2649,7 @@ impl LayoutAssembler {
                         } else {
                             (
                                 tail.early_removals,
-                                instruction_index - end + tail.early_removals
-                                    - end_tail.early_removals,
+                                marker_index - end + tail.early_removals - end_tail.early_removals,
                                 end - start + end_tail.early_removals - start_tail.early_removals,
                             )
                         };
@@ -2623,15 +2663,19 @@ impl LayoutAssembler {
                             && let Some(region) =
                                 self.uniform_exception_owner(start, end, &label_positions)
                         {
-                            owners.insert(
-                                instruction_index,
-                                ExceptionOwnerDecision {
-                                    has_owner: true,
-                                    source_region: Some(region),
-                                    definitive: true,
-                                    override_existing: true,
-                                },
-                            );
+                            if marker_index == instruction_index {
+                                owners.insert(
+                                    instruction_index,
+                                    ExceptionOwnerDecision {
+                                        has_owner: true,
+                                        source_region: Some(region),
+                                        definitive: true,
+                                        override_existing: true,
+                                    },
+                                );
+                            } else {
+                                pending_compacted_append = Some((marker_index, region));
+                            }
                         }
                     }
                     // After fusion, the stale suffix is the pre-fusion live array.
