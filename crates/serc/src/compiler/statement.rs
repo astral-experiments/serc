@@ -4974,10 +4974,10 @@ impl Compiler<'_> {
                                         .active_exception_region_exclusions
                                         .len()
                         });
-                // A handler inside an ordinary try can return through an older iterator.
-                // Restore the handler first, pop that inner try before the iterator, and
-                // retain each surrounding try until its own lexical unwind boundary.
-                let tracks_handler_enclosing_iterator_unwinds = !return_is_overridden
+                // A handler restores its exception state before retiring an enclosing try.
+                // Preserve the existing older-iterator path, and also track an ordinary try
+                // when another try entered inside the handler must unwind before POP_EXCEPT.
+                let tracks_handler_enclosing_try_unwinds = !return_is_overridden
                     && preserve_tos
                     && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
                     && self.context.target_specific_rules_enabled()
@@ -5015,19 +5015,32 @@ impl Compiler<'_> {
                                 && handler.with_depth == 0
                                 && handler.finally_end_depth == 0
                                 && handler.loop_depth == self.control.loops.contexts.len()
-                                && handler.try_body_depth
+                                && ((handler.try_body_depth
                                     == self.control.exceptions.active_try_marker_slots.len()
-                                && self
-                                    .control
-                                    .exceptions
-                                    .active_exception_region_exclusions
-                                    .len()
-                                    == handler.exception_region_depth + 1
-                                && self.control.loops.contexts.iter().any(|context| {
-                                    context.iterator_cleanup != IteratorCleanup::None
-                                        && context.exception_region_depth
-                                            < handler.exception_region_depth
-                                })
+                                    && self
+                                        .control
+                                        .exceptions
+                                        .active_exception_region_exclusions
+                                        .len()
+                                        == handler.exception_region_depth + 1
+                                    && self.control.loops.contexts.iter().any(|context| {
+                                        context.iterator_cleanup != IteratorCleanup::None
+                                            && context.exception_region_depth
+                                                < handler.exception_region_depth
+                                    }))
+                                    || (handler.try_body_depth > 0
+                                        && handler.try_body_depth
+                                            <= self
+                                                .control
+                                                .exceptions
+                                                .active_try_marker_slots
+                                                .len()
+                                        && self
+                                            .control
+                                            .exceptions
+                                            .active_exception_region_exclusions
+                                            .len()
+                                            > handler.exception_region_depth))
                         });
                 let tracks_iterator_region_unwinds = !return_is_overridden
                     && handler_count == 0
@@ -5058,7 +5071,7 @@ impl Compiler<'_> {
                                     .len()
                     });
                 let mut handler_region_unwind_starts = ((tracks_iterator_region_unwinds
-                    || tracks_handler_enclosing_iterator_unwinds
+                    || tracks_handler_enclosing_try_unwinds
                     || tracks_handler_iterator_region_unwinds
                     || tracks_finally_region_unwinds
                     || unwinds_finally_end_inside_handler
@@ -5988,7 +6001,7 @@ impl Compiler<'_> {
                     protected_iterator_start,
                     preserve_tos,
                     if tracks_iterator_region_unwinds
-                        || tracks_handler_enclosing_iterator_unwinds
+                        || tracks_handler_enclosing_try_unwinds
                         || (tracks_handler_iterator_region_unwinds && unwinds_return_finally)
                     {
                         handler_region_unwind_starts.as_deref_mut()
@@ -14356,24 +14369,55 @@ impl Compiler<'_> {
                             self.assembler.mark(start);
                             start
                         });
-                    let exception_policy = if handler_body_has_instructions
+                    let exclude_nested_handler_exit = handler_body_has_instructions
                         && nested_in_final_outer_try_statement
                         && self
                             .control
                             .finally
                             .active_pass_finally_locations
                             .is_empty()
-                        && !protected_loop_value_return
-                    {
-                        ExceptionPolicy::EXCLUDE_ALWAYS
-                    } else {
-                        ExceptionPolicy::default()
-                    };
+                        && !protected_loop_value_return;
+                    let retain_inner_manager_owner = exclude_nested_handler_exit
+                        && self
+                            .control
+                            .withs
+                            .active_with_exits
+                            .last()
+                            .is_some_and(|context| {
+                                context.exception_region_depth
+                                    == self
+                                        .control
+                                        .exceptions
+                                        .active_exception_region_exclusions
+                                        .len()
+                            });
+                    let ordinary_exit_start = retain_inner_manager_owner.then(|| {
+                        let start = self.assembler.label();
+                        self.assembler.mark(start);
+                        start
+                    });
+                    let exception_policy =
+                        if exclude_nested_handler_exit && !retain_inner_manager_owner {
+                            ExceptionPolicy::EXCLUDE_ALWAYS
+                        } else {
+                            ExceptionPolicy::default()
+                        };
                     let handler_exit = self.emit_jump_forward_instruction_with_exception_policy(
                         JUMP_FORWARD,
                         end,
                         exception_policy,
                     )?;
+                    if let Some(start) = ordinary_exit_start {
+                        // The nested exit drops ordinary try owners, but a manager entered
+                        // inside those tries remains active across the handler continuation.
+                        let end = self.assembler.label();
+                        self.assembler.mark(end);
+                        for exclusions in
+                            &mut self.control.exceptions.active_exception_region_exclusions
+                        {
+                            exclusions.push((start, end));
+                        }
+                    }
                     if let Some(start) = trailing_handler_exit_exclusion_start {
                         let exclusion_end = self.assembler.label();
                         self.assembler.mark(exclusion_end);

@@ -277,3 +277,156 @@ fn matches_cpython_early_compaction_return_nop_cell() {
         "early_return_nop_before_cell.py",
     );
 }
+
+#[test]
+fn matches_cpython_nested_fallback_handler_return_owners() {
+    common::assert_matches_cpython_marshal(
+        r"def f(ready):
+    try:
+        if ready:
+            try:
+                return primary()
+            except ValueError:
+                return fallback()
+        finish()
+    except Exception:
+        recover()
+",
+        "fallback_handler_inner0_loop0.py",
+    );
+    common::assert_matches_cpython_marshal(
+        r"def f(items, ready):
+    for item in items:
+        try:
+            if ready:
+                try:
+                    return primary()
+                except ValueError:
+                    return fallback()
+            finish()
+        except Exception:
+            recover()
+",
+        "fallback_handler_inner0_loop1.py",
+    );
+    common::assert_matches_cpython_marshal(
+        r"def f(ready):
+    try:
+        if ready:
+            try:
+                return primary()
+            except ValueError:
+                try:
+                    return fallback()
+                except LookupError:
+                    pass
+        finish()
+    except Exception:
+        recover()
+",
+        "fallback_handler_inner1_loop0.py",
+    );
+    common::assert_matches_cpython_marshal(
+        r"def f(items, ready):
+    for item in items:
+        try:
+            if ready:
+                try:
+                    return primary()
+                except ValueError:
+                    try:
+                        return fallback()
+                    except LookupError:
+                        pass
+            finish()
+        except Exception:
+            recover()
+",
+        "fallback_handler_inner1_loop1.py",
+    );
+    common::assert_matches_cpython_marshal(
+        r"def f():
+    try:
+        return primary()
+    except ValueError:
+        try:
+            return fallback()
+        except LookupError:
+            pass
+",
+        "fallback_handler_no_outer_try.py",
+    );
+}
+
+#[test]
+fn matches_cpython_named_handler_exit_retains_inner_manager_owner() {
+    common::assert_matches_cpython_marshal(
+        r"async def f(manager):
+    try:
+        with manager:
+            try:
+                await work()
+            except Exception as error:
+                report(error)
+                record(error)
+            return await finish()
+    except Exception:
+        return None
+",
+        "manager_handler_with_outer1.py",
+    );
+    common::assert_matches_cpython_marshal(
+        r"async def f(manager):
+    with manager:
+        try:
+            await work()
+        except Exception as error:
+            report(error)
+            record(error)
+        return await finish()
+",
+        "manager_handler_with_outer0.py",
+    );
+    common::assert_matches_cpython_marshal(
+        r"async def f(manager):
+    try:
+        async with manager:
+            try:
+                await work()
+            except Exception as error:
+                report(error)
+                record(error)
+            return await finish()
+    except Exception:
+        return None
+",
+        "manager_handler_async_with_outer1.py",
+    );
+    common::assert_matches_cpython_marshal(
+        r"async def f(manager):
+    async with manager:
+        try:
+            await work()
+        except Exception as error:
+            report(error)
+            record(error)
+        return await finish()
+",
+        "manager_handler_async_with_outer0.py",
+    );
+    common::assert_matches_cpython_marshal(
+        r"async def f(manager):
+    with manager:
+        try:
+            try:
+                await work()
+            except Exception as error:
+                report(error)
+                record(error)
+            return await finish()
+        except Exception:
+            return None
+",
+        "manager_before_outer_try.py",
+    );
+}
