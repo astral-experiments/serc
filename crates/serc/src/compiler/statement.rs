@@ -5542,28 +5542,36 @@ impl Compiler<'_> {
                     self.assembler.set_location(unwind_location);
                     if return_finally_contexts.len() == 1
                         && handler_count == 0
-                        && self.control.exceptions.active_try_marker_slots.len()
-                            == finally_context.try_body_depth + 1
+                        && let Some(ordinary_try_count) = self
+                            .control
+                            .exceptions
+                            .active_try_marker_slots
+                            .len()
+                            .checked_sub(finally_context.try_body_depth)
+                        && ordinary_try_count > 0
                         && self
                             .control
                             .exceptions
                             .active_exception_region_exclusions
                             .len()
-                            == finally_context.exception_region_depth + 2
+                            .checked_sub(finally_context.exception_region_depth)
+                            == Some(ordinary_try_count + 1)
                         && self.control.withs.active_with_exits.is_empty()
                         && self.control.loops.contexts.is_empty()
                         && self.control.finally.active_finally_end_blocks == 0
                         && self.control.finally.active_normal_finally_bodies == 0
                     {
-                        // The ordinary try nested inside this finally unwinds first. Its
+                        // Ordinary tries nested inside this finally unwind first. Each
                         // POP_BLOCK remains a distinct NULL record after NOP compaction.
-                        self.emit_with_exception_policy(
-                            NOP,
-                            0,
-                            0,
-                            ExceptionPolicy::EXCLUDE_ALWAYS,
-                        )?;
-                        self.assembler.mark_last_as_converted_pop_block();
+                        for _ in 0..ordinary_try_count {
+                            self.emit_with_exception_policy(
+                                NOP,
+                                0,
+                                0,
+                                ExceptionPolicy::EXCLUDE_ALWAYS,
+                            )?;
+                            self.assembler.mark_last_as_converted_pop_block();
+                        }
                     }
                     if preserves_enclosing_try_return_owner {
                         // After handler cleanup, ordinary tries unwind before this finally.
@@ -15178,6 +15186,34 @@ impl Compiler<'_> {
                     && loop_statement.orelse.is_empty()
                     && suite_contains_borrow_reachable_conditional_loop_break(&loop_statement.body)
                     && suite_has_linear_live_conditional_break(&loop_statement.body));
+        // A dispatcher has one authored break into normal cleanup. Unrelated
+        // structured arms do not sever that edge when the break's own prefix is linear.
+        let dispatcher_break_reaches_finally = conditional_break_cleanup_entry
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && self.control.loops.contexts.is_empty()
+            && self.control.withs.active_with_exits.is_empty()
+            && self.control.finally.active_copied_finally_bodies == 0
+            && !self.control.in_exception_handler()
+            && !statement.handlers.is_empty()
+            && statement.handlers.iter().all(|handler| {
+                handler
+                    .as_except_handler()
+                    .is_some_and(|handler| handler.type_.is_some())
+            })
+            && statement.finalbody.iter().all(|statement| match statement {
+                Stmt::If(cleanup) => {
+                    condition_has_only_runtime_tests(&cleanup.test)
+                        && !expression_contains_inline_branch(&cleanup.test)
+                        && cleanup.elif_else_clauses.is_empty()
+                        && suite_has_linear_borrow_fallthrough(&cleanup.body)
+                }
+                _ => suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement)),
+            })
+            && matches!(statement.body.last(), Some(Stmt::While(loop_statement))
+                if early_condition_truthiness(&loop_statement.test) == Some(true)
+                    && loop_statement.orelse.is_empty()
+                    && suite_has_direct_dispatcher_break(&loop_statement.body));
         // A live inner try with a typed pass handler retains its normal exit. The
         // following non-tail conditional break can still reach normal cleanup, even
         // when an outer except adds another exception-exclusion depth around the loop.
@@ -15338,6 +15374,7 @@ impl Compiler<'_> {
             || conditional_body_reaches_finally
             || raising_alternative_reaches_finally
             || conditional_break_reaches_finally
+            || dispatcher_break_reaches_finally
             || inner_try_break_loop_range.is_some()
             || conditional_handler_reaches_finally
             || terminal_if_false_edge_reaches_finally;
@@ -21377,6 +21414,38 @@ fn suite_contains_loop_continue(body: &[Stmt]) -> bool {
         Stmt::FunctionDef(_) | Stmt::ClassDef(_) => false,
         _ => false,
     })
+}
+
+// A unique direct dispatcher break has a nonempty original route into cleanup.
+// Keep this certificate separate from the shared conditional-loop predicate.
+fn suite_has_direct_dispatcher_break(body: &[Stmt]) -> bool {
+    let Some((Stmt::If(dispatcher), leading)) = body.split_last() else {
+        return false;
+    };
+    if !suite_has_linear_borrow_fallthrough(leading)
+        || dispatcher.elif_else_clauses.is_empty()
+        || !condition_has_linear_runtime_leaves(&dispatcher.test)
+    {
+        return false;
+    }
+    let mut breaks = 0;
+    let mut valid_arm = |body: &[Stmt]| {
+        if let Some((Stmt::Break(_), leading)) = body.split_last() {
+            breaks += 1;
+            leading.is_empty() || suite_has_linear_borrow_fallthrough(leading)
+        } else {
+            !suite_contains_loop_break(body)
+        }
+    };
+    valid_arm(&dispatcher.body)
+        && dispatcher.elif_else_clauses.iter().all(|clause| {
+            clause
+                .test
+                .as_ref()
+                .is_none_or(condition_has_linear_runtime_leaves)
+                && valid_arm(&clause.body)
+        })
+        && breaks == 1
 }
 
 // Certify a live, non-tail break without interpreting arbitrary control flow. The

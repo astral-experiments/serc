@@ -3996,3 +3996,27 @@ fn nested_warning_handler_keeps_finally_entry_unborrowed() {
         common::assert_matches_cpython_marshal(&source, "nested_warning_finally.py");
     }
 }
+
+#[test]
+fn dispatcher_break_reaches_linear_finally_after_structured_arm() {
+    common::assert_matches_cpython_marshal(
+        "def f(sink, value, manager):\n    try:\n        while True:\n            command = receive()\n            if command == 'work':\n                work(value)\n            elif command == 'stop':\n                break\n            elif command == 'write':\n                with manager:\n                    write(value)\n    except Interrupt:\n        pass\n    except Error as error:\n        report(error)\n    finally:\n        sink.close()\n",
+        "dispatcher_break_structured_arm.py",
+    );
+}
+
+#[test]
+fn dispatcher_break_with_linear_prefix_reaches_finally() {
+    common::assert_matches_cpython_marshal(
+        "def f(sink, value):\n    try:\n        while True:\n            command, data = receive()\n            if command == 'work':\n                work(data)\n            elif command == 'stop':\n                reply(value)\n                break\n            else:\n                raise Error(command)\n    except (Interrupt, Error):\n        report(value)\n    finally:\n        sink.close()\n",
+        "dispatcher_break_linear_prefix.py",
+    );
+}
+
+#[test]
+fn dispatcher_break_reaches_conditional_cleanup_with_raising_handler() {
+    common::assert_matches_cpython_marshal(
+        "def f(sink, value):\n    try:\n        setup(value)\n        while True:\n            command = receive()\n            if command == 'work':\n                work(value)\n            elif command == 'stop':\n                break\n            elif command == 'read' and ready(value):\n                reply(value)\n    except Error as error:\n        report(error)\n        raise error\n    finally:\n        if sink is not None:\n            sink.close()\n        reply(value)\n",
+        "dispatcher_break_conditional_cleanup.py",
+    );
+}

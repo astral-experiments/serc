@@ -302,3 +302,25 @@ fn named_handler_branching_return_finally_condition() {
         "named_handler_branching_return_finally_condition.py",
     );
 }
+
+#[test]
+fn nested_try_except_return_preserves_finally_pop_slots() {
+    for ordinary_depth in 1..=3 {
+        let mut body =
+            "value = await task()\nif flag:\n    return False, value\nreturn True, ''\n".to_owned();
+        for _ in 0..ordinary_depth {
+            body = format!(
+                "try:\n    {}\nexcept ValueError:\n    raise\n",
+                body.replace('\n', "\n    ").trim_end(),
+            );
+        }
+        let source = format!(
+            "async def f(task, session, flag):\n    try:\n        {}\n    finally:\n        if session is not None:\n            await session.close()\n",
+            body.trim_end().replace('\n', "\n        "),
+        );
+        common::assert_matches_cpython_marshal(
+            &source,
+            &format!("nested_try_except_return_finally_pop_slots_{ordinary_depth}.py"),
+        );
+    }
+}

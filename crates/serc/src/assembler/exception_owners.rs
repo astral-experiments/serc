@@ -2169,6 +2169,63 @@ impl LayoutAssembler {
                             );
                         }
                     }
+                    // A retained SETUP fixes this original array's left edge. Local
+                    // fusion leaves its old suffix in place even when an intervening
+                    // POP_BLOCK changes the owner. The last F surviving records span at
+                    // least F old records, so a uniform clean suffix of that width proves
+                    // the owner of a marker appended after F fusion removals.
+                    if instruction.opcode == NOT_TAKEN
+                        && instruction.exception_policy().owner()
+                            == NormalizedExceptionOwner::Absent
+                        && instruction.exception_policy().exclusion()
+                            == super::ExceptionExclusion::None
+                        && owner_history_exact
+                        && !owners.contains_key(&instruction_index)
+                        && tail.insertions == 0
+                        && tail.late_removals == 0
+                        && tail.post_compaction_fusions > 0
+                        && let Some((start, _, _)) = protected_suffix
+                        && original_array_start < start
+                        && start <= instruction_index
+                        && tail.post_compaction_fusions <= instruction_index - start
+                    {
+                        let suffix_start = instruction_index - tail.post_compaction_fusions;
+                        if let Some(region) = self.uniform_exception_owner(
+                            suffix_start,
+                            instruction_index,
+                            &label_positions,
+                        ) && !self.exception_regions[region].is_scope_fallback
+                            && indexed_instructions[suffix_start..instruction_index]
+                                .iter()
+                                .enumerate()
+                                .all(|(offset, previous)| {
+                                    previous.exception_policy().exclusion()
+                                        == super::ExceptionExclusion::None
+                                        && previous.exception_policy().owner()
+                                            == NormalizedExceptionOwner::Unchanged
+                                        && previous.local_policy.hidden_exception_owner_slots() == 0
+                                        && previous.pre_fold_extra_instructions() == 0
+                                        && !matches!(
+                                            previous.opcode,
+                                            LOAD_FAST_BORROW_LOAD_FAST_BORROW
+                                                | LOAD_FAST_LOAD_FAST
+                                                | STORE_FAST_LOAD_FAST
+                                                | STORE_FAST_STORE_FAST
+                                        )
+                                        && !owners.contains_key(&(suffix_start + offset))
+                                })
+                        {
+                            owners.insert(
+                                instruction_index,
+                                ExceptionOwnerDecision {
+                                    has_owner: true,
+                                    source_region: Some(region),
+                                    definitive: true,
+                                    override_existing: true,
+                                },
+                            );
+                        }
+                    }
                     // A late SETUP removal compacts the live array after prologue insertion.
                     // With L removed SETUPs and W surviving records in the final uniform
                     // manager-owned suffix, L <= W places the appended slot inside that

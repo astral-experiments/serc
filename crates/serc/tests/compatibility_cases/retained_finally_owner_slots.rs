@@ -118,3 +118,23 @@ fn matches_cpython_retained_pop_join_and_unfused_controls() {
         common::assert_matches_cpython_marshal(&source, "retained_pop_prefix_controls.py");
     }
 }
+
+#[test]
+fn matches_cpython_finally_condition_fused_suffix_owner() {
+    common::assert_matches_cpython_marshal(
+        r"def f(lock, filesystem, runner, temporary, destination):
+    with lock:
+        if not filesystem.exists(destination):
+            if filesystem.exists(temporary):
+                filesystem.remove(temporary)
+            try:
+                runner.run([temporary, destination], check=True, capture_output=True)
+                filesystem.replace(temporary, destination)
+            finally:
+                if filesystem.exists(temporary):
+                    filesystem.remove(temporary)
+    return destination
+",
+        "finally_condition_fused_suffix.py",
+    );
+}
