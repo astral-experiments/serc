@@ -367,3 +367,52 @@ fn preserves_cpython_manager_exit_predecessor_boundaries() {
         common::assert_matches_cpython_marshal(source, "manager_exit_boundaries.py");
     }
 }
+
+#[test]
+fn terminal_match_call_preserves_manager_exit_nop() {
+    let source = r"def function(manager, value, fallback):
+    with manager:
+        match value:
+            case Kind.FIRST:
+                return handle(value)
+            case _:
+                fallback(value)
+";
+    common::assert_matches_cpython_marshal(source, "terminal_match_manager_exit.py");
+}
+
+#[test]
+fn terminal_async_match_call_preserves_manager_exit_nop() {
+    let source = r"async def function(manager, value, fallback):
+    with manager:
+        match value:
+            case Request():
+                return await handle(value)
+            case _:
+                fallback(value)
+";
+    common::assert_matches_cpython_marshal(source, "terminal_async_match_manager_exit.py");
+}
+
+#[test]
+fn terminal_match_prefix_preserves_manager_exit_nop() {
+    let source = r"def function(manager, value, prepare, fallback):
+    with manager:
+        match value:
+            case Kind.FIRST:
+                return handle(value)
+            case _:
+                prepare(value)
+                fallback(value)
+";
+    common::assert_matches_cpython_marshal(source, "terminal_match_prefix_manager_exit.py");
+}
+
+#[test]
+fn ordinary_call_manager_exit_control() {
+    let source = r"def function(manager, value, fallback):
+    with manager:
+        fallback(value)
+";
+    common::assert_matches_cpython_marshal(source, "ordinary_call_manager_exit.py");
+}

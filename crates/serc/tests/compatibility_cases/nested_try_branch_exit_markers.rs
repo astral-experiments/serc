@@ -33,3 +33,113 @@ fn matches_cpython_nested_try_branch_exit_markers() {
         }
     }
 }
+
+#[test]
+fn preserves_shared_branch_locations_across_cleanup_continuations() {
+    for (filename, source) in [
+        (
+            "direct_following_control.py",
+            r"def f(a, b, c, manager):
+    if a:
+        if b:
+            sink(1)
+        else:
+            if c:
+                sink(2)
+    else:
+        sink(3)
+        sink(4)
+    sink(5)
+",
+        ),
+        (
+            "try_cleanup_continuation.py",
+            r"def f(a, b, c, manager):
+    try:
+        if a:
+            if b:
+                sink(1)
+            else:
+                if c:
+                    sink(2)
+        else:
+            sink(3)
+            sink(4)
+    except Exception:
+        sink(6)
+    sink(5)
+",
+        ),
+        (
+            "with_inside_try_continuation.py",
+            r"def f(a, b, c, manager):
+    try:
+        with manager:
+            if a:
+                if b:
+                    sink(1)
+                else:
+                    if c:
+                        sink(2)
+            else:
+                sink(3)
+                sink(4)
+    except Exception:
+        sink(6)
+",
+        ),
+        (
+            "loop_try_continuation.py",
+            r"def f(a, b, c, manager):
+    while again():
+        try:
+            if a:
+                if b:
+                    sink(1)
+                else:
+                    if c:
+                        sink(2)
+            else:
+                sink(3)
+                sink(4)
+        except Exception:
+            sink(6)
+        sink(5)
+",
+        ),
+        (
+            "implicit_return_copy_control.py",
+            r"def f(a, b, c, manager):
+    if a:
+        if b:
+            sink(1)
+        else:
+            if c:
+                sink(2)
+    else:
+        sink(3)
+        sink(4)
+",
+        ),
+        (
+            "located_raising_arm_control.py",
+            r"def f(a, b, c, manager):
+    try:
+        if a:
+            if b:
+                sink(1)
+            else:
+                if c:
+                    raise RuntimeError
+        else:
+            sink(3)
+            sink(4)
+    except Exception:
+        sink(6)
+    sink(5)
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

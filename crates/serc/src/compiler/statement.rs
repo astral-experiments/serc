@@ -7807,11 +7807,18 @@ impl Compiler<'_> {
                     // An enclosing suite or a split loop tail can supply this branch's
                     // shared continuation. Keep early marker locations for copied exits;
                     // only a surviving shared jump retains the empty join's missing location.
+                    // Protected cleanup supplies a continuation even when its suite
+                    // does not inherit a following-statement flag.
                     let inherited_shared_if_exit =
                         !self.control.statements.current_statement_has_following
                             && (self.control.statements.inherited_statement_has_following
                                 || self.control.loops.split_loop_tail_prefix_end
-                                    == Some(statement.range))
+                                    == Some(statement.range)
+                                || !self
+                                    .control
+                                    .exceptions
+                                    .active_exception_region_exclusions
+                                    .is_empty())
                             && matches!(body.last(), Some(Stmt::If(nested))
                             if matches!(nested_if_exit_location(nested, true),
                                 Some(NestedIfExitLocation::Unlocated))
@@ -17813,6 +17820,13 @@ impl Compiler<'_> {
                         .map(WithBodyExitNoop::RetainedConvertedPopBlock)
                 })
                 .or_else(|| {
+                    remaining
+                        .is_empty()
+                        .then(|| with_body_match_exit_location(body))
+                        .flatten()
+                        .map(WithBodyExitNoop::RetainedConvertedPopBlock)
+                })
+                .or_else(|| {
                     (!self.assembler.last_instruction_is_nop()
                         && with_body_ends_in_retained_pop_block(body, remaining.is_empty()))
                     .then_some(WithBodyExitNoop::ConvertedPopBlock)
@@ -19509,6 +19523,34 @@ fn with_body_handler_exit_location(body: &[Stmt]) -> Option<TextRange> {
         statement @ (Stmt::Expr(_) | Stmt::Pass(_)) => Some(statement.range()),
         _ => None,
     }
+}
+
+/// Locates the manager `POP_BLOCK` reached only by a match's final wildcard body.
+fn with_body_match_exit_location(body: &[Stmt]) -> Option<TextRange> {
+    let Some(Stmt::Match(statement)) = body.last() else {
+        return None;
+    };
+    let (fallback, preceding) = statement.cases.split_last()?;
+    if preceding.is_empty()
+        || fallback.guard.is_some()
+        || !is_wildcard_pattern(&fallback.pattern)
+        || !preceding.iter().all(|case| {
+            matches!(case.body.last(), Some(Stmt::Return(_) | Stmt::Raise(_)))
+                && suite_terminates(&case.body)
+        })
+        || !suite_has_linear_borrow_fallthrough(&fallback.body)
+    {
+        return None;
+    }
+    let Some(Stmt::Expr(expression)) = fallback.body.last() else {
+        return None;
+    };
+    if !matches!(expression.value.as_ref(), Expr::Call(_)) {
+        return None;
+    }
+    // The other cases exit directly. The wildcard's normal edge alone locates the
+    // original match join containing the manager's converted POP_BLOCK.
+    Some(expression.value.range())
 }
 
 // A complete conditional with one direct terminal arm leaves the other arm as the sole
