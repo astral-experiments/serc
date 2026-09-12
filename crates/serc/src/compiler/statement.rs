@@ -639,6 +639,9 @@ pub(super) struct StatementState {
     // Whether that successor is a direct folded tuple return. CPython keeps loop breaks targeting
     // this constant exit instead of copying the tuple-return block onto each break edge.
     current_statement_followed_by_tuple_return: bool,
+    // Two direct name loads, BUILD_TUPLE, and RETURN_VALUE fill CPython's four-slot
+    // copy budget before superinstruction fusion. A copied jump NOP exceeds it.
+    pub(super) match_successor_fills_small_exit_copy_budget: bool,
     // Whether that successor exits the function by returning or raising. CPython copies these
     // exit blocks before removing assertion-branch jumps, including jumps from later clauses.
     current_statement_followed_by_return_or_raise: bool,
@@ -1953,6 +1956,13 @@ impl Compiler<'_> {
                             Some(value @ Expr::Tuple(_)) if fold_constant(value).is_some()
                         )
                 );
+                let match_successor_fills_small_exit_copy_budget = matches!(
+                    (statement, body.get(index + 1)),
+                    (Stmt::Match(_), Some(Stmt::Return(return_statement)))
+                        if matches!(return_statement.value.as_deref(), Some(Expr::Tuple(tuple))
+                            if tuple.elts.len() == 2
+                                && tuple.elts.iter().all(|value| matches!(value, Expr::Name(_))))
+                );
                 let followed_by_return_or_raise =
                     matches!(body.get(index + 1), Some(Stmt::Return(_) | Stmt::Raise(_)));
                 let followed_by_try = matches!(body.get(index + 1), Some(Stmt::Try(_)));
@@ -2222,6 +2232,13 @@ impl Compiler<'_> {
                         .current_statement_followed_by_tuple_return,
                     followed_by_tuple_return,
                 );
+                let previous_match_successor_fills_small_exit_copy_budget = std::mem::replace(
+                    &mut self
+                        .control
+                        .statements
+                        .match_successor_fills_small_exit_copy_budget,
+                    match_successor_fills_small_exit_copy_budget,
+                );
                 let previous_current_statement_followed_by_return_or_raise = std::mem::replace(
                     &mut self
                         .control
@@ -2265,6 +2282,10 @@ impl Compiler<'_> {
                     .statements
                     .current_statement_followed_by_return_or_raise =
                     previous_current_statement_followed_by_return_or_raise;
+                self.control
+                    .statements
+                    .match_successor_fills_small_exit_copy_budget =
+                    previous_match_successor_fills_small_exit_copy_budget;
                 self.control
                     .statements
                     .current_statement_followed_by_tuple_return =
@@ -20538,7 +20559,7 @@ fn finalizer_tail_has_matching_linear_copies(body: &[Stmt]) -> bool {
 
 // Certify an emitted-work path with no internal branch or cleanup entry. A suite
 // containing only pass markers or folded literals does not provide this evidence.
-fn suite_has_linear_borrow_fallthrough(body: &[Stmt]) -> bool {
+pub(super) fn suite_has_linear_borrow_fallthrough(body: &[Stmt]) -> bool {
     let mut has_runtime_work = false;
     for statement in body {
         let has_work = match statement {

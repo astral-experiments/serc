@@ -53,8 +53,8 @@ use super::source::{
     synthetic_condition_exit_range,
 };
 use super::statement::{
-    final_chained_comparison_jump, is_wildcard_pattern, suite_terminates,
-    unique_condition_jump_target,
+    final_chained_comparison_jump, is_wildcard_pattern, suite_has_linear_borrow_fallthrough,
+    suite_terminates, unique_condition_jump_target,
 };
 use super::symbol::{
     ComparisonMode, ComprehensionRestore, ReraiseStackState, ResumeDepth, expression_name, to_u32,
@@ -659,6 +659,11 @@ impl Compiler<'_> {
                         if original_unlocated_head {
                             self.assembler.mark_as_artificial_eval_break(success_exit);
                             if let Some(Stmt::If(tail)) = case.body.last()
+                                && !(self
+                                    .control
+                                    .statements
+                                    .match_successor_fills_small_exit_copy_budget
+                                    && match_case_has_nested_jump_predecessor(tail))
                                 && early_condition_truthiness(&tail.test).is_none()
                                 && tail
                                     .elif_else_clauses
@@ -8446,4 +8451,33 @@ pub(super) fn comparison_operator_boolean(operator: CmpOp) -> (Opcode, u32) {
     } else {
         (opcode, argument)
     }
+}
+
+/// Finds earlier case arms whose nested conditional retains an original jump into the join.
+fn match_case_has_nested_jump_predecessor(statement: &ruff_python_ast::StmtIf) -> bool {
+    std::iter::once(statement.body.as_slice())
+        .chain(
+            statement
+                .elif_else_clauses
+                .iter()
+                .filter(|clause| clause.test.is_some())
+                .map(|clause| clause.body.as_slice()),
+        )
+        .any(|body| {
+            let Some(Stmt::If(nested)) = body.last() else {
+                return false;
+            };
+            !nested.elif_else_clauses.is_empty()
+                && early_condition_truthiness(&nested.test).is_none()
+                && std::iter::once(nested.body.as_slice())
+                    .chain(
+                        nested
+                            .elif_else_clauses
+                            .iter()
+                            .take(nested.elif_else_clauses.len() - 1)
+                            .map(|clause| clause.body.as_slice()),
+                    )
+                    // Cleanup and internal branches leave different original exit blocks.
+                    .any(suite_has_linear_borrow_fallthrough)
+        })
 }

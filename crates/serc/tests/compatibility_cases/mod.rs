@@ -434,3 +434,5 @@ mod cleanup_provenance_probes;
 mod shared_normal_exit_markers;
 
 mod loop_cleanup_regressions;
+
+mod match_exit_copy_budget;
