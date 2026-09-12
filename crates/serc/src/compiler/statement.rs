@@ -5400,8 +5400,9 @@ impl Compiler<'_> {
                                     && !preserve_named_handler_pop_slots
                                     && with_depth > 0
                                     && next_with == with_depth
+                                    // Matching saved depths and the exact emitted prefix
+                                    // exclude iterator cleanup before this pending finally.
                                     && next_loop == loop_depth
-                                    && loop_depth == 0
                                     && self.control.finally.active_finally_end_blocks == 0
                                     && self.control.finally.active_normal_finally_bodies == 0
                                     && return_finally_contexts[0].handler_depth == handler_index

@@ -2915,6 +2915,52 @@ impl LayoutAssembler {
                         && let Some(removed) = tail.early_removals.checked_add(missing)
                     {
                         let suffix = instruction_index - end + tail.early_removals - end_removed;
+                        // Equality selects the original NULL finally POP immediately after
+                        // cleanup, not its preceding POP_EXCEPT. Its one transferred record
+                        // must be the only hidden slot on the immediately following load.
+                        if removed == suffix
+                            && instruction_index - end == 2
+                            && matches!(
+                                indexed_instructions[end].opcode,
+                                crate::target::opcodes::LOAD_FAST
+                                    | crate::target::opcodes::LOAD_FAST_BORROW
+                            )
+                            && indexed_instructions[end]
+                                .local_policy
+                                .hidden_exception_owner_slots()
+                                == 1
+                            && self
+                                .exception_owner_provenance
+                                .source_none_conditions
+                                .iter()
+                                .filter(|origin| Some(origin.instruction) == previous)
+                                .count()
+                                == 1
+                            && self
+                                .exception_owner_provenance
+                                .removed_pop_block_boundaries
+                                .iter()
+                                .any(|label| {
+                                    label_positions.get(label) == Some(&end)
+                                        && self
+                                            .exception_owner_provenance
+                                            .removed_pop_block_widths
+                                            .get(label)
+                                            .copied()
+                                            .unwrap_or(1)
+                                            == 1
+                                })
+                        {
+                            owners.insert(
+                                instruction_index,
+                                ExceptionOwnerDecision {
+                                    has_owner: false,
+                                    source_region: None,
+                                    definitive: true,
+                                    override_existing: true,
+                                },
+                            );
+                        }
                         if removed > suffix && removed - suffix <= end - start {
                             let source = end - (removed - suffix);
                             if let Some(region) =
