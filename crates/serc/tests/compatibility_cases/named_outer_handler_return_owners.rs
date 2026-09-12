@@ -196,3 +196,24 @@ fn matches_cpython_copied_handler_finally_null_slot_with_iterators() {
         "unnamed_handler_nested_loop_return.py",
     );
 }
+
+#[test]
+fn matches_cpython_handler_return_through_enclosing_iterator_regions() {
+    common::assert_matches_cpython_marshal(
+        r#"def nested_handler_iterator_return(values):
+    try:
+        for value in values:
+            try:
+                try:
+                    work(value)
+                except Exception:
+                    return str(value)
+            except Exception:
+                return str(value)
+        return ""
+    except Exception:
+        return ""
+"#,
+        "nested_handler_iterator_return.py",
+    );
+}

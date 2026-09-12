@@ -2151,11 +2151,39 @@ impl LayoutAssembler {
                                     first_unprotected_setup || unprotected_array_prefix
                                 });
                         }
+                        // Presence is already proved for a value-preserving Boolean
+                        // marker. Retained array provenance supplies its exact source owner.
+                        let source_region = (has_owner
+                            && instruction.exception_policy().owner()
+                                == NormalizedExceptionOwner::Dynamic
+                            && instruction_index > 0
+                            && owners.get(&instruction_index).is_none_or(
+                                |owner: &ExceptionOwnerDecision| owner.source_region.is_none(),
+                            ))
+                        .then(|| {
+                            self.exception_owner_provenance
+                                .fused_manager_owners
+                                .iter()
+                                .find_map(|(condition, marker, region)| {
+                                    (!region.is_scope_fallback
+                                        && instruction == marker
+                                        && indexed_instructions[instruction_index - 1] == condition)
+                                        .then(|| {
+                                            self.exception_regions.iter().position(|candidate| {
+                                                super::fusion_owner_slots::same_manager_region(
+                                                    candidate, region,
+                                                )
+                                            })
+                                        })
+                                        .flatten()
+                                })
+                        })
+                        .flatten();
                         owners.insert(
                             instruction_index,
                             ExceptionOwnerDecision {
                                 has_owner,
-                                source_region: None,
+                                source_region,
                                 override_existing: false,
                                 definitive: proven_unprotected_slot
                                     || instruction.exception_policy().owner()

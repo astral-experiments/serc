@@ -478,3 +478,19 @@ fn retained_setup_cell_after_resumable_prefix() {
         );
     }
 }
+
+#[test]
+fn boolean_manager_expression_retains_source_owner() {
+    for managers in [2, 10, 12] {
+        let mut entries = vec!["manager((1, 2, 3, 4, 5))"; managers];
+        entries.push("manager(refresh or replacement())");
+        let source = format!(
+            "def f(refresh):\n    with ({}):\n        consume()\n",
+            entries.join(", "),
+        );
+        common::assert_matches_cpython_marshal(
+            &source,
+            "boolean_manager_expression_retains_source_owner.py",
+        );
+    }
+}

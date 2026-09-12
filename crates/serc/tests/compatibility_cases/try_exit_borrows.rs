@@ -4116,3 +4116,19 @@ fn live_break_reaches_nested_finally_cleanup() {
         "live_break_reaches_nested_finally_cleanup.py",
     );
 }
+
+#[test]
+fn nested_break_arm_reaches_nested_try_cleanup() {
+    common::assert_matches_cpython_marshal(
+        "def f(sink):\n    try:\n        while True:\n            item = receive()\n            if item is not None:\n                result = int(item)\n                if result != 0:\n                    report(result)\n                break\n            advance(item)\n    except Error:\n        report_error()\n    finally:\n        try:\n            sink.close()\n        except Timeout:\n            pass\n",
+        "nested_break_arm.py",
+    );
+}
+
+#[test]
+fn structured_successor_reaches_nested_try_cleanup() {
+    common::assert_matches_cpython_marshal(
+        "async def f(sink):\n    try:\n        while True:\n            item = await receive()\n            if item is None:\n                report(item)\n                break\n            if selected(item):\n                consume(item)\n            advance(item)\n    except Error:\n        report_error()\n    finally:\n        try:\n            await sink.close()\n        except Timeout:\n            pass\n",
+        "structured_successor.py",
+    );
+}

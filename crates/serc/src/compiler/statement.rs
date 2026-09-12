@@ -4964,6 +4964,61 @@ impl Compiler<'_> {
                                         .active_exception_region_exclusions
                                         .len()
                         });
+                // A handler inside an ordinary try can return through an older iterator.
+                // Restore the handler first, pop that inner try before the iterator, and
+                // retain each surrounding try until its own lexical unwind boundary.
+                let tracks_handler_enclosing_iterator_unwinds = !return_is_overridden
+                    && preserve_tos
+                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                    && self.context.target_specific_rules_enabled()
+                    && handler_count == 1
+                    && self.control.exceptions.active_exception_group_handlers == 0
+                    && self.control.withs.active_with_exits.is_empty()
+                    && self
+                        .control
+                        .finally
+                        .active_return_finally_contexts
+                        .is_empty()
+                    && self.control.finally.active_loop_finally_contexts.is_empty()
+                    && self
+                        .control
+                        .finally
+                        .active_pass_finally_locations
+                        .is_empty()
+                    && self
+                        .control
+                        .finally
+                        .preserved_return_value_contexts
+                        .is_empty()
+                    && self.control.finally.copied_return_finally_preserved_values == 0
+                    && self.control.finally.active_finally_end_blocks == 0
+                    && self.control.finally.active_normal_finally_bodies == 0
+                    && self.control.finally.active_copied_finally_bodies == 0
+                    && self.control.finally.active_finally_try_bodies == 0
+                    && self
+                        .control
+                        .exceptions
+                        .active_exception_handlers
+                        .last()
+                        .is_some_and(|handler| {
+                            handler.name.is_none()
+                                && handler.with_depth == 0
+                                && handler.finally_end_depth == 0
+                                && handler.loop_depth == self.control.loops.contexts.len()
+                                && handler.try_body_depth
+                                    == self.control.exceptions.active_try_marker_slots.len()
+                                && self
+                                    .control
+                                    .exceptions
+                                    .active_exception_region_exclusions
+                                    .len()
+                                    == handler.exception_region_depth + 1
+                                && self.control.loops.contexts.iter().any(|context| {
+                                    context.iterator_cleanup != IteratorCleanup::None
+                                        && context.exception_region_depth
+                                            < handler.exception_region_depth
+                                })
+                        });
                 let tracks_iterator_region_unwinds = !return_is_overridden
                     && handler_count == 0
                     && self
@@ -4993,6 +5048,7 @@ impl Compiler<'_> {
                                     .len()
                     });
                 let mut handler_region_unwind_starts = ((tracks_iterator_region_unwinds
+                    || tracks_handler_enclosing_iterator_unwinds
                     || tracks_handler_iterator_region_unwinds
                     || tracks_finally_region_unwinds
                     || unwinds_finally_end_inside_handler
@@ -5894,6 +5950,7 @@ impl Compiler<'_> {
                     protected_iterator_start,
                     preserve_tos,
                     if tracks_iterator_region_unwinds
+                        || tracks_handler_enclosing_iterator_unwinds
                         || (tracks_handler_iterator_region_unwinds && unwinds_return_finally)
                     {
                         handler_region_unwind_starts.as_deref_mut()
@@ -15269,7 +15326,18 @@ impl Compiler<'_> {
                 if early_condition_truthiness(&loop_statement.test) == Some(true)
                     && loop_statement.orelse.is_empty()
                     && suite_contains_borrow_reachable_conditional_loop_break(&loop_statement.body)
-                    && suite_has_linear_live_conditional_break(&loop_statement.body));
+                    && (suite_has_linear_live_conditional_break(&loop_statement.body)
+                        || (matches!(self.unit.scope, Scope::Function { .. })
+                            && self.control.loops.contexts.is_empty()
+                            && self.control.withs.active_with_exits.is_empty()
+                            && self.control.finally.active_copied_finally_bodies == 0
+                            && !self.control.in_exception_handler()
+                            && matches!(statement.finalbody.first(), Some(Stmt::Try(_)))
+                            && !statement.handlers.is_empty()
+                            && statement.handlers.iter().all(|handler| {
+                                handler.as_except_handler().is_some_and(|handler| handler.type_.is_some())
+                            })
+                            && suite_has_structured_live_break(&loop_statement.body))));
         // A dispatcher has one authored break into normal cleanup. Unrelated
         // structured arms do not sever that edge when the break's own prefix is linear.
         let dispatcher_break_reaches_finally = conditional_break_cleanup_entry
@@ -21729,6 +21797,73 @@ fn suite_has_direct_dispatcher_break(body: &[Stmt]) -> bool {
                 && valid_arm(&clause.body)
         })
         && breaks == 1
+}
+
+// A runtime successor test retains the false-arm entry. A simple conditional in
+// the break arm likewise rejoins before the authored jump into located try cleanup.
+fn suite_has_structured_live_break(body: &[Stmt]) -> bool {
+    fn is_linear(statement: &Stmt) -> bool {
+        match statement {
+            Stmt::Expr(expression) => {
+                fold_constant(&expression.value).is_none()
+                    && !expression_contains_inline_branch(&expression.value)
+            }
+            Stmt::Assign(assignment) => {
+                !expression_contains_inline_branch(&assignment.value)
+                    && assignment
+                        .targets
+                        .iter()
+                        .all(|target| matches!(target, Expr::Name(_)))
+            }
+            _ => false,
+        }
+    }
+
+    for (index, statement) in body.iter().enumerate() {
+        let Stmt::If(conditional) = statement else {
+            if !is_linear(statement) {
+                return false;
+            }
+            continue;
+        };
+        if !condition_has_only_runtime_tests(&conditional.test)
+            || expression_contains_inline_branch(&conditional.test)
+            || !conditional.elif_else_clauses.is_empty()
+        {
+            return false;
+        }
+        let Some((Stmt::Break(_), leading)) = conditional.body.split_last() else {
+            return false;
+        };
+        let Some(successor) = body.get(index + 1) else {
+            return false;
+        };
+        if let Stmt::If(successor) = successor {
+            return leading.iter().all(is_linear)
+                && condition_has_only_runtime_tests(&successor.test)
+                && !expression_contains_inline_branch(&successor.test)
+                && successor.elif_else_clauses.is_empty()
+                && !successor.body.is_empty()
+                && successor.body.iter().all(is_linear);
+        }
+        let mut conditional_count = 0;
+        return is_linear(successor)
+            && leading.iter().all(|statement| {
+                if let Stmt::If(guard) = statement {
+                    conditional_count += 1;
+                    conditional_count == 1
+                        && condition_has_only_runtime_tests(&guard.test)
+                        && !expression_contains_inline_branch(&guard.test)
+                        && guard.elif_else_clauses.is_empty()
+                        && !guard.body.is_empty()
+                        && guard.body.iter().all(is_linear)
+                } else {
+                    is_linear(statement)
+                }
+            })
+            && conditional_count == 1;
+    }
+    false
 }
 
 // Certify a live, non-tail break without interpreting arbitrary control flow. The
