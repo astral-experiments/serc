@@ -416,3 +416,52 @@ fn ordinary_call_manager_exit_control() {
 ";
     common::assert_matches_cpython_marshal(source, "ordinary_call_manager_exit.py");
 }
+
+#[test]
+fn matches_cpython_coroutine_return_join_before_sync_manager_exit() {
+    let source = r"async def f(manager, read, flag):
+    with manager:
+        try:
+            value = await read()
+            return value if flag else None
+        except ValueError:
+            raise
+";
+    common::assert_matches_cpython_marshal(source, "coroutine_return_join_sync_manager.py");
+}
+
+#[test]
+fn matches_cpython_coroutine_return_join_before_async_manager_exit() {
+    let source = r"async def f(manager, read, flag):
+    async with manager:
+        try:
+            value = await read()
+            return value if flag else None
+        except ValueError:
+            raise
+";
+    common::assert_matches_cpython_marshal(source, "coroutine_return_join_async_manager.py");
+}
+
+#[test]
+fn retains_cpython_sync_return_join_before_manager_exit() {
+    let source = r"def f(manager, read, flag):
+    with manager:
+        try:
+            value = read()
+            return value if flag else None
+        except ValueError:
+            raise
+";
+    common::assert_matches_cpython_marshal(source, "sync_return_join_manager_control.py");
+}
+
+#[test]
+fn retains_cpython_coroutine_return_join_without_inner_try() {
+    let source = r"async def f(manager, read, flag):
+    async with manager:
+        value = await read()
+        return value if flag else None
+";
+    common::assert_matches_cpython_marshal(source, "coroutine_return_join_no_try_control.py");
+}

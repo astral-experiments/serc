@@ -4555,7 +4555,7 @@ impl Compiler<'_> {
                         self.emit(NOP, 0, 0)?;
                     }
                     if self.context.target_specific_rules_enabled()
-                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                        && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
                         && !return_is_overridden
                         && self.control.exceptions.active_exception_handlers.is_empty()
                         && self.control.exceptions.active_exception_group_handlers == 0
@@ -4574,7 +4574,6 @@ impl Compiler<'_> {
                         && self.control.finally.active_normal_finally_bodies == 0
                         && self.control.finally.active_copied_finally_bodies == 0
                         && let Some(context) = self.control.withs.active_with_exits.last()
-                        && !context.is_async
                         && context.exception_region_depth.checked_add(1)
                             == Some(
                                 self.control
@@ -8116,7 +8115,21 @@ impl Compiler<'_> {
             // keep their own body locations.
             self.assembler.set_location(self.source_location(range));
         } else {
-            self.set_fallthrough_end_location(body, body_start);
+            // An assertion in the final else supplies its success operand's range
+            // to the enclosing branch exit. Folded branches keep their emitted donor.
+            let mut final_else_body = body;
+            while let Some(Stmt::If(statement)) = final_else_body.last()
+                && condition_has_only_runtime_tests(&statement.test)
+                && let [clause] = statement.elif_else_clauses.as_slice()
+                && clause.test.is_none()
+            {
+                final_else_body = &clause.body;
+            }
+            if let Some(range) = suite_assert_success_fallthrough_range(final_else_body) {
+                self.assembler.set_location(self.source_location(range));
+            } else {
+                self.set_fallthrough_end_location(body, body_start);
+            }
         }
     }
 

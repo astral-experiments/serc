@@ -143,3 +143,64 @@ fn preserves_shared_branch_locations_across_cleanup_continuations() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn preserves_nested_else_assertion_success_operand_locations() {
+    for (filename, source) in [
+        (
+            "nested_else_assert_not.py",
+            r"def f(select, branch, a, b, c):
+    if select:
+        if branch:
+            sink(1)
+        else:
+            assert not a
+    else:
+        sink(2)
+        sink(3)
+    sink(4)
+",
+        ),
+        (
+            "nested_else_assert_and.py",
+            r"def f(select, branch, a, b, c):
+    if select:
+        if branch:
+            sink(1)
+        else:
+            assert a is None and b is None and c is None
+    else:
+        sink(2)
+        sink(3)
+    sink(4)
+",
+        ),
+        (
+            "direct_assert_not_control.py",
+            r"def f(select, branch, a, b, c):
+    if select:
+        assert not a
+    else:
+        sink(2)
+        sink(3)
+    sink(4)
+",
+        ),
+        (
+            "nested_plain_assert_control.py",
+            r"def f(select, branch, a, b, c):
+    if select:
+        if branch:
+            sink(1)
+        else:
+            assert a
+    else:
+        sink(2)
+        sink(3)
+    sink(4)
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
