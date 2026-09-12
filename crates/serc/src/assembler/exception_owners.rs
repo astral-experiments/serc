@@ -2092,10 +2092,27 @@ impl LayoutAssembler {
                             // Exact early compaction can reach the unprotected records before
                             // the first SETUP. Exclude any earlier protected origin, including an
                             // empty region removed after its original SETUP was recorded.
+                            // At exactly one record before the protected suffix, reuse
+                            // lands on this authored SETUP's retained, unconditionally NULL NOP.
+                            let retained_setup_cell = tail.insertions == 0
+                                && protected_original_instructions.checked_add(1)
+                                    == Some(stale_slots)
+                                && start.checked_sub(1).is_some_and(|index| {
+                                    original_array_start <= index
+                                        && retained_setup_nops.contains(&index)
+                                        && indexed_instructions.get(index).is_some_and(|nop| {
+                                            nop.opcode == NOP
+                                                && nop.exception_policy().exclusion()
+                                                    == super::ExceptionExclusion::Always
+                                                && nop.local_policy.hidden_exception_owner_slots()
+                                                    == 0
+                                                && nop.pre_fold_extra_instructions() == 0
+                                        })
+                                });
                             proven_unprotected_slot = owner_history_exact
                                 && tail.post_compaction_fusions == 0
                                 && stale_slots > protected_original_instructions
-                                && {
+                                && (retained_setup_cell || {
                                     let first_unprotected_setup = self
                                         .exception_owner_provenance
                                         .setups
@@ -2132,7 +2149,7 @@ impl LayoutAssembler {
                                                 _ => true,
                                             });
                                     first_unprotected_setup || unprotected_array_prefix
-                                };
+                                });
                         }
                         owners.insert(
                             instruction_index,

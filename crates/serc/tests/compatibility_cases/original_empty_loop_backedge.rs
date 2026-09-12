@@ -464,3 +464,17 @@ fn manager_entry_owner_without_local_pair_fusion() {
         );
     }
 }
+
+#[test]
+fn retained_setup_cell_after_resumable_prefix() {
+    for asynchronous in [false, true] {
+        let qualifier = if asynchronous { "async " } else { "" };
+        let source = format!(
+            "{qualifier}def f(stop, flag):\n    if stop:\n        return\n    values = (first(), second(), third(), fourth())\n    try:\n        if flag:\n            consume(values)\n    except ValueError:\n        recover()\n"
+        );
+        common::assert_matches_cpython_marshal(
+            &source,
+            "retained_setup_cell_after_resumable_prefix.py",
+        );
+    }
+}
