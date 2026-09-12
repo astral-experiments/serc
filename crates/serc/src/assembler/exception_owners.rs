@@ -16,6 +16,8 @@ use crate::target::{is_conditional_jump, is_scope_exit};
 #[derive(Debug, Default)]
 pub(super) struct ExceptionOwnerProvenance {
     pub(super) setups: Vec<(Label, Option<SourceLocation>)>,
+    // Authored return NOP, immediately following finally POP, and original try target.
+    pub(super) early_return_nop_pairs: Vec<(Instruction, Instruction, Label)>,
     pub(super) copied_handler_cleanups: Vec<CopiedHandlerCleanup>,
     pub(super) fused_manager_owners: Vec<(Instruction, Instruction, super::ExceptionRegion)>,
     pub(super) block_boundaries: FxHashSet<Label>,
@@ -1613,6 +1615,7 @@ impl LayoutAssembler {
         let mut source_owned_prefix = None;
         let mut pending_retained_prefix = None;
         let mut retained_pop_prefix = None;
+        let mut early_return_nop_slot = None;
         let mut owner_history_exact = true;
         let mut pop_slot_epoch_known = true;
         let mut retained_epoch_known = true;
@@ -1964,6 +1967,45 @@ impl LayoutAssembler {
                     }
                 }
                 Item::Instruction(instruction) => {
+                    if instruction.opcode == NOP {
+                        early_return_nop_slot = None;
+                        if owner_history_exact
+                            && tail.insertions == 0
+                            && tail.late_removals == 0
+                            && tail.post_compaction_fusions == 0
+                            && instruction.local_policy.hidden_exception_owner_slots() == 1
+                            && instruction.pre_fold_extra_instructions() == 0
+                            && instruction.no_location_policy.borrow_fallthrough()
+                                != super::BorrowFallthrough::Barrier
+                            && original_array_start < instruction_index
+                            && let Some(region) = self.uniform_exception_owner(
+                                instruction_index - 1,
+                                instruction_index,
+                                &label_positions,
+                            )
+                            && !self.exception_regions[region].is_scope_fallback
+                            && !self.exception_regions[region].preserve_lasti
+                        {
+                            let matching_pairs = self
+                                .exception_owner_provenance
+                                .early_return_nop_pairs
+                                .iter()
+                                .filter(|(_, pop, target)| {
+                                    let mut expected = *pop;
+                                    expected.local_policy.add_hidden_exception_owner_slots(1);
+                                    expected == *instruction
+                                        && self.exception_regions[region].target == *target
+                                })
+                                .count();
+                            if matching_pairs == 1
+                                && let Some(slot) =
+                                    instruction_index.checked_add(tail.early_removals)
+                            {
+                                early_return_nop_slot =
+                                    Some((original_array_start, instruction_index, slot, region));
+                            }
+                        }
+                    }
                     // A surviving converted POP_BLOCK is an original NULL record, not
                     // an erased slot. Keep its preceding protected prefix separately from
                     // SETUP and removed-POP certificates. Only local fusion can select it.
@@ -3099,6 +3141,51 @@ impl LayoutAssembler {
                                 );
                             }
                         }
+                    }
+                    // Early compaction keeps this exact authored return NOP in its old
+                    // array cell. The adjacent retained POP is NULL and is never included.
+                    if instruction.opcode == NOT_TAKEN
+                        && owner_history_exact
+                        && tail.insertions == 0
+                        && tail.late_removals == 0
+                        && tail.post_compaction_fusions == 0
+                        && instruction.exception_policy().exclusion()
+                            == super::ExceptionExclusion::None
+                        && matches!(
+                            instruction.exception_policy().owner(),
+                            NormalizedExceptionOwner::Present
+                                | NormalizedExceptionOwner::DynamicCondition
+                        )
+                        && owners
+                            .get(&instruction_index)
+                            .is_none_or(|decision| !decision.definitive)
+                        && let Some((array, pop, slot, region)) = early_return_nop_slot
+                        && original_array_start == array
+                        && instruction_index == slot
+                        && instruction_index - pop == 3
+                        && matches!(
+                            indexed_instructions[pop + 1].opcode,
+                            crate::target::opcodes::LOAD_FAST
+                                | crate::target::opcodes::LOAD_FAST_BORROW
+                        )
+                        && indexed_instructions[pop + 1]
+                            .local_policy
+                            .hidden_exception_owner_slots()
+                            == 0
+                        && previous.is_some_and(|previous: Instruction| {
+                            matches!(previous.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+                                && previous.local_policy.hidden_exception_owner_slots() == 3
+                        })
+                    {
+                        owners.insert(
+                            instruction_index,
+                            ExceptionOwnerDecision {
+                                has_owner: true,
+                                source_region: Some(region),
+                                definitive: true,
+                                override_existing: true,
+                            },
+                        );
                     }
                     instruction_index += 1;
                     has_instruction = true;

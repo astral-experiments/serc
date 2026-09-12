@@ -248,3 +248,32 @@ fn matches_cpython_finally_none_condition_reuses_retained_pop_prefix() {
         "normal_finally_prefix.py",
     );
 }
+
+#[test]
+fn matches_cpython_early_compaction_return_nop_cell() {
+    common::assert_matches_cpython_marshal(
+        r"def early_return_nop_owner(resource):
+    try:
+        consume(resource)
+        consume(resource)
+        consume(resource)
+        return 0
+    finally:
+        if resource is not None:
+            finish(resource)
+",
+        "early_return_nop_owner.py",
+    );
+    common::assert_matches_cpython_marshal(
+        r"def early_return_nop_before_cell(resource):
+    try:
+        consume(resource)
+        consume(resource)
+        return 0
+    finally:
+        if resource is not None:
+            finish(resource)
+",
+        "early_return_nop_before_cell.py",
+    );
+}

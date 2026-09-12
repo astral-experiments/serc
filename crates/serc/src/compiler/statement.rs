@@ -5736,6 +5736,34 @@ impl Compiler<'_> {
                     {
                         self.assembler.mark_last_as_converted_pop_block();
                     }
+                    if self.context.target_specific_rules_enabled()
+                        && !preserve_tos
+                        && !return_is_overridden
+                        && handler_count == 0
+                        && context_index == 0
+                        && return_finally_contexts.len() == 1
+                        && self.control.withs.active_with_exits.is_empty()
+                        && self.control.loops.contexts.is_empty()
+                        && self.control.finally.active_finally_end_blocks == 0
+                        && self.control.finally.active_normal_finally_bodies == 0
+                        && self.control.finally.active_copied_finally_bodies == 0
+                        && self
+                            .control
+                            .finally
+                            .preserved_return_value_contexts
+                            .is_empty()
+                        && self
+                            .control
+                            .exceptions
+                            .active_exception_region_exclusions
+                            .len()
+                            == finally_context.exception_region_depth + 1
+                    {
+                        self.assembler.record_early_return_nop_pair(
+                            copied_handler_return_item,
+                            finally_context.handler,
+                        );
+                    }
                     if starts_jump_target
                         && unwind_location.line < 0
                         && matches!(finally_context.body.as_slice(), [Stmt::Pass(_)])

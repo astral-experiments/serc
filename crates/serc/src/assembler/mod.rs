@@ -3456,6 +3456,40 @@ impl Assembler {
             });
     }
 
+    /// Records an authored return NOP immediately before its direct finally POP.
+    pub(crate) fn record_early_return_nop_pair(&mut self, return_item: usize, target: Label) {
+        let items = self.linear_items();
+        let Some(Item::Instruction(return_nop)) = items.get(return_item) else {
+            return;
+        };
+        let instructions = items[return_item..]
+            .iter()
+            .filter_map(|item| match item {
+                Item::Instruction(instruction) => Some(*instruction),
+                Item::Label(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let [authored, pop] = instructions.as_slice() else {
+            return;
+        };
+        if authored != return_nop
+            || authored.opcode != NOP
+            || authored.exception_policy() != ExceptionPolicy::NoneUnchanged
+            || authored.local_policy.hidden_exception_owner_slots() != 0
+            || authored.pre_fold_extra_instructions() != 0
+            || pop.opcode != NOP
+            || !pop.fusion_policy.is_converted_pop_block()
+            || pop.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
+            || pop.local_policy.hidden_exception_owner_slots() != 0
+            || pop.pre_fold_extra_instructions() != 0
+        {
+            return;
+        }
+        self.exception_owner_provenance
+            .early_return_nop_pairs
+            .push((*authored, *pop, target));
+    }
+
     /// Starts a protected prefix within the same original instruction array.
     pub(crate) fn record_exception_owner_prefix(&mut self, label: Label) {
         self.record_exception_owner_continuation(label);
