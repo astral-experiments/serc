@@ -324,3 +324,50 @@ fn nested_try_except_return_preserves_finally_pop_slots() {
         );
     }
 }
+
+#[test]
+fn async_generator_manager_finally_none() {
+    common::assert_matches_cpython_marshal(
+        r"async def f(manager, pending):
+    async with manager:
+        try:
+            yield
+        finally:
+            if pending is not None:
+                await pending.close()
+",
+        "async_generator_manager_finally_none.py",
+    );
+}
+
+#[test]
+fn coroutine_manager_finally_none() {
+    common::assert_matches_cpython_marshal(
+        r"async def f(manager, pending, task):
+    async with manager:
+        try:
+            await task()
+        except ValueError:
+            raise
+        finally:
+            if pending is not None:
+                await pending.close()
+",
+        "coroutine_manager_finally_none.py",
+    );
+}
+
+#[test]
+fn generator_manager_finally_none() {
+    common::assert_matches_cpython_marshal(
+        r"def f(manager, pending):
+    with manager:
+        try:
+            yield
+        finally:
+            if pending is not None:
+                pending.close()
+",
+        "generator_manager_finally_none.py",
+    );
+}

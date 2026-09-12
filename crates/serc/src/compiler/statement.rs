@@ -16186,6 +16186,8 @@ impl Compiler<'_> {
             Ok(())
         })?;
         self.assembler
+            .record_normal_finally_none_prefix(normal_finally_pop_block);
+        self.assembler
             .record_original_normal_finally_array(normal_finally_pop_block);
         let finalbody_stays_in_nonempty_block = self.control.finally.active_normal_finally_bodies
             == 0

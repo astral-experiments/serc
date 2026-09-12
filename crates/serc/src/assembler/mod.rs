@@ -2940,6 +2940,40 @@ impl Assembler {
         instruction.jump_policy.preserve_explicit_nop();
     }
 
+    /// Records the direct local None test following an authored normal-finally `POP_BLOCK`.
+    pub(crate) fn record_normal_finally_none_prefix(&mut self, ordinal: usize) {
+        let mut instructions = self
+            .linear_items()
+            .iter()
+            .filter_map(|item| match item {
+                Item::Instruction(instruction) => Some(*instruction),
+                Item::Label(_) => None,
+            })
+            .skip(ordinal);
+        let (Some(pop), Some(load), Some(condition)) = (
+            instructions.next(),
+            instructions.next(),
+            instructions.next(),
+        ) else {
+            return;
+        };
+        if pop.opcode == NOP
+            && pop.fusion_policy.is_converted_pop_block()
+            && pop.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
+            && load.opcode == LOAD_FAST
+            && load.local_policy.hidden_exception_owner_slots() == 0
+            && load.pre_fold_extra_instructions() == 0
+            && matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+            && matches!(condition.operand(), Operand::Forward(_))
+            && condition.local_policy.hidden_exception_owner_slots() == 3
+            && condition.pre_fold_extra_instructions() == 0
+        {
+            self.exception_owner_provenance
+                .normal_finally_none_prefixes
+                .push((pop, load, condition));
+        }
+    }
+
     /// Captures the unchanged first array of an ordinary normal-finally entry.
     pub(crate) fn record_original_normal_finally_array(&mut self, ordinal: usize) {
         let items = self.linear_items();

@@ -29,6 +29,7 @@ pub(super) struct ExceptionOwnerProvenance {
     // One authored normal POP_BLOCK, not an extra synthetic end record or a copied exit.
     pub(super) retained_normal_pop_blocks: FxHashMap<Label, RetainedNormalPopBlock>,
     pub(super) original_normal_finally_arrays: Vec<OriginalNormalFinallyArray>,
+    pub(super) normal_finally_none_prefixes: Vec<(Instruction, Instruction, Instruction)>,
     pub(super) uncompacted_conditional_arrays: Vec<UncompactedConditionalArray>,
     pub(super) original_primitive_condition_boundaries: Vec<Instruction>,
     pub(super) synchronous_with_setups: FxHashSet<Label>,
@@ -1541,6 +1542,7 @@ impl LayoutAssembler {
         let mut pending_normal_pop_null_append = None;
         let mut original_array_start = 0;
         let mut pending_compacted_append = None;
+        let mut pending_normal_none_owner = None;
         let mut pending_threaded_null_append = None;
         let mut has_uninterrupted_fusion = false;
         let mut instruction_index = 0;
@@ -2584,6 +2586,77 @@ impl LayoutAssembler {
                             },
                         );
                     }
+                    // A normal-finally local None test removes exactly three comparison
+                    // records. With a retained POP its marker reuses IS_OP; with one
+                    // deleted POP it reuses LOAD_CONST(None). Both belong to the unchanged
+                    // local-test region, not the surrounding resumable-scope fallback.
+                    if matches!(instruction.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+                        && owner_history_exact
+                        && tail.insertions == 0
+                        && tail.late_removals == 0
+                        && tail.post_compaction_fusions == 0
+                        && instruction_index > 0
+                        && !owners.contains_key(&(instruction_index - 1))
+                        && !owners.contains_key(&instruction_index)
+                    {
+                        let load_index = instruction_index - 1;
+                        let load = *indexed_instructions[load_index];
+                        for (original_pop, original_load, original_condition) in
+                            &self.exception_owner_provenance.normal_finally_none_prefixes
+                        {
+                            if instruction != original_condition {
+                                continue;
+                            }
+                            let removed_pop = load.local_policy.hidden_exception_owner_slots();
+                            if removed_pop > 1
+                                || tail.early_removals != 3 + usize::from(removed_pop)
+                            {
+                                continue;
+                            }
+                            let mut expected_load = *original_load;
+                            expected_load
+                                .local_policy
+                                .add_hidden_exception_owner_slots(removed_pop);
+                            if load.opcode == crate::target::opcodes::LOAD_FAST_BORROW {
+                                expected_load.opcode = load.opcode;
+                            }
+                            if load != expected_load {
+                                continue;
+                            }
+                            let prefix_start = if removed_pop == 0 {
+                                let Some(pop_index) = load_index.checked_sub(1) else {
+                                    continue;
+                                };
+                                let pop = *indexed_instructions[pop_index];
+                                let mut expected_pop = *original_pop;
+                                expected_pop.location = pop.location;
+                                if pop != expected_pop {
+                                    continue;
+                                }
+                                pop_index
+                            } else {
+                                load_index
+                            };
+                            if original_array_start > prefix_start
+                                || jump_targets.iter().any(|label| {
+                                    label_positions.get(label).is_some_and(|position| {
+                                        prefix_start < *position
+                                            && *position <= instruction_index + 1
+                                    })
+                                })
+                            {
+                                continue;
+                            }
+                            if let Some(region) = self.uniform_exception_owner(
+                                load_index,
+                                instruction_index + 1,
+                                &label_positions,
+                            ) && !self.exception_regions[region].is_scope_fallback
+                            {
+                                pending_normal_none_owner = Some((instruction_index + 1, region));
+                            }
+                        }
+                    }
                     // Capture the original array's owner before range-exclusion labels at the
                     // conditional erase its provenance. A compacted, uniformly owned array
                     // leaves the same owner in every stale slot reused by a forward marker.
@@ -2673,6 +2746,25 @@ impl LayoutAssembler {
                             ExceptionOwnerDecision {
                                 has_owner: false,
                                 source_region: None,
+                                definitive: true,
+                                override_existing: true,
+                            },
+                        );
+                    }
+                    if instruction.opcode == NOT_TAKEN
+                        && instruction.exception_policy().exclusion()
+                            == super::ExceptionExclusion::None
+                        && let Some((index, region)) = pending_normal_none_owner.take()
+                        && index == instruction_index
+                        && owners
+                            .get(&instruction_index)
+                            .is_none_or(|owner| !owner.definitive)
+                    {
+                        owners.insert(
+                            instruction_index,
+                            ExceptionOwnerDecision {
+                                has_owner: true,
+                                source_region: Some(region),
                                 definitive: true,
                                 override_existing: true,
                             },
