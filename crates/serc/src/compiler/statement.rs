@@ -21579,6 +21579,33 @@ fn simple_cleanup_call(expression: &Expr) -> bool {
         })
 }
 
+// A simple branching value reconverges at its name store before the next guard.
+// Keep unpacking targets, suspending expressions, and nested control flow excluded.
+fn recovery_assignment_has_nonempty_join(assignment: &ruff_python_ast::StmtAssign) -> bool {
+    if !matches!(assignment.targets.as_slice(), [Expr::Name(_)]) {
+        return false;
+    }
+    let is_name_value = |value: &Expr| {
+        matches!(value, Expr::Name(_))
+            || matches!(value, Expr::Attribute(attribute)
+                if matches!(attribute.value.as_ref(), Expr::Name(_)))
+    };
+    let is_simple_value = |value: &Expr| is_name_value(value) || fold_constant(value).is_some();
+    match assignment.value.as_ref() {
+        Expr::BoolOp(boolean) => {
+            boolean.op == BoolOp::Or
+                && boolean.values.len() == 2
+                && boolean.values.iter().all(is_name_value)
+        }
+        Expr::If(conditional) => {
+            (is_name_value(&conditional.test) || simple_cleanup_call(&conditional.test))
+                && is_simple_value(&conditional.body)
+                && is_simple_value(&conditional.orelse)
+        }
+        _ => false,
+    }
+}
+
 // Runtime re-raise guards keep their false successors connected to handler cleanup.
 // Linear work may separate guards; copied returns and folded tests need other proofs.
 fn suite_has_linear_reraise_guards(body: &[Stmt]) -> bool {
@@ -21588,12 +21615,11 @@ fn suite_has_linear_reraise_guards(body: &[Stmt]) -> bool {
             Stmt::If(guard)
                 if condition_has_linear_runtime_leaves(&guard.test)
                     && guard.elif_else_clauses.is_empty()
-                    && matches!(guard.body.as_slice(), [Stmt::Raise(raise)]
-                        if raise.exc.as_deref().is_none_or(|value| !expression_contains_inline_branch(value))
-                            && raise.cause.as_deref().is_none_or(|value| !expression_contains_inline_branch(value))) =>
+                    && suite_has_linear_raise_exit(&guard.body) =>
             {
                 has_guard = true;
             }
+            Stmt::Assign(assignment) if recovery_assignment_has_nonempty_join(assignment) => {}
             _ if suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement)) => {}
             _ => return false,
         }

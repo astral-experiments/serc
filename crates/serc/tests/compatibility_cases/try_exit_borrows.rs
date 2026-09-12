@@ -4060,3 +4060,19 @@ fn async_recovery_reaches_conditional_try_cleanup() {
         "async_recovery_conditional_try_cleanup.py",
     );
 }
+
+#[test]
+fn recovery_conditional_assignment_and_work_before_raise() {
+    common::assert_matches_cpython_marshal(
+        "async def f(sink, cached, scope):\n    result = \"success\"\n    try:\n        cached = await fetch(scope)\n    except Error as error:\n        result = \"transient\" if transient(error) else \"failure\"\n        attempt = clock()\n        if cached is None or cached.records is None:\n            state = empty(attempt)\n            store(state)\n            raise Unavailable(scope) from error\n        state = replace(cached, attempt)\n        store(state)\n        warning(error)\n    finally:\n        tags = [f\"scope:{scope}\", f\"result:{result}\"]\n        sink.record(tags)\n    return cached\n",
+        "conditional_value_raise_work.py",
+    );
+}
+
+#[test]
+fn recovery_short_circuit_assignment_before_guard() {
+    common::assert_matches_cpython_marshal(
+        "async def f(sink, item):\n    try:\n        await work(item)\n    except Error as error:\n        cause = error.cause or error.__cause__\n        report(cause)\n        if not recoverable(cause):\n            raise\n    finally:\n        sink.record(item)\n        done(item)\n",
+        "short_circuit_value_recovery.py",
+    );
+}
