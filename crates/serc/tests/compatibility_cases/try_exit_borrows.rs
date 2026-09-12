@@ -4044,3 +4044,11 @@ fn async_reraise_guard_chain_reaches_optional_callback_cleanup() {
         "async_guard_chain_optional_callback.py",
     );
 }
+
+#[test]
+fn synchronous_recovery_reaches_conditional_try_cleanup() {
+    common::assert_matches_cpython_marshal(
+        "def f(sink, item, attempt, limit):\n    try:\n        work(item)\n    except Error as error:\n        if attempt >= limit or not recoverable(error):\n            raise\n        retry(item)\n    finally:\n        if sink is not None:\n            try:\n                sink.close()\n            except Error:\n                pass\n",
+        "synchronous_recovery_conditional_try_cleanup.py",
+    );
+}

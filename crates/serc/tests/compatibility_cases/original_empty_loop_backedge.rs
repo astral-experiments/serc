@@ -371,3 +371,54 @@ fn generator_manager_finally_none() {
         "generator_manager_finally_none.py",
     );
 }
+
+#[test]
+fn coroutine_manager_finally_cell_none() {
+    common::assert_matches_cpython_marshal(
+        r"async def f(manager, pending, task):
+    def current():
+        return pending
+    with manager:
+        try:
+            await task(current)
+        finally:
+            if pending is not None:
+                pending.close()
+",
+        "coroutine_manager_finally_cell_none.py",
+    );
+}
+
+#[test]
+fn manager_finally_none_after_assertion_success() {
+    common::assert_matches_cpython_marshal(
+        r"async def f(manager, pending, task):
+    async with manager:
+        try:
+            result = await task()
+            assert result is not None
+        finally:
+            if pending is not None:
+                await pending.close()
+",
+        "manager_finally_none_after_assertion_success.py",
+    );
+}
+
+#[test]
+fn manager_finally_none_after_nested_try_exit_copy() {
+    common::assert_matches_cpython_marshal(
+        r"async def f(manager, pending, task):
+    async with manager:
+        try:
+            try:
+                await task()
+            except ValueError:
+                report()
+        finally:
+            if pending is not None:
+                pending.close()
+",
+        "manager_finally_none_after_nested_try_exit_copy.py",
+    );
+}

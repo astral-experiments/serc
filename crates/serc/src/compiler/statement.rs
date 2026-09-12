@@ -15360,7 +15360,24 @@ impl Compiler<'_> {
                     && (!expression_contains_inline_branch(&cleanup.test)
                         || ((synchronous_recovery || coroutine_guarded_callback_cleanup)
                             && condition_has_linear_runtime_leaves(&cleanup.test)))
-                    && suite_has_linear_borrow_fallthrough(&cleanup.body)
+                    && (suite_has_linear_borrow_fallthrough(&cleanup.body)
+                        || (synchronous_recovery
+                            && self.control.withs.active_with_exits.is_empty()
+                            && self.control.finally.active_copied_finally_bodies == 0
+                            && cleanup.elif_else_clauses.is_empty()
+                            && matches!(cleanup.body.as_slice(), [Stmt::Try(recovery)]
+                                if !recovery.is_star
+                                    && recovery.orelse.is_empty()
+                                    && recovery.finalbody.is_empty()
+                                    && self.suite_has_nonempty_borrow_entry(&cleanup.body)
+                                    && suite_has_linear_borrow_fallthrough(&recovery.body)
+                                    && !recovery.handlers.is_empty()
+                                    && recovery.handlers.iter().all(|handler| {
+                                        handler.as_except_handler().is_some_and(|handler| {
+                                            handler.type_.is_some()
+                                                && handler.body.iter().all(|statement| matches!(statement, Stmt::Pass(_)))
+                                        })
+                                    }))))
                     && cleanup.elif_else_clauses.iter().all(|clause| {
                         clause.test.as_ref().is_none_or(|test| {
                             condition_has_only_runtime_tests(test)

@@ -2630,6 +2630,16 @@ impl LayoutAssembler {
                                 let pop = *indexed_instructions[pop_index];
                                 let mut expected_pop = *original_pop;
                                 expected_pop.location = pop.location;
+                                // Strengthening an already unconditional POP exclusion to
+                                // an explicit absent owner preserves this original NULL cell.
+                                if expected_pop.exception_policy()
+                                    == super::ExceptionPolicy::EXCLUDE_ALWAYS
+                                    && pop.exception_policy()
+                                        == super::ExceptionPolicy::AlwaysAbsent
+                                {
+                                    expected_pop
+                                        .set_exception_policy(super::ExceptionPolicy::AlwaysAbsent);
+                                }
                                 if pop != expected_pop {
                                     continue;
                                 }

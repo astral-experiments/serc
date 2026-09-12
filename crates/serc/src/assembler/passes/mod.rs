@@ -404,6 +404,17 @@ impl OptimizationPipeline {
         // Also clear scratch origins on assertion-only and duplicate-pass early-return paths.
         Self::clear_initial_borrow_jump_entries(&mut self.graph);
         original_owners.retain_after_exit_copy(&self, &copied_exit_owner_retargets);
+        // Exit duplication changes this surviving conditional's target, not its
+        // original array or the normal-finally comparison cells recorded within it.
+        for (before, after) in &copied_exit_owner_retargets {
+            for (_, _, condition) in
+                &mut self.exception_owner_provenance.normal_finally_none_prefixes
+            {
+                if condition == before {
+                    *condition = *after;
+                }
+            }
+        }
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::DuplicateExitBlocks)?;
         // CPython removes unreachable blocks after its per-block optimizations, including

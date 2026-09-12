@@ -2960,7 +2960,7 @@ impl Assembler {
         if pop.opcode == NOP
             && pop.fusion_policy.is_converted_pop_block()
             && pop.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
-            && load.opcode == LOAD_FAST
+            && matches!(load.opcode, LOAD_FAST | crate::target::opcodes::LOAD_DEREF)
             && load.local_policy.hidden_exception_owner_slots() == 0
             && load.pre_fold_extra_instructions() == 0
             && matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
