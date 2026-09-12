@@ -4140,3 +4140,33 @@ fn dispatching_successor_reaches_nested_try_cleanup() {
         "dispatching_successor.py",
     );
 }
+
+#[test]
+fn matches_cpython_iterator_break_entering_try_else_owner() {
+    common::assert_matches_cpython_marshal(
+        r"def tail_break(values, stop):
+    try:
+        for value in values:
+            if stop(value):
+                break
+    except Exception:
+        report()
+    else:
+        finish()
+    after()
+",
+        "tail_break.py",
+    );
+    common::assert_matches_cpython_marshal(
+        r"def no_else_break(values, stop):
+    try:
+        for value in values:
+            if stop(value):
+                break
+    except Exception:
+        report()
+    after()
+",
+        "no_else_break.py",
+    );
+}

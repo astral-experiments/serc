@@ -4048,6 +4048,16 @@ impl Compiler<'_> {
                         && context.exception_region_depth > 0
                         && context.finally_end_depth == 0
                         && !context.break_target_keeps_exception_owner
+                        // A direct synchronous iterator break enters this try's else
+                        // suite. Its authored jump retains the still-active try owner.
+                        && !(context.iterator_cleanup == IteratorCleanup::Sync
+                            && self.control.exceptions.direct_try_body_has_else
+                            && self.control.withs.active_with_exits.is_empty()
+                            && self.control.finally.active_loop_finally_contexts.is_empty()
+                            && self.control.finally.active_return_finally_contexts.is_empty()
+                            && self.control.finally.active_finally_end_blocks == 0
+                            && self.control.finally.active_normal_finally_bodies == 0
+                            && self.control.finally.active_copied_finally_bodies == 0)
                         && !context.protected_finally_break_owner
                         // A break stays inside a finally-protected loop's enclosing try body.
                         && self.control.finally.active_finally_try_bodies == 0
