@@ -658,6 +658,23 @@ impl Compiler<'_> {
                         let success_exit = self.emit_jump_forward_instruction(JUMP_FORWARD, end)?;
                         if original_unlocated_head {
                             self.assembler.mark_as_artificial_eval_break(success_exit);
+                            if let Some(Stmt::If(tail)) = case.body.last()
+                                && early_condition_truthiness(&tail.test).is_none()
+                                && tail
+                                    .elif_else_clauses
+                                    .last()
+                                    .is_some_and(|clause| clause.test.is_none())
+                                && tail.elif_else_clauses.iter().all(|clause| {
+                                    clause.test.as_ref().is_none_or(|test| {
+                                        early_condition_truthiness(test).is_none()
+                                    })
+                                })
+                            {
+                                // The case-success jump occupies the nested if's empty join.
+                                // Thread incoming branches before retaining its separate line.
+                                self.assembler
+                                    .preserve_redundant_jump_nop_after_threading(success_exit);
+                            }
                         }
                         if index + 1 == matched_cases
                             && (!context.fail_pop.is_empty()

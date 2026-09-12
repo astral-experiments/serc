@@ -1431,7 +1431,7 @@ impl OptimizationPipeline {
                 match item {
                     Item::Label(label) => labels.push(*label),
                     Item::Instruction(instruction) => {
-                        // Only the compiler's common for-loop backedge can certify a
+                        // Only the compiler's common loop backedge can certify a
                         // backward head. Per-arm and copied backedges have no such entry.
                         if (instruction.opcode == JUMP_BACKWARD
                             || (instruction.opcode == JUMP_FORWARD

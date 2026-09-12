@@ -2774,15 +2774,15 @@ impl Assembler {
         self.conditional_threading_targets.insert(label, location);
     }
 
-    /// Records the common backedge emitted after a for-loop body, before optimization.
+    /// Records the common backedge emitted after a loop body, before optimization.
     /// Per-arm backedges emitted by loop-tail lowering do not receive this certificate.
-    pub(crate) fn record_last_original_for_backedge(&mut self) {
+    pub(crate) fn record_last_original_loop_backedge(&mut self) {
         let (last, head) = self
             .linear_items()
             .split_last()
-            .expect("original for backedge");
+            .expect("original loop backedge");
         let Item::Instruction(instruction) = last else {
-            unreachable!("original for backedge must be the last instruction");
+            unreachable!("original loop backedge must be the last instruction");
         };
         assert_eq!(instruction.opcode, JUMP_BACKWARD);
         let location = instruction.location;

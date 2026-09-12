@@ -27,10 +27,11 @@ impl OptimizationPipeline {
             ) else {
                 continue;
             };
-            // A located prefix longer than the small-exit limit cannot be copied
-            // into this cleanup. Other targets need the broader original-array schedule.
+            // A located conditional block is not a scope exit, so it cannot be copied
+            // even below the small-exit limit. Larger located prefixes cannot be copied either.
             let mut target_slots = 0;
             let mut target_is_located = false;
+            let mut target_is_conditional = false;
             for item in self.graph[target_block].items() {
                 match item {
                     Item::Label(_) if target_slots > 0 => break,
@@ -42,6 +43,8 @@ impl OptimizationPipeline {
                         if target_slots > 4 {
                             break;
                         }
+                        target_is_conditional =
+                            super::super::is_conditional_jump(instruction.opcode);
                         if super::super::ends_scope(instruction.opcode)
                             || matches!(
                                 instruction.operand(),
@@ -53,7 +56,7 @@ impl OptimizationPipeline {
                     }
                 }
             }
-            if target_slots <= 4 || !target_is_located {
+            if (target_slots <= 4 && !target_is_conditional) || !target_is_located {
                 continue;
             }
             let items = self.graph[block].items();
@@ -156,11 +159,8 @@ impl OptimizationPipeline {
                     unknown_edge = true;
                 } else if is_unconditional_jump(instruction.opcode) {
                     success_edges += 1;
-                } else if matches!(
-                    instruction.opcode,
-                    crate::target::opcodes::POP_JUMP_IF_FALSE
-                        | crate::target::opcodes::POP_JUMP_IF_TRUE
-                ) && instruction.location.line >= 0
+                } else if super::super::is_conditional_jump(instruction.opcode)
+                    && instruction.location.line >= 0
                 {
                     failure_edges += 1;
                 } else {

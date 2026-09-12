@@ -2697,6 +2697,7 @@ impl Compiler<'_> {
                     self.assembler.set_location(location);
                 }
                 self.emit_jump_backward(JUMP_BACKWARD, start, 0)?;
+                self.assembler.record_last_original_loop_backedge();
             }
         }
 
@@ -8118,15 +8119,25 @@ impl Compiler<'_> {
             // An assertion in the final else supplies its success operand's range
             // to the enclosing branch exit. Folded branches keep their emitted donor.
             let mut final_else_body = body;
+            let mut descended_else = false;
             while let Some(Stmt::If(statement)) = final_else_body.last()
                 && condition_has_only_runtime_tests(&statement.test)
                 && let [clause] = statement.elif_else_clauses.as_slice()
                 && clause.test.is_none()
             {
                 final_else_body = &clause.body;
+                descended_else = true;
             }
             if let Some(range) = suite_assert_success_fallthrough_range(final_else_body) {
                 self.assembler.set_location(self.source_location(range));
+            } else if descended_else
+                && let Some(Stmt::If(statement)) = final_else_body.last()
+                && let Some(test) = final_terminating_arm_fallthrough_test(statement)
+            {
+                // Earlier arms have their own exits; the final false edge supplies
+                // this surviving branch jump's location.
+                self.assembler
+                    .set_location(self.source_location(condition_fallthrough_range(test)));
             } else {
                 self.set_fallthrough_end_location(body, body_start);
             }
@@ -8916,9 +8927,17 @@ impl Compiler<'_> {
 
             self.assembler.mark(exit);
             self.set_depth(base_depth);
-            self.assembler
-                .set_location(self.source_location(condition_fallthrough_range(&statement.test)));
-            self.emit_jump_backward(JUMP_BACKWARD, restart, 0)?;
+            let shared_exit = condition_jump_target_count(&statement.test, false) > 1;
+            self.assembler.set_location(if shared_exit {
+                SourceLocation::NONE
+            } else {
+                self.source_location(condition_fallthrough_range(&statement.test))
+            });
+            let backedge = self.emit_jump_backward_instruction(JUMP_BACKWARD, restart)?;
+            if shared_exit {
+                // The original shared loop exit is unlocated before per-edge copying.
+                self.assembler.mark_as_artificial_eval_break(backedge);
+            }
             return Ok(());
         }
 
@@ -9024,6 +9043,7 @@ impl Compiler<'_> {
             // CPython copies this shared backedge onto each conditional fallthrough.
             self.assembler.mark_as_artificial_eval_break(backedge);
         }
+        self.assembler.record_last_original_loop_backedge();
         Ok(())
     }
 
@@ -10039,19 +10059,25 @@ impl Compiler<'_> {
                 && condition_jump_target_count(fallthrough_test, false) > 1
                 && let Expr::BoolOp(boolean) = fallthrough_test
             {
-                boolean
-                    .values
-                    .last()
-                    .and_then(|last| unique_condition_jump_target(last, false))
+                Some(boolean)
             } else {
                 None
             };
-            let fallthrough_range = copied_protected_fallthrough.map_or_else(
-                || condition_fallthrough_range(fallthrough_test),
-                Ranged::range,
+            // Copying the shared exit does not require a unique location donor. The
+            // surviving original must also inherit its remaining predecessor's location.
+            let fallthrough_location = copied_protected_fallthrough.map_or_else(
+                || self.source_location(condition_fallthrough_range(fallthrough_test)),
+                |boolean| {
+                    boolean
+                        .values
+                        .last()
+                        .and_then(|last| unique_condition_jump_target(last, false))
+                        .map_or(SourceLocation::NONE, |last| {
+                            self.source_location(last.range())
+                        })
+                },
             );
-            self.assembler
-                .set_location(self.source_location(fallthrough_range));
+            self.assembler.set_location(fallthrough_location);
             let backedge = self.emit_loop_tail_backedge(restart, try_body_normal_exit)?;
             if copied_protected_fallthrough.is_some() {
                 // CPython copies a protected loop-tail exit onto each short-circuit edge.
@@ -10987,7 +11013,7 @@ impl Compiler<'_> {
             {
                 self.assembler.mark_as_artificial_eval_break(backedge);
             }
-            self.assembler.record_last_original_for_backedge();
+            self.assembler.record_last_original_loop_backedge();
         } else if self.context.target_specific_rules_enabled()
             && tail_jumps != LoopBackedge::EmittedWithOriginalFallthrough
         {
@@ -11208,7 +11234,41 @@ impl Compiler<'_> {
                 self.assembler.allow_borrow_surviving_break_entry(end);
             }
         }
+        // This marker represents the following protected POP_BLOCK. A split loop
+        // prefix or nested branch tail does not end that original protected body.
+        let ends_protected_body = self
+            .control
+            .exceptions
+            .direct_try_body_statements
+            .last()
+            .is_some_and(|range| *range == statement.range)
+            || self
+                .control
+                .withs
+                .active_with_exits
+                .last()
+                .is_some_and(|context| context.terminal_statement_range == Some(statement.range))
+            || self
+                .control
+                .exceptions
+                .active_exception_handlers
+                .last()
+                .is_some_and(|context| context.trailing_statement == Some(statement.range))
+            // Exception-group handlers do not expose their original body tail here.
+            || self.control.exceptions.active_exception_group_handlers > 0;
         if self.control.loops.emit_protected_async_for_end_nop
+            && !ends_protected_body
+            && statement.orelse.is_empty()
+            && !has_break
+        {
+            // Removing the synthetic POP_BLOCK must not change END_ASYNC_FOR's owner.
+            self.control
+                .generators
+                .generator_region_exclusions
+                .push((async_cleanup, exhaustion_continuation));
+        }
+        if self.control.loops.emit_protected_async_for_end_nop
+            && ends_protected_body
             && statement.orelse.is_empty()
             && !has_break
         {
@@ -12268,6 +12328,14 @@ impl Compiler<'_> {
         // A sole normal predecessor locates the outer finally POP_BLOCK. Keep that
         // original ownerless marker instead of forcing the inner assertion marker.
         let retained_assertion_exit = (self.control.statements.current_statement_has_following
+            || (self.control.statements.inherited_statement_has_following
+                // A breakless async loop reaches the suffix only through its cold
+                // exhaustion handler. The surviving exit jump already keeps this line.
+                && !statement.body.iter().any(|statement| {
+                    matches!(statement, Stmt::For(loop_statement)
+                        if loop_statement.is_async
+                            && !suite_contains_loop_break(&loop_statement.body))
+                }))
             || !statement.orelse.is_empty()
             || direct_with_exit
             || shared_finally_assertion_exit)
@@ -12563,14 +12631,12 @@ impl Compiler<'_> {
                     .expect("retained assertion exit has a unique successful edge");
                 self.assembler
                     .set_location(self.source_location(exit_test.range()));
-                let exception_policy = if self.unit.flags & CO_COROUTINE != 0
-                    && !statement.handlers.is_empty()
-                    && !statement.orelse.is_empty()
-                {
-                    ExceptionPolicy::EXCLUDE_ALWAYS
-                } else {
-                    ExceptionPolicy::default()
-                };
+                let exception_policy =
+                    if !statement.handlers.is_empty() && !statement.orelse.is_empty() {
+                        ExceptionPolicy::EXCLUDE_ALWAYS
+                    } else {
+                        ExceptionPolicy::default()
+                    };
                 self.emit_with_exception_policy(NOP, 0, 0, exception_policy)?;
                 self.assembler.mark_last_as_converted_pop_block();
                 self.assembler.preserve_last_nop();
@@ -12830,6 +12896,9 @@ impl Compiler<'_> {
                 .orelse
                 .is_empty()
                 .then(|| match statement.body.last()? {
+                    Stmt::While(loop_statement) if is_break_only_loop(loop_statement) => {
+                        terminal_while_break_exit_range(loop_statement)
+                    }
                     Stmt::While(loop_statement)
                         if loop_statement.orelse.is_empty()
                             && (condition_jump_target_count(&loop_statement.test, false) == 1
@@ -13281,6 +13350,13 @@ impl Compiler<'_> {
                 // removes this same located jump later. Retain its native NOP then too.
                 self.assembler
                     .preserve_redundant_jump_nop_after_threading(normal_exit);
+            } else if loop_exit_location.is_some()
+                && matches!(normal_exit_suite.last(), Some(Stmt::While(loop_statement))
+                    if is_break_only_loop(loop_statement))
+            {
+                // Delay the break's exit until threading, then allow an adjacent
+                // finally POP_BLOCK with the same line to absorb its redundant NOP.
+                self.assembler.defer_jump_removal(normal_exit);
             }
             if chained_assertion_exit_location.is_some() {
                 // Cold-block relocation removes this jump after native borrowing has
@@ -13289,6 +13365,28 @@ impl Compiler<'_> {
                     .mark_retained_nop_borrow_fallthrough_if_unblocked(normal_exit);
             }
             if statement.orelse.is_empty() && retained_assertion_exit {
+                self.assembler.prevent_jump_threading_target(normal_exit);
+            }
+            if loop_exit_location.is_some()
+                && matches!(normal_exit_suite.last(), Some(Stmt::While(loop_statement))
+                    if is_break_only_loop(loop_statement))
+                && self.control.withs.active_with_exits.is_empty()
+                && (self
+                    .control
+                    .statements
+                    .current_statement_followed_by_literal_return
+                    || self
+                        .control
+                        .statements
+                        .current_statement_followed_by_name_return
+                    || (!self.control.statements.current_statement_has_following
+                        && self
+                            .control
+                            .statements
+                            .inherited_statement_followed_by_small_return))
+            {
+                // Preserve the original POP_BLOCK barrier while the small return is copied.
+                // Larger successors keep the existing loop-break threading provenance.
                 self.assembler.prevent_jump_threading_target(normal_exit);
             }
             // Cold-block cleanup removes a shared unlocated exit completely;
@@ -20330,6 +20428,29 @@ fn is_break_only_loop(statement: &ruff_python_ast::StmtWhile) -> bool {
         && suite_contains_loop_break(&statement.body)
 }
 
+// A folded-true loop has no condition exit. Its sole authored break locates the
+// normal try-exit jump after POP_BLOCK stops the earlier threading pass.
+fn terminal_while_break_exit_range(statement: &ruff_python_ast::StmtWhile) -> Option<TextRange> {
+    if suite_contains_multiple_loop_breaks(&statement.body) {
+        return None;
+    }
+    let Stmt::If(tail) = statement.body.last()? else {
+        return None;
+    };
+    let body = if let Some(clause) = tail.elif_else_clauses.last() {
+        if clause.test.is_some() {
+            return None;
+        }
+        &clause.body
+    } else {
+        &tail.body
+    };
+    match body.last()? {
+        Stmt::Break(statement) => Some(statement.range),
+        _ => None,
+    }
+}
+
 fn suite_ends_in_nested_break_only_loop(body: &[Stmt]) -> bool {
     matches!(
         body.last(),
@@ -21517,6 +21638,23 @@ fn terminal_assert_split_success_ranges(
         (target.range() == operand.range() || supported_nested_and).then(|| target.range())
     };
     Some([success_range(first)?, success_range(second)?])
+}
+
+/// Finds a final terminating arm whose unique false edge keeps a source location.
+fn final_terminating_arm_fallthrough_test(statement: &ruff_python_ast::StmtIf) -> Option<&Expr> {
+    let mut test = statement.test.as_ref();
+    let mut body = statement.body.as_slice();
+    for clause in &statement.elif_else_clauses {
+        if !condition_has_only_runtime_tests(test) {
+            return None;
+        }
+        test = clause.test.as_ref()?;
+        body = &clause.body;
+    }
+    (condition_has_only_runtime_tests(test)
+        && suite_terminates(body)
+        && condition_jump_target_count(test, false) == 1)
+        .then_some(test)
 }
 
 fn terminating_if_fallthrough_test(statement: &ruff_python_ast::StmtIf) -> Option<&Expr> {

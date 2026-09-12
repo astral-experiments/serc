@@ -424,3 +424,13 @@ mod protected_nested_try_loop_exit;
 mod ordinary_named_return_owner_slots;
 
 mod retained_finally_owner_slots;
+
+mod cfg_join_probes;
+
+mod loop_provenance_probes;
+
+mod cleanup_provenance_probes;
+
+mod shared_normal_exit_markers;
+
+mod loop_cleanup_regressions;

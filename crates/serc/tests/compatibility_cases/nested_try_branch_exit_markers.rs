@@ -204,3 +204,92 @@ fn preserves_nested_else_assertion_success_operand_locations() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn preserves_recursive_else_terminating_condition_locations() {
+    for (filename, source) in [
+        (
+            "recursive_raise.py",
+            r"def f(a, b, c):
+    if a:
+        if b:
+            raise ValueError
+        else:
+            if c:
+                raise RuntimeError
+    else:
+        sink(1)
+        sink(2)
+    finish()
+",
+        ),
+        (
+            "recursive_continue.py",
+            r"def f(items, a, b, c):
+    for item in items:
+        if a:
+            if b:
+                continue
+            else:
+                if not c:
+                    continue
+        else:
+            sink(1)
+            sink(2)
+        finish(item)
+",
+        ),
+        (
+            "recursive_elif_return.py",
+            r"def f(a, b, c, d, stop):
+    if a:
+        if b:
+            sink(0)
+        else:
+            if c:
+                sink(1)
+            else:
+                if d:
+                    sink(2)
+                elif stop:
+                    return
+    else:
+        sink(3)
+        sink(4)
+    finish()
+",
+        ),
+        (
+            "nonterminating_tail_control.py",
+            r"def f(a, b, c):
+    if a:
+        if b:
+            sink(0)
+        else:
+            if c:
+                sink(3)
+    else:
+        sink(1)
+        sink(2)
+    finish()
+",
+        ),
+        (
+            "shared_false_edge_control.py",
+            r"def f(a, b, c, d):
+    if a:
+        if b:
+            raise ValueError
+        else:
+            if c and d:
+                raise RuntimeError
+    else:
+        sink(1)
+        sink(2)
+    finish()
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
