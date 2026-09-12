@@ -13437,19 +13437,40 @@ impl Compiler<'_> {
                     self.store_name(name.as_str())?;
                     self.delete_name(name.as_str())?;
                 }
-                let continue_label = self
-                    .control
-                    .loops
-                    .contexts
-                    .last()
-                    .map(|context| context.continue_label)
-                    .ok_or_else(|| {
+                let loop_context =
+                    self.control.loops.contexts.last().copied().ok_or_else(|| {
                         CompileError::invalid_syntax(
                             "'continue' not properly in loop",
                             handler.body[0].range(),
                         )
                     })?;
-                self.emit_jump_backward(JUMP_BACKWARD, continue_label, 0)?;
+                // POP_EXCEPT and the named-handler cleanup retain their owners.
+                // The backedge leaves ordinary tries entered after the target loop.
+                let exclusion_start = (loop_context.exception_region_depth
+                    < self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .len())
+                .then(|| {
+                    let start = self.assembler.label();
+                    self.assembler.mark(start);
+                    start
+                });
+                self.emit_jump_backward(JUMP_BACKWARD, loop_context.continue_label, 0)?;
+                if let Some(start) = exclusion_start {
+                    let end = self.assembler.label();
+                    self.assembler.mark(end);
+                    for exclusions in self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .iter_mut()
+                        .skip(loop_context.exception_region_depth)
+                    {
+                        exclusions.push((start, end));
+                    }
+                }
                 if let Some(name) = &handler.name {
                     self.assembler.add_exception_region(
                         body_start,

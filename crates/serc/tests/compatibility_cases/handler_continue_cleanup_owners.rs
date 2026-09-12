@@ -274,3 +274,83 @@ fn matches_cpython_break_manager_pop_controls() {
         common::assert_matches_cpython_marshal(source, "break_manager_pop_controls.py");
     }
 }
+
+#[test]
+fn direct_handler_continues_leave_enclosing_try_regions() {
+    common::assert_matches_cpython_marshal(
+        r"def f(items):
+    for item in items:
+        try:
+            try:
+                work(item)
+            except ValueError:
+                continue
+        except RuntimeError:
+            recover()
+",
+        "ordinary_for.py",
+    );
+    common::assert_matches_cpython_marshal(
+        r"def f(ready):
+    while ready():
+        try:
+            try:
+                work()
+            except ValueError:
+                continue
+        except RuntimeError:
+            recover()
+",
+        "ordinary_while.py",
+    );
+    common::assert_matches_cpython_marshal(
+        r"def f(items, manager):
+    with manager:
+        for item in items:
+            try:
+                try:
+                    work(item)
+                except ValueError:
+                    continue
+            except RuntimeError:
+                recover()
+",
+        "manager_for.py",
+    );
+    common::assert_matches_cpython_marshal(
+        r"def f(items):
+    for item in items:
+        try:
+            try:
+                work(item)
+            except ValueError as error:
+                continue
+        except RuntimeError:
+            recover()
+",
+        "named_for.py",
+    );
+    common::assert_matches_cpython_marshal(
+        r"async def f(items):
+    for item in items:
+        try:
+            try:
+                await work(item)
+            except ValueError:
+                continue
+        except RuntimeError:
+            recover()
+",
+        "coroutine_for.py",
+    );
+    common::assert_matches_cpython_marshal(
+        r"def f(items):
+    for item in items:
+        try:
+            work(item)
+        except ValueError:
+            continue
+",
+        "direct_handler_control.py",
+    );
+}
