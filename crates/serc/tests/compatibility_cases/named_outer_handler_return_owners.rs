@@ -111,3 +111,19 @@ fn preserves_named_outer_handler_scope_boundaries() {
         common::assert_matches_cpython_marshal(source, "named_outer_scope_boundary.py");
     }
 }
+
+#[test]
+fn matches_cpython_named_handler_teardown_before_intervening_finally() {
+    for (scope, suspension) in [("def", ""), ("async def", "await ")] {
+        for returned in ["inner", "None", "value"] {
+            let source = format!(
+                "{scope} example(value):\n    try:\n        {suspension}acquire()\n    except Exception as outer:\n        try:\n            {suspension}work()\n            return None\n        except Exception as inner:\n            return {returned}\n        finally:\n            {suspension}close()\n"
+            );
+            common::assert_matches_cpython_marshal(&source, "named_handler_intervening_finally.py");
+        }
+        let source = format!(
+            "{scope} control():\n    try:\n        {suspension}acquire()\n    except Exception:\n        try:\n            {suspension}work()\n            return None\n        except Exception as inner:\n            return inner\n        finally:\n            {suspension}close()\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "unnamed_outer_intervening_finally.py");
+    }
+}

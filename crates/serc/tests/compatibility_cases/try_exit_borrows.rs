@@ -4020,3 +4020,19 @@ fn dispatcher_break_reaches_conditional_cleanup_with_raising_handler() {
         "dispatcher_break_conditional_cleanup.py",
     );
 }
+
+#[test]
+fn runtime_and_reraise_handler_reaches_normal_finally() {
+    for prefix in ["", "async "] {
+        let source = "def f(sink, item, allow):\n    try:\n        work(item)\n    except Error as error:\n        report(error)\n        if not allow and not recoverable(error):\n            raise Error(item) from error\n        skipped(item)\n    finally:\n        sink.close()\n".replacen("def f", &format!("{prefix}def f"), 1);
+        common::assert_matches_cpython_marshal(&source, "runtime_and_recovery.py");
+    }
+}
+
+#[test]
+fn runtime_reraise_guard_chain_reaches_normal_finally() {
+    for prefix in ["", "async "] {
+        let source = "def f(sink, item, suppress):\n    try:\n        result = work(item)\n    except Error as error:\n        if not recoverable(error):\n            raise\n        if not suppress:\n            raise\n        skipped(item)\n    finally:\n        if sink is not None:\n            sink.close()\n".replacen("def f", &format!("{prefix}def f"), 1);
+        common::assert_matches_cpython_marshal(&source, "guard_chain_recovery.py");
+    }
+}

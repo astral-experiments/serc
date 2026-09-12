@@ -980,9 +980,42 @@ fn propagate_exit_block_locations(
             analysis.jump_predecessors[target.index()]
         };
         let Some(location) = predecessor.and_then(|source| {
-            graph[source]
-                .last_instruction()
-                .map(|instruction| instruction.location)
+            let last = graph[source].last_instruction()?;
+            // A saved return crosses the artificial SWAP before an unnamed handler's
+            // two-instruction exit. Propagate the same original block's finalizer line
+            // before the later SWAP optimization removes that last donor boundary.
+            if analysis.predecessors[target.index()] == 1
+                && last.opcode == SWAP
+                && matches!(last.operand(), Operand::Value(2))
+                && last.location.line < 0
+                && !last.no_location_policy.preserves_location()
+            {
+                let mut exit = graph[target].items().iter().filter_map(|item| match item {
+                    Item::Instruction(instruction) => Some(instruction.opcode),
+                    Item::Label(_) => None,
+                });
+                if exit.next() == Some(POP_EXCEPT)
+                    && exit.next() == Some(RETURN_VALUE)
+                    && exit.next().is_none()
+                {
+                    let previous = graph[source]
+                        .items()
+                        .iter()
+                        .rev()
+                        .filter_map(|item| match item {
+                            Item::Instruction(instruction) => Some(instruction),
+                            Item::Label(_) => None,
+                        })
+                        .nth(1);
+                    if let Some(previous) = previous
+                        && previous.opcode == POP_TOP
+                        && previous.location.line >= 0
+                    {
+                        return Some(previous.location);
+                    }
+                }
+            }
+            Some(last.location)
         }) else {
             continue;
         };

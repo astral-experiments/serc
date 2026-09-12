@@ -5336,7 +5336,21 @@ impl Compiler<'_> {
                             self.delete_name_id(name)?;
                         }
                         if let Some(start) = protected_pop_except {
+                            // An intervening finally unwinds before the outer handler, so
+                            // its owner cannot be delayed until that handler's SWAP.
+                            let pending_finally_owner = next_finally
+                                .checked_sub(1)
+                                .and_then(|index| return_finally_contexts.get(index))
+                                .filter(|context| {
+                                    handler_index > 0
+                                        && name.is_some()
+                                        && context.handler_depth == handler_index
+                                        && context.with_depth == with_depth
+                                        && context.loop_depth == loop_depth
+                                        && context.exception_region_depth + 1 == region_depth
+                                });
                             if protects_outer_handler
+                                && pending_finally_owner.is_none()
                                 && preserve_tos
                                 && (unwinds_plain_nested_handlers
                                     || (handler_count == 2
@@ -5349,9 +5363,19 @@ impl Compiler<'_> {
                             } else {
                                 let end = self.assembler.label();
                                 self.assembler.mark(end);
-                                if let Some(handler) = handler_index.checked_sub(1).map(|index| {
-                                    &self.control.exceptions.active_exception_handlers[index]
-                                }) {
+                                if let Some(context) = pending_finally_owner {
+                                    self.assembler.add_exception_region(
+                                        start,
+                                        end,
+                                        context.handler,
+                                        context.depth,
+                                        false,
+                                    );
+                                } else if let Some(handler) =
+                                    handler_index.checked_sub(1).map(|index| {
+                                        &self.control.exceptions.active_exception_handlers[index]
+                                    })
+                                {
                                     self.assembler.add_exception_region(
                                         start,
                                         end,
@@ -15292,7 +15316,7 @@ impl Compiler<'_> {
                 handler.as_except_handler().is_some_and(|handler| {
                     handler.type_.is_some()
                         && (handler.name.is_some() || synchronous_recovery)
-                        && handler.body.iter().enumerate().any(|(index, handler_statement)| {
+                        && (handler.body.iter().enumerate().any(|(index, handler_statement)| {
                             let leading = &handler.body[..index];
                             let trailing = &handler.body[index + 1..];
                             matches!(handler_statement, Stmt::If(conditional)
@@ -15331,7 +15355,7 @@ impl Compiler<'_> {
                                     || suite_has_linear_borrow_fallthrough(leading))
                                 && (trailing.is_empty()
                                     || suite_has_linear_borrow_fallthrough(trailing))
-                        })
+                        }) || suite_has_linear_reraise_guards(&handler.body))
                 })
             });
         // A single false edge around a terminal return keeps a located normal
@@ -21414,6 +21438,28 @@ fn suite_contains_loop_continue(body: &[Stmt]) -> bool {
         Stmt::FunctionDef(_) | Stmt::ClassDef(_) => false,
         _ => false,
     })
+}
+
+// Runtime re-raise guards keep their false successors connected to handler cleanup.
+// Linear work may separate guards; copied returns and folded tests need other proofs.
+fn suite_has_linear_reraise_guards(body: &[Stmt]) -> bool {
+    let mut has_guard = false;
+    for statement in body {
+        match statement {
+            Stmt::If(guard)
+                if condition_has_linear_runtime_leaves(&guard.test)
+                    && guard.elif_else_clauses.is_empty()
+                    && matches!(guard.body.as_slice(), [Stmt::Raise(raise)]
+                        if raise.exc.as_deref().is_none_or(|value| !expression_contains_inline_branch(value))
+                            && raise.cause.as_deref().is_none_or(|value| !expression_contains_inline_branch(value))) =>
+            {
+                has_guard = true;
+            }
+            _ if suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement)) => {}
+            _ => return false,
+        }
+    }
+    has_guard
 }
 
 // A unique direct dispatcher break has a nonempty original route into cleanup.
