@@ -158,3 +158,35 @@ fn matches_cpython_shared_protected_loop_interrupt_checks() {
         "manager_protected_else_shared_tail.py",
     );
 }
+
+#[test]
+fn copied_assertion_backedges_leave_their_original_try() {
+    for (source, filename) in [
+        (
+            "def f(items, debug, flag):\n    for item in items:\n        try:\n            if not debug:\n                try:\n                    work(item)\n                    if flag:\n                        consume(item)\n                except ValueError as error:\n                    report(error)\n                    pass\n        except RuntimeError as error:\n            report(error)\n            pass\n",
+            "nested_try_tail_backedges.py",
+        ),
+        (
+            "def f(items, verify, strict):\n    for item in items:\n        try:\n            work(item)\n            if verify:\n                if strict:\n                    assert check(item)\n                else:\n                    assert other(item)\n        except ValueError as error:\n            report(error)\n",
+            "nested_assert_tail_backedges.py",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn final_else_copied_backedges_leave_nested_tries() {
+    for (source, filename) in [
+        (
+            "def f(items, debug, flag):\n    for item in items:\n        try:\n            if not debug:\n                try:\n                    work(item)\n                    if flag:\n                        consume(item)\n                except ValueError as error:\n                    report(error)\n                    pass\n        except RuntimeError as error:\n            report(error)\n            pass\n",
+            "nested_try_tail_backedges.py",
+        ),
+        (
+            "def f(items, debug, flag):\n    for item in items:\n        try:\n            if not debug:\n                consume(item)\n            else:\n                try:\n                    work(item)\n                    if flag:\n                        consume(item)\n                except ValueError as error:\n                    report(error)\n                    pass\n        except RuntimeError as error:\n            report(error)\n            pass\n",
+            "nested_try_final_else_backedges.py",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

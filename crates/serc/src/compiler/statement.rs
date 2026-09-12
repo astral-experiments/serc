@@ -9125,7 +9125,7 @@ impl Compiler<'_> {
                 self.assembler
                     .set_location(self.source_location(test.range()));
             }
-            self.emit_jump_backward(JUMP_BACKWARD, restart, 0)?;
+            self.emit_loop_tail_backedge(restart, false)?;
             return Ok(());
         }
 
@@ -9262,12 +9262,44 @@ impl Compiler<'_> {
         if let Some(exclusion_start) = exclusion_start {
             let exclusion_end = self.assembler.label();
             self.assembler.mark(exclusion_end);
-            self.control
+            let region_count = self
+                .control
                 .exceptions
                 .active_exception_region_exclusions
-                .last_mut()
-                .expect("try-body loop tail requires an active exception region")
-                .push((exclusion_start, exclusion_end));
+                .len();
+            let first_excluded_region = self
+                .control
+                .loops
+                .contexts
+                .last()
+                .filter(|context| {
+                    copied_normal_try_exit
+                        && context.continue_label == restart
+                        && context.exception_region_depth < region_count
+                        && context.with_depth == self.control.withs.active_with_exits.len()
+                        && self.control.exceptions.active_exception_handlers.is_empty()
+                        && self.control.finally.active_loop_finally_contexts.is_empty()
+                })
+                .map_or_else(
+                    || {
+                        region_count
+                            .checked_sub(1)
+                            .expect("try-body loop tail requires an active exception region")
+                    },
+                    |context| context.exception_region_depth,
+                );
+            // A copied normal exit reaches the original loop after leaving every
+            // ordinary try entered inside it. Regions surrounding the loop, and
+            // manager/handler cleanup paths, retain their existing ownership.
+            for exclusions in self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .iter_mut()
+                .skip(first_excluded_region)
+            {
+                exclusions.push((exclusion_start, exclusion_end));
+            }
         }
         Ok(backedge)
     }
