@@ -127,3 +127,51 @@ fn matches_cpython_named_handler_teardown_before_intervening_finally() {
         common::assert_matches_cpython_marshal(&source, "unnamed_outer_intervening_finally.py");
     }
 }
+
+#[test]
+fn matches_cpython_manager_copied_handler_finally_slot_owners() {
+    common::assert_matches_cpython_marshal(
+        r"async def named_handler_nested_manager_return(manager, lock, resource):
+    async with manager:
+        try:
+            await work()
+        except Exception as exc:
+            if lock is not None:
+                async with lock:
+                    report(exc)
+            return None
+        finally:
+            if resource is not None:
+                await resource.close()
+",
+        "named_handler_nested_manager_return.py",
+    );
+    common::assert_matches_cpython_marshal(
+        r"async def named_handler_return(manager, resource):
+    async with manager:
+        try:
+            await work()
+        except Exception as exc:
+            report(exc)
+            return None
+        finally:
+            if resource is not None:
+                await resource.close()
+",
+        "named_handler_return.py",
+    );
+    common::assert_matches_cpython_marshal(
+        r"async def unnamed_handler_return(manager, resource):
+    async with manager:
+        try:
+            await work()
+        except Exception:
+            report()
+            return
+        finally:
+            if resource is not None:
+                await resource.close()
+",
+        "unnamed_handler_return.py",
+    );
+}

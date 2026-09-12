@@ -16,6 +16,8 @@ use crate::target::{is_conditional_jump, is_scope_exit};
 #[derive(Debug, Default)]
 pub(super) struct ExceptionOwnerProvenance {
     pub(super) setups: Vec<(Label, Option<SourceLocation>)>,
+    pub(super) copied_handler_cleanups: Vec<CopiedHandlerCleanup>,
+    pub(super) fused_manager_owners: Vec<(Instruction, Instruction, super::ExceptionRegion)>,
     pub(super) block_boundaries: FxHashSet<Label>,
     // Original entries that split borrowed-load analysis without changing the physical CFG.
     pub(super) borrow_only_block_boundaries: FxHashSet<Label>,
@@ -64,6 +66,16 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) source_none_conditions: Vec<SourceNoneCondition>,
     // Exact terminal pairs produced by original conditional jump threading.
     pub(super) threaded_condition_origins: Vec<(Instruction, Instruction)>,
+}
+
+/// Original constant-return cleanup, including NULL records omitted under a manager.
+#[derive(Debug)]
+pub(super) struct CopiedHandlerCleanup {
+    pub(super) start: Label,
+    pub(super) end: Label,
+    pub(super) return_nop: Instruction,
+    pub(super) instructions: Vec<Instruction>,
+    pub(super) missing_null_pops: usize,
 }
 
 /// A single-line source None comparison whose three removed records precede late SETUP cleanup.
@@ -1543,12 +1555,62 @@ impl LayoutAssembler {
         let mut original_array_start = 0;
         let mut pending_compacted_append = None;
         let mut pending_normal_none_owner = None;
+        let mut copied_handler_prefix = None;
         let mut pending_threaded_null_append = None;
         let mut has_uninterrupted_fusion = false;
         let mut instruction_index = 0;
         for item in &self.items {
             match item {
                 Item::Label(label) => {
+                    for original in &self.exception_owner_provenance.copied_handler_cleanups {
+                        if original.end != *label || !owner_history_exact {
+                            continue;
+                        }
+                        let Some(&start) = label_positions.get(&original.start) else {
+                            continue;
+                        };
+                        if original_array_start > start
+                            || start >= instruction_index
+                            || instruction_index - start != original.instructions.len()
+                            || tail.insertions != 0
+                            || tail.late_removals != 0
+                            || tail.post_compaction_fusions != 0
+                            || original.return_nop.opcode != NOP
+                            || original.return_nop.location != original.instructions[0].location
+                        {
+                            continue;
+                        }
+                        // The return NOP is already represented by one hidden record.
+                        // Unnamed cleanup has its emitted NULL POP as a second record.
+                        let hidden = if original.missing_null_pops == 2 {
+                            1
+                        } else {
+                            2
+                        };
+                        let exact =
+                            original
+                                .instructions
+                                .iter()
+                                .enumerate()
+                                .all(|(offset, expected)| {
+                                    let mut expected = *expected;
+                                    if offset == 0 {
+                                        expected
+                                            .local_policy
+                                            .add_hidden_exception_owner_slots(hidden);
+                                    }
+                                    *indexed_instructions[start + offset] == expected
+                                });
+                        if exact {
+                            copied_handler_prefix = Some((
+                                original_array_start,
+                                start,
+                                instruction_index,
+                                tail.early_removals,
+                                original.missing_null_pops,
+                            ));
+                        }
+                    }
                     if boundaries.contains(label)
                         || jump_targets.contains(label)
                         || setups.contains_key(label)
@@ -2791,6 +2853,85 @@ impl LayoutAssembler {
                                 override_existing: true,
                             },
                         );
+                    }
+                    if instruction.opcode == NOT_TAKEN
+                        && instruction_index > 0
+                        && owners
+                            .get(&instruction_index)
+                            .is_none_or(|owner| !owner.definitive)
+                    {
+                        for (condition, marker, region) in
+                            &self.exception_owner_provenance.fused_manager_owners
+                        {
+                            if instruction == marker
+                                && indexed_instructions[instruction_index - 1] == condition
+                                && let Some(source_region) =
+                                    self.exception_regions.iter().position(|candidate| {
+                                        super::fusion_owner_slots::same_manager_region(
+                                            candidate, region,
+                                        )
+                                    })
+                            {
+                                owners.insert(
+                                    instruction_index,
+                                    ExceptionOwnerDecision {
+                                        has_owner: true,
+                                        source_region: Some(source_region),
+                                        definitive: true,
+                                        override_existing: true,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    // Resolve only a concrete live cleanup record in the original array.
+                    // Missing named-handler POPs precede this span; all existing hidden
+                    // records remain counted exactly once by the ordinary tail scanner.
+                    if instruction.opcode == NOT_TAKEN
+                        && owner_history_exact
+                        && tail.insertions == 0
+                        && tail.late_removals == 0
+                        && tail.post_compaction_fusions == 0
+                        && instruction.exception_policy().exclusion()
+                            == super::ExceptionExclusion::None
+                        && matches!(
+                            instruction.exception_policy().owner(),
+                            NormalizedExceptionOwner::Present
+                                | NormalizedExceptionOwner::DynamicCondition
+                                | NormalizedExceptionOwner::DynamicConditionStrict
+                        )
+                        && owners
+                            .get(&instruction_index)
+                            .is_none_or(|decision| !decision.definitive)
+                        && let Some((array, start, end, end_removed, missing)) =
+                            copied_handler_prefix
+                        && array == original_array_start
+                        && end <= instruction_index
+                        && tail.early_removals >= end_removed
+                        && previous.is_some_and(|previous: Instruction| {
+                            matches!(previous.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+                                && previous.local_policy.hidden_exception_owner_slots() == 3
+                        })
+                        && let Some(removed) = tail.early_removals.checked_add(missing)
+                    {
+                        let suffix = instruction_index - end + tail.early_removals - end_removed;
+                        if removed > suffix && removed - suffix <= end - start {
+                            let source = end - (removed - suffix);
+                            if let Some(region) =
+                                self.uniform_exception_owner(source, source + 1, &label_positions)
+                                && !self.exception_regions[region].is_scope_fallback
+                            {
+                                owners.insert(
+                                    instruction_index,
+                                    ExceptionOwnerDecision {
+                                        has_owner: true,
+                                        source_region: Some(region),
+                                        definitive: true,
+                                        override_existing: true,
+                                    },
+                                );
+                            }
+                        }
                     }
                     instruction_index += 1;
                     has_instruction = true;

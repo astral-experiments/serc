@@ -4435,6 +4435,7 @@ impl Compiler<'_> {
                     start
                 });
 
+                let copied_handler_return_item = self.assembler.item_count();
                 if !preserve_tos {
                     let range = statement
                         .value
@@ -5392,6 +5393,30 @@ impl Compiler<'_> {
                             } else {
                                 let end = self.assembler.label();
                                 self.assembler.mark(end);
+                                if self.context.target_specific_rules_enabled()
+                                    && !preserve_tos
+                                    && handler_count == 1
+                                    && next_finally == 1
+                                    && !preserve_named_handler_pop_slots
+                                    && with_depth > 0
+                                    && next_with == with_depth
+                                    && next_loop == loop_depth
+                                    && loop_depth == 0
+                                    && self.control.finally.active_finally_end_blocks == 0
+                                    && self.control.finally.active_normal_finally_bodies == 0
+                                    && return_finally_contexts[0].handler_depth == handler_index
+                                    && return_finally_contexts[0].with_depth == with_depth
+                                    && return_finally_contexts[0].loop_depth == loop_depth
+                                    && return_finally_contexts[0].exception_region_depth + 1
+                                        == region_depth
+                                {
+                                    self.assembler.record_copied_handler_cleanup(
+                                        start,
+                                        end,
+                                        copied_handler_return_item,
+                                        name.is_some(),
+                                    );
+                                }
                                 if let Some(context) = pending_finally_owner {
                                     self.assembler.add_exception_region(
                                         start,
@@ -15374,8 +15399,15 @@ impl Compiler<'_> {
         // A conditional retry also keeps its handler fallthrough reachable. Its
         // copied cleanup does not remove the normal entry from a live recovery suffix.
         // A single runtime continue condition retains that entry without a suffix too.
+        // Located linear else work preserves the normal route into cleanup too.
         let conditional_handler_reaches_finally = !statement.is_star
-            && statement.orelse.is_empty()
+            && (statement.orelse.is_empty()
+                || (suite_has_linear_borrow_fallthrough(&statement.orelse)
+                    && statement.handlers.iter().all(|handler| {
+                        handler.as_except_handler().is_some_and(|handler| {
+                            suite_has_linear_reraise_guards(&handler.body)
+                        })
+                    })))
             && self.control.withs.active_with_region_exclusions.is_empty()
             && self.control.finally.active_normal_finally_bodies == 0
             && self.control.finally.active_finally_end_blocks == 0
@@ -21606,11 +21638,42 @@ fn recovery_assignment_has_nonempty_join(assignment: &ruff_python_ast::StmtAssig
     }
 }
 
+// The terminal call and POP_TOP remain after a simple list comprehension rejoins.
+// Do not infer this exit for filtered, nested, unpacking, or asynchronous loops.
+fn recovery_comprehension_call_has_nonempty_exit(expression: &Expr) -> bool {
+    let Expr::Call(call) = expression else {
+        return false;
+    };
+    if !(matches!(call.func.as_ref(), Expr::Name(_))
+        || matches!(call.func.as_ref(), Expr::Attribute(attribute)
+            if matches!(attribute.value.as_ref(), Expr::Name(_))))
+        || !call.arguments.keywords.is_empty()
+    {
+        return false;
+    }
+    let mut comprehensions = 0;
+    call.arguments.args.iter().all(|argument| {
+        if let Expr::ListComp(comprehension) = argument {
+            comprehensions += 1;
+            (matches!(comprehension.elt.as_ref(), Expr::Name(_))
+                || matches!(comprehension.elt.as_ref(), Expr::Attribute(attribute)
+                    if matches!(attribute.value.as_ref(), Expr::Name(_))))
+                && matches!(comprehension.generators.as_slice(), [generator]
+                    if !generator.is_async
+                        && generator.ifs.is_empty()
+                        && matches!(generator.target, Expr::Name(_))
+                        && matches!(generator.iter, Expr::Name(_)))
+        } else {
+            matches!(argument, Expr::Name(_)) || fold_constant(argument).is_some()
+        }
+    }) && comprehensions == 1
+}
+
 // Runtime re-raise guards keep their false successors connected to handler cleanup.
 // Linear work may separate guards; copied returns and folded tests need other proofs.
 fn suite_has_linear_reraise_guards(body: &[Stmt]) -> bool {
     let mut has_guard = false;
-    for statement in body {
+    for (index, statement) in body.iter().enumerate() {
         match statement {
             Stmt::If(guard)
                 if condition_has_linear_runtime_leaves(&guard.test)
@@ -21620,6 +21683,9 @@ fn suite_has_linear_reraise_guards(body: &[Stmt]) -> bool {
                 has_guard = true;
             }
             Stmt::Assign(assignment) if recovery_assignment_has_nonempty_join(assignment) => {}
+            Stmt::Expr(expression)
+                if index + 1 == body.len()
+                    && recovery_comprehension_call_has_nonempty_exit(&expression.value) => {}
             _ if suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement)) => {}
             _ => return false,
         }

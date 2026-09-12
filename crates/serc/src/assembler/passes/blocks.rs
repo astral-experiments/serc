@@ -1330,7 +1330,10 @@ impl OptimizationPipeline {
         Ok(())
     }
 
-    pub(in crate::assembler) fn push_cold_blocks_to_end(&mut self) -> FxHashSet<Label> {
+    pub(in crate::assembler) fn push_cold_blocks_to_end(
+        &mut self,
+        mut owner_retargets: Option<&mut Vec<(ExceptionRegion, ExceptionRegion)>>,
+    ) -> FxHashSet<Label> {
         if self.exception_regions.is_empty() {
             normalize_unmoved_interruptible_jumps(&mut self.graph);
             return FxHashSet::default();
@@ -1659,7 +1662,7 @@ impl OptimizationPipeline {
                     final_label = Some(label);
                     label
                 };
-                rebuilt_regions.push(ExceptionRegion {
+                let rebuilt = ExceptionRegion {
                     start,
                     end,
                     target: region.target,
@@ -1667,7 +1670,11 @@ impl OptimizationPipeline {
                     preserve_lasti: region.preserve_lasti,
                     is_scope_fallback: region.is_scope_fallback,
                     priority: region.priority,
-                });
+                };
+                if let Some(retargets) = owner_retargets.as_mut() {
+                    retargets.push((region, rebuilt));
+                }
+                rebuilt_regions.push(rebuilt);
             }
         }
         self.exception_regions = rebuilt_regions;

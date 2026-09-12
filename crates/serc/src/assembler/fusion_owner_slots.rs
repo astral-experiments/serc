@@ -825,9 +825,260 @@ impl View<'_> {
     }
 }
 
+/// Retains one exact manager-entry cell across the known local fusion transaction.
+struct ManagerSetupCertificate {
+    interval: Certificate,
+    source: Instruction,
+    region: ExceptionRegion,
+    regions: Vec<ExceptionRegion>,
+}
+
+pub(super) fn same_manager_region(a: &ExceptionRegion, b: &ExceptionRegion) -> bool {
+    a.start == b.start
+        && a.end == b.end
+        && a.target == b.target
+        && a.depth == b.depth
+        && a.preserve_lasti == b.preserve_lasti
+        && a.is_scope_fallback == b.is_scope_fallback
+        && match (a.priority, b.priority) {
+            (
+                ExceptionRegionPriority::OriginalRange(a, b),
+                ExceptionRegionPriority::OriginalRange(c, d),
+            ) => a == c && b == d,
+            (
+                ExceptionRegionPriority::Resolved { start: a, end: b },
+                ExceptionRegionPriority::Resolved { start: c, end: d },
+            ) => a == c && b == d,
+            _ => false,
+        }
+}
+
+impl ManagerSetupCertificate {
+    fn capture(
+        before: &View<'_>,
+        after: &View<'_>,
+        start: usize,
+        marker: usize,
+        previous: Option<(usize, Instruction)>,
+    ) -> Option<Self> {
+        // Entry arrays have an unambiguous physical origin, including the resumable prefix.
+        if start != 0 {
+            return None;
+        }
+        let (_, condition) = previous?;
+        let Item::Instruction(marker_instruction) = before.items[marker] else {
+            return None;
+        };
+        if marker_instruction.exception_policy().exclusion() != ExceptionExclusion::None {
+            return None;
+        }
+        let (_, after_marker) = after.endpoint(condition, marker_instruction)?;
+        if !one_fusion(&before.items[..=marker], &after.items[..=after_marker]) {
+            return None;
+        }
+        let mut cells = Vec::new();
+        for (index, item) in after.items[..after_marker].iter().enumerate() {
+            match item {
+                Item::Instruction(instruction) => {
+                    if instruction.opcode == NOP {
+                        return None;
+                    }
+                    cells.push(Some(index));
+                }
+                Item::Label(label) => {
+                    if after.boundaries.contains(label) {
+                        return None;
+                    }
+                    if let Some((_, location)) = after
+                        .provenance
+                        .setups
+                        .iter()
+                        .find(|(setup, _)| setup == label)
+                    {
+                        if location.is_some()
+                            || !(after.provenance.synchronous_with_setups.contains(label)
+                                || after.regions.iter().any(|region| {
+                                    region.is_scope_fallback && region.start == *label
+                                }))
+                        {
+                            return None;
+                        }
+                        cells.push(None);
+                    } else if after.references.contains(label) {
+                        return None;
+                    }
+                }
+            }
+        }
+        // SETUP records survive early compaction and fusion, then disappear before
+        // NOT_TAKEN is appended. Its live ordinal selects a concrete old-array cell.
+        let ordinal = after.items[..after_marker]
+            .iter()
+            .filter(|item| matches!(item, Item::Instruction(_)))
+            .count();
+        let source_index = *cells.get(ordinal)?.as_ref()?;
+        let Item::Instruction(source) = after.items[source_index] else {
+            return None;
+        };
+        if source.exception_policy() != ExceptionPolicy::NoneUnchanged {
+            return None;
+        }
+        let position = after.items[..source_index]
+            .iter()
+            .filter(|item| matches!(item, Item::Instruction(_)))
+            .count();
+        let mut regions = Vec::new();
+        for (index, region) in after.regions.iter().enumerate() {
+            let begin = *after.positions.get(&region.start)?;
+            let end = *after.positions.get(&region.end)?;
+            if begin <= position && position < end {
+                let (priority_start, priority_end) = match region.priority {
+                    ExceptionRegionPriority::OriginalRange(start, end) => {
+                        (*after.positions.get(&start)?, *after.positions.get(&end)?)
+                    }
+                    ExceptionRegionPriority::Resolved { start, end } => (start, end),
+                };
+                regions.push((
+                    (
+                        region.is_scope_fallback,
+                        Reverse(priority_start),
+                        priority_end,
+                        index,
+                    ),
+                    *region,
+                ));
+            }
+        }
+        let region = regions.into_iter().min_by_key(|(key, _)| *key)?.1;
+        if region.is_scope_fallback
+            || !after
+                .provenance
+                .synchronous_with_setups
+                .contains(&region.start)
+        {
+            return None;
+        }
+        let mut original_sources =
+            before.items[..marker]
+                .iter()
+                .enumerate()
+                .filter_map(|(index, item)| match item {
+                    Item::Instruction(instruction)
+                        if same_instruction(source, *instruction, false) =>
+                    {
+                        Some(index)
+                    }
+                    _ => None,
+                });
+        let original_source = original_sources.next()?;
+        if original_sources.next().is_some() {
+            return None;
+        }
+        let original_position = before.items[..original_source]
+            .iter()
+            .filter(|item| matches!(item, Item::Instruction(_)))
+            .count();
+        if !(*before.positions.get(&region.start)? <= original_position
+            && original_position < *before.positions.get(&region.end)?)
+        {
+            return None;
+        }
+        let certificate = Self {
+            interval: Certificate {
+                anchor: Anchor::Entry,
+                condition,
+                marker: marker_instruction,
+                items: after.items[..=after_marker].to_vec(),
+                owner: None,
+                boundaries: after
+                    .boundaries
+                    .iter()
+                    .copied()
+                    .filter(|label| {
+                        after.items[..=after_marker].iter().any(
+                            |item| matches!(item, Item::Label(candidate) if candidate == label),
+                        )
+                    })
+                    .collect(),
+                setups: after.provenance.setups.clone(),
+            },
+            source,
+            region,
+            regions: after.regions.to_vec(),
+        };
+        certificate.valid(after, false)?;
+        Some(certificate)
+    }
+
+    fn valid(&self, view: &View<'_>, borrow: bool) -> Option<(usize, usize)> {
+        let (start, condition, marker) = self.interval.range(view, borrow)?;
+        if self.interval.setups != view.provenance.setups
+            || self.regions.len() != view.regions.len()
+            || !self
+                .regions
+                .iter()
+                .zip(view.regions)
+                .all(|(a, b)| same_manager_region(a, b))
+        {
+            return None;
+        }
+        let boundaries = view
+            .boundaries
+            .iter()
+            .copied()
+            .filter(|label| {
+                self.interval
+                    .items
+                    .iter()
+                    .any(|item| matches!(item, Item::Label(candidate) if candidate == label))
+            })
+            .collect::<FxHashSet<_>>();
+        if boundaries != self.interval.boundaries {
+            return None;
+        }
+        self.interval
+            .matches_interval(view, start, marker, borrow)?;
+        let mut sources =
+            view.items[start..marker]
+                .iter()
+                .enumerate()
+                .filter_map(|(offset, item)| match item {
+                    Item::Instruction(instruction)
+                        if same_instruction(self.source, *instruction, borrow) =>
+                    {
+                        Some(start + offset)
+                    }
+                    _ => None,
+                });
+        let source = sources.next()?;
+        if sources.next().is_some() {
+            return None;
+        }
+        let mut regions = view
+            .regions
+            .iter()
+            .filter(|region| same_manager_region(region, &self.region));
+        let region = regions.next()?;
+        if regions.next().is_some() {
+            return None;
+        }
+        let position = view.items[..source]
+            .iter()
+            .filter(|item| matches!(item, Item::Instruction(_)))
+            .count();
+        if !(*view.positions.get(&region.start)? <= position
+            && position < *view.positions.get(&region.end)?)
+        {
+            return None;
+        }
+        Some((condition, marker))
+    }
+}
+
 #[derive(Default)]
 pub(super) struct FusionOwnerCertificates {
     certificates: Vec<Certificate>,
+    manager_setup_certificates: Vec<ManagerSetupCertificate>,
     fallback_certificates: Vec<FallbackCertificate>,
     fresh_singleton_certificates: Vec<FreshSingletonCertificate>,
 }
@@ -1035,6 +1286,11 @@ impl FusionOwnerCertificates {
                                 }
                             }
                         }
+                        if let Some(certificate) =
+                            ManagerSetupCertificate::capture(&b, &a, start, index, previous)
+                        {
+                            result.manager_setup_certificates.push(certificate);
+                        }
                         if let Some(cert) =
                             FallbackCertificate::capture(&b, &a, start, index, previous)
                         {
@@ -1110,8 +1366,85 @@ impl FusionOwnerCertificates {
         self.retain_pipeline(p);
     }
 
+    pub(super) fn has_manager_setup_certificates(&self) -> bool {
+        !self.manager_setup_certificates.is_empty()
+    }
+
+    /// Transfers exact source cells through the cold pass's recorded region splits.
+    pub(super) fn retain_after_cold_regions(
+        &mut self,
+        p: &OptimizationPipeline,
+        retargets: &[(ExceptionRegion, ExceptionRegion)],
+    ) {
+        if !retargets.is_empty() && !self.manager_setup_certificates.is_empty() {
+            let items = p.graph.iter_items().copied().collect::<Vec<_>>();
+            if let Some(view) = View::new(
+                &items,
+                &p.exception_regions,
+                &p.exception_owner_provenance,
+                &p.preserved_block_boundaries,
+            ) {
+                self.manager_setup_certificates.retain_mut(|certificate| {
+                    let Some((start, _, marker)) = certificate.interval.range(&view, false) else {
+                        return false;
+                    };
+                    if certificate
+                        .interval
+                        .matches_interval(&view, start, marker, false)
+                        .is_none()
+                    {
+                        return false;
+                    }
+                    let mut sources = view.items[start..marker].iter().enumerate().filter_map(
+                        |(offset, item)| match item {
+                            Item::Instruction(instruction)
+                                if same_instruction(certificate.source, *instruction, false) =>
+                            {
+                                Some(start + offset)
+                            }
+                            _ => None,
+                        },
+                    );
+                    let Some(source) = sources.next() else {
+                        return false;
+                    };
+                    if sources.next().is_some() {
+                        return false;
+                    }
+                    let position = view.items[..source]
+                        .iter()
+                        .filter(|item| matches!(item, Item::Instruction(_)))
+                        .count();
+                    let mut candidates = retargets.iter().filter_map(|(original, rebuilt)| {
+                        if !same_manager_region(original, &certificate.region) {
+                            return None;
+                        }
+                        let start = *view.positions.get(&rebuilt.start)?;
+                        let end = *view.positions.get(&rebuilt.end)?;
+                        (start <= position && position < end).then_some(*rebuilt)
+                    });
+                    let Some(region) = candidates.next() else {
+                        return false;
+                    };
+                    if candidates.next().is_some() {
+                        return false;
+                    }
+                    // The pass explicitly preserves target, depth, lasti and priority;
+                    // only a recorded replacement containing this exact cell can transfer.
+                    certificate.region = region;
+                    certificate.regions = view.regions.to_vec();
+                    certificate.valid(&view, false).is_some()
+                });
+            } else {
+                self.manager_setup_certificates.clear();
+            }
+        }
+        self.retain_pipeline(p);
+    }
+
     pub(super) fn retain_pipeline(&mut self, p: &OptimizationPipeline) {
         if self.certificates.is_empty()
+            && self.manager_setup_certificates.is_empty()
             && self.fallback_certificates.is_empty()
             && self.fresh_singleton_certificates.is_empty()
         {
@@ -1125,17 +1458,48 @@ impl FusionOwnerCertificates {
             &p.preserved_block_boundaries,
         ) else {
             self.certificates.clear();
+            self.manager_setup_certificates.clear();
             self.fallback_certificates.clear();
             self.fresh_singleton_certificates.clear();
             return;
         };
         self.certificates
             .retain(|c| c.valid(&view, false).is_some());
+        self.manager_setup_certificates
+            .retain(|certificate| certificate.valid(&view, false).is_some());
         self.fallback_certificates
             .retain(|c| c.valid(&view, false).is_some());
         self.fresh_singleton_certificates
             .retain(|certificate| certificate.valid(&view, false).is_some());
     }
+    /// Exports exact surviving manager cells before layout chooses owner regions.
+    pub(super) fn manager_owners(
+        &self,
+        items: &[Item],
+        regions: &[ExceptionRegion],
+        provenance: &ExceptionOwnerProvenance,
+        preserved: &FxHashSet<Label>,
+    ) -> Vec<(Instruction, Instruction, ExceptionRegion)> {
+        if self.manager_setup_certificates.is_empty() {
+            return Vec::new();
+        }
+        let Some(view) = View::new(items, regions, provenance, preserved) else {
+            return Vec::new();
+        };
+        self.manager_setup_certificates
+            .iter()
+            .filter_map(|certificate| {
+                let (condition, marker) = certificate.valid(&view, true)?;
+                let (Item::Instruction(condition), Item::Instruction(marker)) =
+                    (items[condition], items[marker])
+                else {
+                    return None;
+                };
+                Some((condition, marker, certificate.region))
+            })
+            .collect()
+    }
+
     pub(super) fn apply(
         self,
         items: &mut [Item],
@@ -1144,6 +1508,7 @@ impl FusionOwnerCertificates {
         preserved: &FxHashSet<Label>,
     ) {
         if self.certificates.is_empty()
+            && self.manager_setup_certificates.is_empty()
             && self.fallback_certificates.is_empty()
             && self.fresh_singleton_certificates.is_empty()
         {

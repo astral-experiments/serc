@@ -451,8 +451,13 @@ impl OptimizationPipeline {
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::FuseSuperinstructions)?;
         let omitted_borrow_markers = if !assertion_side_exits {
-            let omitted = self.push_cold_blocks_to_end();
-            fusion_owners.retain_pipeline(&self);
+            let mut owner_retargets = Vec::new();
+            let omitted = self.push_cold_blocks_to_end(
+                fusion_owners
+                    .has_manager_setup_certificates()
+                    .then_some(&mut owner_retargets),
+            );
+            fusion_owners.retain_after_cold_regions(&self, &owner_retargets);
             omitted
         } else {
             rustc_hash::FxHashSet::default()
@@ -595,6 +600,12 @@ impl OptimizationPipeline {
                 }
             }
         }
+        self.exception_owner_provenance.fused_manager_owners = fusion_owners.manager_owners(
+            &items,
+            &self.exception_regions,
+            &self.exception_owner_provenance,
+            &self.preserved_block_boundaries,
+        );
         fusion_owners.apply(
             &mut items,
             &self.exception_regions,

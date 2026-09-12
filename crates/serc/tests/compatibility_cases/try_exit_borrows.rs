@@ -4076,3 +4076,19 @@ fn recovery_short_circuit_assignment_before_guard() {
         "short_circuit_value_recovery.py",
     );
 }
+
+#[test]
+fn guarded_recovery_linear_else_preserves_cleanup_entry() {
+    common::assert_matches_cpython_marshal(
+        "async def f(sink, cached, scope):\n    result = \"success\"\n    try:\n        cached = await fetch(scope)\n    except Error as error:\n        result = \"transient\" if transient(error) else \"failure\"\n        attempt = clock()\n        if cached is None or cached.records is None:\n            state = empty(attempt)\n            store(state)\n            raise Unavailable(scope) from error\n        state = replace(cached, attempt)\n        store(state)\n        warning(error)\n    else:\n        state = replace(cached, clock())\n        store(state)\n    finally:\n        tags = [f\"scope:{scope}\", f\"result:{result}\"]\n        sink.record(tags)\n    return cached\n",
+        "linear_else_only.py",
+    );
+}
+
+#[test]
+fn guarded_recovery_terminal_comprehension_call_preserves_cleanup_entry() {
+    common::assert_matches_cpython_marshal(
+        "async def f(sink, cached, scope):\n    result = \"success\"\n    try:\n        cached = await fetch(scope)\n    except Error as error:\n        result = \"transient\" if transient(error) else \"failure\"\n        attempt = clock()\n        if cached is None or cached.records is None:\n            state = empty(attempt)\n            store(state)\n            raise Unavailable(scope) from error\n        state = replace(cached, attempt)\n        store(state)\n        warning([part.kind for part in scope], error)\n    finally:\n        tags = [f\"scope:{scope}\", f\"result:{result}\"]\n        sink.record(tags)\n    return cached\n",
+        "comprehension_warning_only.py",
+    );
+}

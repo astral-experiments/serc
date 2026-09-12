@@ -3340,6 +3340,72 @@ impl Assembler {
             .insert(label);
     }
 
+    /// Captures the exact emitted records of a constant-return handler cleanup.
+    pub(crate) fn record_copied_handler_cleanup(
+        &mut self,
+        start: Label,
+        end: Label,
+        return_item: usize,
+        named: bool,
+    ) {
+        let items = self.linear_items();
+        let Some(Item::Instruction(return_nop)) = items.get(return_item) else {
+            return;
+        };
+        if return_nop.opcode != NOP {
+            return;
+        }
+        let return_nop = *return_nop;
+        let Some(start_at) = items.iter().position(|item| *item == Item::Label(start)) else {
+            return;
+        };
+        let Some(end_at) = items.iter().position(|item| *item == Item::Label(end)) else {
+            return;
+        };
+        if return_item >= start_at || start_at >= end_at {
+            return;
+        }
+        let prefix = items[return_item..start_at]
+            .iter()
+            .filter_map(|item| match item {
+                Item::Instruction(instruction) => Some(instruction),
+                Item::Label(_) => None,
+            })
+            .collect::<Vec<_>>();
+        if prefix.len() != if named { 1 } else { 2 }
+            || (!named
+                && (prefix[1].opcode != NOP || !prefix[1].fusion_policy.is_converted_pop_block()))
+        {
+            return;
+        }
+        let instructions = items[start_at..end_at]
+            .iter()
+            .filter_map(|item| match item {
+                Item::Instruction(instruction) => Some(*instruction),
+                Item::Label(_) => None,
+            })
+            .collect::<Vec<_>>();
+        if instructions.len() != if named { 4 } else { 1 }
+            || instructions[0].opcode != crate::target::opcodes::POP_EXCEPT
+            || (named
+                && (instructions[1].opcode != crate::target::opcodes::LOAD_CONST
+                    || instructions[2].opcode != crate::target::opcodes::STORE_FAST
+                    || instructions[3].opcode != crate::target::opcodes::DELETE_FAST
+                    || instructions[2].operand() != instructions[3].operand()))
+        {
+            return;
+        }
+        self.exception_owner_provenance
+            .copied_handler_cleanups
+            .push(exception_owners::CopiedHandlerCleanup {
+                start,
+                end,
+                return_nop,
+                instructions,
+                missing_null_pops: if named { 2 } else { 0 },
+            });
+    }
+
     /// Starts a protected prefix within the same original instruction array.
     pub(crate) fn record_exception_owner_prefix(&mut self, label: Label) {
         self.record_exception_owner_continuation(label);

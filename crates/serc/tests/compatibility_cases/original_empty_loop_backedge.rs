@@ -433,3 +433,19 @@ fn conditional_manager_after_late_setups() {
         common::assert_matches_cpython_marshal(&source, "conditional_manager_after_late_setups.py");
     }
 }
+
+#[test]
+fn manager_entry_owner_after_local_pair_fusion() {
+    for managers in [2, 10, 12] {
+        let mut entries = vec!["manager((1, 2, 3, 4, 5))"; managers];
+        entries[managers - 2] = "manager((left, right))";
+        let source = format!(
+            "async def f(left, right, flag):\n    with ({}):\n        if flag:\n            await work()\n",
+            entries.join(", "),
+        );
+        common::assert_matches_cpython_marshal(
+            &source,
+            "manager_entry_owner_after_local_pair_fusion.py",
+        );
+    }
+}
