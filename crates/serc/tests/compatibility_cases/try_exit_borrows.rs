@@ -4036,3 +4036,11 @@ fn runtime_reraise_guard_chain_reaches_normal_finally() {
         common::assert_matches_cpython_marshal(&source, "guard_chain_recovery.py");
     }
 }
+
+#[test]
+fn async_reraise_guard_chain_reaches_optional_callback_cleanup() {
+    common::assert_matches_cpython_marshal(
+        "def make_worker(on_chunk_done):\n    async def run(item, suppress):\n        completed = False\n        try:\n            await work(item)\n            completed = True\n        except Error as error:\n            if not recoverable(error):\n                raise\n            if not suppress:\n                raise\n            skipped(item)\n        finally:\n            if completed and on_chunk_done is not None:\n                on_chunk_done(1)\n    return run\n",
+        "async_guard_chain_optional_callback.py",
+    );
+}

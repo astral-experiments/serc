@@ -3941,6 +3941,35 @@ impl Compiler<'_> {
                     },
                 )?;
                 let marker_end = self.assembler.instruction_count();
+                if self.context.target_specific_rules_enabled()
+                    && self.control.withs.active_with_exits.len() > context.with_depth
+                    && self
+                        .control
+                        .withs
+                        .active_with_exits
+                        .last()
+                        .is_some_and(|manager| {
+                            manager.exception_region_depth
+                                < self
+                                    .control
+                                    .exceptions
+                                    .active_exception_region_exclusions
+                                    .len()
+                        })
+                    && self.control.exceptions.active_exception_handlers.is_empty()
+                    && self.control.finally.active_loop_finally_contexts.is_empty()
+                    && self.control.finally.active_finally_try_bodies == 0
+                    && self.control.finally.active_finally_end_blocks == 0
+                    && self.control.finally.active_normal_finally_bodies == 0
+                    && self.control.finally.active_copied_finally_bodies == 0
+                {
+                    // As for continue, an ordinary try inside an exited manager
+                    // first unwinds POP_BLOCK at the authored break location.
+                    // NOP compaction retains this NULL-owned record in place of
+                    // the preceding authored marker before the manager exit.
+                    self.emit_with_exception_policy(NOP, 0, 0, ExceptionPolicy::EXCLUDE_ALWAYS)?;
+                    self.assembler.mark_last_as_converted_pop_block();
+                }
                 let finally_end_unwind_start =
                     self.emit_finally_end_unwind(context.finally_end_depth, false)?;
                 let mut exclusion_start = if self
@@ -15259,6 +15288,35 @@ impl Compiler<'_> {
         // handlers move. Short-circuit cleanup tests retain nonempty runtime entries.
         let synchronous_recovery =
             self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0;
+        // A local completion flag and a plain optional callback do not suspend
+        // before the normal cleanup entry reached by a named recovery guard chain.
+        let coroutine_guarded_callback_cleanup = self.unit.flags & CO_COROUTINE != 0
+            && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+            && self.control.withs.active_with_exits.is_empty()
+            && self.control.finally.active_copied_finally_bodies == 0
+            && !self.control.in_exception_handler()
+            && !statement.handlers.is_empty()
+            && statement.handlers.iter().all(|handler| {
+                handler.as_except_handler().is_some_and(|handler| {
+                    handler.name.is_some() && suite_has_linear_reraise_guards(&handler.body)
+                })
+            })
+            && matches!(statement.finalbody.as_slice(), [Stmt::If(cleanup)]
+            if cleanup.elif_else_clauses.is_empty()
+                && matches!(cleanup.test.as_ref(), Expr::BoolOp(boolean)
+                    if boolean.op == BoolOp::And
+                        && matches!(boolean.values.as_slice(), [Expr::Name(_), Expr::Compare(compare)]
+                            if matches!(compare.left.as_ref(), Expr::Name(_))
+                                && compare.ops[..] == [CmpOp::IsNot]
+                                && matches!(&compare.comparators[..], [Expr::NoneLiteral(_)])))
+                && matches!(cleanup.body.as_slice(), [Stmt::Expr(expression)]
+                    if matches!(expression.value.as_ref(), Expr::Call(call)
+                        if matches!(call.func.as_ref(), Expr::Name(_))
+                            && call.arguments.keywords.is_empty()
+                            && call.arguments.args.iter().all(|argument| {
+                                matches!(argument, Expr::Name(_) | Expr::NumberLiteral(_)
+                                    | Expr::StringLiteral(_) | Expr::BooleanLiteral(_) | Expr::NoneLiteral(_))
+                            }))));
         // A separately located leading pass remains a NOP at the original
         // cleanup entry. The following conditional uses the same recovery route.
         let conditional_handler_cleanup = match statement.finalbody.as_slice() {
@@ -15300,7 +15358,7 @@ impl Compiler<'_> {
                 || matches!(conditional_handler_cleanup, [Stmt::If(cleanup)]
                 if condition_has_only_runtime_tests(&cleanup.test)
                     && (!expression_contains_inline_branch(&cleanup.test)
-                        || (synchronous_recovery
+                        || ((synchronous_recovery || coroutine_guarded_callback_cleanup)
                             && condition_has_linear_runtime_leaves(&cleanup.test)))
                     && suite_has_linear_borrow_fallthrough(&cleanup.body)
                     && cleanup.elif_else_clauses.iter().all(|clause| {
@@ -18872,7 +18930,7 @@ fn with_body_ends_in_terminal_try(body: &[Stmt]) -> bool {
 }
 
 // A converted `POP_BLOCK` after a final try normally inherits its location from a sole jump
-// predecessor. If a direct return or raise terminates the try body and the only normal predecessor
+// predecessor. If a direct return, raise, or break terminates the try body and the only normal predecessor
 // instead comes from an exception handler, CPython propagates that handler's fallthrough location
 // onto the marker.
 fn with_body_handler_exit_location(body: &[Stmt]) -> Option<TextRange> {
@@ -18885,7 +18943,7 @@ fn with_body_handler_exit_location(body: &[Stmt]) -> Option<TextRange> {
         || !statement
             .body
             .iter()
-            .any(|statement| matches!(statement, Stmt::Return(_) | Stmt::Raise(_)))
+            .any(|statement| matches!(statement, Stmt::Return(_) | Stmt::Raise(_) | Stmt::Break(_)))
     {
         return None;
     }

@@ -249,3 +249,28 @@ fn handler_breaks_end_enclosing_tries_after_exception_cleanup() {
         }
     }
 }
+
+#[test]
+fn matches_cpython_break_try_inside_manager_pop_owner() {
+    for (definition, manager, suspension) in [
+        ("def", "with", ""),
+        ("async def", "with", "await "),
+        ("async def", "async with", "await "),
+    ] {
+        let source = format!(
+            "{definition} f(manager, action, recover, Error):\n    while True:\n        {manager} manager:\n            try:\n                {suspension}action()\n                break\n            except Error:\n                recover()\n    return 0\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "break_try_manager_pop.py");
+    }
+}
+
+#[test]
+fn matches_cpython_break_manager_pop_controls() {
+    for source in [
+        "def f(manager, action):\n    while True:\n        with manager:\n            action()\n            break\n    return 0\n",
+        "def f(manager, action, Error):\n    while True:\n        try:\n            with manager:\n                action()\n                break\n        except Error:\n            pass\n    return 0\n",
+        "def f(manager, action, Error):\n    while True:\n        with manager:\n            try:\n                action()\n            except Error:\n                break\n    return 0\n",
+    ] {
+        common::assert_matches_cpython_marshal(source, "break_manager_pop_controls.py");
+    }
+}
