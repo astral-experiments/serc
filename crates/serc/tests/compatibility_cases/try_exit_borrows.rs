@@ -3931,3 +3931,35 @@ fn conditional_recovery_preserves_abrupt_cleanup_entry() {
         "sink.record(value)\n        if value:\n            return value",
     );
 }
+
+#[test]
+fn conditional_retry_handler_reaches_normal_finally() {
+    for prefix in ["", "async "] {
+        let awaited = if prefix.is_empty() { "" } else { "await " };
+        for condition in [
+            "retry",
+            "retry and error.retryable() and item.attempts < limit",
+        ] {
+            let source = format!(
+                "{prefix}def f(sink, item, retry, limit):\n    while ready():\n        ack = True\n        try:\n            {awaited}work(item)\n        except Error as error:\n            item.attempts += 1\n            record(error)\n            if {condition}:\n                {awaited}reschedule(item)\n                ack = False\n                continue\n            failed(item)\n        finally:\n            sink.record(item)\n            if ack:\n                {awaited}sink.ack(item)\n            sink.done()\n    after(sink)\n",
+            );
+            common::assert_matches_cpython_marshal(&source, "conditional_retry_handler_finally.py");
+        }
+    }
+}
+
+#[test]
+fn conditional_retry_handler_without_recovery_suffix() {
+    common::assert_matches_cpython_marshal(
+        "def f(sink, item, retry):\n    while ready():\n        try:\n            work(item)\n        except Error as error:\n            record(error)\n            if retry:\n                reschedule(item)\n                continue\n        finally:\n            sink.record(item)\n            sink.done()\n    after(sink)\n",
+        "conditional_retry_without_suffix.py",
+    );
+}
+
+#[test]
+fn conditional_retry_handler_break_keeps_existing_entry() {
+    common::assert_matches_cpython_marshal(
+        "def f(sink, item, retry):\n    while ready():\n        try:\n            work(item)\n        except Error as error:\n            record(error)\n            if retry:\n                reschedule(item)\n                break\n            failed(item)\n        finally:\n            sink.record(item)\n            sink.done()\n    after(sink)\n",
+        "conditional_retry_break_entry.py",
+    );
+}

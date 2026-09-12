@@ -80,3 +80,31 @@ fn clones_loop_tail_match_exits_per_condition() {
         }
     }
 }
+
+#[test]
+fn terminal_nested_conditions_keep_copied_case_jump_locations() {
+    for prefix in ["def", "async def"] {
+        let source = format!(
+            "{prefix} f(subject, first, second, left, right, result):\n    match subject:\n        case Before():\n            before()\n        case Selected():\n            if first:\n                prepare()\n                if left is not None:\n                    result['left'] = left\n            elif second:\n                prepare()\n                if right is not None:\n                    result['right'] = right\n            else:\n                raise ValueError\n        case _:\n            fallback()\n    finish(result)\n",
+        );
+        common::assert_matches_cpython_marshal(&source, "nested_case_jump_locations.py");
+    }
+}
+
+#[test]
+fn nested_case_jump_locations_preserve_other_shared_joins() {
+    for (name, last_body) in [
+        ("raise", "raise ValueError"),
+        ("call", "fallback()"),
+        ("return", "return None"),
+    ] {
+        let branch = format!(
+            "if first:\n    if left is not None:\n        result['left'] = left\nelif second:\n    if right is not None:\n        result['right'] = right\nelse:\n    {last_body}\n",
+        );
+        let source = format!(
+            "def f(first, second, left, right, result):\n{}    finish(result)\n",
+            indent(&branch)
+        );
+        common::assert_matches_cpython_marshal(&source, &format!("nested_join_{name}.py"));
+    }
+}

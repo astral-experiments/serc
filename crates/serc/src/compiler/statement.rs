@@ -7653,6 +7653,13 @@ impl Compiler<'_> {
                         && matches!(body.last(), Some(Stmt::Assert(_)));
                     if nested_if_ends_in_break && has_terminating_else {
                         self.assembler.preserve_inlined_jump_nop(branch_exit);
+                    } else if has_terminating_else
+                        && matches!(nested_if_exit, Some(NestedIfExitLocation::Unlocated))
+                    {
+                        // The nested condition's original join is shared and unlocated.
+                        // Copies of its exit have separate predecessors and inherit their
+                        // locations, including when a surrounding case exit is threaded.
+                        self.assembler.preserve_shared_jump_no_location(branch_exit);
                     } else if unlocated_while_exit
                         || unlocated_assertion_exit
                         || matches!(nested_if_exit, Some(NestedIfExitLocation::Unlocated))
@@ -15205,6 +15212,9 @@ impl Compiler<'_> {
         };
         // A later simple conditional return does not empty a preceding linear
         // entry; borrowed-load traversal follows both of its live successors.
+        // A conditional retry also keeps its handler fallthrough reachable. Its
+        // copied cleanup does not remove the normal entry from a live recovery suffix.
+        // A single runtime continue condition retains that entry without a suffix too.
         let conditional_handler_reaches_finally = !statement.is_star
             && statement.orelse.is_empty()
             && self.control.withs.active_with_region_exclusions.is_empty()
@@ -15246,14 +15256,30 @@ impl Compiler<'_> {
                 handler.as_except_handler().is_some_and(|handler| {
                     handler.type_.is_some()
                         && (handler.name.is_some() || synchronous_recovery)
-                        && handler.body.iter().enumerate().any(|(index, statement)| {
+                        && handler.body.iter().enumerate().any(|(index, handler_statement)| {
                             let leading = &handler.body[..index];
                             let trailing = &handler.body[index + 1..];
-                            matches!(statement, Stmt::If(conditional)
+                            matches!(handler_statement, Stmt::If(conditional)
                                 if condition_has_only_runtime_tests(&conditional.test)
-                                    && !expression_contains_inline_branch(&conditional.test)
                                     && conditional.elif_else_clauses.is_empty()
-                                    && matches!(conditional.body.as_slice(), [Stmt::Raise(_)]))
+                                    && ((!expression_contains_inline_branch(&conditional.test)
+                                        && matches!(conditional.body.as_slice(), [Stmt::Raise(_)]))
+                                        || ((!trailing.is_empty()
+                                            || !expression_contains_inline_branch(&conditional.test))
+                                            && !self.control.loops.contexts.is_empty()
+                                            && self.control.withs.active_with_exits.is_empty()
+                                            && self.control.finally.active_copied_finally_bodies == 0
+                                            && self.control.finally.active_finally_try_bodies == 0
+                                            && condition_has_linear_runtime_leaves(&conditional.test)
+                                            && conditional.body.split_last().is_some_and(|(last, leading)| {
+                                                (matches!(last, Stmt::Continue(_))
+                                                    || (matches!(last, Stmt::Break(_))
+                                                        && suite_has_linear_borrow_fallthrough(&statement.finalbody)
+                                                        && !trailing.is_empty()
+                                                        && !expression_contains_inline_branch(&conditional.test)))
+                                                    && (leading.is_empty()
+                                                        || suite_has_linear_borrow_fallthrough(leading))
+                                            }))))
                                 && (leading.is_empty()
                                     || suite_has_linear_borrow_fallthrough(leading))
                                 && (trailing.is_empty()
@@ -16771,8 +16797,13 @@ impl Compiler<'_> {
                                     clause.test.as_ref().is_none_or(condition_has_only_runtime_tests)
                                         && suite_has_located_finally_arm(&clause.body)
                                 }))))
-                && statement.orelse.is_empty()
-                && !suite_terminates(&statement.body)
+                && ((statement.orelse.is_empty() && !suite_terminates(&statement.body))
+                    // A linear finalbody tail can inherit the manager POP_BLOCK from a
+                    // handler or else exit. Conditional tails retain their own join owner.
+                    || (statement.finalbody.last().is_some_and(|last| {
+                        matches!(last, Stmt::Expr(_) | Stmt::Assign(_))
+                            && suite_has_linear_borrow_fallthrough(std::slice::from_ref(last))
+                    }) && try_normal_exit_predecessors(statement) > 0))
                 && !suite_terminates(&statement.finalbody)
                 && !suite_terminates(leading)
                 && statement.finalbody.iter().any(|statement| {

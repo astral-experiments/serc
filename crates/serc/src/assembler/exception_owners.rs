@@ -1465,6 +1465,7 @@ impl LayoutAssembler {
             .copied()
             .collect();
         let mut label_positions = FxHashMap::default();
+        let mut indexed_instructions = Vec::new();
         let mut jump_targets = FxHashSet::default();
         let mut position = 0;
         for item in &self.items {
@@ -1473,6 +1474,7 @@ impl LayoutAssembler {
                     label_positions.insert(*label, position);
                 }
                 Item::Instruction(instruction) => {
+                    indexed_instructions.push(instruction);
                     position += 1;
                     if let Operand::Forward(label) | Operand::Backward(label) =
                         instruction.operand()
@@ -1524,6 +1526,7 @@ impl LayoutAssembler {
         let mut ended_owned_prefix = None;
         let mut source_owned_prefix = None;
         let mut pending_retained_prefix = None;
+        let mut retained_pop_prefix = None;
         let mut owner_history_exact = true;
         let mut pop_slot_epoch_known = true;
         let mut retained_epoch_known = true;
@@ -1544,6 +1547,20 @@ impl LayoutAssembler {
         for item in &self.items {
             match item {
                 Item::Label(label) => {
+                    if boundaries.contains(label)
+                        || jump_targets.contains(label)
+                        || setups.contains_key(label)
+                        || self
+                            .exception_owner_provenance
+                            .source_boundaries
+                            .contains(label)
+                        || self
+                            .exception_owner_provenance
+                            .removed_pop_block_boundaries
+                            .contains(label)
+                    {
+                        retained_pop_prefix = None;
+                    }
                     let continues_original_block = self
                         .exception_owner_provenance
                         .continuation_boundaries
@@ -1603,6 +1620,7 @@ impl LayoutAssembler {
                         pending_compacted_append = None;
                     }
                     if has_instruction && boundaries.contains(label) {
+                        retained_pop_prefix = None;
                         original_array_start = instruction_index;
                         tail = ExceptionOwnerTail::default();
                         late_setup_positions.clear();
@@ -1787,6 +1805,70 @@ impl LayoutAssembler {
                     }
                 }
                 Item::Instruction(instruction) => {
+                    // A surviving converted POP_BLOCK is an original NULL record, not
+                    // an erased slot. Keep its preceding protected prefix separately from
+                    // SETUP and removed-POP certificates. Only local fusion can select it.
+                    if instruction.opcode == NOP {
+                        retained_pop_prefix = None;
+                        if instruction.fusion_policy.is_converted_pop_block()
+                            // CPython removes the preceding authored return NOP during
+                            // optimize_cfg, before insert_superinstructions compacts the
+                            // live array. Its one hidden slot does not survive that fusion.
+                            && instruction.local_policy.hidden_exception_owner_slots() <= 1
+                            && instruction.pre_fold_extra_instructions() == 0
+                            && instruction.no_location_policy.borrow_fallthrough()
+                                != super::BorrowFallthrough::Barrier
+                            && owner_history_exact
+                            && tail.insertions == 0
+                            && tail.late_removals == 0
+                            && tail.post_compaction_fusions > 0
+                            && original_array_start < instruction_index
+                            && let Some(region) = self.uniform_exception_owner(
+                                instruction_index - 1,
+                                instruction_index,
+                                &label_positions,
+                            )
+                            && !self.exception_regions[region].is_scope_fallback
+                        {
+                            let start = indexed_instructions
+                                [original_array_start..instruction_index]
+                                .iter()
+                                .enumerate()
+                                .rev()
+                                .map(|(offset, instruction)| {
+                                    (original_array_start + offset, instruction)
+                                })
+                                .take_while(|(index, instruction)| {
+                                    instruction.exception_policy().exclusion()
+                                        == super::ExceptionExclusion::None
+                                        && instruction.exception_policy().owner()
+                                            == NormalizedExceptionOwner::Unchanged
+                                        && !owners.contains_key(index)
+                                        && self.uniform_exception_owner(
+                                            *index,
+                                            *index + 1,
+                                            &label_positions,
+                                        ) == Some(region)
+                                })
+                                .map(|(index, _)| index)
+                                .last();
+                            if let Some(start) = start {
+                                retained_pop_prefix = Some((
+                                    original_array_start,
+                                    start,
+                                    instruction_index,
+                                    tail,
+                                    region,
+                                ));
+                            }
+                        }
+                    } else if instruction.exception_policy().exclusion()
+                        != super::ExceptionExclusion::None
+                        || instruction.no_location_policy.borrow_fallthrough()
+                            == super::BorrowFallthrough::Barrier
+                    {
+                        retained_pop_prefix = None;
+                    }
                     let compacted_append = pending_compacted_append.take();
                     let threaded_null_append = pending_threaded_null_append.take();
                     pending_retained_prefix = (instruction.opcode == NOP
@@ -2249,6 +2331,40 @@ impl LayoutAssembler {
                             );
                         }
                     }
+                    // After fusion, the stale suffix is the pre-fusion live array.
+                    // Include the retained NULL POP_BLOCK in the cleanup width. A slot
+                    // strictly before it belongs to the certified protected prefix.
+                    if instruction.opcode == NOT_TAKEN
+                        && instruction.exception_policy().exclusion()
+                            == super::ExceptionExclusion::None
+                        && instruction.exception_policy().owner()
+                            == NormalizedExceptionOwner::DynamicCondition
+                        && owner_history_exact
+                        && tail.insertions == 0
+                        && tail.late_removals == 0
+                        && let Some((array_start, start, end, end_tail, region)) =
+                            retained_pop_prefix
+                        && original_array_start == array_start
+                        && tail.post_compaction_fusions >= end_tail.post_compaction_fusions
+                    {
+                        let removed = tail.post_compaction_fusions;
+                        let suffix_width =
+                            instruction_index - end + removed - end_tail.post_compaction_fusions;
+                        // The checked live prefix is a conservative lower bound for its
+                        // pre-fusion width; never infer owners before that checked span.
+                        let prefix_width = end - start;
+                        if removed > suffix_width && removed <= suffix_width + prefix_width {
+                            owners.insert(
+                                instruction_index,
+                                ExceptionOwnerDecision {
+                                    has_owner: true,
+                                    source_region: Some(region),
+                                    definitive: true,
+                                    override_existing: true,
+                                },
+                            );
+                        }
+                    }
                     // Certify the fresh append slot at the original terminator, before
                     // bookkeeping labels ahead of NOT_TAKEN obscure its array epoch.
                     // With no removals or insertions, the first retained SETUP's block
@@ -2502,6 +2618,7 @@ impl LayoutAssembler {
                             && (!matches!(instruction.operand(), Operand::Value(_))
                                 || is_scope_exit(instruction.opcode)))
                     {
+                        retained_pop_prefix = None;
                         original_array_start = instruction_index;
                         tail = ExceptionOwnerTail::default();
                         has_uninterrupted_fusion = false;
