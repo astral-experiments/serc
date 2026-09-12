@@ -15359,8 +15359,8 @@ impl Compiler<'_> {
                     && suite_contains_borrow_reachable_conditional_loop_break(
                         &loop_statement.body));
         // A trailing nested try has its own emptied normal exit even when the
-        // enclosing finally has no handlers. Its raising recovery cannot bypass it.
-        let nested_raising_handler_exit = statement.handlers.is_empty()
+        // enclosing finally has no handlers. Straight-line recovery shares that empty exit.
+        let nested_handler_exit = statement.handlers.is_empty()
             && matches!(self.unit.scope, Scope::Function { .. })
             && statement.orelse.is_empty()
             && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
@@ -15392,8 +15392,12 @@ impl Compiler<'_> {
                                 handler.as_except_handler().is_some_and(|handler| {
                                     handler.type_.is_some()
                                         && handler.name.is_some()
-                                        && matches!(handler.body.as_slice(), [Stmt::If(condition), Stmt::Raise(_)]
-                                            if condition.elif_else_clauses.is_empty()
+                                        && matches!(handler.body.as_slice(), [Stmt::If(condition), tail]
+                                            if (matches!(tail, Stmt::Raise(_))
+                                                || matches!(tail, Stmt::Expr(expression)
+                                                    if matches!(expression.value.as_ref(), Expr::Call(_))
+                                                        && !expression_contains_inline_branch(&expression.value)))
+                                                && condition.elif_else_clauses.is_empty()
                                                 && condition_has_only_runtime_tests(&condition.test)
                                                 && !expression_contains_inline_branch(&condition.test)
                                                 && suite_has_linear_borrow_fallthrough(&condition.body))
@@ -15401,7 +15405,7 @@ impl Compiler<'_> {
                             }))
             });
         if (!statement.handlers.is_empty() && !normal_finally_is_borrow_reachable)
-            || nested_raising_handler_exit
+            || nested_handler_exit
         {
             // An abrupt or bare handler leaves an empty CPython CFG block before the normal
             // finally body. Breaks and trailing structured try-body exits can leave the same
@@ -17669,6 +17673,7 @@ impl Compiler<'_> {
             self.emit_implicit_return()?;
         } else {
             let finally_depth = (!self.control.statements.current_statement_has_following
+                && !self.control.exceptions.direct_try_body_has_else
                 && self.control.exceptions.direct_try_body_statements.last()
                     == direct_try_range.as_ref())
             .then_some(

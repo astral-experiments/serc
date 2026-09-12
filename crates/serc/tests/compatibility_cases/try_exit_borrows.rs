@@ -3986,3 +3986,13 @@ fn nested_raising_handler_keeps_finally_entry_unborrowed() {
         }
     }
 }
+
+#[test]
+fn nested_warning_handler_keeps_finally_entry_unborrowed() {
+    for warning in ["warn(error)", "logger.warning('failed', describe(error))"] {
+        let source = format!(
+            "def f(sink, flag, work, record, after):\n    try:\n        try:\n            value = work()\n            if flag is not None:\n                record(value)\n        except Error as error:\n            if flag is not None:\n                record(error)\n            {warning}\n    finally:\n        sink.close()\n    after(sink)\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "nested_warning_finally.py");
+    }
+}
