@@ -2598,8 +2598,11 @@ impl LayoutAssembler {
                     if instruction.opcode == NOT_TAKEN
                         && instruction.exception_policy().exclusion()
                             == super::ExceptionExclusion::None
-                        && instruction.exception_policy().owner()
-                            == NormalizedExceptionOwner::DynamicCondition
+                        && matches!(
+                            instruction.exception_policy().owner(),
+                            NormalizedExceptionOwner::DynamicCondition
+                                | NormalizedExceptionOwner::Present
+                        )
                         && owner_history_exact
                         && tail.insertions == 0
                         && tail.late_removals == 0

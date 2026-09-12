@@ -217,3 +217,34 @@ fn matches_cpython_handler_return_through_enclosing_iterator_regions() {
         "nested_handler_iterator_return.py",
     );
 }
+
+#[test]
+fn matches_cpython_finally_none_condition_reuses_retained_pop_prefix() {
+    common::assert_matches_cpython_marshal(
+        r"def copied_finally_prefix(value, first, second):
+    try:
+        consume(first, second)
+        consume(first, second)
+        consume(first, second)
+        consume(first, second)
+        return 0
+    finally:
+        if value is not None:
+            finish(value)
+",
+        "copied_finally_prefix.py",
+    );
+    common::assert_matches_cpython_marshal(
+        r"def normal_finally_prefix(value, first, second):
+    try:
+        consume(first, second)
+        consume(first, second)
+        consume(first, second)
+        consume(first, second)
+    finally:
+        if value is not None:
+            finish(value)
+",
+        "normal_finally_prefix.py",
+    );
+}
