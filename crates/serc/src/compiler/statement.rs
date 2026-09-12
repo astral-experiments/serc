@@ -15278,7 +15278,18 @@ impl Compiler<'_> {
                                                         && !trailing.is_empty()
                                                         && !expression_contains_inline_branch(&conditional.test)))
                                                     && (leading.is_empty()
-                                                        || suite_has_linear_borrow_fallthrough(leading))
+                                                        || suite_has_linear_borrow_fallthrough(leading)
+                                                        || leading.split_last().is_some_and(|(last, prefix)| {
+                                                            suite_has_linear_borrow_fallthrough(std::slice::from_ref(last))
+                                                                && prefix.iter().all(|statement| match statement {
+                                                                    Stmt::If(logging) => {
+                                                                        condition_has_linear_runtime_leaves(&logging.test)
+                                                                            && logging.elif_else_clauses.is_empty()
+                                                                            && suite_has_linear_borrow_fallthrough(&logging.body)
+                                                                    }
+                                                                    _ => suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement)),
+                                                                })
+                                                        }))
                                             }))))
                                 && (leading.is_empty()
                                     || suite_has_linear_borrow_fallthrough(leading))

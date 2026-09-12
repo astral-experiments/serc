@@ -3963,3 +3963,14 @@ fn conditional_retry_handler_break_keeps_existing_entry() {
         "conditional_retry_break_entry.py",
     );
 }
+
+#[test]
+fn conditional_retry_logging_join_reaches_normal_finally() {
+    for prefix in ["", "async "] {
+        let awaited = if prefix.is_empty() { "" } else { "await " };
+        let source = format!(
+            "{prefix}def f(sink, item, retry, limit):\n    while ready():\n        ack = True\n        try:\n            {awaited}work(item)\n        except Error as error:\n            item.attempts += 1\n            record(error)\n            if retry and error.retryable() and item.attempts < limit:\n                delay = error.delay(item.attempts)\n                {awaited}reschedule(item, delay)\n                if item.attempts == 1 or item.attempts % 5 == 0:\n                    record(item, delay)\n                ack = False\n                continue\n            failed(item)\n        finally:\n            sink.record(item)\n            if ack:\n                {awaited}sink.ack(item)\n            sink.done()\n    after(sink)\n",
+        );
+        common::assert_matches_cpython_marshal(&source, "conditional_retry_logging_finally.py");
+    }
+}
