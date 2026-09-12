@@ -264,3 +264,41 @@ fn async_retained_try_condition_after_straight_line_prefix() {
         "async_retained_try_after_prefix.py",
     );
 }
+
+#[test]
+fn named_handler_return_finally_condition() {
+    common::assert_matches_cpython_marshal(
+        r"async def f(task, pending):
+    try:
+        return await task()
+    except ValueError as exc:
+        return result(error=exc)
+    finally:
+        if pending is not None:
+            pending.cancel()
+            await finish(pending)
+",
+        "named_handler_return_finally_condition.py",
+    );
+}
+
+#[test]
+fn named_handler_branching_return_finally_condition() {
+    common::assert_matches_cpython_marshal(
+        r"async def f(task, pending, progress):
+    try:
+        return await task()
+    except ValueError as exc:
+        return result(
+            error=exc,
+            link=None if progress is None else progress.link,
+            response=None if progress is None else progress.response,
+        )
+    finally:
+        if pending is not None:
+            pending.cancel()
+            await finish(pending)
+",
+        "named_handler_branching_return_finally_condition.py",
+    );
+}

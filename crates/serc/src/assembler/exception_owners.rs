@@ -1522,7 +1522,7 @@ impl LayoutAssembler {
         let mut has_instruction = false;
         let mut source_block = false;
         let mut protected_suffix = None;
-        let mut retained_owned_suffix = None;
+        let mut retained_owned_suffix: Option<(usize, ExceptionOwnerTail)> = None;
         let mut ended_owned_prefix = None;
         let mut source_owned_prefix = None;
         let mut pending_retained_prefix = None;
@@ -1656,11 +1656,33 @@ impl LayoutAssembler {
                         } else {
                             None
                         };
-                        if retained_epoch_known
-                            && self
-                                .exception_owner_provenance
-                                .removed_pop_block_boundaries
-                                .contains(label)
+                        if self
+                            .exception_owner_provenance
+                            .removed_pop_block_boundaries
+                            .contains(label)
+                            && (retained_epoch_known
+                                // Named-handler cleanup labels can end the retained-SETUP
+                                // epoch without changing this original array. An exact,
+                                // uniformly owned prefix still locates its final NULL POP.
+                                || (owner_history_exact
+                                    && pop_slot_epoch_known
+                                    && tail.insertions == 0
+                                    && tail.late_removals == 0
+                                    && tail.post_compaction_fusions == 0
+                                    && ended_owned_prefix.is_some_and(
+                                        |(start, end, start_tail, end_tail)| {
+                                            original_array_start <= start
+                                                && start < end
+                                                && end == instruction_index
+                                                && start_tail.early_removals
+                                                    == end_tail.early_removals
+                                                && self.has_uniform_exception_owner(
+                                                    start,
+                                                    end,
+                                                    &label_positions,
+                                                )
+                                        },
+                                    )))
                         {
                             ended_owned_suffix = Some(instruction_index);
                             ended_pop_slot = pop_slot_epoch_known.then_some((

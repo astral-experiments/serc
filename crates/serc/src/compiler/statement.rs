@@ -15358,7 +15358,51 @@ impl Compiler<'_> {
                     && suite_has_linear_live_conditional_break(&loop_statement.body)
                     && suite_contains_borrow_reachable_conditional_loop_break(
                         &loop_statement.body));
-        if !statement.handlers.is_empty() && !normal_finally_is_borrow_reachable {
+        // A trailing nested try has its own emptied normal exit even when the
+        // enclosing finally has no handlers. Its raising recovery cannot bypass it.
+        let nested_raising_handler_exit = statement.handlers.is_empty()
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && statement.orelse.is_empty()
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && self.control.loops.contexts.is_empty()
+            && self.control.withs.active_with_exits.is_empty()
+            && self.control.exceptions.active_exception_region_exclusions.is_empty()
+            && !self.control.in_exception_handler()
+            && self.control.finally.active_finally_try_bodies == 0
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+            && suite_has_linear_borrow_fallthrough(&statement.finalbody)
+            && statement.body.split_last().is_some_and(|(last, leading)| {
+                (leading.is_empty() || suite_has_linear_borrow_fallthrough(leading))
+                    && matches!(last, Stmt::Try(nested)
+                        if !nested.is_star
+                            && nested.orelse.is_empty()
+                            && nested.finalbody.is_empty()
+                            && !nested.handlers.is_empty()
+                            && nested.body.split_last().is_some_and(|(last, leading)| {
+                                suite_has_linear_borrow_fallthrough(leading)
+                                    && matches!(last, Stmt::If(condition)
+                                        if condition.elif_else_clauses.is_empty()
+                                            && condition_has_only_runtime_tests(&condition.test)
+                                            && !expression_contains_inline_branch(&condition.test)
+                                            && suite_has_linear_borrow_fallthrough(&condition.body))
+                            })
+                            && nested.handlers.iter().all(|handler| {
+                                handler.as_except_handler().is_some_and(|handler| {
+                                    handler.type_.is_some()
+                                        && handler.name.is_some()
+                                        && matches!(handler.body.as_slice(), [Stmt::If(condition), Stmt::Raise(_)]
+                                            if condition.elif_else_clauses.is_empty()
+                                                && condition_has_only_runtime_tests(&condition.test)
+                                                && !expression_contains_inline_branch(&condition.test)
+                                                && suite_has_linear_borrow_fallthrough(&condition.body))
+                                })
+                            }))
+            });
+        if (!statement.handlers.is_empty() && !normal_finally_is_borrow_reachable)
+            || nested_raising_handler_exit
+        {
             // An abrupt or bare handler leaves an empty CPython CFG block before the normal
             // finally body. Breaks and trailing structured try-body exits can leave the same
             // boundary. Outside a synchronous with, ordinary typed fallthrough handlers keep

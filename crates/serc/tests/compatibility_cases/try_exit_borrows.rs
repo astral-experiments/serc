@@ -3974,3 +3974,15 @@ fn conditional_retry_logging_join_reaches_normal_finally() {
         common::assert_matches_cpython_marshal(&source, "conditional_retry_logging_finally.py");
     }
 }
+
+#[test]
+fn nested_raising_handler_keeps_finally_entry_unborrowed() {
+    for leading in ["", "        prepare(sink)\n"] {
+        for raised in ["raise", "raise Error(value) from None"] {
+            let source = format!(
+                "def f(sink, flag, work, record, after, prepare):\n    try:\n{leading}        try:\n            value = work()\n            if flag is not None:\n                record(value)\n        except Error as error:\n            if flag is not None:\n                record(error)\n            {raised}\n    finally:\n        sink.close()\n    after(sink, value)\n"
+            );
+            common::assert_matches_cpython_marshal(&source, "nested_raising_finally.py");
+        }
+    }
+}
