@@ -2560,6 +2560,7 @@ impl LayoutAssembler {
                             instruction.exception_policy().owner(),
                             NormalizedExceptionOwner::Absent
                                 | NormalizedExceptionOwner::Present
+                                | NormalizedExceptionOwner::OverridePresent
                                 | NormalizedExceptionOwner::DynamicCondition
                                 | NormalizedExceptionOwner::DynamicConditionStrict
                         )
@@ -2576,15 +2577,26 @@ impl LayoutAssembler {
                             let source = instruction_index - removed_before;
                             self.uniform_exception_owner(source, source + 1, &label_positions)
                         };
-                        owners.insert(
-                            instruction_index,
-                            ExceptionOwnerDecision {
-                                has_owner: source_region.is_some(),
-                                source_region,
-                                definitive: true,
-                                override_existing: true,
-                            },
-                        );
+                        // A structural override is weaker than a certified old-array
+                        // region, but must not replace an earlier definitive decision.
+                        if instruction.exception_policy().owner()
+                            != NormalizedExceptionOwner::OverridePresent
+                            || (source_region.is_some_and(|region| {
+                                !self.exception_regions[region].is_scope_fallback
+                            }) && owners
+                                .get(&instruction_index)
+                                .is_none_or(|owner| !owner.definitive))
+                        {
+                            owners.insert(
+                                instruction_index,
+                                ExceptionOwnerDecision {
+                                    has_owner: source_region.is_some(),
+                                    source_region,
+                                    definitive: true,
+                                    override_existing: true,
+                                },
+                            );
+                        }
                     }
                     // A normal-finally local None test removes exactly three comparison
                     // records. With a retained POP its marker reuses IS_OP; with one

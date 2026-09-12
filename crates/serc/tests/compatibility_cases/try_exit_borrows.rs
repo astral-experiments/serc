@@ -4052,3 +4052,11 @@ fn synchronous_recovery_reaches_conditional_try_cleanup() {
         "synchronous_recovery_conditional_try_cleanup.py",
     );
 }
+
+#[test]
+fn async_recovery_reaches_conditional_try_cleanup() {
+    common::assert_matches_cpython_marshal(
+        "async def f(client, enabled, item, raise_on_error):\n    try:\n        await work(item)\n    except Error as error:\n        report(error)\n        if raise_on_error:\n            raise\n        failed(item)\n    finally:\n        if enabled is not None and client is not None:\n            try:\n                await client.close()\n            except Error:\n                warning()\n",
+        "async_recovery_conditional_try_cleanup.py",
+    );
+}

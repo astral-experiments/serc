@@ -15317,6 +15317,47 @@ impl Compiler<'_> {
                                 matches!(argument, Expr::Name(_) | Expr::NumberLiteral(_)
                                     | Expr::StringLiteral(_) | Expr::BooleanLiteral(_) | Expr::NoneLiteral(_))
                             }))));
+        // These two None tests cannot suspend. Their true edge reaches the
+        // separately located try marker before the protected close call awaits.
+        let coroutine_guarded_try_cleanup = self.unit.flags & CO_COROUTINE != 0
+            && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+            && self.control.loops.contexts.is_empty()
+            && self.control.withs.active_with_exits.is_empty()
+            && self.control.finally.active_copied_finally_bodies == 0
+            && !self.control.in_exception_handler()
+            && matches!(statement.finalbody.as_slice(), [Stmt::If(cleanup)]
+            if cleanup.elif_else_clauses.is_empty()
+                && matches!(cleanup.test.as_ref(), Expr::BoolOp(boolean)
+                    if boolean.op == BoolOp::And && boolean.values.len() == 2
+                        && boolean.values.iter().all(|value| {
+                            matches!(value, Expr::Compare(compare)
+                                if matches!(compare.left.as_ref(), Expr::Name(_))
+                                    && compare.ops[..] == [CmpOp::IsNot]
+                                    && matches!(&compare.comparators[..], [Expr::NoneLiteral(_)]))
+                        }))
+                && matches!(cleanup.body.as_slice(), [Stmt::Try(recovery)]
+                    if !recovery.is_star
+                        && recovery.orelse.is_empty()
+                        && recovery.finalbody.is_empty()
+                        && self.suite_has_nonempty_borrow_entry(&cleanup.body)
+                        && matches!(recovery.body.as_slice(), [Stmt::Expr(expression)]
+                            if matches!(expression.value.as_ref(), Expr::Await(awaited)
+                                if simple_cleanup_call(&awaited.value)))
+                        && !recovery.handlers.is_empty()
+                        && recovery.handlers.iter().all(|handler| {
+                            handler.as_except_handler().is_some_and(|handler| {
+                                handler.type_.is_some()
+                                    && handler.name.is_none()
+                                    && matches!(handler.body.as_slice(), [Stmt::Expr(expression)]
+                                        if simple_cleanup_call(&expression.value))
+                            })
+                        })))
+            && !statement.handlers.is_empty()
+            && statement.handlers.iter().all(|handler| {
+                handler.as_except_handler().is_some_and(|handler| {
+                    handler.name.is_some() && suite_has_linear_reraise_guards(&handler.body)
+                })
+            });
         // A separately located leading pass remains a NOP at the original
         // cleanup entry. The following conditional uses the same recovery route.
         let conditional_handler_cleanup = match statement.finalbody.as_slice() {
@@ -15358,9 +15399,10 @@ impl Compiler<'_> {
                 || matches!(conditional_handler_cleanup, [Stmt::If(cleanup)]
                 if condition_has_only_runtime_tests(&cleanup.test)
                     && (!expression_contains_inline_branch(&cleanup.test)
-                        || ((synchronous_recovery || coroutine_guarded_callback_cleanup)
+                        || ((synchronous_recovery || coroutine_guarded_callback_cleanup || coroutine_guarded_try_cleanup)
                             && condition_has_linear_runtime_leaves(&cleanup.test)))
-                    && (suite_has_linear_borrow_fallthrough(&cleanup.body)
+                    && (coroutine_guarded_try_cleanup
+                        || suite_has_linear_borrow_fallthrough(&cleanup.body)
                         || (synchronous_recovery
                             && self.control.withs.active_with_exits.is_empty()
                             && self.control.finally.active_copied_finally_bodies == 0
@@ -21515,6 +21557,26 @@ fn suite_contains_loop_continue(body: &[Stmt]) -> bool {
         Stmt::FunctionDef(_) | Stmt::ClassDef(_) => false,
         _ => false,
     })
+}
+
+// A plain recovery call has no branching or suspending argument evaluation.
+fn simple_cleanup_call(expression: &Expr) -> bool {
+    let Expr::Call(call) = expression else {
+        return false;
+    };
+    (matches!(call.func.as_ref(), Expr::Name(_))
+        || matches!(call.func.as_ref(), Expr::Attribute(attribute)
+            if matches!(attribute.value.as_ref(), Expr::Name(_))))
+        && call
+            .arguments
+            .args
+            .iter()
+            .all(|argument| matches!(argument, Expr::Name(_)) || fold_constant(argument).is_some())
+        && call.arguments.keywords.iter().all(|keyword| {
+            keyword.arg.is_some()
+                && (matches!(keyword.value, Expr::Name(_))
+                    || fold_constant(&keyword.value).is_some())
+        })
 }
 
 // Runtime re-raise guards keep their false successors connected to handler cleanup.

@@ -422,3 +422,14 @@ fn manager_finally_none_after_nested_try_exit_copy() {
         "manager_finally_none_after_nested_try_exit_copy.py",
     );
 }
+
+#[test]
+fn conditional_manager_after_late_setups() {
+    for managers in [2, 10, 12] {
+        let prefix = (0..managers).map(|_| "manager(), ").collect::<String>();
+        let source = format!(
+            "def f(value):\n    with ({prefix}manager(value) if value is not None else manager()):\n        yield value\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "conditional_manager_after_late_setups.py");
+    }
+}
