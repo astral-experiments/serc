@@ -4132,3 +4132,11 @@ fn structured_successor_reaches_nested_try_cleanup() {
         "structured_successor.py",
     );
 }
+
+#[test]
+fn dispatching_successor_reaches_nested_try_cleanup() {
+    common::assert_matches_cpython_marshal(
+        "async def f(sink, buffer, sample_rate):\n    try:\n        while True:\n            message = await sink.receive()\n            msg_type = message.get(\"type\")\n            if msg_type == \"disconnect\":\n                report(\"disconnected\")\n                break\n            if message.get(\"text\") is not None:\n                parsed = await parse(message[\"text\"])\n                if not parsed:\n                    continue\n                event = parsed.get(\"event\")\n                if event == \"start\":\n                    maybe_rate = parsed.get(\"sample_rate\")\n                    if isinstance(maybe_rate, (int, float)) and maybe_rate > 0:\n                        sample_rate = int(maybe_rate)\n                    report(sample_rate)\n                elif event == \"stop\":\n                    path = save(buffer, sample_rate)\n                    await sink.send({\"event\": \"saved\", \"path\": str(path), \"bytes\": len(buffer)})\n                    report(path, len(buffer))\n                    break\n                continue\n            chunk = message.get(\"bytes\")\n            if chunk:\n                buffer.extend(chunk)\n    except Disconnect:\n        report(\"disconnected\")\n    except Exception:\n        report_error()\n        try:\n            await sink.send({\"event\": \"error\"})\n        except Exception:\n            pass\n        raise\n    finally:\n        try:\n            await sink.close()\n        except Exception:\n            pass\n",
+        "dispatching_successor.py",
+    );
+}

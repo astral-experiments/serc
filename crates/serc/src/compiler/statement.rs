@@ -21819,6 +21819,66 @@ fn suite_has_structured_live_break(body: &[Stmt]) -> bool {
         }
     }
 
+    // The retry guard and dispatcher have explicit loop exits. Every remaining
+    // arm falls through to the trailing continue; no nested cleanup is crossed.
+    fn is_dispatching_successor(body: &[Stmt]) -> bool {
+        let [
+            Stmt::Assign(input),
+            Stmt::If(retry),
+            event,
+            Stmt::If(dispatch),
+            Stmt::Continue(_),
+        ] = body
+        else {
+            return false;
+        };
+        if !matches!(input.value.as_ref(), Expr::Await(_))
+            || !input
+                .targets
+                .iter()
+                .all(|target| matches!(target, Expr::Name(_)))
+            || input.targets.len() != 1
+            || expression_contains_inline_branch(&input.value)
+            || !condition_has_only_runtime_tests(&retry.test)
+            || expression_contains_inline_branch(&retry.test)
+            || !retry.elif_else_clauses.is_empty()
+            || !matches!(retry.body.as_slice(), [Stmt::Continue(_)])
+            || !matches!(event, Stmt::Assign(_))
+            || !is_linear(event)
+            || !condition_has_only_runtime_tests(&dispatch.test)
+            || expression_contains_inline_branch(&dispatch.test)
+        {
+            return false;
+        }
+        let [stop] = dispatch.elif_else_clauses.as_slice() else {
+            return false;
+        };
+        let Some(test) = &stop.test else {
+            return false;
+        };
+        let Some((Stmt::Break(_), leading)) = stop.body.split_last() else {
+            return false;
+        };
+        let mut guards = 0;
+        condition_has_only_runtime_tests(test)
+            && !expression_contains_inline_branch(test)
+            && !leading.is_empty()
+            && leading.iter().all(is_linear)
+            && !dispatch.body.is_empty()
+            && dispatch.body.iter().all(|statement| {
+                if let Stmt::If(guard) = statement {
+                    guards += 1;
+                    guards == 1
+                        && condition_has_only_runtime_tests(&guard.test)
+                        && guard.elif_else_clauses.is_empty()
+                        && !guard.body.is_empty()
+                        && guard.body.iter().all(is_linear)
+                } else {
+                    is_linear(statement)
+                }
+            })
+    }
+
     for (index, statement) in body.iter().enumerate() {
         let Stmt::If(conditional) = statement else {
             if !is_linear(statement) {
@@ -21844,7 +21904,8 @@ fn suite_has_structured_live_break(body: &[Stmt]) -> bool {
                 && !expression_contains_inline_branch(&successor.test)
                 && successor.elif_else_clauses.is_empty()
                 && !successor.body.is_empty()
-                && successor.body.iter().all(is_linear);
+                && (successor.body.iter().all(is_linear)
+                    || is_dispatching_successor(&successor.body));
         }
         let mut conditional_count = 0;
         return is_linear(successor)
