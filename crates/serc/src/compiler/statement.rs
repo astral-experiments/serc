@@ -15256,6 +15256,11 @@ impl Compiler<'_> {
                         early_condition_truthiness(&conditional.test).is_none()
                             && !expression_contains_inline_branch(&conditional.test)
                     }
+                    Stmt::Try(_) => {
+                        self.control.withs.active_with_exits.is_empty()
+                            && self.control.finally.active_copied_finally_bodies == 0
+                            && self.suite_has_nonempty_borrow_entry(&statement.finalbody)
+                    }
                     _ => false,
                 });
         let conditional_break_reaches_finally = conditional_break_cleanup_entry

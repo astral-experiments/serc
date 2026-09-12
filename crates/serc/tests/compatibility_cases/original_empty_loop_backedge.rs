@@ -449,3 +449,18 @@ fn manager_entry_owner_after_local_pair_fusion() {
         );
     }
 }
+
+#[test]
+fn manager_entry_owner_without_local_pair_fusion() {
+    for managers in [2, 10, 12] {
+        let entries = vec!["manager((1, 2, 3, 4, 5))"; managers];
+        let source = format!(
+            "def f(flag):\n    with ({}):\n        assert predicate(flag) == 1\n",
+            entries.join(", "),
+        );
+        common::assert_matches_cpython_marshal(
+            &source,
+            "manager_entry_owner_without_local_pair_fusion.py",
+        );
+    }
+}

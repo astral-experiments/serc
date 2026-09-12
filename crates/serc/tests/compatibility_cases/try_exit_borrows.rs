@@ -4092,3 +4092,27 @@ fn guarded_recovery_terminal_comprehension_call_preserves_cleanup_entry() {
         "comprehension_warning_only.py",
     );
 }
+
+#[test]
+fn live_break_reaches_nested_try_cleanup() {
+    common::assert_matches_cpython_marshal(
+        "async def f(sink):\n    try:\n        while True:\n            item = await receive()\n            if item is None:\n                break\n            consume(item)\n    except Error as error:\n        report(error)\n    finally:\n        try:\n            await sink.close()\n        except Timeout:\n            pass\n",
+        "live_break_reaches_nested_try_cleanup.py",
+    );
+}
+
+#[test]
+fn generator_live_break_reaches_nested_try_cleanup() {
+    common::assert_matches_cpython_marshal(
+        "async def f(sink):\n    try:\n        while True:\n            item = await receive()\n            if item is None:\n                break\n            line = parse(item)\n            yield line\n    except Error as error:\n        report(error)\n    finally:\n        try:\n            await sink.close()\n        except Timeout:\n            pass\n",
+        "generator_live_break_reaches_nested_try_cleanup.py",
+    );
+}
+
+#[test]
+fn live_break_reaches_nested_finally_cleanup() {
+    common::assert_matches_cpython_marshal(
+        "async def f(sink, flag):\n    try:\n        while True:\n            item = await receive()\n            if item is None:\n                break\n            consume(item)\n    except Error as error:\n        report(error)\n    finally:\n        try:\n            await sink.close()\n        finally:\n            if flag:\n                await sink.release()\n",
+        "live_break_reaches_nested_finally_cleanup.py",
+    );
+}

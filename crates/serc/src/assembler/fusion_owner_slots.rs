@@ -873,7 +873,10 @@ impl ManagerSetupCertificate {
             return None;
         }
         let (_, after_marker) = after.endpoint(condition, marker_instruction)?;
-        if !one_fusion(&before.items[..=marker], &after.items[..=after_marker]) {
+        // An unchanged transaction preserves the same concrete SETUP-array cells.
+        if before.items[..=marker] != after.items[..=after_marker]
+            && !one_fusion(&before.items[..=marker], &after.items[..=after_marker])
+        {
             return None;
         }
         let mut cells = Vec::new();
