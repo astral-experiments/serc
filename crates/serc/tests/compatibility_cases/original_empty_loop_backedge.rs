@@ -494,3 +494,16 @@ fn boolean_manager_expression_retains_source_owner() {
         );
     }
 }
+
+#[test]
+fn retained_setup_in_original_finally_array() {
+    for source in [
+        "def f(flag):\n    try:\n        yield 1\n    except BaseException:\n        raise\n    finally:\n        try:\n            if flag:\n                cleanup()\n        except OSError:\n            recover()\n",
+        "def f(flag):\n    with manager():\n        try:\n            work()\n        except BaseException:\n            raise\n        finally:\n            try:\n                if flag:\n                    cleanup()\n            except OSError:\n                recover()\n",
+    ] {
+        common::assert_matches_cpython_marshal(
+            source,
+            "retained_setup_in_original_finally_array.py",
+        );
+    }
+}

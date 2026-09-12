@@ -110,6 +110,7 @@ pub(super) struct OriginalNormalFinallyArray {
     pub(super) entry: Label,
     pub(super) prefix: Vec<Item>,
     pub(super) incoming: Vec<Instruction>,
+    pub(super) retained_setup: Option<(Label, Label, Label)>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -749,6 +750,51 @@ impl LayoutAssembler {
             .exception_owner_provenance
             .original_normal_finally_arrays
         {
+            let retained_setup_nop = origin.retained_setup.and_then(|(start, end, setup)| {
+                if !self
+                    .exception_owner_provenance
+                    .setup_nop_ranges
+                    .contains(&(start, end))
+                {
+                    return None;
+                }
+                let start_at = origin
+                    .prefix
+                    .iter()
+                    .position(|item| *item == Item::Label(start))?;
+                let end_at = origin
+                    .prefix
+                    .iter()
+                    .position(|item| *item == Item::Label(end))?;
+                let setup_at = origin
+                    .prefix
+                    .iter()
+                    .position(|item| *item == Item::Label(setup))?;
+                if !(start_at < end_at && end_at <= setup_at) {
+                    return None;
+                }
+                let mut instructions =
+                    origin.prefix[start_at..end_at]
+                        .iter()
+                        .filter_map(|item| match item {
+                            Item::Instruction(instruction) => Some(*instruction),
+                            Item::Label(_) => None,
+                        });
+                let nop = instructions.next()?;
+                if instructions.next().is_some()
+                    || nop.opcode != NOP
+                    || !self
+                        .exception_owner_provenance
+                        .setups
+                        .contains(&(setup, Some(nop.location)))
+                {
+                    return None;
+                }
+                Some(nop)
+            });
+            if origin.retained_setup.is_some() && retained_setup_nop.is_none() {
+                continue;
+            }
             let authored_break_location = match origin.incoming.as_slice() {
                 [jump] if jump.fusion_policy.is_authored_break() && jump.location.line >= 0 => {
                     Some(jump.location)
@@ -785,7 +831,13 @@ impl LayoutAssembler {
                 || labels.iter().any(|label| {
                     (jump_targets.contains(label)
                         && !(authored_break_location.is_some() && *label == origin.entry))
-                        || self.preserved_block_boundaries.contains(label)
+                        || (self.preserved_block_boundaries.contains(label)
+                            && !(retained_setup_nop.is_some()
+                                && origin
+                                    .prefix
+                                    .iter()
+                                    .take_while(|item| matches!(item, Item::Label(_)))
+                                    .any(|item| *item == Item::Label(*label))))
                         || self
                             .exception_regions
                             .iter()
@@ -794,7 +846,12 @@ impl LayoutAssembler {
                             .exception_owner_provenance
                             .setups
                             .iter()
-                            .any(|(setup, _)| setup == label)
+                            .any(|(setup, _)| {
+                                setup == label
+                                    && !origin
+                                        .retained_setup
+                                        .is_some_and(|(_, _, retained)| *setup == retained)
+                            })
                         || self
                             .exception_owner_provenance
                             .removed_pop_block_boundaries
@@ -827,10 +884,13 @@ impl LayoutAssembler {
                             .exception_owner_provenance
                             .fusion_boundaries
                             .contains(label)
-                        || self
+                        || (self
                             .exception_owner_provenance
                             .setup_nop_boundaries
                             .contains(label)
+                            && !origin
+                                .retained_setup
+                                .is_some_and(|(start, end, _)| *label == start || *label == end))
                         || (*label != origin.entry
                             && (self
                                 .exception_owner_provenance
@@ -853,62 +913,63 @@ impl LayoutAssembler {
             let [start] = starts.as_slice() else {
                 continue;
             };
-            let (current, end) = if authored_break_location.is_some() {
-                let original_labels = labels.iter().copied().collect::<FxHashSet<_>>();
-                let mut cursor = *start;
-                let mut current = Vec::with_capacity(origin.prefix.len());
-                let mut valid = true;
-                for _ in &origin.prefix {
-                    while let Some(Item::Label(label)) = self.items.get(cursor)
-                        && !original_labels.contains(label)
-                    {
-                        // The graph can label the already-emitted marker's
-                        // fallthrough. Such aliases do not add original cells.
-                        if jump_targets.contains(label)
-                            || self
-                                .exception_owner_provenance
-                                .block_boundaries
-                                .contains(label)
-                            || self
-                                .exception_owner_provenance
-                                .source_boundaries
-                                .contains(label)
-                            || self.preserved_block_boundaries.contains(label)
-                            || self
-                                .exception_owner_provenance
-                                .setups
-                                .iter()
-                                .any(|(setup, _)| setup == label)
-                            || self
-                                .exception_regions
-                                .iter()
-                                .any(|region| region.target == *label)
+            let (current, end) =
+                if authored_break_location.is_some() || retained_setup_nop.is_some() {
+                    let original_labels = labels.iter().copied().collect::<FxHashSet<_>>();
+                    let mut cursor = *start;
+                    let mut current = Vec::with_capacity(origin.prefix.len());
+                    let mut valid = true;
+                    for _ in &origin.prefix {
+                        while let Some(Item::Label(label)) = self.items.get(cursor)
+                            && !original_labels.contains(label)
                         {
-                            valid = false;
+                            // The graph can label the already-emitted marker's
+                            // fallthrough. Such aliases do not add original cells.
+                            if jump_targets.contains(label)
+                                || self
+                                    .exception_owner_provenance
+                                    .block_boundaries
+                                    .contains(label)
+                                || self
+                                    .exception_owner_provenance
+                                    .source_boundaries
+                                    .contains(label)
+                                || self.preserved_block_boundaries.contains(label)
+                                || self
+                                    .exception_owner_provenance
+                                    .setups
+                                    .iter()
+                                    .any(|(setup, _)| setup == label)
+                                || self
+                                    .exception_regions
+                                    .iter()
+                                    .any(|region| region.target == *label)
+                            {
+                                valid = false;
+                                break;
+                            }
+                            cursor += 1;
+                        }
+                        if !valid {
                             break;
                         }
+                        let Some(item) = self.items.get(cursor) else {
+                            valid = false;
+                            break;
+                        };
+                        current.push(*item);
                         cursor += 1;
                     }
                     if !valid {
-                        break;
+                        continue;
                     }
-                    let Some(item) = self.items.get(cursor) else {
-                        valid = false;
-                        break;
+                    (current, cursor)
+                } else {
+                    let Some(current) = self.items.get(*start..*start + origin.prefix.len()) else {
+                        continue;
                     };
-                    current.push(*item);
-                    cursor += 1;
-                }
-                if !valid {
-                    continue;
-                }
-                (current, cursor)
-            } else {
-                let Some(current) = self.items.get(*start..*start + origin.prefix.len()) else {
-                    continue;
+                    (current.to_vec(), *start + origin.prefix.len())
                 };
-                (current.to_vec(), *start + origin.prefix.len())
-            };
             let Some(marker_at) = origin
                 .prefix
                 .iter()
@@ -950,6 +1011,17 @@ impl LayoutAssembler {
                     }
                 }
             }
+            if retained_setup_nop.is_some() {
+                for (expected, current) in expected.iter_mut().zip(&current) {
+                    if let (Item::Instruction(expected), Item::Instruction(current)) =
+                        (expected, current)
+                        && expected.opcode == LOAD_FAST
+                        && current.opcode == LOAD_FAST_BORROW
+                    {
+                        expected.opcode = LOAD_FAST_BORROW;
+                    }
+                }
+            }
             if current != expected
                 || marker.opcode != NOP
                 || !marker.fusion_policy.is_converted_pop_block()
@@ -973,7 +1045,8 @@ impl LayoutAssembler {
                     || instruction.pre_fold_extra_instructions() != 0
                     || instruction.no_location_policy.borrow_fallthrough()
                         != super::BorrowFallthrough::Reachable
-                    || matches!(instruction.opcode, NOP | NOT_TAKEN | FOR_ITER | SEND)
+                    || (instruction.opcode == NOP && retained_setup_nop != Some(*instruction))
+                    || matches!(instruction.opcode, NOT_TAKEN | FOR_ITER | SEND)
                     || is_scope_exit(instruction.opcode)
                 {
                     valid = false;
@@ -996,7 +1069,7 @@ impl LayoutAssembler {
                 && (matches!(
                     last.exception_policy().owner(),
                     NormalizedExceptionOwner::Absent | NormalizedExceptionOwner::DynamicCondition
-                ) || (authored_break_location.is_some()
+                ) || ((authored_break_location.is_some() || retained_setup_nop.is_some())
                     && last.exception_policy().owner() == NormalizedExceptionOwner::Present))
             {
                 let logical_end = self.items[..end]
@@ -4174,6 +4247,7 @@ mod tests {
                     source_boundaries: [entry].into_iter().collect(),
                     block_boundaries: [entry].into_iter().collect(),
                     original_normal_finally_arrays: vec![OriginalNormalFinallyArray {
+                        retained_setup: None,
                         entry,
                         prefix,
                         incoming: vec![plain(JUMP_FORWARD, Operand::Forward(entry))],

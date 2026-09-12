@@ -3043,6 +3043,7 @@ impl Assembler {
         {
             return;
         }
+        let mut retained_setup: Option<(Label, Label, Label)> = None;
         let mut end = index + 1;
         while matches!(items.get(end), Some(Item::Label(_))) {
             end += 1;
@@ -3067,7 +3068,9 @@ impl Assembler {
                         })
                         .collect::<rustc_hash::FxHashSet<_>>();
                     if labels.iter().any(|label| {
-                        self.original_nop_targets.contains(label)
+                        (self.original_nop_targets.contains(label)
+                            && !retained_setup
+                                .is_some_and(|(start, end, _)| *label == start || *label == end))
                             || self
                                 .exception_owner_provenance
                                 .omitted_nop_counts
@@ -3080,10 +3083,13 @@ impl Assembler {
                                 .exception_owner_provenance
                                 .fusion_boundaries
                                 .contains(label)
-                            || self
+                            || (self
                                 .exception_owner_provenance
                                 .setup_nop_boundaries
                                 .contains(label)
+                                && !retained_setup.is_some_and(|(start, end, _)| {
+                                    *label == start || *label == end
+                                }))
                     }) {
                         return;
                     }
@@ -3103,6 +3109,7 @@ impl Assembler {
                         entry: *entry,
                         prefix: items[begin..end].to_vec(),
                         incoming,
+                        retained_setup,
                     };
                     self.exception_owner_provenance
                         .original_normal_finally_arrays
@@ -3113,6 +3120,49 @@ impl Assembler {
             if !matches!(instruction.operand(), Operand::Value(_)) || ends_scope(instruction.opcode)
             {
                 return;
+            }
+            // One authored retained SETUP can introduce range labels without
+            // introducing another original instruction array.
+            if instruction.opcode == NOP && retained_setup.is_none() {
+                let mut before = end - 1;
+                while before > index && matches!(items[before - 1], Item::Label(_)) {
+                    before -= 1;
+                }
+                let mut after = end;
+                while matches!(items.get(after), Some(Item::Label(_))) {
+                    after += 1;
+                }
+                let before_labels = &items[before..end - 1];
+                let after_labels = &items[end..after];
+                let mut candidates = self
+                    .exception_owner_provenance
+                    .setup_nop_ranges
+                    .iter()
+                    .filter_map(|(start, finish)| {
+                        if !before_labels.contains(&Item::Label(*start))
+                            || !after_labels.contains(&Item::Label(*finish))
+                        {
+                            return None;
+                        }
+                        let mut setups = self.exception_owner_provenance.setups.iter().filter(
+                            |(label, location)| {
+                                *location == Some(instruction.location)
+                                    && after_labels.contains(&Item::Label(*label))
+                            },
+                        );
+                        let (setup, _) = setups.next()?;
+                        if setups.next().is_some() {
+                            return None;
+                        }
+                        Some((*start, *finish, *setup))
+                    });
+                if let Some(origin) = candidates.next() {
+                    if candidates.next().is_some() {
+                        return;
+                    }
+                    retained_setup = Some(origin);
+                    end = after;
+                }
             }
         }
     }
