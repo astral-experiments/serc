@@ -4796,6 +4796,73 @@ impl Compiler<'_> {
                                 && pair[0].exception_region_depth.checked_add(1)
                                     == Some(pair[1].exception_region_depth)
                         });
+                // Two contiguous unnamed handlers retire their own collectors before
+                // the one ordinary try surrounding both handlers is unwound.
+                let tracks_two_handlers_inside_ordinary_try = !return_is_overridden
+                    && self.context.target_specific_rules_enabled()
+                    && handler_count == 2
+                    && self.control.exceptions.active_try_marker_slots.len() == 1
+                    && self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .len()
+                        == 3
+                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                    && self.control.exceptions.active_exception_group_handlers == 0
+                    && self.control.withs.active_with_exits.is_empty()
+                    && self.control.loops.contexts.is_empty()
+                    && self
+                        .control
+                        .finally
+                        .active_return_finally_contexts
+                        .is_empty()
+                    && self.control.finally.active_loop_finally_contexts.is_empty()
+                    && self
+                        .control
+                        .finally
+                        .active_pass_finally_locations
+                        .is_empty()
+                    && self
+                        .control
+                        .finally
+                        .preserved_return_value_contexts
+                        .is_empty()
+                    && self.control.finally.copied_return_finally_preserved_values == 0
+                    && self.control.finally.active_finally_try_bodies == 0
+                    && self.control.finally.active_normal_finally_bodies == 0
+                    && self.control.finally.active_copied_finally_bodies == 0
+                    && self.control.finally.active_finally_end_blocks == 0
+                    && self.control.finally.active_overriding_finally_returns == 0
+                    && self
+                        .control
+                        .exceptions
+                        .active_exception_handlers
+                        .first()
+                        .is_some_and(|handler| {
+                            handler.try_body_depth == 1 && handler.exception_region_depth == 1
+                        })
+                    && self
+                        .control
+                        .exceptions
+                        .active_exception_handlers
+                        .iter()
+                        .all(|handler| {
+                            handler.name.is_none()
+                                && handler.with_depth == 0
+                                && handler.loop_depth == 0
+                                && handler.finally_end_depth == 0
+                        })
+                    && self
+                        .control
+                        .exceptions
+                        .active_exception_handlers
+                        .windows(2)
+                        .all(|pair| {
+                            pair[1].try_body_depth == pair[0].try_body_depth
+                                && pair[0].exception_region_depth.checked_add(1)
+                                    == Some(pair[1].exception_region_depth)
+                        });
                 // CPython keeps a nested handler's return cleanup protected by its enclosing
                 // try body. A return compiled in a newer try body under an outer handler has a
                 // deeper marker stack and must keep the existing ownerless unwind instead.
@@ -5072,6 +5139,7 @@ impl Compiler<'_> {
                     });
                 let mut handler_region_unwind_starts = ((tracks_iterator_region_unwinds
                     || tracks_handler_enclosing_try_unwinds
+                    || tracks_two_handlers_inside_ordinary_try
                     || tracks_handler_iterator_region_unwinds
                     || tracks_finally_region_unwinds
                     || unwinds_finally_end_inside_handler

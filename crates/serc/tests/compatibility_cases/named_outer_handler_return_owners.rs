@@ -359,6 +359,16 @@ fn matches_cpython_nested_fallback_handler_return_owners() {
 }
 
 #[test]
+fn matches_cpython_two_fallback_handlers_inside_ordinary_try() {
+    for value in ["0", "{}", "finish()"] {
+        let source = format!(
+            "def f():\n    try:\n        try:\n            return first()\n        except Exception:\n            try:\n                return second()\n            except Exception:\n                return {value}\n    except Exception:\n        return None\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "two_fallback_handlers_outer_try.py");
+    }
+}
+
+#[test]
 fn matches_cpython_named_handler_exit_retains_inner_manager_owner() {
     common::assert_matches_cpython_marshal(
         r"async def f(manager):
