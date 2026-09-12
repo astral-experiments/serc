@@ -201,3 +201,27 @@ def ownerless_control(lines, parse, use):
         "<synchronous-with-protected-iterator-condition-owners>",
     );
 }
+
+#[test]
+fn atomic_loop_tail_exclusions_subsume_only_their_marker() {
+    for (source, filename) in [
+        (
+            "def f(items, manager):\n    with manager:\n        try:\n            work()\n        finally:\n            for item in items:\n                if item.left == LIMIT and item.right == \"ready\":\n                    consume(item)\n",
+            "manager_finally_compound_overlap.py",
+        ),
+        (
+            "def f(items, manager):\n    with manager:\n        for item in items:\n            flag = check(item)\n            if flag:\n                consume(item)\n",
+            "manager_tail_simple.py",
+        ),
+        (
+            "def f(items, manager):\n    with manager:\n        try:\n            work()\n        finally:\n            for item in items:\n                if check(item):\n                    consume(item)\n",
+            "manager_finally_tail_call.py",
+        ),
+        (
+            "def f(items, manager):\n    with manager:\n        for item in items:\n            if check(item):\n                consume(item)\n            finish(item)\n",
+            "manager_forward_control.py",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

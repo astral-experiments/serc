@@ -2418,6 +2418,29 @@ impl Assembler {
         instruction.jump_policy.mark_borrow_empty_block();
     }
 
+    /// Checks that two labels delimit only the last emitted instruction.
+    pub(crate) fn range_is_last_instruction(
+        &self,
+        start: Label,
+        end: Label,
+        opcode: Opcode,
+    ) -> bool {
+        let items = self.linear_items();
+        let Some(index) = items
+            .iter()
+            .rposition(|item| matches!(item, Item::Instruction(_)))
+        else {
+            return false;
+        };
+        matches!(items[index], Item::Instruction(instruction) if instruction.opcode == opcode)
+            && items[..index]
+                .iter()
+                .rev()
+                .take_while(|item| matches!(item, Item::Label(_)))
+                .any(|item| *item == Item::Label(start))
+            && items[index + 1..].contains(&Item::Label(end))
+    }
+
     pub(crate) fn mark_before_trailing_instructions(&mut self, label: Label, count: usize) {
         let instruction_count = self.instruction_count();
         let count = count.max(1);

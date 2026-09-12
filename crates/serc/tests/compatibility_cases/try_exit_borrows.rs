@@ -4227,3 +4227,19 @@ fn named_recovery_for_break_with_linear_notification() {
         "named_recovery_for_break_with_linear_notification.py",
     );
 }
+
+#[test]
+fn recovery_cleanup_conditional_call() {
+    common::assert_matches_cpython_marshal(
+        "def f(items, path, batch, fail):\n    for item in items:\n        try:\n            work(item)\n        except Error as error:\n            report(error)\n            if fail:\n                raise\n        finally:\n            write_json(path, {\"item\": item, \"batch\": batch.get(\"created\") if batch else None, \"failed\": fail})\n",
+        "conditional_call.py",
+    );
+}
+
+#[test]
+fn recovery_cleanup_linear_call() {
+    common::assert_matches_cpython_marshal(
+        "def f(items, path, batch, fail):\n    for item in items:\n        try:\n            work(item)\n        except Error as error:\n            report(error)\n            if fail:\n                raise\n        finally:\n            write_json(path, {\"item\": item, \"batch\": batch.get(\"created\"), \"failed\": fail})\n",
+        "linear_call.py",
+    );
+}

@@ -7907,7 +7907,8 @@ impl Compiler<'_> {
                         && matches!(self.unit.scope, Scope::Function { .. })
                         && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
                             == 0
-                        && self.control.loops.contexts.is_empty()
+                        && (self.control.loops.contexts.is_empty()
+                            || self.control.statements.current_statement_has_following)
                         && self.control.withs.active_with_exits.is_empty()
                         && self
                             .control
@@ -10090,6 +10091,23 @@ impl Compiler<'_> {
         let generator_exclusion = (control_region.is_none()
             && self.control.generators.generator_region_start.is_some())
         .then(|| self.assembler.label());
+        let exclusion_lengths = control_region.map(|_| {
+            (
+                self.control.generators.generator_region_exclusions.len(),
+                self.control
+                    .withs
+                    .active_with_region_exclusions
+                    .iter()
+                    .map(Vec::len)
+                    .collect::<Vec<_>>(),
+                self.control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .iter()
+                    .map(Vec::len)
+                    .collect::<Vec<_>>(),
+            )
+        });
         self.compile_jump_if(expression, jump_on, success)?;
         // Only a runtime conditional leaves a POP_JUMP/NOT_TAKEN suffix. Folded
         // conditions retain their authored NOP or jump owner, including when a
@@ -10103,6 +10121,47 @@ impl Compiler<'_> {
         } else {
             0
         };
+        if condition_tail == 2
+            && let Some((generator_length, with_lengths, exception_lengths)) = exclusion_lengths
+        {
+            // compile_jump_if may append a marker-only exclusion before this
+            // broader condition/marker/backedge exclusion. Region collectors
+            // consume ranges in emission order, so keep just the broader range.
+            // Exact adjacent labels prove coverage without using label ordinals;
+            // earlier exclusions from evaluating the operand remain untouched.
+            let assembler = &self.assembler;
+            let remove_marker_range = |ranges: &mut RegionExclusions, original_length: usize| {
+                if ranges.len() > original_length
+                    && ranges.last().is_some_and(|(start, end)| {
+                        assembler.range_is_last_instruction(*start, *end, NOT_TAKEN)
+                    })
+                {
+                    ranges.pop();
+                }
+            };
+            remove_marker_range(
+                &mut self.control.generators.generator_region_exclusions,
+                generator_length,
+            );
+            for (ranges, original_length) in self
+                .control
+                .withs
+                .active_with_region_exclusions
+                .iter_mut()
+                .zip(with_lengths)
+            {
+                remove_marker_range(ranges, original_length);
+            }
+            for (ranges, original_length) in self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .iter_mut()
+                .zip(exception_lengths)
+            {
+                remove_marker_range(ranges, original_length);
+            }
+        }
         self.assembler.mark_last_condition_fallthrough_fresh();
         for start in control_region
             .map(|(start, _)| start)
@@ -15768,6 +15827,20 @@ impl Compiler<'_> {
                             !expression_contains_inline_branch(value)
                         })))))
                 || suite_has_linear_borrow_fallthrough(&statement.finalbody)
+                || (matches!(self.unit.scope, Scope::Function { .. })
+                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                    && self.control.withs.active_with_exits.is_empty()
+                    && self.control.finally.active_copied_finally_bodies == 0
+                    && self.control.finally.active_finally_try_bodies == 0
+                    && self.control.exceptions.active_exception_region_exclusions.is_empty()
+                    && !self.control.in_exception_handler()
+                    && statement.handlers.iter().all(|handler| {
+                        handler.as_except_handler().is_some_and(|handler| {
+                            handler.name.is_some() && suite_has_linear_reraise_guards(&handler.body)
+                        })
+                    })
+                    && matches!(statement.finalbody.as_slice(), [Stmt::Expr(cleanup)]
+                        if cleanup_dictionary_call_has_live_join(&cleanup.value)))
                 || matches!(conditional_handler_cleanup, [Stmt::If(cleanup)]
                 if condition_has_only_runtime_tests(&cleanup.test)
                     && (!expression_contains_inline_branch(&cleanup.test)
@@ -21929,6 +22002,44 @@ fn suite_contains_loop_continue(body: &[Stmt]) -> bool {
         Stmt::FunctionDef(_) | Stmt::ClassDef(_) => false,
         _ => false,
     })
+}
+
+// One optional dictionary value rejoins at BUILD_MAP and the cleanup call. The
+// surrounding evaluations neither branch nor suspend before reaching that join.
+fn cleanup_dictionary_call_has_live_join(expression: &Expr) -> bool {
+    let Expr::Call(call) = expression else {
+        return false;
+    };
+    let [Expr::Name(_), Expr::Dict(dictionary)] = &call.arguments.args[..] else {
+        return false;
+    };
+    if !matches!(call.func.as_ref(), Expr::Name(_)) || !call.arguments.keywords.is_empty() {
+        return false;
+    }
+    let mut conditional_values = 0;
+    dictionary.items.iter().all(|item| {
+        if item.key.as_ref().is_none_or(|key| fold_constant(key).is_none()) {
+            return false;
+        }
+        if let Expr::If(conditional) = &item.value {
+            conditional_values += 1;
+            let Expr::Name(test) = conditional.test.as_ref() else {
+                return false;
+            };
+            let Expr::Call(value) = conditional.body.as_ref() else {
+                return false;
+            };
+            conditional_values == 1
+                && matches!(conditional.orelse.as_ref(), Expr::NoneLiteral(_))
+                && matches!(value.func.as_ref(), Expr::Attribute(attribute)
+                    if matches!(attribute.value.as_ref(), Expr::Name(receiver) if receiver.id == test.id))
+                && matches!(&value.arguments.args[..], [Expr::StringLiteral(_)])
+                && value.arguments.keywords.is_empty()
+        } else {
+            !expression_contains_inline_branch(&item.value)
+                && !expression_suspends_current_scope(&item.value)
+        }
+    }) && conditional_values == 1
 }
 
 // A plain recovery call has no branching or suspending argument evaluation.
