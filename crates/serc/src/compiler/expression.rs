@@ -5015,7 +5015,7 @@ impl Compiler<'_> {
                 exclusions.push((start, end));
             }
         }
-        // Backward-branch normalization creates the synchronous filter-rejection block after
+        // Backward-branch normalization creates the filter-rejection block after
         // CPython assigns exception handlers, leaving it outside every enclosing try/with
         // region. This also applies after suspension and inside copied finally bodies.
         if include_protected_region_exclusion
@@ -5594,7 +5594,7 @@ impl Compiler<'_> {
                 accepted,
                 start,
                 add_opcode == LIST_APPEND,
-                false,
+                true,
             )?;
             self.assembler.mark(accepted);
         }

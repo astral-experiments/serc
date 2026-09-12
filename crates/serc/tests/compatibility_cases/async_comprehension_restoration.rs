@@ -61,3 +61,22 @@ fn async_comprehension_restores_distinct_outer_values() {
         "([(10, 11, 12)], (11, 22, 33))\n",
     );
 }
+
+#[test]
+fn matches_cpython_async_filter_rejection_exception_owners() {
+    for expression in [
+        "[value async for value in values if value]",
+        "{value async for value in values if value and accepted(value)}",
+        "{value: transform(value) async for value in values if value}",
+        "[value async for value in values]",
+    ] {
+        let source = format!(
+            "async def f(values):\n    try:\n        return {expression}\n    except Exception:\n        return None\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "async_filter_try_owner.py");
+        let source = format!(
+            "async def f(values, manager):\n    with manager:\n        return {expression}\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "async_filter_manager_owner.py");
+    }
+}

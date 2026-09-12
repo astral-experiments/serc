@@ -10641,6 +10641,25 @@ impl Compiler<'_> {
             IteratorCleanup::Sync,
             self.loop_break_policy(statement.range),
         );
+        // Splitting an enclosing loop's terminal condition must not make this
+        // iterator's break appear to leave the enclosing ordinary try body.
+        if self.control.loops.split_loop_tail_prefix_end == Some(statement.range)
+            && context.exception_region_depth > 0
+            && context.finally_end_depth == 0
+            && self.control.exceptions.active_exception_handlers.is_empty()
+            && self.control.withs.active_with_exits.is_empty()
+            && self.control.finally.active_finally_try_bodies == 0
+            && self.control.finally.active_loop_finally_contexts.is_empty()
+            && self
+                .control
+                .finally
+                .active_return_finally_contexts
+                .is_empty()
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+        {
+            context.break_target_keeps_exception_owner = true;
+        }
         context.has_orelse = !statement.orelse.is_empty();
         let body_start = self.assembler.instruction_count();
         let first_iterator_loop_assertion = first_iterator_loop_assertion(&statement.body);
@@ -12097,7 +12116,12 @@ impl Compiler<'_> {
                 && statement.orelse.is_empty()
                 && let Some((Stmt::If(statement), leading)) = statement.body.split_last()
             {
-                self.compile_suite(leading)?;
+                // The separately compiled tail still follows the prefix's last statement.
+                self.with_control_override(
+                    |control| &mut control.loops.split_loop_tail_prefix_end,
+                    leading.last().map(Ranged::range),
+                    |compiler| compiler.compile_suite(leading),
+                )?;
                 let owner_depth = self
                     .control
                     .exceptions

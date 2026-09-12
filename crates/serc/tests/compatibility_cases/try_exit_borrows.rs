@@ -4170,3 +4170,44 @@ fn matches_cpython_iterator_break_entering_try_else_owner() {
         "no_else_break.py",
     );
 }
+
+#[test]
+fn matches_cpython_iterator_break_before_split_try_loop_tail() {
+    common::assert_matches_cpython_marshal(
+        r"def split_tail(groups, stop, report_error):
+    timed_out = False
+    for values in groups:
+        try:
+            for value in values:
+                if stop(value):
+                    timed_out = True
+                    break
+                consume(value)
+            if timed_out:
+                break
+        except Exception:
+            if report_error:
+                report()
+    after()
+",
+        "split_try_loop_tail.py",
+    );
+    common::assert_matches_cpython_marshal(
+        r"def unsplit_tail(groups, stop):
+    timed_out = False
+    for values in groups:
+        try:
+            for value in values:
+                if stop(value):
+                    timed_out = True
+                    break
+                consume(value)
+            if timed_out:
+                break
+        except Exception:
+            report()
+    after()
+",
+        "unsplit_try_loop_tail.py",
+    );
+}
