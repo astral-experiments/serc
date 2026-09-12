@@ -732,6 +732,20 @@ impl Assembler {
         self.folded_away_loop_else_targets.insert(target);
     }
 
+    /// Records the existing NOP at a folded edge's source, without adding a CFG boundary.
+    pub(crate) fn record_folded_predecessor_source(&mut self, source: Label, target: Label) {
+        if !self.folded_away_condition_targets.contains(&target)
+            && !self.folded_away_loop_else_targets.contains(&target)
+        {
+            return;
+        }
+        let marker = self.required_last_instruction_mut("recording a folded source marker");
+        debug_assert_eq!(marker.opcode, NOP);
+        let location = marker.location;
+        self.folded_predecessor_sources
+            .push((source, target, location));
+    }
+
     /// Whether folded and emitted conditional edges share this original block head.
     pub(crate) fn has_folded_shared_conditional_entry(&self) -> bool {
         let items = self.linear_items();
@@ -2802,6 +2816,17 @@ impl Assembler {
         self.emitted_jump_mut(emitted, "preventing jump threading through a target")
             .jump_policy
             .prevent_threading_target();
+    }
+
+    /// Keeps an original cleanup from certifying a borrowed-load route through its jump.
+    /// Physical jump threading still transfers the break's owner and interrupt check.
+    pub(crate) fn prevent_borrow_jump_threading_target(&mut self, emitted: EmittedJump) {
+        self.emitted_jump_mut(
+            emitted,
+            "preventing borrowed-load threading through a target",
+        )
+        .jump_policy
+        .prevent_borrow_threading_target();
     }
 
     pub(crate) fn mark_jump_as_authored_break(&mut self, emitted: EmittedJump) {

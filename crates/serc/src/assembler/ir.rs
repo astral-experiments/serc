@@ -531,6 +531,7 @@ impl JumpPolicy {
     const BORROW_EMPTY_BLOCK: u16 = 1 << 6;
     const PRESERVE_EXPLICIT_NOP: u16 = 1 << 7;
     const NORMALIZED_CONDITIONAL_BACKEDGE: u16 = 1 << 8;
+    const PREVENT_BORROW_THREADING_TARGET: u16 = 1 << 9;
 
     const SYNTHETIC: Self = Self(Self::PREVENT_SMALL_EXIT_INLINING);
     const DEFAULT: Self = Self(0);
@@ -542,6 +543,9 @@ impl JumpPolicy {
         }
         if !first.allows_threading_target() || !second.allows_threading_target() {
             policy.0 |= Self::PREVENT_THREADING_TARGET;
+        }
+        if !first.allows_borrow_threading_target() || !second.allows_borrow_threading_target() {
+            policy.0 |= Self::PREVENT_BORROW_THREADING_TARGET;
         }
         if first.defers_redundant_removal() || second.defers_redundant_removal() {
             policy.0 |= Self::DEFER_REDUNDANT_REMOVAL;
@@ -568,6 +572,10 @@ impl JumpPolicy {
 
     pub(super) const fn allows_threading_target(self) -> bool {
         self.0 & Self::PREVENT_THREADING_TARGET == 0
+    }
+
+    pub(super) const fn allows_borrow_threading_target(self) -> bool {
+        self.0 & Self::PREVENT_BORROW_THREADING_TARGET == 0
     }
 
     pub(super) const fn defers_redundant_removal(self) -> bool {
@@ -675,6 +683,10 @@ impl JumpPolicy {
         self.0 |= Self::PREVENT_THREADING_TARGET;
     }
 
+    pub(super) fn prevent_borrow_threading_target(&mut self) {
+        self.0 |= Self::PREVENT_BORROW_THREADING_TARGET;
+    }
+
     pub(super) fn resolve_deferred_removal(&mut self) {
         debug_assert!(self.defers_redundant_removal());
         self.0 &= !Self::DEFER_REDUNDANT_REMOVAL;
@@ -695,6 +707,10 @@ impl std::fmt::Debug for JumpPolicy {
             .field("retained_nop", &self.retained_nop())
             .field("interruptible", &self.is_interruptible())
             .field("allow_threading_target", &self.allows_threading_target())
+            .field(
+                "allow_borrow_threading_target",
+                &self.allows_borrow_threading_target(),
+            )
             .field("defer_redundant_removal", &self.defers_redundant_removal())
             .field(
                 "preserve_nop_after_threading",
@@ -1308,6 +1324,8 @@ pub(crate) struct Assembler {
     pub(super) folded_away_condition_targets: FxHashSet<Label>,
     /// Original normal predecessors from discarded linear constant-loop else suites.
     pub(super) folded_away_loop_else_targets: FxHashSet<Label>,
+    /// Existing source marker, target, and marker location of an original folded edge.
+    pub(super) folded_predecessor_sources: Vec<(Label, Label, SourceLocation)>,
     pub(super) operand_patches: Vec<OperandPatch>,
     pub(super) deferred_none_constant_index: Option<u32>,
     pub(super) discarded_fold_admissions: FxHashMap<Label, Vec<u32>>,
@@ -1393,6 +1411,8 @@ pub(super) struct OptimizationPipeline {
     pub(super) graph: BlockGraph,
     /// Original incoming edges removed before CPython resolves cleanup locations.
     pub(super) folded_original_predecessor_targets: FxHashSet<Label>,
+    /// Source markers retained to prove that a folded edge was originally reachable.
+    pub(super) folded_predecessor_sources: Vec<(Label, Label, SourceLocation)>,
     /// First-fold admissions retained before their next surviving source label.
     pub(super) discarded_fold_admissions: FxHashMap<Label, Vec<u32>>,
     pub(super) initial_reachable: Option<Vec<bool>>,
@@ -1506,6 +1526,7 @@ impl Default for Assembler {
             emission_stream: EmissionStreamId::next(),
             folded_away_condition_targets: FxHashSet::default(),
             folded_away_loop_else_targets: FxHashSet::default(),
+            folded_predecessor_sources: Vec::new(),
             operand_patches: Vec::new(),
             deferred_none_constant_index: None,
             discarded_fold_admissions: FxHashMap::default(),

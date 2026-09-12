@@ -1051,6 +1051,7 @@ impl OptimizationPipeline {
                         pending.clear();
                     } else if instruction.opcode == crate::target::opcodes::JUMP_FORWARD
                         && instruction.jump_policy.allows_threading_target()
+                        && instruction.jump_policy.allows_borrow_threading_target()
                         && !instruction.jump_policy.always_retains_nop()
                         && !instruction.jump_policy.borrow_empty_block()
                         && let Operand::Forward(target) = instruction.operand()

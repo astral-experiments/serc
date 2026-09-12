@@ -802,7 +802,10 @@ impl OptimizationPipeline {
                                         pop_block_owner,
                                         instruction.jump_policy.borrow_empty_block(),
                                         instruction.no_location_policy.borrow_fallthrough()
-                                            == BorrowFallthrough::Barrier,
+                                            == BorrowFallthrough::Barrier
+                                            || !instruction
+                                                .jump_policy
+                                                .allows_borrow_threading_target(),
                                         instruction.jump_policy.is_interruptible(),
                                         instruction.jump_policy.preserves_nop_after_threading(),
                                         normal_try_exits.contains(&label_offsets[label])
@@ -1876,7 +1879,36 @@ impl OptimizationPipeline {
                         };
                         instruction.location.line
                     });
-                    if !instruction.jump_policy.always_retains_nop()
+                    // A restored normal manager POP_BLOCK now owns this line event.
+                    // The original try jump must retire against that same-line NULL
+                    // record, even when its old collapsed representation retained a NOP.
+                    let absorbed_normal_try_exit = finalize_borrow_empty_blocks
+                        && instruction.pre_fold_extra_instructions() == 0
+                        && !instruction.fusion_policy.is_authored_break()
+                        && next.is_some_and(|next| {
+                            let Item::Instruction(pop) = graph.item(next) else {
+                                return false;
+                            };
+                            pop.opcode == NOP
+                                && pop.fusion_policy.is_converted_pop_block()
+                                && matches!(
+                                    pop.exception_policy(),
+                                    super::super::ExceptionPolicy::AlwaysUnchanged
+                                        | super::super::ExceptionPolicy::AlwaysAbsent
+                                )
+                                && pop.location == instruction.location
+                                && self.exception_owner_provenance.normal_try_exits.iter().any(
+                                    |(entry, end)| {
+                                        *end == target
+                                            && graph[block].items()[..offset]
+                                                .iter()
+                                                .rev()
+                                                .take_while(|item| matches!(item, Item::Label(_)))
+                                                .any(|item| *item == Item::Label(*entry))
+                                    },
+                                )
+                        });
+                    if (!instruction.jump_policy.always_retains_nop() || absorbed_normal_try_exit)
                         && (instruction.location.line < 0
                             || previous_line == Some(instruction.location.line)
                             || next_line == Some(instruction.location.line))

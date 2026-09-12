@@ -1733,6 +1733,110 @@ impl OptimizationPipeline {
         omitted_markers
     }
 
+    /// Keeps a normal cleanup head unlocated when folding removed an original predecessor.
+    ///
+    /// CPython resolves lines before folding constant condition edges. Walk the original
+    /// folded paths from a surviving, reachable source marker while their instructions
+    /// still exist, stopping where they rejoin live code. A folded target alone does not
+    /// prove reachability: lowering can also emit constant loops after terminal try arms.
+    /// Only a located target that cannot be copied before line resolution certifies
+    /// that the converted `POP_BLOCK` had no sole predecessor from which to inherit a line.
+    pub(in crate::assembler) fn preserve_folded_pop_block_locations(&mut self) {
+        if self.folded_predecessor_sources.is_empty() {
+            return;
+        }
+        let reachable = self.graph.reachable_blocks(&self.exception_regions);
+        let order = self.graph.order();
+        let positions = order
+            .iter()
+            .enumerate()
+            .map(|(index, block)| (*block, index))
+            .collect::<FxHashMap<_, _>>();
+        let mut pending = self
+            .folded_predecessor_sources
+            .iter()
+            .filter_map(|&(source, target, location)| {
+                let source = self.graph.label_block(source)?;
+                if !reachable[source.index()] {
+                    return None;
+                }
+                let marker = self.graph[source]
+                    .items()
+                    .iter()
+                    .find_map(|item| match item {
+                        Item::Instruction(instruction) => Some(instruction),
+                        Item::Label(_) => None,
+                    })?;
+                // A removed source marker can leave its label aliased to later live code.
+                // Such an alias no longer certifies the original condition's reachability.
+                if marker.opcode != NOP || marker.location != location {
+                    return None;
+                }
+                self.graph.label_block(target)
+            })
+            .collect::<Vec<_>>();
+        let mut visited = FxHashSet::default();
+        let mut joins = Vec::new();
+        while let Some(block) = pending.pop() {
+            if !visited.insert(block) {
+                continue;
+            }
+            if reachable[block.index()] {
+                joins.push(block);
+                continue;
+            }
+            if block_has_fallthrough(self.graph[block].items())
+                && let Some(next) = order.get(positions[&block] + 1)
+            {
+                pending.push(*next);
+            }
+            if let Some(target) = block_jump_target(self.graph[block].items())
+                && let Some(target) = self.graph.label_block(target)
+            {
+                pending.push(target);
+            }
+        }
+        for block in joins {
+            let instructions = self.graph[block]
+                .items()
+                .iter()
+                .filter_map(|item| match item {
+                    Item::Instruction(instruction) => Some(instruction),
+                    Item::Label(_) => None,
+                })
+                .collect::<Vec<_>>();
+            let Some(first) = instructions.first() else {
+                continue;
+            };
+            if first.opcode != NOP
+                || !first.fusion_policy.is_converted_pop_block()
+                || !matches!(
+                    first.exception_policy(),
+                    ExceptionPolicy::AlwaysUnchanged | ExceptionPolicy::AlwaysAbsent
+                )
+                || first.location != SourceLocation::NONE
+                || first.no_location_policy.preserves_location()
+                || first.pre_fold_extra_instructions() != 0
+                || first.local_policy.hidden_exception_owner_slots() != 0
+                || !instructions
+                    .iter()
+                    .any(|instruction| instruction.location.line >= 0)
+                || (instructions.len() <= 4
+                    && instructions.last().is_some_and(|instruction| {
+                        ends_scope(instruction.opcode) || is_unconditional_jump(instruction.opcode)
+                    }))
+            {
+                continue;
+            }
+            self.graph
+                .instructions_mut(block)
+                .next()
+                .expect("certified converted POP_BLOCK head")
+                .no_location_policy
+                .preserve_location();
+        }
+    }
+
     // CPython resolves locations before removing redundant jump blocks. A later shared entry
     // can therefore retain a line inherited while it still had one predecessor. Capture the
     // original relation before threading, including omitted NOP and folded-slot evidence.

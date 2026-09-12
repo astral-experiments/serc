@@ -2450,12 +2450,14 @@ impl Compiler<'_> {
         self.emit_deferred_implicit_return()
     }
 
-    fn mark_terminal_assignment_implicit_return_boundary(&mut self, body: &[Stmt]) {
-        if matches!(body.last(), Some(Stmt::Assign(_))) {
-            // CPython emits the function's implicit return after compiling the source suite, so
-            // a terminal assignment and that return begin in separate basic blocks. Keep the
-            // boundary so a preceding handler exit does not see their combined four instructions
-            // as a small exit block and copy both onto the cold edge.
+    fn mark_terminal_statement_implicit_return_boundary(&mut self, body: &[Stmt]) {
+        let needs_boundary = matches!(body.last(), Some(Stmt::Assign(_)))
+            || matches!(body.last(), Some(Stmt::Expr(expression))
+                if matches!(expression.value.as_ref(), Expr::Call(_)));
+        if needs_boundary {
+            // CPython emits the implicit return in the enclosing if's separate join block.
+            // Keep that original boundary when terminal lowering distributes the return into
+            // a branch, so an incoming jump cannot copy an assignment or call with the footer.
             let implicit_return = self.assembler.label();
             self.assembler.mark(implicit_return);
         }
@@ -3047,7 +3049,7 @@ impl Compiler<'_> {
                         self.assembler
                             .set_location(self.source_location(condition_fallthrough_range(test)));
                     }
-                    self.mark_terminal_assignment_implicit_return_boundary(body);
+                    self.mark_terminal_statement_implicit_return_boundary(body);
                     self.emit_deferred_implicit_return()?;
                 }
                 // The false branch starts its own original instruction array.
@@ -3094,7 +3096,7 @@ impl Compiler<'_> {
                         self.assembler
                             .set_location(self.source_location(statement.range()));
                     }
-                    self.mark_terminal_assignment_implicit_return_boundary(body);
+                    self.mark_terminal_statement_implicit_return_boundary(body);
                     self.emit_deferred_implicit_return()?;
                 }
             }
@@ -10461,6 +10463,7 @@ impl Compiler<'_> {
             self.assembler
                 .set_location(self.source_location(statement.test.range()));
             self.emit(NOP, 0, 0)?;
+            self.assembler.record_folded_predecessor_source(start, end);
             // Folding the test preserves the authored loop body's separate original array.
             let body = self.assembler.label();
             self.assembler.record_exception_owner_block_boundary(body);
@@ -10841,14 +10844,9 @@ impl Compiler<'_> {
                         .last()
                         .is_some_and(|range| *range == statement.range)))
             && condition_jump_target_count(&statement.test, false) == 1
-            // The ordinary-try join can reconstruct its deferred POP_BLOCK.
-            // Manager exit markers follow separate finally and copy rules.
-            && (!self
-                .control
-                .withs
-                .active_with_region_exclusions
-                .is_empty()
-                || !self.assembler.has_authored_forward_break_to(end))
+            // The break and false edge share the original protected-region exit.
+            // Its completed cleanup determines the POP_BLOCK location after copying.
+            && !self.assembler.has_authored_forward_break_to(end)
         {
             let exclusion_start = self.assembler.label();
             self.assembler.mark(exclusion_start);
@@ -13391,24 +13389,30 @@ impl Compiler<'_> {
             if loop_exit_location.is_some()
                 && matches!(normal_exit_suite.last(), Some(Stmt::While(loop_statement))
                     if is_break_only_loop(loop_statement))
-                && self.control.withs.active_with_exits.is_empty()
-                && (self
-                    .control
-                    .statements
-                    .current_statement_followed_by_literal_return
-                    || self
+            {
+                let has_small_return_successor = self.control.withs.active_with_exits.is_empty()
+                    && (self
                         .control
                         .statements
-                        .current_statement_followed_by_name_return
-                    || (!self.control.statements.current_statement_has_following
-                        && self
+                        .current_statement_followed_by_literal_return
+                        || self
                             .control
                             .statements
-                            .inherited_statement_followed_by_small_return))
-            {
-                // Preserve the original POP_BLOCK barrier while the small return is copied.
-                // Larger successors keep the existing loop-break threading provenance.
-                self.assembler.prevent_jump_threading_target(normal_exit);
+                            .current_statement_followed_by_name_return
+                        || (!self.control.statements.current_statement_has_following
+                            && self
+                                .control
+                                .statements
+                                .inherited_statement_followed_by_small_return));
+                if has_small_return_successor {
+                    // Preserve the original POP_BLOCK barrier while the small return is copied.
+                    self.assembler.prevent_jump_threading_target(normal_exit);
+                } else {
+                    // The cleanup stops original borrowed-load routes even when later
+                    // physical threading transfers the break's owner and interrupt check.
+                    self.assembler
+                        .prevent_borrow_jump_threading_target(normal_exit);
+                }
             }
             // Cold-block cleanup removes a shared unlocated exit completely;
             // only a located normal join retains its converted jump as a NOP.
@@ -14375,8 +14379,12 @@ impl Compiler<'_> {
                         && tail.body.iter().all(|statement| match statement {
                             Stmt::If(_) => !tail.body.iter().any(|statement| matches!(statement, Stmt::Assert(_)))
                                 && handler_cleanup_has_runtime_if_join(tail),
+                            Stmt::For(loop_statement)
+                                if suite_terminates(&loop_statement.orelse) => false,
                             Stmt::Try(_) | Stmt::With(_) | Stmt::For(_) | Stmt::While(_)
-                                | Stmt::Match(_) => false,
+                                | Stmt::Match(_) => condition_has_only_runtime_tests(&tail.test)
+                                    && suite_has_normal_fallthrough(&tail.body)
+                                    && !conditional_for_else_cleanup_exit(tail),
                             _ => true,
                         })
             )
@@ -15404,7 +15412,15 @@ impl Compiler<'_> {
             |compiler| {
                 compiler.with_control_counter(
                     |control| &mut control.finally.active_finally_end_blocks,
-                    |compiler| compiler.compile_suite(body),
+                    |compiler| {
+                        // This separate exceptional-finally array can inline its own
+                        // small RERAISE continuation despite an outer protected body.
+                        compiler.with_control_override(
+                            |control| &mut control.exceptions.prevent_try_exit_inlining,
+                            false,
+                            |compiler| compiler.compile_suite(body),
+                        )
+                    },
                 )
             },
         )
@@ -16905,7 +16921,14 @@ impl Compiler<'_> {
                 .exclude_normalized_exception_owner_at(normal_finally_pop_block);
         }
         if terminal && !finalbody_emitted_fallthrough && !suite_terminates(&statement.finalbody) {
-            if let Some(range) = suite_unary_not_fallthrough_range(&statement.finalbody) {
+            if matches!(
+                statement.finalbody.last(),
+                Some(Stmt::For(_) | Stmt::While(_) | Stmt::Match(_))
+            ) {
+                // This return follows the shared normal-finally exit. Preserve the
+                // individual branch donor when a loop break or match arm copies it.
+                self.assembler.set_location(SourceLocation::NONE);
+            } else if let Some(range) = suite_unary_not_fallthrough_range(&statement.finalbody) {
                 self.assembler.set_location(self.source_location(range));
             } else if let Some(statement) = statement
                 .finalbody
@@ -16918,6 +16941,9 @@ impl Compiler<'_> {
                 self.assembler.set_location(location);
             }
             self.emit_implicit_return()?;
+            // CPython copies the footer onto the normal-finally jump, retaining its NOP
+            // until small-exit inlining finishes. Count that original slot on this copy.
+            self.assembler.add_last_inlined_jump_slot();
         } else if !terminal {
             let conditional_exit =
                 statement
@@ -17250,9 +17276,12 @@ impl Compiler<'_> {
                 self.compile_exceptional_finally_suite(&statement.finalbody)?;
             }
             if !suite_terminates(&statement.finalbody) {
-                if matches!(statement.finalbody.last(), Some(Stmt::If(_))) {
-                    // CPython leaves the shared exceptional exit unlocated so CFG predecessor
-                    // propagation assigns the owning arm and can remove pass-only exits.
+                if matches!(
+                    statement.finalbody.last(),
+                    Some(Stmt::If(_) | Stmt::For(_) | Stmt::While(_) | Stmt::Match(_))
+                ) {
+                    // CPython leaves the shared exceptional exit unlocated. Each incoming
+                    // branch, including a loop break, supplies the copied exit's location.
                     self.assembler.set_location(SourceLocation::NONE);
                 } else if let Some(range) = suite_unary_not_fallthrough_range(&statement.finalbody)
                 {
@@ -18025,7 +18054,7 @@ impl Compiler<'_> {
         self.assembler
             .set_location(self.source_location(item.context_expr.range()));
         let none = self.add_constant(Constant::None)?;
-        if !suite_terminates(body) || !remaining.is_empty() {
+        if !suite_terminates_before_constant_folding(body) || !remaining.is_empty() {
             self.emit(LOAD_CONST, none, 1)?;
             self.emit(LOAD_CONST, none, 1)?;
             self.emit(LOAD_CONST, none, 1)?;
@@ -19803,9 +19832,7 @@ fn with_body_ends_in_retained_pop_block(body: &[Stmt], direct_body: bool) -> boo
         }
         Some(Stmt::Try(statement)) => {
             if statement.finalbody.is_empty() {
-                !suite_terminates(&statement.body)
-                    && !matches!(statement.body.last(), Some(Stmt::If(_)))
-                    && try_normal_exit_predecessors(statement) == 1
+                !suite_terminates(&statement.body) && try_normal_exit_predecessors(statement) == 1
             } else {
                 // A handler can reach the finalizer after the protected body terminates.
                 // Keep the manager's POP_BLOCK at the finalizer join, after its cold handlers.

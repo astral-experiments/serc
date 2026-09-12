@@ -98,3 +98,75 @@ fn matches_cpython_match_nested_branch_markers() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_while_break_borrow_routes() {
+    for (filename, source) in [
+        (
+            "while_break_large_borrow_route.py",
+            r"def f(step, done, value, consume):
+    try:
+        while True:
+            step()
+            if done():
+                break
+    except OSError:
+        return None
+    consume(value)
+    return value
+",
+        ),
+        (
+            "while_break_manager_borrow_route.py",
+            r"async def f(manager, poll):
+    async with manager:
+        try:
+            while True:
+                value = await poll()
+                if value is not None:
+                    break
+        except OSError:
+            return None
+    return value
+",
+        ),
+        (
+            "while_break_loop_suffix_borrow_route.py",
+            r"def f(step, done, value):
+    try:
+        while True:
+            step()
+            if done():
+                break
+    except OSError:
+        return None
+    result: list = []
+    for item in value:
+        result.append(item)
+    return result
+",
+        ),
+        (
+            "while_break_named_retry_route_control.py",
+            r"def f(ready, other, step, finish, result):
+    try:
+        while True:
+            step()
+            if ready() or other():
+                break
+    except RuntimeError as error:
+        try:
+            while True:
+                step()
+                if ready() or other():
+                    break
+        except ValueError as retry_error:
+            step()
+    finish(result)
+    return result
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

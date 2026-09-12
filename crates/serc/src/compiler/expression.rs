@@ -7446,6 +7446,8 @@ impl Compiler<'_> {
                 let exclusion_start = self.assembler.label();
                 self.assembler.mark(exclusion_start);
                 self.emit(NOP, 0, 0)?;
+                self.assembler
+                    .record_folded_predecessor_source(exclusion_start, label);
                 if empty_folded_block {
                     // Removing the sole folded condition empties its original array.
                     // A retained line NOP still permits borrowing through that array.

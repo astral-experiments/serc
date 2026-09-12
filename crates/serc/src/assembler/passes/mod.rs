@@ -262,6 +262,7 @@ impl Assembler {
                 .union(&self.folded_away_loop_else_targets)
                 .copied()
                 .collect(),
+            folded_predecessor_sources: self.folded_predecessor_sources,
             discarded_fold_admissions: self.discarded_fold_admissions,
             initial_reachable,
             next_label: self.next_label,
@@ -338,6 +339,7 @@ impl OptimizationPipeline {
         original_owners.retain_pipeline(&self);
         self.prepare_original_conditional_jump_targets();
         original_owners.retain_pipeline(&self);
+        self.preserve_folded_pop_block_locations();
         let assertion_side_exits = self.has_only_assertion_side_exits();
         let mut removed_max_depth = if assertion_side_exits {
             None

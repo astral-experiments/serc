@@ -285,6 +285,7 @@ fn jump_policy_defaults_are_explicit() {
     assert!(policy.inline_small_exit());
     assert_eq!(policy.retained_nop(), RetainedJumpNop::None);
     assert!(policy.allows_threading_target());
+    assert!(policy.allows_borrow_threading_target());
     assert!(!policy.defers_redundant_removal());
     assert!(!policy.preserves_nop_after_threading());
 }
@@ -310,6 +311,9 @@ fn jump_policy_fusion_is_exhaustive() {
         if bits & 8 != 0 {
             policy.preserve_nop_after_threading_for_test();
         }
+        if bits & 16 == 0 {
+            policy.prevent_borrow_threading_target();
+        }
         policy
     }
 
@@ -318,8 +322,8 @@ fn jump_policy_fusion_is_exhaustive() {
         RetainedJumpNop::DirectTarget,
         RetainedJumpNop::Always,
     ];
-    for first_bits in 0..16 {
-        for second_bits in 0..16 {
+    for first_bits in 0..32 {
+        for second_bits in 0..32 {
             for first_retained in retained_nops {
                 for second_retained in retained_nops {
                     let first = policy(first_bits, first_retained);
@@ -336,7 +340,11 @@ fn jump_policy_fusion_is_exhaustive() {
                             | (u8::from(
                                 first.preserves_nop_after_threading()
                                     || second.preserves_nop_after_threading(),
-                            ) << 3);
+                            ) << 3)
+                            | (u8::from(
+                                first.allows_borrow_threading_target()
+                                    && second.allows_borrow_threading_target(),
+                            ) << 4);
                     assert_eq!(
                         JumpPolicy::fused(first, second),
                         policy(expected_bits, RetainedJumpNop::None)

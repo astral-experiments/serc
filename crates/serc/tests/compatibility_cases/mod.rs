@@ -174,9 +174,11 @@ mod nested_while_branch_exits;
 mod non_final_loop_branch_assert_location_compatibility;
 mod non_final_try_loop_backedges;
 mod normal_finally_join_owners;
+mod normal_finally_pop_locations;
 mod normal_finally_with_exit_owner;
 mod normal_handler_cleanup_copies;
 mod normal_try_loop_tail_owners;
+mod normal_try_manager_pop_owners;
 mod optimized_generator_loop_dispatch_owners;
 mod optimized_tuple_guard_owner_compatibility;
 mod ordinary_condition_owner_slots;
@@ -435,4 +437,10 @@ mod shared_normal_exit_markers;
 
 mod loop_cleanup_regressions;
 
+mod copied_exit_regressions;
+mod shared_cleanup_positions;
+
 mod match_exit_copy_budget;
+
+mod nested_exit_regression_controls;
+mod original_cleanup_provenance;

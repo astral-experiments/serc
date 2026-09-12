@@ -2714,7 +2714,7 @@ def nested_finally_break(manager, active, stop):
         .compile_module(parsed.suite())
         .unwrap();
 
-    for (name, expected_nops) in [("protected_break", 2), ("nested_finally_break", 3)] {
+    for (name, expected_nops) in [("protected_break", 2), ("nested_finally_break", 2)] {
         let function = module
             .constants
             .iter()
