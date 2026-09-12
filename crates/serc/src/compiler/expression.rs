@@ -681,6 +681,14 @@ impl Compiler<'_> {
                         } else if self.assembler.instruction_count() == body_start + 1
                             && !previous_instruction_covers_branch
                             && !matches!(self.unit.scope, Scope::Class { .. })
+                            // A refutable pass arm before a default still owns a real JUMP.
+                            // At a loop tail it must thread to the backedge; retaining its
+                            // removed-jump NOP would leave a forward bridge.
+                            && !(has_default
+                                && case.guard.is_none()
+                                && matches!(case.pattern, Pattern::MatchValue(_))
+                                && matches!(case.body.as_slice(), [Stmt::Pass(_)])
+                                && self.control.falls_through_to_loop_backedge())
                         {
                             self.assembler.preserve_inlined_jump_nop(success_exit);
                             // CPython keeps this retained success-exit NOP on the physical

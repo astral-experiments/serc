@@ -56,3 +56,27 @@ fn preserves_live_entries_around_folded_false_statements() {
         }
     }
 }
+
+#[test]
+fn preserves_empty_join_after_runtime_or_true_branch() {
+    for condition in [
+        "flag or True",
+        "flag != other or True",
+        "flag or other or True",
+    ] {
+        let source = format!(
+            "def function(flag, other, value, consume):\n    if {condition}:\n        consume(value)\n    else:\n        consume(other)\n    consume(value)\n    if flag:\n        consume(other)\n    consume(value)\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "runtime_or_true_join.py");
+    }
+}
+
+#[test]
+fn preserves_runtime_or_join_controls() {
+    for condition in ["flag or other", "flag or False", "flag and True"] {
+        let source = format!(
+            "def function(flag, other, value, consume):\n    if {condition}:\n        consume(value)\n    else:\n        consume(other)\n    consume(value)\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "runtime_or_join_control.py");
+    }
+}

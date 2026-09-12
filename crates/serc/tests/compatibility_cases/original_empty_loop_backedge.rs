@@ -190,3 +190,77 @@ fn shared_original_for_return_backedges_keep_threading() {
         "compound_conditional_return.py",
     );
 }
+
+#[test]
+fn final_value_match_pass_threads_to_loop_backedge() {
+    for (name, prefix) in [("sync", "def"), ("async", "async def")] {
+        let source = format!(
+            "{prefix} f(items):\n    for item in items:\n        match item:\n            case 1:\n                use(item)\n            case 2:\n                pass\n            case _:\n                fallback(item)\n    return None\n",
+        );
+        common::assert_matches_cpython_marshal(&source, &format!("match_pass_{name}.py"));
+    }
+}
+
+#[test]
+fn match_pass_backedge_preserves_other_case_exits() {
+    for (name, arms, after) in [
+        (
+            "nonterminal",
+            "case 2:\n    pass\ncase _:\n    fallback(item)",
+            "        after(item)\n",
+        ),
+        ("no_default", "case 2:\n    pass", ""),
+        (
+            "copied_subject",
+            "case 1:\n    pass\ncase 2:\n    use(item)\ncase _:\n    fallback(item)",
+            "",
+        ),
+        (
+            "nonempty",
+            "case 2:\n    use(item)\ncase _:\n    fallback(item)",
+            "",
+        ),
+    ] {
+        let arms = arms
+            .lines()
+            .flat_map(|line| ["            ", line, "\n"])
+            .collect::<String>();
+        let source = format!(
+            "def f(items):\n    for item in items:\n        match item:\n{arms}{after}    return None\n"
+        );
+        common::assert_matches_cpython_marshal(&source, &format!("match_pass_control_{name}.py"));
+    }
+}
+
+#[test]
+fn retained_try_condition_after_inlined_comprehensions() {
+    for prefix in [
+        "counts = {key: factory() for key in keys}\n    other = {key: factory() for key in keys}\n    output = None",
+        "counts = {}\n    other = {}\n    output = None",
+    ] {
+        let source = format!(
+            "def f(keys, dry_run):\n    {prefix}\n    try:\n        if not dry_run:\n            prepare()\n        work(counts, other)\n    finally:\n        if output is not None:\n            output.close()\n",
+        );
+        common::assert_matches_cpython_marshal(&source, "retained_try_after_comprehensions.py");
+    }
+}
+
+#[test]
+fn async_retained_try_condition_after_straight_line_prefix() {
+    common::assert_matches_cpython_marshal(
+        r"async def f(flag, client):
+    previous = None
+    options = {'enabled': True}
+    try:
+        if flag:
+            await client.update(options)
+        else:
+            await client.create(options)
+    except Exception:
+        await client.rollback(previous)
+        raise
+    return options
+",
+        "async_retained_try_after_prefix.py",
+    );
+}

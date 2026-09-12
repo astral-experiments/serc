@@ -3852,3 +3852,82 @@ fn terminal_handler_borrow_all_live_handlers() {
         "terminal_handler_borrow_all_live_handlers.py",
     );
 }
+
+#[test]
+fn terminal_if_return_false_edge_reaches_normal_finally() {
+    for handler in [
+        "except Error:\n            pass",
+        "except Error as error:\n            recover(error)",
+    ] {
+        for cleanup in [
+            "sink.close()",
+            "if sink is not None:\n                sink.close()",
+        ] {
+            let source = format!(
+                "def f(sink, expected):\n    while ready():\n        try:\n            result = work()\n            if result == expected:\n                return\n        {handler}\n        finally:\n            {cleanup}\n        again()\n",
+            );
+            common::assert_matches_cpython_marshal(&source, "terminal_if_return_finally.py");
+        }
+    }
+}
+
+fn check_terminal_if_return_finally_condition(condition: &str) {
+    let source = format!(
+        "def f(sink, left, right):\n    try:\n        if {condition}:\n            return\n    except Error:\n        pass\n    finally:\n        sink.close()\n    again(sink)\n",
+    );
+    common::assert_matches_cpython_marshal(&source, "terminal_if_return_finally_control.py");
+}
+
+#[test]
+fn terminal_if_return_finally_shared_condition_control() {
+    check_terminal_if_return_finally_condition("left and right");
+}
+
+#[test]
+fn terminal_if_return_finally_single_false_edge_condition_control() {
+    check_terminal_if_return_finally_condition("left or right");
+}
+
+#[test]
+fn terminal_if_return_finally_folded_condition_control() {
+    check_terminal_if_return_finally_condition("left and True");
+}
+
+#[test]
+fn conditional_recovery_reaches_linear_finally_entry_before_branch() {
+    for prefix in ["", "async "] {
+        for leading in ["elapsed = clock() - started", "sink.record(value)"] {
+            let source = format!(
+                "{prefix}def f(sink, value, suppress, started):\n    try:\n        work(value)\n    except Error as error:\n        recover(error)\n        if not suppress:\n            raise\n    finally:\n        {leading}\n        if value is not None:\n            sink.close(value)\n    after(sink)\n",
+            );
+            common::assert_matches_cpython_marshal(
+                &source,
+                "conditional_recovery_finally_entry.py",
+            );
+        }
+    }
+}
+
+fn check_conditional_recovery_cleanup_entry(cleanup: &str) {
+    let source = format!(
+        "def f(sink, value, suppress):\n    try:\n        work(value)\n    except Error as error:\n        recover(error)\n        if not suppress:\n            raise\n    finally:\n        {cleanup}\n    after(sink)\n",
+    );
+    common::assert_matches_cpython_marshal(
+        &source,
+        "conditional_recovery_finally_entry_control.py",
+    );
+}
+
+#[test]
+fn conditional_recovery_preserves_leading_pass_cleanup_entry() {
+    check_conditional_recovery_cleanup_entry(
+        "pass\n        if value:\n            sink.close(value)",
+    );
+}
+
+#[test]
+fn conditional_recovery_preserves_abrupt_cleanup_entry() {
+    check_conditional_recovery_cleanup_entry(
+        "sink.record(value)\n        if value:\n            return value",
+    );
+}

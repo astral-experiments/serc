@@ -7606,7 +7606,33 @@ impl Compiler<'_> {
                         }
                         branch_exit
                     };
-                    if branch_index == 0 && first_branch_is_always_true {
+                    let folded_or_true_exit = branch_index == 0
+                        && matches!(self.unit.scope, Scope::Function { .. })
+                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                            == 0
+                        && self.control.loops.contexts.is_empty()
+                        && self.control.withs.active_with_exits.is_empty()
+                        && self
+                            .control
+                            .exceptions
+                            .active_exception_region_exclusions
+                            .is_empty()
+                        && !self.control.in_exception_handler()
+                        && self.control.finally.active_finally_try_bodies == 0
+                        && self.control.finally.active_normal_finally_bodies == 0
+                        && self.control.finally.active_finally_end_blocks == 0
+                        && self.control.finally.active_copied_finally_bodies == 0
+                        && matches!(statement.elif_else_clauses.as_slice(), [clause]
+                            if clause.test.is_none())
+                        && suite_has_linear_borrow_fallthrough(body)
+                        && matches!(test, Expr::BoolOp(boolean)
+                        if boolean.op == BoolOp::Or
+                            && boolean.values.split_last().is_some_and(|(last, leading)| {
+                                jump_constant_truthiness(last) == Some(true)
+                                    && !leading.is_empty()
+                                    && leading.iter().all(condition_has_only_runtime_tests)
+                            }));
+                    if (branch_index == 0 && first_branch_is_always_true) || folded_or_true_exit {
                         // Later arms are discarded, leaving the same empty original join
                         // as the simple constant-true branch with an else suite.
                         self.assembler.mark_folded_condition_exit(branch_exit);
@@ -12380,7 +12406,7 @@ impl Compiler<'_> {
                                 .iter()
                                 .any(|statement| matches!(statement, Stmt::Try(_)))
                             && matches!(nested.test.as_ref(), Expr::BoolOp(_))
-                            && condition_jump_target_count(&nested.test, false) > 1
+                            && !original_condition_has_unique_jump_target(&nested.test, false)
                             && !expression_contains_chained_comparison(&nested.test)
                 );
             let unlocated_direct_exit_before_break =
@@ -15166,6 +15192,19 @@ impl Compiler<'_> {
         // handlers move. Short-circuit cleanup tests retain nonempty runtime entries.
         let synchronous_recovery =
             self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0;
+        // A separately located leading pass remains a NOP at the original
+        // cleanup entry. The following conditional uses the same recovery route.
+        let conditional_handler_cleanup = match statement.finalbody.as_slice() {
+            [pass @ Stmt::Pass(_), conditional @ Stmt::If(_)]
+                if self.source_location(pass.range()).line
+                    != self.source_location(conditional.range()).line =>
+            {
+                &statement.finalbody[1..]
+            }
+            _ => statement.finalbody.as_slice(),
+        };
+        // A later simple conditional return does not empty a preceding linear
+        // entry; borrowed-load traversal follows both of its live successors.
         let conditional_handler_reaches_finally = !statement.is_star
             && statement.orelse.is_empty()
             && self.control.withs.active_with_region_exclusions.is_empty()
@@ -15176,8 +15215,19 @@ impl Compiler<'_> {
                 statement.body.last(),
                 Some(Stmt::If(_) | Stmt::Try(_) | Stmt::While(_) | Stmt::With(_))
             )
-            && (suite_has_linear_borrow_fallthrough(&statement.finalbody)
-                || matches!(statement.finalbody.as_slice(), [Stmt::If(cleanup)]
+            && ((statement.finalbody.first().is_some_and(|entry| {
+                suite_has_linear_borrow_fallthrough(std::slice::from_ref(entry))
+            }) && (!suite_contains_abrupt_control_flow(&statement.finalbody)
+                || matches!(statement.finalbody.as_slice(), [_, Stmt::If(cleanup)]
+                if condition_has_only_runtime_tests(&cleanup.test)
+                    && !expression_contains_inline_branch(&cleanup.test)
+                    && cleanup.elif_else_clauses.is_empty()
+                    && matches!(cleanup.body.as_slice(), [Stmt::Return(return_)]
+                        if return_.value.as_deref().is_none_or(|value| {
+                            !expression_contains_inline_branch(value)
+                        })))))
+                || suite_has_linear_borrow_fallthrough(&statement.finalbody)
+                || matches!(conditional_handler_cleanup, [Stmt::If(cleanup)]
                 if condition_has_only_runtime_tests(&cleanup.test)
                     && (!expression_contains_inline_branch(&cleanup.test)
                         || (synchronous_recovery
@@ -15211,6 +15261,39 @@ impl Compiler<'_> {
                         })
                 })
             });
+        // A single false edge around a terminal return keeps a located normal
+        // try exit. Unlike a shared conditional join, removing that exit does not
+        // leave an empty block between the condition and ordinary recovery cleanup.
+        let terminal_if_false_edge_reaches_finally = !statement.is_star
+            && statement.orelse.is_empty()
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && self.control.withs.active_with_region_exclusions.is_empty()
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+            && !statement.handlers.is_empty()
+            && statement.handlers.iter().all(|handler| {
+                handler.as_except_handler().is_some_and(|handler| {
+                    handler.type_.is_some()
+                        && (handler
+                            .body
+                            .iter()
+                            .all(|statement| matches!(statement, Stmt::Pass(_)))
+                            || suite_has_linear_borrow_fallthrough(&handler.body))
+                })
+            })
+            && (suite_has_linear_borrow_fallthrough(&statement.finalbody)
+                || matches!(statement.finalbody.as_slice(), [Stmt::If(cleanup)]
+                    if condition_has_only_runtime_tests(&cleanup.test)
+                        && !expression_contains_inline_branch(&cleanup.test)
+                        && cleanup.elif_else_clauses.is_empty()
+                        && suite_has_linear_borrow_fallthrough(&cleanup.body)))
+            && matches!(statement.body.last(), Some(Stmt::If(conditional))
+                if condition_has_only_runtime_tests(&conditional.test)
+                    && condition_has_linear_runtime_leaves(&conditional.test)
+                    && original_condition_has_unique_jump_target(&conditional.test, false)
+                    && conditional.elif_else_clauses.is_empty()
+                    && matches!(conditional.body.as_slice(), [Stmt::Return(_)]));
         let normal_finally_is_borrow_reachable = (simple_fallthrough_handlers_reach_finally
             || compound_fallthrough_handlers_reach_finally
             || runtime_while_handlers_reach_finally)
@@ -15219,7 +15302,8 @@ impl Compiler<'_> {
             || raising_alternative_reaches_finally
             || conditional_break_reaches_finally
             || inner_try_break_loop_range.is_some()
-            || conditional_handler_reaches_finally;
+            || conditional_handler_reaches_finally
+            || terminal_if_false_edge_reaches_finally;
         let for_break_reaches_finally = !statement.handlers.is_empty()
             && !normal_finally_is_borrow_reachable
             && !statement.is_star

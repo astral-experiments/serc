@@ -1924,19 +1924,47 @@ impl LayoutAssembler {
                             // Exact early compaction can reach the unprotected records before
                             // the first SETUP. Exclude any earlier protected origin, including an
                             // empty region removed after its original SETUP was recorded.
-                            proven_unprotected_slot = self
-                                .exception_owner_provenance
-                                .setups
-                                .first()
-                                .is_some_and(|(first, _)| *first == setup_label)
-                                && owner_history_exact
+                            proven_unprotected_slot = owner_history_exact
                                 && tail.post_compaction_fusions == 0
                                 && stale_slots > protected_original_instructions
-                                && !self.exception_regions.iter().any(|region| {
-                                    label_positions
-                                        .get(&region.start)
-                                        .is_some_and(|position| *position < start)
-                                });
+                                && {
+                                    let first_unprotected_setup = self
+                                        .exception_owner_provenance
+                                        .setups
+                                        .first()
+                                        .is_some_and(|(first, _)| *first == setup_label)
+                                        && !self.exception_regions.iter().any(|region| {
+                                            label_positions
+                                                .get(&region.start)
+                                                .is_some_and(|position| *position < start)
+                                        });
+                                    // Earlier arrays cannot supply this array's stale records.
+                                    // A later SETUP has the same NULL prefix when no protected
+                                    // region or removed SETUP precedes it in this original array.
+                                    let unprotected_array_prefix =
+                                        original_array_start < start
+                                            && !self.exception_owner_provenance.setups.iter().any(
+                                                |(label, _)| {
+                                                    *label != setup_label
+                                                        && label_positions.get(label).is_none_or(
+                                                            |position| {
+                                                                original_array_start <= *position
+                                                                    && *position < start
+                                                            },
+                                                        )
+                                                },
+                                            )
+                                            && !self.exception_regions.iter().any(|region| match (
+                                                label_positions.get(&region.start),
+                                                label_positions.get(&region.end),
+                                            ) {
+                                                (Some(begin), Some(end)) => {
+                                                    *begin < start && *end > original_array_start
+                                                }
+                                                _ => true,
+                                            });
+                                    first_unprotected_setup || unprotected_array_prefix
+                                };
                         }
                         owners.insert(
                             instruction_index,
