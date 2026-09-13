@@ -184,3 +184,23 @@ fn preserves_fusion_owner_without_global_call_compaction() {
 ";
     common::assert_matches_cpython_marshal(source, "value_match_local_fusion_owner.py");
 }
+
+#[test]
+fn preserves_fresh_manager_singleton_arrays_and_other_identity_tests() {
+    for (filename, source) in [
+        (
+            "match_bool_in_with.py",
+            "def f(manager, subject):\n    with manager:\n        match subject:\n            case (False, error):\n                return error\n            case (True, result, name):\n                pass\n            case _:\n                raise ValueError()\n        return result\n",
+        ),
+        (
+            "integer_singleton_manager_control.py",
+            "def f(manager, subject):\n    with manager:\n        match subject:\n            case (0, error):\n                return error\n            case (1, result, name):\n                pass\n            case _:\n                raise ValueError()\n        return result\n",
+        ),
+        (
+            "identity_condition_manager_control.py",
+            "def f(manager, subject):\n    with manager:\n        if subject is False:\n            return 0\n        elif subject is True:\n            return 1\n        return 2\n",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

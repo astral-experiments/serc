@@ -182,6 +182,7 @@ mod normal_try_manager_pop_owners;
 mod optimized_generator_loop_dispatch_owners;
 mod optimized_tuple_guard_owner_compatibility;
 mod ordinary_condition_owner_slots;
+mod original_array_exit_copies;
 mod overriding_finally_return_compatibility;
 mod post_async_with_condition_owner_compatibility;
 mod postponed_annotation_string_compatibility;
@@ -441,6 +442,8 @@ mod copied_exit_regressions;
 mod shared_cleanup_positions;
 
 mod match_exit_copy_budget;
+
+mod normal_finally_original_edges;
 
 mod nested_exit_regression_controls;
 mod original_cleanup_provenance;

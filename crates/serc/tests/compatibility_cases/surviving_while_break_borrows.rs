@@ -29,3 +29,88 @@ fn matches_cpython_borrows_after_surviving_while_breaks() {
         }
     }
 }
+
+#[test]
+fn matches_cpython_borrows_after_protected_surviving_while_breaks() {
+    for (filename, source) in [
+        (
+            "protected_early_break_continue_call.py",
+            r"def collect(reader):
+    items = []
+    try:
+        while True:
+            ready, item = reader.read()
+            if not ready:
+                if reader.done():
+                    break
+                continue
+            items.append(item)
+            if reader.done():
+                break
+        count = reader.finish(items)
+    finally:
+        reader.close()
+    return count
+",
+        ),
+        (
+            "protected_no_early_break_continue_call.py",
+            r"def collect(reader):
+    items = []
+    try:
+        while True:
+            ready, item = reader.read()
+            if not ready:
+                continue
+            items.append(item)
+            if reader.done():
+                break
+        count = reader.finish(items)
+    finally:
+        reader.close()
+    return count
+",
+        ),
+        (
+            "protected_early_break_no_continue_call.py",
+            r"def collect(reader):
+    items = []
+    try:
+        while True:
+            ready, item = reader.read()
+            if not ready:
+                if reader.done():
+                    break
+            items.append(item)
+            if reader.done():
+                break
+        count = reader.finish(items)
+    finally:
+        reader.close()
+    return count
+",
+        ),
+        (
+            "protected_early_break_continue_call_async.py",
+            r"async def collect(reader):
+    items = []
+    try:
+        while True:
+            ready, item = reader.read()
+            if not ready:
+                if reader.done():
+                    break
+                continue
+            items.append(item)
+            if reader.done():
+                break
+        count = reader.finish(items)
+    finally:
+        reader.close()
+    return count
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

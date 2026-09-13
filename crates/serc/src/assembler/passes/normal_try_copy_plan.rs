@@ -18,6 +18,10 @@ pub(super) enum OriginalTail {
         // Authored return marker, LOAD_CONST, RETURN_VALUE.
         located: [bool; 3],
     },
+    LocalTupleReturn {
+        // Two unfused local loads, BUILD_TUPLE, RETURN_VALUE.
+        located: [bool; 4],
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -127,7 +131,9 @@ pub(super) fn plan_normal_try_copies(nodes: &[OriginalNode]) -> Option<CopyResul
             }
             match nodes[current].tail {
                 OriginalTail::Jump { target, .. } => current = index_of(target)?,
-                OriginalTail::ConstantReturn { .. } => break,
+                OriginalTail::ConstantReturn { .. } | OriginalTail::LocalTupleReturn { .. } => {
+                    break;
+                }
             }
         }
     }
@@ -174,6 +180,28 @@ pub(super) fn plan_normal_try_copies(nodes: &[OriginalNode]) -> Option<CopyResul
                 for (kind, located) in [SlotKind::Nop, SlotKind::LoadConst, SlotKind::ReturnValue]
                     .into_iter()
                     .zip(located)
+                {
+                    slots.push(Slot {
+                        kind,
+                        located,
+                        #[cfg(test)]
+                        origin: SlotOrigin {
+                            node: node.id,
+                            slot: slots.len(),
+                        },
+                    });
+                }
+                None
+            }
+            OriginalTail::LocalTupleReturn { located } => {
+                for (kind, located) in [
+                    SlotKind::Other,
+                    SlotKind::Other,
+                    SlotKind::Other,
+                    SlotKind::ReturnValue,
+                ]
+                .into_iter()
+                .zip(located)
                 {
                     slots.push(Slot {
                         kind,
@@ -333,6 +361,45 @@ mod tests {
             tail: OriginalTail::ConstantReturn { located: [true; 3] },
         });
         nodes
+    }
+
+    #[test]
+    fn tuple_return_growth_retains_the_earlier_jump() {
+        let mut nodes = (0..3)
+            .map(|id| OriginalNode {
+                id,
+                prefix: Vec::new(),
+                tail: OriginalTail::Jump {
+                    target: id + 1,
+                    located: false,
+                    interruptible: false,
+                },
+            })
+            .collect::<Vec<_>>();
+        nodes[0].prefix = vec![
+            PrefixSlot {
+                is_nop: false,
+                located: true,
+            };
+            2
+        ];
+        nodes.push(OriginalNode {
+            id: 3,
+            prefix: Vec::new(),
+            tail: OriginalTail::LocalTupleReturn { located: [true; 4] },
+        });
+        let result = plan_normal_try_copies(&nodes).unwrap();
+        assert_eq!(
+            result
+                .steps
+                .iter()
+                .map(|step| (step.round, step.source, step.target, step.target_width))
+                .collect::<Vec<_>>(),
+            [(1, 0, 1, 1), (1, 1, 2, 1), (1, 2, 3, 4), (2, 1, 3, 4)]
+        );
+        assert_eq!(result.plans[0].final_target, Some(2));
+        assert_eq!(result.plans[2].final_slots.len(), 5);
+        assert_eq!(result.plans[1].final_slots.len(), 6);
     }
 
     #[test]

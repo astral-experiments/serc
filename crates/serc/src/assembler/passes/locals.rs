@@ -42,9 +42,12 @@ pub(in crate::assembler) struct BorrowEntryLabels<'a> {
     pub(super) authored_finally_break_entries: &'a AuthoredFinallyBreakEntries,
 }
 
-/// An original direct jump and its nonempty normal-finally destination.
+/// An original direct source and its nonempty normal-finally destination.
 pub(super) struct RetainedFinallyOrigin {
     source_labels: Vec<Label>,
+    // Empty for a retained jump NOP; otherwise this complete prefix must survive
+    // unchanged after the ordinary jump disappears.
+    source_prefix: Vec<Instruction>,
     target_labels: Vec<Label>,
     target: Label,
     jump_location: crate::assembler::SourceLocation,
@@ -240,21 +243,74 @@ impl OptimizationPipeline {
                     return None;
                 };
                 if jump.opcode != crate::target::opcodes::JUMP_FORWARD
-                    || jump.jump_policy.retained_nop()
-                        != crate::assembler::ir::RetainedJumpNop::DirectTarget
                     || jump.jump_policy.borrow_empty_block()
                     || jump.no_location_policy.borrow_fallthrough() != BorrowFallthrough::Reachable
-                    || jump.location.line < 0
                 {
                     return None;
                 }
-                let source_labels = leading
+                let source_label_count = leading
+                    .iter()
+                    .take_while(|item| matches!(item, Item::Label(_)))
+                    .count();
+                let source_labels = leading[..source_label_count]
                     .iter()
                     .map(|item| match item {
-                        Item::Label(label) => Some(*label),
-                        Item::Instruction(_) => None,
+                        Item::Label(label) => *label,
+                        Item::Instruction(_) => unreachable!(),
                     })
-                    .collect::<Option<Vec<_>>>()?;
+                    .collect::<Vec<_>>();
+                let mut source_prefix = Vec::new();
+                for item in &leading[source_label_count..] {
+                    let Item::Instruction(instruction) = item else {
+                        return None;
+                    };
+                    // CPython removes these recorded POP_BLOCK slots before borrowing.
+                    // Their disappearance does not empty a source whose complete live
+                    // prefix survives. Arbitrary or explicitly retained NOPs are excluded.
+                    if instruction.opcode == NOP
+                        && instruction.operand() == Operand::Value(0)
+                        && instruction.fusion_policy.is_converted_pop_block()
+                        && instruction.exception_policy()
+                            == crate::assembler::ExceptionPolicy::EXCLUDE_ALWAYS
+                        && instruction.jump_policy.retained_nop()
+                            == crate::assembler::ir::RetainedJumpNop::None
+                        && !instruction.jump_policy.preserves_explicit_nop()
+                        && !instruction.jump_policy.borrow_empty_block()
+                        && !instruction.no_location_policy.preserves_location()
+                        && instruction.no_location_policy.borrow_fallthrough()
+                            == BorrowFallthrough::Reachable
+                    {
+                        continue;
+                    }
+                    if matches!(instruction.opcode, NOP | NOT_TAKEN)
+                        || !matches!(instruction.operand(), Operand::Value(_))
+                        || ends_scope(instruction.opcode)
+                        || instruction.jump_policy.borrow_empty_block()
+                        || instruction.no_location_policy.borrow_fallthrough()
+                            != BorrowFallthrough::Reachable
+                    {
+                        return None;
+                    }
+                    source_prefix.push(*instruction);
+                }
+                // A source containing only removed POP_BLOCKs is still an empty array.
+                if source_label_count != leading.len() && source_prefix.is_empty() {
+                    return None;
+                }
+                if source_prefix.is_empty() {
+                    if jump.jump_policy.retained_nop()
+                        != crate::assembler::ir::RetainedJumpNop::DirectTarget
+                        || jump.location.line < 0
+                    {
+                        return None;
+                    }
+                } else if jump.fusion_policy.is_authored_break()
+                    || !jump.jump_policy.allows_borrow_threading_target()
+                    || jump.jump_policy.retained_nop()
+                        != crate::assembler::ir::RetainedJumpNop::None
+                {
+                    return None;
+                }
                 let Operand::Forward(target) = jump.operand() else {
                     return None;
                 };
@@ -335,6 +391,7 @@ impl OptimizationPipeline {
                 }
                 Some(RetainedFinallyOrigin {
                     source_labels,
+                    source_prefix,
                     target_labels,
                     target,
                     jump_location: jump.location,
@@ -344,7 +401,7 @@ impl OptimizationPipeline {
             .collect()
     }
 
-    /// Keeps only retained NOP edges whose original source and target arrays survive.
+    /// Keeps only original normal edges whose source and target arrays survive.
     pub(super) fn retained_finally_entries(
         &self,
         origins: &[RetainedFinallyOrigin],
@@ -380,19 +437,43 @@ impl OptimizationPipeline {
                 continue;
             }
             let mut cursor = start + origin.source_labels.len();
-            let Some(Item::Instruction(nop)) = items.get(cursor) else {
-                continue;
-            };
-            if nop.opcode != NOP
-                || nop.location != origin.jump_location
-                || nop.jump_policy.retained_nop()
-                    != crate::assembler::ir::RetainedJumpNop::DirectTarget
-                || nop.jump_policy.borrow_empty_block()
-                || nop.no_location_policy.borrow_fallthrough() != BorrowFallthrough::Reachable
-            {
-                continue;
+            if origin.source_prefix.is_empty() {
+                let Some(Item::Instruction(nop)) = items.get(cursor) else {
+                    continue;
+                };
+                if nop.opcode != NOP
+                    || nop.location != origin.jump_location
+                    || nop.jump_policy.retained_nop()
+                        != crate::assembler::ir::RetainedJumpNop::DirectTarget
+                    || nop.jump_policy.borrow_empty_block()
+                    || nop.no_location_policy.borrow_fallthrough() != BorrowFallthrough::Reachable
+                {
+                    continue;
+                }
+                cursor += 1;
+            } else {
+                // The source was not a jump-only original array. Require every
+                // original instruction before its erased jump, with no new labels,
+                // copied instructions, retained jump NOP, or intervening empty array.
+                let prefix_matches =
+                    origin
+                        .source_prefix
+                        .iter()
+                        .enumerate()
+                        .all(|(offset, expected)| {
+                            matches!(items.get(cursor + offset), Some(Item::Instruction(actual))
+                            if actual.opcode == expected.opcode
+                                && actual.operand() == expected.operand()
+                                && actual.location == expected.location
+                                && !actual.jump_policy.borrow_empty_block()
+                                && actual.no_location_policy.borrow_fallthrough()
+                                    == BorrowFallthrough::Reachable)
+                        });
+                if !prefix_matches {
+                    continue;
+                }
+                cursor += origin.source_prefix.len();
             }
-            cursor += 1;
             // Exact adjacency excludes intervening empty arrays and newly merged labels.
             let target_start = cursor;
             let aliases_match = origin.target_labels.iter().enumerate().all(|(offset, label)| {
@@ -2697,6 +2778,35 @@ impl OptimizationPipeline {
                     // A surviving original direct jump can become a physical NOP
                     // when cold handlers move away. Its exact target certificate
                     // admits fallthrough without reopening erased handler exits.
+                    let original_finally_entry = items[blocks[block].clone()]
+                        .iter()
+                        .rev()
+                        .find_map(|item| match item {
+                            Item::Label(label) => Some(label),
+                            Item::Instruction(_) => None,
+                        })
+                        .and_then(|source| retained_finally_entries.get(source))
+                        .is_some_and(|target| {
+                            label_blocks
+                                .get(usize::try_from(target.0).unwrap())
+                                .copied()
+                                == Some(block + 1)
+                                && items[blocks[block + 1].clone()].iter().all(|item| {
+                                    !matches!(item, Item::Label(label)
+                                            if borrow_unreachable_labels.contains(label)
+                                                && !borrow_finally_entries.contains_key(label))
+                                })
+                                && items[blocks[block + 1].clone()]
+                                    .iter()
+                                    .find_map(|item| match item {
+                                        Item::Instruction(instruction) => Some(instruction),
+                                        Item::Label(_) => None,
+                                    })
+                                    .is_some_and(|instruction| {
+                                        !matches!(instruction.opcode, NOP | NOT_TAKEN)
+                                            && !instruction.jump_policy.borrow_empty_block()
+                                    })
+                        });
                     let retained_finally_entry = last.opcode == NOP
                         && last.jump_policy.retained_nop()
                             == crate::assembler::ir::RetainedJumpNop::DirectTarget
@@ -2707,36 +2817,15 @@ impl OptimizationPipeline {
                             .filter(|item| matches!(item, Item::Instruction(_)))
                             .count()
                             == 1
-                        && items[blocks[block].clone()]
-                            .iter()
-                            .rev()
-                            .find_map(|item| match item {
-                                Item::Label(label) => Some(label),
-                                Item::Instruction(_) => None,
-                            })
-                            .and_then(|source| retained_finally_entries.get(source))
-                            .is_some_and(|target| {
-                                label_blocks
-                                    .get(usize::try_from(target.0).unwrap())
-                                    .copied()
-                                    == Some(block + 1)
-                                    && items[blocks[block + 1].clone()].iter().all(|item| {
-                                        !matches!(item, Item::Label(label)
-                                            if borrow_unreachable_labels.contains(label)
-                                                && !borrow_finally_entries.contains_key(label))
-                                    })
-                                    && items[blocks[block + 1].clone()]
-                                        .iter()
-                                        .find_map(|item| match item {
-                                            Item::Instruction(instruction) => Some(instruction),
-                                            Item::Label(_) => None,
-                                        })
-                                        .is_some_and(|instruction| {
-                                            !matches!(instruction.opcode, NOP | NOT_TAKEN)
-                                                && !instruction.jump_policy.borrow_empty_block()
-                                        })
-                            });
-                    pending.push((block + 1, retained_finally_entry));
+                        && original_finally_entry;
+                    // Removing a redundant ordinary jump preserves fallthrough when
+                    // its original source still has its complete nonempty prefix.
+                    // The same endpoint certificate rejects empty or merged targets.
+                    let erased_finally_entry = !matches!(last.opcode, NOP | NOT_TAKEN)
+                        && finally_jump_sources.get(block).copied().unwrap_or(false)
+                        && jump_entry_blocks.get(block + 1).copied().unwrap_or(false)
+                        && original_finally_entry;
+                    pending.push((block + 1, retained_finally_entry || erased_finally_entry));
                 }
                 // A removed normal edge can stop fallthrough at an empty CFG block,
                 // but a surviving threaded jump still reaches its explicit target.

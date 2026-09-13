@@ -222,7 +222,12 @@ impl Assembler {
                 (graph, Some(reachable))
             }
         };
-        if !self.exception_regions.is_empty() {
+        if !self.exception_regions.is_empty()
+            || !self
+                .exception_owner_provenance
+                .normal_try_jump_owners
+                .is_empty()
+        {
             // Original setup order expresses nesting even when copied cleanup code makes an
             // inner range longer than its parent, or exclusions split the parent into fragments.
             let label_positions = graph
@@ -233,7 +238,12 @@ impl Assembler {
                     Item::Instruction(_) => None,
                 })
                 .collect::<rustc_hash::FxHashMap<_, _>>();
-            for region in &mut self.exception_regions {
+            for region in self.exception_regions.iter_mut().chain(
+                self.exception_owner_provenance
+                    .normal_try_jump_owners
+                    .values_mut()
+                    .flatten(),
+            ) {
                 if let super::ExceptionRegionPriority::OriginalRange(start, end) = region.priority {
                     region.priority = super::ExceptionRegionPriority::Resolved {
                         start: label_positions[&start],
@@ -350,6 +360,7 @@ impl OptimizationPipeline {
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::RemoveUnreachableInitial)?;
         self.prepare_normal_try_copy_plan();
+        self.prepare_plain_tuple_copy_plan();
         self.prepare_conditional_normal_try_joins();
         original_owners.retain_pipeline(&self);
         let original_location_absence = self.capture_original_location_absence();

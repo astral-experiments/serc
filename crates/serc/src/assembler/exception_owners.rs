@@ -51,8 +51,17 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) omitted_nop_tail: Option<(usize, SourceLocation, usize)>,
     // Original constant-expression/Pass pairs sharing only their fresh marker labels.
     pub(super) constant_pass_clusters: Vec<ConstantPassCluster>,
+    // Original owners of branch jumps excluded only by an eager cleanup-copy prediction.
+    pub(super) normal_try_jump_owners: FxHashMap<(Label, Label), Vec<super::ExceptionRegion>>,
     pub(super) normal_try_copy_blocks: FxHashSet<Label>,
     pub(super) normal_try_copy_steps: Vec<(Label, Label, usize)>,
+    // Captured source/continuation labels whose instructions were erased by reachability pruning.
+    pub(super) retired_normal_try_copy_labels: FxHashSet<Label>,
+    // Candidate original fallthrough stores; only a successful static swap certifies them.
+    pub(super) normal_try_copy_join_origins: FxHashMap<Label, TupleJoinLocationOrigin>,
+    // Exact original tuple-join jump and the assignment donor certified before its exchange.
+    // Copies inherit their own predecessors; this donor is consumed only once.
+    pub(super) normal_try_copy_join_donors: FxHashMap<Label, (Instruction, SourceLocation)>,
     // Existing copied-entry labels immediately following replaced original jump NOPs.
     pub(super) normal_try_copy_jump_nop_successors: FxHashSet<Label>,
     // Physical labels appended by a certified original-array copy, before region aliases.
@@ -68,6 +77,14 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) source_none_conditions: Vec<SourceNoneCondition>,
     // Exact terminal pairs produced by original conditional jump threading.
     pub(super) threaded_condition_origins: Vec<(Instruction, Instruction)>,
+}
+
+/// Original assignment fallthrough into a selected tuple-copy join, before static swaps.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct TupleJoinLocationOrigin {
+    pub(super) predecessor: Label,
+    pub(super) store: Instruction,
+    pub(super) jump: Instruction,
 }
 
 /// Original constant-return cleanup, including NULL records omitted under a manager.
@@ -1847,10 +1864,44 @@ impl LayoutAssembler {
                         ended_uniform_with_suffix = true;
                         // A deleted authored POP_BLOCK preserves this original array's epoch
                         // when its slot was transferred without crossing a source or jump join.
+                        // Cold-block reordering can name an exclusion endpoint with the
+                        // original head label instead of its adjacent SETUP-range label.
+                        // At an unchanged fresh head, that alias contributes no POP record.
+                        let retained_setup_head_alias = !has_instruction
+                            && instruction_index == original_array_start
+                            && owner_history_exact
+                            && tail.early_removals == 0
+                            && tail.insertions == 0
+                            && tail.late_removals == 0
+                            && tail.post_compaction_fusions == 0
+                            && self
+                                .exception_owner_provenance
+                                .block_boundaries
+                                .contains(label)
+                            && retained_setup_nops.contains(&instruction_index)
+                            && self
+                                .exception_owner_provenance
+                                .setups
+                                .iter()
+                                .filter(|(setup, _)| {
+                                    label_positions.get(setup) == Some(&(instruction_index + 1))
+                                })
+                                .count()
+                                == 1
+                            && !self
+                                .exception_owner_provenance
+                                .removed_pop_block_boundaries
+                                .iter()
+                                .chain(self.exception_owner_provenance.omitted_nop_counts.keys())
+                                .chain(self.exception_owner_provenance.omitted_nop_locations.keys())
+                                .any(|origin| {
+                                    label_positions.get(origin) == Some(&instruction_index)
+                                });
                         if !self
                             .exception_owner_provenance
                             .removed_pop_block_boundaries
                             .contains(label)
+                            && !retained_setup_head_alias
                         {
                             retained_epoch_known = false;
                         }
@@ -2946,6 +2997,151 @@ impl LayoutAssembler {
                             {
                                 pending_normal_none_owner = Some((instruction_index + 1, region));
                             }
+                        }
+                    }
+                    // A retained normal POP_BLOCK separates the old protected prefix from
+                    // the cleanup suffix without removing its NULL cell. Local fusion
+                    // compacts that live array again. If its stale slot stays inside the
+                    // unchanged cleanup suffix, use that suffix's exact region, even when
+                    // source-level cleanup exclusions hide it around the late marker.
+                    if is_conditional_jump(instruction.opcode)
+                        && matches!(instruction.operand(), Operand::Forward(_))
+                        && !threaded_conditions.contains(&instruction_index)
+                        && owner_history_exact
+                        && has_uninterrupted_fusion
+                        && tail.insertions == 0
+                        && tail.late_removals == 0
+                        && tail.post_compaction_fusions > 0
+                        && let Some(pop) = indexed_instructions
+                            [original_array_start..instruction_index]
+                            .iter()
+                            .rposition(|instruction| instruction.opcode == NOP)
+                            .map(|offset| original_array_start + offset)
+                        && indexed_instructions[pop]
+                            .fusion_policy
+                            .is_converted_pop_block()
+                        && indexed_instructions[pop].exception_policy().exclusion()
+                            == super::ExceptionExclusion::Always
+                    {
+                        let suffix = &indexed_instructions[pop + 1..=instruction_index];
+                        let fused = suffix
+                            .iter()
+                            .filter(|instruction| {
+                                matches!(
+                                    instruction.opcode,
+                                    LOAD_FAST_LOAD_FAST
+                                        | LOAD_FAST_BORROW_LOAD_FAST_BORROW
+                                        | STORE_FAST_LOAD_FAST
+                                        | STORE_FAST_STORE_FAST
+                                )
+                            })
+                            .count();
+                        if fused > 0
+                            && tail.post_compaction_fusions <= suffix.len() + fused
+                            && suffix.iter().all(|instruction| {
+                                instruction.exception_policy()
+                                    == super::ExceptionPolicy::NoneUnchanged
+                                    && instruction.local_policy.hidden_exception_owner_slots() == 0
+                                    && instruction.pre_fold_extra_instructions() == 0
+                                    && instruction.no_location_policy.borrow_fallthrough()
+                                        != super::BorrowFallthrough::Barrier
+                                    && !instruction.only_allows_unconditional_inlining()
+                            })
+                            && let Some(region) = self.uniform_exception_owner(
+                                pop + 1,
+                                instruction_index + 1,
+                                &label_positions,
+                            )
+                            && !self.exception_regions[region].is_scope_fallback
+                            && self.exception_regions[region].depth > 0
+                            && self.exception_regions[region].preserve_lasti
+                        {
+                            pending_compacted_append = Some((instruction_index + 1, region));
+                        }
+                    }
+                    // A Boolean membership fold removes CONTAINS_OP before TO_BOOL takes
+                    // its place. After a retained original-head POP_BLOCK, that first
+                    // compaction leaves the condition's manager owner in the next slot.
+                    // Any subsequent local fusion still reuses the same uniformly owned
+                    // suffix. Account for every removed record before trusting that slot.
+                    if is_conditional_jump(instruction.opcode)
+                        && matches!(instruction.operand(), Operand::Forward(_))
+                        && !threaded_conditions.contains(&instruction_index)
+                        && owner_history_exact
+                        && tail.insertions == 0
+                        && tail.late_removals == 0
+                        && instruction_index >= original_array_start + 2
+                    {
+                        let pop = indexed_instructions[original_array_start];
+                        let comparison = indexed_instructions[instruction_index - 1];
+                        let suffix =
+                            &indexed_instructions[original_array_start + 1..=instruction_index];
+                        let fused = suffix
+                            .iter()
+                            .filter(|instruction| {
+                                matches!(
+                                    instruction.opcode,
+                                    LOAD_FAST_LOAD_FAST
+                                        | LOAD_FAST_BORROW_LOAD_FAST_BORROW
+                                        | STORE_FAST_LOAD_FAST
+                                        | STORE_FAST_STORE_FAST
+                                )
+                            })
+                            .count();
+                        if pop.opcode == NOP
+                            && pop.fusion_policy.is_converted_pop_block()
+                            && pop.exception_policy().exclusion()
+                                == super::ExceptionExclusion::Always
+                            && pop.local_policy.hidden_exception_owner_slots() == 0
+                            && pop.pre_fold_extra_instructions() == 0
+                            && pop.no_location_policy.borrow_fallthrough()
+                                != super::BorrowFallthrough::Barrier
+                            && !pop.only_allows_unconditional_inlining()
+                            && comparison.opcode == crate::target::opcodes::CONTAINS_OP
+                            && comparison.location == instruction.location
+                            && comparison.local_policy.hidden_exception_owner_slots() == 1
+                            && tail.post_compaction_fusions == fused
+                            && tail.early_removals == 1 + fused
+                            && self
+                                .exception_owner_provenance
+                                .source_boundaries
+                                .iter()
+                                .any(|label| {
+                                    self.exception_owner_provenance
+                                        .block_boundaries
+                                        .contains(label)
+                                        && label_positions.get(label) == Some(&original_array_start)
+                                })
+                            && !boundaries
+                                .iter()
+                                .chain(&self.exception_owner_provenance.source_boundaries)
+                                .chain(&jump_targets)
+                                .any(|label| {
+                                    label_positions.get(label).is_some_and(|position| {
+                                        original_array_start < *position
+                                            && *position <= instruction_index
+                                    })
+                                })
+                            && suffix.iter().enumerate().all(|(offset, instruction)| {
+                                instruction.exception_policy()
+                                    == super::ExceptionPolicy::NoneUnchanged
+                                    && instruction.local_policy.hidden_exception_owner_slots()
+                                        == u16::from(offset + 2 == suffix.len())
+                                    && instruction.pre_fold_extra_instructions() == 0
+                                    && instruction.no_location_policy.borrow_fallthrough()
+                                        != super::BorrowFallthrough::Barrier
+                                    && !instruction.only_allows_unconditional_inlining()
+                            })
+                            && let Some(region) = self.uniform_exception_owner(
+                                original_array_start + 1,
+                                instruction_index + 1,
+                                &label_positions,
+                            )
+                            && !self.exception_regions[region].is_scope_fallback
+                            && self.exception_regions[region].depth > 0
+                            && self.exception_regions[region].preserve_lasti
+                        {
+                            pending_compacted_append = Some((instruction_index + 1, region));
                         }
                     }
                     // Capture the original array's owner before range-exclusion labels at the

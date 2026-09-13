@@ -2552,6 +2552,82 @@ def surrogate_filter(items):
 }
 
 #[test]
+fn copied_returns_omit_nops_at_original_conditional_joins() {
+    let source = r#"import json
+
+def event_shape(event, issues, sink):
+    kind = event.get("kind")
+    if kind == "request":
+        if event.get("accepted"):
+            if event.get("served"):
+                sink(issues)
+            else:
+                if not event.get("first"):
+                    sink(issues)
+                if event.get("first") and event.get("first") == event.get("last"):
+                    for field in ("first", "last"):
+                        if field not in issues:
+                            issues.append(field)
+        elif event.get("requested"):
+            sink(issues)
+        elif event.get("observed"):
+            if "context" not in issues:
+                issues.append("context")
+    elif kind == "attempt":
+        sink(issues)
+    return issues
+
+def validate_payload(state, text, errors):
+    if state == "empty":
+        if text:
+            errors.append("unexpected text")
+    elif state in ("partial", "complete"):
+        if state == "complete":
+            if not isinstance(text, str) or not text.strip():
+                errors.append("missing text")
+            else:
+                try:
+                    decoded = json.loads(text)
+                except json.JSONDecodeError:
+                    decoded = None
+                if not isinstance(decoded, dict):
+                    errors.append("expected an object")
+        elif text not in ("", None):
+            errors.append("unexpected partial text")
+    elif state in ("invalid", "mixed"):
+        if text not in ("", None):
+            errors.append("unexpected invalid text")
+    return state
+"#;
+    let parsed = parse_module(source).unwrap();
+    let module = module_compiler(source, &parsed)
+        .compile_module(parsed.suite())
+        .unwrap();
+
+    for (name, expected_nops) in [("event_shape", 0), ("validate_payload", 1)] {
+        let function = module
+            .constants
+            .iter()
+            .find_map(|constant| match constant {
+                Constant::Code(code) if code.name == name => Some(code),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("module should contain {name}"));
+        let nops = function
+            .bytecode
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .filter(|instruction| instruction[0] == NOP.code())
+            .count();
+
+        // The decode function retains its try-statement marker. Neither copied
+        // return adds a line event at the preceding conditional's shared join.
+        assert_eq!(nops, expected_nops, "unexpected NOP count for {name}");
+    }
+}
+
+#[test]
 fn copied_finally_exits_keep_statement_and_assertion_nops() {
     let source = r"def boolean_condition(manager, left, right):
     with manager:

@@ -269,3 +269,108 @@ fn matches_cpython_normal_cleanup_after_stable_tail() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_async_manager_loop_return_fallback() {
+    common::assert_matches_cpython_marshal(
+        r"async def f(manager, items, ready):
+    try:
+        async with manager:
+            if await ready():
+                return 1
+            async for item in items:
+                if item:
+                    return item
+    except LookupError:
+        return None
+    except Exception:
+        return None
+    return None
+",
+        "async_manager_loop_return_fallback.py",
+    );
+}
+
+#[test]
+fn matches_cpython_async_manager_loop_finally_return_fallback() {
+    common::assert_matches_cpython_marshal(
+        r"async def f(manager, items, cleanup):
+    try:
+        async with manager:
+            async for item in items:
+                try:
+                    if item is None:
+                        continue
+                    if item:
+                        return item
+                    return None
+                finally:
+                    try:
+                        if item is not None:
+                            cleanup(item)
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    return None
+",
+        "async_manager_loop_finally_return_fallback.py",
+    );
+}
+
+#[test]
+fn preserves_original_cleanup_copy_targets_after_manager_elif() {
+    let source = r#"def probe(manager, value, kind, action, report):
+    try:
+        if value is not None:
+            if manager is None:
+                return "no manager"
+            with manager:
+                state = action()
+                if state == 1:
+                    return "one"
+                if state == 2:
+                    return "two"
+                action()
+        elif kind == 1:
+            action()
+        else:
+            report()
+    except LookupError:
+        return "missing"
+    except OSError as error:
+        return report(error)
+    return "done"
+"#;
+    common::assert_matches_cpython_marshal(source, "cleanup_copy_manager_elif.py");
+}
+
+#[test]
+fn preserves_original_cleanup_copy_targets_after_nested_try_elif() {
+    let source = r"def probe(state, work, cleanup):
+    try:
+        if state == 0:
+            if work():
+                cleanup()
+        elif state == 1:
+            if work():
+                cleanup()
+        elif state == 2:
+            try:
+                if work():
+                    cleanup()
+                    work()
+            except Exception:
+                cleanup()
+                raise
+        elif state == 3:
+            if work():
+                cleanup()
+        else:
+            raise ValueError(state)
+    except Exception:
+        cleanup()
+    return True
+";
+    common::assert_matches_cpython_marshal(source, "nested_try_elif_cleanup.py");
+}

@@ -149,3 +149,108 @@ def existing_iterator_control(items, action, consume):
         "protected_terminal_while.py",
     );
 }
+
+#[test]
+fn nonfinal_loop_arms_preserve_chained_comparison_exits() {
+    for (filename, source) in [
+        (
+            "nonfinal_for_chained_call.py",
+            r"def target(items, enabled, low, high, consume):
+    for item in items:
+        if enabled:
+            if low <= item < high:
+                consume(item)
+        else:
+            consume(None)
+",
+        ),
+        (
+            "nonfinal_for_chained_return.py",
+            r"def target(items, enabled, low, high):
+    for item in items:
+        if enabled:
+            if low <= item < high:
+                return item + 1
+        else:
+            if low <= item < high:
+                return item
+    return None
+",
+        ),
+        (
+            "nonfinal_while_chained_call.py",
+            r"def target(read, enabled, low, high, consume):
+    while True:
+        item = read()
+        if enabled:
+            if low <= item < high:
+                consume(item)
+        else:
+            consume(None)
+",
+        ),
+        (
+            "nonfinal_protected_chained_call.py",
+            r"def target(items, enabled, low, high, consume):
+    try:
+        for item in items:
+            if enabled:
+                if low <= item < high:
+                    consume(item)
+            else:
+                consume(None)
+    except Exception:
+        consume(None)
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn nonfinal_chained_comparisons_preserve_copied_small_returns() {
+    for (filename, source) in [
+        (
+            "nonfinal_chain_small_literal_return.py",
+            r"def target(items, enabled, low, high, consume):
+    for item in items:
+        if enabled:
+            if low <= item < high:
+                return True
+        else:
+            consume(item)
+    return False
+",
+        ),
+        (
+            "nonfinal_chain_small_name_return.py",
+            r"def target(items, enabled, low, high, consume):
+    for item in items:
+        if enabled:
+            if low <= item < high:
+                return item
+        else:
+            consume(item)
+    return False
+",
+        ),
+        (
+            "nonfinal_chain_call_bounds_small_return.py",
+            r"def target(rules, value, ignored, is_range, split):
+    for rule in rules:
+        if ignored(rule):
+            continue
+        if is_range(rule):
+            low, high = split(rule)
+            if int(low) <= value <= int(high):
+                return True
+        elif int(rule) == value:
+            return True
+    return False
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

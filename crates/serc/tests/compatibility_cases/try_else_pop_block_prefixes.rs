@@ -227,3 +227,23 @@ fn preserves_folded_loop_returning_else_before_short_else_condition() {
 fn preserves_folded_loop_raising_else_before_short_else_condition() {
     assert_loop_break_before_else_condition(9);
 }
+
+#[test]
+fn preserves_original_linear_try_pop_slot_after_compaction() {
+    for (filename, expression) in [
+        ("try_else_erased_pop_prefix_zero_control.py", "value"),
+        (
+            "try_else_erased_pop_prefix_two_control.py",
+            "first(second(value))",
+        ),
+        (
+            "try_else_erased_pop_prefix.py",
+            "first(second(third(fourth(value))))",
+        ),
+    ] {
+        let source = format!(
+            "def f(value, enabled):\n    try:\n        result = {expression}\n    except Error:\n        return None\n    else:\n        if enabled:\n            record(result)\n    return result\n"
+        );
+        assert_matches_cpython_marshal(&source, filename);
+    }
+}

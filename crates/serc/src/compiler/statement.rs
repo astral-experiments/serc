@@ -15,7 +15,7 @@ use super::{
 use crate::CompileError;
 use crate::assembler::{
     Assembler, BooleanValueMarkerScan, EmittedInstruction, EmittedJump, ExceptionPolicy, Label,
-    SourceLocation,
+    NameReturnBorrowExit, SourceLocation,
 };
 use crate::code_object::Constant;
 use crate::target::code_flags::{
@@ -453,6 +453,8 @@ pub(super) struct FinallyState {
     // The direct try consumes this request before compiling nested finalizers.
     capture_next_finally_manager_pop: bool,
     captured_finally_manager_pop: Option<(SourceLocation, Label)>,
+    // The delegated normal edge awaits its completed original finally target.
+    pending_name_return_borrow_exit: Option<NameReturnBorrowExit>,
     active_return_finally_contexts: Vec<FinallyExitContext>,
     active_loop_finally_contexts: Vec<FinallyExitContext>,
     // A loop control inside a copied finalizer replaces the pending exit and has its own unwind.
@@ -7924,6 +7926,10 @@ impl Compiler<'_> {
                         if let Some(start) = direct_try_body_exit_start {
                             let exclusion_end = self.assembler.label();
                             self.assembler.mark(exclusion_end);
+                            if !self.control.in_exception_handler() {
+                                self.assembler
+                                    .record_normal_try_jump_exclusion(start, exclusion_end);
+                            }
                             self.control
                                 .exceptions
                                 .active_exception_region_exclusions
@@ -8051,7 +8057,8 @@ impl Compiler<'_> {
                             self.assembler
                                 .preserve_redundant_jump_nop_after_threading(branch_exit);
                         } else {
-                            self.assembler.preserve_direct_inlined_jump_nop(branch_exit);
+                            self.assembler
+                                .preserve_empty_join_inlined_jump_nop(branch_exit);
                         }
                     }
                 }
@@ -9405,8 +9412,6 @@ impl Compiler<'_> {
                 && self.control.in_loop_tail_without_nested_cleanup()
                 && (!self.has_active_control_flow_region()
                     || condition_has_only_runtime_tests(&statement.test));
-            let copied_loop_branch_exit =
-                copied_loop_branch_exit && !expression_contains_chained_comparison(&statement.test);
             // CPython keeps a non-final branch's nested condition body before the fallback
             // backedge even when that body exits the enclosing loop or function.
             if copied_loop_branch_exit
@@ -9420,6 +9425,12 @@ impl Compiler<'_> {
             {
                 let body = statement.body.as_slice();
                 let fallback = self.assembler.label();
+                // The successful comparison edge can copy a small terminal exit.
+                // Retain its original jump cell as a NOP, as for other terminal branches.
+                let retained_exit = matches!(body, [Stmt::Return(_) | Stmt::Raise(_)])
+                    .then(|| final_chained_comparison_jump(&statement.test))
+                    .flatten()
+                    .or(self.control.conditions.retained_chained_comparison_exit);
                 self.with_control_override(
                     |control| {
                         &mut control
@@ -9427,7 +9438,13 @@ impl Compiler<'_> {
                             .exclude_condition_not_taken_from_exception
                     },
                     protected_try_normal_exit,
-                    |compiler| compiler.compile_jump_if(&statement.test, false, fallback),
+                    |compiler| {
+                        compiler.with_control_override(
+                            |control| &mut control.conditions.retained_chained_comparison_exit,
+                            retained_exit,
+                            |compiler| compiler.compile_jump_if(&statement.test, false, fallback),
+                        )
+                    },
                 )?;
                 let body_start = self.assembler.instruction_count();
                 let nested_tail = self.compile_with_strict_owned_loads(
@@ -10555,11 +10572,19 @@ impl Compiler<'_> {
                 self.assembler.prevent_borrow_loop_exit_reachability(end);
                 // A surviving authored break still reaches the loop's nonempty exit,
                 // even when a different break loses its edge before borrowed-load traversal.
-                if self
+                // A following statement remains inside the current protected body; its
+                // surviving break does not cross the enclosing handler or finally cleanup.
+                if (self
                     .control
                     .exceptions
                     .active_exception_region_exclusions
                     .is_empty()
+                    || (self.control.statements.current_statement_has_following
+                        && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+                        && self.control.loops.contexts.is_empty()
+                        && self.control.exceptions.active_exception_handlers.is_empty()
+                        && self.control.exceptions.active_exception_group_handlers == 0
+                        && self.control.finally.active_copied_finally_bodies == 0))
                     && self.control.withs.active_with_region_exclusions.is_empty()
                     && self.control.finally.active_normal_finally_bodies == 0
                     && self.control.finally.active_finally_end_blocks == 0
@@ -12152,12 +12177,13 @@ impl Compiler<'_> {
                             .active_exception_region_exclusions
                             .len()
             });
-        // Loop-tail lowering compiles the final condition separately from its preceding suite.
-        // Both that condition and an enclosing manager cleanup remain successors in CPython's
+        // Loop-tail lowering compiles its final statement separately from the preceding suite.
+        // That extracted tail and an enclosing manager cleanup remain successors in CPython's
         // borrow graph, even though they are emitted outside this statement's source suite.
         let borrow_exit_has_source_successor =
             self.control.statements.current_statement_has_following
-                || self.control.loops.synthesized_loop_tail_predecessor == Some(statement.range);
+                || self.control.loops.synthesized_loop_tail_predecessor == Some(statement.range)
+                || self.control.loops.split_loop_tail_prefix_end == Some(statement.range);
         let borrow_exit_has_successor =
             borrow_exit_has_source_successor || normal_exit_reaches_enclosing_manager;
         let handler_has_orphan_cold_cleanup = statement.handlers.iter().any(|handler| {
@@ -12830,6 +12856,9 @@ impl Compiler<'_> {
                 )
             },
         )?;
+        if removed_try_pop_block && !deferred_try_pop_block {
+            self.assembler.transfer_linear_try_pop_block_slot(try_end);
+        }
         if removed_shared_try_pop_block {
             // Original folded and surviving conditional edges prevent a unique
             // source donor. Native first compaction removes the unlocated POP_BLOCK.
@@ -13142,6 +13171,22 @@ impl Compiler<'_> {
             } else {
                 ExceptionPolicy::default()
             };
+            // The nested recovery's cold join does not empty this normal source:
+            // its original CALL/POP_TOP survives before the jump, and the jump's
+            // own finally array begins with runtime work. Borrowing still checks
+            // the exact original endpoints if the normal jump later disappears.
+            let nonempty_finally_normal_source = !statement.is_star
+                && statement.orelse.is_empty()
+                && handler_contains_nested_handler_cold_join
+                && !handler_contains_terminal_nested_try
+                && !suite_ends_in_empty_try_exit_block(normal_exit_suite, loop_tail.is_some())
+                && matches!(statement.finalbody.first(), Some(Stmt::Expr(expression))
+                    if matches!(expression.value.as_ref(), Expr::Call(_))
+                        && !expression_contains_inline_branch(&expression.value))
+                && self.suite_has_nonempty_borrow_entry(&statement.finalbody)
+                && self
+                    .assembler
+                    .current_original_block_ends_with_discarded_call();
             let normal_exit = self.emit_jump_forward_instruction_with_exception_policy(
                 JUMP_FORWARD,
                 end,
@@ -13262,7 +13307,9 @@ impl Compiler<'_> {
                 // removal. The apparent fallthrough is not a borrowed-load entry.
                 self.assembler.prevent_borrow_fallthrough_reachability(end);
             }
-            if (normal_exit_starts_in_empty_block && borrow_exit_has_source_successor)
+            if (normal_exit_starts_in_empty_block
+                && borrow_exit_has_source_successor
+                && !nonempty_finally_normal_source)
                 || matches!(normal_exit_suite.last(), Some(Stmt::Assert(assertion))
                     if assertion_has_only_runtime_tests(&assertion.test)
                         && condition_jump_target_count(&assertion.test, true) > 1)
@@ -13271,16 +13318,18 @@ impl Compiler<'_> {
                 // removal leaves an empty original block for borrowed-load traversal.
                 self.assembler.mark_borrow_empty_block(normal_exit);
             }
-            if (statement.handlers.iter().any(|handler| {
+            let terminal_handler_exit = statement.handlers.iter().any(|handler| {
                 handler.as_except_handler().is_some_and(|handler| {
                     suite_terminates(&handler.body)
                         || suite_contains_partial_terminal_handler_if(&handler.body)
                 })
-            }) && !(self
-                .control
-                .statements
-                .current_statement_followed_by_name_return
-                && self.control.withs.active_with_exits.is_empty()))
+            });
+            if (terminal_handler_exit
+                && !(self
+                    .control
+                    .statements
+                    .current_statement_followed_by_name_return
+                    && self.control.withs.active_with_exits.is_empty()))
                 || handler_has_orphan_cold_cleanup
                 || has_bare_handler
                 || (!statement.is_star
@@ -13508,6 +13557,19 @@ impl Compiler<'_> {
                 // original empty join stops borrowing, unless a retained NOP keeps it live.
                 self.assembler
                     .mark_borrow_empty_block_if_unretained(normal_exit);
+            }
+            if terminal_handler_exit
+                && !statement.finalbody.is_empty()
+                && self
+                    .control
+                    .statements
+                    .current_statement_followed_by_name_return
+                && self.control.withs.active_with_exits.is_empty()
+            {
+                // The following return belongs beyond this statement's own finalizer.
+                // Resolve its copy eligibility only after that target has been emitted.
+                self.control.finally.pending_name_return_borrow_exit =
+                    Some(self.assembler.record_name_return_borrow_exit(normal_exit));
             }
         }
         if deferred_try_pop_block && !removed_shared_try_pop_block {
@@ -15380,6 +15442,14 @@ impl Compiler<'_> {
     ) {
         let mut region_start = start;
         for (exclusion_start, exclusion_end) in exclusions {
+            self.assembler.record_normal_try_jump_owner(
+                *exclusion_start,
+                *exclusion_end,
+                target,
+                depth,
+                preserve_lasti,
+                (start, end),
+            );
             self.assembler.add_exception_region_with_origin(
                 region_start,
                 *exclusion_start,
@@ -16129,6 +16199,8 @@ impl Compiler<'_> {
                 })
             })
             && (suite_has_linear_borrow_fallthrough(&statement.finalbody)
+                || matches!(statement.finalbody.as_slice(), [Stmt::Expr(cleanup)]
+                    if cleanup_conditional_argument_has_eager_call_prefix(&cleanup.value))
                 || matches!(statement.finalbody.as_slice(), [Stmt::If(cleanup)]
                     if condition_has_only_runtime_tests(&cleanup.test)
                         && !expression_contains_inline_branch(&cleanup.test)
@@ -16377,138 +16449,143 @@ impl Compiler<'_> {
                 preserves_conditional_exit_owner: statement.handlers.is_empty()
                     && finally_suite_preserves_none_condition_owner(&statement.finalbody),
             });
-        let ((protected_has_instructions, async_for_end_pop), protected_exclusions) = self
-            .with_finally_protected_context(
-                pass_finally_location,
-                overriding_return,
-                FinallyProtectedLoopRanges {
-                    preserve_break_exit: preserve_break_exit_loop_range,
-                    borrow_reachable_exit: inner_try_break_loop_range,
-                },
-                finally_suite_preserves_none_condition_owner(&statement.finalbody),
-                return_context,
-                |compiler| {
-                    if statement.handlers.is_empty() {
-                        let instruction_count = compiler.assembler.instruction_count();
-                        if statement.body.len() > 1
-                            && let Some(Stmt::Pass(pass)) = statement.body.first()
+        let outer_name_return_borrow_exit =
+            self.control.finally.pending_name_return_borrow_exit.take();
+        let protected_result = self.with_finally_protected_context(
+            pass_finally_location,
+            overriding_return,
+            FinallyProtectedLoopRanges {
+                preserve_break_exit: preserve_break_exit_loop_range,
+                borrow_reachable_exit: inner_try_break_loop_range,
+            },
+            finally_suite_preserves_none_condition_owner(&statement.finalbody),
+            return_context,
+            |compiler| {
+                if statement.handlers.is_empty() {
+                    let instruction_count = compiler.assembler.instruction_count();
+                    if statement.body.len() > 1
+                        && let Some(Stmt::Pass(pass)) = statement.body.first()
+                    {
+                        compiler
+                            .assembler
+                            .set_location(compiler.source_location(pass.range));
+                        compiler.emit(NOP, 0, 0)?;
+                    }
+                    let recorder = AsyncForEndPopRecorder::new(&compiler.control);
+                    let ((), recorder) = compiler.with_control_stack(
+                        |control| &mut control.finally.async_for_end_pop_recorders,
+                        recorder,
+                        |compiler| {
+                            compiler.with_control_override(
+                                |control| &mut control.finally.protected_finally_break_owner,
+                                protected_finally_break_owner,
+                                |compiler| {
+                                    compiler.with_try_body_context(statement, |compiler| {
+                                        compiler.compile_suite(&statement.body)
+                                    })
+                                },
+                            )
+                        },
+                    )?;
+                    let has_instructions =
+                        compiler.assembler.instruction_count() > instruction_count;
+                    if let Some(Stmt::Expr(tail)) = statement.body.last()
+                        && fold_constant(&tail.value).is_some()
+                        && compiler.assembler.last_instruction_is_nop()
+                    {
+                        let range = if let Expr::FString(fstring) = tail.value.as_ref() {
+                            Self::fstring_result_range(fstring)
+                        } else {
+                            tail.range
+                        };
+                        if compiler.assembler.last_instruction_location()
+                            == Some(compiler.source_location(range))
                         {
+                            // This direct body tail donates its location to POP_BLOCK.
+                            // The surviving NOP occupies that ownerless original cell,
+                            // including under enclosing handlers and generator cleanup.
+                            let start = compiler.assembler.label();
                             compiler
                                 .assembler
-                                .set_location(compiler.source_location(pass.range));
+                                .mark_before_trailing_instructions(start, 1);
+                            let end = compiler.assembler.label();
+                            compiler.assembler.mark(end);
+                            for exclusions in &mut compiler
+                                .control
+                                .exceptions
+                                .active_exception_region_exclusions
+                            {
+                                exclusions.push((start, end));
+                            }
+                            for exclusions in
+                                &mut compiler.control.withs.active_with_region_exclusions
+                            {
+                                exclusions.push((start, end));
+                            }
+                            compiler
+                                .control
+                                .generators
+                                .generator_region_exclusions
+                                .push((start, end));
+                        }
+                    }
+                    if has_instructions
+                        && let Some(Stmt::Pass(pass)) = statement.body.last()
+                        && suite_has_linear_borrow_fallthrough(&statement.body)
+                    {
+                        // The authored pass locates the following POP_BLOCK before NOP
+                        // removal. Keep both original slots so the surviving marker has
+                        // POP_BLOCK's empty exception owner, including after suspension.
+                        let location = compiler.source_location(pass.range);
+                        compiler.assembler.record_noop_finally_location(location);
+                        if !compiler.assembler.last_instruction_is_nop()
+                            || compiler.assembler.last_instruction_location() != Some(location)
+                        {
+                            compiler.assembler.set_location(location);
                             compiler.emit(NOP, 0, 0)?;
                         }
-                        let recorder = AsyncForEndPopRecorder::new(&compiler.control);
-                        let ((), recorder) = compiler.with_control_stack(
-                            |control| &mut control.finally.async_for_end_pop_recorders,
-                            recorder,
-                            |compiler| {
-                                compiler.with_control_override(
-                                    |control| &mut control.finally.protected_finally_break_owner,
-                                    protected_finally_break_owner,
-                                    |compiler| {
-                                        compiler.with_try_body_context(statement, |compiler| {
-                                            compiler.compile_suite(&statement.body)
-                                        })
-                                    },
-                                )
-                            },
-                        )?;
-                        let has_instructions =
-                            compiler.assembler.instruction_count() > instruction_count;
-                        if let Some(Stmt::Expr(tail)) = statement.body.last()
-                            && fold_constant(&tail.value).is_some()
-                            && compiler.assembler.last_instruction_is_nop()
-                        {
-                            let range = if let Expr::FString(fstring) = tail.value.as_ref() {
-                                Self::fstring_result_range(fstring)
-                            } else {
-                                tail.range
-                            };
-                            if compiler.assembler.last_instruction_location()
-                                == Some(compiler.source_location(range))
-                            {
-                                // This direct body tail donates its location to POP_BLOCK.
-                                // The surviving NOP occupies that ownerless original cell,
-                                // including under enclosing handlers and generator cleanup.
-                                let start = compiler.assembler.label();
-                                compiler
-                                    .assembler
-                                    .mark_before_trailing_instructions(start, 1);
-                                let end = compiler.assembler.label();
-                                compiler.assembler.mark(end);
-                                for exclusions in &mut compiler
-                                    .control
-                                    .exceptions
-                                    .active_exception_region_exclusions
-                                {
-                                    exclusions.push((start, end));
-                                }
-                                for exclusions in
-                                    &mut compiler.control.withs.active_with_region_exclusions
-                                {
-                                    exclusions.push((start, end));
-                                }
-                                compiler
-                                    .control
-                                    .generators
-                                    .generator_region_exclusions
-                                    .push((start, end));
-                            }
-                        }
-                        if has_instructions
-                            && let Some(Stmt::Pass(pass)) = statement.body.last()
-                            && suite_has_linear_borrow_fallthrough(&statement.body)
-                        {
-                            // The authored pass locates the following POP_BLOCK before NOP
-                            // removal. Keep both original slots so the surviving marker has
-                            // POP_BLOCK's empty exception owner, including after suspension.
-                            let location = compiler.source_location(pass.range);
-                            compiler.assembler.record_noop_finally_location(location);
-                            if !compiler.assembler.last_instruction_is_nop()
-                                || compiler.assembler.last_instruction_location() != Some(location)
-                            {
-                                compiler.assembler.set_location(location);
-                                compiler.emit(NOP, 0, 0)?;
-                            }
-                        }
-                        if !has_instructions {
-                            if let Some(last) = statement.body.last() {
-                                compiler
-                                    .assembler
-                                    .set_location(compiler.source_location(last.range()));
-                            }
-                            // Line propagation gives the following POP_BLOCK this no-op's
-                            // location, then removes the authored no-op. Its replacement keeps
-                            // POP_BLOCK's empty exception owner, including in coroutine scopes.
-                            compiler.emit_with_exception_policy(
-                                NOP,
-                                0,
-                                0,
-                                ExceptionPolicy::EXCLUDE_ALWAYS,
-                            )?;
-                        }
-                        // Any later instruction or even a foreign label ends the capture.
-                        // A nested/copy scope cannot provide this body's normal POP record.
-                        let async_for_end_pop = recorder.origin.filter(|origin| {
-                            compiler.assembler.item_count() == origin.end_item_count
-                        });
-                        Ok((has_instructions, async_for_end_pop))
-                    } else {
-                        compiler.with_control_override(
-                            |control| &mut control.exceptions.prevent_try_exit_inlining,
-                            true,
-                            |compiler| {
-                                compiler.compile_try_except(
-                                    statement,
-                                    TryCompileOptions::NESTED_HANDLER,
-                                )
-                            },
-                        )?;
-                        Ok((true, None))
                     }
-                },
-            )?;
+                    if !has_instructions {
+                        if let Some(last) = statement.body.last() {
+                            compiler
+                                .assembler
+                                .set_location(compiler.source_location(last.range()));
+                        }
+                        // Line propagation gives the following POP_BLOCK this no-op's
+                        // location, then removes the authored no-op. Its replacement keeps
+                        // POP_BLOCK's empty exception owner, including in coroutine scopes.
+                        compiler.emit_with_exception_policy(
+                            NOP,
+                            0,
+                            0,
+                            ExceptionPolicy::EXCLUDE_ALWAYS,
+                        )?;
+                    }
+                    // Any later instruction or even a foreign label ends the capture.
+                    // A nested/copy scope cannot provide this body's normal POP record.
+                    let async_for_end_pop = recorder
+                        .origin
+                        .filter(|origin| compiler.assembler.item_count() == origin.end_item_count);
+                    Ok((has_instructions, async_for_end_pop))
+                } else {
+                    compiler.with_control_override(
+                        |control| &mut control.exceptions.prevent_try_exit_inlining,
+                        true,
+                        |compiler| {
+                            compiler
+                                .compile_try_except(statement, TryCompileOptions::NESTED_HANDLER)
+                        },
+                    )?;
+                    Ok((true, None))
+                }
+            },
+        );
+        let name_return_borrow_exit = std::mem::replace(
+            &mut self.control.finally.pending_name_return_borrow_exit,
+            outer_name_return_borrow_exit,
+        );
+        let ((protected_has_instructions, async_for_end_pop), protected_exclusions) =
+            protected_result?;
         let protected_tail_is_nop = self.assembler.last_instruction_is_nop();
         self.assembler.mark(protected_end);
         if terminal
@@ -16876,6 +16953,10 @@ impl Compiler<'_> {
             }
             Ok(())
         })?;
+        if let Some(normal_exit) = name_return_borrow_exit {
+            self.assembler
+                .mark_noncopyable_finally_borrow_barrier(normal_exit, normal_finally_pop_block);
+        }
         self.assembler
             .record_normal_finally_none_prefix(normal_finally_pop_block);
         self.assembler
@@ -22275,6 +22356,45 @@ fn suite_contains_loop_continue(body: &[Stmt]) -> bool {
         Stmt::FunctionDef(_) | Stmt::ClassDef(_) => false,
         _ => false,
     })
+}
+
+/// A callable is loaded before one runtime conditional argument starts branching.
+/// Both value arms rejoin at the discarded call, so its original entry stays nonempty.
+fn cleanup_conditional_argument_has_eager_call_prefix(expression: &Expr) -> bool {
+    let Expr::Call(call) = expression else {
+        return false;
+    };
+    if !(matches!(call.func.as_ref(), Expr::Name(_))
+        || matches!(call.func.as_ref(), Expr::Attribute(attribute)
+            if matches!(attribute.value.as_ref(), Expr::Name(_))))
+        || expression_suspends_current_scope(expression)
+        || call
+            .arguments
+            .keywords
+            .iter()
+            .any(|keyword| keyword.arg.is_none())
+    {
+        return false;
+    }
+    let mut conditional_arguments = 0;
+    call.arguments
+        .args
+        .iter()
+        .chain(call.arguments.keywords.iter().map(|keyword| &keyword.value))
+        .all(|argument| {
+            if let Expr::If(conditional) = argument {
+                conditional_arguments += 1;
+                conditional_arguments == 1
+                    && condition_has_only_runtime_tests(&conditional.test)
+                    && !expression_contains_inline_branch(&conditional.test)
+                    && !expression_contains_inline_branch(&conditional.body)
+                    && !expression_contains_inline_branch(&conditional.orelse)
+            } else {
+                !matches!(argument, Expr::Starred(_))
+                    && !expression_contains_inline_branch(argument)
+            }
+        })
+        && conditional_arguments == 1
 }
 
 // One optional dictionary value rejoins at BUILD_MAP and the cleanup call. The

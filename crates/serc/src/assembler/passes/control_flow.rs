@@ -129,7 +129,11 @@ pub(super) fn is_original_constant_return(graph: &BlockGraph, target: Label) -> 
         return false;
     };
     marker.opcode == NOP
-        && value.opcode == LOAD_CONST
+        // The compiler emits nonnegative u8 literals as LOAD_SMALL_INT before
+        // this pass; CPython's original LOAD_CONST still occupies one CFG slot.
+        && (value.opcode == LOAD_CONST
+            || (value.opcode == crate::target::opcodes::LOAD_SMALL_INT
+                && matches!(value.operand(), Operand::Value(0..=255))))
         && ret.opcode == RETURN_VALUE
         && marker.location.line >= 0
         && marker.location == value.location
@@ -344,6 +348,7 @@ impl OptimizationPipeline {
                 }
                 continue;
             }
+            let had_instructions = graph[block].last_instruction().is_some();
             graph.retain_items(block, |item| match item {
                 Item::Label(label) => {
                     // A label-only unreachable array no longer certifies copy continuity.
@@ -373,6 +378,34 @@ impl OptimizationPipeline {
                     false
                 }
             });
+            if had_instructions {
+                // The unreachable array's instructions were erased above. Record its
+                // original array labels before normalization can attach these labels
+                // to a different live array; keep the original copy plan intact.
+                for item in graph[block].items() {
+                    if let Item::Label(label) = item
+                        && (self
+                            .exception_owner_provenance
+                            .normal_try_copy_blocks
+                            .contains(label)
+                            || self
+                                .exception_owner_provenance
+                                .normal_try_copy_internal_labels
+                                .contains(label)
+                            || self
+                                .exception_owner_provenance
+                                .normal_try_copy_join_origins
+                                .iter()
+                                .any(|(join, origin)| {
+                                    join == label || origin.predecessor == *label
+                                }))
+                    {
+                        self.exception_owner_provenance
+                            .retired_normal_try_copy_labels
+                            .insert(*label);
+                    }
+                }
+            }
             if graph[block].items().is_empty() {
                 empty.insert(block);
             }
@@ -701,6 +734,24 @@ impl OptimizationPipeline {
                 }
             }
         }
+        // A scheduled copy must still observe its original source target.
+        let planned_blocks = self
+            .exception_owner_provenance
+            .normal_try_copy_blocks
+            .iter()
+            .filter(|label| {
+                !self
+                    .exception_owner_provenance
+                    .retired_normal_try_copy_labels
+                    .contains(*label)
+            })
+            .filter_map(|label| graph.label_block(*label))
+            .collect::<FxHashSet<_>>();
+        let planned_sources = instruction_positions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (block, _))| planned_blocks.contains(block).then_some(index))
+            .collect::<FxHashSet<_>>();
         let region_ranges = self
             .exception_regions
             .iter()
@@ -885,7 +936,8 @@ impl OptimizationPipeline {
             instruction_index += 1;
             // Cold ordering settles direction later; a backward-form opcode can still
             // have a forward target here, including an original handler break.
-            if !is_unconditional_jump(instruction.opcode)
+            if planned_sources.contains(&source_index)
+                || !is_unconditional_jump(instruction.opcode)
                 || instruction.jump_policy.always_retains_nop()
             {
                 return;
@@ -1699,6 +1751,21 @@ impl OptimizationPipeline {
                 *shared_entries.entry(*origin).or_default() += 1;
             }
         }
+        let planned_blocks = if finalize_borrow_empty_blocks {
+            FxHashSet::default()
+        } else {
+            self.exception_owner_provenance
+                .normal_try_copy_blocks
+                .iter()
+                .filter(|label| {
+                    !self
+                        .exception_owner_provenance
+                        .retired_normal_try_copy_labels
+                        .contains(*label)
+                })
+                .filter_map(|label| self.graph.label_block(*label))
+                .collect::<FxHashSet<_>>()
+        };
         let graph = &mut self.graph;
         if !finalize_borrow_empty_blocks && !graph.features().has_forward_jump() {
             return;
@@ -1766,6 +1833,10 @@ impl OptimizationPipeline {
                         continue;
                     };
                     if instruction.opcode != JUMP_FORWARD {
+                        previous = Some(position);
+                        continue;
+                    }
+                    if planned_blocks.contains(&block) {
                         previous = Some(position);
                         continue;
                     }
@@ -2308,9 +2379,16 @@ impl OptimizationPipeline {
                 for (offset, item) in graph[block].items().iter().enumerate() {
                     match item {
                         Item::Label(label) => {
-                            if !provenance.normal_try_copy_inline_labels.contains(label)
-                                || entries.contains(label)
-                            {
+                            // A scheduled source can have a physical label immediately
+                            // before its original jump without a new original CFG entry.
+                            // Keep its copied records in the preceding source array.
+                            let inside_original_array = !provenance
+                                .retired_normal_try_copy_labels
+                                .contains(label)
+                                && (provenance.normal_try_copy_inline_labels.contains(label)
+                                    || provenance.normal_try_copy_internal_labels.contains(label)
+                                    || provenance.normal_try_copy_blocks.contains(label));
+                            if !inside_original_array || entries.contains(label) {
                                 component += 1;
                             }
                         }

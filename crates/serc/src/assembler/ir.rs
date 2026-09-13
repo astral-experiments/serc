@@ -209,6 +209,12 @@ impl LocalPolicy {
             | (slots << Self::HIDDEN_EXCEPTION_OWNER_SLOTS_SHIFT);
     }
 
+    /// Removes one known vacancy without changing the local-load policy bits.
+    pub(super) fn remove_hidden_exception_owner_slot(&mut self) {
+        assert!(self.hidden_exception_owner_slots() > 0);
+        self.0 -= 1 << Self::HIDDEN_EXCEPTION_OWNER_SLOTS_SHIFT;
+    }
+
     const fn fused(first: Self, second: Self) -> Self {
         let slots = first
             .hidden_exception_owner_slots()
@@ -532,6 +538,8 @@ impl JumpPolicy {
     const PRESERVE_EXPLICIT_NOP: u16 = 1 << 7;
     const NORMALIZED_CONDITIONAL_BACKEDGE: u16 = 1 << 8;
     const PREVENT_BORROW_THREADING_TARGET: u16 = 1 << 9;
+    const ORIGINAL_EMPTY_JOIN: u16 = 1 << 10;
+    const ORIGINAL_SHARED_EMPTY_JOIN: u16 = 1 << 11;
 
     const SYNTHETIC: Self = Self(Self::PREVENT_SMALL_EXIT_INLINING);
     const DEFAULT: Self = Self(0);
@@ -562,6 +570,12 @@ impl JumpPolicy {
         if first.is_normalized_conditional_backedge() || second.is_normalized_conditional_backedge()
         {
             policy.0 |= Self::NORMALIZED_CONDITIONAL_BACKEDGE;
+        }
+        if first.is_original_empty_join() || second.is_original_empty_join() {
+            policy.0 |= Self::ORIGINAL_EMPTY_JOIN;
+        }
+        if first.is_original_shared_empty_join() || second.is_original_shared_empty_join() {
+            policy.0 |= Self::ORIGINAL_SHARED_EMPTY_JOIN;
         }
         policy
     }
@@ -656,6 +670,22 @@ impl JumpPolicy {
         }
     }
 
+    pub(super) const fn is_original_empty_join(self) -> bool {
+        self.0 & Self::ORIGINAL_EMPTY_JOIN != 0
+    }
+
+    pub(super) fn mark_original_empty_join(&mut self) {
+        self.0 |= Self::ORIGINAL_EMPTY_JOIN;
+    }
+
+    pub(super) const fn is_original_shared_empty_join(self) -> bool {
+        self.0 & Self::ORIGINAL_SHARED_EMPTY_JOIN != 0
+    }
+
+    pub(super) fn mark_original_shared_empty_join(&mut self) {
+        self.0 |= Self::ORIGINAL_SHARED_EMPTY_JOIN;
+    }
+
     fn clear_direct_target_retention(&mut self) {
         if matches!(self.retained_nop(), RetainedJumpNop::DirectTarget) {
             self.0 &= !Self::RETAINED_NOP_MASK;
@@ -668,6 +698,14 @@ impl JumpPolicy {
 
     pub(super) fn retain_redundant_nop_after_threading(&mut self) {
         self.0 |= Self::DEFER_REDUNDANT_REMOVAL | Self::PRESERVE_NOP_AFTER_THREADING;
+    }
+
+    /// Gives an accepted original-join copy plan ownership of its predicted NOP slots.
+    pub(super) fn consume_original_join_copy_prediction(&mut self) {
+        assert!(self.is_original_empty_join());
+        assert!(self.defers_redundant_removal());
+        assert!(self.preserves_nop_after_threading());
+        self.0 &= !(Self::DEFER_REDUNDANT_REMOVAL | Self::PRESERVE_NOP_AFTER_THREADING);
     }
 
     #[cfg(test)]

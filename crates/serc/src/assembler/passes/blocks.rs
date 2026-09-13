@@ -19,6 +19,51 @@ fn has_jump_eval_check(instruction: &Instruction) -> bool {
         || (is_unconditional_jump(instruction.opcode) && instruction.jump_policy.is_interruptible())
 }
 
+/// Propagates lines through copied records in the same original instruction array.
+fn propagate_planned_array_locations(
+    graph: &mut BlockGraph,
+    order: &[BasicBlockId],
+    planned_blocks: &FxHashSet<BasicBlockId>,
+    internal_labels: &FxHashSet<Label>,
+) {
+    for block in order
+        .iter()
+        .copied()
+        .filter(|block| planned_blocks.contains(block))
+    {
+        let mut previous = None;
+        let updates = graph[block]
+            .items()
+            .iter()
+            .enumerate()
+            .filter_map(|(offset, item)| match item {
+                Item::Label(label) => {
+                    if !internal_labels.contains(label) {
+                        previous = None;
+                    }
+                    None
+                }
+                Item::Instruction(instruction) => {
+                    if instruction.location.line >= 0
+                        || instruction.no_location_policy.preserves_location()
+                    {
+                        previous = Some(instruction.location);
+                        None
+                    } else {
+                        previous.map(|location| (ItemPosition::new(block, offset), location))
+                    }
+                }
+            })
+            .collect::<Vec<_>>();
+        for (position, location) in updates {
+            graph
+                .instruction_mut(position)
+                .expect("planned array instruction")
+                .location = location;
+        }
+    }
+}
+
 const WARM_BLOCK: u8 = 1;
 const COLD_BLOCK: u8 = 2;
 
@@ -1921,11 +1966,19 @@ impl OptimizationPipeline {
         if !graph.is_normalized(&self.preserved_block_boundaries) {
             graph.normalize_blocks(&self.preserved_block_boundaries);
         }
-        if !self
+        let active_internal_labels = self
             .exception_owner_provenance
             .normal_try_copy_internal_labels
-            .is_empty()
-        {
+            .iter()
+            .copied()
+            .filter(|label| {
+                !self
+                    .exception_owner_provenance
+                    .retired_normal_try_copy_labels
+                    .contains(label)
+            })
+            .collect::<Vec<_>>();
+        if !active_internal_labels.is_empty() {
             let mut forbidden_entries = self.preserved_block_boundaries.clone();
             forbidden_entries.extend(self.exception_regions.iter().map(|region| region.target));
             forbidden_entries.extend(
@@ -1934,24 +1987,13 @@ impl OptimizationPipeline {
                     .iter()
                     .map(|(label, _)| *label),
             );
-            forbidden_entries.extend(
+            forbidden_entries.extend(active_internal_labels.iter().copied().filter(|label| {
                 self.exception_owner_provenance
-                    .normal_try_copy_internal_labels
-                    .iter()
-                    .copied()
-                    .filter(|label| {
-                        self.exception_owner_provenance
-                            .synchronous_with_setups
-                            .contains(label)
-                    }),
-            );
+                    .synchronous_with_setups
+                    .contains(label)
+            }));
             graph
-                .join_continuation_blocks(
-                    &self
-                        .exception_owner_provenance
-                        .normal_try_copy_internal_labels,
-                    &forbidden_entries,
-                )
+                .join_continuation_blocks(&active_internal_labels, &forbidden_entries)
                 .expect("certified original cleanup array continuations");
         }
         if graph.len() < 2 {
@@ -2123,7 +2165,10 @@ impl OptimizationPipeline {
         }
 
         let mut inline_copies = FxHashMap::<_, Vec<Vec<Item>>>::default();
-        let mut planned_inline_labels = FxHashSet::default();
+        let mut planned_inline_labels = active_internal_labels
+            .iter()
+            .copied()
+            .collect::<FxHashSet<_>>();
         let mut copied_entry_labels = Vec::new();
         let mut copied_exit_or_eval_entry_labels = FxHashSet::default();
         let mut retained_unlocated_join_blocks = FxHashSet::default();
@@ -2157,16 +2202,21 @@ impl OptimizationPipeline {
             .iter()
             .copied()
             .partition(|source| block_has_fallthrough(graph[*source].items()));
+        let retired_labels = &self
+            .exception_owner_provenance
+            .retired_normal_try_copy_labels;
         let planned_blocks = self
             .exception_owner_provenance
             .normal_try_copy_blocks
             .iter()
+            .filter(|label| !retired_labels.contains(*label))
             .filter_map(|label| graph.label_block(*label))
             .collect::<FxHashSet<_>>();
         let planned_steps = self
             .exception_owner_provenance
             .normal_try_copy_steps
             .iter()
+            .filter(|(source, _, _)| !retired_labels.contains(source))
             .map(|(source, target, width)| {
                 (
                     graph.label_block(*source).expect("certified copy source"),
@@ -2175,6 +2225,7 @@ impl OptimizationPipeline {
                 )
             })
             .collect::<Vec<_>>();
+        let mut original_join_marker_donors = Vec::new();
         let mut planned_cursor = 0;
         let mut source_cursor = 0;
         loop {
@@ -2209,44 +2260,12 @@ impl OptimizationPipeline {
                     exit_without_unique_predecessor[block.index()] |=
                         remaining_predecessors[block.index()] > 1 && unlocated_scope_exit;
                 }
-                for block in order
-                    .iter()
-                    .copied()
-                    .filter(|block| planned_blocks.contains(block))
-                {
-                    let mut previous = None;
-                    let updates = graph[block]
-                        .items()
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(offset, item)| match item {
-                            Item::Label(label) => {
-                                if !planned_inline_labels.contains(label) {
-                                    previous = None;
-                                }
-                                None
-                            }
-                            Item::Instruction(instruction) => {
-                                if instruction.location.line >= 0
-                                    || instruction.no_location_policy.preserves_location()
-                                {
-                                    previous = Some(instruction.location);
-                                    None
-                                } else {
-                                    previous.map(|location| {
-                                        (ItemPosition::new(block, offset), location)
-                                    })
-                                }
-                            }
-                        })
-                        .collect::<Vec<_>>();
-                    for (position, location) in updates {
-                        graph
-                            .instruction_mut(position)
-                            .expect("planned array instruction")
-                            .location = location;
-                    }
-                }
+                propagate_planned_array_locations(
+                    graph,
+                    &order,
+                    &planned_blocks,
+                    &planned_inline_labels,
+                );
                 sources.append(&mut conditional_sources);
                 continue;
             };
@@ -2640,9 +2659,32 @@ impl OptimizationPipeline {
             if preserve_unlocated_join_nop {
                 retained_unlocated_join_blocks.insert(source);
             }
+            // CPython copies small exits before threading jumps. The compiler's
+            // original-empty-join certificate survives retargeting even when the
+            // direct-edge line policy is cleared. Current block width alone cannot
+            // prove this: earlier folding may have removed original instructions.
+            let preserve_threaded_join_nop = inline_unprotected_return
+                && target_chain_end == target_position
+                && source_location.line >= 0
+                && graph[source].items().iter().any(|item| {
+                    matches!(item, Item::Label(label)
+                        if self.exception_owner_provenance.block_boundaries.contains(label))
+                })
+                && graph[source]
+                    .items()
+                    .iter()
+                    .filter(|item| matches!(item, Item::Instruction(_)))
+                    .count()
+                    == 1
+                && graph[source].last_instruction().is_some_and(|instruction| {
+                    instruction.jump_policy.is_original_empty_join()
+                        && !instruction.no_location_policy.preserves_location()
+                        && instruction.exception_policy() == ExceptionPolicy::default()
+                });
             let preserve_inlined_jump_nop = planned_copy
                 || (inline_small_exit
                     && (preserve_unlocated_join_nop
+                        || preserve_threaded_join_nop
                         || (source_location.line >= 0
                             && graph[source].last_instruction().is_some_and(|instruction| {
                                 instruction
@@ -2823,6 +2865,41 @@ impl OptimizationPipeline {
                     })
                 },
             ));
+            // CPython labels the original return before copying it. A previous
+            // cleanup copy can leave a hole in the destination's scope fallback;
+            // preserve the complete return target's own fallback inside that hole.
+            // The intact original return certificate excludes cleanup POP_BLOCKs and
+            // internal exception boundaries, whose owners must remain independent.
+            if planned_copy
+                && target_chain_end == target_position
+                && (super::control_flow::is_original_constant_return(graph, target_label)
+                    || super::normal_try_copies::original_local_tuple_return(graph[target].items())
+                        .is_some())
+            {
+                let fallbacks = self
+                    .exception_regions
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, region)| {
+                        region.is_scope_fallback
+                            && region_memberships[*index].contains(&target_position)
+                            && !protected_fragment_origins.contains(index)
+                    })
+                    .map(|(_, region)| *region)
+                    .collect::<Vec<_>>();
+                if !fallbacks.is_empty() {
+                    let copied_end = Label(self.next_label);
+                    self.next_label += 1;
+                    copied.push(Item::Label(copied_end));
+                    copied_exception_regions.extend(fallbacks.into_iter().map(|region| {
+                        ExceptionRegion {
+                            start: copied_label,
+                            end: copied_end,
+                            ..region
+                        }
+                    }));
+                }
+            }
             // A copied fragment only replaces the holes for its own original region.
             // Other enclosing regions still need the copied exclusions even when this
             // cleanup also introduces a separate protected fragment.
@@ -2846,6 +2923,19 @@ impl OptimizationPipeline {
                 let original = *graph[source]
                     .last_instruction()
                     .expect("planned source jump");
+                let original_donor = if planned_copy {
+                    graph[source]
+                        .first_label()
+                        .and_then(|label| {
+                            self.exception_owner_provenance
+                                .normal_try_copy_join_donors
+                                .remove(&label)
+                        })
+                        .filter(|(record, _)| *record == original)
+                        .map(|(_, location)| location)
+                } else {
+                    None
+                };
                 let mut marker = Instruction::synthetic(
                     NOP,
                     Operand::Value(0),
@@ -2860,6 +2950,11 @@ impl OptimizationPipeline {
                 }
                 if !planned_copy {
                     marker.add_pre_fold_extra_instructions(original.pre_fold_extra_instructions());
+                }
+                if let Some(location) = original_donor {
+                    // Keep every copy round unlocated. The unique copied successor
+                    // identifies this original marker after the schedule finishes.
+                    original_join_marker_donors.push((source, copied_label, marker, location));
                 }
                 graph.insert_item(
                     ItemPosition::new(source, position),
@@ -2985,7 +3080,8 @@ impl OptimizationPipeline {
                 }
             }
             if inline_small_exit || inline_no_location_block {
-                if inline_no_location_block && target_chain_end > target_position {
+                if planned_copy || (inline_no_location_block && target_chain_end > target_position)
+                {
                     let copied_positions = copied
                         .iter()
                         .enumerate()
@@ -3006,11 +3102,18 @@ impl OptimizationPipeline {
                         }
                         // A previously expanded cleanup can contain holes in this enclosing
                         // owner. Copy both boundaries with the instructions they delimit.
+                        // Scheduled copies require physically copied endpoints; synthetic
+                        // region-end aliases do not identify an original owner hole.
+                        let exclusion_labels = if planned_copy {
+                            &copied_handler_labels
+                        } else {
+                            &copied_labels
+                        };
                         let inherited = exclusions
                             .iter()
                             .filter_map(|(start, end)| {
-                                let start = *copied_labels.get(start)?;
-                                let end = *copied_labels.get(end)?;
+                                let start = *exclusion_labels.get(start)?;
+                                let end = *exclusion_labels.get(end)?;
                                 (copied_positions[&start] < copied_positions[&end])
                                     .then_some((start, end))
                             })
@@ -3456,6 +3559,34 @@ impl OptimizationPipeline {
             }
         }
 
+        // Location restoration must follow every copy round: locating a join's NOP
+        // earlier can change the eligibility of a later original-array copy. Copies
+        // receive new labels, so this seam certifies only the original jump marker.
+        for (source, successor, mut expected, location) in original_join_marker_donors {
+            let items = graph[source].items();
+            let Some(successor_position) = items
+                .iter()
+                .position(|item| matches!(item, Item::Label(label) if *label == successor))
+            else {
+                continue;
+            };
+            let Some(position) = items[..successor_position]
+                .iter()
+                .rposition(|item| matches!(item, Item::Instruction(_)))
+            else {
+                continue;
+            };
+            let Some(marker) = graph.instruction_mut(ItemPosition::new(source, position)) else {
+                continue;
+            };
+            // The ordinary location writer may have visited this exact marker while
+            // finishing unconditional copies. Every other record field must agree.
+            expected.location = marker.location;
+            if *marker == expected {
+                marker.location = location;
+            }
+        }
+
         if copied_region_exclusions
             .iter()
             .any(|exclusions| !exclusions.is_empty())
@@ -3628,6 +3759,32 @@ impl OptimizationPipeline {
             if exception_handler_blocks[target.index()] {
                 continue;
             }
+            if planned_blocks.contains(&target)
+                && remaining_predecessors[target.index()] > 1
+                && original_entry_has_no_location_donor(
+                    graph[target].items(),
+                    original_location_absence,
+                )
+                && has_shared_cleanup_entry(
+                    graph,
+                    &order,
+                    positions[target.index()],
+                    jump_sources[target.index()]
+                        .iter()
+                        .filter(|source| {
+                            block_has_fallthrough(graph[**source].items())
+                                && block_jump_target(graph[**source].items())
+                                    .and_then(|label| graph.label_block(label))
+                                    == Some(target)
+                        })
+                        .count(),
+                    remaining_predecessors[target.index()],
+                )
+            {
+                // Conditional edges and fallthrough still share this original array.
+                // Its original entry had no line donor before jump threading either.
+                continue;
+            }
             if remaining_predecessors[target.index()] > 1
                 && matches!(
                     graph[target].items().iter().find(|item| matches!(item, Item::Instruction(_))),
@@ -3703,7 +3860,10 @@ impl OptimizationPipeline {
             }
             let copied_exit_needs_location = remaining_predecessors[target.index()] == 1
                 && (predecessors[target.index()] > 1
-                    || retained_unlocated_join_blocks.contains(&target))
+                    || retained_unlocated_join_blocks.contains(&target)
+                    // Scheduled copies restore the original leading jump NOP even
+                    // when its conditional predecessor was already unique.
+                    || planned_blocks.contains(&target))
                 && graph[target].items().iter().find_map(|item| match item {
                     Item::Instruction(instruction) => Some(instruction.location.line < 0),
                     Item::Label(_) => None,
@@ -3814,6 +3974,11 @@ impl OptimizationPipeline {
                 }
             }
         }
+
+        // A unique remaining predecessor can locate the first restored POP or
+        // replaced jump only after copying. Carry that donation through its
+        // original array before NOP compaction, just as for the copied arrays.
+        propagate_planned_array_locations(graph, &order, &planned_blocks, &planned_inline_labels);
 
         let jump_target = |item: &Item| match item {
             Item::Instruction(instruction) => match instruction.operand() {

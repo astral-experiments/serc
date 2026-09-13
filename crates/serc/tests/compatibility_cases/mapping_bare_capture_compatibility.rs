@@ -186,3 +186,68 @@ fn protected_multiple_mapping_captures_keep_longer_rotation_order() {
 "#;
     common::assert_matches_cpython_marshal(source, "multiple_mapping_capture_markers.py");
 }
+
+#[test]
+fn folds_class_capture_rotations_after_unpack() {
+    let source = r#"def single(subject):
+    match subject:
+        case {"value": str(value)}:
+            return value
+    return None
+
+
+def pair(subject):
+    match subject:
+        case {"left": str(left), "right": int(right)}:
+            return left, right
+    return None
+
+
+def pair_as(subject):
+    match subject:
+        case {"left": str() as left, "right": str() as right}:
+            return left, right
+    return None
+"#;
+    common::assert_matches_cpython_marshal(source, "mapping_class_capture_rotation.py");
+}
+
+#[test]
+fn folds_nested_mapping_capture_rotations_with_line_boundaries() {
+    let source = r#"def target(subject):
+    match subject:
+        case {"left": {"value": left}, "right": {"value": right}}:
+            return left, right
+    return None
+
+
+def different_cleanup_lines(left, right):
+    match left, right:
+        case (
+            {"value": str(first)},
+            {
+                "value": str(second),
+                "extra": str(third),
+            },
+        ):
+            return first, second, third
+    return None
+"#;
+    common::assert_matches_cpython_marshal(source, "nested_mapping_capture_rotation.py");
+}
+
+#[test]
+fn folds_sequence_capture_rotations_after_unpack() {
+    let source = r#"def target(subject):
+    match subject:
+        case {
+            "first": str(first),
+            "second": str(second),
+            "third": str(third),
+            "last": [str(last)],
+        } if first and last:
+            return first, second, third, last
+    return None
+"#;
+    common::assert_matches_cpython_marshal(source, "mapping_sequence_capture_rotation.py");
+}

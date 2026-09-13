@@ -1,8 +1,8 @@
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::super::{
-    Instruction, Item, NOP, Operand, POP_TOP, STORE_FAST, SWAP, ends_scope,
-    single_capture_cleanup_vacancies,
+    Instruction, Item, NOP, Operand, POP_TOP, STORE_FAST, SWAP, UNPACK_SEQUENCE, ends_scope,
+    single_capture_cleanup_vacancies, unpacked_capture_cleanup,
 };
 use crate::assembler::OptimizationPipeline;
 use crate::assembler::block_graph::{BlockGraph, ItemPosition};
@@ -64,12 +64,14 @@ impl OptimizationPipeline {
     /// This is the first half of CPython's `swaptimize` pass. Reconstructing the
     /// permutation from the end of the run guarantees that the replacement fits
     /// in the original instruction slots.
-    pub(in crate::assembler) fn optimize_swap_runs(&mut self) -> Vec<Vec<ItemPosition>> {
+    pub(in crate::assembler) fn optimize_swap_runs(
+        &mut self,
+    ) -> (Vec<Vec<ItemPosition>>, FxHashSet<ItemPosition>) {
         const VISITED: usize = usize::MAX;
 
         let graph = &self.graph;
         if !graph.features().has_swap() {
-            return Vec::new();
+            return (Vec::new(), FxHashSet::default());
         }
         let mut block_labels = FxHashSet::default();
         for item in graph.iter_items() {
@@ -86,6 +88,31 @@ impl OptimizationPipeline {
         let blocks = graph.partition_positions(&block_labels, |instruction| {
             !matches!(instruction.operand(), Operand::Value(_)) || ends_scope(instruction.opcode)
         });
+        // Admit unpacked cleanups from their complete original partition before any swap
+        // run is rewritten. A newly simplified suffix cannot certify an emitted owner slot.
+        let mut unpacked_capture_swaps = FxHashSet::default();
+        for block in &blocks {
+            if !block.iter().any(|position| {
+                matches!(graph.item(*position), Item::Instruction(instruction)
+                    if instruction.opcode == UNPACK_SEQUENCE
+                        && matches!(instruction.operand(), Operand::Value(0 | 1)))
+            }) {
+                continue;
+            }
+            let items = block
+                .iter()
+                .map(|position| *graph.item(*position))
+                .collect::<Vec<_>>();
+            for index in 0..items.len() {
+                if let Some(rotation) = unpacked_capture_cleanup(&items[index..]) {
+                    unpacked_capture_swaps.extend(
+                        block[index + 1..index + 1 + rotation.swap_count]
+                            .iter()
+                            .copied(),
+                    );
+                }
+            }
+        }
         let graph = &mut self.graph;
         for block in &blocks {
             let instruction_positions = block
@@ -183,7 +210,7 @@ impl OptimizationPipeline {
                 position = run_end;
             }
         }
-        blocks
+        (blocks, unpacked_capture_swaps)
     }
 
     /// Applies stack swaps statically by reordering local stores and pops.
@@ -191,7 +218,10 @@ impl OptimizationPipeline {
     /// This is the `apply_static_swaps` half of CPython's `swaptimize` pass and
     /// must run before adjacent local stores are fused. Reverse traversal applies
     /// consecutive swaps from right to left, matching CPython's per-run handoff.
-    pub(in crate::assembler) fn apply_static_swaps(&mut self, blocks: Vec<Vec<ItemPosition>>) {
+    pub(in crate::assembler) fn apply_static_swaps(
+        &mut self,
+        blocks: (Vec<Vec<ItemPosition>>, FxHashSet<ItemPosition>),
+    ) {
         fn swappable(instruction: &Instruction) -> bool {
             matches!(instruction.opcode, POP_TOP | STORE_FAST)
         }
@@ -229,7 +259,39 @@ impl OptimizationPipeline {
             None
         }
 
+        let (blocks, unpacked_capture_swaps) = blocks;
+        let join_origins =
+            std::mem::take(&mut self.exception_owner_provenance.normal_try_copy_join_origins);
+        let retired_labels = &self
+            .exception_owner_provenance
+            .retired_normal_try_copy_labels;
         let graph = &mut self.graph;
+        // Resolve original labels only within this pass. A saved item offset could
+        // otherwise name a different store after earlier graph rewrites.
+        let join_stores = graph
+            .order()
+            .windows(2)
+            .filter_map(|pair| {
+                let label = graph[pair[1]].first_label()?;
+                if retired_labels.contains(&label) {
+                    return None;
+                }
+                let origin = *join_origins.get(&label)?;
+                if retired_labels.contains(&origin.predecessor)
+                    || graph[pair[0]].first_label() != Some(origin.predecessor)
+                    || graph[pair[0]].last_instruction() != Some(&origin.store)
+                    || !matches!(graph[pair[1]].items(), [Item::Label(head), Item::Instruction(jump)]
+                        if *head == label && *jump == origin.jump)
+                {
+                    return None;
+                }
+                let offset = graph[pair[0]]
+                    .items()
+                    .iter()
+                    .rposition(|item| matches!(item, Item::Instruction(_)))?;
+                Some((ItemPosition::new(pair[0], offset), (label, origin)))
+            })
+            .collect::<FxHashMap<_, _>>();
         for positions in blocks {
             let mut index = positions.len();
             while index > 0 {
@@ -275,7 +337,10 @@ impl OptimizationPipeline {
                 };
                 let first_store = stored_local(&first_instruction);
                 let last_store = stored_local(&last_instruction);
-                if first_store.is_none() && last_store.is_none() {
+                if first_store.is_none()
+                    && last_store.is_none()
+                    && !unpacked_capture_swaps.contains(&positions[index])
+                {
                     // A complete conditional-fallthrough capture rotation proves both pop
                     // records are identical and its compacted-slot count is known at emission.
                     let rotation = index
@@ -309,6 +374,20 @@ impl OptimizationPipeline {
                     && last_instruction.opcode == STORE_FAST
                     && !last_instruction.local_policy.may_store_null()
                 {
+                    if let Some((label, origin)) = join_stores.get(&positions[last])
+                        && origin.store == last_instruction
+                        && graph.label_block(*label).is_some_and(|block| {
+                            matches!(graph[block].items(), [Item::Label(head), Item::Instruction(jump)]
+                                if *head == *label && *jump == origin.jump)
+                        })
+                    {
+                        // The original assignment store really moves in this exchange.
+                        // Its adjacent selected join stays unlocated through copying;
+                        // only the original replacement NOP receives this donor later.
+                        self.exception_owner_provenance
+                            .normal_try_copy_join_donors
+                            .insert(*label, (origin.jump, last_instruction.location));
+                    }
                     // Native resolves unlocated successors before exchanging the target
                     // store with a comprehension restore. Retain that original origin.
                     for position in &positions[last + 1..] {
