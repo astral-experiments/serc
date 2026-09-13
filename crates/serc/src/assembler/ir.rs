@@ -1359,9 +1359,10 @@ pub(super) enum UnoptimizedCode {
     },
 }
 
-/// A call that keeps an original normal-cleanup entry nonempty.
+/// An exact instruction that keeps an original normal-cleanup entry nonempty.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct BorrowCleanupCall {
+    pub(super) opcode: Opcode,
     pub(super) argument: u32,
     pub(super) location: SourceLocation,
 }

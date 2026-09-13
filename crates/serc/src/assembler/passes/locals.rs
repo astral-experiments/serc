@@ -26,7 +26,7 @@ use crate::assembler::block_graph::ItemMut;
 use crate::assembler::ir::{ThreadedBorrowEntries, ThreadedBorrowSnapshot};
 use crate::target::{
     is_unconditional_jump,
-    opcodes::{CALL, END_FOR},
+    opcodes::{CALL, CALL_KW, END_FOR, GET_AWAITABLE},
 };
 
 /// Original block entries retained for CPython's final borrowing traversal.
@@ -2211,8 +2211,31 @@ impl OptimizationPipeline {
                             .filter(|pair| pair[0].opcode == CALL && pair[1].opcode == POP_TOP)
                             .nth(1)
                             .is_some();
-                    for (index, instruction) in instructions.iter().enumerate() {
-                        if instruction.opcode != CALL || instruction.location.line < 0 {
+                    // Preserve any existing CALL witness before considering the
+                    // authored-break-only alternatives later in the same original block.
+                    let candidates = instructions
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, instruction)| instruction.opcode == CALL)
+                        .chain(
+                            instructions
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, instruction)| instruction.opcode != CALL),
+                        );
+                    for (index, instruction) in candidates {
+                        // Keyword calls and plain await entry operations also keep
+                        // this original array nonempty. Only the captured authored-break
+                        // route may use these witnesses; ordinary call routes stay unchanged.
+                        let authored_finally_witness =
+                            self.borrow_finally_entries.contains_key(&label)
+                                && !scope_exit
+                                && (instruction.opcode == CALL_KW
+                                    || (instruction.opcode == GET_AWAITABLE
+                                        && instruction.operand() == Operand::Value(0)));
+                        if (instruction.opcode != CALL && !authored_finally_witness)
+                            || instruction.location.line < 0
+                        {
                             continue;
                         }
                         let Operand::Value(argument) = instruction.operand() else {
@@ -2249,6 +2272,7 @@ impl OptimizationPipeline {
                             .collect::<Vec<_>>();
                         return Some((
                             BorrowCleanupCall {
+                                opcode: instruction.opcode,
                                 argument,
                                 location: instruction.location,
                             },
@@ -2263,7 +2287,10 @@ impl OptimizationPipeline {
         let mut finally_entries = FxHashMap::default();
         for (label, entry) in calls {
             if let Some(policy) = self.borrow_loop_exit_blocks.get_mut(&label) {
-                policy.cleanup_call = entry.as_ref().map(|(call, _)| *call);
+                policy.cleanup_call = entry
+                    .as_ref()
+                    .filter(|(call, _)| call.opcode == CALL)
+                    .map(|(call, _)| *call);
             }
             if self.borrow_finally_entries.contains_key(&label) {
                 let (call, aliases) =
@@ -2891,6 +2918,7 @@ impl OptimizationPipeline {
                                                 Item::Instruction(instruction) => {
                                                     at_target
                                                         && instruction.opcode == CALL
+                                                        && call.opcode == CALL
                                                         && instruction.operand()
                                                             == Operand::Value(call.argument)
                                                         && instruction.location == call.location
@@ -2928,6 +2956,7 @@ impl OptimizationPipeline {
                                                 Item::Instruction(instruction) => {
                                                     at_target
                                                         && instruction.opcode == CALL
+                                                        && call.opcode == CALL
                                                         && instruction.operand()
                                                             == Operand::Value(call.argument)
                                                         && instruction.location == call.location
@@ -3022,7 +3051,8 @@ impl OptimizationPipeline {
                                                             }
                                                             Item::Instruction(instruction) => {
                                                                 at_target
-                                                                    && instruction.opcode == CALL
+                                                                    && instruction.opcode
+                                                                        == call.opcode
                                                                     && instruction.operand()
                                                                         == Operand::Value(
                                                                             call.argument,

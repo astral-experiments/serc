@@ -8593,10 +8593,14 @@ impl Compiler<'_> {
     /// Counts the original `POP_BLOCK` records before a direct continued finalizer.
     fn continued_finally_pop_blocks(&self, context: LoopContext) -> usize {
         // Each ordinary try and the single finalizer contribute one original record.
-        // A manager, handler, iterator, or pending exit would interleave other cleanup.
+        // A manager, handler, or pending exit would interleave other cleanup.
+        // Continue leaves the target while or ordinary for loop itself active.
         if !self.context.target_specific_rules_enabled()
             || self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) != CO_COROUTINE
-            || context.iterator_cleanup != IteratorCleanup::None
+            || !matches!(
+                context.iterator_cleanup,
+                IteratorCleanup::None | IteratorCleanup::Sync
+            )
             || context.exception_region_depth != 0
             || !self.control.withs.active_with_exits.is_empty()
             || !self.control.exceptions.active_exception_handlers.is_empty()
@@ -8626,6 +8630,10 @@ impl Compiler<'_> {
         if finally.loop_depth != self.control.loops.contexts.len()
             || finally.exception_region_depth != context.exception_region_depth
             || matches!(finally.body.as_slice(), [Stmt::Pass(_)])
+            // Ordinary-for copies with nested cleanup or folded selectors retain their
+            // separate original-slot pipeline until copied-tail lowering supports them.
+            || (context.iterator_cleanup == IteratorCleanup::Sync
+                && !copied_finally_tail_can_inline_continue(&finally.body))
         {
             return 0;
         }
@@ -23729,6 +23737,12 @@ fn try_has_conditional_shared_loop_exit(statement: &Stmt) -> bool {
     }
     let direct_expression =
         normal_exit.len() == 1 && matches!(final_if.body.as_slice(), [Stmt::Expr(_)]);
+    // The shared exit copies the backedge, not the preceding straight-line body.
+    // Several statements therefore retain the same condition-fallthrough copy.
+    let linear_else_body = normal_exit.len() == 1
+        && !statement.is_star
+        && final_if.body.len() > 1
+        && suite_has_linear_borrow_fallthrough(&final_if.body);
     let nested_condition = normal_exit.len() > 1
         && !statement.is_star
         && has_direct_break_handler(statement)
@@ -23739,7 +23753,7 @@ fn try_has_conditional_shared_loop_exit(statement: &Stmt) -> bool {
                     && early_condition_truthiness(&statement.test).is_none()
                     && !suite_terminates(&statement.body)
         );
-    direct_expression || nested_condition
+    direct_expression || linear_else_body || nested_condition
 }
 
 #[cfg(test)]

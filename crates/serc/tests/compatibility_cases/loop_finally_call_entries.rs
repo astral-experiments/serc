@@ -160,3 +160,61 @@ fn matches_cpython_nested_setup_finally_break_entries() {
         common::assert_matches_cpython_marshal(&source, &format!("nested_setup_finally_{name}.py"));
     }
 }
+
+#[test]
+fn matches_cpython_normal_finally_authored_break_await_keyword() {
+    let source = r"async def target(queue, finished, pending, gather, task):
+    try:
+        while True:
+            if not pending:
+                if finished and not pending:
+                    break
+                item = await queue.get()
+                pending.append(item)
+                continue
+            item = pending.pop()
+            yield item
+    except Exception:
+        task.cancel()
+        raise
+    finally:
+        await gather(task, return_exceptions=True)
+        if pending:
+            await gather(*pending, return_exceptions=True)
+";
+    common::assert_matches_cpython_marshal(
+        source,
+        "normal_finally_authored_break_await_keyword.py",
+    );
+}
+
+#[test]
+fn matches_cpython_normal_finally_authored_break_await_name_with() {
+    let source = r"async def target(manager, queue, cleanup, record):
+    with manager as token:
+        total = 0
+        try:
+            while True:
+                if total == 0:
+                    item = await queue.get()
+                else:
+                    item = await queue.get()
+                if isinstance(item, Exception):
+                    raise item
+                if item is None:
+                    break
+                total += 1
+                yield item
+        except Exception:
+            record(token)
+            raise
+        finally:
+            await cleanup
+        fresh = total + 1
+        record(token, total, fresh)
+";
+    common::assert_matches_cpython_marshal(
+        source,
+        "normal_finally_authored_break_await_name_with.py",
+    );
+}

@@ -957,6 +957,11 @@ impl OptimizationPipeline {
                 return;
             };
             let original_target = target;
+            let authored_break_copy_nop = instruction.fusion_policy.is_authored_break()
+                && instruction.opcode == JUMP_FORWARD
+                && instruction
+                    .jump_policy
+                    .retains_nop_for(instruction.operand());
             let original_borrow_route = instruction
                 .initial_borrow_jump_target()
                 .and_then(|target| self.borrow_threaded_jump_targets.get(&target).copied());
@@ -973,6 +978,7 @@ impl OptimizationPipeline {
             let mut backward_form_interruptible =
                 backward_form && (instruction.opcode == JUMP_BACKWARD || interruptible);
             let mut threaded_jump_count = 0_u8;
+            let mut crosses_normal_try_exit = false;
             for _ in 0..jump_target_count {
                 let Some((
                     next_operand,
@@ -983,7 +989,7 @@ impl OptimizationPipeline {
                     next_fallthrough_barrier,
                     next_interruptible,
                     next_retains_nop,
-                    _next_normal_try_exit,
+                    next_normal_try_exit,
                 )) = jump_targets
                     .get(usize::try_from(target.0).expect("label index fits in usize"))
                     .copied()
@@ -1006,6 +1012,7 @@ impl OptimizationPipeline {
                 }
                 operand = next_operand;
                 threaded_jump_count = threaded_jump_count.saturating_add(1);
+                crosses_normal_try_exit |= next_normal_try_exit;
                 crosses_empty_block |= next_empty_block;
                 crosses_fallthrough_barrier |= next_fallthrough_barrier;
                 interruptible |= next_interruptible;
@@ -1050,6 +1057,17 @@ impl OptimizationPipeline {
                 // Threading through JUMP preserves its eval-breaker check, including when
                 // another synthetic cleanup edge supplies the final target.
                 instruction.jump_policy.mark_interruptible();
+            }
+            if authored_break_copy_nop
+                && threaded_jump_count == 1
+                && crosses_normal_try_exit
+                && matches!(operand, Operand::Forward(_))
+                && !instruction.jump_policy.is_interruptible()
+            {
+                // A break's direct copy request survives the original POP_BLOCK/JUMP
+                // exit. The small-exit copier still decides whether the target fits,
+                // and gives the copied NOP this break's own location and exit owner.
+                instruction.jump_policy.retain_nop_for_direct_target();
             }
             if let Some(target_index) = copied_owner
                 && region_ranges

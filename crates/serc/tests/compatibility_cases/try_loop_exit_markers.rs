@@ -126,3 +126,75 @@ fn matches_cpython_for_else_cleanup_for_without_else_control() {
         "for_without_else_control.py",
     );
 }
+
+#[test]
+fn matches_cpython_protected_while_breaks_before_small_return() {
+    for (filename, source) in [
+        (
+            "protected_while_one_break_async_control.py",
+            r"async def probe(fetch, remaining):
+    collected = []
+    cursor = None
+    try:
+        while True:
+            page = await fetch(cursor)
+            collected.extend(page.items)
+            if remaining is not None:
+                remaining -= len(page.items)
+            cursor = page.next_cursor
+            if cursor is None:
+                break
+    except Exception as error:
+        report(error)
+        return []
+    return collected
+",
+        ),
+        (
+            "protected_while_two_breaks_async.py",
+            r"async def probe(fetch, remaining):
+    collected = []
+    cursor = None
+    try:
+        while True:
+            page = await fetch(cursor)
+            collected.extend(page.items)
+            if remaining is not None:
+                remaining -= len(page.items)
+                if remaining <= 0:
+                    break
+            cursor = page.next_cursor
+            if cursor is None:
+                break
+    except Exception as error:
+        report(error)
+        return []
+    return collected
+",
+        ),
+        (
+            "protected_while_two_breaks_sync.py",
+            r"def probe(fetch):
+    collected = []
+    cursor = None
+    try:
+        while True:
+            page = fetch(cursor)
+            if page.items:
+                collected.extend(page.items)
+                if page.has_more:
+                    cursor = page.next_cursor
+                else:
+                    break
+            else:
+                break
+    except Exception as error:
+        report(error)
+        return []
+    return collected
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

@@ -247,3 +247,67 @@ fn preserves_original_linear_try_pop_slot_after_compaction() {
         assert_matches_cpython_marshal(&source, filename);
     }
 }
+
+#[test]
+fn preserves_shared_try_else_backedge_after_linear_statements() {
+    for (filename, source) in [
+        (
+            "try_else_multi_statement_shared_backedge.py",
+            r"async def probe(call, collect, state, clock):
+    while True:
+        if state.done():
+            return
+        started = clock()
+        try:
+            await call()
+        except Error as error:
+            if collect:
+                elapsed = clock() - started
+                state.latencies.append(elapsed)
+                if error.code():
+                    state.timeouts += 1
+                else:
+                    state.errors += 1
+        except TimeoutError:
+            if collect:
+                elapsed = clock() - started
+                state.latencies.append(elapsed)
+                state.timeouts += 1
+        else:
+            if collect:
+                elapsed = clock() - started
+                state.latencies.append(elapsed)
+                state.successes += 1
+",
+        ),
+        (
+            "try_else_single_expression_backedge_control.py",
+            r"async def probe(call, collect, state, clock):
+    while True:
+        if state.done():
+            return
+        started = clock()
+        try:
+            await call()
+        except Error as error:
+            if collect:
+                elapsed = clock() - started
+                state.latencies.append(elapsed)
+                if error.code():
+                    state.timeouts += 1
+                else:
+                    state.errors += 1
+        except TimeoutError:
+            if collect:
+                elapsed = clock() - started
+                state.latencies.append(elapsed)
+                state.timeouts += 1
+        else:
+            if collect:
+                state.record_success()
+",
+        ),
+    ] {
+        assert_matches_cpython_marshal(source, filename);
+    }
+}
