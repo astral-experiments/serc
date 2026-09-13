@@ -65,3 +65,37 @@ def multi_statement_terminal(items, low, high, out):
 ";
     common::assert_matches_cpython_marshal(source, "loop_tail_chained_compare_returns.py");
 }
+
+#[test]
+fn matches_cpython_marshal_for_final_elif_chained_compare() {
+    common::assert_matches_cpython_marshal(
+        r"def probe(items, out):
+    for value in items:
+        if 10 <= value < 20:
+            out[1] += 1
+    return out
+",
+        "loop_bare_chained_compare_control.py",
+    );
+    common::assert_matches_cpython_marshal(
+        r"def probe(items, out):
+    for value in items:
+        if 0 <= value < 10:
+            out[0] += 1
+        elif 10 <= value < 20:
+            out[1] += 1
+    return out
+",
+        "loop_final_elif_chained_compare.py",
+    );
+    common::assert_matches_cpython_marshal(
+        r"for value in items:
+    if 0 <= value < 10:
+        out[0] += 1
+    elif 10 <= value < 20:
+        out[1] += 1
+finish(out)
+",
+        "module_final_elif_chained_compare.py",
+    );
+}

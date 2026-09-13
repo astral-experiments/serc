@@ -9719,10 +9719,22 @@ impl Compiler<'_> {
                     return Ok(LoopBackedge::Emitted);
                 }
                 let body_label = self.assembler.label();
-                // Chained comparisons retain a separate cleanup join before the loop edge.
-                // Keep their generic Boolean join until that loop-tail layout is modeled;
-                // ordinary short-circuit operands normalize directly against the backedge.
-                if split_short_circuit && !expression_contains_chained_comparison(test) {
+                // A direct final chain keeps separate success and cleanup arrays, as
+                // a bare loop-tail chain does. Compound and non-final branch layouts
+                // retain their existing routes.
+                if !non_final_branch
+                    && self.control.generators.generator_region_start.is_none()
+                    && let Expr::Compare(comparison) = test
+                    && comparison.ops.len() > 1
+                {
+                    self.compile_loop_tail_chained_condition(
+                        comparison,
+                        restart,
+                        body_label,
+                        false,
+                        matches!(body, [Stmt::Return(_)]),
+                    )?;
+                } else if split_short_circuit && !expression_contains_chained_comparison(test) {
                     self.compile_loop_tail_condition(test, true, body_label, restart)?;
                 } else {
                     self.compile_loop_tail_condition_atom(test, true, body_label, restart)?;
