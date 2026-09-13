@@ -434,3 +434,106 @@ fn matches_cpython_comprehension_restore_without_retained_setup() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_normal_finally_owner_after_comprehension_restore() {
+    for (filename, source) in [
+        (
+            "normal_finally_dictcomp_restore_prefix.py",
+            r"def f(resource, pairs, sink):
+    try:
+        mapped = {str(key): int(value) for key, value in pairs}
+        result = third(second(first(mapped)))
+    finally:
+        if resource is not None:
+            resource.close()
+    sink(result)
+",
+        ),
+        (
+            "normal_finally_dictcomp_local_call_control.py",
+            r"def f(resource, pairs, sink, first, second, third):
+    try:
+        mapped = {str(key): int(value) for key, value in pairs}
+        result = third(second(first(mapped)))
+    finally:
+        if resource is not None:
+            resource.close()
+    sink(result)
+",
+        ),
+        (
+            "normal_finally_global_call_folds.py",
+            r"def f(resource, value):
+    try:
+        result = third(second(first(value)))
+    finally:
+        if resource is not None:
+            resource.close()
+    consume(result)
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn matches_cpython_finally_return_owner_before_original_nop() {
+    for (filename, source) in [
+        (
+            "finally_return_multiline_global_print_prefix.py",
+            r#"def target(options, path, value):
+    try:
+        if options.skip:
+            return 0
+        result = run(
+            value,
+            mode=options.mode,
+            enabled=options.enabled,
+        )
+        print(f"output={result.output}")
+        print(f"details={result.details}")
+        print(f"report={result.report}")
+        print(f"url={result.url}")
+        print(f"manifest={result.manifest}")
+        print(f"count={result.count}")
+        print(f"average={result.average}")
+        return 0
+    finally:
+        if not options.keep:
+            try:
+                path.unlink(missing_ok=True)
+                path.parent.rmdir()
+            except OSError:
+                pass
+"#,
+        ),
+        (
+            "finally_return_global_print_prefix.py",
+            r#"def target(options, path, value):
+    try:
+        if options.skip:
+            return 0
+        result = run(value, mode=options.mode, enabled=options.enabled)
+        print(f"output={result.output}")
+        print(f"details={result.details}")
+        print(f"report={result.report}")
+        print(f"url={result.url}")
+        print(f"manifest={result.manifest}")
+        print(f"count={result.count}")
+        print(f"average={result.average}")
+        return 0
+    finally:
+        if not options.keep:
+            try:
+                path.unlink(missing_ok=True)
+                path.parent.rmdir()
+            except OSError:
+                pass
+"#,
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

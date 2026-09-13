@@ -38,6 +38,8 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) original_primitive_condition_boundaries: Vec<Instruction>,
     // Authored normal exits from synchronous inlined comprehensions.
     pub(super) original_comprehension_normal_exits: Vec<(Label, Instruction)>,
+    // Exact final normal restore, after its fusion policies are complete.
+    pub(super) comprehension_restore_owner_prefixes: Vec<(Label, Instruction)>,
     pub(super) retired_comprehension_normal_entries: FxHashSet<Label>,
     pub(super) synchronous_with_setups: FxHashSet<Label>,
     pub(super) removed_pop_block_boundaries: FxHashSet<Label>,
@@ -1708,6 +1710,36 @@ impl LayoutAssembler {
                 }
             }
         }
+        let comprehension_restore_prefixes = self
+            .exception_owner_provenance
+            .comprehension_restore_owner_prefixes
+            .iter()
+            .filter_map(|(entry, restore)| {
+                if self
+                    .exception_owner_provenance
+                    .retired_comprehension_normal_entries
+                    .contains(entry)
+                    || restore.exception_policy() != super::ExceptionPolicy::NoneUnchanged
+                    || restore.local_policy.hidden_exception_owner_slots() != 0
+                    || restore.pre_fold_extra_instructions() != 0
+                    || self
+                        .items
+                        .iter()
+                        .filter(|item| **item == Item::Label(*entry))
+                        .count()
+                        != 1
+                {
+                    return None;
+                }
+                let start = *label_positions.get(entry)?;
+                let mut matches = indexed_instructions
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, instruction)| ***instruction == *restore);
+                let (index, _) = matches.next()?;
+                (index >= start && matches.next().is_none()).then_some((index, start))
+            })
+            .collect::<FxHashMap<_, _>>();
         let retained_setup_nops = self.retained_setup_nops(&label_positions);
         let retained_setup_null_markers =
             self.retained_setup_null_markers(&label_positions, &jump_targets, &retained_setup_nops);
@@ -2342,6 +2374,16 @@ impl LayoutAssembler {
                     {
                         retained_owned_suffix = None;
                         source_owned_prefix = None;
+                    }
+                    // A completed normal restore supplies a protected suffix within its
+                    // original array. Static SWAP elimination may move this exact record;
+                    // start after it, beyond any hidden slot transferred to an earlier store.
+                    if owner_history_exact
+                        && source_owned_prefix.is_none()
+                        && comprehension_restore_prefixes.get(&instruction_index)
+                            == Some(&original_array_start)
+                    {
+                        source_owned_prefix = Some((instruction_index + 1, tail));
                     }
                     if matches!(
                         instruction.exception_policy().owner(),
@@ -3500,6 +3542,50 @@ impl LayoutAssembler {
                                 );
                             }
                         }
+                    }
+                    // Before the captured authored-return slot, an appended marker can
+                    // reuse the uniformly protected prefix. The retained POP remains NULL.
+                    if instruction.opcode == NOT_TAKEN
+                        && owner_history_exact
+                        && tail.insertions == 0
+                        && tail.late_removals == 0
+                        && tail.post_compaction_fusions == 0
+                        && instruction.exception_policy().exclusion()
+                            == super::ExceptionExclusion::None
+                        && matches!(
+                            instruction.exception_policy().owner(),
+                            NormalizedExceptionOwner::Present
+                                | NormalizedExceptionOwner::DynamicCondition
+                        )
+                        && owners
+                            .get(&instruction_index)
+                            .is_none_or(|decision| !decision.definitive)
+                        && let Some((array, pop, slot, region)) = early_return_nop_slot
+                        && original_array_start == array
+                        && pop < instruction_index
+                        && instruction_index < slot
+                        && self.uniform_exception_owner(array, pop, &label_positions)
+                            == Some(region)
+                        && indexed_instructions[array..pop].iter().all(|instruction| {
+                            instruction.exception_policy().exclusion()
+                                == super::ExceptionExclusion::None
+                                && instruction.exception_policy().owner()
+                                    == NormalizedExceptionOwner::Unchanged
+                                && instruction.local_policy.hidden_exception_owner_slots() == 0
+                                && instruction.pre_fold_extra_instructions() == 0
+                                && instruction.no_location_policy.borrow_fallthrough()
+                                    != super::BorrowFallthrough::Barrier
+                        })
+                    {
+                        owners.insert(
+                            instruction_index,
+                            ExceptionOwnerDecision {
+                                has_owner: true,
+                                source_region: Some(region),
+                                definitive: true,
+                                override_existing: true,
+                            },
+                        );
                     }
                     // Early compaction keeps this exact authored return NOP in its old
                     // array cell. The adjacent retained POP is NULL and is never included.

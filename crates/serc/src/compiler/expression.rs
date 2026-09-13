@@ -4025,6 +4025,10 @@ impl Compiler<'_> {
             }
             // CPython converts STORE_FAST_MAYBE_NULL only after inserting superinstructions.
             self.assembler.prevent_last_instruction_fusion();
+            if !discard_result && generators.iter().all(|generator| !generator.is_async) {
+                self.assembler
+                    .record_comprehension_restore_owner_prefix(normal_cleanup);
+            }
         }
         restore_temporary_scopes(self);
 

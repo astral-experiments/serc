@@ -3990,6 +3990,16 @@ impl Assembler {
             .push((entry, jump));
     }
 
+    /// Anchors the protected continuation after an original synchronous normal restore.
+    pub(crate) fn record_comprehension_restore_owner_prefix(&mut self, entry: Label) {
+        let restore =
+            *self.required_last_instruction_mut("recording a normal comprehension restore");
+        assert_eq!(restore.opcode, STORE_FAST);
+        self.exception_owner_provenance
+            .comprehension_restore_owner_prefixes
+            .push((entry, restore));
+    }
+
     /// Retains a folded condition's selected entry for borrowed-reference analysis.
     pub(crate) fn record_folded_condition_borrow_boundary(&mut self, label: Label) {
         self.exception_owner_provenance

@@ -14257,6 +14257,16 @@ impl Compiler<'_> {
                                 }))
                     }
                     Stmt::With(statement) => !suite_terminates(&statement.body),
+                    // A trailing for loop joins its breaks with iterator exhaustion before
+                    // the handler's source-less cleanup. Copy that cleanup before assigning
+                    // each predecessor's location, as for other original compound joins.
+                    Stmt::For(tail) => {
+                        handler.name.is_none()
+                            && !tail.is_async
+                            && tail.orelse.is_empty()
+                            && suite_contains_loop_break(&tail.body)
+                            && !suite_contains_loop_break_with_finally(&tail.body)
+                    }
                     Stmt::If(tail) => {
                         (tail.elif_else_clauses.is_empty()
                             && matches!(tail.body.last(), Some(Stmt::Try(nested))

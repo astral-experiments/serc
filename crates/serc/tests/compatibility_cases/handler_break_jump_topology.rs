@@ -284,3 +284,38 @@ fn matches_cpython_call_constant_and_pass_original_block() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_break_from_handler_tail_for_loop() {
+    for (filename, source) in [
+        (
+            "handler_tail_for_break_import_fallback.py",
+            r"async def f(items, predicate):
+    try:
+        from example import run
+    except ImportError:
+        for item in items:
+            if predicate(item):
+                observe(item)
+                break
+    from example import run
+    return await run()
+",
+        ),
+        (
+            "handler_tail_for_without_break_control.py",
+            r"async def f(items, predicate):
+    try:
+        from example import run
+    except ImportError:
+        for item in items:
+            if predicate(item):
+                observe(item)
+    from example import run
+    return await run()
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
