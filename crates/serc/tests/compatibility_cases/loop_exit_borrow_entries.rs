@@ -467,3 +467,42 @@ fn assert_nested_async_break_exit_control(body: &str) {
     );
     common::assert_matches_cpython_marshal(&source, "nested_async_break_exit_controls.py");
 }
+
+#[test]
+fn protected_async_final_elif_break_keeps_following_loads_owned() {
+    common::assert_matches_cpython_marshal(
+        r"async def f(events, worker, ready, choose):
+    try:
+        async for event in events:
+            if ready:
+                worker.update(event)
+            elif choose(event):
+                break
+    finally:
+        worker.cancel()
+        await worker.wait()
+    emit(worker)
+",
+        "protected_async_final_elif_break.py",
+    );
+}
+
+#[test]
+fn protected_async_completed_prefix_keeps_following_loads_owned() {
+    common::assert_matches_cpython_marshal(
+        r"async def f(events, worker, ready, choose):
+    try:
+        async for event in events:
+            if ready:
+                if event.changed:
+                    worker.update(event)
+                if choose(event):
+                    break
+    finally:
+        worker.cancel()
+        await worker.wait()
+    emit(worker)
+",
+        "protected_async_nested_prefix_break.py",
+    );
+}

@@ -4221,6 +4221,7 @@ impl Compiler<'_> {
                 let context = self.control.loops.contexts.last().copied().ok_or_else(|| {
                     CompileError::invalid_syntax("'continue' not properly in loop", statement.range)
                 })?;
+                let continued_finally_pop_blocks = self.continued_finally_pop_blocks(context);
                 let copied_finally_exclusion_lengths = self
                     .control
                     .exceptions
@@ -4232,7 +4233,9 @@ impl Compiler<'_> {
                     NOP,
                     0,
                     0,
-                    if self
+                    if continued_finally_pop_blocks > 0 {
+                        ExceptionPolicy::default()
+                    } else if self
                         .control
                         .finally
                         .active_loop_finally_contexts
@@ -4260,6 +4263,10 @@ impl Compiler<'_> {
                         ExceptionPolicy::default()
                     },
                 )?;
+                for _ in 0..continued_finally_pop_blocks {
+                    self.emit_with_exception_policy(NOP, 0, 0, ExceptionPolicy::EXCLUDE_ALWAYS)?;
+                    self.assembler.mark_last_as_converted_pop_block();
+                }
                 if self.context.target_specific_rules_enabled()
                     && self.control.withs.active_with_exits.len() > context.with_depth
                     && self
@@ -8583,6 +8590,70 @@ impl Compiler<'_> {
         )
     }
 
+    /// Counts the original `POP_BLOCK` records before a direct continued finalizer.
+    fn continued_finally_pop_blocks(&self, context: LoopContext) -> usize {
+        // Each ordinary try and the single finalizer contribute one original record.
+        // A manager, handler, iterator, or pending exit would interleave other cleanup.
+        if !self.context.target_specific_rules_enabled()
+            || self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) != CO_COROUTINE
+            || context.iterator_cleanup != IteratorCleanup::None
+            || context.exception_region_depth != 0
+            || !self.control.withs.active_with_exits.is_empty()
+            || !self.control.exceptions.active_exception_handlers.is_empty()
+            || self.control.exceptions.active_exception_group_handlers != 0
+            || self.control.finally.active_finally_try_bodies != 1
+            || self.control.finally.active_finally_end_blocks != 0
+            || self.control.finally.active_normal_finally_bodies != 0
+            || self.control.finally.active_copied_finally_bodies != 0
+            || self.control.finally.active_overriding_finally_returns != 0
+            || !self
+                .control
+                .finally
+                .active_pass_finally_locations
+                .is_empty()
+            || !self
+                .control
+                .finally
+                .preserved_return_value_contexts
+                .is_empty()
+            || self.control.finally.copied_return_finally_preserved_values != 0
+        {
+            return 0;
+        }
+        let [finally] = self.control.finally.active_loop_finally_contexts.as_slice() else {
+            return 0;
+        };
+        if finally.loop_depth != self.control.loops.contexts.len()
+            || finally.exception_region_depth != context.exception_region_depth
+            || matches!(finally.body.as_slice(), [Stmt::Pass(_)])
+        {
+            return 0;
+        }
+        let Some(ordinary_tries) = self
+            .control
+            .exceptions
+            .active_try_marker_slots
+            .len()
+            .checked_sub(finally.try_body_depth)
+        else {
+            return 0;
+        };
+        let Some(pop_blocks) = ordinary_tries.checked_add(1) else {
+            return 0;
+        };
+        if !(1..=2).contains(&pop_blocks)
+            || self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .len()
+                != pop_blocks
+        {
+            return 0;
+        }
+        pop_blocks
+    }
+
     // End each protected region at its lexical cleanup point. An enclosing handler remains
     // active while an inner finally runs; a manager entered inside that handler exits first.
     fn emit_loop_control_finally_unwind(
@@ -9217,12 +9288,10 @@ impl Compiler<'_> {
         {
             return self.compile_loop_tail_ifexp_assert(statement, conditional, restart);
         }
-        if non_final_branch
-            && condition_jump_target_count(&statement.test, false) == 1
-            && condition_jump_target_count(&statement.test, true) == 1
-        {
+        if non_final_branch && condition_jump_target_count(&statement.test, true) == 1 {
             // In a non-final branch, successful assertion evaluation exits the enclosing branch.
-            // CPython jumps over the fallthrough raise block to the loop backedge.
+            // CPython jumps over the fallthrough raise block to the loop backedge. Multiple
+            // short-circuit failure edges still share that fallthrough raise block.
             let success = self.assembler.label();
             self.compile_jump_if(&statement.test, true, success)?;
             self.assembler
@@ -23066,21 +23135,55 @@ fn condition_reaches_async_break_entry(expression: &Expr) -> bool {
     }
 }
 
-/// Finds a terminal break behind nested runtime conditions with no alternative suite.
+/// Finds a terminal break behind nested runtime conditions without a final else.
 fn suite_ends_in_terminal_conditional_break(body: &[Stmt]) -> bool {
     let Some(Stmt::If(first)) = body.last() else {
         return false;
     };
     let mut tail = first;
     loop {
-        if !tail.elif_else_clauses.is_empty() || !condition_reaches_async_break_entry(&tail.test) {
+        if !condition_reaches_async_break_entry(&tail.test) {
             return false;
         }
-        let Some((last, leading)) = tail.body.split_last() else {
+        let body = if let Some((last, earlier)) = tail.elif_else_clauses.split_last() {
+            if !suite_has_linear_borrow_fallthrough(&tail.body)
+                || tail.elif_else_clauses.iter().any(|clause| {
+                    clause
+                        .test
+                        .as_ref()
+                        .is_none_or(|test| !condition_reaches_async_break_entry(test))
+                })
+                || earlier
+                    .iter()
+                    .any(|clause| !suite_has_linear_borrow_fallthrough(&clause.body))
+            {
+                return false;
+            }
+            // Earlier arms rejoin the loop backedge. Only the final tested arm
+            // reaches the iterator discard and the original empty loop exit.
+            &last.body
+        } else {
+            &tail.body
+        };
+        let Some((last, leading)) = body.split_last() else {
             return false;
         };
         if !leading.is_empty() && !suite_has_linear_borrow_fallthrough(leading) {
-            return false;
+            // A completed conditional rejoins before the terminal condition. It
+            // does not create another entry past the break's iterator discard.
+            let completed_prefix = matches!(last, Stmt::If(_))
+                && leading.iter().enumerate().any(|(index, statement)| {
+                    matches!(statement, Stmt::If(prefix)
+                        if prefix.elif_else_clauses.is_empty()
+                            && condition_reaches_async_break_entry(&prefix.test)
+                            && suite_has_linear_borrow_fallthrough(&prefix.body))
+                        && (index == 0 || suite_has_linear_borrow_fallthrough(&leading[..index]))
+                        && (index + 1 == leading.len()
+                            || suite_has_linear_borrow_fallthrough(&leading[index + 1..]))
+                });
+            if !completed_prefix {
+                return false;
+            }
         }
         match last {
             Stmt::Break(_) => return true,

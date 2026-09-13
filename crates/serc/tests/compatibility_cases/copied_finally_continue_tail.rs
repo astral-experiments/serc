@@ -33,3 +33,91 @@ fn normalizes_continue_tail_when_try_encloses_the_whole_loop() {
         }
     }
 }
+
+#[test]
+fn continued_finally_pop_records_preserve_coroutine_marker_owners() {
+    for (filename, source) in [
+        (
+            "async_continue_after_suppress_before_finally_cancel.py",
+            r#"async def read(self):
+    if not self.enabled:
+        return await self.primary.read()
+    while True:
+        if not self.selected:
+            primary_read = asyncio.create_task(self.primary.read())
+            activation_wait = asyncio.create_task(self.activation.wait())
+            try:
+                done, _ = await asyncio.wait(
+                    {primary_read, activation_wait},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if activation_wait in done and self.selected:
+                    if primary_read.done():
+                        with suppress(asyncio.CancelledError, Exception):
+                            primary_read.result()
+                    continue
+                chunk = await primary_read
+                return Packet(
+                    data=chunk.data,
+                    time=chunk.time,
+                    speaker=chunk.speaker,
+                    enabled=chunk.enabled,
+                    epoch=chunk.epoch,
+                    generation=chunk.generation,
+                    source=chunk.source or "primary",
+                )
+            finally:
+                if not primary_read.done():
+                    primary_read.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await primary_read
+                if not activation_wait.done():
+                    activation_wait.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await activation_wait
+        return await self.fallback.read()
+"#,
+        ),
+        (
+            "continued_finally_counter.py",
+            r#"async def continued_finally_counter(queue, totals, interval):
+    processed = 0
+    cache = {}
+    while True:
+        item = await queue.get()
+        if item is None:
+            queue.done()
+            break
+        processed += 1
+        try:
+            if item.key:
+                if item.key in cache:
+                    value = cache[item.key]
+                else:
+                    try:
+                        value = await fetch(item.key)
+                    except Error as exc:
+                        report("lookup", extra={"key": item.key, "error": str(exc)})
+                        value = None
+                    cache[item.key] = value
+                if value is None:
+                    totals["skipped"] = totals.get("skipped", 0) + 1
+                    continue
+                async with context(value):
+                    status = await process(item=item)
+            else:
+                status = await process(item=item)
+            totals[status] = totals.get(status, 0) + 1
+        except Error as exc:
+            report("process", extra={"item": str(item.key), "error": str(exc)})
+            totals["errors"] = totals.get("errors", 0) + 1
+        finally:
+            if interval and processed % interval == 0:
+                report("progress", extra={"processed": processed, "totals": dict(totals)})
+            queue.done()
+"#,
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

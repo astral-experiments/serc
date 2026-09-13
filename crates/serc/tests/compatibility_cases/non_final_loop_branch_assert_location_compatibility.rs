@@ -140,3 +140,43 @@ def check(item):
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_marshal_for_non_final_loop_conjunction_assert() {
+    let cases = [
+        (
+            "nonfinal_loop_boolean_assert.py",
+            r"def probe(items, outer, first, second, work):
+    for item in items:
+        if outer(item):
+            assert first(item) and second(item)
+        else:
+            work(item)
+",
+        ),
+        (
+            "nonfinal_loop_single_assert_control.py",
+            r"def probe(items, outer, first, second, work):
+    for item in items:
+        if outer(item):
+            assert first(item)
+        else:
+            work(item)
+",
+        ),
+        (
+            "nonfinal_loop_ifexp_false_arm_control.py",
+            r"def probe(items, outer, first, selector, work):
+    for item in items:
+        if outer(item):
+            assert (first(item) if selector(item) else False)
+        else:
+            work(item)
+",
+        ),
+    ];
+
+    for (filename, source) in cases {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

@@ -2227,6 +2227,13 @@ impl OptimizationPipeline {
                 Item::Label(_) => None,
             }));
         }
+        let setup_nop_starts = self
+            .exception_owner_provenance
+            .setup_nop_ranges
+            .iter()
+            .map(|(start, _)| *start)
+            .collect::<FxHashSet<_>>();
+        let mut setup_nop_predecessors = FxHashMap::default();
         let mut converted_pop_boundaries = FxHashMap::default();
         let mut discontinuous_instructions = FxHashSet::default();
         let mut preceding_labels = Vec::new();
@@ -2264,6 +2271,32 @@ impl OptimizationPipeline {
                     Item::Instruction(instruction) => {
                         let position = ItemPosition::new(block, offset);
                         if track_pop_block_boundaries {
+                            // A SETUP's exclusion label need not start an original array.
+                            // Retain the exact fallthrough predecessor across only that label;
+                            // independent entries cannot donate their preceding line.
+                            if !with_exits_only
+                                && instruction.opcode == NOP
+                                && let [setup_start] = preceding_labels.as_slice()
+                                && setup_nop_starts.contains(setup_start)
+                                && !nonlinear_labels.contains(setup_start)
+                                && !self
+                                    .exception_owner_provenance
+                                    .source_boundaries
+                                    .contains(setup_start)
+                                && !self.original_nop_targets.contains(setup_start)
+                                && !self.original_jump_head_targets.contains(setup_start)
+                                && let Some((previous_position, previous)) = last_instruction
+                                // NEXT_LOCATION is resolved after NOP removal and cannot
+                                // supply an authored predecessor line during this pass.
+                                && !previous.fusion_policy.location_from_next()
+                                && previous.location.line == instruction.location.line
+                                && previous.opcode != NOT_TAKEN
+                                && !ends_scope(previous.opcode)
+                                && !is_unconditional_jump(previous.opcode)
+                                && matches!(previous.operand(), Operand::Value(_))
+                            {
+                                setup_nop_predecessors.insert(position, previous_position);
+                            }
                             if preceding_labels
                                 .iter()
                                 .any(|label| nonlinear_labels.contains(label))
@@ -2534,6 +2567,10 @@ impl OptimizationPipeline {
                             previous.location.line == instruction.location.line
                                 && !(ends_scope(previous.opcode)
                                     || is_unconditional_jump(previous.opcode))
+                        }))
+                    || (setup_nops.contains(&position)
+                        && setup_nop_predecessors.get(&position).is_some_and(|expected| {
+                            previous_position == Some(*expected)
                         }))
                     || (constant_pass_predecessors.get(&position).is_some_and(|expected| {
                         previous_position == Some(*expected)
