@@ -100,3 +100,29 @@ def nested_finally_break(manager, active, stop):
 ";
     common::assert_matches_cpython_marshal(source, "protected_with_breaks_existing.py");
 }
+
+#[test]
+fn retains_handler_success_pop_before_nested_finally_try() {
+    let source = r"async def target(make, record, attempts):
+    for attempt in attempts:
+        client = None
+        try:
+            client = make()
+            await client.read()
+            record(None)
+            return
+        except Exception as error:
+            retry = bool(attempt)
+            record(
+                error,
+                retry,
+            )
+        finally:
+            try:
+                if client is not None:
+                    await client.close()
+            except Exception as error:
+                record(error)
+";
+    common::assert_matches_cpython_marshal(source, "handler_success_before_nested_finally_try.py");
+}

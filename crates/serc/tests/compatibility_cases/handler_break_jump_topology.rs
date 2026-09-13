@@ -319,3 +319,47 @@ fn matches_cpython_break_from_handler_tail_for_loop() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_named_handler_tail_for_cleanup_copies() {
+    for (filename, source) in [
+        (
+            "named_handler_tail_for_retry_break.py",
+            r#"async def f(manager, copy, size, finish):
+    with manager:
+        try:
+            copy()
+        except Exception as error:
+            report("failed")
+            for i in range(5):
+                try:
+                    copy()
+                    break
+                except Exception as error:
+                    report(i, error)
+        value = size()
+    return finish(value)
+"#,
+        ),
+        (
+            "unnamed_handler_tail_for_retry_break.py",
+            r#"async def f(manager, copy, size, finish):
+    with manager:
+        try:
+            copy()
+        except Exception:
+            report("failed")
+            for i in range(5):
+                try:
+                    copy()
+                    break
+                except Exception as error:
+                    report(i, error)
+        value = size()
+    return finish(value)
+"#,
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

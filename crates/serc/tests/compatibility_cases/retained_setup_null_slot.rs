@@ -775,3 +775,66 @@ fn matches_cpython_normal_finally_owner_after_saturated_literal_fold() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_condition_after_original_comprehension_restore_span() {
+    for (filename, source) in [
+        (
+            "async_cell_setcomp_then_try_expr.py",
+            r"async def f(values):
+    selected = sorted({(lambda: item) for item in values if item})
+    try:
+        result = await consume(selected) if selected else {}
+    except Exception:
+        result = {}
+    return result
+",
+        ),
+        (
+            "async_generator_setcomp_then_try_expr.py",
+            r"async def f(values):
+    selected = sorted({item async for item in values if item})
+    try:
+        result = await consume(selected) if selected else {}
+    except Exception:
+        result = {}
+    return result
+",
+        ),
+        (
+            "async_two_restore_setcomp_then_try_expr.py",
+            r"async def f(values):
+    selected = sorted({(left, right) for left in values for right in values if right})
+    try:
+        result = await consume(selected) if selected else {}
+    except Exception:
+        result = {}
+    return result
+",
+        ),
+        (
+            "async_setcomp_then_try_expr.py",
+            r"async def f(values):
+    selected = sorted({item for item in values if item})
+    try:
+        result = await consume(selected) if selected else {}
+    except Exception:
+        result = {}
+    return result
+",
+        ),
+        (
+            "async_setcomp_without_call_then_try_expr.py",
+            r"async def f(values):
+    selected = {item for item in values if item}
+    try:
+        result = await consume(selected) if selected else {}
+    except Exception:
+        result = {}
+    return result
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

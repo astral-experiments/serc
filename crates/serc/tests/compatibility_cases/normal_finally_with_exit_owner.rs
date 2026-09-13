@@ -87,3 +87,35 @@ fn preserves_outer_manager_owner_on_conditional_finally_manager_joins() {
         }
     }
 }
+
+#[test]
+fn preserves_outer_manager_owner_on_conditional_finally_handler_joins() {
+    for (filename, source) in [
+        (
+            "manager_conditional_finally_recovery.py",
+            r"def target(manager, work, cleanup, enabled):
+    with manager:
+        try:
+            work()
+        finally:
+            if enabled:
+                try:
+                    cleanup()
+                except ValueError:
+                    pass
+",
+        ),
+        (
+            "manager_linear_finally_control.py",
+            r"def target(manager, work, cleanup, enabled):
+    with manager:
+        try:
+            work()
+        finally:
+            cleanup()
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

@@ -114,3 +114,42 @@ fn matches_cpython_borrows_after_protected_surviving_while_breaks() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn protected_while_name_return_preserves_small_exit_borrowing() {
+    for (filename, source) in [
+        (
+            "protected_infinite_loop_return.py",
+            r"def collect(factory):
+    items = []
+    try:
+        reader = factory()
+        while True:
+            ready, item = reader.read()
+            if ready:
+                items.append(item)
+            else:
+                break
+        return items
+    except Exception as error:
+        pass
+",
+        ),
+        (
+            "unprotected_infinite_loop_return.py",
+            r"def collect(factory):
+    items = []
+    reader = factory()
+    while True:
+        ready, item = reader.read()
+        if ready:
+            items.append(item)
+        else:
+            break
+    return items
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

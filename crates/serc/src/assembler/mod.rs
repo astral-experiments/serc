@@ -3995,7 +3995,7 @@ impl Assembler {
             .push(condition);
     }
 
-    /// Records the original jump into a synchronous comprehension's normal restore array.
+    /// Records the original jump into a comprehension's normal restore array.
     pub(crate) fn record_original_comprehension_normal_exit(
         &mut self,
         emitted: EmittedJump,
@@ -4017,6 +4017,27 @@ impl Assembler {
         self.exception_owner_provenance
             .comprehension_restore_owner_prefixes
             .push((entry, restore));
+    }
+
+    /// Seals the immediate normal restore records after their fusion policies are final.
+    pub(crate) fn record_original_comprehension_normal_restores(&mut self, entry: Label) {
+        let items = self.linear_items();
+        let Some(start) = items.iter().rposition(|item| *item == Item::Label(entry)) else {
+            return;
+        };
+        let Some(restores) = items[start + 1..]
+            .iter()
+            .map(|item| match item {
+                Item::Instruction(instruction) => Some(*instruction),
+                Item::Label(_) => None,
+            })
+            .collect::<Option<Vec<_>>>()
+        else {
+            return;
+        };
+        self.exception_owner_provenance
+            .original_comprehension_normal_restores
+            .insert(entry, restores);
     }
 
     /// Retains a folded condition's selected entry for borrowed-reference analysis.

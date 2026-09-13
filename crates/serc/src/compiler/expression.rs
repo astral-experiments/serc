@@ -694,10 +694,18 @@ impl Compiler<'_> {
                                     .match_successor_fills_small_exit_copy_budget
                                     && match_case_has_nested_jump_predecessor(tail))
                                 && early_condition_truthiness(&tail.test).is_none()
-                                && tail
+                                && (tail
                                     .elif_else_clauses
                                     .last()
                                     .is_some_and(|clause| clause.test.is_none())
+                                    || (index + 1 == matched_cases
+                                        && !has_default
+                                        && !self.control.falls_through_to_loop_backedge()
+                                        && !self.following_name_return_fits_match_copy_budget()
+                                        && tail.elif_else_clauses.last().is_some_and(|clause| {
+                                            clause.test.is_some()
+                                                && suite_has_linear_borrow_fallthrough(&clause.body)
+                                        })))
                                 && tail.elif_else_clauses.iter().all(|clause| {
                                     clause.test.as_ref().is_none_or(|test| {
                                         early_condition_truthiness(test).is_none()
@@ -3971,7 +3979,7 @@ impl Compiler<'_> {
         if discard_result && generators.iter().any(|generator| generator.is_async) {
             self.assembler.prevent_jump_inlining(normal_exit);
         }
-        if !discard_result && generators.iter().all(|generator| !generator.is_async) {
+        if !discard_result {
             self.assembler
                 .record_original_comprehension_normal_exit(normal_exit, normal_cleanup);
         }
@@ -4054,6 +4062,10 @@ impl Compiler<'_> {
             }
             // CPython converts STORE_FAST_MAYBE_NULL only after inserting superinstructions.
             self.assembler.prevent_last_instruction_fusion();
+            if !discard_result {
+                self.assembler
+                    .record_original_comprehension_normal_restores(normal_cleanup);
+            }
             if !discard_result && generators.iter().all(|generator| !generator.is_async) {
                 self.assembler
                     .record_comprehension_restore_owner_prefix(normal_cleanup);

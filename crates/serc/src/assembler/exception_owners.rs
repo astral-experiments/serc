@@ -36,8 +36,9 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) normal_finally_none_prefixes: Vec<(Instruction, Instruction, Instruction)>,
     pub(super) uncompacted_conditional_arrays: Vec<UncompactedConditionalArray>,
     pub(super) original_primitive_condition_boundaries: Vec<Instruction>,
-    // Authored normal exits from synchronous inlined comprehensions.
+    // Authored normal exits and their immediate, fully emitted restore records.
     pub(super) original_comprehension_normal_exits: Vec<(Label, Instruction)>,
+    pub(super) original_comprehension_normal_restores: FxHashMap<Label, Vec<Instruction>>,
     // Exact final normal restore, after its fusion policies are complete.
     pub(super) comprehension_restore_owner_prefixes: Vec<(Label, Instruction)>,
     pub(super) retired_comprehension_normal_entries: FxHashSet<Label>,
@@ -254,11 +255,11 @@ impl ExceptionOwnerProvenance {
                     && matches!(items[end], Item::Instruction(marker) if marker.opcode == NOT_TAKEN)
                 {
                     let prefix = &items[begin..=end];
-                    let certified = if self.uncompacted_prefix(prefix, items, false) {
+                    let certified = if self.uncompacted_prefix(prefix, items, 0) {
                         Some((prefix, None))
-                    } else if let Some((entry, prefix)) =
+                    } else if let Some((entry, prefix, restore_count)) =
                         self.comprehension_normal_prefix(prefix, items)
-                        && self.uncompacted_prefix(prefix, items, true)
+                        && self.uncompacted_prefix(prefix, items, restore_count)
                     {
                         Some((prefix, Some(entry)))
                     } else {
@@ -292,7 +293,7 @@ impl ExceptionOwnerProvenance {
         &self,
         prefix: &'a [Item],
         all: &[Item],
-    ) -> Option<(Label, &'a [Item])> {
+    ) -> Option<(Label, &'a [Item], usize)> {
         use crate::target::opcodes::{CALL, STORE_FAST, SWAP};
 
         let leading = prefix
@@ -301,6 +302,22 @@ impl ExceptionOwnerProvenance {
             .copied()
             .collect::<Vec<_>>();
         for (entry, jump) in &self.original_comprehension_normal_exits {
+            let Some(original) = self.original_comprehension_normal_restores.get(entry) else {
+                continue;
+            };
+            let [swap, restores @ ..] = original.as_slice() else {
+                continue;
+            };
+            if restores.is_empty()
+                || swap.opcode != SWAP
+                || !matches!(swap.operand(), Operand::Value(depth)
+                    if usize::try_from(depth).is_ok_and(|depth| depth == original.len()))
+                || restores.iter().any(|restore| {
+                    restore.opcode != STORE_FAST || restore.location != swap.location
+                })
+            {
+                continue;
+            }
             let Some(start) = leading.iter().position(|item| *item == Item::Label(*entry)) else {
                 continue;
             };
@@ -338,33 +355,34 @@ impl ExceptionOwnerProvenance {
                 .iter()
                 .filter_map(|item| {
                     if let Item::Instruction(instruction) = item {
-                        Some(instruction)
+                        Some(*instruction)
                     } else {
                         None
                     }
                 })
-                .take(3)
+                .take(original.len() + 1)
                 .collect::<Vec<_>>();
-            let [swap, restore, call] = instructions.as_slice() else {
-                continue;
-            };
-            // One maybe-null restore remains a distinct CP record until after
-            // superinstruction insertion. CALL prevents static SWAP elimination;
-            // an ordinary adjacent store or POP_TOP would not provide that proof.
-            if swap.opcode == SWAP
-                && swap.operand() == Operand::Value(2)
-                && restore.opcode == STORE_FAST
-                && restore.local_policy.may_store_null()
-                && restore.location == swap.location
-                && call.opcode == CALL
+            // All authored restores are STORE_FAST_MAYBE_NULL in CPython,
+            // including cells. They remain distinct through superinstruction
+            // insertion. CALL prevents static elimination of SWAP(n + 1),
+            // because only n swappable restores precede it.
+            if instructions.starts_with(original)
+                && instructions
+                    .get(original.len())
+                    .is_some_and(|call| call.opcode == CALL)
             {
-                return Some((*entry, &prefix[start..]));
+                return Some((*entry, &prefix[start..], restores.len()));
             }
         }
         None
     }
 
-    fn uncompacted_prefix(&self, prefix: &[Item], all: &[Item], comprehension_entry: bool) -> bool {
+    fn uncompacted_prefix(
+        &self,
+        prefix: &[Item],
+        all: &[Item],
+        comprehension_restore_count: usize,
+    ) -> bool {
         use crate::target::opcodes::{
             BINARY_OP, CALL, IMPORT_NAME, LOAD_ATTR, LOAD_CONST, LOAD_FAST, LOAD_GLOBAL, LOAD_NAME,
             LOAD_SMALL_INT, POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE, PUSH_NULL, STORE_FAST, STORE_NAME,
@@ -393,7 +411,7 @@ impl ExceptionOwnerProvenance {
                 && matches!(instruction.operand(), Operand::Forward(label) | Operand::Backward(label)
                     if leading_labels.contains(&label)))
         });
-        if !has_original_target && !comprehension_entry {
+        if !has_original_target && comprehension_restore_count == 0 {
             return false;
         }
         let positions = all
@@ -527,12 +545,15 @@ impl ExceptionOwnerProvenance {
                     }
                 }
                 STORE_FAST => {
-                    // CP fuses adjacent local stores/loads only on the same
-                    // line. Distinct located lines keep both original records.
-                    if instructions.get(index + 1).is_some_and(|next| {
-                        matches!(next.opcode, LOAD_FAST | STORE_FAST)
-                            && next.location.line == instruction.location.line
-                    }) {
+                    // Certified comprehension restores are still MAYBE_NULL
+                    // pseudo instructions during CP superinstruction insertion.
+                    // Ordinary adjacent stores/loads can fuse on the same line.
+                    if !(1..=comprehension_restore_count).contains(&index)
+                        && instructions.get(index + 1).is_some_and(|next| {
+                            matches!(next.opcode, LOAD_FAST | STORE_FAST)
+                                && next.location.line == instruction.location.line
+                        })
+                    {
                         return false;
                     }
                 }
@@ -591,14 +612,14 @@ impl ExceptionOwnerProvenance {
                     }
                 }
                 LOAD_NAME | LOAD_ATTR | LOAD_CONST | STORE_NAME | CALL | IMPORT_NAME => {}
-                crate::target::opcodes::SWAP if comprehension_entry && index == 0 => {}
+                crate::target::opcodes::SWAP if comprehension_restore_count > 0 && index == 0 => {}
                 _ => return false,
             }
         }
         // Retained SETUPs need an authored NOP proof. A certified comprehension
         // restore followed by CALL already establishes the original array head,
         // including a condition reached without crossing a new SETUP.
-        (setup_count > 0 || comprehension_entry)
+        (setup_count > 0 || comprehension_restore_count > 0)
             && self
                 .setups
                 .iter()
@@ -5075,6 +5096,88 @@ mod tests {
                 assembler.original_normal_finally_null_markers(&targets),
                 expected,
                 "{change}"
+            );
+        }
+    }
+
+    #[test]
+    fn comprehension_restore_spans_require_a_live_original_entry() {
+        use super::ExceptionOwnerProvenance;
+        use crate::assembler::{
+            Instruction, Item, Label, LayoutAssembler, Operand, SourceLocation,
+        };
+        use crate::target::opcodes::{
+            CALL, JUMP_FORWARD, NOT_TAKEN, POP_JUMP_IF_FALSE, STORE_FAST, SWAP, TO_BOOL,
+        };
+
+        for case in ["original", "unsealed", "cloned", "retired"] {
+            let entry = Label(0);
+            let exit = Label(1);
+            let clone = Label(2);
+            let plain = |opcode, operand| {
+                Instruction::new(opcode, operand, SourceLocation::new(3, 3, 0, 4), None)
+            };
+            let incoming = plain(JUMP_FORWARD, Operand::Forward(entry));
+            // Two same-line restores require the complete authored span proof.
+            let restores = vec![
+                plain(SWAP, Operand::Value(3)),
+                plain(STORE_FAST, Operand::Value(0)),
+                plain(STORE_FAST, Operand::Value(1)),
+            ];
+            let mut items = vec![Item::Instruction(incoming), Item::Label(entry)];
+            items.extend(restores.iter().copied().map(Item::Instruction));
+            items.extend([
+                Item::Instruction(plain(CALL, Operand::Value(0))),
+                Item::Instruction(plain(TO_BOOL, Operand::Value(0))),
+                Item::Instruction(plain(POP_JUMP_IF_FALSE, Operand::Forward(exit))),
+                Item::Instruction(plain(NOT_TAKEN, Operand::Value(0))),
+                Item::Label(exit),
+            ]);
+            let mut provenance = ExceptionOwnerProvenance {
+                original_comprehension_normal_exits: vec![(entry, incoming)],
+                original_comprehension_normal_restores: [(entry, restores)].into_iter().collect(),
+                ..ExceptionOwnerProvenance::default()
+            };
+            if case == "unsealed" {
+                provenance.original_comprehension_normal_restores.clear();
+            }
+            provenance.capture_uncompacted_conditional_arrays(&items);
+            assert_eq!(
+                provenance.uncompacted_conditional_arrays.len(),
+                usize::from(case != "unsealed"),
+                "{case}"
+            );
+            if case == "cloned" {
+                // The original is gone; its sole live replacement has a fresh entry.
+                items[0] = Item::Instruction(plain(JUMP_FORWARD, Operand::Forward(clone)));
+                items[1] = Item::Label(clone);
+            } else if case == "retired" {
+                // Reusing identical records cannot revive an erased original entry.
+                provenance
+                    .retired_comprehension_normal_entries
+                    .insert(entry);
+            }
+            let assembler = LayoutAssembler {
+                items,
+                exception_owner_provenance: provenance,
+                exception_regions: vec![],
+                preserved_block_boundaries: rustc_hash::FxHashSet::default(),
+                removed_max_depth: None,
+                next_label: 3,
+                has_next_location: false,
+            };
+            let targets = [if case == "cloned" { clone } else { entry }, exit]
+                .into_iter()
+                .collect();
+            let expected = if case == "original" {
+                [7].into_iter().collect()
+            } else {
+                rustc_hash::FxHashSet::default()
+            };
+            assert_eq!(
+                assembler.uncompacted_conditional_null_markers(&targets),
+                expected,
+                "{case}"
             );
         }
     }

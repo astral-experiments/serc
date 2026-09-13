@@ -372,3 +372,105 @@ fn matches_cpython_terminal_false_match_guard_locations() {
         common::assert_matches_cpython_marshal(&source, "terminal_false_match_guard_locations.py");
     }
 }
+
+#[test]
+fn retains_match_elif_success_jump_before_try() {
+    for (filename, source) in [
+        (
+            "match_elif_success_jump_before_try.py",
+            r#"def f(value):
+    value = value.replace("/", "-")
+    if accept(value):
+        first, second = value.split()
+        if len(first) == 3:
+            number = short_names.index(first.lower())
+        else:
+            number = long_names.index(first.title())
+        if check(second) and number:
+            value = f"{second}-{number:02d}-01"
+    else:
+        match len(value):
+            case 4:
+                value = f"{value}-01-01"
+            case 7:
+                if check(value[:4]):
+                    value = value + "-01"
+                elif check(value[-4:]):
+                    value = f"{value[-4:]}-{value[0:2]}-01"
+            case 8:
+                if check(value[-4:]):
+                    value = value[0:2] + "-" + value[2:4] + "-" + value[4:]
+                elif check(value[:4]):
+                    value = value[0:4] + "-" + value[4:6] + "-" + value[6:]
+    try:
+        parsed = parser.parse(value).isoformat()
+        if check(parsed[:4]):
+            return parsed
+    except Exception as error:
+        print(error)
+    return ""
+"#,
+        ),
+        (
+            "match_else_success_jump_before_try.py",
+            r#"def f(value):
+    value = value.replace("/", "-")
+    if accept(value):
+        first, second = value.split()
+        if len(first) == 3:
+            number = short_names.index(first.lower())
+        else:
+            number = long_names.index(first.title())
+        if check(second) and number:
+            value = f"{second}-{number:02d}-01"
+    else:
+        match len(value):
+            case 4:
+                value = f"{value}-01-01"
+            case 7:
+                if check(value[:4]):
+                    value = value + "-01"
+                elif check(value[-4:]):
+                    value = f"{value[-4:]}-{value[0:2]}-01"
+            case 8:
+                if check(value[-4:]):
+                    value = value[0:2] + "-" + value[2:4] + "-" + value[4:]
+                else:
+                    value = value[0:4] + "-" + value[4:6] + "-" + value[6:]
+    try:
+        parsed = parser.parse(value).isoformat()
+        if check(parsed[:4]):
+            return parsed
+    except Exception as error:
+        print(error)
+    return ""
+"#,
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn copies_name_return_after_final_match_elif() {
+    let source = r#"def outer(assignment, meta, block_scope_mergeability):
+    def render_block_scope_handle(handle: Handle, handle_has_approval: bool) -> str:
+        res = link_to_handle_with_assignment(handle, assignment, meta)
+        match handle:
+            case UserHandle(_) as user:
+                if user not in block_scope_mergeability.approving_users and handle_has_approval:
+                    res = f"~{res}~"
+            case TeamHandle(_, _) as team:
+                if users := block_scope_mergeability.approving_teams.get(team, set()):
+                    via = " + ".join(link_to_handle(user) for user in _sorted_handles(users))
+                    res = f"{res} _via_ {via}"
+                elif handle_has_approval:
+                    res = f"~{res}~"
+        return res
+    return render_block_scope_handle
+"#;
+    common::assert_matches_cpython_marshal(
+        source,
+        "match_elif_named_return_after_class_patterns.py",
+    );
+}

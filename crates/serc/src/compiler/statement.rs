@@ -1477,6 +1477,43 @@ impl Compiler<'_> {
             && self.control.finally.active_finally_try_bodies == 0
     }
 
+    /// A name return, its optional line NOP, and the replaced jump fit four original slots.
+    pub(super) fn following_name_return_fits_match_copy_budget(&self) -> bool {
+        self.control
+            .statements
+            .current_statement_followed_by_name_return
+            && self.control.loops.contexts.is_empty()
+            && self.control.withs.active_with_exits.is_empty()
+            && self.control.withs.active_with_region_exclusions.is_empty()
+            && self.control.exceptions.active_exception_handlers.is_empty()
+            && self.control.exceptions.active_exception_group_handlers == 0
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            && self
+                .control
+                .finally
+                .active_return_finally_contexts
+                .is_empty()
+            && self
+                .control
+                .finally
+                .preserved_return_value_contexts
+                .is_empty()
+            && self
+                .control
+                .finally
+                .active_pass_finally_locations
+                .is_empty()
+            && self.control.finally.active_overriding_finally_returns == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
+            && self.control.finally.active_finally_try_bodies == 0
+    }
+
     pub(super) fn compile_suite(&mut self, body: &[Stmt]) -> Result<(), CompileError> {
         self.compile_suite_inner(body, false)
     }
@@ -10516,16 +10553,47 @@ impl Compiler<'_> {
             self.assembler.mark(end);
             // Small exit duplication copies a direct name return onto each authored break edge
             // before redundant break jumps are removed. The copied load therefore remains
-            // visible to CPython's borrowed-load pass for every break layout.
+            // visible to CPython's borrowed-load pass for every break layout. One ordinary
+            // try adds only POP_BLOCK to the name load and RETURN_VALUE (plus a return-line
+            // NOP), within the four-record copy limit. Other unwinds can exceed that budget.
+            // A coroutine's stop-iteration wrapper contributes no return-unwind instructions.
             let copied_direct_return_exit = self
                 .control
                 .statements
                 .current_statement_followed_by_name_return
-                && self
+                && (self
                     .control
                     .exceptions
                     .active_exception_region_exclusions
                     .is_empty()
+                    || (self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+                        && self.control.loops.contexts.is_empty()
+                        && self
+                            .control
+                            .exceptions
+                            .active_exception_region_exclusions
+                            .len()
+                            == 1
+                        && self.control.exceptions.active_pass_only_try_bodies.len() == 1
+                        && self.control.exceptions.active_try_body_start.is_some()
+                        && self.control.exceptions.active_exception_handlers.is_empty()
+                        && self.control.exceptions.active_exception_group_handlers == 0
+                        && self.control.withs.active_with_exits.is_empty()
+                        && self
+                            .control
+                            .finally
+                            .active_return_finally_contexts
+                            .is_empty()
+                        && self.control.finally.active_finally_try_bodies == 0
+                        && self.control.finally.active_normal_finally_bodies == 0
+                        && self.control.finally.active_finally_end_blocks == 0
+                        && self.control.finally.active_copied_finally_bodies == 0
+                        && self.control.finally.active_overriding_finally_returns == 0
+                        && self
+                            .control
+                            .finally
+                            .active_pass_finally_locations
+                            .is_empty()))
                 && self.control.withs.active_with_region_exclusions.is_empty();
             let coroutine_terminal_break_exit =
                 self.control.generators.generator_region_start.is_some()
@@ -14260,9 +14328,9 @@ impl Compiler<'_> {
                     // A trailing for loop joins its breaks with iterator exhaustion before
                     // the handler's source-less cleanup. Copy that cleanup before assigning
                     // each predecessor's location, as for other original compound joins.
+                    // Named cleanup uses the same unlocated exit-copy rule regardless of size.
                     Stmt::For(tail) => {
-                        handler.name.is_none()
-                            && !tail.is_async
+                        !tail.is_async
                             && tail.orelse.is_empty()
                             && suite_contains_loop_break(&tail.body)
                             && !suite_contains_loop_break_with_finally(&tail.body)
@@ -15636,7 +15704,7 @@ impl Compiler<'_> {
                             && manager.items.len() == 1
                             && !expression_contains_inline_branch(&manager.items[0].context_expr)
                             && suite_has_linear_borrow_fallthrough(&manager.body)));
-        // A single false edge retains a located join after the inner manager.
+        // A single false edge retains a located join after a nested manager or handler.
         // Linear cleanup before the condition does not turn that join into an
         // unowned manager-pop marker, including in a synchronous generator.
         let located_manager_exit = preserve_exit_nop
@@ -15664,13 +15732,24 @@ impl Compiler<'_> {
                             && condition_jump_target_count(&tail.test, false) == 1
                             && matches!(nested_if_exit_location(tail, false),
                                 Some(NestedIfExitLocation::Located(_)))
-                            && matches!(tail.body.as_slice(), [Stmt::With(manager)]
+                            && (matches!(tail.body.as_slice(), [Stmt::With(manager)]
                                 if !manager.is_async
                                     && manager.items.len() == 1
                                     && !expression_contains_inline_branch(&manager.items[0].context_expr)
                                     && !expression_suspends_current_scope(&manager.items[0].context_expr)
                                     && suite_has_linear_borrow_fallthrough(&manager.body)
-                                    && !suite_contains_yield(&manager.body)))
+                                    && !suite_contains_yield(&manager.body))
+                                || matches!(tail.body.as_slice(), [Stmt::Try(recovery)]
+                                    if recovery.orelse.is_empty()
+                                        && try_has_linear_shared_handler_cleanup(recovery)
+                                        && recovery.handlers.iter().all(|handler| {
+                                            handler.as_except_handler().is_some_and(|handler| {
+                                                handler.type_.as_deref().is_some_and(|type_| {
+                                                    !expression_contains_inline_branch(type_)
+                                                        && !expression_suspends_current_scope(type_)
+                                                })
+                                            })
+                                        }))))
             });
         let shared_manager_exit = shared_manager_exit || located_manager_exit;
         // Boolean false edges can leave the shared join unlocated. A chained
@@ -16886,6 +16965,23 @@ impl Compiler<'_> {
                         .as_except_handler()
                         .is_some_and(|handler| suite_terminates(&handler.body))
                 })
+                && matches!(statement.finalbody.first(), Some(Stmt::Try(_)))
+            {
+                self.assembler.preserve_last_nop();
+                self.assembler
+                    .record_retained_pop_block_origin(protected_end);
+            }
+            // A sole linear handler supplies the same original POP_BLOCK when the
+            // protected body already exits before constant folding. Preserve that
+            // ownerless marker independently of the nested try's setup line.
+            if !statement.is_star
+                && statement.orelse.is_empty()
+                && suite_terminates_before_constant_folding(&statement.body)
+                && matches!(statement.handlers.as_slice(), [handler]
+                if handler.as_except_handler().is_some_and(|handler| {
+                    handler.type_.is_some()
+                        && suite_has_linear_borrow_fallthrough(&handler.body)
+                }))
                 && matches!(statement.finalbody.first(), Some(Stmt::Try(_)))
             {
                 self.assembler.preserve_last_nop();
