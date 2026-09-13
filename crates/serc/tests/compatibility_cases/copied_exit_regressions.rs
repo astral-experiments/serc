@@ -221,3 +221,224 @@ fn matches_cpython_marshal_for_shared_guarded_return_join() {
 "#;
     common::assert_matches_cpython_marshal(source, "guarded_nested_else_return.py");
 }
+
+#[test]
+fn keeps_finally_assertion_success_location() {
+    for (filename, source) in [
+        (
+            "finally_assert_method_success_nop.py",
+            r"def target(resource, registry):
+    try:
+        resource.start()
+        assert registry.ready is True
+    finally:
+        assert resource.stop()
+    assert registry.count == 1
+    assert not resource.is_alive()
+",
+        ),
+        (
+            "finally_linear_method_control.py",
+            r"def target(resource, registry):
+    try:
+        resource.start()
+        assert registry.ready is True
+    finally:
+        resource.stop()
+    assert registry.count == 1
+    assert not resource.is_alive()
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn keeps_try_else_assertion_success_operand_location() {
+    for (filename, source) in [
+        (
+            "try_else_assert_not_success.py",
+            r"def target(work, flag, record):
+    try:
+        work()
+    except ValueError:
+        assert flag
+    else:
+        assert not flag
+    record()
+",
+        ),
+        (
+            "try_else_assert_shared_success_control.py",
+            r"def target(work, flag, other, record):
+    try:
+        work()
+    except ValueError:
+        assert flag
+    else:
+        assert flag or other
+    record()
+",
+        ),
+        (
+            "try_body_assert_not_success_control.py",
+            r"def target(work, flag, record):
+    try:
+        work()
+        assert not flag
+    except ValueError:
+        assert flag
+    record()
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+#[test]
+fn keeps_finally_assertion_success_operand_location() {
+    for (filename, source) in [
+        (
+            "finally_assert_not_attribute_success.py",
+            r"async def target(client, record):
+    try:
+        await client.work()
+    finally:
+        result = await client.cleanup()
+        assert not result.retry
+    record()
+",
+        ),
+        (
+            "finally_assert_not_call_success.py",
+            r#"async def target(operation, record):
+    try:
+        await operation.run()
+    finally:
+        record()
+        assert not operation.done()
+    raise AssertionError("unreachable")
+"#,
+        ),
+        (
+            "finally_assert_plain_call_control.py",
+            r#"async def target(operation, record):
+    try:
+        await operation.run()
+    finally:
+        record()
+        assert operation.done()
+    raise AssertionError("unreachable")
+"#,
+        ),
+        (
+            "finally_assert_terminal_control.py",
+            r"async def target(client, record):
+    try:
+        await client.work()
+    finally:
+        result = await client.cleanup()
+        assert not result.retry
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn keeps_try_else_final_match_failure_location() {
+    for (filename, source) in [
+        (
+            "try_else_final_dotted_raise_failure.py",
+            r#"async def target(items, operate, record):
+    total = 0
+    async for item in items:
+        try:
+            outcome = await operate(item)
+        except Exception as error:
+            outcome = Status.FAILED
+            record(error)
+        else:
+            record(outcome)
+            match outcome:
+                case Status.CREATED:
+                    total += 1
+                case Status.REUSED | Status.SKIPPED:
+                    total += 2
+                case Status.FAILED:
+                    raise AssertionError("failure belongs to recovery")
+        record(outcome)
+    return total
+"#,
+        ),
+        (
+            "try_else_final_dotted_raise_minimal.py",
+            r#"async def target(items, operate, record):
+    async for item in items:
+        try:
+            outcome = await operate(item)
+        except Exception as error:
+            record(error)
+        else:
+            match outcome:
+                case Status.OK:
+                    record(outcome)
+                case Status.FAILED:
+                    raise AssertionError("failed")
+        record(outcome)
+    return None
+"#,
+        ),
+        (
+            "try_else_final_wildcard_raise_control.py",
+            r#"async def target(items, operate, record):
+    total = 0
+    async for item in items:
+        try:
+            outcome = await operate(item)
+        except Exception as error:
+            outcome = Status.FAILED
+            record(error)
+        else:
+            record(outcome)
+            match outcome:
+                case Status.CREATED:
+                    total += 1
+                case Status.REUSED | Status.SKIPPED:
+                    total += 2
+                case _:
+                    raise AssertionError("failure belongs to recovery")
+        record(outcome)
+    return total
+"#,
+        ),
+        (
+            "try_else_final_match_followed_by_call_control.py",
+            r#"async def target(items, operate, record):
+    total = 0
+    async for item in items:
+        try:
+            outcome = await operate(item)
+        except Exception as error:
+            outcome = Status.FAILED
+            record(error)
+        else:
+            record(outcome)
+            match outcome:
+                case Status.CREATED:
+                    total += 1
+                case Status.REUSED | Status.SKIPPED:
+                    total += 2
+                case Status.FAILED:
+                    raise AssertionError("failure belongs to recovery")
+            record("else finished")
+        record(outcome)
+    return total
+"#,
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

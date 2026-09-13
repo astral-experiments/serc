@@ -309,3 +309,128 @@ except Exception:
         "6697_08_no_outer_guard.py",
     );
 }
+
+#[test]
+fn matches_cpython_comprehension_restore_then_retained_setup() {
+    common::assert_matches_cpython_marshal(
+        r"async def f(values):
+    selected = sorted({item for item in values if item})
+    try:
+        result = await consume(selected) if selected else {}
+    except Exception:
+        result = {}
+    return result
+",
+        "async_setcomp_then_try_expr.py",
+    );
+    common::assert_matches_cpython_marshal(
+        r#"async def f(value):
+    disabled = value in {"a", "b", "c"}
+    staged = False
+    try:
+        if not disabled:
+            staged = await consume(value)
+    except Exception:
+        staged = False
+    return staged
+"#,
+        "async_contains_then_try_if.py",
+    );
+    common::assert_matches_cpython_marshal(
+        r"async def f(value):
+    ready = False
+    try:
+        ready = await consume(value)
+    finally:
+        try:
+            if not ready:
+                await cleanup(value)
+        finally:
+            await finish(value)
+",
+        "async_nested_finally_try_if.py",
+    );
+    common::assert_matches_cpython_marshal(
+        r"async def f(value):
+    ready = value
+    try:
+        if ready:
+            return await consume(value)
+    except Exception:
+        return None
+    return value
+",
+        "async_plain_assignment_try_if.py",
+    );
+    common::assert_matches_cpython_marshal(
+        r"def f(value):
+    ready = value
+    try:
+        if ready:
+            return consume(value)
+    except Exception:
+        return None
+    return value
+",
+        "sync_plain_assignment_try_if.py",
+    );
+    common::assert_matches_cpython_marshal(
+        r"def f(value):
+    def capture():
+        return value
+    ready = value
+    try:
+        result = consume(ready) if ready else []
+    except Exception:
+        result = []
+    return capture, result
+",
+        "sync_cell_assignment_try_expr.py",
+    );
+}
+
+#[test]
+fn matches_cpython_comprehension_restore_without_retained_setup() {
+    for (filename, source) in [
+        (
+            "with_loop_any_listcomp_condition.py",
+            r"def f(manager, groups):
+    with manager:
+        for values in groups:
+            if any([value for value in values]):
+                consume(values)
+",
+        ),
+        (
+            "with_loop_not_all_listcomp_condition.py",
+            r"def f(manager, groups):
+    with manager:
+        for values in groups:
+            if not all([value for value in values]):
+                continue
+            consume(values)
+",
+        ),
+        (
+            "with_loop_any_plain_argument_control.py",
+            r"def f(manager, groups):
+    with manager:
+        for values in groups:
+            if any(values):
+                consume(values)
+",
+        ),
+        (
+            "with_loop_not_all_plain_argument_control.py",
+            r"def f(manager, groups):
+    with manager:
+        for values in groups:
+            if not all(values):
+                continue
+            consume(values)
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

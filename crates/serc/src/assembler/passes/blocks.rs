@@ -2130,6 +2130,28 @@ impl OptimizationPipeline {
             .iter()
             .flat_map(|region| [region.start, region.end])
             .collect::<FxHashSet<_>>();
+        // Keep locations already present on original return records distinct from
+        // locations inherited by synthetic cleanup copies during this pass.
+        let mut original_return_locations = FxHashMap::default();
+        let mut return_labels = Vec::new();
+        for item in graph.iter_items() {
+            match item {
+                Item::Label(label) => return_labels.push(*label),
+                Item::Instruction(instruction) => {
+                    if instruction.opcode == RETURN_VALUE
+                        && instruction.location.line >= 0
+                        && !instruction
+                            .no_location_policy
+                            .copy_inherits_shared_predecessor()
+                    {
+                        for label in &return_labels {
+                            original_return_locations.insert(*label, instruction.location);
+                        }
+                    }
+                    return_labels.clear();
+                }
+            }
+        }
         let mut exit_without_unique_predecessor = vec![false; positions.len()];
         for block in order.iter().copied() {
             let unlocated_scope_exit = graph[block].items().iter().all(|item| {
@@ -3035,6 +3057,14 @@ impl OptimizationPipeline {
                             }))
                         && !instruction.no_location_policy.preserves_location()
                 });
+            let copied_return_locations = copied_labels
+                .iter()
+                .filter_map(|(original, copied)| {
+                    original_return_locations
+                        .get(original)
+                        .map(|location| (*copied, *location))
+                })
+                .collect::<FxHashMap<_, _>>();
             if inherit_copied_locations && !planned_copy {
                 // Exception boundaries split the IR into blocks after CPython has already treated
                 // the synthetic cleanup as one source-less exit. Every copied split therefore
@@ -3050,17 +3080,34 @@ impl OptimizationPipeline {
                 let mut block_needs_location = true;
                 let mut inline_entry = false;
                 let mut inline_location = source_location;
+                let mut original_return_location = None;
+                let mut exception_split_entry = false;
                 for item in &mut copied {
+                    if let Item::Label(label) = item
+                        && let Some(location) = copied_return_locations.get(label)
+                    {
+                        original_return_location = Some(*location);
+                    }
                     match item {
                         Item::Label(label) if copied_exception_split_labels.contains(label) => {
                             block_needs_location = true;
+                            exception_split_entry = true;
                         }
                         Item::Label(label) if copied_inline_entry_labels.contains(label) => {
                             inline_entry = true;
                         }
                         Item::Instruction(instruction) => {
                             if block_needs_location {
-                                instruction.location = source_location;
+                                // A synthetic exception split does not erase the original
+                                // located RETURN that follows the copied expression.
+                                if !exception_split_entry
+                                    || instruction.opcode != RETURN_VALUE
+                                    || original_return_location != Some(instruction.location)
+                                    || copy_conditional_split_return
+                                    || target_has_artificial_eval_break
+                                {
+                                    instruction.location = source_location;
+                                }
                                 block_needs_location = false;
                             } else if inline_entry
                                 && instruction.location.line < 0
@@ -3069,6 +3116,8 @@ impl OptimizationPipeline {
                                 instruction.location = inline_location;
                             }
                             inline_entry = false;
+                            original_return_location = None;
+                            exception_split_entry = false;
                             if instruction.location.line >= 0
                                 || instruction.no_location_policy.preserves_location()
                             {
@@ -3079,6 +3128,7 @@ impl OptimizationPipeline {
                     }
                 }
             }
+            original_return_locations.extend(copied_return_locations);
             if inline_small_exit || inline_no_location_block {
                 if planned_copy || (inline_no_location_block && target_chain_end > target_position)
                 {

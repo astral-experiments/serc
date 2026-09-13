@@ -36,6 +36,9 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) normal_finally_none_prefixes: Vec<(Instruction, Instruction, Instruction)>,
     pub(super) uncompacted_conditional_arrays: Vec<UncompactedConditionalArray>,
     pub(super) original_primitive_condition_boundaries: Vec<Instruction>,
+    // Authored normal exits from synchronous inlined comprehensions.
+    pub(super) original_comprehension_normal_exits: Vec<(Label, Instruction)>,
+    pub(super) retired_comprehension_normal_entries: FxHashSet<Label>,
     pub(super) synchronous_with_setups: FxHashSet<Label>,
     pub(super) removed_pop_block_boundaries: FxHashSet<Label>,
     pub(super) removed_pop_block_widths: FxHashMap<Label, u16>,
@@ -198,6 +201,7 @@ impl ExceptionOwnerTail {
 #[derive(Debug)]
 pub(super) struct UncompactedConditionalArray {
     prefix: Vec<Item>,
+    comprehension_entry: Option<Label>,
 }
 
 impl ExceptionOwnerProvenance {
@@ -219,12 +223,25 @@ impl ExceptionOwnerProvenance {
                     .map(|offset| index + 1 + offset);
                 if let Some(end) = next
                     && matches!(items[end], Item::Instruction(marker) if marker.opcode == NOT_TAKEN)
-                    && self.uncompacted_prefix(&items[begin..=end], items)
                 {
-                    self.uncompacted_conditional_arrays
-                        .push(UncompactedConditionalArray {
-                            prefix: items[begin..=end].to_vec(),
-                        });
+                    let prefix = &items[begin..=end];
+                    let certified = if self.uncompacted_prefix(prefix, items, false) {
+                        Some((prefix, None))
+                    } else if let Some((entry, prefix)) =
+                        self.comprehension_normal_prefix(prefix, items)
+                        && self.uncompacted_prefix(prefix, items, true)
+                    {
+                        Some((prefix, Some(entry)))
+                    } else {
+                        None
+                    };
+                    if let Some((prefix, comprehension_entry)) = certified {
+                        self.uncompacted_conditional_arrays
+                            .push(UncompactedConditionalArray {
+                                prefix: prefix.to_vec(),
+                                comprehension_entry,
+                            });
+                    }
                 }
             }
             // Labels alone are not original array boundaries. A terminator ends
@@ -241,7 +258,84 @@ impl ExceptionOwnerProvenance {
         }
     }
 
-    fn uncompacted_prefix(&self, prefix: &[Item], all: &[Item]) -> bool {
+    /// Selects the exact normal restore entry, excluding preceding cleanup aliases.
+    fn comprehension_normal_prefix<'a>(
+        &self,
+        prefix: &'a [Item],
+        all: &[Item],
+    ) -> Option<(Label, &'a [Item])> {
+        use crate::target::opcodes::{CALL, STORE_FAST, SWAP};
+
+        let leading = prefix
+            .iter()
+            .take_while(|item| matches!(item, Item::Label(_)))
+            .copied()
+            .collect::<Vec<_>>();
+        for (entry, jump) in &self.original_comprehension_normal_exits {
+            let Some(start) = leading.iter().position(|item| *item == Item::Label(*entry)) else {
+                continue;
+            };
+            if all
+                .iter()
+                .filter(|item| **item == Item::Label(*entry))
+                .count()
+                != 1
+                || all
+                    .iter()
+                    .filter(|item| **item == Item::Instruction(*jump))
+                    .count()
+                    != 1
+            {
+                continue;
+            }
+            let incoming = all
+                .iter()
+                .filter_map(|item| {
+                    if let Item::Instruction(instruction) = item
+                        && let Operand::Forward(label) | Operand::Backward(label) =
+                            instruction.operand()
+                        && leading.contains(&Item::Label(label))
+                    {
+                        Some(*instruction)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+            if incoming.as_slice() != [*jump] {
+                continue;
+            }
+            let instructions = prefix[start..]
+                .iter()
+                .filter_map(|item| {
+                    if let Item::Instruction(instruction) = item {
+                        Some(instruction)
+                    } else {
+                        None
+                    }
+                })
+                .take(3)
+                .collect::<Vec<_>>();
+            let [swap, restore, call] = instructions.as_slice() else {
+                continue;
+            };
+            // One maybe-null restore remains a distinct CP record until after
+            // superinstruction insertion. CALL prevents static SWAP elimination;
+            // an ordinary adjacent store or POP_TOP would not provide that proof.
+            if swap.opcode == SWAP
+                && swap.operand() == Operand::Value(2)
+                && restore.opcode == STORE_FAST
+                && restore.local_policy.may_store_null()
+                && restore.location == swap.location
+                && call.opcode == CALL
+            {
+                return Some((*entry, &prefix[start..]));
+            }
+        }
+        None
+    }
+
+    fn uncompacted_prefix(&self, prefix: &[Item], all: &[Item], comprehension_entry: bool) -> bool {
         use crate::target::opcodes::{
             BINARY_OP, CALL, IMPORT_NAME, LOAD_ATTR, LOAD_CONST, LOAD_FAST, LOAD_GLOBAL, LOAD_NAME,
             LOAD_SMALL_INT, POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE, PUSH_NULL, STORE_FAST, STORE_NAME,
@@ -270,7 +364,7 @@ impl ExceptionOwnerProvenance {
                 && matches!(instruction.operand(), Operand::Forward(label) | Operand::Backward(label)
                     if leading_labels.contains(&label)))
         });
-        if !has_original_target {
+        if !has_original_target && !comprehension_entry {
             return false;
         }
         let positions = all
@@ -468,12 +562,14 @@ impl ExceptionOwnerProvenance {
                     }
                 }
                 LOAD_NAME | LOAD_ATTR | LOAD_CONST | STORE_NAME | CALL | IMPORT_NAME => {}
+                crate::target::opcodes::SWAP if comprehension_entry && index == 0 => {}
                 _ => return false,
             }
         }
-        // Unlocated POP_BLOCK and arbitrary emitted NOPs need different
-        // retention proofs. This certificate covers authored retained SETUPs.
-        setup_count > 0
+        // Retained SETUPs need an authored NOP proof. A certified comprehension
+        // restore followed by CALL already establishes the original array head,
+        // including a condition reached without crossing a new SETUP.
+        (setup_count > 0 || comprehension_entry)
             && self
                 .setups
                 .iter()
@@ -497,6 +593,29 @@ impl LayoutAssembler {
             let Some(Item::Label(entry)) = origin.prefix.first() else {
                 continue;
             };
+            if let Some(original_entry) = origin.comprehension_entry
+                && (original_entry != *entry
+                    || self
+                        .exception_owner_provenance
+                        .retired_comprehension_normal_entries
+                        .contains(&original_entry))
+            {
+                continue;
+            }
+            let leading_labels = origin
+                .prefix
+                .iter()
+                .take_while(|item| matches!(item, Item::Label(_)))
+                .copied()
+                .collect::<Vec<_>>();
+            if origin.comprehension_entry.is_some()
+                && origin.prefix.iter().any(|item| {
+                    matches!(item, Item::Label(label)
+                        if !leading_labels.contains(item) && jump_targets.contains(label))
+                })
+            {
+                continue;
+            }
             let starts = self
                 .items
                 .iter()

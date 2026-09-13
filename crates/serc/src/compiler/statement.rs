@@ -3677,11 +3677,25 @@ impl Compiler<'_> {
                         self.compile_expression(value)?;
                     }
                     if targets.len() > 1 {
+                        // CPython turns BUILD_TUPLE into a NOP before UNPACK_SEQUENCE
+                        // becomes SWAP. Its line can survive between multiline values
+                        // and targets, just as in a singleton comprehension assignment.
+                        let tuple_location = self.source_location(value.range);
+                        let emit_tuple_nop = self
+                            .assembler
+                            .current_block_last_instruction_location()
+                            .is_none_or(|previous| previous.line != tuple_location.line);
+                        if emit_tuple_nop {
+                            self.assembler.set_location(tuple_location);
+                            self.emit(NOP, 0, 0)?;
+                        }
                         self.assembler
                             .set_location(self.source_location(assignment.targets[0].range()));
                         self.emit(SWAP, to_u32(targets.len(), "unpack target count")?, 0)?;
-                        // BUILD_TUPLE and UNPACK_SEQUENCE become one SWAP before fusion.
-                        self.assembler.add_last_constant_fold_slots(1);
+                        if !emit_tuple_nop {
+                            // A real NOP already counts as the original tuple-build record.
+                            self.assembler.add_last_constant_fold_slots(1);
+                        }
                     }
                     let target_start = self.assembler.item_count();
                     for target in targets {
@@ -13065,8 +13079,10 @@ impl Compiler<'_> {
                 && let Some(range) = suite_unary_not_fallthrough_range(&statement.body)
             {
                 self.assembler.set_location(self.source_location(range));
-            } else if statement.orelse.is_empty()
-                && let Some(range) = suite_assert_success_fallthrough_range(&statement.body)
+            } else if (statement.orelse.is_empty()
+                || matches!(statement.orelse.last(), Some(Stmt::Assert(assertion))
+                    if assertion_has_only_runtime_tests(&assertion.test)))
+                && let Some(range) = suite_assert_success_fallthrough_range(normal_exit_suite)
             {
                 // The normal exit inherits its sole successful assertion operand,
                 // rather than the assertion failure block's final RAISE location.
@@ -13099,6 +13115,18 @@ impl Compiler<'_> {
                 && statement.finalbody.is_empty()
                 && let Some(range) = suite_match_failure_range(normal_exit_suite)
             {
+                self.assembler.set_location(self.source_location(range));
+            } else if statement.finalbody.is_empty()
+                && let Some(Stmt::Match(matched)) = statement.orelse.last()
+                && fold_constant(&matched.subject).is_none()
+                && matched
+                    .cases
+                    .last()
+                    .is_some_and(|case| matches!(case.body.as_slice(), [Stmt::Raise(_)]))
+                && let Some(range) = suite_match_failure_range(normal_exit_suite)
+            {
+                // The final arm raises, so only its unguarded pattern failure reaches
+                // this original exit. Earlier case-success jumps thread past it.
                 self.assembler.set_location(self.source_location(range));
             } else if statement.orelse.is_empty()
                 && !suite_terminates(&statement.body)
@@ -13284,13 +13312,25 @@ impl Compiler<'_> {
                     if early_condition_truthiness(&tail.test).is_none()
                         && !original_condition_has_unique_jump_target(&tail.test, false)
                         && tail.elif_else_clauses.is_empty()
-                        && matches!(tail.body.last(), Some(Stmt::Try(nested))
-                            if nested.orelse.is_empty()
-                                && nested.finalbody.is_empty()
-                                && suite_ends_in_empty_try_exit_block(&nested.body, false)))
+                        && (matches!(tail.body.last(), Some(Stmt::With(_)))
+                            || matches!(tail.body.last(), Some(Stmt::Try(nested))
+                                if nested.orelse.is_empty()
+                                    && nested.finalbody.is_empty()
+                                    && (suite_ends_in_empty_try_exit_block(&nested.body, false)
+                                        || (!nested.is_star
+                                            && nested.handlers.iter().all(|handler| {
+                                                handler.as_except_handler().is_some_and(|handler| {
+                                                    handler.name.is_none()
+                                                        && matches!(handler.body.as_slice(), [Stmt::Pass(_)])
+                                                })
+                                            })
+                                            && (suite_has_linear_borrow_fallthrough(&nested.body)
+                                                || suite_retained_try_exit_leaves_empty_join(&nested.body)))))))
             {
                 // Multiple original false edges leave the outer POP_BLOCK unlocated;
-                // its removed NOP cannot bridge the nested try's empty normal exit.
+                // its removed NOP cannot bridge a nested manager or empty try exit.
+                // Pass-only recovery also leaves that exit empty after a linear body or
+                // a retained conditional return exit, even when the body itself is nonempty.
                 // A sole false edge retains a located NOP and its original borrow route.
                 self.assembler.prevent_borrow_fallthrough_reachability(end);
             }
@@ -17039,6 +17079,13 @@ impl Compiler<'_> {
                     .set_location(self.source_location(condition_fallthrough_range(test)));
             } else if matches!(conditional_exit, Some(NestedIfExitLocation::Unlocated)) {
                 self.assembler.set_location(SourceLocation::NONE);
+            } else if matches!(statement.finalbody.last(), Some(Stmt::Assert(assertion))
+                if assertion_has_only_runtime_tests(&assertion.test))
+                && let Some(range) = suite_assert_success_fallthrough_range(&statement.finalbody)
+            {
+                // The normal cleanup exit inherits its unique assertion-success operand,
+                // independently of the failure RAISE's full test location.
+                self.assembler.set_location(self.source_location(range));
             } else if let Some(location) = self.assembler.last_instruction_location() {
                 self.assembler.set_location(location);
             }

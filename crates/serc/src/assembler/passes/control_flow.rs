@@ -13,8 +13,8 @@ use crate::assembler::block_graph::{BlockGraph, ItemMut, ItemPosition};
 use crate::code_object::Constant;
 use crate::target::Opcode;
 use crate::target::opcodes::{
-    LOAD_CONST, LOAD_GLOBAL, POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE, RAISE_VARARGS, RETURN_VALUE,
-    SWAP,
+    LOAD_CONST, LOAD_GLOBAL, POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE, RAISE_VARARGS, RERAISE,
+    RETURN_VALUE, SWAP,
 };
 use crate::target::operands::ComparisonOperation;
 
@@ -383,6 +383,17 @@ impl OptimizationPipeline {
                 // original array labels before normalization can attach these labels
                 // to a different live array; keep the original copy plan intact.
                 for item in graph[block].items() {
+                    if let Item::Label(label) = item
+                        && self
+                            .exception_owner_provenance
+                            .original_comprehension_normal_exits
+                            .iter()
+                            .any(|(entry, _)| entry == label)
+                    {
+                        self.exception_owner_provenance
+                            .retired_comprehension_normal_entries
+                            .insert(*label);
+                    }
                     if let Item::Label(label) = item
                         && (self
                             .exception_owner_provenance
@@ -1938,11 +1949,14 @@ impl OptimizationPipeline {
                         continue;
                     }
 
-                    let previous_line = previous.map(|previous| {
+                    let previous_line = previous.and_then(|previous| {
                         let Item::Instruction(instruction) = *graph.item(previous) else {
                             unreachable!();
                         };
-                        instruction.location.line
+                        // A raising predecessor cannot supply the line for another path's
+                        // exit. Keep ordinary jump and copied-return location handling.
+                        (!matches!(instruction.opcode, RAISE_VARARGS | RERAISE))
+                            .then_some(instruction.location.line)
                     });
                     let next_line = next.map(|next| {
                         let Item::Instruction(instruction) = *graph.item(next) else {

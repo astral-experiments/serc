@@ -50,3 +50,67 @@ fn keeps_direct_nested_handler_returns() {
         common::assert_matches_cpython_marshal(&source, "direct_nested_handler_return.py");
     }
 }
+
+#[test]
+fn keeps_authored_return_locations_after_copied_keyword_calls() {
+    use std::fmt::Write as _;
+
+    for (filename, protected, large, conditional) in [
+        (
+            "protected_large_keyword_return_conditional.py",
+            true,
+            true,
+            true,
+        ),
+        (
+            "protected_large_keyword_return_linear_control.py",
+            true,
+            true,
+            false,
+        ),
+        (
+            "protected_short_keyword_return_conditional_control.py",
+            true,
+            false,
+            true,
+        ),
+        (
+            "unprotected_large_keyword_return_conditional_control.py",
+            false,
+            true,
+            true,
+        ),
+    ] {
+        let indent = if protected {
+            "            "
+        } else {
+            "        "
+        };
+        let keywords = if large {
+            let mut keywords = String::new();
+            for index in 0..36 {
+                writeln!(keywords, "{indent}field{index:02}=value,").unwrap();
+            }
+            keywords
+        } else {
+            format!("{indent}initial=value,\n")
+        };
+        let final_value = if conditional {
+            "(value if flag else None)"
+        } else {
+            "value"
+        };
+        let (prefix, suffix) = if protected {
+            (
+                "    try:\n        return factory(\n",
+                "        )\n    except ValueError:\n        raise\n",
+            )
+        } else {
+            ("    return factory(\n", "    )\n")
+        };
+        let source = format!(
+            "def target(factory, flag, value):\n{prefix}{keywords}{indent}final={final_value},\n{suffix}"
+        );
+        common::assert_matches_cpython_marshal(&source, filename);
+    }
+}

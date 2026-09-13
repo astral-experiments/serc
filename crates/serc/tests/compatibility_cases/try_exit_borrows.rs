@@ -4243,3 +4243,143 @@ fn recovery_cleanup_linear_call() {
         "linear_call.py",
     );
 }
+
+#[test]
+fn matches_cpython_multicondition_compound_try_exit_borrows() {
+    for (filename, source) in [
+        (
+            "protected_multi_guard_nested_call_try.py",
+            r"def probe(value, ready, enabled):
+    try:
+        if ready and enabled:
+            try:
+                observe(value)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    consume(value)
+",
+        ),
+        (
+            "protected_multi_guard_nested_return_try.py",
+            r"def probe(value, ready, enabled):
+    try:
+        if ready and enabled:
+            try:
+                result = decode(value)
+                if valid(result):
+                    return result
+            except Exception:
+                pass
+    except Exception:
+        pass
+    consume(value)
+",
+        ),
+        (
+            "protected_multi_guard_return_with.py",
+            r"def probe(value, ready, enabled, manager):
+    try:
+        if ready and enabled:
+            with manager:
+                return value
+    except Exception:
+        pass
+    consume(value)
+",
+        ),
+        (
+            "protected_unique_guard_nested_call_try.py",
+            r"def probe(value, ready, enabled):
+    try:
+        if ready:
+            try:
+                observe(value)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    consume(value)
+",
+        ),
+        (
+            "protected_unique_guard_nested_return_try.py",
+            r"def probe(value, ready, enabled):
+    try:
+        if ready:
+            try:
+                result = decode(value)
+                if valid(result):
+                    return result
+            except Exception:
+                pass
+    except Exception:
+        pass
+    consume(value)
+",
+        ),
+        (
+            "protected_unique_guard_return_with.py",
+            r"def probe(value, ready, enabled, manager):
+    try:
+        if ready:
+            with manager:
+                return value
+    except Exception:
+        pass
+    consume(value)
+",
+        ),
+        (
+            "multi_guard_live_with.py",
+            r"def probe(value, ready, enabled, manager):
+    try:
+        if ready and enabled:
+            with manager:
+                observe(value)
+    except Exception:
+        recover(value)
+    consume(value)
+",
+        ),
+        (
+            "unique_guard_live_with.py",
+            r"def probe(value, ready, enabled, manager):
+    try:
+        if ready:
+            with manager:
+                observe(value)
+    except Exception:
+        recover(value)
+    consume(value)
+",
+        ),
+        (
+            "async_multi_guard_live_with.py",
+            r"async def probe(value, ready, enabled, manager):
+    try:
+        if ready and enabled:
+            async with manager:
+                observe(value)
+    except Exception:
+        recover(value)
+    consume(value)
+",
+        ),
+        (
+            "async_unique_guard_live_with.py",
+            r"async def probe(value, ready, enabled, manager):
+    try:
+        if ready:
+            async with manager:
+                observe(value)
+    except Exception:
+        recover(value)
+    consume(value)
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

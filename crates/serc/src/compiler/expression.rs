@@ -3942,6 +3942,10 @@ impl Compiler<'_> {
         if discard_result && generators.iter().any(|generator| generator.is_async) {
             self.assembler.prevent_jump_inlining(normal_exit);
         }
+        if !discard_result && generators.iter().all(|generator| !generator.is_async) {
+            self.assembler
+                .record_original_comprehension_normal_exit(normal_exit, normal_cleanup);
+        }
         self.assembler.mark(cleanup);
         self.set_depth(base_depth + i32::try_from(temporary_indices.len()).unwrap() + 2);
         self.assembler.set_location(SourceLocation::NONE);

@@ -3976,6 +3976,20 @@ impl Assembler {
             .push(condition);
     }
 
+    /// Records the original jump into a synchronous comprehension's normal restore array.
+    pub(crate) fn record_original_comprehension_normal_exit(
+        &mut self,
+        emitted: EmittedJump,
+        entry: Label,
+    ) {
+        let jump = *self.emitted_jump_mut(emitted, "recording a comprehension normal exit");
+        assert_eq!(jump.opcode, JUMP_FORWARD);
+        assert_eq!(jump.operand(), Operand::Forward(entry));
+        self.exception_owner_provenance
+            .original_comprehension_normal_exits
+            .push((entry, jump));
+    }
+
     /// Retains a folded condition's selected entry for borrowed-reference analysis.
     pub(crate) fn record_folded_condition_borrow_boundary(&mut self, label: Label) {
         self.exception_owner_provenance
