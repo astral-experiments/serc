@@ -303,3 +303,51 @@ fn copies_named_match_handler_cleanup_before_threading_loop_conditions() {
         common::assert_matches_cpython_marshal(&source, "named_match_handler_loop_cleanup.py");
     }
 }
+
+#[test]
+fn copies_named_elif_handler_cleanup_before_async_for() {
+    for (filename, source) in [
+        (
+            "named_handler_elif_cleanup_before_async_for.py",
+            r"class Wrapper(Base):
+    async def process(self, message):
+        if self.enabled:
+            text = render(message)
+            try:
+                result = loads(text)
+            except DecodeError as error:
+                text = repair(text)
+                if isinstance(message.content, Text):
+                    message.content.parts[0] = text
+                elif isinstance(message.content, Code):
+                    message.content.text = text
+            except Exception as other:
+                pass
+        async for message in super().process(message):
+            yield message
+",
+        ),
+        (
+            "named_handler_else_cleanup_before_async_for_control.py",
+            r"class Wrapper(Base):
+    async def process(self, message):
+        if self.enabled:
+            text = render(message)
+            try:
+                result = loads(text)
+            except DecodeError as error:
+                text = repair(text)
+                if isinstance(message.content, Text):
+                    message.content.parts[0] = text
+                else:
+                    message.content.text = text
+            except Exception as other:
+                pass
+        async for message in super().process(message):
+            yield message
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

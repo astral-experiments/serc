@@ -194,3 +194,52 @@ fn matches_cpython_same_operator_constant_loop_boolean_discard_locations() {
         );
     }
 }
+
+#[test]
+fn protected_nested_if_preserves_forward_exit_before_returning_handler() {
+    let source = r"def probe(groups, manager, build, accept, stop):
+    for items in groups:
+        with manager():
+            for item in items:
+                try:
+                    value = build(item)
+                    if accept(value):
+                        value = build(value)
+                        if stop(value):
+                            return value
+                except KeyboardInterrupt:
+                    return None
+    return None
+";
+    common::assert_matches_cpython_marshal(source, "protected_nested_if_return_handler.py");
+}
+
+#[test]
+fn protected_nested_if_preserves_forward_exit_before_continuing_handler() {
+    let source = r"def probe(items, outer, inner, work, report):
+    for item in items:
+        try:
+            if outer(item):
+                if inner(item):
+                    work(item)
+        except Exception:
+            report(item)
+            continue
+";
+    common::assert_matches_cpython_marshal(source, "protected_nested_if_continue_handler.py");
+}
+
+#[test]
+fn protected_nested_if_preserves_forward_exit_before_conditional_handler() {
+    let source = r"def probe(items, outer, inner, work, recover, report):
+    for item in items:
+        try:
+            if outer(item):
+                if inner(item):
+                    work(item)
+        except Exception:
+            if recover(item):
+                report(item)
+";
+    common::assert_matches_cpython_marshal(source, "protected_nested_if_conditional_handler.py");
+}

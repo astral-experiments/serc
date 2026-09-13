@@ -79,3 +79,69 @@ fn matches_cpython_bare_handler_return() {
         "bare_handler_return.py",
     );
 }
+
+#[test]
+fn matches_cpython_handler_cleanup_after_loop_control_arm() {
+    common::assert_matches_cpython_marshal(
+        r"def probe(items, parse, recover, choose, finish):
+    for item in items:
+        try:
+            value = parse(item)
+            break
+        except KeyError:
+            if not choose(item):
+                break
+            else:
+                recover(item)
+                finish(item)
+    return None
+",
+        "handler_break_before_normal_arm_control.py",
+    );
+    common::assert_matches_cpython_marshal(
+        r"def probe(items, parse, recover, keep, finish):
+    for item in items:
+        try:
+            value = parse(item)
+        except ValueError:
+            if not keep(item):
+                continue
+            else:
+                value = recover(item)
+        finish(value)
+    return None
+",
+        "handler_continue_before_normal_arm_control.py",
+    );
+    common::assert_matches_cpython_marshal(
+        r"def probe(items, parse, recover, choose, finish):
+    for item in items:
+        try:
+            value = parse(item)
+            break
+        except KeyError:
+            if choose(item):
+                recover(item)
+                finish(item)
+            else:
+                break
+    return None
+",
+        "handler_normal_arm_before_break.py",
+    );
+    common::assert_matches_cpython_marshal(
+        r"def probe(items, parse, recover, keep, finish):
+    for item in items:
+        try:
+            value = parse(item)
+        except ValueError:
+            if keep(item):
+                value = recover(item)
+            else:
+                continue
+        finish(value)
+    return None
+",
+        "handler_normal_arm_before_continue.py",
+    );
+}

@@ -816,7 +816,7 @@ impl Assembler {
         else {
             return false;
         };
-        if !ends_scope(previous.opcode)
+        if !(ends_scope(previous.opcode) || is_unconditional_jump(previous.opcode))
             || labels.iter().any(|label| {
                 self.original_nop_targets.contains(label)
                     || self.borrow_block_aliases.contains(label)

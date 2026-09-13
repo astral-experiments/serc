@@ -12173,8 +12173,12 @@ impl Compiler<'_> {
                     && self.control.finally.active_normal_finally_bodies == 0
                     && self.control.finally.active_finally_end_blocks == 0,
             ) || nested_loop_conversion_try);
+        // An ordinary try/except emits its normal POP_BLOCK before the handlers.
+        // Nested body conditions still target that forward exit during jump
+        // threading, regardless of whether a handler branches or terminates.
+        // Keep the existing admission for the handler half of a try/finally.
         let propagates_protected_loop_tail_mode =
-            try_propagates_protected_loop_tail_mode(statement);
+            statement.finalbody.is_empty() || try_propagates_protected_loop_tail_mode(statement);
         let nested_handler_tail_if_with_terminal_handlers = handlers_terminate
             && self.control.in_exception_handler()
             && statement.orelse.is_empty()
@@ -14223,7 +14227,19 @@ impl Compiler<'_> {
                                         && (!cleanup_has_small_return_successor
                                             || suite_has_normal_fallthrough(&clause.body))
                                 }))
-                );
+                )
+                // An elif also gives earlier runtime arms an original success jump,
+                // even when its own final body falls through without an else.
+                || (handler.name.is_some()
+                    && self.control.finally.active_normal_finally_bodies == 0
+                    && self.control.finally.active_finally_end_blocks == 0
+                    && suite_has_normal_fallthrough(&handler.body)
+                    && matches!(handler.body.last(), Some(Stmt::If(tail))
+                        if tail.elif_else_clauses.last().is_some_and(|clause| clause.test.is_some())
+                            && handler_cleanup_has_runtime_jump_exit(tail)
+                            && handler_cleanup_has_stable_fallthrough_location(tail)
+                            && (!cleanup_has_small_return_successor
+                                || !handler_cleanup_has_nested_branch_exit(tail))));
             let direct_nested_loop_handler_backedge = nested_loop_conversion_try;
             let copy_nested_loop_handler_backedge = direct_nested_loop_handler_backedge
                 && matches!(
@@ -14439,7 +14455,6 @@ impl Compiler<'_> {
             // wholly unlocated array before propagating locations, including joins after
             // nested finalizers and manager suppression. Existing cleanup routes stay intact.
             let handler_cleanup_from_original_join = self.context.target_specific_rules_enabled()
-                && loop_tail.is_none()
                 && !handler_ends_with_inlineable_cleanup
                 && cold_with_cleanup_location.is_none()
                 // A terminating nested try can leave unreachable jumps into this join.
