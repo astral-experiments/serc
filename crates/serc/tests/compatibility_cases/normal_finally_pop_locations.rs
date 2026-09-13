@@ -126,3 +126,127 @@ fn retains_handler_success_pop_before_nested_finally_try() {
 ";
     common::assert_matches_cpython_marshal(source, "handler_success_before_nested_finally_try.py");
 }
+
+#[test]
+fn absorbs_compound_try_exit_into_same_location_finally_pop() {
+    for (filename, source) in [
+        (
+            "compound_try_return_else_before_conditional_finally.py",
+            r"async def probe(request, close_sessions, made_sessions):
+    token = ''
+    url = ''
+    try:
+        response = await request()
+        if response is None:
+            return Output(output_dict={})
+        else:
+            token = response.get('token')
+            url = response.get('url')
+    except Exception as error:
+        return Output(output_dict={'success': False, 'error': str(error)})
+    finally:
+        if made_sessions:
+            await close_sessions()
+    return token, url
+",
+        ),
+        (
+            "compound_try_return_then_assign_finally_control.py",
+            r"async def probe(request, close_sessions, made_sessions):
+    token = ''
+    url = ''
+    try:
+        response = await request()
+        if response is None:
+            return Output(output_dict={})
+        token = response.get('token')
+        url = response.get('url')
+    except Exception as error:
+        return Output(output_dict={'success': False, 'error': str(error)})
+    finally:
+        if made_sessions:
+            await close_sessions()
+    return token, url
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn matches_cpython_nested_else_while_normal_exit_location() {
+    let source = r"def probe(local_workers, indices, in_flight, process_piece, consume_result, commit_progress):
+    executor = None
+    rows_seen = 0
+    rows_skipped = 0
+    committed_idx = None
+
+    def submit_next():
+        return schedule(executor, in_flight)
+
+    try:
+        if local_workers <= 1:
+            for i in indices:
+                rows_seen += 1
+                if committed_idx is not None and i <= committed_idx:
+                    rows_skipped += 1
+                    continue
+                consume_result(process_piece(i))
+        else:
+            executor = Pool(max_workers=local_workers)
+            for _ in range(local_workers * 2):
+                if not submit_next():
+                    break
+            while in_flight:
+                future = in_flight.popleft()
+                consume_result(future.result())
+                submit_next()
+    except KeyboardInterrupt:
+        warn()
+        commit_progress()
+        raise
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
+        commit_progress()
+        if rows_skipped:
+            report(rows_seen, rows_skipped)
+    return iter(())
+";
+    common::assert_matches_cpython_marshal(source, "protected_final_else_while_exit_location.py");
+    let source = r"def probe(local_workers, indices, in_flight, process_piece, consume_result, commit_progress):
+    executor = None
+    rows_seen = 0
+    rows_skipped = 0
+    committed_idx = None
+
+    def submit_next():
+        return schedule(executor, in_flight)
+
+    try:
+        executor = Pool(max_workers=local_workers)
+        for _ in range(local_workers * 2):
+            if not submit_next():
+                break
+        while in_flight:
+            future = in_flight.popleft()
+            consume_result(future.result())
+            submit_next()
+    except KeyboardInterrupt:
+        warn()
+        commit_progress()
+        raise
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
+        commit_progress()
+        if rows_skipped:
+            report(rows_seen, rows_skipped)
+    return iter(())
+";
+    common::assert_matches_cpython_marshal(
+        source,
+        "protected_direct_while_exit_location_control.py",
+    );
+}

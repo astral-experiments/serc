@@ -367,3 +367,38 @@ fn matches_cpython_copied_async_with_tuple_fallback_owners() {
 "#;
     common::assert_matches_cpython_marshal(source, "async_with_for_guards_tuple.py");
 }
+
+#[test]
+fn matches_cpython_authored_pass_after_exit_threading() {
+    let source = r"def probe(outer, inner, keep, other):
+    if outer:
+        if inner:
+            pass
+        else:
+            if keep:
+                return 1
+    elif other:
+        return 2
+    return None
+";
+    common::assert_matches_cpython_marshal(source, "pass_through_nested_join.py");
+    let source = r"def probe(inner, keep):
+    if inner:
+        pass
+    elif keep:
+        return 1
+    return None
+";
+    common::assert_matches_cpython_marshal(source, "pass_direct_join_control.py");
+    let source = r"def probe(outer, inner, keep, other):
+    if outer:
+        if inner: pass
+        else:
+            if keep:
+                return 1
+    elif other:
+        return 2
+    return None
+";
+    common::assert_matches_cpython_marshal(source, "pass_same_line_nested_join_control.py");
+}

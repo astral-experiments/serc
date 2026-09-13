@@ -49,7 +49,8 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) normal_try_exits: Vec<(Label, Label)>,
     // First records of the original manager cleanup arrays, before line resolution.
     pub(super) original_manager_pop_blocks: Vec<Label>,
-    // Original try/except POP_BLOCK exits inside their own finally, for owner transfer only.
+    // Original try/except POP_BLOCK exits inside their own finally, for owner transfer
+    // and late redundant-exit removal, but not ordinary-try exit copying.
     pub(super) compound_try_owner_exits: Vec<(Label, Label)>,
     pub(super) omitted_nop_locations: FxHashMap<Label, SourceLocation>,
     pub(super) omitted_nop_counts: FxHashMap<Label, usize>,

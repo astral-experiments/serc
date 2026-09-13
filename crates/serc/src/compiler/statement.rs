@@ -8061,8 +8061,9 @@ impl Compiler<'_> {
                     } else if pass_only_body && is_none_pass_assignment_branch(statement) {
                         self.assembler
                             .preserve_redundant_jump_nop_after_threading(branch_exit);
-                    } else if pass_only_body
-                        || retain_assertion_exit
+                    } else if pass_only_body {
+                        self.assembler.preserve_authored_pass_jump_nop(branch_exit);
+                    } else if retain_assertion_exit
                         || matches!(body.last(), Some(Stmt::For(statement))
                             if suite_contains_loop_break(&statement.body))
                         || matches!(body.last(), Some(Stmt::While(statement))
@@ -13139,6 +13140,24 @@ impl Compiler<'_> {
                     _ => None,
                 })
                 .flatten();
+            let nested_else_while_exit_location = if !statement.is_star
+                && statement.orelse.is_empty()
+                && let Some(Stmt::If(branch)) = statement.body.last()
+                && early_condition_truthiness(&branch.test).is_none()
+                && let [clause] = branch.elif_else_clauses.as_slice()
+                && clause.test.is_none()
+                && let Some(Stmt::While(loop_statement)) = clause.body.last()
+                && loop_statement.orelse.is_empty()
+                && !suite_contains_loop_break(&loop_statement.body)
+                && early_condition_truthiness(&loop_statement.test).is_none()
+                && condition_jump_target_count(&loop_statement.test, false) == 1
+            {
+                // The final else falls through from the loop's false condition. This
+                // supplies a line without changing the shared exit's copying policy.
+                Some(while_condition_exit_range(&loop_statement.test))
+            } else {
+                None
+            };
             let following_try_threads_conditional_exit =
                 self.control.statements.current_statement_followed_by_try
                     && statement.orelse.is_empty()
@@ -13202,6 +13221,8 @@ impl Compiler<'_> {
                 // does not inherit the terminal branch's source range.
                 self.assembler.set_location(SourceLocation::NONE);
             } else if let Some(range) = loop_exit_location {
+                self.assembler.set_location(self.source_location(range));
+            } else if let Some(range) = nested_else_while_exit_location {
                 self.assembler.set_location(self.source_location(range));
             } else if let Some(location) = orelse_noop_location {
                 self.assembler.set_location(location);

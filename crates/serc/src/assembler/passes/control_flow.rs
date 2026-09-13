@@ -1982,9 +1982,9 @@ impl OptimizationPipeline {
                         };
                         instruction.location.line
                     });
-                    // A restored normal manager POP_BLOCK now owns this line event.
-                    // The original try jump must retire against that same-line NULL
-                    // record, even when its old collapsed representation retained a NOP.
+                    // An original POP_BLOCK owns this line event, including the normal
+                    // entry to a finally suite. The try jump retires against that same-line
+                    // ownerless record even if its collapsed representation retained a NOP.
                     let absorbed_normal_try_exit = finalize_borrow_empty_blocks
                         && instruction.pre_fold_extra_instructions() == 0
                         && !instruction.fusion_policy.is_authored_break()
@@ -2000,16 +2000,21 @@ impl OptimizationPipeline {
                                         | super::super::ExceptionPolicy::AlwaysAbsent
                                 )
                                 && pop.location == instruction.location
-                                && self.exception_owner_provenance.normal_try_exits.iter().any(
-                                    |(entry, end)| {
+                                && self
+                                    .exception_owner_provenance
+                                    .normal_try_exits
+                                    .iter()
+                                    .chain(
+                                        &self.exception_owner_provenance.compound_try_owner_exits,
+                                    )
+                                    .any(|(entry, end)| {
                                         *end == target
                                             && graph[block].items()[..offset]
                                                 .iter()
                                                 .rev()
                                                 .take_while(|item| matches!(item, Item::Label(_)))
                                                 .any(|item| *item == Item::Label(*entry))
-                                    },
-                                )
+                                    })
                         });
                     if (!instruction.jump_policy.always_retains_nop() || absorbed_normal_try_exit)
                         && (instruction.location.line < 0

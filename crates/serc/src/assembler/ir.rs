@@ -541,6 +541,7 @@ impl JumpPolicy {
     const ORIGINAL_EMPTY_JOIN: u16 = 1 << 10;
     const ORIGINAL_SHARED_EMPTY_JOIN: u16 = 1 << 11;
     const ORIGINAL_UNIFORM_FOLD: u16 = 1 << 12;
+    const RETAIN_NOP_AFTER_RETARGETING: u16 = 1 << 13;
 
     const SYNTHETIC: Self = Self(Self::PREVENT_SMALL_EXIT_INLINING);
     const DEFAULT: Self = Self(0);
@@ -671,6 +672,12 @@ impl JumpPolicy {
         }
     }
 
+    /// Keeps an authored line event when jump threading changes its exit target.
+    pub(super) fn retain_nop_after_retargeting(&mut self) {
+        self.retain_nop_for_direct_target();
+        self.0 |= Self::RETAIN_NOP_AFTER_RETARGETING;
+    }
+
     /// Identifies an unchanged literal fold after its copy budget has saturated.
     pub(super) const fn has_original_uniform_fold(self) -> bool {
         self.0 & Self::ORIGINAL_UNIFORM_FOLD != 0
@@ -701,7 +708,9 @@ impl JumpPolicy {
     }
 
     fn clear_direct_target_retention(&mut self) {
-        if matches!(self.retained_nop(), RetainedJumpNop::DirectTarget) {
+        if matches!(self.retained_nop(), RetainedJumpNop::DirectTarget)
+            && self.0 & Self::RETAIN_NOP_AFTER_RETARGETING == 0
+        {
             self.0 &= !Self::RETAINED_NOP_MASK;
         }
     }

@@ -3092,7 +3092,7 @@ impl Assembler {
             .push((entry, target));
     }
 
-    /// Records a try/except `POP_BLOCK` exit inside its own finally for owner transfer.
+    /// Records an inner try/except `POP_BLOCK` exit for owner transfer and redundant-jump removal.
     pub(crate) fn record_compound_try_owner_exit(&mut self, entry: Label, target: Label) {
         self.exception_owner_provenance
             .compound_try_owner_exits
@@ -3140,6 +3140,13 @@ impl Assembler {
         self.emitted_jump_mut(emitted, "retaining an inlined jump NOP")
             .jump_policy
             .retain_nop();
+    }
+
+    /// Retains an authored Pass line without preventing threading through its join.
+    pub(crate) fn preserve_authored_pass_jump_nop(&mut self, emitted: EmittedJump) {
+        self.emitted_jump_mut(emitted, "retaining an authored Pass jump NOP")
+            .jump_policy
+            .retain_nop_after_retargeting();
     }
 
     pub(crate) fn preserve_direct_inlined_jump_nop(&mut self, emitted: EmittedJump) {
