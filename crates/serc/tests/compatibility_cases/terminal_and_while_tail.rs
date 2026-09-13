@@ -29,3 +29,15 @@ fn preserves_folded_selectors_in_terminal_and_while_loops() {
         }
     }
 }
+
+#[test]
+fn duplicates_implicit_return_for_mixed_boolean_terminal_while() {
+    common::assert_matches_cpython_marshal(
+        r"async def f(state, last=False):
+    while state.count >= state.limit or (last and state.count > 0):
+        await state.stage()
+        state.count = state.count - state.limit
+",
+        "terminal_mixed_boolean_while_async.py",
+    );
+}

@@ -1782,6 +1782,7 @@ impl LayoutAssembler {
         let mut ended_owned_prefix = None;
         let mut source_owned_prefix = None;
         let mut pending_retained_prefix = None;
+        let mut transferred_pop_setup: Option<(Label, usize)> = None;
         let mut retained_pop_prefix = None;
         let mut early_return_nop_slot = None;
         let mut owner_history_exact = true;
@@ -1892,6 +1893,34 @@ impl LayoutAssembler {
                                 .contains(label))
                     {
                         pending_retained_prefix = None;
+                    }
+                    if transferred_pop_setup.is_some_and(|(setup, _)| {
+                        boundaries.contains(label)
+                            || jump_targets.contains(label)
+                            || region_ends.contains(label)
+                            || self
+                                .exception_owner_provenance
+                                .source_boundaries
+                                .contains(label)
+                            || self
+                                .exception_owner_provenance
+                                .removed_pop_block_boundaries
+                                .contains(label)
+                            || self
+                                .exception_owner_provenance
+                                .omitted_nop_counts
+                                .contains_key(label)
+                            || self
+                                .exception_owner_provenance
+                                .omitted_nop_locations
+                                .contains_key(label)
+                            || (*label != setup
+                                && !self
+                                    .exception_owner_provenance
+                                    .setup_nop_boundaries
+                                    .contains(label))
+                    }) {
+                        transferred_pop_setup = None;
                     }
                     if boundaries.contains(label)
                         || jump_targets.contains(label)
@@ -2164,11 +2193,86 @@ impl LayoutAssembler {
                         ended_uniform_with_suffix = false;
                         protected_suffix = (retained && unprotected_setups.contains(label))
                             .then_some((instruction_index, tail, *label));
-                        retained_owned_suffix =
-                            (retained && retained_epoch_known).then_some((instruction_index, tail));
+                        // A copied return can transfer its outer POP into this authored
+                        // SETUP NOP. That exact pair starts a new protected suffix without
+                        // restoring the broader retained-SETUP or POP-slot epoch.
+                        let transferred_pop =
+                            transferred_pop_setup.take() == Some((*label, original_array_start));
+                        retained_owned_suffix = (retained
+                            && (retained_epoch_known || transferred_pop))
+                            .then_some((instruction_index, tail));
                     }
                 }
                 Item::Instruction(instruction) => {
+                    // Capture the single original POP before the NOP consumes its
+                    // transferred slot. Only the immediately adjacent authored SETUP
+                    // may use this proof; another instruction or boundary retires it.
+                    transferred_pop_setup = None;
+                    if instruction.opcode == NOP
+                        && !instruction.fusion_policy.is_converted_pop_block()
+                        && instruction.exception_policy() == super::ExceptionPolicy::NoneUnchanged
+                        && instruction.local_policy.hidden_exception_owner_slots() == 1
+                        && instruction.pre_fold_extra_instructions() == 0
+                        && instruction.no_location_policy.borrow_fallthrough()
+                            != super::BorrowFallthrough::Barrier
+                        && owner_history_exact
+                        && pop_slot_epoch_known
+                        && tail.insertions == 0
+                        && tail.late_removals == 0
+                        && tail.post_compaction_fusions == 0
+                        && ended_pop_slot.is_some_and(|(index, pop_tail, width)| {
+                            index == instruction_index
+                                && width == 1
+                                && pop_tail.early_removals == tail.early_removals
+                        })
+                        && ended_owned_prefix.is_some_and(|(start, end, _, _)| {
+                            original_array_start <= start
+                                && start < end
+                                && end == instruction_index
+                                && self.has_uniform_exception_owner(start, end, &label_positions)
+                        })
+                        && !self
+                            .exception_owner_provenance
+                            .omitted_nop_counts
+                            .keys()
+                            .chain(self.exception_owner_provenance.omitted_nop_locations.keys())
+                            .any(|origin| {
+                                label_positions.get(origin).is_some_and(|position| {
+                                    *position == instruction_index
+                                        || *position == instruction_index + 1
+                                })
+                            })
+                        && !self
+                            .exception_owner_provenance
+                            .source_boundaries
+                            .iter()
+                            .chain(jump_targets.iter())
+                            .any(|origin| label_positions.get(origin) == Some(&instruction_index))
+                        && self
+                            .exception_owner_provenance
+                            .setup_nop_ranges
+                            .iter()
+                            .filter(|(start, end)| {
+                                label_positions.get(start) == Some(&instruction_index)
+                                    && label_positions.get(end) == Some(&(instruction_index + 1))
+                            })
+                            .count()
+                            == 1
+                    {
+                        let mut matching_setups = self
+                            .exception_owner_provenance
+                            .setups
+                            .iter()
+                            .filter(|(label, location)| {
+                                *location == Some(instruction.location)
+                                    && label_positions.get(label) == Some(&(instruction_index + 1))
+                            });
+                        if let Some((setup, _)) = matching_setups.next()
+                            && matching_setups.next().is_none()
+                        {
+                            transferred_pop_setup = Some((*setup, original_array_start));
+                        }
+                    }
                     if instruction.opcode == NOP {
                         early_return_nop_slot = None;
                         if owner_history_exact

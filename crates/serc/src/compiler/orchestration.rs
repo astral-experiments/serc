@@ -35,7 +35,7 @@ use super::scope::{
 };
 use super::source::{CompilationContext, implicit_return_range};
 use super::statement::{
-    ControlFlowState, statement_uses_implicit_return_location, suite_terminates,
+    ControlFlowState, suite_terminates, terminal_statement_uses_implicit_return_location,
 };
 use super::symbol::{ReraiseStackState, ResumeDepth, SymbolState, to_u32};
 use super::{Compiler, Scope};
@@ -473,7 +473,7 @@ impl<'source> Compiler<'source> {
         if add_implicit_return
             && body
                 .last()
-                .is_some_and(statement_uses_implicit_return_location)
+                .is_some_and(terminal_statement_uses_implicit_return_location)
         {
             self.assembler.set_location(
                 self.source_location(implicit_return_range(&self, body.last().unwrap())),
@@ -517,7 +517,7 @@ impl<'source> Compiler<'source> {
         if add_implicit_return
             && body
                 .last()
-                .is_some_and(statement_uses_implicit_return_location)
+                .is_some_and(terminal_statement_uses_implicit_return_location)
         {
             self.assembler.set_location(
                 self.source_location(implicit_return_range(&self, body.last().unwrap())),

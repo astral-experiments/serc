@@ -22147,6 +22147,15 @@ fn suite_contains_class_keyword_none_match_break(body: &[Stmt]) -> bool {
     })
 }
 
+/// Keeps a shared scope-exit return unlocated until each condition edge receives its copy.
+pub(super) fn terminal_statement_uses_implicit_return_location(statement: &Stmt) -> bool {
+    statement_uses_implicit_return_location(statement)
+        && !matches!(statement, Stmt::While(statement)
+            if statement.orelse.is_empty()
+                && !suite_contains_loop_break(&statement.body)
+                && condition_jump_target_count(&statement.test, false) > 1)
+}
+
 pub(super) fn statement_uses_implicit_return_location(statement: &Stmt) -> bool {
     matches!(statement, Stmt::Assign(assignment) if assignment.targets.len() > 1 || matches!(assignment.targets.last(), Some(Expr::List(_) | Expr::Tuple(_))))
         || matches!(statement, Stmt::Assign(assignment) if matches!(assignment.value.as_ref(), Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_)))

@@ -537,3 +537,78 @@ fn matches_cpython_finally_return_owner_before_original_nop() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_nested_finally_owner_after_return_pop() {
+    for (filename, source) in [
+        (
+            "finally_nested_return_multiline_prefix.py",
+            r#"def target(local_path, root, metadata, destination, stats, count):
+    try:
+        if local_path is None:
+            return []
+        frames = list(
+            extract(
+                local_path,
+                root,
+                count,
+                stats=stats,
+                enabled=True,
+            )
+        )
+        started = clock.time()
+        uploaded = upload(
+            frames,
+            destination,
+        )
+        elapsed = clock.time() - started
+        print(
+            f"id={metadata.get('id')} "
+            f"bytes={metadata.get('size')} "
+            f"frames={len(frames)} "
+            f"elapsed={elapsed:.2f}"
+        )
+        return uploaded
+    finally:
+        try:
+            cleanup.remove_tree(root, ignore_errors=True)
+        finally:
+            if local_path:
+                try:
+                    cleanup.remove(local_path)
+                except Exception:
+                    pass
+"#,
+        ),
+        (
+            "finally_nested_return_global_prefix.py",
+            r#"def target(local_path, root, metadata, destination, stats, count):
+    try:
+        if local_path is None:
+            return []
+        frames = list(extract(local_path, root, count, stats=stats, enabled=True))
+        started = clock.time()
+        uploaded = upload(frames, destination)
+        elapsed = clock.time() - started
+        print(
+            f"id={metadata.get('id')} "
+            f"bytes={metadata.get('size')} "
+            f"frames={len(frames)} "
+            f"elapsed={elapsed:.2f}"
+        )
+        return uploaded
+    finally:
+        try:
+            cleanup.remove_tree(root, ignore_errors=True)
+        finally:
+            if local_path:
+                try:
+                    cleanup.remove(local_path)
+                except Exception:
+                    pass
+"#,
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
