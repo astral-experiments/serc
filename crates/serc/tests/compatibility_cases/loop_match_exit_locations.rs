@@ -22,3 +22,41 @@ fn matches_cpython_nested_match_failure_exits_inside_loops() {
         }
     }
 }
+
+#[test]
+fn preserves_nested_value_match_failure_before_outer_case_exit() {
+    for (filename, source) in [
+        (
+            "nested_match_loop_polarity.py",
+            r#"def f(tokens, low=3, high=7):
+    count = 0
+    for token in tokens:
+        match token:
+            case int():
+                count += 1
+            case dict():
+                match token.get("type"):
+                    case "low":
+                        count += low
+                    case "high":
+                        count += high
+    return count
+"#,
+        ),
+        (
+            "direct_match_loop_polarity.py",
+            r#"def f(tokens, low=3, high=7):
+    count = 0
+    for token in tokens:
+        match token.get("type"):
+            case "low":
+                count += low
+            case "high":
+                count += high
+    return count
+"#,
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

@@ -2849,10 +2849,12 @@ impl Assembler {
         let Item::Instruction(previous) = &mut items[source] else {
             unreachable!();
         };
+        previous.jump_policy.retire_original_uniform_fold();
         previous.local_policy.remove_hidden_exception_owner_slot();
         let Item::Instruction(next) = &mut items[target] else {
             unreachable!();
         };
+        next.jump_policy.retire_original_uniform_fold();
         next.local_policy.add_hidden_exception_owner_slots(1);
         self.exception_owner_provenance
             .removed_pop_block_boundaries
@@ -2888,6 +2890,23 @@ impl Assembler {
 
     /// Certifies contiguous literal-fold records that share their survivor's owner.
     pub(crate) fn record_last_uniform_fold_owner_slots(&mut self, count: usize) {
+        if count >= 4 && count < usize::from(LocalPolicy::MAX_HIDDEN_EXCEPTION_OWNER_SLOTS) {
+            let instruction = self.required_last_instruction_mut("recording original literal fold");
+            if matches!(
+                instruction.opcode,
+                crate::target::opcodes::LIST_EXTEND | crate::target::opcodes::SET_UPDATE
+            ) && instruction.operand() == Operand::Value(1)
+                && instruction.exception_policy() == ExceptionPolicy::NoneUnchanged
+                && instruction.pre_fold_extra_instructions() == 4
+                && usize::from(instruction.local_policy.hidden_exception_owner_slots()) == count
+            {
+                instruction.jump_policy.mark_original_uniform_fold();
+                let original = *instruction;
+                self.exception_owner_provenance
+                    .original_uniform_folds
+                    .push(original);
+            }
+        }
         // The copy budget saturates at four, so larger counts cannot reject foreign additions.
         if count == 0 || count >= 4 {
             return;

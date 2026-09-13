@@ -2572,6 +2572,12 @@ impl OptimizationPipeline {
             let mut copied = target_blocks
                 .iter()
                 .flat_map(|block| graph[*block].items().iter().copied())
+                .map(|item| match item {
+                    Item::Instruction(instruction) => {
+                        Item::Instruction(instruction.for_exit_copy())
+                    }
+                    Item::Label(_) => item,
+                })
                 .collect::<Vec<_>>();
             // A shared jump keeps its original no-location policy through NOP removal.
             // Its copy has a new predecessor and can inherit that predecessor's location.
@@ -3371,7 +3377,13 @@ impl OptimizationPipeline {
                     let copied_label = Label(self.next_label);
                     self.next_label += 1;
                     let mut predecessor_copy = vec![Item::Label(copied_label)];
-                    predecessor_copy.extend(transitive_copy.iter().copied().map(Item::Instruction));
+                    predecessor_copy.extend(
+                        transitive_copy
+                            .iter()
+                            .copied()
+                            .map(Instruction::for_exit_copy)
+                            .map(Item::Instruction),
+                    );
                     let jump_position = graph[predecessor]
                         .items()
                         .iter()

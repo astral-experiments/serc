@@ -616,7 +616,24 @@ impl Compiler<'_> {
                     })?;
                     emitted_fallthrough
                 } else {
-                    self.compile_suite(&case.body)?;
+                    // A non-default case appends its own success jump after a nested match.
+                    // Its retained original slot prevents that match's final value failure
+                    // from threading directly to the enclosing loop backedge.
+                    let non_final_match_tail = if !terminal
+                        && self.control.falls_through_to_loop_backedge()
+                        && let Some(Stmt::Match(nested)) = case.body.last()
+                        && nested.cases.last().is_some_and(|case| {
+                            case.guard.is_none() && matches!(case.pattern, Pattern::MatchValue(_))
+                        }) {
+                        Some(nested.range)
+                    } else {
+                        self.control.loops.non_final_match_tail
+                    };
+                    self.with_control_override(
+                        |control| &mut control.loops.non_final_match_tail,
+                        non_final_match_tail,
+                        |compiler| compiler.compile_suite(&case.body),
+                    )?;
                     false
                 };
                 if !context.empty_failure_jumps.is_empty()
@@ -640,11 +657,23 @@ impl Compiler<'_> {
                     }
                 }
                 if !emitted_case_exit && !suite_terminates(&case.body) && !emitted_fallthrough {
-                    if !terminal && index + 1 == matched_cases && !has_default {
+                    let nested_pattern_failure = self.control.falls_through_to_loop_backedge()
+                        && matches!(case.body.last(), Some(Stmt::Match(nested))
+                        if nested.cases.last().is_some_and(|case| {
+                            case.guard.is_none()
+                                && matches!(case.pattern, Pattern::MatchValue(_))
+                        }));
+                    if !terminal
+                        && index + 1 == matched_cases
+                        && !has_default
+                        && !nested_pattern_failure
+                    {
                         // This final case falls into the following code after its jump is
                         // removed; it does not retain a separate failed-pattern exit.
                         self.set_fallthrough_end_location(&case.body, body_start);
                     } else {
+                        // A nested value-pattern failure reaches the outer case's exit after
+                        // successful inner cases have copied it, supplying its pattern span.
                         self.set_branch_end_location(&case.body, body_start);
                     }
                     self.set_match_case_backedge_location(&case.body);

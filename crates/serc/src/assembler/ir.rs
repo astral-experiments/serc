@@ -540,6 +540,7 @@ impl JumpPolicy {
     const PREVENT_BORROW_THREADING_TARGET: u16 = 1 << 9;
     const ORIGINAL_EMPTY_JOIN: u16 = 1 << 10;
     const ORIGINAL_SHARED_EMPTY_JOIN: u16 = 1 << 11;
+    const ORIGINAL_UNIFORM_FOLD: u16 = 1 << 12;
 
     const SYNTHETIC: Self = Self(Self::PREVENT_SMALL_EXIT_INLINING);
     const DEFAULT: Self = Self(0);
@@ -668,6 +669,19 @@ impl JumpPolicy {
         if !self.always_retains_nop() {
             self.0 = (self.0 & !Self::RETAINED_NOP_MASK) | Self::RETAINED_NOP_DIRECT_TARGET;
         }
+    }
+
+    /// Identifies an unchanged literal fold after its copy budget has saturated.
+    pub(super) const fn has_original_uniform_fold(self) -> bool {
+        self.0 & Self::ORIGINAL_UNIFORM_FOLD != 0
+    }
+
+    pub(super) fn mark_original_uniform_fold(&mut self) {
+        self.0 |= Self::ORIGINAL_UNIFORM_FOLD;
+    }
+
+    pub(super) fn retire_original_uniform_fold(&mut self) {
+        self.0 &= !Self::ORIGINAL_UNIFORM_FOLD;
     }
 
     pub(super) const fn is_original_empty_join(self) -> bool {
@@ -1158,6 +1172,9 @@ impl Instruction {
     }
 
     pub(super) fn set_exception_policy(&mut self, policy: ExceptionPolicy) {
+        if policy != self.exception_policy() {
+            self.jump_policy.retire_original_uniform_fold();
+        }
         self.metadata = InstructionMetadata::new(
             policy,
             self.pre_fold_extra_instructions(),
@@ -1183,6 +1200,11 @@ impl Instruction {
     }
 
     pub(super) fn add_pre_fold_extra_instructions(&mut self, count: u8) {
+        if count > 0 {
+            // A positive addition is observable even when the four-slot budget
+            // cannot change. It invalidates the original literal-only transaction.
+            self.jump_policy.retire_original_uniform_fold();
+        }
         self.metadata = InstructionMetadata::new(
             self.exception_policy(),
             self.pre_fold_extra_instructions().saturating_add(count),
@@ -1229,6 +1251,7 @@ impl Instruction {
 
     pub(super) fn set_operand(&mut self, operand: Operand) {
         if self.operand() != operand {
+            self.jump_policy.retire_original_uniform_fold();
             self.metadata = self.metadata.with_initial_borrow_entry(false);
         }
         self.operand_payload = self.fusion_policy.set_operand(operand);
@@ -1280,6 +1303,12 @@ impl Instruction {
         let mut instruction = Self::new(opcode, operand, location, depth_after);
         instruction.jump_policy = JumpPolicy::SYNTHETIC;
         instruction
+    }
+
+    /// Retires source-only literal-fold provenance on a physical copy into another block.
+    pub(super) fn for_exit_copy(mut self) -> Self {
+        self.jump_policy.retire_original_uniform_fold();
+        self
     }
 
     /// Combines the provenance of two instructions replaced by one superinstruction.

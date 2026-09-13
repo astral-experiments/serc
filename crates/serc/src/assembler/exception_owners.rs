@@ -78,6 +78,8 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) noop_finally_locations: Vec<SourceLocation>,
     pub(super) with_context_locations: Vec<SourceLocation>,
     pub(super) uniform_fold_owner_slots: Vec<(SourceLocation, crate::target::Opcode, u16)>,
+    // Exact survivors of literal collection folds whose copy budget saturated.
+    pub(super) original_uniform_folds: Vec<Instruction>,
     // Exact source comparison and original labels, before any jump copying or cleanup.
     pub(super) source_none_conditions: Vec<SourceNoneCondition>,
     // Exact terminal pairs produced by original conditional jump threading.
@@ -207,6 +209,31 @@ pub(super) struct UncompactedConditionalArray {
 }
 
 impl ExceptionOwnerProvenance {
+    /// Finds a unique unchanged survivor whose literal-fold witness has not retired.
+    fn original_uniform_fold_positions(&self, instructions: &[&Instruction]) -> FxHashSet<usize> {
+        self.original_uniform_folds
+            .iter()
+            .filter_map(|original| {
+                if !original.jump_policy.has_original_uniform_fold()
+                    || self
+                        .original_uniform_folds
+                        .iter()
+                        .filter(|other| *other == original)
+                        .count()
+                        != 1
+                {
+                    return None;
+                }
+                let mut matches = instructions
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, instruction)| ***instruction == *original);
+                let (index, _) = matches.next()?;
+                matches.next().is_none().then_some(index)
+            })
+            .collect()
+    }
+
     /// Retains whole original arrays, before optimization can remove their live records.
     pub(super) fn capture_uncompacted_conditional_arrays(&mut self, items: &[Item]) {
         use crate::target::opcodes::{POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE};
@@ -1710,6 +1737,9 @@ impl LayoutAssembler {
                 }
             }
         }
+        let original_uniform_folds = self
+            .exception_owner_provenance
+            .original_uniform_fold_positions(&indexed_instructions);
         let comprehension_restore_prefixes = self
             .exception_owner_provenance
             .comprehension_restore_owner_prefixes
@@ -2443,19 +2473,20 @@ impl LayoutAssembler {
                     {
                         has_uninterrupted_fusion = true;
                     }
-                    let uniform_fold = instruction.local_policy.hidden_exception_owner_slots() > 0
-                        && self
-                            .exception_owner_provenance
-                            .uniform_fold_owner_slots
-                            .iter()
-                            .any(|(location, opcode, slots)| {
-                                instruction.location == *location
-                                    && instruction.opcode == *opcode
-                                    && instruction.local_policy.hidden_exception_owner_slots()
-                                        == *slots
-                                    && instruction.pre_fold_extra_instructions()
-                                        == (*slots).min(4) as u8
-                            });
+                    let uniform_fold = original_uniform_folds.contains(&instruction_index)
+                        || (instruction.local_policy.hidden_exception_owner_slots() > 0
+                            && self
+                                .exception_owner_provenance
+                                .uniform_fold_owner_slots
+                                .iter()
+                                .any(|(location, opcode, slots)| {
+                                    instruction.location == *location
+                                        && instruction.opcode == *opcode
+                                        && instruction.local_policy.hidden_exception_owner_slots()
+                                            == *slots
+                                        && instruction.pre_fold_extra_instructions()
+                                            == (*slots).min(4) as u8
+                                }));
                     if instruction.local_policy.hidden_exception_owner_slots()
                         == super::LocalPolicy::MAX_HIDDEN_EXCEPTION_OWNER_SLOTS
                         || (instruction.pre_fold_extra_instructions() > 0 && !uniform_fold)
@@ -5394,6 +5425,128 @@ mod tests {
                 assert!(
                     !decisions.get(&4).is_some_and(|decision| decision.has_owner),
                     "{case}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn saturated_literal_fold_rejects_changed_and_copied_origins() {
+        use crate::assembler::ir::UnoptimizedCode;
+        use crate::assembler::{
+            Assembler, ExceptionPolicy, Instruction, Item, Operand, SourceLocation,
+        };
+        use crate::target::opcodes::{LIST_EXTEND, NOP, SET_UPDATE};
+
+        for opcode in [LIST_EXTEND, SET_UPDATE] {
+            for count in [4, 9, 28] {
+                let location = SourceLocation::new(1, 1, 0, 12);
+                let mut assembler = Assembler {
+                    code: UnoptimizedCode::Linear(vec![Item::Instruction(Instruction::new(
+                        opcode,
+                        Operand::Value(1),
+                        location,
+                        None,
+                    ))]),
+                    ..Assembler::default()
+                };
+                assembler.add_last_constant_fold_slots(count);
+                assembler.record_last_uniform_fold_owner_slots(count);
+                let Item::Instruction(original) = assembler.linear_items()[0] else {
+                    unreachable!();
+                };
+                let provenance = &assembler.exception_owner_provenance;
+                assert!(provenance.uniform_fold_owner_slots.is_empty());
+                assert!(
+                    provenance
+                        .original_uniform_fold_positions(&[&original])
+                        .contains(&0)
+                );
+
+                let mut unchanged = original;
+                unchanged.add_pre_fold_extra_instructions(0);
+                unchanged.set_operand(Operand::Value(1));
+                unchanged.set_exception_policy(ExceptionPolicy::NoneUnchanged);
+                assert!(
+                    provenance
+                        .original_uniform_fold_positions(&[&unchanged])
+                        .contains(&0)
+                );
+
+                // The public count cannot change at saturation, but a foreign
+                // earlier instruction must still invalidate the literal transaction.
+                let mut foreign = original;
+                foreign.add_pre_fold_extra_instructions(1);
+                assert_eq!(
+                    foreign.pre_fold_extra_instructions(),
+                    original.pre_fold_extra_instructions()
+                );
+                assert!(
+                    provenance
+                        .original_uniform_fold_positions(&[&foreign])
+                        .is_empty()
+                );
+
+                let mut changed_operand = original;
+                changed_operand.set_operand(Operand::Value(2));
+                changed_operand.set_operand(Operand::Value(1));
+                assert!(
+                    provenance
+                        .original_uniform_fold_positions(&[&changed_operand])
+                        .is_empty()
+                );
+                let mut changed_policy = original;
+                changed_policy.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS);
+                changed_policy.set_exception_policy(ExceptionPolicy::NoneUnchanged);
+                assert!(
+                    provenance
+                        .original_uniform_fold_positions(&[&changed_policy])
+                        .is_empty()
+                );
+
+                let mut extra_hidden = original;
+                extra_hidden
+                    .local_policy
+                    .add_hidden_exception_owner_slots(1);
+                assert!(
+                    provenance
+                        .original_uniform_fold_positions(&[&extra_hidden])
+                        .is_empty()
+                );
+                let fused = Instruction::fused(
+                    opcode,
+                    Operand::Value(1),
+                    original,
+                    Instruction::new(NOP, Operand::Value(0), location, None),
+                );
+                assert!(
+                    provenance
+                        .original_uniform_fold_positions(&[&fused])
+                        .is_empty()
+                );
+
+                // Even when the original is deleted and only one physical copy
+                // survives, uniqueness cannot revive its retired source identity.
+                let sole_copy = original.for_exit_copy();
+                assert!(
+                    provenance
+                        .original_uniform_fold_positions(&[&sole_copy])
+                        .is_empty()
+                );
+                assert!(
+                    provenance
+                        .original_uniform_fold_positions(&[&original, &original])
+                        .is_empty()
+                );
+                assembler
+                    .exception_owner_provenance
+                    .original_uniform_folds
+                    .push(original);
+                assert!(
+                    assembler
+                        .exception_owner_provenance
+                        .original_uniform_fold_positions(&[&original])
+                        .is_empty()
                 );
             }
         }
