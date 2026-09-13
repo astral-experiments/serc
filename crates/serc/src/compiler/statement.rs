@@ -4879,8 +4879,9 @@ impl Compiler<'_> {
                                 && pair[0].exception_region_depth.checked_add(1)
                                     == Some(pair[1].exception_region_depth)
                         });
-                // Two contiguous unnamed handlers retire their own collectors before
-                // the one ordinary try surrounding both handlers is unwound.
+                // Two contiguous handlers retire their own collectors before the ordinary
+                // try surrounding them. The outer handler is unnamed; an inner name
+                // is cleared while the outer handler still owns its cleanup.
                 let tracks_two_handlers_inside_ordinary_try = !return_is_overridden
                     && self.context.target_specific_rules_enabled()
                     && handler_count == 2
@@ -4891,7 +4892,7 @@ impl Compiler<'_> {
                         .active_exception_region_exclusions
                         .len()
                         == 3
-                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                    && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
                     && self.control.exceptions.active_exception_group_handlers == 0
                     && self.control.withs.active_with_exits.is_empty()
                     && self.control.loops.contexts.is_empty()
@@ -4923,7 +4924,9 @@ impl Compiler<'_> {
                         .active_exception_handlers
                         .first()
                         .is_some_and(|handler| {
-                            handler.try_body_depth == 1 && handler.exception_region_depth == 1
+                            handler.name.is_none()
+                                && handler.try_body_depth == 1
+                                && handler.exception_region_depth == 1
                         })
                     && self
                         .control
@@ -4931,8 +4934,7 @@ impl Compiler<'_> {
                         .active_exception_handlers
                         .iter()
                         .all(|handler| {
-                            handler.name.is_none()
-                                && handler.with_depth == 0
+                            handler.with_depth == 0
                                 && handler.loop_depth == 0
                                 && handler.finally_end_depth == 0
                         })
@@ -5129,7 +5131,9 @@ impl Compiler<'_> {
                 // when another try entered inside the handler must unwind before POP_EXCEPT.
                 let tracks_handler_enclosing_try_unwinds = !return_is_overridden
                     && preserve_tos
-                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                    && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+                    && (self.unit.flags & CO_COROUTINE == 0
+                        || self.control.loops.contexts.is_empty())
                     && self.context.target_specific_rules_enabled()
                     && handler_count == 1
                     && self.control.exceptions.active_exception_group_handlers == 0
@@ -16338,6 +16342,30 @@ impl Compiler<'_> {
                             !expression_contains_inline_branch(value)
                         })))))
                 || suite_has_linear_borrow_fallthrough(&statement.finalbody)
+                // A synchronous for exhaustion retains END_FOR and POP_ITER.
+                // Its normal recovery exit reaches the next iterator preheader
+                // without an empty conditional or copied-finally boundary.
+                || (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                    && self.control.withs.active_with_exits.is_empty()
+                    && self.control.finally.active_copied_finally_bodies == 0
+                    && self.control.finally.active_finally_try_bodies == 0
+                    && matches!(statement.body.last(), Some(Stmt::For(body_loop))
+                        if !body_loop.is_async
+                            && body_loop.orelse.is_empty()
+                            && !expression_contains_inline_branch(&body_loop.iter)
+                            && !expression_contains_inline_branch(&body_loop.target)
+                            && suite_has_linear_borrow_fallthrough(&body_loop.body))
+                    && matches!(statement.finalbody.as_slice(), [Stmt::For(cleanup)]
+                        if !cleanup.is_async
+                            && cleanup.orelse.is_empty()
+                            && !expression_contains_inline_branch(&cleanup.iter)
+                            && !expression_contains_inline_branch(&cleanup.target)
+                            && (suite_has_linear_borrow_fallthrough(&cleanup.body)
+                                || matches!(cleanup.body.as_slice(), [Stmt::If(guard)]
+                                    if condition_has_only_runtime_tests(&guard.test)
+                                        && !expression_contains_inline_branch(&guard.test)
+                                        && guard.elif_else_clauses.is_empty()
+                                        && suite_has_linear_borrow_fallthrough(&guard.body)))))
                 || (matches!(self.unit.scope, Scope::Function { .. })
                     && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
                     && self.control.withs.active_with_exits.is_empty()

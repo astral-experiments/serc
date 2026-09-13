@@ -490,3 +490,52 @@ fn matches_cpython_finally_borrows_after_exception_only_breaks() {
 "#;
     common::assert_matches_cpython_marshal(source, "exception_only_break_finally_borrows.py");
 }
+
+#[test]
+fn matches_cpython_iterator_finally_entry_after_handler_reraise_guard() {
+    for (source, filename) in [
+        (
+            r"def f(values, consume, should_raise):
+    try:
+        for value in values:
+            consume(value)
+    except RuntimeError:
+        if should_raise():
+            raise
+    finally:
+        for value in values:
+            consume(value)
+",
+            "handler_raise_finally_for.py",
+        ),
+        (
+            r"def f(next_item, values, consume):
+    try:
+        while True:
+            item = next_item()
+            if item is None:
+                break
+            consume(item)
+    finally:
+        for value in values:
+            consume(value)
+",
+            "while_break_finally_for.py",
+        ),
+        (
+            r"def f(flag, values, consume):
+    try:
+        if flag:
+            consume(1)
+    except RuntimeError:
+        pass
+    finally:
+        for value in values:
+            consume(value)
+",
+            "empty_join_finally_for_control.py",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
