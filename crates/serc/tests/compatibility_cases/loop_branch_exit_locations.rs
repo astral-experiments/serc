@@ -152,6 +152,84 @@ fn matches_cpython_handler_assertion_success_locations() {
 }
 
 #[test]
+fn matches_cpython_loop_tail_handler_assertion_cleanup_locations() {
+    for (filename, source) in [
+        (
+            "cleanup_reverse_control_assert_loop.py",
+            r"def f(values, flag, other):
+    for value in values:
+        try:
+            work(value)
+        except Error as error:
+            assert flag or other
+        else:
+            raise Other
+",
+        ),
+        (
+            "cleanup_assert_loop_else_call.py",
+            r"def f(values, flag, other):
+    for value in values:
+        try:
+            work(value)
+        except Error as error:
+            assert flag or other
+        else:
+            fail()
+",
+        ),
+        (
+            "cleanup_assert_loop_following_statement.py",
+            r"def f(values, flag, other):
+    for value in values:
+        try:
+            work(value)
+        except Error as error:
+            assert flag or other
+        else:
+            raise Other
+        after()
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn matches_cpython_try_else_break_backedge_locations() {
+    for (filename, scope, action, condition, following) in [
+        ("try_else_break_name.py", "", "read(value)", "key", ""),
+        (
+            "try_else_break_none_async.py",
+            "async ",
+            "await read(value)",
+            "key is None",
+            "",
+        ),
+        (
+            "try_else_break_compare.py",
+            "",
+            "read(value)",
+            "len(key) == 0",
+            "",
+        ),
+        (
+            "try_else_break_multiple_false_control.py",
+            "",
+            "read(value)",
+            "key and other",
+            "",
+        ),
+    ] {
+        let source = format!(
+            "{scope}def f(values, other):\n    for value in values:\n        try:\n            key = {action}\n        except Error:\n            continue\n        else:\n            if {condition}:\n                break\n{following}"
+        );
+        common::assert_matches_cpython_marshal(&source, filename);
+    }
+}
+
+#[test]
 fn matches_cpython_suspended_handler_cleanup_locations() {
     for (scope, action, prefix) in [
         ("async ", "await finish()", ""),

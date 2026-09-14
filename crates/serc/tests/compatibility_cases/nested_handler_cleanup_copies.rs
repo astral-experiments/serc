@@ -107,3 +107,27 @@ fn matches_cpython_fresh_condition_slot_in_nested_retained_try() {
         common::assert_matches_cpython_marshal(&source, "nested_retained_try_condition.py");
     }
 }
+
+#[test]
+fn preserves_named_handler_return_owner_before_older_iterators() {
+    for (filename, source) in [
+        (
+            "named_handler_return_before_outer_iterator.py",
+            "def probe(values, run, retry, recover, close):\n    for value in values:\n        try:\n            try:\n                run(value)\n            except KeyError as error:\n                if retry(error):\n                    continue\n                return recover(error)\n        except RuntimeError:\n            run(value)\n        finally:\n            close(value)\n",
+        ),
+        (
+            "named_handler_tuple_return_before_outer_iterator.py",
+            "def probe(values, run, retry, recover, close):\n    for value in values:\n        try:\n            try:\n                run(value)\n            except KeyError as error:\n                if retry(error):\n                    continue\n                return recover(error), value\n        except RuntimeError:\n            run(value)\n        finally:\n            close(value)\n",
+        ),
+        (
+            "named_handler_no_iterator_control.py",
+            "def probe(value, run, recover, close):\n    try:\n        try:\n            run(value)\n        except KeyError as error:\n            return recover(error)\n    except RuntimeError:\n        run(value)\n    finally:\n        close(value)\n",
+        ),
+        (
+            "named_handler_younger_iterator_control.py",
+            "def probe(values, run, recover, close):\n    try:\n        try:\n            for value in values:\n                try:\n                    run(value)\n                except KeyError as error:\n                    return recover(error)\n        except RuntimeError:\n            run(None)\n    finally:\n        close(None)\n",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

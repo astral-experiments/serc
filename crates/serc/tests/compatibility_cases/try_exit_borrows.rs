@@ -4383,6 +4383,79 @@ fn recovery_cleanup_linear_call() {
 }
 
 #[test]
+fn matches_cpython_manager_while_cancellation_recovery_borrows() {
+    for (filename, source) in [
+        (
+            "manager_while_cancel_reraise.py",
+            r"def probe(manager, pending, value):
+    with manager():
+        try:
+            while pending:
+                work(pending)
+        except BaseException:
+            for future in pending:
+                future.cancel()
+            raise
+    consume(value)
+    finish(value)
+    return value
+",
+        ),
+        (
+            "nested_manager_while_cancel_reraise.py",
+            r"def probe(manager, pending, value):
+    with manager():
+        with manager():
+            try:
+                while pending:
+                    work(pending)
+            except BaseException:
+                for future in pending:
+                    future.cancel()
+                raise
+    consume(value)
+    finish(value)
+    return value
+",
+        ),
+        (
+            "manager_while_cancel_source_successor_control.py",
+            r"def probe(manager, pending, value):
+    with manager():
+        try:
+            while pending:
+                work(pending)
+        except BaseException:
+            for future in pending:
+                future.cancel()
+            raise
+        observe(value)
+    consume(value)
+    finish(value)
+    return value
+",
+        ),
+        (
+            "manager_while_recovery_fallthrough_control.py",
+            r"def probe(manager, pending, value):
+    with manager():
+        try:
+            while pending:
+                work(pending)
+        except BaseException:
+            for future in pending:
+                future.cancel()
+    consume(value)
+    finish(value)
+    return value
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
 fn matches_cpython_multicondition_nested_recovery_borrows() {
     for (filename, source) in [
         (

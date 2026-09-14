@@ -4998,36 +4998,42 @@ impl Compiler<'_> {
                 // a pending finally. Keep each enclosing collector active until its own
                 // unwind boundary; the handler's saved depth also retires any try entered
                 // inside the handler before POP_EXCEPT clears its exception state.
-                let preserves_enclosing_try_return_owner = !return_is_overridden
-                    && self.context.target_specific_rules_enabled()
-                    && handler_count == 1
-                    && self.control.finally.active_return_finally_contexts.len() == 1
-                    && self
-                        .control
-                        .loops
-                        .contexts
-                        .iter()
-                        .all(|context| context.iterator_cleanup == IteratorCleanup::None)
-                    && self.control.withs.active_with_exits.is_empty()
-                    && self.control.finally.active_finally_end_blocks == 0
-                    && self.control.finally.active_normal_finally_bodies == 0
-                    && self
-                        .control
-                        .exceptions
-                        .active_exception_handlers
-                        .last()
-                        .is_some_and(|handler| {
-                            let finally = &self.control.finally.active_return_finally_contexts[0];
-                            finally.handler_depth == 0
-                                && handler.exception_region_depth
-                                    > finally.exception_region_depth + 1
-                                && self
-                                    .control
-                                    .exceptions
-                                    .active_exception_region_exclusions
-                                    .len()
-                                    > handler.exception_region_depth
-                        });
+                let preserves_enclosing_try_return_owner =
+                    !return_is_overridden
+                        && self.context.target_specific_rules_enabled()
+                        && handler_count == 1
+                        && self.control.finally.active_return_finally_contexts.len() == 1
+                        && self.control.loops.contexts.iter().enumerate().all(
+                            |(index, context)| {
+                                // Older iterators unwind after this finally, so they do not
+                                // retire the ordinary try before handler cleanup.
+                                context.iterator_cleanup == IteratorCleanup::None
+                                    || index
+                                        < self.control.finally.active_return_finally_contexts[0]
+                                            .loop_depth
+                            },
+                        )
+                        && self.control.withs.active_with_exits.is_empty()
+                        && self.control.finally.active_finally_end_blocks == 0
+                        && self.control.finally.active_normal_finally_bodies == 0
+                        && self
+                            .control
+                            .exceptions
+                            .active_exception_handlers
+                            .last()
+                            .is_some_and(|handler| {
+                                let finally =
+                                    &self.control.finally.active_return_finally_contexts[0];
+                                finally.handler_depth == 0
+                                    && handler.exception_region_depth
+                                        > finally.exception_region_depth + 1
+                                    && self
+                                        .control
+                                        .exceptions
+                                        .active_exception_region_exclusions
+                                        .len()
+                                        > handler.exception_region_depth
+                            });
                 // An enclosing finally still owns iterator disposal after its inner
                 // handler has restored the exception state. Give each collector its
                 // own unwind start instead of ending both at POP_EXCEPT. An ordinary
@@ -13375,6 +13381,23 @@ impl Compiler<'_> {
                 // CPython then retains the edge as a NOP carrying the condition's exit range.
                 self.assembler
                     .set_location(self.source_location(synthetic_condition_exit_range(test)));
+            } else if !statement.is_star
+                && statement.finalbody.is_empty()
+                && self.control.in_iterator_loop()
+                && self.control.loops.uncopied_loop_tail_statement == Some(statement.range)
+                && self.control.in_loop_tail_without_nested_cleanup()
+                && let Some(Stmt::If(nested)) = statement.orelse.last()
+                && nested.elif_else_clauses.is_empty()
+                && matches!(nested.body.as_slice(), [Stmt::Break(_)])
+                && let Some(test) = terminating_if_fallthrough_test(nested)
+                && condition_has_only_runtime_tests(test)
+                && original_condition_has_unique_jump_target(test, false)
+                && let Some(donor) = unique_condition_jump_target(test, false)
+            {
+                // Only the false condition reaches this generic iterator backedge;
+                // the break exits the loop and cannot donate its location.
+                self.assembler
+                    .set_location(self.source_location(donor.range()));
             } else if statement.orelse.is_empty()
                 && let Some(Stmt::If(nested)) = statement.body.last()
                 && let Some(test) = terminating_if_fallthrough_test(nested)
@@ -13875,6 +13898,43 @@ impl Compiler<'_> {
             }
             if self.control.exceptions.prevent_try_exit_inlining {
                 self.assembler.prevent_jump_inlining(normal_exit);
+            }
+            if normal_exit_reaches_enclosing_manager
+                && self
+                    .control
+                    .withs
+                    .active_with_exits
+                    .last()
+                    .is_some_and(|manager| !manager.is_async)
+                && !borrow_exit_has_source_successor
+                && !statement.is_star
+                && statement.orelse.is_empty()
+                && statement.finalbody.is_empty()
+                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                && matches!(statement.body.last(), Some(Stmt::While(loop_statement))
+                    if matches!(loop_statement.test.as_ref(), Expr::Name(_))
+                        && loop_statement.orelse.is_empty()
+                        && !suite_contains_loop_break(&loop_statement.body))
+                && matches!(statement.handlers.as_slice(), [handler]
+                if handler.as_except_handler().is_some_and(|handler| {
+                    handler.type_.is_some()
+                        && handler.name.is_none()
+                        && matches!(handler.body.as_slice(), [Stmt::For(recovery), Stmt::Raise(raise)]
+                            if !recovery.is_async
+                                && recovery.orelse.is_empty()
+                                && matches!(recovery.iter.as_ref(), Expr::Name(_))
+                                && matches!(recovery.body.as_slice(), [Stmt::Expr(expression)]
+                                    if matches!(expression.value.as_ref(), Expr::Call(_))
+                                        && !expression_contains_inline_branch(&expression.value))
+                                && raise.exc.is_none()
+                                && raise.cause.is_none())
+                }))
+            {
+                // The sole normal edge gives the manager POP_BLOCK the while line.
+                // Cold ordering then removes the preceding try exit's same-line NOP,
+                // leaving that original array empty. Its direct-copy retention policy
+                // does not describe the surviving NOP in the next manager-entry array.
+                self.assembler.mark_borrow_empty_block(normal_exit);
             }
             if normal_exit_starts_in_empty_block && !borrow_exit_has_source_successor {
                 // A terminal manager try may retain its normal-exit NOP, for example after
@@ -15129,7 +15189,13 @@ impl Compiler<'_> {
                     || (handler_ends_with_multi_success_assert
                         && !terminal
                         && !cleanup_has_small_return_successor
-                        && loop_tail.is_none())
+                        && loop_tail.is_none()
+                        // Generic iterator tails copy the cleanup onto each assertion success
+                        // predecessor, just like the specialized loop-tail path.
+                        && !(self.control.in_iterator_loop()
+                            && self.control.loops.uncopied_loop_tail_statement
+                                == Some(statement.range)
+                            && self.control.in_loop_tail_without_nested_cleanup()))
                 {
                     self.assembler.preserve_last_no_location();
                     if handler_ends_with_unlocated_if_cleanup {
