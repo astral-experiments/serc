@@ -6504,6 +6504,10 @@ impl Compiler<'_> {
                     {
                         // Nested try exits share a single region-end label in the IR, but each
                         // original POP_BLOCK still counts toward CPython's early copy limit.
+                        let original_pop = exception_unwind_start
+                            .or(return_exclusion_start)
+                            .expect("ordinary return unwind has a boundary");
+                        self.assembler.record_name_return_pop_boundary(original_pop);
                         self.assembler.add_last_original_block_slots(
                             self.control
                                 .exceptions
@@ -8589,6 +8593,10 @@ impl Compiler<'_> {
                 // own its cleanup, and a deeper iterator may have ended newer regions already.
                 let start = self.assembler.label();
                 self.assembler.mark(start);
+                if preserve_tos {
+                    self.assembler
+                        .record_name_return_iterator_region_alias(start);
+                }
                 for region_start in &mut starts[context.exception_region_depth..] {
                     region_start.get_or_insert(start);
                 }
@@ -13863,6 +13871,17 @@ impl Compiler<'_> {
                 // Resolve its copy eligibility only after that target has been emitted.
                 self.control.finally.pending_name_return_borrow_exit =
                     Some(self.assembler.record_name_return_borrow_exit(normal_exit));
+            } else if terminal_handler_exit
+                && statement.finalbody.is_empty()
+                && self
+                    .control
+                    .statements
+                    .current_statement_followed_by_name_return
+                && self.control.withs.active_with_exits.is_empty()
+            {
+                // The emitted return can include erased try POPs and iterator cleanup.
+                // Keep this exemption only until its original target width is known.
+                self.assembler.defer_name_return_borrow_exit(normal_exit);
             }
         }
         if deferred_try_pop_block && !removed_shared_try_pop_block {
@@ -14525,10 +14544,15 @@ impl Compiler<'_> {
                     // A trailing for loop joins its breaks with iterator exhaustion before
                     // the handler's source-less cleanup. Copy that cleanup before assigning
                     // each predecessor's location, as for other original compound joins.
+                    // A literal return on exhaustion leaves only the breaks reaching that
+                    // cleanup in an unnamed handler.
                     // Named cleanup uses the same unlocated exit-copy rule regardless of size.
                     Stmt::For(tail) => {
                         !tail.is_async
-                            && tail.orelse.is_empty()
+                            && (tail.orelse.is_empty()
+                                || (handler.name.is_none()
+                                    && matches!(tail.orelse.as_slice(), [Stmt::Return(ret)]
+                                        if ret.value.as_deref().is_some_and(is_literal_constant))))
                             && suite_contains_loop_break(&tail.body)
                             && !suite_contains_loop_break_with_finally(&tail.body)
                     }

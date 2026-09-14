@@ -284,3 +284,55 @@ fn matches_cpython_membership_fold_after_retained_finally_pop() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_identity_fold_after_retained_finally_pop() {
+    for (filename, source) in [
+        (
+            "identity_owner_worker_finally_multiline.py",
+            r"def f(manager, pool, value, first, second):
+    for attempt in range(3):
+        try:
+            with manager:
+                worker = pool.acquire()
+                try:
+                    try:
+                        worker.render(value, first, second)
+                    except Error:
+                        replacement = pool.replace(worker)
+                        pool.release(replacement)
+                        raise
+                finally:
+                    if worker is (
+                        pool.workers
+                    ):
+                        pool.release(worker)
+        except Error:
+            retry(attempt)
+",
+        ),
+        (
+            "identity_owner_worker_finally.py",
+            r"def f(manager, pool, value, first, second):
+    for attempt in range(3):
+        try:
+            with manager:
+                worker = pool.acquire()
+                try:
+                    try:
+                        worker.render(value, first, second)
+                    except Error:
+                        replacement = pool.replace(worker)
+                        pool.release(replacement)
+                        raise
+                finally:
+                    if worker is not pool.workers:
+                        pool.release(worker)
+        except Error:
+            retry(attempt)
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

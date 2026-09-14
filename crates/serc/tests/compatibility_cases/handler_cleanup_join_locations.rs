@@ -110,6 +110,69 @@ fn matches_cpython_handler_cleanup_after_for_else_raise() {
 }
 
 #[test]
+fn matches_cpython_handler_cleanup_after_retry_for_literal_return_else() {
+    for (filename, source) in [
+        (
+            "handler_retry_for_return_else.py",
+            r"def parse_value(value, formats, primary, fallback):
+    try:
+        parsed = primary(value)
+    except ValueError:
+        for fmt in formats:
+            try:
+                parsed = fallback(value, fmt)
+                break
+            except ValueError:
+                continue
+        else:
+            return None
+    if parsed.ready is None:
+        parsed = parsed.replace()
+    return parsed.finish()
+",
+        ),
+        (
+            "handler_retry_for_return_float_else.py",
+            r"def parse_value(value, formats, primary, fallback):
+    try:
+        parsed = primary(value)
+    except ValueError:
+        for fmt in formats:
+            try:
+                parsed = fallback(value, fmt)
+                break
+            except ValueError:
+                continue
+        else:
+            return 0.0
+    if parsed.ready is None:
+        parsed = parsed.replace()
+    return parsed.finish()
+",
+        ),
+        (
+            "handler_retry_for_empty_else_control.py",
+            r"def parse_value(value, formats, primary, fallback):
+    try:
+        parsed = primary(value)
+    except ValueError:
+        for fmt in formats:
+            try:
+                parsed = fallback(value, fmt)
+                break
+            except ValueError:
+                continue
+    if parsed.ready is None:
+        parsed = parsed.replace()
+    return parsed.finish()
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
 fn matches_cpython_for_else_handler_cleanup_in_suspended_and_finally_contexts() {
     for source in [
         r"def f(items, a, b):

@@ -1424,6 +1424,12 @@ pub(crate) struct Assembler {
     /// Entries whose empty original fallthrough can be bypassed by a surviving jump.
     pub(super) borrow_jump_entry_labels: FxHashSet<Label>,
     pub(super) deferred_borrow_entries: Vec<DeferredBorrowEntry>,
+    /// Normal edges whose following local return must prove its original copy width.
+    pub(super) deferred_name_return_borrow_exits: Vec<super::NameReturnBorrowExit>,
+    /// Exact omitted ordinary-try POP slots in pending local-return targets.
+    pub(super) name_return_pop_boundaries: FxHashSet<Label>,
+    /// Iterator-region aliases immediately following an ordinary-return POP boundary.
+    pub(super) name_return_iterator_region_aliases: FxHashMap<Label, Label>,
     /// Disconnected loop exits and the normal entries that remain reachable.
     pub(super) borrow_loop_exit_blocks: FxHashMap<Label, BorrowLoopExitPolicy>,
     /// Normal finally entries whose original nonempty cleanup can retain an explicit jump.
@@ -1623,6 +1629,9 @@ impl Default for Assembler {
             borrow_omitted_for_backedges: FxHashSet::default(),
             borrow_jump_entry_labels: FxHashSet::default(),
             deferred_borrow_entries: Vec::new(),
+            deferred_name_return_borrow_exits: Vec::new(),
+            name_return_pop_boundaries: FxHashSet::default(),
+            name_return_iterator_region_aliases: FxHashMap::default(),
             borrow_loop_exit_blocks: FxHashMap::default(),
             borrow_finally_entries: FxHashMap::default(),
             borrow_block_aliases: FxHashSet::default(),

@@ -1359,6 +1359,7 @@ impl Assembler {
 
     /// Resolves pending entries using label groups before any assembler optimization.
     fn resolve_folded_condition_borrow_entries(&mut self) {
+        self.resolve_name_return_borrow_exits();
         if self.deferred_borrow_entries.is_empty() {
             return;
         }
@@ -2535,6 +2536,161 @@ impl Assembler {
         NameReturnBorrowExit {
             source,
             original: *self.emitted_jump_mut(source, "recording a normal-finally borrow exit"),
+        }
+    }
+
+    /// Defers a normal-edge exemption until its complete local-return target is emitted.
+    pub(crate) fn defer_name_return_borrow_exit(&mut self, source: EmittedJump) {
+        let origin = self.record_name_return_borrow_exit(source);
+        self.deferred_name_return_borrow_exits.push(origin);
+    }
+
+    /// Records the first erased ordinary-try POP before a return's remaining unwind.
+    pub(crate) fn record_name_return_pop_boundary(&mut self, boundary: Label) {
+        if !self.deferred_name_return_borrow_exits.is_empty() {
+            self.name_return_pop_boundaries.insert(boundary);
+        }
+    }
+
+    /// Certifies a metadata-only iterator-region label beside the return's unwind label.
+    pub(crate) fn record_name_return_iterator_region_alias(&mut self, boundary: Label) {
+        if self.deferred_name_return_borrow_exits.is_empty() {
+            return;
+        }
+        let original = match self.linear_items() {
+            [.., Item::Label(original), Item::Label(alias)] if *alias == boundary => *original,
+            _ => return,
+        };
+        self.name_return_iterator_region_aliases
+            .insert(boundary, original);
+    }
+
+    /// Rejects copy-based borrowing only for a proven oversized original return array.
+    fn resolve_name_return_borrow_exits(&mut self) {
+        if self.deferred_name_return_borrow_exits.is_empty() {
+            return;
+        }
+        let origins = std::mem::take(&mut self.deferred_name_return_borrow_exits);
+        let pop_boundaries = std::mem::take(&mut self.name_return_pop_boundaries);
+        let iterator_region_aliases = std::mem::take(&mut self.name_return_iterator_region_aliases);
+        let items = self.linear_items();
+        let labels = items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| match item {
+                Item::Label(label) => Some((*label, index)),
+                Item::Instruction(_) => None,
+            })
+            .collect::<FxHashMap<_, _>>();
+        let jump_targets = items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Instruction(instruction) => match instruction.operand() {
+                    Operand::Forward(label) | Operand::Backward(label) => Some(label),
+                    _ => None,
+                },
+                Item::Label(_) => None,
+            })
+            .collect::<rustc_hash::FxHashSet<_>>();
+        let mut barriers = Vec::new();
+        'origin: for origin in origins {
+            if origin.source.instruction().stream != self.emission_stream {
+                continue;
+            }
+            let index = usize::try_from(origin.source.instruction().item_index)
+                .expect("emitted instruction index fits in usize");
+            let Some(Item::Instruction(jump)) = items.get(index) else {
+                continue;
+            };
+            let Operand::Forward(target) = jump.operand() else {
+                continue;
+            };
+            let Some(&target_index) = labels.get(&target) else {
+                continue;
+            };
+            if *jump != origin.original || jump.opcode != JUMP_FORWARD || target_index <= index {
+                continue;
+            }
+            let mut size = 0;
+            let mut pending_pop = None;
+            let mut needs_iterator_pop = false;
+            for item in &items[target_index + 1..] {
+                match item {
+                    Item::Label(label) if size == 0 => {
+                        if self
+                            .exception_owner_provenance
+                            .block_boundaries
+                            .contains(label)
+                            || self.preserved_block_boundaries.contains(label)
+                        {
+                            continue 'origin;
+                        }
+                    }
+                    Item::Label(label) => {
+                        if needs_iterator_pop
+                            || jump_targets.contains(label)
+                            || self
+                                .exception_owner_provenance
+                                .block_boundaries
+                                .contains(label)
+                            || self.preserved_block_boundaries.contains(label)
+                        {
+                            continue 'origin;
+                        }
+                        if let Some(original) = iterator_region_aliases.get(label) {
+                            // This fresh exception-range label adds no original slot.
+                            // Its producer must place it directly after the exact POP
+                            // boundary already counted by this return traversal.
+                            if pending_pop != Some(*original)
+                                || !pop_boundaries.contains(original)
+                                || labels.get(original).zip(labels.get(label)).is_none_or(
+                                    |(original_index, alias_index)| {
+                                        original_index + 1 != *alias_index
+                                    },
+                                )
+                            {
+                                continue 'origin;
+                            }
+                        } else {
+                            // Only the producer's omitted ordinary POP can add a slot.
+                            if pending_pop.is_some() || !pop_boundaries.contains(label) {
+                                continue 'origin;
+                            }
+                            pending_pop = Some(*label);
+                            size += 1;
+                        }
+                    }
+                    Item::Instruction(instruction) => {
+                        match (instruction.opcode, instruction.operand()) {
+                            (LOAD_FAST, Operand::Value(_)) if size == 0 => {}
+                            (SWAP, Operand::Value(2)) if size > 0 && !needs_iterator_pop => {
+                                needs_iterator_pop = true;
+                            }
+                            (POP_TOP, Operand::Value(0)) if needs_iterator_pop => {
+                                needs_iterator_pop = false;
+                            }
+                            (RETURN_VALUE, Operand::Value(0))
+                                if size > 0 && !needs_iterator_pop => {}
+                            _ => continue 'origin,
+                        }
+                        pending_pop = None;
+                        size += 1 + usize::from(instruction.pre_fold_extra_instructions());
+                        if instruction.opcode == RETURN_VALUE {
+                            if instruction.location.line >= 0 && size > 4 {
+                                barriers.push(index);
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        for index in barriers {
+            let Item::Instruction(jump) = &mut self.linear_items_mut()[index] else {
+                unreachable!("the captured normal jump was checked above");
+            };
+            jump.no_location_policy
+                .set_borrow_fallthrough(BorrowFallthrough::Barrier);
         }
     }
 

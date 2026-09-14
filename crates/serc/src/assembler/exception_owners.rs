@@ -3377,9 +3377,10 @@ impl LayoutAssembler {
                             pending_compacted_append = Some((instruction_index + 1, region));
                         }
                     }
-                    // A Boolean membership fold removes CONTAINS_OP before TO_BOOL takes
-                    // its place. After a retained original-head POP_BLOCK, that first
-                    // compaction leaves the condition's manager owner in the next slot.
+                    // A Boolean identity or membership fold removes IS_OP or CONTAINS_OP
+                    // before TO_BOOL takes its place. After a retained original-head
+                    // POP_BLOCK, that first compaction leaves the condition's manager
+                    // owner in the next slot.
                     // Any subsequent local fusion still reuses the same uniformly owned
                     // suffix. Account for every removed record before trusting that slot.
                     if is_conditional_jump(instruction.opcode)
@@ -3415,7 +3416,10 @@ impl LayoutAssembler {
                             && pop.no_location_policy.borrow_fallthrough()
                                 != super::BorrowFallthrough::Barrier
                             && !pop.only_allows_unconditional_inlining()
-                            && comparison.opcode == crate::target::opcodes::CONTAINS_OP
+                            && matches!(
+                                comparison.opcode,
+                                crate::target::opcodes::CONTAINS_OP | crate::target::opcodes::IS_OP
+                            )
                             && comparison.location == instruction.location
                             && comparison.local_policy.hidden_exception_owner_slots() == 1
                             && tail.post_compaction_fusions == fused

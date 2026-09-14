@@ -114,3 +114,55 @@ fn keeps_authored_return_locations_after_copied_keyword_calls() {
         common::assert_matches_cpython_marshal(&source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_name_return_borrowing_at_original_copy_limit() {
+    for (filename, source) in [
+        (
+            "outer_try_iterator_return.py",
+            r"async def probe(items, build, report):
+    for item in items:
+        try:
+            try:
+                result = build(item)
+            except Exception as error:
+                report(error)
+                continue
+            return result
+        except Exception as error:
+            report(error)
+    return None
+",
+        ),
+        (
+            "iterator_only_return_control.py",
+            r"async def probe(items, build, report):
+    for item in items:
+        try:
+            result = build(item)
+        except Exception as error:
+            report(error)
+            continue
+        return result
+    return None
+",
+        ),
+        (
+            "outer_try_no_iterator_control.py",
+            r"async def probe(item, build, report):
+    try:
+        try:
+            result = build(item)
+        except Exception as error:
+            report(error)
+            return None
+        return result
+    except Exception as error:
+        report(error)
+    return None
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
