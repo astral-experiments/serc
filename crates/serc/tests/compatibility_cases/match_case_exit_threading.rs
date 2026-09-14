@@ -474,3 +474,27 @@ fn copies_name_return_after_final_match_elif() {
         "match_elif_named_return_after_class_patterns.py",
     );
 }
+
+#[test]
+fn matches_cpython_final_value_pattern_before_literal_return() {
+    for (filename, source) in [
+        (
+            "match_final_failure_outer_if.py",
+            "def f(flag, value):\n    if flag:\n        match value:\n            case 'first':\n                return first()\n            case 'second':\n                return second()\n    else:\n        other(value)\n    return None\n",
+        ),
+        (
+            "match_final_failure_plain_control.py",
+            "def f(value):\n    match value:\n        case 'first':\n            return first()\n        case 'second':\n            return second()\n    return None\n",
+        ),
+        (
+            "match_failure_nonempty_continuation_control.py",
+            "def f(flag, value):\n    if flag:\n        match value:\n            case 'first':\n                first()\n            case 'second':\n                second()\n        consume(value)\n    else:\n        other(value)\n    return None\n",
+        ),
+        (
+            "match_failure_guarded_control.py",
+            "def f(flag, value, ready):\n    if flag:\n        match value:\n            case 'first':\n                return first()\n            case 'second' if ready:\n                return second()\n    else:\n        other(value)\n    return None\n",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

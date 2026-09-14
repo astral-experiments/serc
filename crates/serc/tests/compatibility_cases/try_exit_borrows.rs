@@ -3818,6 +3818,79 @@ fn terminal_handler_borrow_following_name_return() {
 }
 
 #[test]
+fn matches_cpython_borrowing_after_retry_loop_terminal_else_break() {
+    for (filename, source) in [
+        (
+            "retry_loop_terminal_else_break.py",
+            r"def retry(check, work, recover, finish, value):
+    while True:
+        try:
+            value = work(value)
+            if check(value):
+                recover(value)
+            else:
+                break
+        except ValueError:
+            recover(value)
+    finish(value)
+    return value
+",
+        ),
+        (
+            "async_retry_loop_terminal_else_break.py",
+            r"async def retry(check, work, recover, finish, value):
+    while True:
+        try:
+            value = await work(value)
+            if check(value):
+                return
+            else:
+                break
+        except ValueError:
+            if not await recover(value):
+                raise
+    finish(value)
+    return value
+",
+        ),
+        (
+            "generator_retry_loop_terminal_else_break.py",
+            r"def retry(check, work, update, finish, value):
+    while True:
+        try:
+            value = work(value)
+            if check(value):
+                value = update(value)
+            else:
+                break
+        except ValueError:
+            value = yield
+    finish(value)
+    return value
+",
+        ),
+        (
+            "retry_loop_true_arm_break_control.py",
+            r"def retry(check, work, recover, finish, value):
+    while True:
+        try:
+            value = work(value)
+            if check(value):
+                break
+            else:
+                recover(value)
+        except ValueError:
+            recover(value)
+    finish(value)
+    return value
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
 fn terminal_handler_name_return_with_enclosing_finally_cleanup() {
     for (filename, source) in [
         (
@@ -4307,6 +4380,88 @@ fn recovery_cleanup_linear_call() {
         "def f(items, path, batch, fail):\n    for item in items:\n        try:\n            work(item)\n        except Error as error:\n            report(error)\n            if fail:\n                raise\n        finally:\n            write_json(path, {\"item\": item, \"batch\": batch.get(\"created\"), \"failed\": fail})\n",
         "linear_call.py",
     );
+}
+
+#[test]
+fn matches_cpython_multicondition_nested_recovery_borrows() {
+    for (filename, source) in [
+        (
+            "multi_guard_named_recovery_reraise.py",
+            r"def probe(value, ready, enabled):
+    try:
+        if ready and enabled:
+            try:
+                observe(value)
+            except ValueError as error:
+                if not expected(error):
+                    raise
+                recover(error)
+    except Exception:
+        return None
+    consume(value)
+    finish(value)
+    return value
+",
+        ),
+        (
+            "multi_guard_named_assignment_recovery.py",
+            r"def probe(value, ready, enabled):
+    try:
+        if ready and enabled:
+            try:
+                result = decode(value)
+                value = result
+            except ValueError as error:
+                recover(error)
+    except Exception:
+        return None
+    consume(value)
+    finish(value)
+    return value
+",
+        ),
+        (
+            "async_multi_guard_conditional_recovery.py",
+            r"async def probe(value, ready, enabled):
+    try:
+        if ready and enabled:
+            try:
+                await observe(value)
+            except ValueError:
+                result = await recover(value)
+                enabled = result is None or not valid(result)
+                if not enabled:
+                    log(value)
+    except Exception:
+        enabled = False
+    if not enabled:
+        return None
+    consume(value)
+    finish(value)
+    return value
+",
+        ),
+        (
+            "unique_guard_named_recovery_control.py",
+            r"def probe(value, ready, enabled):
+    try:
+        if ready:
+            try:
+                observe(value)
+            except ValueError as error:
+                if not expected(error):
+                    raise
+                recover(error)
+    except Exception:
+        return None
+    consume(value)
+    finish(value)
+    return value
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
 }
 
 #[test]

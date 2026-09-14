@@ -109,3 +109,51 @@ fn threads_refutable_pass_success_to_loop_backedge() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn preserves_final_elif_false_edge_location_on_match_backedge() {
+    for (filename, source) in [
+        (
+            "match_final_elif_break_donor.py",
+            r#"def check_changes(changes, action):
+    count = 0
+    valid = True
+    for change, old, new in changes:
+        match action:
+            case "archive":
+                count += 1
+            case "mark as read":
+                count += 1
+            case "move to trash":
+                if change == "added" and old is None and new == {"TRASH"}:
+                    count += 1
+                elif not (change == "removed" and old == {"INBOX"} and new is None):
+                    valid = False
+                    break
+    return count, valid
+"#,
+        ),
+        (
+            "match_all_terminating_arms_donor_control.py",
+            r#"def check_changes(changes, action):
+    count = 0
+    valid = True
+    for change, old, new in changes:
+        match action:
+            case "archive":
+                count += 1
+            case "mark as read":
+                count += 1
+            case "move to trash":
+                if change == "added" and old is None and new == {"TRASH"}:
+                    break
+                elif not (change == "removed" and old == {"INBOX"} and new is None):
+                    valid = False
+                    break
+    return count, valid
+"#,
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

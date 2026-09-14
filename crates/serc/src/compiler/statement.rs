@@ -8125,6 +8125,59 @@ impl Compiler<'_> {
                         // while loop also has an empty condition-failure block. Its inlined
                         // branch jump therefore has no preceding line event to replace it.
                         self.assembler.preserve_direct_inlined_jump_nop(branch_exit);
+                    } else if branch_index == 0
+                        && matches!(self.unit.scope, Scope::Function { .. })
+                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                        && self
+                            .control
+                            .statements
+                            .current_statement_followed_by_literal_return
+                        && self.control.loops.contexts.is_empty()
+                        && self.control.withs.active_with_exits.is_empty()
+                        && self.control.withs.active_with_region_exclusions.is_empty()
+                        && self.control.exceptions.active_exception_handlers.is_empty()
+                        && self.control.exceptions.active_exception_group_handlers == 0
+                        && self
+                            .control
+                            .exceptions
+                            .active_exception_region_exclusions
+                            .is_empty()
+                        && self
+                            .control
+                            .finally
+                            .active_return_finally_contexts
+                            .is_empty()
+                        && self
+                            .control
+                            .finally
+                            .preserved_return_value_contexts
+                            .is_empty()
+                        && self
+                            .control
+                            .finally
+                            .active_pass_finally_locations
+                            .is_empty()
+                        && self.control.finally.active_overriding_finally_returns == 0
+                        && self.control.finally.active_copied_finally_bodies == 0
+                        && self.control.finally.active_normal_finally_bodies == 0
+                        && self.control.finally.active_finally_end_blocks == 0
+                        && self.control.finally.active_finally_try_bodies == 0
+                        && condition_has_only_runtime_tests(&statement.test)
+                        && matches!(statement.elif_else_clauses.as_slice(), [clause]
+                            if clause.test.is_none())
+                        && matches!(body, [Stmt::Match(matched)]
+                        if matched.cases.len() > 1
+                            && matched.cases.iter().all(|case| {
+                                case.guard.is_none()
+                                    && matches!(&case.pattern, Pattern::MatchValue(value)
+                                        if matches!(value.value.as_ref(), Expr::StringLiteral(_)))
+                                    && matches!(case.body.as_slice(), [Stmt::Return(_)])
+                            }))
+                    {
+                        // Only the final pattern can enter this empty join. The following
+                        // literal return fits CPython's small-exit copy without cleanup.
+                        self.assembler
+                            .preserve_final_match_failure_return_join(branch_exit);
                     } else if matches!(body.last(), Some(Stmt::Match(matched))
                     if matched.cases.len() > 1
                         && matched.cases.last().is_some_and(|case| {
@@ -8291,7 +8344,11 @@ impl Compiler<'_> {
         let Some(Stmt::If(statement)) = body.last() else {
             return;
         };
-        let Some(mut test) = terminating_if_fallthrough_test(statement) else {
+        // Earlier arms already exit the case. A final terminating elif leaves its
+        // false edge to supply the original case backedge's location.
+        let Some(mut test) = terminating_if_fallthrough_test(statement)
+            .or_else(|| final_terminating_arm_fallthrough_test(statement))
+        else {
             return;
         };
         if !condition_has_only_runtime_tests(test) {
@@ -13558,28 +13615,37 @@ impl Compiler<'_> {
             }
             if borrow_exit_has_source_successor
                 && matches!(normal_exit_suite.last(), Some(Stmt::If(tail))
-                    if early_condition_truthiness(&tail.test).is_none()
-                        && !original_condition_has_unique_jump_target(&tail.test, false)
-                        && tail.elif_else_clauses.is_empty()
-                        && (matches!(tail.body.last(), Some(Stmt::With(_)))
-                            || matches!(tail.body.last(), Some(Stmt::Try(nested))
-                                if nested.orelse.is_empty()
-                                    && nested.finalbody.is_empty()
-                                    && (suite_ends_in_empty_try_exit_block(&nested.body, false)
-                                        || (!nested.is_star
-                                            && nested.handlers.iter().all(|handler| {
-                                                handler.as_except_handler().is_some_and(|handler| {
-                                                    handler.name.is_none()
-                                                        && matches!(handler.body.as_slice(), [Stmt::Pass(_)])
-                                                })
+                if early_condition_truthiness(&tail.test).is_none()
+                    && !original_condition_has_unique_jump_target(&tail.test, false)
+                    && tail.elif_else_clauses.is_empty()
+                    && (matches!(tail.body.last(), Some(Stmt::With(_)))
+                        || matches!(tail.body.last(), Some(Stmt::Try(nested))
+                            if nested.orelse.is_empty()
+                                && nested.finalbody.is_empty()
+                                && (suite_ends_in_empty_try_exit_block(&nested.body, false)
+                                    || (!nested.is_star
+                                        && ((nested.handlers.iter().all(|handler| {
+                                            handler.as_except_handler().is_some_and(|handler| {
+                                                handler.name.is_none()
+                                                    && matches!(handler.body.as_slice(), [Stmt::Pass(_)])
                                             })
+                                        })
                                             && (suite_has_linear_borrow_fallthrough(&nested.body)
-                                                || suite_retained_try_exit_leaves_empty_join(&nested.body)))))))
+                                                || suite_retained_try_exit_leaves_empty_join(&nested.body)))
+                                            || (suite_has_linear_borrow_fallthrough(&nested.body)
+                                                && matches!(nested.handlers.as_slice(), [handler]
+                                                    if handler.as_except_handler().is_some_and(|handler| {
+                                                        handler.type_.is_some()
+                                                            && !suite_contains_yield(&handler.body)
+                                                            && suite_has_plain_recovery_fallthrough(&handler.body, false)
+                                                    })))))))))
             {
                 // Multiple original false edges leave the outer POP_BLOCK unlocated;
                 // its removed NOP cannot bridge a nested manager or empty try exit.
-                // Pass-only recovery also leaves that exit empty after a linear body or
-                // a retained conditional return exit, even when the body itself is nonempty.
+                // A linear nested body also leaves this join empty when its recovery has
+                // one normal cleanup edge. That recovery remains cold, including named
+                // exception cleanup, and cannot populate the normal exit's original array.
+                // Keep the separate pass-only rule for retained conditional return exits.
                 // A sole false edge retains a located NOP and its original borrow route.
                 self.assembler.prevent_borrow_fallthrough_reachability(end);
             }
@@ -21121,6 +21187,30 @@ pub(super) fn suite_has_linear_borrow_fallthrough(body: &[Stmt]) -> bool {
     has_runtime_work
 }
 
+// A plain recovery has one normal cleanup edge. Conditional reraises add only
+// exceptional exits; nested cleanup, loop exits and returns need separate analysis.
+fn suite_has_plain_recovery_fallthrough(body: &[Stmt], allow_reraise: bool) -> bool {
+    !body.is_empty()
+        && body
+            .iter()
+            .enumerate()
+            .all(|(index, statement)| match statement {
+                Stmt::Pass(_) | Stmt::Expr(_) | Stmt::Assign(_) => true,
+                Stmt::If(branch) => {
+                    branch.elif_else_clauses.is_empty()
+                        && early_condition_truthiness(&branch.test).is_none()
+                        && suite_has_plain_recovery_fallthrough(&branch.body, true)
+                }
+                Stmt::Raise(raise) => {
+                    allow_reraise
+                        && index + 1 == body.len()
+                        && raise.exc.is_none()
+                        && raise.cause.is_none()
+                }
+                _ => false,
+            })
+}
+
 /// Certify a branch-free raising alternative without a copied cleanup return.
 fn suite_has_linear_raise_exit(body: &[Stmt]) -> bool {
     body.split_last().is_some_and(|(last, leading)| {
@@ -23494,7 +23584,25 @@ fn suite_contains_borrow_reachable_conditional_loop_break(body: &[Stmt]) -> bool
                 && statement.orelse.is_empty()
                 && statement.finalbody.is_empty() =>
         {
-            contains(&statement.body, false)
+            let terminal_else_break = statement.body.split_last().is_some_and(|(last, leading)| {
+                let Stmt::If(tail) = last else {
+                    return false;
+                };
+                matches!(tail.elif_else_clauses.as_slice(), [clause]
+                    if clause.test.is_none()
+                        && matches!(clause.body.as_slice(), [Stmt::Break(_)]))
+                    && !suite_contains_loop_break(leading)
+                    && !suite_contains_loop_break(&tail.body)
+                    && statement.handlers.iter().all(|handler| {
+                        handler
+                            .as_except_handler()
+                            .is_some_and(|handler| !suite_contains_loop_break(&handler.body))
+                    })
+            });
+            // The last else-break loses its jump after the protected body is unwrapped.
+            // Its retained line NOP still falls into an empty original join, which stops
+            // borrowed-load traversal. Other conditional breaks can retain a direct exit.
+            !terminal_else_break && contains(&statement.body, false)
         }
         // A simple final conditional break is disconnected, but CPython retains the shared exit
         // when another branch of the final `if` can fall through.

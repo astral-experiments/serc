@@ -3244,6 +3244,65 @@ impl Assembler {
         self.record_original_empty_join(emitted);
     }
 
+    /// Retains the empty final-pattern block before copying an unprotected literal return.
+    /// The caller must exclude loops and cleanup suites and require directly returning cases.
+    pub(crate) fn preserve_final_match_failure_return_join(&mut self, emitted: EmittedJump) {
+        let jump = *self.emitted_jump_mut(emitted, "retaining a final match failure join");
+        if jump.opcode != JUMP_FORWARD
+            || !matches!(jump.operand(), Operand::Forward(_))
+            || jump.location.line < 0
+            || jump.pre_fold_extra_instructions() != 0
+            || jump.exception_policy() != ExceptionPolicy::default()
+        {
+            return;
+        }
+        let index = usize::try_from(emitted.instruction().item_index)
+            .expect("emitted instruction index should fit in usize");
+        let items = &self.linear_items()[..index];
+        let labels = items
+            .iter()
+            .rev()
+            .map_while(|item| match item {
+                Item::Label(label) => Some(*label),
+                Item::Instruction(_) => None,
+            })
+            .collect::<Vec<_>>();
+        if labels.is_empty()
+            || labels.iter().any(|label| {
+                self.borrow_block_aliases.contains(label)
+                    || self.original_nop_targets.contains(label)
+                    || self.folded_away_condition_targets.contains(label)
+            })
+            || !matches!(items[..items.len() - labels.len()].last(),
+                Some(Item::Instruction(previous)) if previous.opcode == RETURN_VALUE)
+        {
+            return;
+        }
+        let mut incoming = items.iter().filter_map(|item| match item {
+            Item::Instruction(instruction)
+                if matches!(instruction.operand(), Operand::Forward(label) | Operand::Backward(label)
+                    if labels.contains(&label)) => Some(instruction),
+            _ => None,
+        });
+        let (Some(condition), None) = (incoming.next(), incoming.next()) else {
+            return;
+        };
+        if condition.opcode != POP_JUMP_IF_FALSE
+            || !matches!(condition.operand(), Operand::Forward(_))
+            || condition.location != jump.location
+            || condition.pre_fold_extra_instructions() != 0
+        {
+            return;
+        }
+        // CPython emits fail_pop[0], then the match end label, immediately before
+        // the outer branch jump. This actual conditional target starts its own
+        // block; the preceding return excludes fallthrough into the empty join.
+        let jump = self.emitted_jump_mut(emitted, "retaining a final match failure join");
+        jump.jump_policy.mark_original_empty_join();
+        jump.jump_policy.retain_redundant_nop_after_threading();
+        jump.jump_policy.prevent_threading_target();
+    }
+
     pub(crate) fn prevent_jump_inlining(&mut self, emitted: EmittedJump) {
         self.emitted_jump_mut(emitted, "preventing jump inlining")
             .jump_policy
