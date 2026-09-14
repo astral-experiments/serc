@@ -60,3 +60,52 @@ fn preserves_nested_value_match_failure_before_outer_case_exit() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn threads_refutable_pass_success_to_loop_backedge() {
+    for (filename, source) in [
+        (
+            "refutable_class_pass_before_default_loop.py",
+            r"def collect(values):
+    output = []
+    for value in values:
+        match value:
+            case Included():
+                output.append(value)
+            case Skipped():
+                pass
+            case _:
+                assert_never(value)
+    return output
+",
+        ),
+        (
+            "refutable_class_pass_final_async_loop.py",
+            r"async def collect(values, output):
+    async for value in values:
+        match value:
+            case Included():
+                await output.put(value)
+            case Skipped():
+                pass
+",
+        ),
+        (
+            "refutable_class_call_before_default_loop_control.py",
+            r"def collect(values):
+    output = []
+    for value in values:
+        match value:
+            case Included():
+                output.append(value)
+            case Skipped():
+                consume(value)
+            case _:
+                assert_never(value)
+    return output
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

@@ -2736,9 +2736,22 @@ impl Compiler<'_> {
                         || (matches!(tail.body.last(), Some(Stmt::Break(_)))
                             && condition_has_only_runtime_tests(&tail.test)))
         );
-        if normalize_final_condition {
+        let complete_tail_has_no_fallthrough = matches!(
+            statement.body.last(),
+            Some(Stmt::If(tail))
+                if condition_has_only_runtime_tests(&tail.test)
+                    && tail.elif_else_clauses.last().is_some_and(|clause| {
+                        clause.test.is_none() && suite_terminates_before_constant_folding(&clause.body)
+                    })
+                    && tail.elif_else_clauses.iter().all(|clause| {
+                        clause.test.as_ref().is_none_or(condition_has_only_runtime_tests)
+                    })
+        );
+        if normalize_final_condition || complete_tail_has_no_fallthrough {
             // CPython normalizes a backward conditional jump by reversing it around an explicit
             // backedge. A final `if` keeps that layout when its body does work before breaking.
+            // A terminating final else leaves no fallthrough into the original common
+            // backedge. Earlier arms receive its copies with their own branch locations.
             let body_start = self.assembler.instruction_count();
             let tail_jumps = self.with_loop_context(context, |compiler| {
                 compiler.compile_while_tail_suite(&statement.body, start)
@@ -5560,9 +5573,39 @@ impl Compiler<'_> {
                                     [handler_index]
                                     .protect_outer_return_pop
                                 || unwinds_plain_nested_handlers);
+                        // An ordinary try between this handler and its finally still owns
+                        // POP_EXCEPT and any exception-name clearing. The manager unwind
+                        // tracks that collector until the finally starts; a synthetic
+                        // finally owner would replace it early.
+                        let enclosing_try_owns_pop_except =
+                            self.context.target_specific_rules_enabled()
+                                && handler_count == 1
+                                && next_finally == 1
+                                && return_finally_contexts.len() == 1
+                                && with_depth > 0
+                                && next_with == with_depth
+                                && with_depth == self.control.withs.active_with_exits.len()
+                                && self.control.loops.contexts.is_empty()
+                                && self.control.finally.active_finally_end_blocks == 0
+                                && self.control.finally.active_normal_finally_bodies == 0
+                                && return_finally_contexts[0].handler_depth == 0
+                                && return_finally_contexts[0].with_depth == with_depth
+                                && return_finally_contexts[0].exception_region_depth + 2
+                                    == region_depth
+                                && self
+                                    .control
+                                    .exceptions
+                                    .active_exception_region_exclusions
+                                    .len()
+                                    == region_depth + 1
+                                && handler_region_unwind_starts
+                                    .as_ref()
+                                    .and_then(|starts| starts.get(region_depth - 1))
+                                    .is_some_and(Option::is_none);
                         let protected_pop_except = (protects_outer_handler
                             || (!return_is_overridden
                                 && !preserves_enclosing_try_return_owner
+                                && !enclosing_try_owns_pop_except
                                 // The tracked outer try already owns this handler cleanup.
                                 && !tracks_handler_outer_try_iterator_unwinds
                                 && self
@@ -15635,11 +15678,29 @@ impl Compiler<'_> {
                     )
                 }
             };
+            // A final manager's normal and suppression jumps share an artificial
+            // named-handler cleanup. Copy that unlocated cleanup before resolving
+            // either predecessor's location, even when clearing the name makes it large.
+            let inline_manager_cleanup = self.context.target_specific_rules_enabled()
+                && matches!(body.last(), Some(Stmt::With(statement))
+                    if !statement.is_async && !suite_terminates(&statement.body))
+                && self.assembler.at_original_unconditional_join();
+            if inline_manager_cleanup {
+                self.assembler.record_unlocated_cleanup_targets();
+            }
             exclusions.push(self.emit_terminal_exception_handler_action(
                 name,
                 handler_depth,
-                action_location,
+                if inline_manager_cleanup {
+                    SourceLocation::NONE
+                } else {
+                    action_location
+                },
             )?);
+            if inline_manager_cleanup {
+                self.assembler.allow_last_no_location_block_inlining();
+                self.assembler.allow_last_unconditional_block_inlining();
+            }
 
             if let Some(next) = next {
                 self.assembler.mark(next);
@@ -23194,6 +23255,30 @@ fn condition_reaches_async_break_entry(expression: &Expr) -> bool {
 
 /// Finds a terminal break behind nested runtime conditions without a final else.
 fn suite_ends_in_terminal_conditional_break(body: &[Stmt]) -> bool {
+    // Completed conditions and for exhaustion can precede the final break
+    // without adding an entry beyond its iterator discard. A conditional
+    // continue returns to the async header; it does not reach the loop exit.
+    fn prefix_keeps_terminal_break(body: &[Stmt], conditional: bool) -> bool {
+        body.iter()
+            .enumerate()
+            .all(|(index, statement)| match statement {
+                Stmt::If(guard) => {
+                    condition_reaches_async_break_entry(&guard.test)
+                        && guard.elif_else_clauses.is_empty()
+                        && prefix_keeps_terminal_break(&guard.body, true)
+                }
+                Stmt::For(loop_statement) => {
+                    !loop_statement.is_async
+                        && loop_statement.orelse.is_empty()
+                        && !expression_contains_inline_branch(&loop_statement.iter)
+                        && !expression_contains_inline_branch(&loop_statement.target)
+                        && suite_has_linear_borrow_fallthrough(&loop_statement.body)
+                }
+                Stmt::Continue(_) => conditional && index + 1 == body.len(),
+                _ => suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement)),
+            })
+    }
+
     let Some(Stmt::If(first)) = body.last() else {
         return false;
     };
@@ -23238,7 +23323,7 @@ fn suite_ends_in_terminal_conditional_break(body: &[Stmt]) -> bool {
                         && (index + 1 == leading.len()
                             || suite_has_linear_borrow_fallthrough(&leading[index + 1..]))
                 });
-            if !completed_prefix {
+            if !completed_prefix && !prefix_keeps_terminal_break(leading, false) {
                 return false;
             }
         }

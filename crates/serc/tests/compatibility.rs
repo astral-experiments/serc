@@ -11269,6 +11269,12 @@ def final_elif(action, first, second):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_manager_handler_enclosing_try_owners() {
+        let source = include_str!("fixtures/manager_handler_enclosing_try_owners.py");
+        assert_matches_cpython_marshal(source, "manager_handler_enclosing_try_owners.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_iterator_handler_return_owners() {
         let source = include_str!("fixtures/iterator_handler_return_owners.py");
         assert_matches_cpython_marshal(source, "iterator_handler_return_owners.py");

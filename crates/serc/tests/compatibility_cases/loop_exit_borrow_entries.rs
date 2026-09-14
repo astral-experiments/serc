@@ -506,3 +506,71 @@ fn protected_async_completed_prefix_keeps_following_loads_owned() {
         "protected_async_nested_prefix_break.py",
     );
 }
+
+#[test]
+fn protected_async_completed_break_prefixes_preserve_borrow_reachability() {
+    for (source, filename) in [
+        (
+            r"async def f(stream, value, should_stop, should_log, should_retry, consume):
+    try:
+        async for item in stream:
+            if should_stop(item):
+                if should_log(item):
+                    consume(item)
+                    if value:
+                        consume(value)
+                if should_retry(item):
+                    value = item
+                    continue
+                value = item
+                break
+        consume(value)
+        consume(value)
+    except RuntimeError:
+        consume(value)
+",
+            "async_break_after_completed_if_continue.py",
+        ),
+        (
+            r"async def f(stream, values, value, should_stop, should_finish, consume):
+    try:
+        async for item in stream:
+            consume(item)
+            if should_stop(item):
+                value = item
+                for inner in values:
+                    consume(inner)
+                if should_finish(item):
+                    value = item
+                    break
+        consume(value)
+        consume(value)
+    finally:
+        consume(value)
+",
+            "async_break_after_completed_for.py",
+        ),
+        (
+            r"async def f(stream, values, value, should_stop, should_finish, consume):
+    try:
+        async for item in stream:
+            if should_finish(item):
+                break
+            consume(item)
+            if should_stop(item):
+                for inner in values:
+                    consume(inner)
+                if should_finish(value):
+                    value = item
+                    break
+        consume(value)
+        consume(value)
+    finally:
+        consume(value)
+",
+            "async_earlier_break_survives_control.py",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

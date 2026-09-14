@@ -41,3 +41,24 @@ fn duplicates_implicit_return_for_mixed_boolean_terminal_while() {
         "terminal_mixed_boolean_while_async.py",
     );
 }
+
+#[test]
+fn normalizes_complete_terminal_while_branches_without_final_fallthrough() {
+    common::assert_matches_cpython_marshal(
+        r"def probe(fetch):
+    while True:
+        result = fetch()
+        if isinstance(result, dict):
+            for item in result.get('items', []):
+                yield item
+            marker = result.get('next')
+            if not marker:
+                break
+        else:
+            for item in result:
+                yield item
+            break
+",
+        "generator_nested_loop_exits.py",
+    );
+}
