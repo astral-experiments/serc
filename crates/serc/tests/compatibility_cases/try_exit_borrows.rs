@@ -3818,6 +3818,71 @@ fn terminal_handler_borrow_following_name_return() {
 }
 
 #[test]
+fn terminal_handler_name_return_with_enclosing_finally_cleanup() {
+    for (filename, source) in [
+        (
+            "sync_outer_cleanup.py",
+            r"def f(value, make, touch, cleanup):
+    try:
+        result = make(value)
+        try:
+            touch(result)
+        except Exception:
+            cleanup(result)
+            raise
+        return result
+    finally:
+        cleanup(value)
+",
+        ),
+        (
+            "async_outer_cleanup.py",
+            r"async def f(value, make, touch, cleanup):
+    try:
+        result = make(value)
+        try:
+            await touch(result)
+        except BaseException:
+            await cleanup(result)
+            raise
+        return result
+    finally:
+        cleanup(value)
+",
+        ),
+        (
+            "no_outer_cleanup_control.py",
+            r"def f(value, make, touch, cleanup):
+    result = make(value)
+    try:
+        touch(result)
+    except Exception:
+        cleanup(result)
+        raise
+    return result
+",
+        ),
+        (
+            "pass_outer_cleanup_control.py",
+            r"def f(value, make, touch, cleanup):
+    try:
+        result = make(value)
+        try:
+            touch(result)
+        except Exception:
+            cleanup(result)
+            raise
+        return result
+    finally:
+        pass
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
 fn terminal_handler_borrow_mixed_false_last() {
     common::assert_matches_cpython_marshal(
         r"def f(run, values):

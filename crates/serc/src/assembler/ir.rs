@@ -868,6 +868,8 @@ pub(crate) enum ExceptionPolicy {
     AlwaysDynamicConditionStrict,
     /// Authored Boolean-singleton failure marker; ownership stays unchanged unless certified.
     NoneUnchangedBooleanSingleton,
+    /// Post-try marker stays excluded unless an original owned slot is certified.
+    AlwaysAbsentPostTryCondition,
 }
 
 impl ExceptionPolicy {
@@ -967,6 +969,7 @@ impl ExceptionPolicy {
             | Self::AlwaysPresent
             | Self::AlwaysOverridePresent
             | Self::AlwaysAbsent
+            | Self::AlwaysAbsentPostTryCondition
             | Self::AlwaysDynamic
             | Self::AlwaysDynamicCondition
             | Self::AlwaysDynamicConditionStrict => ExceptionExclusion::Always,
@@ -996,9 +999,10 @@ impl ExceptionPolicy {
             Self::NoneOverridePresent
             | Self::IfExtendedOverridePresent
             | Self::AlwaysOverridePresent => NormalizedExceptionOwner::OverridePresent,
-            Self::NoneAbsent | Self::IfExtendedAbsent | Self::AlwaysAbsent => {
-                NormalizedExceptionOwner::Absent
-            }
+            Self::NoneAbsent
+            | Self::IfExtendedAbsent
+            | Self::AlwaysAbsent
+            | Self::AlwaysAbsentPostTryCondition => NormalizedExceptionOwner::Absent,
         }
     }
 
@@ -1023,10 +1027,10 @@ impl ExceptionPolicy {
 struct InstructionMetadata(NonZeroU16);
 
 impl InstructionMetadata {
-    const POLICY_COUNT: u16 = 22;
+    const POLICY_COUNT: u16 = 23;
     const NORMAL_STATES: u16 = Self::POLICY_COUNT * 5 * 2;
 
-    // Values 221..=264 retain all 22 exception policies and both copy modes for
+    // Values 231..=276 retain all 23 exception policies and both copy modes for
     // a direct original jump with no earlier copied slots. Adding slots discards
     // this conservative proof; existing slot counts keep their full range.
     const fn has_initial_borrow_entry(self) -> bool {
@@ -1058,7 +1062,7 @@ impl InstructionMetadata {
     ) -> Self {
         // The early exit pass copies at most four instructions, so four extra instructions
         // on any one surviving instruction are sufficient to rule it out.
-        // 22 policies, five slot counts, and two copy modes occupy 220 nonzero values.
+        // 23 policies, five slot counts, and two copy modes occupy 230 nonzero values.
         let bits = ((u16::from(pre_fold_extra_instructions.min(4)) * Self::POLICY_COUNT)
             + exception_policy as u16)
             * 2
@@ -1091,6 +1095,7 @@ impl InstructionMetadata {
             19 => ExceptionPolicy::IfExtendedDynamicConditionStrict,
             20 => ExceptionPolicy::AlwaysDynamicConditionStrict,
             21 => ExceptionPolicy::NoneUnchangedBooleanSingleton,
+            22 => ExceptionPolicy::AlwaysAbsentPostTryCondition,
             _ => unreachable!(),
         }
     }
@@ -1649,7 +1654,7 @@ mod initial_borrow_metadata_tests {
     };
     use crate::target::opcodes::JUMP_FORWARD;
 
-    const POLICIES: [ExceptionPolicy; 22] = [
+    const POLICIES: [ExceptionPolicy; 23] = [
         ExceptionPolicy::NoneUnchanged,
         ExceptionPolicy::NonePresent,
         ExceptionPolicy::NoneOverridePresent,
@@ -1672,21 +1677,22 @@ mod initial_borrow_metadata_tests {
         ExceptionPolicy::IfExtendedDynamicConditionStrict,
         ExceptionPolicy::AlwaysDynamicConditionStrict,
         ExceptionPolicy::NoneUnchangedBooleanSingleton,
+        ExceptionPolicy::AlwaysAbsentPostTryCondition,
     ];
 
     #[test]
-    fn wide_initial_borrow_metadata_preserves_all_264_encodings() {
+    fn wide_initial_borrow_metadata_preserves_all_276_encodings() {
         let mut above_byte_capacity = 0;
-        for raw in 1..=264 {
+        for raw in 1..=276 {
             let value = InstructionMetadata(NonZeroU16::new(raw).unwrap());
-            let origin = raw > 220;
-            let payload = if origin { raw - 221 } else { raw - 1 };
+            let origin = raw > 230;
+            let payload = if origin { raw - 231 } else { raw - 1 };
             assert_eq!(value.has_initial_borrow_entry(), origin);
             assert_eq!(
                 value.exception_policy(),
-                POLICIES[usize::from(payload / 2 % 22)]
+                POLICIES[usize::from(payload / 2 % 23)]
             );
-            assert_eq!(u16::from(value.pre_fold_extra_instructions()), payload / 44);
+            assert_eq!(u16::from(value.pre_fold_extra_instructions()), payload / 46);
             assert_eq!(value.only_allows_unconditional_inlining(), payload % 2 != 0);
             if origin {
                 assert_eq!(value.pre_fold_extra_instructions(), 0);
@@ -1699,7 +1705,7 @@ mod initial_borrow_metadata_tests {
             .with_initial_borrow_entry(origin);
             assert_eq!(rebuilt.0.get(), raw);
             let cleared = value.with_initial_borrow_entry(false);
-            assert!((1..=220).contains(&cleared.0.get()));
+            assert!((1..=230).contains(&cleared.0.get()));
             assert_eq!(cleared.exception_policy(), value.exception_policy());
             assert_eq!(
                 cleared.pre_fold_extra_instructions(),
@@ -1714,18 +1720,18 @@ mod initial_borrow_metadata_tests {
                 assert!(u8::try_from(rebuilt.0.get()).is_err());
             }
         }
-        assert_eq!(above_byte_capacity, 9);
+        assert_eq!(above_byte_capacity, 21);
         for copy in [false, true] {
             let tagged =
                 InstructionMetadata::new(ExceptionPolicy::NoneUnchangedBooleanSingleton, 0, copy)
                     .with_initial_borrow_entry(true);
-            assert_eq!(tagged.0.get(), 263 + u16::from(copy));
+            assert_eq!(tagged.0.get(), 273 + u16::from(copy));
         }
     }
 
     #[test]
     fn wide_metadata_preserves_policy_updates_and_invalidates_changed_origins() {
-        for raw in 1..=264 {
+        for raw in 1..=276 {
             let metadata = InstructionMetadata(NonZeroU16::new(raw).unwrap());
             let mut original = Instruction::synthetic(
                 JUMP_FORWARD,

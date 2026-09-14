@@ -2977,6 +2977,15 @@ impl Assembler {
         }
     }
 
+    /// Retains the post-try origin while a marker awaits an exact owned-slot proof.
+    pub(crate) fn defer_last_post_try_condition_owner(&mut self) {
+        let instruction =
+            self.required_last_instruction_mut("deferring a post-try condition owner");
+        if instruction.opcode == NOT_TAKEN {
+            instruction.set_exception_policy(ExceptionPolicy::AlwaysAbsentPostTryCondition);
+        }
+    }
+
     /// Keeps the normalized exception owner on a trailing condition fallthrough marker.
     pub(crate) fn preserve_last_not_taken_exception_owner(&mut self) {
         let instruction =

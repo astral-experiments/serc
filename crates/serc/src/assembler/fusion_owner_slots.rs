@@ -508,6 +508,11 @@ impl FallbackCertificate {
         marker_index: usize,
         previous: Option<(usize, Instruction)>,
     ) -> Option<Self> {
+        if matches!(before.items.get(marker_index), Some(Item::Instruction(marker))
+            if marker.exception_policy() == ExceptionPolicy::AlwaysAbsentPostTryCondition)
+        {
+            return Self::capture_post_try_fusion(before, after, start, marker_index, previous?);
+        }
         let start = before.original_array_start(start)?;
         let Item::Label(anchor) = before.items[start] else {
             return None;
@@ -519,6 +524,77 @@ impl FallbackCertificate {
             marker_index,
             previous?,
         )?;
+        result.valid(after, false)?;
+        Some(result)
+    }
+
+    /// Reuses a protected slot only after one observed local-load fusion in this array.
+    fn capture_post_try_fusion(
+        before: &View<'_>,
+        after: &View<'_>,
+        start: usize,
+        marker_index: usize,
+        (condition_index, condition): (usize, Instruction),
+    ) -> Option<Self> {
+        let Item::Instruction(marker) = before.items[marker_index] else {
+            return None;
+        };
+        key(condition, marker)?;
+        let owner = before.post_try_fusion_array(start, condition_index, marker_index, false)?;
+        let Item::Label(anchor) = before.items[start] else {
+            return None;
+        };
+        let (after_condition, after_marker) = after.endpoint(condition, marker)?;
+        let after_start = *after.labels.get(&anchor)?;
+        if after_start > after_condition {
+            return None;
+        }
+        if before.items[start..=marker_index].len()
+            != after.items[after_start..=after_marker].len() + 1
+            || !one_fusion(
+                &before.items[start..=marker_index],
+                &after.items[after_start..=after_marker],
+            )
+        {
+            return None;
+        }
+        let prefix = before.items[start..=marker_index]
+            .iter()
+            .zip(&after.items[after_start..=after_marker])
+            .take_while(|(a, b)| same_item(**a, **b, false))
+            .count();
+        if !matches!(&before.items[start + prefix..start + prefix + 2],
+            [Item::Instruction(first), Item::Instruction(second)]
+                if first.opcode == LOAD_FAST && second.opcode == LOAD_FAST)
+            || after.post_try_fusion_array(after_start, after_condition, after_marker, true)?
+                != owner
+        {
+            return None;
+        }
+        let items = after.items[after_start..=after_marker].to_vec();
+        let boundaries = after
+            .boundaries
+            .iter()
+            .copied()
+            .filter(|label| {
+                items
+                    .iter()
+                    .any(|item| matches!(item, Item::Label(l) if l == label))
+            })
+            .collect();
+        let result = Self {
+            interval: Certificate {
+                anchor: Anchor::Label(anchor),
+                condition,
+                marker,
+                items,
+                owner,
+                boundaries,
+                setups: before.provenance.setups.clone(),
+            },
+            removed_slots: 1,
+            observed_local_fusion: true,
+        };
         result.valid(after, false)?;
         Some(result)
     }
@@ -688,7 +764,16 @@ impl FallbackCertificate {
                 if view.original_array_start(start)? != start {
                     return None;
                 }
-                view.uniform_fallback_slots(start, condition)?
+                if self.interval.marker.exception_policy()
+                    == ExceptionPolicy::AlwaysAbsentPostTryCondition
+                {
+                    (
+                        view.post_try_fusion_array(start, condition, marker, true)?,
+                        1,
+                    )
+                } else {
+                    view.uniform_fallback_slots(start, condition)?
+                }
             }
             Anchor::OriginalMarker(_, _) => {
                 view.uniform_fallback_interval(start, condition, self.observed_local_fusion)?
@@ -703,6 +788,35 @@ impl FallbackCertificate {
 }
 
 impl View<'_> {
+    /// Requires an uninterrupted source array with a single uniform fallback owner.
+    fn post_try_fusion_array(
+        &self,
+        start: usize,
+        condition: usize,
+        marker: usize,
+        fused: bool,
+    ) -> Option<Owner> {
+        if start > condition || condition >= marker || marker >= self.items.len() {
+            return None;
+        }
+        let Item::Label(anchor) = self.items[start] else {
+            return None;
+        };
+        if self.original_array_start(start)? != start
+            || !self.provenance.source_boundaries.contains(&anchor)
+            || self.items[start + 1..=marker].iter().any(|item| {
+                matches!(item,
+                Item::Label(label) if self.boundaries.contains(label)
+                    || self.provenance.source_boundaries.contains(label))
+            })
+            || !self.no_late_insertions_or_setups(start, marker)
+        {
+            return None;
+        }
+        let (owner, removed) = self.uniform_fallback_interval(start, condition, fused)?;
+        (removed == usize::from(fused)).then_some(owner)
+    }
+
     /// Finds the sole original boundary in an adjacent run of labels.
     fn original_array_start(&self, start: usize) -> Option<usize> {
         let mut first = start;
@@ -1615,6 +1729,9 @@ impl FusionOwnerCertificates {
             };
             if owner.is_none() {
                 marker.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS);
+            } else if marker.exception_policy() == ExceptionPolicy::AlwaysAbsentPostTryCondition {
+                // Only the complete post-try array proof may retire this explicit exclusion.
+                marker.set_exception_policy(ExceptionPolicy::NoneOverridePresent);
             } else {
                 marker.set_exception_owner(NormalizedExceptionOwner::OverridePresent);
             }
@@ -1785,6 +1902,170 @@ mod tests {
         }
         .into_optimization_pipeline()
     }
+    fn post_try_fusion_pipeline() -> OptimizationPipeline {
+        let mut pipeline = protected_pipeline(false, NormalizedExceptionOwner::Absent);
+        pipeline.exception_regions[0].is_scope_fallback = true;
+        pipeline
+            .exception_owner_provenance
+            .block_boundaries
+            .insert(Label(0));
+        pipeline
+            .exception_owner_provenance
+            .source_boundaries
+            .insert(Label(0));
+        edit_singleton(&mut pipeline, |items| {
+            for item in items {
+                if let Item::Instruction(marker) = item
+                    && marker.opcode == NOT_TAKEN
+                {
+                    marker.set_exception_policy(ExceptionPolicy::AlwaysAbsentPostTryCondition);
+                }
+            }
+        });
+        pipeline
+    }
+
+    #[test]
+    fn post_try_local_fusion_reuses_only_its_original_fallback_slot() {
+        let mut pipeline = post_try_fusion_pipeline();
+        let before = FusionOwnerCertificates::snapshot(&pipeline);
+        pipeline.fuse_superinstructions();
+        let certificates = FusionOwnerCertificates::capture(&before, &pipeline);
+        assert_eq!(certificates.fallback_certificates.len(), 1);
+        let mut items = pipeline.graph.into_items();
+        let mut expected = items.clone();
+        for item in &mut expected {
+            if let Item::Instruction(marker) = item
+                && marker.opcode == NOT_TAKEN
+            {
+                marker.set_exception_policy(ExceptionPolicy::NoneOverridePresent);
+            }
+        }
+        certificates.apply(
+            &mut items,
+            &pipeline.exception_regions,
+            &pipeline.exception_owner_provenance,
+            &pipeline.preserved_block_boundaries,
+        );
+        assert_eq!(items, expected);
+    }
+
+    #[test]
+    fn post_try_fusion_preserves_fresh_and_uncertified_markers() {
+        for change in 0..12 {
+            let mut pipeline = post_try_fusion_pipeline();
+            match change {
+                0 | 1 => edit_singleton(&mut pipeline, |items| {
+                    for item in items {
+                        if let Item::Instruction(marker) = item
+                            && marker.opcode == NOT_TAKEN
+                        {
+                            marker.set_exception_policy(if change == 0 {
+                                ExceptionPolicy::AlwaysAbsent
+                            } else {
+                                ExceptionPolicy::EXCLUDE_ALWAYS
+                            });
+                        }
+                    }
+                }),
+                2 => pipeline
+                    .exception_owner_provenance
+                    .source_boundaries
+                    .clear(),
+                3 => pipeline.exception_owner_provenance.block_boundaries.clear(),
+                4 => pipeline.exception_regions[0].depth = 1,
+                5 => pipeline.exception_regions[0].is_scope_fallback = false,
+                6 => pipeline
+                    .exception_regions
+                    .push(pipeline.exception_regions[0]),
+                7 => pipeline
+                    .exception_owner_provenance
+                    .setups
+                    .push((Label(0), None)),
+                8 => {
+                    edit_singleton(&mut pipeline, |items| {
+                        let marker = items
+                            .iter()
+                            .position(|item| {
+                                matches!(item,
+                            Item::Instruction(i) if i.opcode == NOT_TAKEN)
+                            })
+                            .unwrap();
+                        items.insert(marker, Item::Label(Label(4)));
+                    });
+                    pipeline
+                        .exception_owner_provenance
+                        .block_boundaries
+                        .insert(Label(4));
+                }
+                9 => edit_singleton(&mut pipeline, |items| {
+                    let Item::Instruction(first) = &mut items[1] else {
+                        unreachable!()
+                    };
+                    first.opcode = STORE_FAST;
+                }),
+                10 => edit_singleton(&mut pipeline, |items| {
+                    let (second_pair, _) = pair();
+                    items.splice(1..1, second_pair);
+                }),
+                11 => {}
+                _ => unreachable!(),
+            }
+            let before = FusionOwnerCertificates::snapshot(&pipeline);
+            if change != 11 {
+                pipeline.fuse_superinstructions();
+            }
+            let certificates = FusionOwnerCertificates::capture(&before, &pipeline);
+            assert!(
+                certificates.fallback_certificates.is_empty(),
+                "case {change}"
+            );
+        }
+    }
+
+    #[test]
+    fn post_try_fusion_invalidates_later_owner_boundary_and_instruction_changes() {
+        for change in 0..4 {
+            let mut pipeline = post_try_fusion_pipeline();
+            let before = FusionOwnerCertificates::snapshot(&pipeline);
+            pipeline.fuse_superinstructions();
+            let mut certificates = FusionOwnerCertificates::capture(&before, &pipeline);
+            assert_eq!(certificates.fallback_certificates.len(), 1);
+            match change {
+                0 => pipeline.exception_regions[0].depth = 1,
+                1 => pipeline
+                    .exception_owner_provenance
+                    .source_boundaries
+                    .clear(),
+                2 => edit_singleton(&mut pipeline, |items| {
+                    let marker = items
+                        .iter()
+                        .position(|item| {
+                            matches!(item,
+                        Item::Instruction(i) if i.opcode == NOT_TAKEN)
+                        })
+                        .unwrap();
+                    items.insert(
+                        marker,
+                        Item::Instruction(instruction(NOP, Operand::Value(0))),
+                    );
+                }),
+                3 => edit_singleton(&mut pipeline, |items| {
+                    let Item::Instruction(fused) = &mut items[1] else {
+                        unreachable!()
+                    };
+                    fused.set_operand(Operand::Value(34));
+                }),
+                _ => unreachable!(),
+            }
+            certificates.retain_pipeline(&pipeline);
+            assert!(
+                certificates.fallback_certificates.is_empty(),
+                "case {change}"
+            );
+        }
+    }
+
     #[test]
     fn observed_fusion_transports_null_and_protected_terminal_owner() {
         for (excluded, owner) in [

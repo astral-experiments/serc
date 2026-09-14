@@ -180,3 +180,37 @@ fn matches_cpython_marshal_for_non_final_loop_conjunction_assert() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_marshal_for_non_final_loop_disjunction_assert() {
+    let cases = [
+        (
+            "nonfinal_loop_or_assert.py",
+            r"def check_gradients(values):
+    for left, right in values:
+        if left is None:
+            assert right is None or (right == 0).all(), right
+        else:
+            assert left.ready is None
+            assert right.ready is None
+            assert (left == right).all(), (left, right)
+",
+        ),
+        (
+            "nonfinal_loop_and_assert_control.py",
+            r"def check_gradients(values):
+    for left, right in values:
+        if left is None:
+            assert right is None and (right == 0).all(), right
+        else:
+            assert left.ready is None
+            assert right.ready is None
+            assert (left == right).all(), (left, right)
+",
+        ),
+    ];
+
+    for (filename, source) in cases {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

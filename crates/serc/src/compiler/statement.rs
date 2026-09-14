@@ -7736,9 +7736,9 @@ impl Compiler<'_> {
                 }
                 compile_condition?;
                 if exclude_direct_post_try_coroutine_return_condition {
-                    // This normal post-try entry has a fresh marker; terminal-owner
-                    // recovery must not refill it from the preceding protected array.
-                    self.assembler.mark_last_condition_fallthrough_fresh();
+                    // Keep this marker excluded unless compaction in its own original
+                    // array proves that the late append reuses a protected slot.
+                    self.assembler.defer_last_post_try_condition_owner();
                 }
                 if jump_constant_truthiness(test) == Some(false) {
                     // CPython retains the discarded body's empty original block between
@@ -9344,10 +9344,16 @@ impl Compiler<'_> {
         {
             return self.compile_loop_tail_ifexp_assert(statement, conditional, restart);
         }
-        if non_final_branch && condition_jump_target_count(&statement.test, true) == 1 {
+        let copy_success_backedge = non_final_branch
+            && matches!(statement.test.as_ref(), Expr::BoolOp(boolean) if boolean.op == BoolOp::Or)
+            && condition_jump_target_count(&statement.test, true) > 1
+            && condition_has_linear_runtime_leaves(&statement.test);
+        if non_final_branch
+            && (copy_success_backedge || condition_jump_target_count(&statement.test, true) == 1)
+        {
             // In a non-final branch, successful assertion evaluation exits the enclosing branch.
             // CPython jumps over the fallthrough raise block to the loop backedge. Multiple
-            // short-circuit failure edges still share that fallthrough raise block.
+            // short-circuit success edges share that original exit until location resolution.
             let success = self.assembler.label();
             self.compile_jump_if(&statement.test, true, success)?;
             self.assembler
@@ -9370,8 +9376,14 @@ impl Compiler<'_> {
             if let Some(test) = unique_condition_jump_target(&statement.test, true) {
                 self.assembler
                     .set_location(self.source_location(test.range()));
+            } else if copy_success_backedge {
+                self.assembler.set_location(SourceLocation::NONE);
             }
-            self.emit_loop_tail_backedge(restart, false)?;
+            let backedge = self.emit_loop_tail_backedge(restart, false)?;
+            if copy_success_backedge {
+                // Each copied exit inherits its own successful operand's source range.
+                self.assembler.mark_as_artificial_eval_break(backedge);
+            }
             return Ok(());
         }
 
@@ -13593,12 +13605,23 @@ impl Compiler<'_> {
                         || suite_contains_partial_terminal_handler_if(&handler.body)
                 })
             });
+            let following_name_return_has_call_cleanup = self
+                .control
+                .finally
+                .active_return_finally_contexts
+                .last()
+                .is_some_and(|context| {
+                    matches!(context.body.as_slice(), [Stmt::Expr(expression)]
+                        if matches!(expression.value.as_ref(), Expr::Call(_))
+                            && !expression_contains_inline_branch(&expression.value))
+                });
             if (terminal_handler_exit
                 && !(self
                     .control
                     .statements
                     .current_statement_followed_by_name_return
-                    && self.control.withs.active_with_exits.is_empty()))
+                    && self.control.withs.active_with_exits.is_empty()
+                    && !following_name_return_has_call_cleanup))
                 || handler_has_orphan_cold_cleanup
                 || has_bare_handler
                 || (!statement.is_star
@@ -13618,7 +13641,8 @@ impl Compiler<'_> {
                 // the barrier on the source edge so a shared target can still be reached from
                 // an enclosing branch or loop. A direct following name return is copied onto
                 // the normal edge first, so its load remains reachable and borrowed. Pending
-                // manager cleanup makes that exit too large to copy, preserving the barrier.
+                // manager cleanup or a copied finally call makes that exit too large to
+                // copy, preserving the barrier. A pass-only finalizer can still fit.
                 self.assembler
                     .mark_borrow_fallthrough_barrier(normal_exit.instruction());
             }
