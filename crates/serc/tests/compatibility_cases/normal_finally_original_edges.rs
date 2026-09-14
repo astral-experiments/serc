@@ -231,6 +231,34 @@ fn matches_cpython_marshal_for_conditional_argument_after_terminal_if_exit() {
             "normal_finally_conditional_join_entry.py",
         ),
         (
+            r#"async def target(flag, work, sink):
+    error = None
+    try:
+        if flag:
+            return work()
+    except Exception as caught:
+        error = caught
+    finally:
+        sink("failure" if error else "success")
+    return error
+"#,
+            "async_conditional_argument_cleanup.py",
+        ),
+        (
+            r"def target(flag, work, sink):
+    error = None
+    try:
+        if flag:
+            return work()
+    except Exception as caught:
+        error = caught
+    finally:
+        (sink if error else work)(error)
+    return error
+",
+            "conditional_callable_cleanup_control.py",
+        ),
+        (
             r#"def target(flag, work, sink):
     error = None
     try:

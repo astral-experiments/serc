@@ -859,19 +859,22 @@ impl ControlFlowState {
                 // A retained SETUP NOP occupies one slot before the protected body. If
                 // SETUP instead disappears late, that final compaction leaves a protected
                 // tail slot regardless of earlier vacancies before the setup.
-                matches!(
+                // Compaction inside this protected block can still leave an owned slot.
+                // Let the assembler prove that donation before forcing the join ownerless.
+                (matches!(
                     context.direct_condition,
                     TryMarkerDirectCondition::Ownerless(ownerless) if ownerless == condition
-                ) || (context.ownerless_prefix_slots
-                    > assembler
-                        .instruction_count()
-                        .saturating_sub(context.protected_start_instruction)
-                    && context.setup_location.is_some_and(|setup| {
-                        setup.line >= 0
-                            && assembler
-                                .instruction_location_at(context.protected_start_instruction)
-                                .is_some_and(|first| first.line != setup.line)
-                    }))
+                ) && !assembler.current_block_has_dynamic_exception_owner())
+                    || (context.ownerless_prefix_slots
+                        > assembler
+                            .instruction_count()
+                            .saturating_sub(context.protected_start_instruction)
+                        && context.setup_location.is_some_and(|setup| {
+                            setup.line >= 0
+                                && assembler
+                                    .instruction_location_at(context.protected_start_instruction)
+                                    .is_some_and(|first| first.line != setup.line)
+                        }))
             })
     }
 
@@ -3287,9 +3290,14 @@ impl Compiler<'_> {
                 self.assembler
                     .last_instruction_location()
                     .unwrap_or_else(|| self.source_location(last.range()))
-            } else if matches!(last, Stmt::If(_)) {
-                // The nested branches share CPython's unlocated implicit return. Let exit
-                // copying assign each branch's predecessor location before line propagation.
+            } else if matches!(last, Stmt::If(_))
+                || matches!(last, Stmt::Try(statement)
+                    if !statement.is_star
+                        && statement.finalbody.is_empty()
+                        && matches!(statement.orelse.last(), Some(Stmt::If(_))))
+            {
+                // Nested branches, including the normal try-else exit, share CPython's
+                // unlocated implicit return. Exit copying assigns each predecessor's location.
                 SourceLocation::NONE
             } else {
                 self.source_location(last.range())
@@ -12143,6 +12151,14 @@ impl Compiler<'_> {
                                             pre_suspension_coroutine_boolean_assertion,
                                             |compiler| {
                                                 if let Some(split_success) = split_success {
+                                                    if let Expr::If(conditional) = statement.test.as_ref() {
+                                                        return compiler.compile_if_expression_jump(
+                                                            conditional,
+                                                            true,
+                                                            split_success,
+                                                            end,
+                                                        );
+                                                    }
                                                     let Expr::BoolOp(boolean) =
                                                         statement.test.as_ref()
                                                     else {
@@ -12797,6 +12813,7 @@ impl Compiler<'_> {
         let split_terminal_try_assert_success = matches!(statement.body.last(),
             Some(Stmt::Assert(assertion))
                 if early_condition_truthiness(&assertion.test).is_none()
+                    && matches!(assertion.test.as_ref(), Expr::BoolOp(_))
                     && terminal_assert_splits_success_return(assertion));
         let mut normal_return_emitted = false;
         let body_noop_location = if direct_continue {
@@ -16786,7 +16803,12 @@ impl Compiler<'_> {
         // leave an empty block between the condition and ordinary recovery cleanup.
         let terminal_if_false_edge_reaches_finally = !statement.is_star
             && statement.orelse.is_empty()
-            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                || (self.unit.flags & CO_COROUTINE != 0
+                    && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+                    && terminal_if_cleanup_is_suspension_free(statement)
+                    && matches!(statement.finalbody.as_slice(), [Stmt::Expr(cleanup)]
+                        if cleanup_conditional_argument_has_eager_call_prefix(&cleanup.value))))
             && self.control.withs.active_with_region_exclusions.is_empty()
             && self.control.finally.active_normal_finally_bodies == 0
             && self.control.finally.active_finally_end_blocks == 0
@@ -16804,7 +16826,8 @@ impl Compiler<'_> {
             })
             && (suite_has_linear_borrow_fallthrough(&statement.finalbody)
                 || matches!(statement.finalbody.as_slice(), [Stmt::Expr(cleanup)]
-                    if cleanup_conditional_argument_has_eager_call_prefix(&cleanup.value))
+                    if cleanup_conditional_argument_has_eager_call_prefix(&cleanup.value)
+                        || cleanup_conditional_callable_has_runtime_entry(&cleanup.value))
                 || matches!(statement.finalbody.as_slice(), [Stmt::If(cleanup)]
                     if condition_has_only_runtime_tests(&cleanup.test)
                         && !expression_contains_inline_branch(&cleanup.test)
@@ -22397,7 +22420,7 @@ fn suite_assert_success_fallthrough_range(body: &[Stmt]) -> Option<TextRange> {
     unique_condition_jump_target(&statement.test, true).map(Ranged::range)
 }
 
-// CPython gives each authored success edge of a terminal two-term `or` its own implicit-return
+// CPython gives each authored success edge of a terminal assertion its own implicit-return
 // block, whose instructions inherit that operand's location.
 fn terminal_assert_splits_success_return(statement: &ruff_python_ast::StmtAssert) -> bool {
     terminal_assert_split_success_ranges(statement).is_some()
@@ -22406,6 +22429,29 @@ fn terminal_assert_splits_success_return(statement: &ruff_python_ast::StmtAssert
 fn terminal_assert_split_success_ranges(
     statement: &ruff_python_ast::StmtAssert,
 ) -> Option<[TextRange; 2]> {
+    if let Expr::If(conditional) = statement.test.as_ref() {
+        if statement.msg.is_some()
+            || !matches!(conditional.test.as_ref(), Expr::Name(_))
+            || early_condition_truthiness(&conditional.test).is_some()
+        {
+            return None;
+        }
+        let success_range = |operand: &Expr| {
+            let Expr::Compare(comparison) = operand else {
+                return None;
+            };
+            // Keep folded selectors and branching arms on their original lowering.
+            // A runtime None comparison has one authored, located success edge.
+            (is_specialized_none_condition(operand)
+                && condition_has_only_runtime_tests(&comparison.left)
+                && !expression_contains_inline_branch(&comparison.left))
+            .then(|| operand.range())
+        };
+        return Some([
+            success_range(&conditional.body)?,
+            success_range(&conditional.orelse)?,
+        ]);
+    }
     let Expr::BoolOp(boolean) = statement.test.as_ref() else {
         return None;
     };
@@ -23030,6 +23076,68 @@ fn suite_contains_loop_continue(body: &[Stmt]) -> bool {
         Stmt::FunctionDef(_) | Stmt::ClassDef(_) => false,
         _ => false,
     })
+}
+
+// This coroutine path has the same local blocks as a synchronous terminal-if exit.
+// Restrict it to one return and linear recovery assignments with no suspension.
+fn terminal_if_cleanup_is_suspension_free(statement: &ruff_python_ast::StmtTry) -> bool {
+    let [Stmt::If(conditional)] = statement.body.as_slice() else {
+        return false;
+    };
+    let [Stmt::Return(returned)] = conditional.body.as_slice() else {
+        return false;
+    };
+    !expression_suspends_current_scope(&conditional.test)
+        && returned.value.as_deref().is_none_or(|value| {
+            !expression_contains_inline_branch(value) && !expression_suspends_current_scope(value)
+        })
+        && statement.handlers.iter().all(|handler| {
+            handler.as_except_handler().is_some_and(|handler| {
+                matches!(handler.type_.as_deref(), Some(Expr::Name(_)))
+                    && handler.body.iter().all(|statement| match statement {
+                        Stmt::Pass(_) => true,
+                        Stmt::Assign(assignment) => {
+                            assignment
+                                .targets
+                                .iter()
+                                .all(|target| matches!(target, Expr::Name(_)))
+                                && !expression_contains_inline_branch(&assignment.value)
+                                && !expression_suspends_current_scope(&assignment.value)
+                        }
+                        _ => false,
+                    })
+            })
+        })
+}
+
+// A runtime test starts this cleanup before the callable arms rejoin at the call.
+// Its first block stays nonempty when the preceding POP_BLOCK marker is removed.
+fn cleanup_conditional_callable_has_runtime_entry(expression: &Expr) -> bool {
+    let Expr::Call(call) = expression else {
+        return false;
+    };
+    let Expr::If(conditional) = call.func.as_ref() else {
+        return false;
+    };
+    matches!(conditional.test.as_ref(), Expr::Name(_))
+        && condition_has_only_runtime_tests(&conditional.test)
+        && matches!(conditional.body.as_ref(), Expr::Name(_))
+        && matches!(conditional.orelse.as_ref(), Expr::Name(_))
+        && !expression_suspends_current_scope(expression)
+        && call
+            .arguments
+            .keywords
+            .iter()
+            .all(|keyword| keyword.arg.is_some())
+        && call
+            .arguments
+            .args
+            .iter()
+            .chain(call.arguments.keywords.iter().map(|keyword| &keyword.value))
+            .all(|argument| {
+                !matches!(argument, Expr::Starred(_))
+                    && !expression_contains_inline_branch(argument)
+            })
 }
 
 /// A callable is loaded before one runtime conditional argument starts branching.

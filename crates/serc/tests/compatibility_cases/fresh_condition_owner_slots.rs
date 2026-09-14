@@ -161,3 +161,45 @@ fn matches_cpython_async_function_for_break_try_assert() {
         "async_function_for_break_try_assert.py",
     );
 }
+
+#[test]
+fn matches_cpython_fresh_try_call_condition_after_branch_join() {
+    for (filename, source) in [
+        (
+            "fresh_try_call_after_join_with_continuation.py",
+            r"def f(values, flag):
+    for value in values:
+        if flag:
+            prepare(value)
+        else:
+            fallback(value)
+        try:
+            if isinstance(value.payload, Kind):
+                consume(value)
+            else:
+                discard(value)
+        except Error:
+            recover(value)
+        after(value)
+",
+        ),
+        (
+            "fresh_try_call_after_guard_with_continuation.py",
+            r"def f(values, flag):
+    for value in values:
+        if flag:
+            raise Error(value)
+        try:
+            if isinstance(value, Kind):
+                consume(value)
+            else:
+                discard(value)
+        except Error:
+            recover(value)
+        after(value)
+",
+        ),
+    ] {
+        assert_matches_cpython_marshal(source, filename);
+    }
+}

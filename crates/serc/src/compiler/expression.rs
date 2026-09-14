@@ -7455,6 +7455,53 @@ impl Compiler<'_> {
         result
     }
 
+    /// Lowers a runtime conditional with independently addressable arm outcomes.
+    pub(super) fn compile_if_expression_jump(
+        &mut self,
+        conditional: &ruff_python_ast::ExprIf,
+        jump_on: bool,
+        body_target: Label,
+        else_target: Label,
+    ) -> Result<(), CompileError> {
+        let otherwise = self.assembler.label();
+        let end = self.assembler.label();
+        self.compile_jump_if(&conditional.test, false, otherwise)?;
+        self.assembler.record_short_circuit_owner_continuation();
+        self.compile_jump_if(&conditional.body, jump_on, body_target)?;
+        self.assembler.set_location(SourceLocation::NONE);
+        let body_exit = self.emit_jump_forward_instruction(JUMP_FORWARD, end)?;
+        if self.control.conditions.retained_multiline_assert_ifexp_exit == Some(conditional.range) {
+            self.assembler.preserve_inlined_jump_nop(body_exit);
+        } else {
+            // CPython copies the original unlocated join before small branch tails.
+            self.assembler.preserve_direct_inlined_jump_nop(body_exit);
+        }
+        self.assembler
+            .record_exception_owner_block_boundary(otherwise);
+        self.assembler.mark(otherwise);
+        if self
+            .control
+            .exceptions
+            .terminal_try_condition_exception_exclusion_depth
+            .is_some()
+        {
+            self.with_control_override(
+                |control| {
+                    &mut control
+                        .exceptions
+                        .terminal_try_condition_exception_exclusion_depth
+                },
+                None,
+                |compiler| compiler.compile_jump_if(&conditional.orelse, jump_on, else_target),
+            )?;
+        } else {
+            self.compile_jump_if(&conditional.orelse, jump_on, else_target)?;
+        }
+        self.assembler.preserve_block_boundary_if_new(end);
+        self.assembler.mark(end);
+        Ok(())
+    }
+
     pub(super) fn compile_jump_if(
         &mut self,
         expression: &Expr,
@@ -7485,7 +7532,33 @@ impl Compiler<'_> {
             self.pre_register_expression_names(&conditional.body)?;
             self.pre_register_expression_names(&conditional.orelse)?;
             self.preserve_folded_if_expression_entry(truthiness);
-            return self.compile_jump_if(
+            if truthiness
+                && self.assembler.at_empty_borrow_block()
+                && self.source_location(conditional.test.range()).line
+                    == self.source_location(conditional.body.range()).line
+            {
+                // Removing this same-line selector empties its original block.
+                // Preserve the separate selected arm after that borrow barrier.
+                let empty_selector = self.assembler.label();
+                self.assembler.mark(empty_selector);
+                self.assembler.prevent_borrow_reachability(empty_selector);
+                let selected_arm = self.assembler.label();
+                self.assembler.preserve_block_boundary(selected_arm);
+                self.assembler.mark(selected_arm);
+            }
+            let preserve_multiline_failure_join = truthiness
+                && self.control.conditions.retained_multiline_assert_ifexp_exit
+                    == Some(conditional.range);
+            if preserve_multiline_failure_join
+                && self.source_location(conditional.test.range()).line
+                    != self.source_location(conditional.body.range()).line
+            {
+                // The selected arm starts on another line, retaining the folded selector marker.
+                self.assembler
+                    .set_location(self.source_location(conditional.test.range()));
+                self.emit(NOP, 0, 0)?;
+            }
+            self.compile_jump_if(
                 if truthiness {
                     &conditional.body
                 } else {
@@ -7493,7 +7566,15 @@ impl Compiler<'_> {
                 },
                 jump_on,
                 label,
-            );
+            )?;
+            if preserve_multiline_failure_join {
+                // The first arm's removed forward join keeps its multiline assertion marker.
+                self.assembler
+                    .set_location(self.source_location(conditional.body.range()));
+                self.emit(NOP, 0, 0)?;
+                self.assembler.preserve_last_nop();
+            }
+            return Ok(());
         }
         let constant_truthiness = jump_constant_truthiness(expression);
         if let Some(truthiness) = constant_truthiness {
@@ -7613,45 +7694,7 @@ impl Compiler<'_> {
             return Ok(());
         }
         if let Expr::If(conditional) = expression {
-            let otherwise = self.assembler.label();
-            let end = self.assembler.label();
-            self.compile_jump_if(&conditional.test, false, otherwise)?;
-            self.assembler.record_short_circuit_owner_continuation();
-            self.compile_jump_if(&conditional.body, jump_on, label)?;
-            self.assembler.set_location(SourceLocation::NONE);
-            let body_exit = self.emit_jump_forward_instruction(JUMP_FORWARD, end)?;
-            if self.control.conditions.retained_multiline_assert_ifexp_exit
-                == Some(conditional.range)
-            {
-                self.assembler.preserve_inlined_jump_nop(body_exit);
-            } else {
-                // CPython copies the original unlocated join before small branch tails.
-                self.assembler.preserve_direct_inlined_jump_nop(body_exit);
-            }
-            self.assembler
-                .record_exception_owner_block_boundary(otherwise);
-            self.assembler.mark(otherwise);
-            if self
-                .control
-                .exceptions
-                .terminal_try_condition_exception_exclusion_depth
-                .is_some()
-            {
-                self.with_control_override(
-                    |control| {
-                        &mut control
-                            .exceptions
-                            .terminal_try_condition_exception_exclusion_depth
-                    },
-                    None,
-                    |compiler| compiler.compile_jump_if(&conditional.orelse, jump_on, label),
-                )?;
-            } else {
-                self.compile_jump_if(&conditional.orelse, jump_on, label)?;
-            }
-            self.assembler.preserve_block_boundary_if_new(end);
-            self.assembler.mark(end);
-            return Ok(());
+            return self.compile_if_expression_jump(conditional, jump_on, label, label);
         }
         if let Expr::Compare(comparison) = expression
             && comparison.ops.len() > 1

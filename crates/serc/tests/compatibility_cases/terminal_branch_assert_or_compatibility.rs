@@ -167,3 +167,56 @@ fn terminal_try_assert_or_success_exits() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn terminal_branch_assert_ifexp_success_exits() {
+    for (filename, source) in [
+        (
+            "terminal_branch_assert_ifexp_existing_or_control.py",
+            r"def terminal_or(enabled, left, right):
+    if enabled:
+        assert left or right
+",
+        ),
+        (
+            "terminal_branch_assert_ifexp.py",
+            r"def terminal_ifexp(enabled, condition, value):
+    if enabled:
+        assert value is not None if condition else value is None
+",
+        ),
+        (
+            "terminal_branch_assert_ifexp_folded_selector_control.py",
+            r"def terminal_true_selector(enabled, value):
+    if enabled:
+        assert value is not None if True else value is None
+
+
+def terminal_false_selector(enabled, value):
+    if enabled:
+        assert value is not None if False else value is None
+",
+        ),
+        (
+            "terminal_branch_assert_ifexp_nonempty_selector_control.py",
+            r"def terminal_nonempty_selector(enabled, value):
+    if enabled:
+        prepare()
+        assert value is not None if True else value is None
+",
+        ),
+        (
+            "terminal_branch_assert_ifexp_multiline_selector_control.py",
+            r"def terminal_multiline_selector(enabled, value):
+    if enabled:
+        assert (
+            value is not None
+            if True
+            else value is None
+        )
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
