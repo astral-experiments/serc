@@ -126,6 +126,7 @@ mod iterator_setup_owner_slots;
 mod iterator_try_assignment_branch_compatibility;
 mod jump_argument_width_seeds;
 mod large_class_arguments;
+mod later_handler_owner_slots;
 mod literal_return_finally_locations;
 mod loop_branch_exit_locations;
 mod loop_branch_source_owner_boundaries;

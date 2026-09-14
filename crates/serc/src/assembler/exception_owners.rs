@@ -20,6 +20,7 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) early_return_nop_pairs: Vec<(Instruction, Instruction, Label)>,
     pub(super) copied_handler_cleanups: Vec<CopiedHandlerCleanup>,
     pub(super) fused_manager_owners: Vec<(Instruction, Instruction, super::ExceptionRegion)>,
+    pub(super) handler_dispatch_arrays: Vec<HandlerDispatchArray>,
     pub(super) block_boundaries: FxHashSet<Label>,
     // Original entries that split borrowed-load analysis without changing the physical CFG.
     pub(super) borrow_only_block_boundaries: FxHashSet<Label>,
@@ -89,6 +90,15 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) source_none_conditions: Vec<SourceNoneCondition>,
     // Exact terminal pairs produced by original conditional jump threading.
     pub(super) threaded_condition_origins: Vec<(Instruction, Instruction)>,
+}
+
+/// A later typed handler's authored dispatch, before its late marker is excluded.
+#[derive(Debug)]
+pub(super) struct HandlerDispatchArray {
+    pub(super) entry: Label,
+    pub(super) items: Vec<Item>,
+    pub(super) target: Label,
+    pub(super) depth: u32,
 }
 
 /// One completed async manager entry and its original late `SETUP_WITH` record.

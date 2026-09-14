@@ -95,3 +95,30 @@ def terminal_simple_assert_control(enabled, value):
 
     common::assert_matches_cpython_marshal(source, "terminal_branch_assert_or_success_exits.py");
 }
+
+#[test]
+fn terminal_branch_negated_assert_or_success_exit() {
+    for (filename, source) in [
+        (
+            "terminal_branch_assert_or_existing_control.py",
+            r"def terminal_else_or(enabled, left, right):
+    if enabled:
+        prepare()
+    else:
+        assert left or right
+",
+        ),
+        (
+            "terminal_branch_negated_assert_or.py",
+            r#"def f(value, request):
+    if value.limit is not None:
+        assert request.paged, "expected paged"
+        assert value.limit == request.limit, "different limit"
+    else:
+        assert not request.paged or request.limit is None, "missing limit"
+"#,
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

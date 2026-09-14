@@ -14113,6 +14113,7 @@ impl Compiler<'_> {
                             self.assembler.current_block_token(),
                         )
                     });
+                let exception_type_start = self.assembler.item_count();
                 self.with_control_override(
                     |control| &mut control.exceptions.exception_type_bool_marker_state,
                     bool_marker_state,
@@ -14143,6 +14144,18 @@ impl Compiler<'_> {
                         ExceptionPolicy::default()
                     },
                 )?;
+                // An eagerly folded expression branch can erase an original array entry.
+                // Record only authored linear dispatches; compaction is proved by the passes.
+                if handler_index > 0
+                    && self.context.target_specific_rules_enabled()
+                    && !expression_contains_inline_branch(exception_type)
+                {
+                    self.assembler.record_handler_dispatch_array(
+                        exception_type_start,
+                        common_cleanup,
+                        (base_depth + 1).cast_unsigned(),
+                    );
+                }
                 let exclusion_end = self.assembler.label();
                 // A matched exception starts a fresh original fallthrough array.
                 self.assembler
@@ -22390,7 +22403,15 @@ fn terminal_assert_split_success_ranges(
             if nested.op == BoolOp::And
                 && nested.values.iter().all(|value| jump_constant_truthiness(value).is_none())
                 && nested.values.last().is_some_and(|last| last.range() == target.range()));
-        (target.range() == operand.range() || supported_nested_and).then(|| target.range())
+        // `not` flips the jump polarity while retaining the inner expression's location.
+        // Admit only an immediate runtime atom with its own single authored success edge.
+        let supported_negated_atom = matches!(operand, Expr::UnaryOp(unary)
+            if unary.op == UnaryOp::Not
+                && target.range() == unary.operand.range()
+                && condition_has_only_runtime_tests(&unary.operand)
+                && !expression_contains_inline_branch(&unary.operand));
+        (target.range() == operand.range() || supported_nested_and || supported_negated_atom)
+            .then(|| target.range())
     };
     Some([success_range(first)?, success_range(second)?])
 }
@@ -24425,6 +24446,8 @@ mod tests {
     fn terminal_assert_split_requires_one_authored_success_edge_per_operand() {
         for expression in [
             "left or right",
+            "(not left) or right",
+            "(not request.paged) or request.limit is None",
             "check(left) or check(right)",
             "(value := left) or right",
             "(left < middle < right) or other",
@@ -24440,7 +24463,11 @@ mod tests {
             "(left or middle) or False",
             "False or (left or right)",
             "(left and True) or right",
-            "(not left) or right",
+            "(not True) or right",
+            "(not False) or right",
+            "(not not left) or right",
+            "(not (left and middle)) or right",
+            "(not (left or middle)) or right",
             "(left if choose else False) or right",
         ] {
             assert!(!terminal_assert_splits(expression), "{expression}");

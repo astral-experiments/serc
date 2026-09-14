@@ -1537,6 +1537,30 @@ impl Assembler {
         count
     }
 
+    /// Records the real entry and cleanup owner of a later typed-handler dispatch.
+    pub(crate) fn record_handler_dispatch_array(
+        &mut self,
+        start: usize,
+        target: Label,
+        depth: u32,
+    ) {
+        let Some(entry_index) = start.checked_sub(1) else {
+            return;
+        };
+        let Some(Item::Label(entry)) = self.linear_items().get(entry_index).copied() else {
+            return;
+        };
+        let items = self.linear_items()[entry_index..].to_vec();
+        self.exception_owner_provenance
+            .handler_dispatch_arrays
+            .push(exception_owners::HandlerDispatchArray {
+                entry,
+                items,
+                target,
+                depth,
+            });
+    }
+
     /// Counts emitted instructions before constant folding and global-call fusion.
     pub(crate) fn pre_fusion_instruction_count_since(&self, instruction_offset: usize) -> usize {
         self.linear_items()

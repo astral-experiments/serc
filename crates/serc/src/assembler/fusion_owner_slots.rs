@@ -1240,9 +1240,234 @@ impl ManagerSetupCertificate {
     }
 }
 
+/// One uniformly owned original dispatch with at most one accounted-for compaction.
+struct HandlerDispatchCertificate {
+    interval: Certificate,
+    region: ExceptionRegion,
+    removed: usize,
+    observed_fusion: bool,
+}
+
+impl HandlerDispatchCertificate {
+    fn capture(
+        view: &View<'_>,
+        origin: &super::exception_owners::HandlerDispatchArray,
+    ) -> Option<Self> {
+        use crate::target::opcodes::CHECK_EXC_MATCH;
+
+        let instructions = origin
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Instruction(instruction) => Some(*instruction),
+                Item::Label(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let [.., check, condition, marker] = instructions.as_slice() else {
+            return None;
+        };
+        if check.opcode != CHECK_EXC_MATCH
+            || condition.opcode != POP_JUMP_IF_FALSE
+            || marker.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
+        {
+            return None;
+        }
+        let (condition_index, _) = view.endpoint(*condition, *marker)?;
+        let region = Self::owner(view, condition_index)?;
+        if region.target != origin.target
+            || region.depth != origin.depth
+            || !region.preserve_lasti
+            || region.is_scope_fallback
+        {
+            return None;
+        }
+        let mut interval = Certificate {
+            anchor: Anchor::Label(origin.entry),
+            condition: *condition,
+            marker: *marker,
+            items: origin.items.clone(),
+            owner: Some((region.target, region.depth, region.preserve_lasti)),
+            boundaries: view.boundaries.clone(),
+            setups: view.provenance.setups.clone(),
+        };
+        interval
+            .boundaries
+            .retain(|label| origin.items.contains(&Item::Label(*label)));
+        let mut result = Self {
+            interval,
+            region,
+            removed: 0,
+            observed_fusion: false,
+        };
+        let (start, condition, _) = result.interval.valid_array(view, false)?;
+        result.removed = result.slots(view, start, condition)?;
+        result.valid(view, false)?;
+        Some(result)
+    }
+
+    /// Selects the concrete live record's owner with the layout's existing priority.
+    fn owner(view: &View<'_>, index: usize) -> Option<ExceptionRegion> {
+        let Item::Instruction(instruction) = view.items[index] else {
+            return None;
+        };
+        if instruction.exception_policy() != ExceptionPolicy::NoneUnchanged {
+            return None;
+        }
+        let position = view.items[..index]
+            .iter()
+            .filter(|item| matches!(item, Item::Instruction(_)))
+            .count();
+        let mut owners = Vec::new();
+        for (order, region) in view.regions.iter().enumerate() {
+            let start = *view.positions.get(&region.start)?;
+            let end = *view.positions.get(&region.end)?;
+            if start <= position && position < end {
+                let (start, end) = match region.priority {
+                    ExceptionRegionPriority::OriginalRange(start, end) => {
+                        (*view.positions.get(&start)?, *view.positions.get(&end)?)
+                    }
+                    ExceptionRegionPriority::Resolved { start, end } => (start, end),
+                };
+                owners.push((
+                    (region.is_scope_fallback, Reverse(start), end, order),
+                    *region,
+                ));
+            }
+        }
+        owners
+            .into_iter()
+            .min_by_key(|(priority, _)| *priority)
+            .map(|(_, region)| region)
+    }
+
+    /// Accounts only for a global-call NULL fold or an observed pair of local loads.
+    fn slots(&self, view: &View<'_>, start: usize, condition: usize) -> Option<usize> {
+        use crate::target::opcodes::{
+            BUILD_TUPLE, CALL, CHECK_EXC_MATCH, LOAD_ATTR, LOAD_CONST, LOAD_FAST_CHECK, LOAD_GLOBAL,
+        };
+
+        if !view.no_late_insertions_or_setups(start, condition)
+            || view.provenance.setups.iter().any(|(label, _)| {
+                view.labels
+                    .get(label)
+                    .is_none_or(|position| start <= *position && *position <= condition)
+            })
+            || view
+                .provenance
+                .removed_pop_block_boundaries
+                .iter()
+                .any(|label| {
+                    view.labels
+                        .get(label)
+                        .is_none_or(|position| start <= *position && *position <= condition)
+                })
+        {
+            return None;
+        }
+        let mut removed = 0;
+        let mut global_call = false;
+        let mut call = false;
+        for (offset, item) in view.items[start..=condition].iter().enumerate() {
+            let index = start + offset;
+            let instruction = match item {
+                Item::Label(label) => {
+                    if offset != 0 && view.references.contains(label) {
+                        return None;
+                    }
+                    continue;
+                }
+                Item::Instruction(instruction) => instruction,
+            };
+            if instruction.exception_policy() != ExceptionPolicy::NoneUnchanged
+                || instruction.pre_fold_extra_instructions() != 0
+                || instruction.local_policy.hidden_exception_owner_slots() != 0
+                || instruction.only_allows_unconditional_inlining()
+                || instruction.no_location_policy.borrow_fallthrough()
+                    == super::BorrowFallthrough::Barrier
+                || !same_manager_region(&Self::owner(view, index)?, &self.region)
+            {
+                return None;
+            }
+            match instruction.opcode {
+                LOAD_GLOBAL => {
+                    let Operand::Value(argument) = instruction.operand() else {
+                        return None;
+                    };
+                    if argument & 1 != 0 {
+                        removed += 1;
+                        global_call = true;
+                    }
+                }
+                LOAD_FAST_LOAD_FAST | LOAD_FAST_BORROW_LOAD_FAST_BORROW if self.observed_fusion => {
+                    removed += 1;
+                }
+                LOAD_FAST | LOAD_FAST_BORROW | LOAD_FAST_CHECK | LOAD_CONST | BUILD_TUPLE
+                | CHECK_EXC_MATCH => {}
+                LOAD_ATTR if matches!(instruction.operand(), Operand::Value(argument) if argument & 1 == 0) =>
+                    {}
+                CALL => call = true,
+                POP_JUMP_IF_FALSE if index == condition => {}
+                _ => return None,
+            }
+        }
+        (removed <= 1 && (!global_call || call)).then_some(removed)
+    }
+
+    fn valid(&self, view: &View<'_>, borrow: bool) -> Option<usize> {
+        let (start, condition, marker) = self.interval.valid_array(view, borrow)?;
+        (self.slots(view, start, condition)? == self.removed).then_some(marker)
+    }
+
+    fn rebind_one_fusion(&mut self, before: &View<'_>, after: &View<'_>) -> Option<()> {
+        if self.observed_fusion || self.removed != 0 {
+            return None;
+        }
+        self.valid(before, false)?;
+        let (start, _, marker) = self.interval.range(after, false)?;
+        let items = after.items[start..=marker].to_vec();
+        if !one_fusion(&self.interval.items, &items) {
+            return None;
+        }
+        self.interval.items = items;
+        self.observed_fusion = true;
+        self.removed = 1;
+        self.valid(after, false)?;
+        Some(())
+    }
+
+    fn rebind_cold_region(
+        &mut self,
+        view: &View<'_>,
+        retargets: &[(ExceptionRegion, ExceptionRegion)],
+    ) -> Option<()> {
+        if self.valid(view, false).is_some() {
+            return Some(());
+        }
+        let (_, condition, _) = self.interval.valid_array(view, false)?;
+        let selected = Self::owner(view, condition)?;
+        let mut replacements = retargets.iter().filter_map(|(original, rebuilt)| {
+            let mut shape = *rebuilt;
+            shape.start = self.region.start;
+            shape.end = self.region.end;
+            (same_manager_region(original, &self.region)
+                && same_manager_region(&shape, &self.region)
+                && same_manager_region(rebuilt, &selected))
+            .then_some(*rebuilt)
+        });
+        let region = replacements.next()?;
+        if replacements.next().is_some() {
+            return None;
+        }
+        self.region = region;
+        self.valid(view, false)?;
+        Some(())
+    }
+}
+
 #[derive(Default)]
 pub(super) struct FusionOwnerCertificates {
     certificates: Vec<Certificate>,
+    handler_dispatch_certificates: Vec<HandlerDispatchCertificate>,
     manager_setup_certificates: Vec<ManagerSetupCertificate>,
     fallback_certificates: Vec<FallbackCertificate>,
     fresh_singleton_certificates: Vec<FreshSingletonCertificate>,
@@ -1251,9 +1476,9 @@ pub(super) struct FusionOwnerCertificates {
 impl FusionOwnerCertificates {
     /// Captures authored arrays before any CFG pass can reuse their owner slots.
     pub(super) fn capture_original_owners(p: &OptimizationPipeline) -> Self {
-        if p.exception_regions.is_empty() || !p.graph.iter_items().any(|item| {
+        if p.exception_regions.is_empty() || (p.exception_owner_provenance.handler_dispatch_arrays.is_empty() && !p.graph.iter_items().any(|item| {
             matches!(item, Item::Instruction(instruction) if instruction.opcode == NOT_TAKEN && matches!(instruction.exception_policy(), ExceptionPolicy::NoneUnchangedBooleanSingleton | ExceptionPolicy::NonePresent | ExceptionPolicy::NoneAbsent))
-        }) {
+        })) {
             return Self::default();
         }
         let items = p.graph.iter_items().copied().collect::<Vec<_>>();
@@ -1329,11 +1554,19 @@ impl FusionOwnerCertificates {
                 }
             }
         }
+        result.handler_dispatch_certificates = p
+            .exception_owner_provenance
+            .handler_dispatch_arrays
+            .iter()
+            .filter_map(|origin| HandlerDispatchCertificate::capture(&view, origin))
+            .collect();
         result
     }
 
     /// Moves original-array certificates into the existing later-pass retention path.
     pub(super) fn extend_original_owners(&mut self, mut original: Self) {
+        self.handler_dispatch_certificates
+            .append(&mut original.handler_dispatch_certificates);
         self.fallback_certificates
             .append(&mut original.fallback_certificates);
         self.fresh_singleton_certificates
@@ -1506,7 +1739,8 @@ impl FusionOwnerCertificates {
 
     /// Transfers original fallback proofs across the immediately preceding fusion pass.
     pub(super) fn retain_after_fusion(&mut self, before: &[Item], p: &OptimizationPipeline) {
-        if !self.fallback_certificates.is_empty() {
+        if !self.fallback_certificates.is_empty() || !self.handler_dispatch_certificates.is_empty()
+        {
             let items = p.graph.iter_items().copied().collect::<Vec<_>>();
             if let (Some(before), Some(after)) = (
                 View::new(
@@ -1526,13 +1760,19 @@ impl FusionOwnerCertificates {
                     certificate.valid(&after, false).is_some()
                         || certificate.rebind_one_fusion(&before, &after).is_some()
                 });
+                self.handler_dispatch_certificates
+                    .retain_mut(|certificate| {
+                        certificate.valid(&after, false).is_some()
+                            || certificate.rebind_one_fusion(&before, &after).is_some()
+                    });
             }
         }
         self.retain_pipeline(p);
     }
 
     pub(super) fn has_manager_setup_certificates(&self) -> bool {
-        !self.manager_setup_certificates.is_empty()
+        !self.handler_dispatch_certificates.is_empty()
+            || !self.manager_setup_certificates.is_empty()
             || self
                 .fresh_singleton_certificates
                 .iter()
@@ -1545,6 +1785,22 @@ impl FusionOwnerCertificates {
         p: &OptimizationPipeline,
         retargets: &[(ExceptionRegion, ExceptionRegion)],
     ) {
+        if !self.handler_dispatch_certificates.is_empty() {
+            let items = p.graph.iter_items().copied().collect::<Vec<_>>();
+            if let Some(view) = View::new(
+                &items,
+                &p.exception_regions,
+                &p.exception_owner_provenance,
+                &p.preserved_block_boundaries,
+            ) {
+                self.handler_dispatch_certificates
+                    .retain_mut(|certificate| {
+                        certificate.rebind_cold_region(&view, retargets).is_some()
+                    });
+            } else {
+                self.handler_dispatch_certificates.clear();
+            }
+        }
         for certificate in &mut self.fresh_singleton_certificates {
             let mut transferred = Vec::new();
             for region in &certificate.manager_regions {
@@ -1635,6 +1891,7 @@ impl FusionOwnerCertificates {
 
     pub(super) fn retain_pipeline(&mut self, p: &OptimizationPipeline) {
         if self.certificates.is_empty()
+            && self.handler_dispatch_certificates.is_empty()
             && self.manager_setup_certificates.is_empty()
             && self.fallback_certificates.is_empty()
             && self.fresh_singleton_certificates.is_empty()
@@ -1649,12 +1906,15 @@ impl FusionOwnerCertificates {
             &p.preserved_block_boundaries,
         ) else {
             self.certificates.clear();
+            self.handler_dispatch_certificates.clear();
             self.manager_setup_certificates.clear();
             self.fallback_certificates.clear();
             self.fresh_singleton_certificates.clear();
             return;
         };
         self.certificates
+            .retain(|c| c.valid(&view, false).is_some());
+        self.handler_dispatch_certificates
             .retain(|c| c.valid(&view, false).is_some());
         self.manager_setup_certificates
             .retain(|certificate| certificate.valid(&view, false).is_some());
@@ -1699,6 +1959,7 @@ impl FusionOwnerCertificates {
         preserved: &FxHashSet<Label>,
     ) {
         if self.certificates.is_empty()
+            && self.handler_dispatch_certificates.is_empty()
             && self.manager_setup_certificates.is_empty()
             && self.fallback_certificates.is_empty()
             && self.fresh_singleton_certificates.is_empty()
@@ -1723,6 +1984,12 @@ impl FusionOwnerCertificates {
                     .filter_map(|certificate| Some((certificate.valid(&view, true)?, None))),
             )
             .collect::<Vec<_>>();
+        let dispatch_markers = self
+            .handler_dispatch_certificates
+            .iter()
+            .filter(|certificate| certificate.removed == 1)
+            .filter_map(|certificate| certificate.valid(&view, true))
+            .collect::<Vec<_>>();
         for (index, owner) in changes {
             let Item::Instruction(marker) = &mut items[index] else {
                 continue;
@@ -1734,6 +2001,14 @@ impl FusionOwnerCertificates {
                 marker.set_exception_policy(ExceptionPolicy::NoneOverridePresent);
             } else {
                 marker.set_exception_owner(NormalizedExceptionOwner::OverridePresent);
+            }
+        }
+        for index in dispatch_markers {
+            if let Item::Instruction(marker) = &mut items[index] {
+                // The exact original dispatch and every surviving record still select
+                // this same cleanup owner. Retire only its predicted late-slot exclusion;
+                // layout can therefore recover that owner from the preceding condition.
+                marker.set_exception_policy(ExceptionPolicy::NoneOverridePresent);
             }
         }
     }
