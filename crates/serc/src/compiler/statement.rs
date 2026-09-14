@@ -4325,6 +4325,45 @@ impl Compiler<'_> {
                     self.assembler.mark(start);
                     Some(start)
                 };
+                let original_finally_continue_test = (self.context.target_specific_rules_enabled()
+                    && context.iterator_cleanup == IteratorCleanup::Sync
+                    && !context.has_orelse
+                    && self.control.withs.active_with_exits.len() == context.with_depth
+                    && self.control.finally.active_finally_end_blocks == context.finally_end_depth
+                    && self.control.finally.active_copied_finally_bodies == 0
+                    && self.control.finally.active_normal_finally_bodies == 0
+                    && self
+                        .control
+                        .finally
+                        .active_pass_finally_locations
+                        .is_empty()
+                    && self
+                        .control
+                        .finally
+                        .preserved_return_value_contexts
+                        .is_empty()
+                    && self.control.finally.copied_return_finally_preserved_values == 0)
+                    .then(|| {
+                        let [finally] =
+                            self.control.finally.active_loop_finally_contexts.as_slice()
+                        else {
+                            return None;
+                        };
+                        let [Stmt::If(tail)] = finally.body.as_slice() else {
+                            return None;
+                        };
+                        (finally.loop_depth >= self.control.loops.contexts.len()
+                            && finally.with_depth == context.with_depth
+                            && finally.exception_region_depth == context.exception_region_depth
+                            && tail.elif_else_clauses.is_empty()
+                            && matches!(tail.test.as_ref(), Expr::Name(_))
+                            && matches!(tail.body.as_slice(), [Stmt::Try(recovery)]
+                                if !recovery.is_star && recovery.finalbody.is_empty()))
+                        .then(|| tail.test.range())
+                    })
+                    .flatten()
+                    .map(|range| self.source_location(range));
+                let finally_unwind_start = self.assembler.item_count();
                 let LoopControlUnwind {
                     with_starts: with_unwind_starts,
                     region_starts: region_unwind_starts,
@@ -4349,6 +4388,16 @@ impl Compiler<'_> {
                 // CPython emits a temporary NOP before loop control, so an incoming jump sees
                 // the NOP instead of threading through this backward jump.
                 self.assembler.prevent_jump_threading_target(continue_jump);
+                if let Some(test) = original_finally_continue_test {
+                    // The authored continue NOP precedes the copied finalizer. Its false
+                    // join can therefore begin with the original, unlocated continue jump.
+                    self.assembler.record_copied_finally_continue_head(
+                        continue_jump,
+                        context.continue_label,
+                        test,
+                        finally_unwind_start,
+                    );
+                }
                 if self
                     .control
                     .finally
@@ -6523,7 +6572,8 @@ impl Compiler<'_> {
                         );
                     }
                     let return_exclusion_end = self.assembler.label();
-                    self.assembler.mark(return_exclusion_end);
+                    self.assembler
+                        .mark_return_region_reentry(return_exclusion_end);
                     let exclusion_start = exception_unwind_start
                         .or(return_exclusion_start)
                         .expect("return exclusion has a start");
@@ -18147,12 +18197,17 @@ impl Compiler<'_> {
                 == Some(statement.range)
             || (self.context.target_specific_rules_enabled()
                 && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
-                && self
-                    .control
-                    .loops
-                    .contexts
-                    .last()
-                    .is_some_and(|context| context.iterator_cleanup != IteratorCleanup::None)
+                && self.control.loops.contexts.last().is_some_and(|context| {
+                    context.iterator_cleanup != IteratorCleanup::None
+                            // A try entered inside the loop ends before its backedge. A try
+                            // surrounding the loop still owns the suppression continuation.
+                            && context.exception_region_depth
+                                < self
+                                    .control
+                                    .exceptions
+                                    .active_exception_region_exclusions
+                                    .len()
+                })
                 && self.control.withs.active_with_exits.is_empty()
                 && self.control.exceptions.active_exception_handlers.is_empty()
                 && self

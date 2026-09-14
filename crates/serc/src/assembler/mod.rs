@@ -2545,6 +2545,14 @@ impl Assembler {
         self.deferred_name_return_borrow_exits.push(origin);
     }
 
+    /// Marks exception coverage resuming after a return, without an original instruction.
+    pub(crate) fn mark_return_region_reentry(&mut self, boundary: Label) {
+        self.mark(boundary);
+        self.exception_owner_provenance
+            .return_region_reentries
+            .insert(boundary);
+    }
+
     /// Records the first erased ordinary-try POP before a return's remaining unwind.
     pub(crate) fn record_name_return_pop_boundary(&mut self, boundary: Label) {
         if !self.deferred_name_return_borrow_exits.is_empty() {
@@ -3477,6 +3485,57 @@ impl Assembler {
             .collect::<Vec<_>>();
         self.conditional_threading_targets
             .extend(labels.into_iter().map(|label| (label, location)));
+    }
+
+    /// Certifies the actual false-edge head emitted after a copied finalizer unwinds.
+    pub(crate) fn record_copied_finally_continue_head(
+        &mut self,
+        emitted: EmittedJump,
+        target: Label,
+        condition: SourceLocation,
+        unwind_start: usize,
+    ) {
+        let jump = *self.emitted_jump_mut(emitted, "recording a copied-finally continue head");
+        if jump.opcode != JUMP_BACKWARD
+            || jump.operand() != Operand::Backward(target)
+            || jump.location != SourceLocation::NONE
+            || jump.pre_fold_extra_instructions() != 0
+        {
+            return;
+        }
+        let Some((Item::Instruction(_), head)) = self.linear_items().split_last() else {
+            return;
+        };
+        let labels = head
+            .iter()
+            .rev()
+            .map_while(|item| match item {
+                Item::Label(label) => Some(*label),
+                Item::Instruction(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let Some(unwind) = head.get(unwind_start..) else {
+            return;
+        };
+        let mut matching = unwind.iter().filter_map(|item| match item {
+            Item::Instruction(instruction)
+                if instruction.opcode == POP_JUMP_IF_FALSE && instruction.location == condition =>
+            {
+                match instruction.operand() {
+                    Operand::Forward(label) if labels.contains(&label) => Some(label),
+                    _ => None,
+                }
+            }
+            _ => None,
+        });
+        let Some(label) = matching.next() else {
+            return;
+        };
+        if matching.next().is_some() {
+            return;
+        }
+        self.conditional_threading_targets
+            .insert(label, SourceLocation::NONE);
     }
 
     pub(crate) fn prevent_jump_threading_target(&mut self, emitted: EmittedJump) {

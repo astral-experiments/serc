@@ -254,3 +254,55 @@ fn nonfinal_chained_comparisons_preserve_copied_small_returns() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn conditional_finally_copied_continue_nested_handler() {
+    common::assert_matches_cpython_marshal(
+        r"def f(items, action, consume):
+    for value in items:
+        try:
+            if not action(value):
+                continue
+        finally:
+            if value:
+                try:
+                    consume(value)
+                except Exception:
+                    pass
+",
+        "finally_copied_continue_nested_handler.py",
+    );
+}
+
+#[test]
+fn conditional_finally_nested_handler_backedge() {
+    for (filename, source) in [
+        (
+            "finally_linear_cleanup_control.py",
+            r"def f(items, action, consume):
+    for value in items:
+        try:
+            action(value)
+        finally:
+            if value:
+                consume(value)
+",
+        ),
+        (
+            "finally_nested_handler_backedge.py",
+            r"def f(items, action, consume):
+    for value in items:
+        try:
+            action(value)
+        finally:
+            if value:
+                try:
+                    consume(value)
+                except Exception:
+                    pass
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

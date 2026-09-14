@@ -149,3 +149,34 @@ fn copies_four_instruction_chained_return_blocks() {
 ";
     common::assert_matches_cpython_marshal(source, "four_instruction_chained_else_return.py");
 }
+
+#[test]
+fn copies_constant_returns_after_generic_chained_cleanup() {
+    for (filename, source) in [
+        (
+            "chained_cleanup_constant_footer.py",
+            r"def f(raw):
+    try:
+        value = int(raw)
+        if 0 <= value <= 4:
+            return value
+        return None
+    except Exception:
+        return None
+",
+        ),
+        (
+            "boolean_chained_cleanup_constant_footer.py",
+            r"def f(ready, value, limit):
+    try:
+        if ready and 0 < value < limit:
+            return True
+        return False
+    except Exception:
+        return False
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

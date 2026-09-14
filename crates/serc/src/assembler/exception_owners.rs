@@ -25,6 +25,8 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) borrow_only_block_boundaries: FxHashSet<Label>,
     pub(super) source_boundaries: FxHashSet<Label>,
     pub(super) continuation_boundaries: FxHashSet<Label>,
+    // Region re-entry after a return emits no original instruction or unwind slot.
+    pub(super) return_region_reentries: FxHashSet<Label>,
     pub(super) fusion_boundaries: FxHashSet<Label>,
     pub(super) setup_nop_boundaries: FxHashSet<Label>,
     pub(super) setup_nop_ranges: Vec<(Label, Label)>,

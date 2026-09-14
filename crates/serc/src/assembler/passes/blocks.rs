@@ -268,6 +268,7 @@ fn exit_block_analysis(
     order: &[BasicBlockId],
     exception_regions: &[ExceptionRegion],
     original_nop_targets: &FxHashSet<Label>,
+    return_region_reentries: &FxHashSet<Label>,
 ) -> ExitBlockAnalysis {
     let vector_len = order
         .iter()
@@ -416,7 +417,8 @@ fn exit_block_analysis(
                 }
                 Item::Label(label) => usize::from(
                     target_chain_end > target_position
-                        && exception_split_labels.contains(label),
+                        && exception_split_labels.contains(label)
+                        && !return_region_reentries.contains(label),
                 ),
             })
             .sum::<usize>();
@@ -2021,6 +2023,7 @@ impl OptimizationPipeline {
             &order,
             &self.exception_regions,
             &self.original_nop_targets,
+            &self.exception_owner_provenance.return_region_reentries,
         );
         let shared_pop_block_heads = order
             .iter()
@@ -2357,7 +2360,11 @@ impl OptimizationPipeline {
                     }
                     Item::Label(label) => usize::from(
                         target_chain_end > target_position
-                            && exception_split_labels.contains(label),
+                            && exception_split_labels.contains(label)
+                            && !self
+                                .exception_owner_provenance
+                                .return_region_reentries
+                                .contains(label),
                     ),
                 })
                 .sum::<usize>();
@@ -2881,6 +2888,15 @@ impl OptimizationPipeline {
                 self.next_label += 1;
                 copied.push(Item::Label(copied_end));
                 copied_labels.insert(original, copied_end);
+            }
+            // Renaming a region-only re-entry must not create an original unwind slot.
+            let reentries = &mut self.exception_owner_provenance.return_region_reentries;
+            let mut ordered_copied_labels = copied_labels.iter().collect::<Vec<_>>();
+            ordered_copied_labels.sort_unstable_by_key(|(original, _)| original.0);
+            for (original, replacement) in ordered_copied_labels {
+                if reentries.contains(original) {
+                    reentries.insert(*replacement);
+                }
             }
             // An exception split can end inside the copied cleanup even when its region began in
             // the predecessor's handler body. Preserve that leading intersection in the copy;
