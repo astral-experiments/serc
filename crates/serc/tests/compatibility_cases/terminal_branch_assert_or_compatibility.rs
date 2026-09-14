@@ -122,3 +122,48 @@ fn terminal_branch_negated_assert_or_success_exit() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn terminal_try_assert_or_success_exits() {
+    for (filename, source) in [
+        (
+            "terminal_try_assert_or_existing_control.py",
+            r"def protected_terminal_or(enabled, left, right):
+    try:
+        if enabled:
+            assert left or right
+    except Exception:
+        recover()
+",
+        ),
+        (
+            "terminal_try_true_assert_or_control.py",
+            r"def terminal_try_true_or(value):
+    try:
+        assert True or value
+    except Exception:
+        recover()
+",
+        ),
+        (
+            "terminal_try_assert_or.py",
+            r#"async def terminal_try_or(left, right):
+    try:
+        if left is not None:
+            return await action(left)
+        elif right is not None:
+            value = await action(right)
+            check(value)
+            return value.item()
+        assert left or right, "missing value"
+    except ValueError as error:
+        raise RuntimeError("bad value") from error
+    except Exception as error:
+        observe(error)
+        raise RuntimeError("bad value") from error
+"#,
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

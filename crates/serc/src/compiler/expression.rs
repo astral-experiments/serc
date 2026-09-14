@@ -1676,7 +1676,7 @@ impl Compiler<'_> {
         continuation: Option<(BoolOp, SourceLocation)>,
     ) -> Result<(), CompileError> {
         let starting_depth = self.control.stack.depth;
-        if matches!(expression, Expr::BoolOp(_))
+        if let Expr::BoolOp(boolean) = expression
             && let Some((origin, constant)) = folded_bool_operand(expression)
         {
             self.pre_register_expression_names(expression)?;
@@ -1689,6 +1689,22 @@ impl Compiler<'_> {
             self.assembler.set_location(origin_location);
             let constant = self.source_aware_fold_constant(origin).unwrap_or(constant);
             self.emit_folded_constant(origin, constant)?;
+            if boolean.values.len() > 1
+                && boolean
+                    .values
+                    .first()
+                    .is_some_and(|first| first.range() == origin.range())
+            {
+                // A decisive first operand leaves an empty original block before
+                // the join. Keep pending call inputs in the preceding borrow block,
+                // but allow independent outer Boolean jumps to reach the join.
+                let discarded = self.assembler.label();
+                self.assembler.mark(discarded);
+                self.assembler.prevent_borrow_reachability(discarded);
+                let end = self.assembler.label();
+                self.assembler.preserve_block_boundary(end);
+                self.assembler.mark(end);
+            }
             return Ok(());
         }
         if (matches!(

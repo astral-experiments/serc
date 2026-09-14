@@ -12374,7 +12374,7 @@ impl Compiler<'_> {
                 })
             && !self.control.exceptions.direct_try_body_has_else
             && self.control.finally.active_finally_try_bodies == 0
-            && !self.control.in_iterator_loop()
+            && !self.control.in_loop()
             && try_has_named_pair_exception_handler(statement))
             || nested_final_named_assignment_try;
         let try_start = self.assembler.label();
@@ -12794,6 +12794,10 @@ impl Compiler<'_> {
         } else {
             None
         };
+        let split_terminal_try_assert_success = matches!(statement.body.last(),
+            Some(Stmt::Assert(assertion))
+                if early_condition_truthiness(&assertion.test).is_none()
+                    && terminal_assert_splits_success_return(assertion));
         let mut normal_return_emitted = false;
         let body_noop_location = if direct_continue {
             self.assembler.mark(try_end);
@@ -12876,10 +12880,11 @@ impl Compiler<'_> {
                 )?;
             } else if terminal
                 && statement.orelse.is_empty()
-                && statement
-                    .body
-                    .last()
-                    .is_some_and(terminal_try_distributes_implicit_return)
+                && (split_terminal_try_assert_success
+                    || statement
+                        .body
+                        .last()
+                        .is_some_and(terminal_try_distributes_implicit_return))
             {
                 let exception_region_depth = self
                     .control
@@ -12899,9 +12904,22 @@ impl Compiler<'_> {
                                 },
                                 Some(exception_region_depth),
                                 |compiler| {
-                                    compiler.with_fallthrough_tracking(|compiler| {
-                                        compiler.compile_suite_inner(&statement.body, true)
-                                    })
+                                    // Each assertion success edge keeps its own return outside
+                                    // this try, while retaining any enclosing cleanup region.
+                                    let split_assert_success =
+                                        compiler.control.statements.split_terminal_assert_success
+                                            || split_terminal_try_assert_success;
+                                    compiler.with_control_override(
+                                        |control| {
+                                            &mut control.statements.split_terminal_assert_success
+                                        },
+                                        split_assert_success,
+                                        |compiler| {
+                                            compiler.with_fallthrough_tracking(|compiler| {
+                                                compiler.compile_suite_inner(&statement.body, true)
+                                            })
+                                        },
+                                    )
                                 },
                             )
                         },
