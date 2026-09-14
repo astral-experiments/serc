@@ -11389,6 +11389,22 @@ def final_elif(action, first, second):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_async_setup_cleanup_bridges() {
+        for (filename, source) in [
+            (
+                "async_entry_five_sync_managers.py",
+                include_bytes!("fixtures/async_entry_five_sync_managers.py").as_slice(),
+            ),
+            (
+                "async_entry_fifteen_sync_managers.py",
+                include_bytes!("fixtures/async_entry_fifteen_sync_managers.py").as_slice(),
+            ),
+        ] {
+            assert_matches_cpython_marshal_bytes(source, filename);
+        }
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_async_with_handler_cleanup_owners() {
         let source = include_str!("fixtures/async_with_handler_cleanup_owners.py");
         assert_matches_cpython_marshal(source, "async_with_handler_cleanup_owners.py");

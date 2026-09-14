@@ -383,6 +383,10 @@ impl OptimizationPipeline {
                 // original array labels before normalization can attach these labels
                 // to a different live array; keep the original copy plan intact.
                 for item in graph[block].items() {
+                    if let Item::Label(label) = item {
+                        self.exception_owner_provenance
+                            .retire_async_with_setup(*label);
+                    }
                     if let Item::Label(label) = item
                         && self
                             .exception_owner_provenance

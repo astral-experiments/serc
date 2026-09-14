@@ -13,18 +13,18 @@ use rustc_hash::FxHashMap;
 use crate::CompileError;
 use crate::code_object::Constant;
 use crate::target::opcodes::{
-    CHECK_EXC_MATCH, COMPARE_OP, CONTAINS_OP, COPY, COPY_FREE_VARS, DELETE_DEREF, DELETE_FAST,
-    DICT_MERGE, DICT_UPDATE, END_SEND, EXTENDED_ARG, FOR_ITER, FORMAT_SIMPLE, GET_ANEXT, GET_LEN,
-    GET_YIELD_FROM_ITER, IMPORT_FROM, IS_OP, JUMP_BACKWARD, JUMP_BACKWARD_NO_INTERRUPT,
-    JUMP_FORWARD, LIST_APPEND, LIST_EXTEND, LOAD_ATTR, LOAD_COMMON_CONSTANT, LOAD_CONST, LOAD_FAST,
-    LOAD_FAST_AND_CLEAR, LOAD_FAST_BORROW, LOAD_FAST_BORROW_LOAD_FAST_BORROW, LOAD_FAST_CHECK,
-    LOAD_FAST_LOAD_FAST, LOAD_GLOBAL, LOAD_SMALL_INT, LOAD_SPECIAL, LOAD_SUPER_ATTR, MAKE_CELL,
-    MAP_ADD, MATCH_KEYS, MATCH_MAPPING, MATCH_SEQUENCE, NOP, NOT_TAKEN, POP_EXCEPT,
-    POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE, POP_JUMP_IF_TRUE, POP_TOP,
-    PUSH_EXC_INFO, RAISE_VARARGS, RERAISE, RESUME, RETURN_VALUE, SEND, SET_ADD,
-    SET_FUNCTION_ATTRIBUTE, SET_UPDATE, STORE_DEREF, STORE_FAST, STORE_FAST_LOAD_FAST,
-    STORE_FAST_STORE_FAST, STORE_GLOBAL, SWAP, TO_BOOL, UNARY_NOT, UNPACK_SEQUENCE,
-    WITH_EXCEPT_START,
+    CHECK_EXC_MATCH, CLEANUP_THROW, COMPARE_OP, CONTAINS_OP, COPY, COPY_FREE_VARS, DELETE_DEREF,
+    DELETE_FAST, DICT_MERGE, DICT_UPDATE, END_SEND, EXTENDED_ARG, FOR_ITER, FORMAT_SIMPLE,
+    GET_ANEXT, GET_LEN, GET_YIELD_FROM_ITER, IMPORT_FROM, IS_OP, JUMP_BACKWARD,
+    JUMP_BACKWARD_NO_INTERRUPT, JUMP_FORWARD, LIST_APPEND, LIST_EXTEND, LOAD_ATTR,
+    LOAD_COMMON_CONSTANT, LOAD_CONST, LOAD_FAST, LOAD_FAST_AND_CLEAR, LOAD_FAST_BORROW,
+    LOAD_FAST_BORROW_LOAD_FAST_BORROW, LOAD_FAST_CHECK, LOAD_FAST_LOAD_FAST, LOAD_GLOBAL,
+    LOAD_SMALL_INT, LOAD_SPECIAL, LOAD_SUPER_ATTR, MAKE_CELL, MAP_ADD, MATCH_KEYS, MATCH_MAPPING,
+    MATCH_SEQUENCE, NOP, NOT_TAKEN, POP_EXCEPT, POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE,
+    POP_JUMP_IF_NOT_NONE, POP_JUMP_IF_TRUE, POP_TOP, PUSH_EXC_INFO, RAISE_VARARGS, RERAISE, RESUME,
+    RETURN_VALUE, SEND, SET_ADD, SET_FUNCTION_ATTRIBUTE, SET_UPDATE, STORE_DEREF, STORE_FAST,
+    STORE_FAST_LOAD_FAST, STORE_FAST_STORE_FAST, STORE_GLOBAL, SWAP, TO_BOOL, UNARY_NOT,
+    UNPACK_SEQUENCE, WITH_EXCEPT_START,
 };
 use crate::target::operands::ResumeLocation;
 use crate::target::{
@@ -4368,6 +4368,70 @@ impl Assembler {
         self.exception_owner_provenance
             .setups
             .push((label, nop_location));
+    }
+
+    /// Authenticates the original `SEND`/`END_SEND` array before an async manager's setup.
+    pub(crate) fn record_async_with_exception_setup(&mut self, label: Label) {
+        self.record_exception_setup(label, false);
+        let items = self.linear_items();
+        let Some(Item::Instruction(end_send)) = items.last() else {
+            return;
+        };
+        if end_send.opcode != END_SEND {
+            return;
+        }
+        let begin = items[..items.len() - 1]
+            .iter()
+            .rposition(|item| matches!(item, Item::Instruction(_)))
+            .map_or(0, |index| index + 1);
+        let prefix = &items[begin..];
+        let Some(cleanup_end) = begin.checked_sub(1) else {
+            return;
+        };
+        let Item::Instruction(cleanup_throw) = items[cleanup_end] else {
+            return;
+        };
+        if cleanup_throw.opcode != CLEANUP_THROW {
+            return;
+        }
+        let cleanup_begin = items[..cleanup_end]
+            .iter()
+            .rposition(|item| matches!(item, Item::Instruction(_)))
+            .map_or(0, |index| index + 1);
+        let cleanup = &items[cleanup_begin..begin];
+        if !self.exception_regions.iter().any(|region| {
+            cleanup.contains(&Item::Label(region.target))
+                && !prefix.contains(&Item::Label(region.target))
+        }) {
+            return;
+        }
+        let mut incoming = items.iter().filter_map(|item| match item {
+            Item::Instruction(instruction)
+                if instruction.opcode == SEND
+                    && matches!(instruction.operand(), Operand::Forward(entry)
+                        if prefix.contains(&Item::Label(entry))
+                            && self.exception_owner_provenance.block_boundaries.contains(&entry)) =>
+            {
+                Some(*instruction)
+            }
+            _ => None,
+        });
+        let Some(send) = incoming.next() else {
+            return;
+        };
+        if incoming.next().is_some() {
+            return;
+        }
+        let origin = exception_owners::AsyncWithSetup {
+            setup: label,
+            send,
+            prefix: prefix.to_vec(),
+            cleanup: cleanup.to_vec(),
+            bridge: None,
+        };
+        self.exception_owner_provenance
+            .async_with_setups
+            .push(origin);
     }
 
     /// Records a synchronous manager setup whose protected suffix has one lexical owner.

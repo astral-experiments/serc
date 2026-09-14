@@ -18906,7 +18906,7 @@ impl Compiler<'_> {
         self.emit(CALL, 0, -1)?;
         self.compile_awaitable_on_stack(1)?;
         self.assembler
-            .record_exception_setup(protected_start, false);
+            .record_async_with_exception_setup(protected_start);
         self.assembler.mark(protected_start);
         let context = WithExitContext {
             location: self.source_location(item.context_expr.range()),

@@ -1548,21 +1548,36 @@ impl OptimizationPipeline {
             );
             let label = Label(self.next_label);
             self.next_label += 1;
+            let mut bridge = Instruction::synthetic(
+                JUMP_BACKWARD_NO_INTERRUPT,
+                Operand::Backward(target),
+                location,
+                None,
+            );
+            bridge.exclude_from_exception_table(exception_exclusion);
+            for origin in &mut self.exception_owner_provenance.async_with_setups {
+                if origin.bridge.is_some()
+                    || graph[current].items() != origin.cleanup.as_slice()
+                    || graph[next].items() != origin.prefix.as_slice()
+                    || graph.order().get(position + 2).is_none_or(|after| {
+                        graph[*after].items().first() != Some(&Item::Label(origin.setup))
+                    })
+                {
+                    continue;
+                }
+                let mut incoming = graph.iter().flat_map(|(_, block)| block.items()).filter_map(|item| match item {
+                    Item::Instruction(instruction)
+                        if matches!(instruction.operand(), Operand::Forward(entry) | Operand::Backward(entry)
+                            if origin.prefix.contains(&Item::Label(entry)) || entry == origin.setup) => Some(instruction),
+                    _ => None,
+                });
+                if incoming.next() == Some(&origin.send) && incoming.next().is_none() {
+                    origin.bridge = Some((label, bridge));
+                }
+            }
             let block = graph.insert_block(
                 position + 1,
-                vec![
-                    Item::Label(label),
-                    Item::Instruction({
-                        let mut instruction = Instruction::synthetic(
-                            JUMP_BACKWARD_NO_INTERRUPT,
-                            Operand::Backward(target),
-                            location,
-                            None,
-                        );
-                        instruction.exclude_from_exception_table(exception_exclusion);
-                        instruction
-                    }),
-                ],
+                vec![Item::Label(label), Item::Instruction(bridge)],
             );
             let index = block.index();
             block_labels.resize(index + 1, None);
@@ -4095,6 +4110,8 @@ impl OptimizationPipeline {
             if drop_blocks[block.index()] {
                 for item in graph[block].items() {
                     if let Item::Label(label) = item {
+                        self.exception_owner_provenance
+                            .retire_async_with_setup(*label);
                         // Labels retained without their array cannot certify a later seam.
                         self.exception_owner_provenance
                             .normal_try_copy_inline_labels

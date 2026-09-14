@@ -43,6 +43,7 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) comprehension_restore_owner_prefixes: Vec<(Label, Instruction)>,
     pub(super) retired_comprehension_normal_entries: FxHashSet<Label>,
     pub(super) synchronous_with_setups: FxHashSet<Label>,
+    pub(super) async_with_setups: Vec<AsyncWithSetup>,
     pub(super) removed_pop_block_boundaries: FxHashSet<Label>,
     pub(super) removed_pop_block_widths: FxHashMap<Label, u16>,
     // Original ordinary-try exits contain POP_BLOCK followed by JUMP_NO_INTERRUPT.
@@ -86,6 +87,17 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) source_none_conditions: Vec<SourceNoneCondition>,
     // Exact terminal pairs produced by original conditional jump threading.
     pub(super) threaded_condition_origins: Vec<(Instruction, Instruction)>,
+}
+
+/// One completed async manager entry and its original late `SETUP_WITH` record.
+#[derive(Debug)]
+pub(super) struct AsyncWithSetup {
+    pub(super) setup: Label,
+    pub(super) send: Instruction,
+    pub(super) prefix: Vec<Item>,
+    pub(super) cleanup: Vec<Item>,
+    // Filled only where the cold pass converts this original fallthrough to a jump.
+    pub(super) bridge: Option<(Label, Instruction)>,
 }
 
 /// Original assignment fallthrough into a selected tuple-copy join, before static swaps.
@@ -211,6 +223,16 @@ pub(super) struct UncompactedConditionalArray {
 }
 
 impl ExceptionOwnerProvenance {
+    /// Retires an async entry before erased labels can migrate to another live array.
+    pub(super) fn retire_async_with_setup(&mut self, label: Label) {
+        self.async_with_setups.retain(|origin| {
+            origin.setup != label
+                && !origin.prefix.contains(&Item::Label(label))
+                && !origin.cleanup.contains(&Item::Label(label))
+                && origin.bridge.is_none_or(|(bridge, _)| bridge != label)
+        });
+    }
+
     /// Finds a unique unchanged survivor whose literal-fold witness has not retired.
     fn original_uniform_fold_positions(&self, instructions: &[&Instruction]) -> FxHashSet<usize> {
         self.original_uniform_folds
@@ -629,6 +651,110 @@ impl ExceptionOwnerProvenance {
 }
 
 impl LayoutAssembler {
+    /// Keeps only the unchanged `SEND` entry immediately before its authored async setup.
+    fn original_async_with_setups(&self) -> FxHashSet<Label> {
+        let mut result = FxHashSet::default();
+        for origin in &self.exception_owner_provenance.async_with_setups {
+            let Some(first) = origin.prefix.first() else {
+                continue;
+            };
+            let mut entries = self
+                .items
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| *item == first);
+            let Some((start, _)) = entries.next() else {
+                continue;
+            };
+            let end = start + origin.prefix.len();
+            if entries.next().is_some()
+                || self.items.get(start..end) != Some(origin.prefix.as_slice())
+                || self.items.get(end) != Some(&Item::Label(origin.setup))
+                || self
+                    .items
+                    .iter()
+                    .filter(|item| **item == Item::Label(origin.setup))
+                    .count()
+                    != 1
+                || self
+                    .exception_owner_provenance
+                    .setups
+                    .iter()
+                    .filter(|(label, _)| *label == origin.setup)
+                    .count()
+                    != 1
+            {
+                continue;
+            }
+            let Some(first_cleanup) = origin.cleanup.first() else {
+                continue;
+            };
+            let mut cleanups = self
+                .items
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| *item == first_cleanup);
+            let Some((cleanup_start, _)) = cleanups.next() else {
+                continue;
+            };
+            let cleanup_end = cleanup_start + origin.cleanup.len();
+            if cleanups.next().is_some()
+                || self.items.get(cleanup_start..cleanup_end) != Some(origin.cleanup.as_slice())
+            {
+                continue;
+            }
+            if let Some((label, instruction)) = origin.bridge {
+                // The cold pass's exact fresh block must still immediately follow
+                // the original cleanup. Equal opcodes or locations are insufficient.
+                if self.items.get(cleanup_end..cleanup_end + 2)
+                    != Some([Item::Label(label), Item::Instruction(instruction)].as_slice())
+                    || self
+                        .items
+                        .iter()
+                        .filter(|item| **item == Item::Label(label))
+                        .count()
+                        != 1
+                {
+                    continue;
+                }
+            } else if cleanup_end != start {
+                continue;
+            }
+            // Only the original SEND and the authenticated conversion of the
+            // original cleanup fallthrough may enter this array.
+            let mut incoming = self.items.iter().filter_map(|item| match item {
+                Item::Instruction(instruction)
+                    if matches!(instruction.operand(), Operand::Forward(label) | Operand::Backward(label)
+                        if origin.prefix.contains(&Item::Label(label)) || label == origin.setup) =>
+                {
+                    Some(instruction)
+                }
+                _ => None,
+            });
+            let mut seen_send = false;
+            let mut seen_bridge = false;
+            let exact = incoming.all(|instruction| {
+                if *instruction == origin.send && !seen_send {
+                    seen_send = true;
+                    true
+                } else if origin
+                    .bridge
+                    .is_some_and(|(_, bridge)| bridge == *instruction)
+                    && !seen_bridge
+                {
+                    seen_bridge = true;
+                    true
+                } else {
+                    false
+                }
+            });
+            if exact && seen_send && seen_bridge == origin.bridge.is_some() {
+                result.insert(origin.setup);
+            }
+        }
+        result
+    }
+
     /// Maps a proven virgin append cell to its unchanged conditional and marker.
     fn uncompacted_conditional_null_markers(
         &self,
@@ -1733,6 +1859,7 @@ impl LayoutAssembler {
             return FxHashMap::default();
         }
         let threaded_conditions = self.threaded_condition_positions();
+        let original_async_with_setups = self.original_async_with_setups();
         let setups: FxHashMap<_, _> = self
             .exception_owner_provenance
             .setups
@@ -2231,6 +2358,7 @@ impl LayoutAssembler {
                                 .exception_owner_provenance
                                 .synchronous_with_setups
                                 .contains(label)
+                                || original_async_with_setups.contains(label)
                                 || self.exception_regions.iter().any(|region| {
                                     region.is_scope_fallback && region.start == *label
                                 });
