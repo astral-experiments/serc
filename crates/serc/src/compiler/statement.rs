@@ -16698,6 +16698,34 @@ impl Compiler<'_> {
                             && (suite_has_linear_borrow_fallthrough(&clause.body)
                                 || coroutine_manager_arm_reaches_finally(&clause.body))
                     })));
+        // A nested raising guard leaves one live false edge in the first arm.
+        // The final else does not certify that entry; its inner loops may continue,
+        // but no path may copy this finalizer onto a return or outer loop transfer.
+        let guarded_first_arm_reaches_finally = matches!(self.unit.scope, Scope::Function { .. })
+            && matches!(statement.handlers.as_slice(), [handler]
+            if handler.as_except_handler().is_some_and(|handler| {
+                handler.type_.is_some()
+                    && handler.name.is_some()
+                    && suite_has_linear_raise_exit(&handler.body)
+            }))
+            && matches!(statement.body.as_slice(), [Stmt::If(conditional)]
+                if condition_has_only_runtime_tests(&conditional.test)
+                    && !expression_contains_inline_branch(&conditional.test)
+                    && matches!(conditional.body.as_slice(), [Stmt::If(guard)]
+                        if condition_has_only_runtime_tests(&guard.test)
+                            && !expression_contains_inline_branch(&guard.test)
+                            && original_condition_has_unique_jump_target(&guard.test, false)
+                            && guard.elif_else_clauses.is_empty()
+                            && matches!(guard.body.as_slice(), [Stmt::Raise(_)])
+                            && suite_has_linear_raise_exit(&guard.body))
+                    && matches!(conditional.elif_else_clauses.as_slice(), [clause]
+                        if clause.test.is_none()
+                            && !suite_contains_return(&clause.body)
+                            && !suite_contains_loop_break(&clause.body)
+                            && !suite_contains_loop_continue(&clause.body)
+                            && matches!(clause.body.last(), Some(Stmt::Expr(call))
+                                if matches!(call.value.as_ref(), Expr::Call(_))
+                                    && !expression_contains_inline_branch(&call.value))));
         // A live arm before a raising else keeps its original jump into normal cleanup.
         // The raising alternative does not make that jump cross the empty handler exit.
         // Keep this certificate separate from the broader non-abrupt-arm certificate:
@@ -16724,7 +16752,7 @@ impl Compiler<'_> {
                                 && !expression_contains_inline_branch(test)
                         }) && suite_has_linear_borrow_fallthrough(&clause.body)
                     })))
-            && matches!(statement.body.as_slice(), [Stmt::If(conditional)]
+            && (matches!(statement.body.as_slice(), [Stmt::If(conditional)]
             if condition_has_only_runtime_tests(&conditional.test)
                 && !expression_contains_inline_branch(&conditional.test)
                 && conditional.elif_else_clauses.last().is_some_and(|clause| {
@@ -16743,7 +16771,8 @@ impl Compiler<'_> {
                     || conditional.elif_else_clauses.iter().any(|clause| {
                         clause.test.is_some()
                             && suite_has_linear_borrow_fallthrough(&clause.body)
-                    })));
+                    })))
+                || guarded_first_arm_reaches_finally);
         // Unconditional cleanup predecessors can empty their original handler or else
         // exit block. That block survives cold relocation and stops borrowed-load traversal.
         let has_empty_handler_or_else_exit = statement.handlers.iter().any(|handler| {
@@ -16754,11 +16783,62 @@ impl Compiler<'_> {
             statement.orelse.last(),
             Some(Stmt::With(_) | Stmt::Try(_) | Stmt::If(_))
         );
+        // A terminal raising guard gives the else-exit jump one runtime predecessor.
+        // CPython lends that condition's location to the jump before moving handlers;
+        // its retained NOP keeps the normal cleanup entry reachable for borrowed loads.
+        let terminal_else_raise_bypasses_empty_exit = compound_fallthrough_handlers_reach_finally
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
+            && self.control.loops.contexts.is_empty()
+            && self.control.withs.active_with_exits.is_empty()
+            && self.control.exceptions.active_exception_region_exclusions.is_empty()
+            && !self.control.in_exception_handler()
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+            && self.control.finally.active_finally_try_bodies == 0
+            && !statement.handlers.is_empty()
+            && statement.handlers.iter().all(|handler| {
+                handler.as_except_handler().is_some_and(|handler| {
+                    handler.name.is_none() && suite_has_linear_borrow_fallthrough(&handler.body)
+                })
+            })
+            && suite_has_linear_borrow_fallthrough(&statement.body)
+            && statement.orelse.split_last().is_some_and(|(last, leading)| {
+                leading.iter().all(|statement| {
+                    suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement))
+                        || matches!(statement, Stmt::If(branch)
+                            if condition_has_only_runtime_tests(&branch.test)
+                                && !expression_contains_inline_branch(&branch.test)
+                                && !expression_suspends_current_scope(&branch.test)
+                                && suite_has_linear_borrow_fallthrough(&branch.body)
+                                && matches!(branch.elif_else_clauses.as_slice(), [otherwise]
+                                    if otherwise.test.is_none()
+                                        && suite_has_linear_borrow_fallthrough(&otherwise.body)))
+                })
+                    && matches!(last, Stmt::If(guard)
+                        if condition_has_only_runtime_tests(&guard.test)
+                            && !expression_contains_inline_branch(&guard.test)
+                            && !expression_suspends_current_scope(&guard.test)
+                            && original_condition_has_unique_jump_target(&guard.test, false)
+                            && guard.elif_else_clauses.is_empty()
+                            && matches!(guard.body.as_slice(), [Stmt::Raise(raise)]
+                                if raise.exc.as_deref().is_none_or(|value| !expression_suspends_current_scope(value))
+                                    && raise.cause.as_deref().is_none_or(|value| !expression_suspends_current_scope(value)))
+                            && suite_has_linear_raise_exit(&guard.body))
+            })
+            && !suite_contains_abrupt_control_flow(&statement.finalbody)
+            && matches!(statement.finalbody.first(), Some(Stmt::If(cleanup))
+                if condition_has_linear_runtime_leaves(&cleanup.test)
+                    && !expression_suspends_current_scope(&cleanup.test)
+                    && cleanup.elif_else_clauses.is_empty()
+                    && suite_has_linear_borrow_fallthrough(&cleanup.body));
         // A live conditional arm can jump directly to the finally body and bypass those
         // empty blocks. A single plain If arm only falls through the empty else exit.
         let else_bypasses_empty_handler_exit = match statement.orelse.last() {
             Some(tail_statement @ Stmt::If(tail)) => {
                 statement_threads_through_empty_join(tail_statement)
+                    || terminal_else_raise_bypasses_empty_exit
                     || (tail.elif_else_clauses.is_empty()
                         && tail
                             .body

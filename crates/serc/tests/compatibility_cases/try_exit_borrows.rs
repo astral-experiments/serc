@@ -4816,3 +4816,39 @@ fn nested_async_finally_source(cleanup: &str, recover_cleanup: bool) -> String {
 "#
     )
 }
+
+#[test]
+fn nested_raise_conditional_finally_target() {
+    common::assert_matches_cpython_marshal(
+        &nested_raise_conditional_finally_source(
+            "            if not resource.read():\n                raise ValueError()\n",
+        ),
+        "nested_raise_conditional_finally_target.py",
+    );
+}
+
+#[test]
+fn nested_raise_conditional_finally_plain_control() {
+    common::assert_matches_cpython_marshal(
+        &nested_raise_conditional_finally_source("            resource.read()\n"),
+        "nested_raise_conditional_finally_plain_control.py",
+    );
+}
+
+fn nested_raise_conditional_finally_source(first_arm: &str) -> String {
+    format!(
+        r"def run(resource, selection, timer):
+    try:
+        if selection is None:
+{first_arm}        else:
+            resource.select(selection)
+            resource.close()
+    except TimeoutError as error:
+        raise RuntimeError() from error
+    finally:
+        if timer:
+            stop_timer()
+    return resource.result()
+"
+    )
+}

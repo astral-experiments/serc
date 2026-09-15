@@ -837,3 +837,58 @@ fn matches_cpython_marshal_for_coroutine_plain_arm_finally_entry() {
 "#;
     common::assert_matches_cpython_marshal(source, "coroutine_plain_arm_finally_entry.py");
 }
+
+fn async_else_conditional_finally_source() -> &'static str {
+    r#"def make_cleanup(waitable, first_gate, report, second_gate):
+    async def cleanup():
+        status: str = "failed"
+        released = False
+        try:
+            item = await waitable
+        except errors.Cancelled:
+            status = "cancelled"
+            released = True
+        except Exception:
+            status = "failed"
+            released = True
+        else:
+            result = await terminate(item, message="cleanup failed")
+            if not result.confirmed:
+                status = "incomplete"
+            else:
+                status = "finished"
+                released = True
+            if result.interrupted:
+                raise errors.Cancelled
+        finally:
+            if released and first_gate is not None:
+                first_gate.release()
+            try:
+                if report is not None:
+                    report(status, released)
+            finally:
+                if released and second_gate is not None:
+                    await second_gate.release()
+    return cleanup
+"#
+}
+
+#[test]
+fn matches_cpython_marshal_for_async_else_conditional_finally_target() {
+    common::assert_matches_cpython_marshal(
+        async_else_conditional_finally_source(),
+        "async_else_conditional_finally_target.py",
+    );
+}
+
+#[test]
+fn matches_cpython_marshal_for_async_else_conditional_finally_following_call_control() {
+    let source = async_else_conditional_finally_source().replace(
+        "                raise errors.Cancelled\n        finally:",
+        "                raise errors.Cancelled\n            finish_else(status)\n        finally:",
+    );
+    common::assert_matches_cpython_marshal(
+        &source,
+        "async_else_conditional_finally_following_call_control.py",
+    );
+}
