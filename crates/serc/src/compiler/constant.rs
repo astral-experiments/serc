@@ -421,7 +421,8 @@ impl Compiler<'_> {
         }
         self.assembler
             .add_last_constant_fold_slots(hidden_owner_slots);
-        // A primitive tuple removes only literal loads from this owner's block.
+        // Literal tuple elements, including prebuilt constant slices, each remove
+        // one load from this owner's block when the tuple is folded.
         if let Expr::Tuple(tuple) = expression
             && tuple.elts.iter().all(|element| {
                 matches!(
@@ -432,7 +433,7 @@ impl Compiler<'_> {
                         | Expr::StringLiteral(_)
                         | Expr::BytesLiteral(_)
                         | Expr::EllipsisLiteral(_)
-                )
+                ) || matches!(element, Expr::Slice(slice) if constant_slice(slice).is_some())
             })
         {
             self.assembler

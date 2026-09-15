@@ -91,3 +91,14 @@ fn preserves_borrows_after_manager_finalizers_with_live_handlers() {
         }
     }
 }
+
+#[test]
+fn matches_cpython_original_conditional_finally_jump_owners() {
+    let cases: std::collections::BTreeMap<String, String> = serde_json::from_str(include_str!(
+        "fixtures/original_conditional_finally_jump_owners.json"
+    ))
+    .expect("public finally-exit cases are filename-to-source strings");
+    for (filename, source) in cases {
+        common::assert_matches_cpython_marshal(&source, &filename);
+    }
+}

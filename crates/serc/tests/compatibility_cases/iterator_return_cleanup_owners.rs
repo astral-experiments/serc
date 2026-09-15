@@ -215,3 +215,38 @@ fn call_finally_preserves_inner_iterator_cleanup_owner() {
         common::assert_matches_cpython_marshal(source, "call_finally_iterator_owner.py");
     }
 }
+
+#[test]
+fn suppressed_manager_return_keeps_try_owner_before_following_break() {
+    for (filename, source) in [
+        (
+            "manager_suppression_following_break.py",
+            r"def target(items, manager, work, report):
+    for item in items:
+        try:
+            with manager as value:
+                result = work(value)
+                return result
+            break
+        except ValueError as error:
+            report(error)
+    return None
+",
+        ),
+        (
+            "manager_suppression_loop_backedge_control.py",
+            r"def target(items, manager, work, report):
+    for item in items:
+        try:
+            with manager as value:
+                result = work(value)
+                return result
+        except ValueError as error:
+            report(error)
+    return None
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

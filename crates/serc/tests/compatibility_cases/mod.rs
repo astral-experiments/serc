@@ -448,3 +448,5 @@ mod normal_finally_original_edges;
 
 mod nested_exit_regression_controls;
 mod original_cleanup_provenance;
+
+mod split_loop_tail_owner_continuations;

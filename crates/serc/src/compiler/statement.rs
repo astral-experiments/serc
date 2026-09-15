@@ -6787,7 +6787,9 @@ impl Compiler<'_> {
             .last()
             .is_some_and(|direct| *direct == statement.range)
             || (self.control.exceptions.direct_try_if_exit
-                && !self.control.statements.current_statement_has_following))
+                && !self.control.statements.current_statement_has_following
+                // The separately compiled loop tail is still a protected successor.
+                && self.control.loops.split_loop_tail_prefix_end != Some(statement.range)))
             && matches!(
                 statement.elif_else_clauses.as_slice(),
                 [clause] if clause.test.is_none()
@@ -7975,7 +7977,7 @@ impl Compiler<'_> {
                                                         compiler.with_control_override(
                                                             |control| &mut control.conditions.include_assert_none_condition_owner,
                                                             include_assert_none_condition_owner,
-                                                            |compiler| compiler.compile_suite(body),
+                                                            |compiler| compiler.compile_if_branch_suite(statement, body),
                                                         )
                                                     },
                                                 )
@@ -8323,7 +8325,7 @@ impl Compiler<'_> {
                                         &mut control.conditions.suppress_else_assert_none_condition_owner
                                     },
                                     suppress_else_assert_none_condition_owner,
-                                    |compiler| compiler.compile_suite(body),
+                                    |compiler| compiler.compile_if_branch_suite(statement, body),
                                 )
                             },
                         )
@@ -8365,6 +8367,29 @@ impl Compiler<'_> {
             self.control.stack.max_depth = max_depth;
         }
         Ok(())
+    }
+
+    fn compile_if_branch_suite(
+        &mut self,
+        statement: &ruff_python_ast::StmtIf,
+        body: &[Stmt],
+    ) -> Result<(), CompileError> {
+        // This branch's sole iterator still reaches the separately compiled source
+        // successor. Carry that exact continuation to the iterator's break policy.
+        let prefix_end = self.control.loops.split_loop_tail_prefix_end;
+        let prefix_end = if prefix_end == Some(statement.range)
+            && let [Stmt::For(nested)] = body
+            && !nested.is_async
+        {
+            Some(nested.range)
+        } else {
+            prefix_end
+        };
+        self.with_control_override(
+            |control| &mut control.loops.split_loop_tail_prefix_end,
+            prefix_end,
+            |compiler| compiler.compile_suite(body),
+        )
     }
 
     pub(super) fn set_branch_end_location(&mut self, body: &[Stmt], body_start: usize) {
@@ -17715,8 +17740,63 @@ impl Compiler<'_> {
             };
             // The shared manager join has no leading POP_BLOCK. Its outer owner
             // must survive when suppression jumps inline the deferred exit.
-            let exit_exclusion_start =
-                (preserve_exit_nop && !shared_manager_exit && !separate_manager_pop).then(|| {
+            // This empty conditional array still contains the original finally
+            // jump. It precedes the manager's POP_BLOCK and retains the owner of
+            // the enclosing protected body when cold cleanup keeps the jump live.
+            let original_conditional_finally_jump = capture_manager_pop
+                && self.unit.flags & CO_COROUTINE != 0
+                && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+                && self.control.loops.contexts.is_empty()
+                && self.control.exceptions.active_exception_handlers.is_empty()
+                && self.control.finally.active_normal_finally_bodies == 0
+                && self.control.finally.active_copied_finally_bodies == 0
+                && self.control.finally.active_finally_end_blocks == 0
+                && !drop_expression_if_exit_nop
+                && !drop_shared_manager_exit_nop
+                && !statement.is_star
+                && statement.orelse.is_empty()
+                && self
+                    .control
+                    .withs
+                    .active_with_exits
+                    .last()
+                    .is_some_and(|manager| {
+                        !manager.is_async
+                            && manager.loop_depth == self.control.loops.contexts.len()
+                            && manager.exception_region_depth
+                                == self
+                                    .control
+                                    .exceptions
+                                    .active_exception_region_exclusions
+                                    .len()
+                    })
+                && matches!(conditional_exit, Some(NestedIfExitLocation::Unlocated))
+                && self.assembler.current_original_block_location().is_none()
+                && self
+                    .assembler
+                    .current_original_block_pre_fusion_instruction_count()
+                    == 0
+                && statement.handlers.iter().all(|handler| {
+                    handler.as_except_handler().is_some_and(|handler| {
+                        is_call_expression_suite(&handler.body)
+                            && suite_has_linear_borrow_fallthrough(&handler.body)
+                    })
+                })
+                && matches!(statement.finalbody.last(), Some(Stmt::If(tail))
+                if condition_has_linear_runtime_leaves(&tail.test)
+                    && !expression_suspends_current_scope(&tail.test)
+                    && suite_has_linear_borrow_fallthrough(&tail.body)
+                    && tail.elif_else_clauses.iter().all(|clause| {
+                        clause.test.as_ref().is_some_and(|test| {
+                            condition_has_linear_runtime_leaves(test)
+                                && !expression_suspends_current_scope(test)
+                        }) && suite_has_linear_borrow_fallthrough(&clause.body)
+                    }));
+            let exit_exclusion_start = (preserve_exit_nop
+                && !shared_manager_exit
+                && !separate_manager_pop
+                && !original_conditional_finally_jump)
+                .then(|| {
                     let start = self.assembler.label();
                     self.assembler.mark(start);
                     start
@@ -18250,6 +18330,9 @@ impl Compiler<'_> {
                 .direct_final_sync_with_protected_handler_try_body
                 == Some(statement.range)
             || (self.context.target_specific_rules_enabled()
+                // A following break begins its own try unwind. The manager's
+                // suppression jump reaches that unwind while still inside the try.
+                && !self.control.statements.current_statement_followed_by_break
                 && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
                 && self.control.loops.contexts.last().is_some_and(|context| {
                     context.iterator_cleanup != IteratorCleanup::None

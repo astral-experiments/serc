@@ -2842,7 +2842,44 @@ impl LayoutAssembler {
                         // Once none remain, the appended marker gets a fresh NULL owner.
                         let prologue_consumed_all_slots =
                             tail.insertions > 0 && tail.early_removals <= tail.insertions;
+                        // Entry prologue insertion can move the append onto the retained
+                        // NULL SETUP immediately before this protected suffix. Certify
+                        // that exact original cell; earlier prefix owners remain unknown.
+                        let prologue_reuses_null_setup = owner_history_exact
+                            && original_array_start == 0
+                            && tail.insertions > 0
+                            && tail.insertions == setup_tail.insertions
+                            && tail.post_compaction_fusions == 0
+                            && tail.early_removals.checked_sub(tail.insertions)
+                                == protected_before_compaction.checked_add(1)
+                            && start.checked_sub(1).is_some_and(|index| {
+                                retained_setup_nops.contains(&index)
+                                    && indexed_instructions.get(index).is_some_and(|nop| {
+                                        nop.opcode == NOP
+                                            && (nop.exception_policy().exclusion()
+                                                == super::ExceptionExclusion::Always
+                                                || (nop.exception_policy()
+                                                    == super::ExceptionPolicy::NoneUnchanged
+                                                    && !owners.contains_key(&index)
+                                                    && self.exception_regions.iter().all(
+                                                        |region| match (
+                                                            label_positions.get(&region.start),
+                                                            label_positions.get(&region.end),
+                                                        ) {
+                                                            (Some(begin), Some(end)) => {
+                                                                index < *begin || *end <= index
+                                                            }
+                                                            _ => false,
+                                                        },
+                                                    )))
+                                            && nop.local_policy.hidden_exception_owner_slots() == 0
+                                            && nop.pre_fold_extra_instructions() == 0
+                                            && nop.no_location_policy.borrow_fallthrough()
+                                                != super::BorrowFallthrough::Barrier
+                                    })
+                            });
                         if prologue_consumed_all_slots
+                            || prologue_reuses_null_setup
                             || (tail.insertions == 0 && removed > protected_before_compaction)
                         {
                             owners.insert(
