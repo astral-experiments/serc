@@ -770,8 +770,10 @@ impl Compiler<'_> {
                             // predecessors threaded through it keep its eval-breaker check.
                             self.assembler.mark_jump_as_interruptible(success_exit);
                             if original_unlocated_head {
-                                self.assembler
-                                    .inherit_nested_if_match_exit_locations(success_exit);
+                                self.assembler.inherit_nested_if_match_exit_locations(
+                                    success_exit,
+                                    original_unlocated_head,
+                                );
                             }
                         }
                     }
@@ -918,8 +920,11 @@ impl Compiler<'_> {
             }
             self.set_branch_end_location(&statement.body, body_start);
             if loop_tail {
+                let original_unlocated_head = self.assembler.at_jump_target();
                 let success_exit = self.emit_jump_forward_instruction(JUMP_FORWARD, match_end)?;
                 self.assembler.mark_jump_as_interruptible(success_exit);
+                self.assembler
+                    .inherit_nested_if_match_exit_locations(success_exit, original_unlocated_head);
             }
         }
 
@@ -7197,6 +7202,26 @@ impl Compiler<'_> {
             // Each later condition in the manager body can start a fresh original array.
             // Recover its owner only when compaction left a protected reusable slot.
             policy.ordinary = ExceptionPolicy::NoneDynamicConditionStrict;
+        }
+        if self.control.finally.active_normal_finally_bodies > 0
+            && !self.control.withs.active_with_region_exclusions.is_empty()
+            && !self.control.conditions.exclude_terminal_if_not_taken
+            && !self
+                .control
+                .conditions
+                .exclude_condition_not_taken_from_exception
+            && !self.control.withs.force_terminal_with_marker_ownerless
+            && self
+                .assembler
+                .current_normal_finally_call_none_has_owned_slot()
+        {
+            // The loop exit's excluded NOP does not split the original array.
+            return self.emit_with_exception_policy(
+                NOT_TAKEN,
+                0,
+                0,
+                policy.ordinary.defer_condition_owner(),
+            );
         }
         if (self.control.conditions.allow_compacted_condition_owner
             || (self.control.finally.active_normal_finally_bodies > 0

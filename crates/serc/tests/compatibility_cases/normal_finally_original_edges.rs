@@ -550,3 +550,20 @@ fn matches_cpython_marshal_for_retry_without_else_control() {
 ";
     common::assert_matches_cpython_marshal(source, "retry_without_else_control.py");
 }
+
+#[test]
+fn matches_cpython_marshal_for_loop_finally_owner_cell_none_owner() {
+    let source = r"async def f(manager, tasks, progress, writer):
+    def capture():
+        return progress, writer
+    with manager:
+        try:
+            while tasks:
+                await drain(tasks)
+        finally:
+            progress.close()
+            if writer is not None:
+                writer.close()
+";
+    common::assert_matches_cpython_marshal(source, "loop_finally_cell_none_owner.py");
+}

@@ -2774,7 +2774,10 @@ impl Compiler<'_> {
                 if let Some(location) = self.assembler.last_instruction_location() {
                     self.assembler.set_location(location);
                 }
-                self.emit_jump_backward(JUMP_BACKWARD, start, 0)?;
+                let original_unlocated_head = self.assembler.at_jump_target();
+                let backedge = self.emit_jump_backward_instruction(JUMP_BACKWARD, start)?;
+                self.assembler
+                    .inherit_nested_if_while_backedge_locations(backedge, original_unlocated_head);
                 self.assembler.record_last_original_loop_backedge();
             }
         }

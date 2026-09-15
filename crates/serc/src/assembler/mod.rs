@@ -8,7 +8,7 @@ mod passes;
 #[cfg(test)]
 mod tests;
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::CompileError;
 use crate::code_object::Constant;
@@ -2002,6 +2002,125 @@ impl Assembler {
         }
     }
 
+    /// Proves an owned comparison slot after a loop's normal-finally call prefix.
+    pub(crate) fn current_normal_finally_call_none_has_owned_slot(&self) -> bool {
+        use crate::target::opcodes::{CALL, LOAD_ATTR, LOAD_DEREF};
+
+        let items = self.linear_items();
+        if !matches!(items.last(), Some(Item::Instruction(instruction))
+            if matches!(instruction.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+                && instruction.local_policy.hidden_exception_owner_slots() == 3)
+        {
+            return false;
+        }
+        let provenance = &self.exception_owner_provenance;
+        let Some(begin) = items.iter().rposition(|item| {
+            matches!(item, Item::Label(label)
+            if provenance.source_boundaries.contains(label)
+                && provenance.block_boundaries.contains(label))
+        }) else {
+            return false;
+        };
+        let prefix = &items[begin..];
+        let mut leading_labels = FxHashSet::default();
+        let mut labels = FxHashSet::default();
+        let mut instructions = Vec::new();
+        for item in prefix {
+            match item {
+                Item::Label(label) => {
+                    if instructions.len() > 1
+                        || self.preserved_block_boundaries.contains(label)
+                        || provenance.setups.iter().any(|(setup, _)| setup == label)
+                        || provenance.fusion_boundaries.contains(label)
+                        || provenance.omitted_nop_counts.contains_key(label)
+                        || provenance.omitted_nop_locations.contains_key(label)
+                        || self
+                            .exception_regions
+                            .iter()
+                            .any(|region| region.target == *label)
+                        || (!instructions.is_empty() && provenance.block_boundaries.contains(label))
+                    {
+                        return false;
+                    }
+                    labels.insert(*label);
+                    if instructions.is_empty() {
+                        leading_labels.insert(*label);
+                    }
+                }
+                Item::Instruction(instruction) => {
+                    if instructions.len() == 8 {
+                        return false;
+                    }
+                    instructions.push(*instruction);
+                }
+            }
+        }
+        let [plain, pop, receiver, method, call, discard, load, condition] =
+            instructions.as_slice()
+        else {
+            return false;
+        };
+        if plain.opcode != NOP
+            || plain.operand() != Operand::Value(0)
+            || plain.location.line < 0
+            || plain.fusion_policy != ir::FusionPolicy::default()
+            || pop.opcode != NOP
+            || pop.operand() != Operand::Value(0)
+            || pop.location != SourceLocation::NONE
+            || !pop.fusion_policy.is_converted_pop_block()
+            || pop.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
+            || !matches!(receiver.opcode, LOAD_FAST | LOAD_DEREF)
+            || method.opcode != LOAD_ATTR
+            || !matches!(method.operand(), Operand::Value(argument) if argument & 1 != 0)
+            || call.opcode != CALL
+            || call.operand() != Operand::Value(0)
+            || discard.opcode != POP_TOP
+            || !matches!(load.opcode, LOAD_FAST | LOAD_DEREF)
+            || !matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+            || !matches!(condition.operand(), Operand::Forward(_))
+            || instructions.iter().enumerate().any(|(index, instruction)| {
+                instruction.pre_fold_extra_instructions() != 0
+                    || instruction.local_policy.hidden_exception_owner_slots()
+                        != if index == 7 { 3 } else { 0 }
+                    || instruction.no_location_policy.borrow_fallthrough()
+                        != BorrowFallthrough::Reachable
+                    || (index != 1 && instruction.exception_policy() != ExceptionPolicy::default())
+                    || (index != 7 && !matches!(instruction.operand(), Operand::Value(_)))
+            })
+        {
+            return false;
+        }
+        let incoming = items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Instruction(jump)
+                    if matches!(jump.operand(), Operand::Forward(target) | Operand::Backward(target)
+                    if labels.contains(&target)) =>
+                {
+                    Some(*jump)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let [entry] = incoming.as_slice() else {
+            return false;
+        };
+        if !is_conditional_jump(entry.opcode)
+            || !matches!(entry.operand(), Operand::Forward(target) if leading_labels.contains(&target))
+            || entry.location != plain.location
+            || !matches!(items[..begin].iter().rev().find(|item| matches!(item, Item::Instruction(_))),
+                Some(Item::Instruction(backedge))
+                    if is_unconditional_jump(backedge.opcode)
+                        && matches!(backedge.operand(), Operand::Backward(_)))
+        {
+            return false;
+        }
+        // This original exit exceeds the small-exit copy budget. Removing up to
+        // two leading NOPs and the three comparison records leaves the appended
+        // marker inside the unchanged, uniformly protected call/test suffix.
+        true
+    }
+
     /// Requires an original entry before the current span, without a later region transition.
     pub(crate) fn current_block_starts_at_source_boundary(&self) -> bool {
         let mut boundary = false;
@@ -3672,7 +3791,39 @@ impl Assembler {
     }
 
     /// Lets private copies inherit locations when the original join reaches a case exit.
-    pub(crate) fn inherit_nested_if_match_exit_locations(&mut self, emitted: EmittedJump) {
+    /// The caller captures the unlocated head before emitting this source-authored exit.
+    pub(crate) fn inherit_nested_if_match_exit_locations(
+        &mut self,
+        emitted: EmittedJump,
+        original_unlocated_head: bool,
+    ) {
+        self.inherit_nested_if_original_exit_locations(
+            emitted,
+            original_unlocated_head,
+            JUMP_FORWARD,
+        );
+    }
+
+    /// Uses only the original common backedge emitted after a while body.
+    /// The caller captures the head before emission can remove an authored NOP.
+    pub(crate) fn inherit_nested_if_while_backedge_locations(
+        &mut self,
+        emitted: EmittedJump,
+        original_unlocated_head: bool,
+    ) {
+        self.inherit_nested_if_original_exit_locations(
+            emitted,
+            original_unlocated_head,
+            JUMP_BACKWARD,
+        );
+    }
+
+    fn inherit_nested_if_original_exit_locations(
+        &mut self,
+        emitted: EmittedJump,
+        original_unlocated_head: bool,
+        original_exit_opcode: Opcode,
+    ) {
         if self.nested_if_unlocated_join_blocks.is_empty() {
             return;
         }
@@ -3682,9 +3833,9 @@ impl Assembler {
         let Some(Item::Instruction(exit)) = items.get(index) else {
             return;
         };
-        if exit.opcode != JUMP_FORWARD
-            || !exit.jump_policy.is_interruptible()
-            || !exit.no_location_policy.is_artificial_eval_break()
+        if exit.opcode != original_exit_opcode
+            || (exit.opcode == JUMP_FORWARD && !exit.jump_policy.is_interruptible())
+            || !original_unlocated_head
             || exit.pre_fold_extra_instructions() != 0
             || exit.local_policy.hidden_exception_owner_slots() != 0
             || exit.jump_policy.always_retains_nop()
@@ -3744,8 +3895,9 @@ impl Assembler {
                 }
             }
         }
-        // CPython first inlines this original NO_LOCATION case-success JUMP. The
-        // nested join then owns that eval-check exit before locations are resolved.
+        // CPython first inlines this original NO_LOCATION case-success or common
+        // while-backedge JUMP. The nested join then owns that eval-check exit before
+        // locations are resolved.
         // Its copies and sole surviving original follow the existing copy policy.
         self.shared_jump_copy_location_blocks.extend(promoted);
     }
