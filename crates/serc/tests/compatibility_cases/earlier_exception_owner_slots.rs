@@ -97,3 +97,56 @@ fn matches_cpython_targeted_finally_entry_rejects_prior_array_history() {
         }
     }
 }
+
+#[test]
+fn normal_finally_none_marker_reuses_removed_pop_slot() {
+    let source =
+        normal_finally_pop_slot_source(r#"create_client(f"{ROOT}/{key}/resource", credential)"#);
+    common::assert_matches_cpython_marshal(&source, "normal_finally_removed_pop_slot.py");
+}
+
+#[test]
+fn normal_finally_none_marker_keeps_slot_after_removed_pop() {
+    let source =
+        normal_finally_pop_slot_source(r#"client_factory(f"{ROOT}/{key}/resource", credential)"#);
+    common::assert_matches_cpython_marshal(&source, "normal_finally_slot_after_removed_pop.py");
+}
+
+#[test]
+fn normal_finally_none_marker_keeps_slot_before_removed_pop() {
+    let source = normal_finally_pop_slot_source(
+        r#"normalize(create_client(f"{ROOT}/{key}/resource", credential))"#,
+    );
+    common::assert_matches_cpython_marshal(&source, "normal_finally_slot_before_removed_pop.py");
+}
+
+fn normal_finally_pop_slot_source(client_call: &str) -> String {
+    format!(
+        r#"from contextlib import contextmanager
+
+@contextmanager
+def collect(key: str, client_factory) -> Iterator[None]:
+    with GATE:
+        local = LOCKS.setdefault(key, Lock())
+
+    with local:
+        if not ROOT.startswith("remote://"):
+            yield
+            return
+
+        from example import Credential
+
+        credential = Credential()
+        client = {client_call}
+        lease = None
+        try:
+            lease = acquire(client)
+            yield
+        finally:
+            if lease is not None:
+                lease.release()
+            client.close()
+            credential.close()
+"#
+    )
+}

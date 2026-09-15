@@ -3512,9 +3512,7 @@ impl LayoutAssembler {
                                 continue;
                             }
                             let removed_pop = load.local_policy.hidden_exception_owner_slots();
-                            if removed_pop > 1
-                                || tail.early_removals != 3 + usize::from(removed_pop)
-                            {
+                            if removed_pop > 1 {
                                 continue;
                             }
                             let mut expected_load = *original_load;
@@ -3561,13 +3559,34 @@ impl LayoutAssembler {
                             {
                                 continue;
                             }
+                            // Earlier compaction can instead put the appended marker in
+                            // the captured POP_BLOCK's original NULL cell. Remove only this
+                            // prefix's hidden records to recover that exact old slot.
+                            let comparison_removals = usize::from(
+                                original_condition
+                                    .local_policy
+                                    .hidden_exception_owner_slots(),
+                            );
+                            let original_pop_slot = tail
+                                .early_removals
+                                .checked_sub(comparison_removals + usize::from(removed_pop))
+                                .and_then(|removed_before| load_index.checked_add(removed_before));
+                            if removed_pop == 1 && original_pop_slot == Some(instruction_index + 1)
+                            {
+                                pending_normal_none_owner = Some((instruction_index + 1, None));
+                                continue;
+                            }
+                            if tail.early_removals != 3 + usize::from(removed_pop) {
+                                continue;
+                            }
                             if let Some(region) = self.uniform_exception_owner(
                                 load_index,
                                 instruction_index + 1,
                                 &label_positions,
                             ) && !self.exception_regions[region].is_scope_fallback
                             {
-                                pending_normal_none_owner = Some((instruction_index + 1, region));
+                                pending_normal_none_owner =
+                                    Some((instruction_index + 1, Some(region)));
                             }
                         }
                     }
@@ -3826,8 +3845,8 @@ impl LayoutAssembler {
                         owners.insert(
                             instruction_index,
                             ExceptionOwnerDecision {
-                                has_owner: true,
-                                source_region: Some(region),
+                                has_owner: region.is_some(),
+                                source_region: region,
                                 definitive: true,
                                 override_existing: true,
                             },

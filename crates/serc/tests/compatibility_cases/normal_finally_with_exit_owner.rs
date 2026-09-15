@@ -119,3 +119,17 @@ fn preserves_outer_manager_owner_on_conditional_finally_handler_joins() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn preserves_outer_manager_owner_after_sequential_finally_guards() {
+    for leading in [
+        "            cleanup()\n",
+        "            if ready:\n                cleanup()\n",
+        "            if ready:\n                cleanup()\n                flush()\n",
+    ] {
+        let source = format!(
+            "def f(outer, inner, ready, resource):\n    with outer():\n        try:\n            work()\n        finally:\n{leading}            if resource is not None:\n                with inner():\n                    resource.flush()\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "sequential_finally_manager_joins.py");
+    }
+}

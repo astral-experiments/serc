@@ -16353,7 +16353,20 @@ impl Compiler<'_> {
             && statement.handlers.is_empty()
             && statement.orelse.is_empty()
             && statement.finalbody.split_last().is_some_and(|(last, leading)| {
-                (leading.is_empty() || suite_has_linear_borrow_fallthrough(leading))
+                // An earlier ordinary cleanup guard rejoins before this final condition.
+                // It does not move the manager's POP_BLOCK into the final located join.
+                (leading.is_empty()
+                    || suite_has_linear_borrow_fallthrough(leading)
+                    || (self.unit.flags & CO_GENERATOR == 0
+                        && matches!(leading, [Stmt::If(prefix)]
+                        if matches!(last, Stmt::If(tail)
+                                if matches!(tail.body.as_slice(), [Stmt::With(_)]))
+                            && prefix.elif_else_clauses.is_empty()
+                            && condition_has_only_runtime_tests(&prefix.test)
+                            && !expression_contains_inline_branch(&prefix.test)
+                            && !expression_suspends_current_scope(&prefix.test)
+                            && condition_jump_target_count(&prefix.test, false) == 1
+                            && suite_has_linear_borrow_fallthrough(&prefix.body))))
                     && !suite_contains_yield(leading)
                     && matches!(last, Stmt::If(tail)
                         if tail.elif_else_clauses.is_empty()
