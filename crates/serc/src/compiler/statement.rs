@@ -24522,6 +24522,25 @@ fn try_has_conditional_shared_loop_exit(statement: &Stmt) -> bool {
     let Some(Stmt::If(final_if)) = normal_exit.last() else {
         return false;
     };
+    // A runtime if/elif chain with no final else shares the same unlocated
+    // normal exit as a single expression arm. Its final false edge needs its
+    // own copy of the artificial loop backedge before locations propagate.
+    let direct_elif_expressions = !statement.is_star
+        && statement.finalbody.is_empty()
+        && normal_exit.len() == 1
+        && !final_if.elif_else_clauses.is_empty()
+        && condition_has_only_runtime_tests(&final_if.test)
+        && matches!(final_if.body.as_slice(), [Stmt::Expr(_)])
+        && final_if.elif_else_clauses.iter().all(|clause| {
+            clause
+                .test
+                .as_ref()
+                .is_some_and(condition_has_only_runtime_tests)
+                && matches!(clause.body.as_slice(), [Stmt::Expr(_)])
+        });
+    if direct_elif_expressions {
+        return true;
+    }
     if !final_if.elif_else_clauses.is_empty()
         || early_condition_truthiness(&final_if.test).is_some()
         || suite_terminates(&final_if.body)

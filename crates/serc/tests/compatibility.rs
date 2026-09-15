@@ -1833,6 +1833,88 @@ def try_finally(values):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_try_else_elif_loop_backedges() {
+        for (filename, source) in [
+            (
+                "selected_try_else_elif_chained_backedge.py",
+                r#"def collect(rows, output):
+    for row in rows:
+        if row.enabled:
+            try:
+                low = float(row.low)
+                middle = float(row.middle)
+                high = float(row.high)
+            except ValueError:
+                output.append("invalid input")
+            else:
+                if not all(is_finite(value) for value in (low, middle, high)):
+                    output.append("nonfinite")
+                elif not low <= middle <= high:
+                    output.append("out of order")
+"#,
+            ),
+            (
+                "direct_try_else_elif_chained_backedge.py",
+                r#"def collect(rows, output):
+    for row in rows:
+        try:
+            low = float(row.low)
+            middle = float(row.middle)
+            high = float(row.high)
+        except ValueError:
+            output.append("invalid input")
+        else:
+            if not all(is_finite(value) for value in (low, middle, high)):
+                output.append("nonfinite")
+            elif not low <= middle <= high:
+                output.append("out of order")
+"#,
+            ),
+            (
+                "selected_try_else_elif_following_call_control.py",
+                r#"def collect(rows, output):
+    for row in rows:
+        if row.enabled:
+            try:
+                low = float(row.low)
+                middle = float(row.middle)
+                high = float(row.high)
+            except ValueError:
+                output.append("invalid input")
+            else:
+                if not all(is_finite(value) for value in (low, middle, high)):
+                    output.append("nonfinite")
+                elif not low <= middle <= high:
+                    output.append("out of order")
+            finish(row)
+"#,
+            ),
+            (
+                "selected_try_else_elif_final_else_control.py",
+                r#"def collect(rows, output):
+    for row in rows:
+        if row.enabled:
+            try:
+                low = float(row.low)
+                middle = float(row.middle)
+                high = float(row.high)
+            except ValueError:
+                output.append("invalid input")
+            else:
+                if not all(is_finite(value) for value in (low, middle, high)):
+                    output.append("nonfinite")
+                elif not low <= middle <= high:
+                    output.append("out of order")
+                else:
+                    output.append("accepted")
+"#,
+            ),
+        ] {
+            assert_matches_cpython_marshal(source, filename);
+        }
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_nested_try_else_loop_backedges() {
         let source = r"def nested_try_else_loop(first, second):
     try:
