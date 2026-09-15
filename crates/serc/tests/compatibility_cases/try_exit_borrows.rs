@@ -4676,3 +4676,40 @@ fn matches_cpython_multicondition_compound_try_exit_borrows() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn named_return_conditional_cleanup_target() {
+    common::assert_matches_cpython_marshal(
+        r"async def probe(owner, token, result, touch):
+    try:
+        try:
+            await touch(result)
+        except BaseException:
+            owner.release(result)
+            raise
+        return result
+    finally:
+        if token is not None:
+            owner.remove(token)
+",
+        "named_return_conditional_cleanup_target.py",
+    );
+}
+
+#[test]
+fn named_return_plain_cleanup_control() {
+    common::assert_matches_cpython_marshal(
+        r"async def probe(owner, token, result, touch):
+    try:
+        try:
+            await touch(result)
+        except BaseException:
+            owner.release(result)
+            raise
+        return result
+    finally:
+        owner.remove(token)
+",
+        "named_return_plain_cleanup_control.py",
+    );
+}

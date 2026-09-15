@@ -13923,7 +13923,7 @@ impl Compiler<'_> {
                         || suite_contains_partial_terminal_handler_if(&handler.body)
                 })
             });
-            let following_name_return_has_call_cleanup = self
+            let following_name_return_has_noncopyable_cleanup = self
                 .control
                 .finally
                 .active_return_finally_contexts
@@ -13932,6 +13932,18 @@ impl Compiler<'_> {
                     matches!(context.body.as_slice(), [Stmt::Expr(expression)]
                         if matches!(expression.value.as_ref(), Expr::Call(_))
                             && !expression_contains_inline_branch(&expression.value))
+                        || matches!(context.body.as_slice(), [Stmt::If(conditional)]
+                            if conditional.elif_else_clauses.is_empty()
+                                && matches!(conditional.test.as_ref(), Expr::Compare(comparison)
+                                    if matches!(comparison.left.as_ref(), Expr::Name(_))
+                                        && comparison.ops.len() == 1
+                                        && comparison.ops[0] == CmpOp::IsNot
+                                        && comparison.comparators.len() == 1
+                                        && matches!(comparison.comparators[0], Expr::NoneLiteral(_)))
+                                && matches!(conditional.body.as_slice(), [Stmt::Expr(expression)]
+                                    if matches!(expression.value.as_ref(), Expr::Call(_))
+                                        && !expression_contains_inline_branch(&expression.value)
+                                        && !expression_suspends_current_scope(&expression.value)))
                 });
             if (terminal_handler_exit
                 && !(self
@@ -13939,7 +13951,7 @@ impl Compiler<'_> {
                     .statements
                     .current_statement_followed_by_name_return
                     && self.control.withs.active_with_exits.is_empty()
-                    && !following_name_return_has_call_cleanup))
+                    && !following_name_return_has_noncopyable_cleanup))
                 || handler_has_orphan_cold_cleanup
                 || has_bare_handler
                 || (!statement.is_star
@@ -13960,7 +13972,8 @@ impl Compiler<'_> {
                 // an enclosing branch or loop. A direct following name return is copied onto
                 // the normal edge first, so its load remains reachable and borrowed. Pending
                 // manager cleanup or a copied finally call makes that exit too large to
-                // copy, preserving the barrier. A pass-only finalizer can still fit.
+                // copy. A copied runtime condition ends the original array before RETURN,
+                // so it is not a small scope exit either. A pass-only finalizer can still fit.
                 self.assembler
                     .mark_borrow_fallthrough_barrier(normal_exit.instruction());
             }
