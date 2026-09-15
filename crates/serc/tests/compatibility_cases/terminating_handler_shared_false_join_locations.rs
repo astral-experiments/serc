@@ -116,3 +116,56 @@ fn matches_cpython_terminal_unnamed_handler_shared_cleanup() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_handler_final_else_condition_location() {
+    let source = r"def retry(attempts, send, log, special):
+    for attempt in range(attempts):
+        try:
+            response = send()
+            log(response)
+        except LookupError as error:
+            if special(error):
+                log(error)
+                return None
+            else:
+                log(error)
+                if attempt == attempts - 1:
+                    return None
+        except Exception as error:
+            log(error)
+            if attempt == attempts - 1:
+                return None
+        else:
+            assert isinstance(response, dict)
+            return response
+    raise AssertionError
+";
+    common::assert_matches_cpython_marshal(source, "handler_final_else_condition_location.py");
+}
+
+#[test]
+fn matches_cpython_handler_final_else_multiple_predecessors() {
+    let source = r"def retry(attempts, send, log, special):
+    for attempt in range(attempts):
+        try:
+            response = send()
+            log(response)
+        except LookupError as error:
+            if special(error):
+                log(error)
+            else:
+                log(error)
+                if attempt == attempts - 1:
+                    return None
+        except Exception as error:
+            log(error)
+            if attempt == attempts - 1:
+                return None
+        else:
+            assert isinstance(response, dict)
+            return response
+    raise AssertionError
+";
+    common::assert_matches_cpython_marshal(source, "handler_final_else_multiple_predecessors.py");
+}

@@ -11025,14 +11025,15 @@ impl Compiler<'_> {
                 self.assembler.prevent_borrow_loop_exit_reachability(end);
                 // A surviving authored break still reaches the loop's nonempty exit,
                 // even when a different break loses its edge before borrowed-load traversal.
-                // A following statement remains inside the current protected body; its
-                // surviving break does not cross the enclosing handler or finally cleanup.
+                // A following statement remains inside the current protected body. A direct
+                // finally cleanup also retains entry through an authored break that survives.
                 if (self
                     .control
                     .exceptions
                     .active_exception_region_exclusions
                     .is_empty()
-                    || (self.control.statements.current_statement_has_following
+                    || ((self.control.statements.current_statement_has_following
+                        || finally_break_reaches_cleanup)
                         && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
                         && self.control.loops.contexts.is_empty()
                         && self.control.exceptions.active_exception_handlers.is_empty()
@@ -22578,6 +22579,30 @@ fn conditional_for_else_cleanup_exit(statement: &ruff_python_ast::StmtIf) -> boo
         && suite_has_linear_borrow_fallthrough(&cleanup.finalbody)
 }
 
+// An ordinary cleanup exits through unconditional jumps. Nested final else arms
+// preserve that property: earlier arms copy the shared exit before line resolution.
+// A following authored statement supplies fallthrough instead and stops this walk.
+fn suite_has_unconditional_cleanup_exit(body: &[Stmt]) -> bool {
+    match body.last() {
+        Some(Stmt::Try(statement)) => statement.finalbody.is_empty(),
+        Some(Stmt::With(_)) => true,
+        Some(Stmt::If(statement))
+            if early_condition_truthiness(&statement.test).is_none()
+                && statement.elif_else_clauses.iter().all(|clause| {
+                    clause
+                        .test
+                        .as_ref()
+                        .is_none_or(|test| early_condition_truthiness(test).is_none())
+                }) =>
+        {
+            statement.elif_else_clauses.last().is_some_and(|clause| {
+                clause.test.is_none() && suite_has_unconditional_cleanup_exit(&clause.body)
+            })
+        }
+        _ => false,
+    }
+}
+
 pub(super) fn nested_if_exit_location(
     statement: &ruff_python_ast::StmtIf,
     allow_recursive_fallthrough: bool,
@@ -22654,8 +22679,7 @@ pub(super) fn nested_if_exit_location(
             if nested.elif_else_clauses.last().is_some_and(|clause| {
                 clause.test.is_none() && suite_terminates(&clause.body)
             }))
-            || matches!(body.last(), Some(Stmt::Try(statement)) if statement.finalbody.is_empty())
-            || matches!(body.last(), Some(Stmt::With(_))))
+            || suite_has_unconditional_cleanup_exit(body))
             && !unlocated_multi_exit_boolean
         {
             NestedIfExitLocation::Located(test)
@@ -22947,6 +22971,22 @@ fn handler_cleanup_has_runtime_if_join(statement: &ruff_python_ast::StmtIf) -> b
 }
 
 fn handler_cleanup_fallthrough_test(statement: &ruff_python_ast::StmtIf) -> Option<&Expr> {
+    // If every earlier arm exits, a final else's terminating conditional is the
+    // only normal predecessor of the handler cleanup. Its false edge supplies
+    // the location; the terminating body's return cannot donate across that join.
+    if let Some((last, earlier)) = statement.elif_else_clauses.split_last()
+        && last.test.is_none()
+        && suite_terminates_before_constant_folding(&statement.body)
+        && earlier
+            .iter()
+            .all(|clause| suite_terminates_before_constant_folding(&clause.body))
+        && let Some(Stmt::If(tail)) = last.body.last()
+        && let Some(test) = handler_cleanup_fallthrough_test(tail)
+        && condition_has_only_runtime_tests(test)
+        && original_condition_has_unique_jump_target(test, false)
+    {
+        return Some(test);
+    }
     terminating_if_fallthrough_test(statement).or_else(|| {
         // Returning from both a nested try body and every handler leaves only the outer
         // condition's false edge to supply the normal POP_EXCEPT location.

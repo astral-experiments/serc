@@ -3,6 +3,50 @@ use std::fmt::Write as _;
 use crate::common;
 
 #[test]
+fn matches_cpython_dynamic_retry_exit_after_manager_return() {
+    let source = r#"from contextlib import nullcontext
+
+
+async def retry(worker, manager=None):
+    count = 0
+    while count < 3:
+        try:
+            with manager.enter() if manager is not None else nullcontext():
+                result = await worker()
+                return result.value
+        except Exception as error:
+            report(error)
+            count += 1
+            if manager is not None:
+                manager.update({"failed": 1})
+    if manager is not None:
+        manager.update({"dropped": 1})
+    return None
+"#;
+    common::assert_matches_cpython_marshal(source, "dynamic_retry_manager_return.py");
+}
+
+#[test]
+fn matches_cpython_dynamic_retry_exit_without_manager() {
+    let source = r#"async def retry(worker, manager=None):
+    count = 0
+    while count < 3:
+        try:
+            result = await worker()
+            return result.value
+        except Exception as error:
+            report(error)
+            count += 1
+            if manager is not None:
+                manager.update({"failed": 1})
+    if manager is not None:
+        manager.update({"dropped": 1})
+    return None
+"#;
+    common::assert_matches_cpython_marshal(source, "dynamic_retry_without_manager.py");
+}
+
+#[test]
 fn preserves_independent_entries_after_async_for_breaks() {
     for generator in [false, true] {
         for wrapper in ["plain", "if", "if_else"] {

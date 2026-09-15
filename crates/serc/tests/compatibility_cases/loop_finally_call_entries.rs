@@ -1,6 +1,36 @@
 use crate::common;
 
 #[test]
+fn matches_cpython_finally_borrows_after_match_break_and_continue() {
+    let source = r#"class Consumer:
+    async def finish(self):
+        await self.input.put(None)
+        try:
+            if self.pending is not None:
+                result = await self.pending
+                if result == Status.FAIL:
+                    raise self.error("input")
+            while True:
+                result = await self.output.get()
+                match result:
+                    case Status.OK:
+                        continue
+                    case Status.FAIL:
+                        record("failure", extra={"id": self.identifier, "streaming": self.streaming})
+                        if not self.streaming:
+                            raise self.error("output")
+                    case None:
+                        break
+                    case _:
+                        unreachable(result)
+        finally:
+            await self.task
+            await self.logger.flush()
+"#;
+    common::assert_matches_cpython_marshal(source, "match_break_async_finally.py");
+}
+
+#[test]
 fn matches_cpython_finally_calls_reached_by_retained_breaks() {
     for (prefix, cleanup) in [("", "x.close()"), ("async ", "await x.close()")] {
         for (name, body) in [

@@ -26,7 +26,7 @@ use crate::assembler::block_graph::ItemMut;
 use crate::assembler::ir::{ThreadedBorrowEntries, ThreadedBorrowSnapshot};
 use crate::target::{
     is_unconditional_jump,
-    opcodes::{CALL, CALL_KW, END_FOR, GET_AWAITABLE},
+    opcodes::{CALL, CALL_KW, END_FOR, GET_AWAITABLE, POP_JUMP_IF_FALSE},
 };
 
 /// Original block entries retained for CPython's final borrowing traversal.
@@ -590,6 +590,51 @@ fn for_iter_enters_original_cleanup(
                 return at_target
                     && first.opcode == END_FOR
                     && first.operand() == Operand::Value(0)
+                    && first.no_location_policy.borrow_fallthrough()
+                        == BorrowFallthrough::Reachable
+                    && !first.jump_policy.borrow_empty_block();
+            }
+        }
+    }
+    false
+}
+
+/// Preserves an explicit false edge past an earlier erased original array.
+fn conditional_enters_original_block(
+    instruction: &Instruction,
+    target: Label,
+    items: &[Item],
+    original_boundaries: &FxHashSet<Label>,
+    unreachable: &FxHashSet<Label>,
+) -> bool {
+    if instruction.opcode != POP_JUMP_IF_FALSE
+        || instruction.operand() != Operand::Forward(target)
+        || !original_boundaries.contains(&target)
+        || instruction.jump_policy.borrow_empty_block()
+        || instruction.jump_policy.is_normalized_conditional_backedge()
+        || !instruction.jump_policy.allows_borrow_threading_target()
+        || instruction.no_location_policy.borrow_fallthrough() != BorrowFallthrough::Reachable
+    {
+        return false;
+    }
+    let mut at_target = false;
+    for item in items {
+        match item {
+            Item::Label(label) => {
+                if *label == target {
+                    at_target = true;
+                } else if at_target && original_boundaries.contains(label) {
+                    // An empty original target cannot inherit a later array's body.
+                    return false;
+                }
+                // Only erased arrays strictly before this explicit target are bypassed.
+                if at_target && unreachable.contains(label) {
+                    return false;
+                }
+            }
+            Item::Instruction(first) => {
+                return at_target
+                    && !matches!(first.opcode, NOP | NOT_TAKEN)
                     && first.no_location_policy.borrow_fallthrough()
                         == BorrowFallthrough::Reachable
                     && !first.jump_policy.borrow_empty_block();
@@ -2877,6 +2922,13 @@ impl OptimizationPipeline {
                         original_block_boundaries,
                         borrow_unreachable_labels,
                     );
+                    let conditional_entry = conditional_enters_original_block(
+                        last,
+                        label,
+                        &items[blocks[target].clone()],
+                        original_block_boundaries,
+                        borrow_unreachable_labels,
+                    );
                     let shared_break = last.fusion_policy.is_authored_break()
                         && items[blocks[block].clone()].iter().any(|item| {
                             matches!(item, Item::Label(label) if cold_join_targets.contains(label))
@@ -3068,6 +3120,7 @@ impl OptimizationPipeline {
                     pending.push((
                         target,
                         for_cleanup_entry
+                            || conditional_entry
                             || shared_break
                             || independent_loop_entry
                             || cleanup_entry
