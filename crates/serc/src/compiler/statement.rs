@@ -6101,6 +6101,41 @@ impl Compiler<'_> {
                             self.assembler.mark_last_as_converted_pop_block();
                         }
                     }
+                    let copied_manager_none_pop = (self.context.target_specific_rules_enabled()
+                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                            == CO_COROUTINE
+                        && preserve_tos
+                        && !return_is_overridden
+                        && matches!(statement.value.as_deref(), Some(Expr::Name(name))
+                            if self.source_location(name.range).line
+                                == self.source_location(statement.range).line)
+                        && context_index == 0
+                        && return_finally_contexts.len() == 1
+                        && handler_count == 0
+                        && finally_context.exception_region_depth == 0
+                        && self
+                            .control
+                            .exceptions
+                            .active_exception_region_exclusions
+                            .len()
+                            == 2
+                        && self
+                            .control
+                            .exceptions
+                            .active_try_marker_slots
+                            .len()
+                            .checked_sub(finally_context.try_body_depth)
+                            == Some(1)
+                        && self.control.withs.active_with_exits.len() == 1
+                        && !self.control.withs.active_with_exits[0].is_async
+                        && next_with == 0
+                        && with_unwind_starts.len() == 1
+                        && with_unwind_starts[0].index == 0
+                        && self.control.loops.contexts.is_empty()
+                        && self.control.finally.active_finally_end_blocks == 0
+                        && self.control.finally.active_normal_finally_bodies == 0
+                        && self.control.finally.active_copied_finally_bodies == 0)
+                        .then_some(self.assembler.item_count());
                     self.emit_with_exception_policy(NOP, 0, 0, ExceptionPolicy::EXCLUDE_ALWAYS)?;
                     if !starts_jump_target
                         || matches!(finally_context.body.as_slice(), [Stmt::Pass(_)])
@@ -6242,6 +6277,16 @@ impl Compiler<'_> {
                             }
                         },
                     );
+                    if result.is_ok()
+                        && let Some(pop_item) = copied_manager_none_pop
+                    {
+                        // This return omits the manager POP and its surrounding ordinary
+                        // try POP. Both precede the emitted finally POP's original NULL cell.
+                        self.assembler.record_copied_manager_return_none_prefix(
+                            copied_handler_return_item,
+                            pop_item,
+                        );
+                    }
                     self.control.finally.active_copied_finally_bodies -= 1;
                     self.control.finally.active_finally_try_bodies = active_try_bodies;
                     self.control
@@ -16905,6 +16950,39 @@ impl Compiler<'_> {
         // copied cleanup does not remove the normal entry from a live recovery suffix.
         // A single runtime continue condition retains that entry without a suffix too.
         // Located linear else work preserves the normal route into cleanup too.
+        // A nested typed recovery keeps a located SETUP_FINALLY entry before
+        // its linear body. Conditional reraises add exceptional exits without
+        // copying cleanup onto a return, break, or continue.
+        let nested_recovery_finally_entry = matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
+            && self.control.loops.contexts.is_empty()
+            && self.control.withs.active_with_exits.is_empty()
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            && !self.control.in_exception_handler()
+            && self.control.finally.active_copied_finally_bodies == 0
+            && self.control.finally.active_finally_try_bodies == 0
+            && suite_has_linear_borrow_fallthrough(&statement.body)
+            && matches!(statement.finalbody.as_slice(), [Stmt::Try(recovery)]
+            if !recovery.is_star
+                && recovery.orelse.is_empty()
+                && recovery.finalbody.is_empty()
+                && suite_has_linear_borrow_fallthrough(&recovery.body)
+                && recovery.body.first().is_some_and(|first| {
+                    self.source_location(first.range()).line
+                        != self.source_location(recovery.range).line
+                })
+                && !recovery.handlers.is_empty()
+                && recovery.handlers.iter().all(|handler| {
+                    handler.as_except_handler().is_some_and(|handler| {
+                        handler.type_.is_some()
+                            && handler.name.is_some()
+                            && suite_has_linear_reraise_guards(&handler.body)
+                    })
+                }));
         let conditional_handler_reaches_finally = !statement.is_star
             && (statement.orelse.is_empty()
                 || (suite_has_linear_borrow_fallthrough(&statement.orelse)
@@ -16949,6 +17027,7 @@ impl Compiler<'_> {
                             !expression_contains_inline_branch(value)
                         })))))
                 || suite_has_linear_borrow_fallthrough(&statement.finalbody)
+                || nested_recovery_finally_entry
                 // A synchronous for exhaustion retains END_FOR and POP_ITER.
                 // Its normal recovery exit reaches the next iterator preheader
                 // without an empty conditional or copied-finally boundary.

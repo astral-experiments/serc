@@ -448,6 +448,14 @@ impl OptimizationPipeline {
                     *condition = *after;
                 }
             }
+            for origin in &mut self
+                .exception_owner_provenance
+                .copied_manager_return_none_prefixes
+            {
+                if origin.condition == *before {
+                    origin.condition = *after;
+                }
+            }
         }
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::DuplicateExitBlocks)?;

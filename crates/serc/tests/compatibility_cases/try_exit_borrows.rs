@@ -4762,3 +4762,57 @@ fn named_return_for_cleanup_source(cleanup: &str) -> String {
 {cleanup}"
     )
 }
+
+#[test]
+fn nested_async_finally_await_target() {
+    common::assert_matches_cpython_marshal(
+        &nested_async_finally_source("await self.close()", true),
+        "nested_async_finally_await_target.py",
+    );
+}
+
+#[test]
+fn nested_async_finally_sync_control() {
+    common::assert_matches_cpython_marshal(
+        &nested_async_finally_source("self.close()", true),
+        "nested_async_finally_sync_control.py",
+    );
+}
+
+#[test]
+fn nested_async_finally_plain_await_control() {
+    common::assert_matches_cpython_marshal(
+        &nested_async_finally_source("await self.close()", false),
+        "nested_async_finally_plain_await_control.py",
+    );
+}
+
+fn nested_async_finally_source(cleanup: &str, recover_cleanup: bool) -> String {
+    let cleanup = if recover_cleanup {
+        format!(
+            "try:\n    {cleanup}\nexcept BaseException as cleanup_error:\n    if kind is None:\n        raise\n    self.record(cleanup_error)"
+        )
+    } else {
+        cleanup.to_owned()
+    };
+    let cleanup = cleanup.replace('\n', "\n            ");
+    format!(
+        r#"class Session(BaseSession):
+    async def __aexit__(self, kind, error, traceback):
+        if self.event is not None:
+            self.event["status"] = "failed" if kind is not None else "ok"
+            if kind is not None:
+                self.event["kind"] = kind.__name__
+        result = False
+        try:
+            result = await super().__aexit__(kind, error, traceback)
+        except BaseException as cleanup_error:
+            if kind is None:
+                raise
+            self.record(cleanup_error)
+        finally:
+            {cleanup}
+        return result
+"#
+    )
+}

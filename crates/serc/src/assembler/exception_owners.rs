@@ -39,6 +39,7 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) retained_normal_pop_blocks: FxHashMap<Label, RetainedNormalPopBlock>,
     pub(super) original_normal_finally_arrays: Vec<OriginalNormalFinallyArray>,
     pub(super) normal_finally_none_prefixes: Vec<(Instruction, Instruction, Instruction)>,
+    pub(super) copied_manager_return_none_prefixes: Vec<CopiedManagerReturnNonePrefix>,
     pub(super) uncompacted_conditional_arrays: Vec<UncompactedConditionalArray>,
     pub(super) original_primitive_condition_boundaries: Vec<Instruction>,
     // Authored normal exits and their immediate, fully emitted restore records.
@@ -122,6 +123,16 @@ pub(super) struct TupleJoinLocationOrigin {
     pub(super) predecessor: Label,
     pub(super) store: Instruction,
     pub(super) jump: Instruction,
+}
+
+/// Exact awaited return and manager unwind, with two omitted POPs before its finally POP.
+#[derive(Debug)]
+pub(super) struct CopiedManagerReturnNonePrefix {
+    pub(super) entry: Label,
+    pub(super) prefix: [Instruction; 10],
+    pub(super) pop: Instruction,
+    pub(super) load: Instruction,
+    pub(super) condition: Instruction,
 }
 
 /// Original constant-return cleanup, including NULL records omitted under a manager.
@@ -3509,8 +3520,20 @@ impl LayoutAssembler {
                     {
                         let load_index = instruction_index - 1;
                         let load = *indexed_instructions[load_index];
-                        for (original_pop, original_load, original_condition) in
-                            &self.exception_owner_provenance.normal_finally_none_prefixes
+                        let normal_prefixes = self
+                            .exception_owner_provenance
+                            .normal_finally_none_prefixes
+                            .iter()
+                            .map(|(pop, load, condition)| (pop, load, condition, None));
+                        let copied_prefixes = self
+                            .exception_owner_provenance
+                            .copied_manager_return_none_prefixes
+                            .iter()
+                            .map(|origin| {
+                                (&origin.pop, &origin.load, &origin.condition, Some(origin))
+                            });
+                        for (original_pop, original_load, original_condition, copied) in
+                            normal_prefixes.chain(copied_prefixes)
                         {
                             if instruction != original_condition {
                                 continue;
@@ -3563,6 +3586,40 @@ impl LayoutAssembler {
                             {
                                 continue;
                             }
+                            let omitted_pops = if let Some(origin) = copied {
+                                if removed_pop != 1
+                                    || tail.early_removals != 4
+                                    || label_positions.get(&origin.entry)
+                                        != Some(&original_array_start)
+                                    || original_array_start.checked_add(origin.prefix.len())
+                                        != Some(load_index)
+                                    || jump_targets.iter().any(|label| {
+                                        label_positions.get(label).is_some_and(|position| {
+                                            original_array_start < *position
+                                                && *position <= instruction_index + 1
+                                        })
+                                    })
+                                    || indexed_instructions[original_array_start..load_index]
+                                        .iter()
+                                        .zip(origin.prefix)
+                                        .any(|(actual, mut expected)| {
+                                            if expected.opcode == crate::target::opcodes::LOAD_FAST
+                                                && actual.opcode
+                                                    == crate::target::opcodes::LOAD_FAST_BORROW
+                                            {
+                                                expected.opcode = actual.opcode;
+                                            }
+                                            **actual != expected
+                                        })
+                                {
+                                    continue;
+                                }
+                                // Only this intact source prefix omits the manager POP and
+                                // surrounding ordinary-try POP. Do not change generic history.
+                                2
+                            } else {
+                                0
+                            };
                             // Earlier compaction can instead put the appended marker in
                             // the captured POP_BLOCK's original NULL cell. Remove only this
                             // prefix's hidden records to recover that exact old slot.
@@ -3573,14 +3630,20 @@ impl LayoutAssembler {
                             );
                             let original_pop_slot = tail
                                 .early_removals
-                                .checked_sub(comparison_removals + usize::from(removed_pop))
+                                .checked_add(omitted_pops)
+                                .and_then(|removed| {
+                                    removed
+                                        .checked_sub(comparison_removals + usize::from(removed_pop))
+                                })
                                 .and_then(|removed_before| load_index.checked_add(removed_before));
                             if removed_pop == 1 && original_pop_slot == Some(instruction_index + 1)
                             {
                                 pending_normal_none_owner = Some((instruction_index + 1, None));
                                 continue;
                             }
-                            if tail.early_removals != 3 + usize::from(removed_pop) {
+                            if copied.is_some()
+                                || tail.early_removals != 3 + usize::from(removed_pop)
+                            {
                                 continue;
                             }
                             if let Some(region) = self.uniform_exception_owner(

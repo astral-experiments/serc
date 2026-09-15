@@ -4056,6 +4056,99 @@ impl Assembler {
         }
     }
 
+    /// Captures an awaited manager return whose two omitted POPs precede its finally POP.
+    pub(crate) fn record_copied_manager_return_none_prefix(
+        &mut self,
+        return_item: usize,
+        pop_item: usize,
+    ) {
+        use crate::target::opcodes::{CALL, END_SEND, LOAD_CONST, SWAP};
+
+        let items = self.linear_items();
+        if return_item >= pop_item || pop_item >= items.len() {
+            return;
+        }
+        let preceding = items[..return_item]
+            .iter()
+            .enumerate()
+            .rev()
+            .filter_map(|(index, item)| match item {
+                Item::Instruction(instruction) => Some((index, *instruction)),
+                Item::Label(_) => None,
+            })
+            .take(2)
+            .collect::<Vec<_>>();
+        let [(_, discarded), (start, ended)] = preceding.as_slice() else {
+            return;
+        };
+        if discarded.opcode != POP_TOP || ended.opcode != END_SEND {
+            return;
+        }
+        let Some(Item::Label(entry)) = start.checked_sub(1).and_then(|index| items.get(index))
+        else {
+            return;
+        };
+        let entry = *entry;
+        let prefix = items[*start..pop_item]
+            .iter()
+            .filter_map(|item| match item {
+                Item::Instruction(instruction) => Some(*instruction),
+                Item::Label(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let Ok(prefix): Result<[Instruction; 10], _> = prefix.try_into() else {
+            return;
+        };
+        if prefix.iter().map(|instruction| instruction.opcode).ne([
+            END_SEND, POP_TOP, LOAD_FAST, SWAP, SWAP, LOAD_CONST, LOAD_CONST, LOAD_CONST, CALL,
+            POP_TOP,
+        ]) || prefix[3].operand() != Operand::Value(3)
+            || prefix[4].operand() != Operand::Value(2)
+            || prefix[5].operand() != prefix[6].operand()
+            || prefix[6].operand() != prefix[7].operand()
+            || prefix[8].operand() != Operand::Value(3)
+            || items.get(return_item) != Some(&Item::Instruction(prefix[2]))
+            || prefix.iter().any(|instruction| {
+                instruction.local_policy.hidden_exception_owner_slots() != 0
+                    || instruction.pre_fold_extra_instructions() != 0
+            })
+        {
+            return;
+        }
+        let mut suffix = items[pop_item..].iter().filter_map(|item| match item {
+            Item::Instruction(instruction) => Some(*instruction),
+            Item::Label(_) => None,
+        });
+        let (Some(pop), Some(load), Some(condition)) =
+            (suffix.next(), suffix.next(), suffix.next())
+        else {
+            return;
+        };
+        if pop.opcode == NOP
+            && pop.fusion_policy.is_converted_pop_block()
+            && pop.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
+            && pop.local_policy.hidden_exception_owner_slots() == 0
+            && pop.pre_fold_extra_instructions() == 0
+            && load.opcode == LOAD_FAST
+            && load.local_policy.hidden_exception_owner_slots() == 0
+            && load.pre_fold_extra_instructions() == 0
+            && matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+            && matches!(condition.operand(), Operand::Forward(_))
+            && condition.local_policy.hidden_exception_owner_slots() == 3
+            && condition.pre_fold_extra_instructions() == 0
+        {
+            self.exception_owner_provenance
+                .copied_manager_return_none_prefixes
+                .push(exception_owners::CopiedManagerReturnNonePrefix {
+                    entry,
+                    prefix,
+                    pop,
+                    load,
+                    condition,
+                });
+        }
+    }
+
     /// Captures the unchanged first array of an ordinary normal-finally entry.
     pub(crate) fn record_original_normal_finally_array(&mut self, ordinal: usize) {
         let items = self.linear_items();
