@@ -7,9 +7,10 @@ use super::super::{
 };
 use crate::assembler::block_graph::{BasicBlockId, BlockGraph, ItemPosition};
 use crate::target::opcodes::{
-    BUILD_TUPLE, CALL, END_ASYNC_FOR, END_SEND, FOR_ITER, LOAD_CONST, LOAD_FAST, LOAD_GLOBAL, NOP,
-    NOT_TAKEN, POP_EXCEPT, POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE,
-    POP_JUMP_IF_TRUE, POP_TOP, RAISE_VARARGS, RETURN_VALUE, STORE_ATTR, STORE_FAST, SWAP,
+    BUILD_TUPLE, CALL, CALL_KW, END_ASYNC_FOR, END_SEND, FOR_ITER, LOAD_CONST, LOAD_FAST,
+    LOAD_GLOBAL, NOP, NOT_TAKEN, POP_EXCEPT, POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE,
+    POP_JUMP_IF_NOT_NONE, POP_JUMP_IF_TRUE, POP_TOP, RAISE_VARARGS, RETURN_VALUE, STORE_ATTR,
+    STORE_FAST, SWAP,
 };
 use crate::target::{is_conditional_jump, is_unconditional_jump};
 
@@ -2143,6 +2144,75 @@ impl OptimizationPipeline {
             })
             .collect::<Vec<_>>();
 
+        // Snapshot the original keyword-return seam before any exit is copied. A cleanup
+        // elsewhere in the unit must not split two owned loads in this unprotected array.
+        // Keep the complete item lists so a rewritten source, target, or alias cannot reuse it.
+        let original_keyword_return_seams = order
+            .iter()
+            .filter_map(|&source| {
+                let source_items = graph[source].items();
+                let [.., Item::Instruction(first), Item::Instruction(jump)] = source_items else {
+                    return None;
+                };
+                let Operand::Forward(label) = jump.operand() else {
+                    return None;
+                };
+                let target = graph.label_block(label)?;
+                let target_items = graph[target].items();
+                let first_instruction = target_items
+                    .iter()
+                    .position(|item| matches!(item, Item::Instruction(_)))?;
+                let [
+                    Item::Instruction(second),
+                    Item::Instruction(names),
+                    Item::Instruction(call),
+                    Item::Instruction(ret),
+                ] = &target_items[first_instruction..]
+                else {
+                    return None;
+                };
+                (jump.opcode == JUMP_FORWARD
+                    && first.opcode == LOAD_FAST
+                    && second.opcode == LOAD_FAST
+                    && names.opcode == LOAD_CONST
+                    && call.opcode == CALL_KW
+                    && ret.opcode == RETURN_VALUE
+                    && first.pre_fold_extra_instructions() == 0
+                    && jump.pre_fold_extra_instructions() == 0
+                    && first.exception_policy() == ExceptionPolicy::default()
+                    && [second, names, call, ret].iter().all(|instruction| {
+                        instruction.pre_fold_extra_instructions() == 0
+                            && instruction.exception_policy() == ExceptionPolicy::default()
+                            && matches!(instruction.operand(), Operand::Value(_))
+                    })
+                    && super::locals::fuse_pair(first, second).is_some()
+                    && self
+                        .exception_owner_provenance
+                        .block_boundaries
+                        .contains(&label)
+                    && !exception_boundary_blocks[source.index()]
+                    && !exception_boundary_blocks[target.index()]
+                    && region_memberships
+                        .iter()
+                        .enumerate()
+                        .all(|(index, membership)| {
+                            let source_owned = membership.contains(&positions[source.index()]);
+                            let target_owned = membership.contains(&positions[target.index()]);
+                            if self.exception_regions[index].is_scope_fallback {
+                                source_owned == target_owned
+                            } else {
+                                !source_owned && !target_owned
+                            }
+                        }))
+                .then(|| {
+                    (
+                        source,
+                        (target, source_items.to_vec(), target_items.to_vec()),
+                    )
+                })
+            })
+            .collect::<FxHashMap<_, _>>();
+
         let exception_split_labels = self
             .exception_regions
             .iter()
@@ -2591,6 +2661,16 @@ impl OptimizationPipeline {
                     })
                     .unwrap_or(SourceLocation::NONE)
             };
+            let keyword_return_seam = original_keyword_return_seams.get(&source).filter(
+                |(original_target, source_items, target_items)| {
+                    inline_small_exit
+                        && target_chain_end == target_position
+                        && target_pre_fusion_size == 4
+                        && *original_target == target
+                        && graph[source].items() == source_items
+                        && graph[target].items() == target_items
+                },
+            );
             let mut copied = target_blocks
                 .iter()
                 .flat_map(|block| graph[*block].items().iter().copied())
@@ -3537,7 +3617,40 @@ impl OptimizationPipeline {
                                 && super::locals::fuse_pair(first, second).is_some()
                         })
                 });
-            if inline_borrowed_tuple_exit || inline_unprotected_local_pair {
+            // Only the copied entry is artificial. Keep its original target and require
+            // the source to have lost exactly its jump, with the four copied records intact.
+            let inline_keyword_return_pair =
+                keyword_return_seam.is_some_and(|(_, source_items, target_items)| {
+                    inline_unprotected_return
+                        && !planned_copy
+                        && !preserve_inlined_jump_nop
+                        && graph[source].items() == &source_items[..source_items.len() - 1]
+                        && graph[target].items() == target_items
+                        && copied
+                            .iter()
+                            .skip_while(|item| matches!(item, Item::Label(_)))
+                            .copied()
+                            .eq(target_items
+                                .iter()
+                                .skip_while(|item| matches!(item, Item::Label(_)))
+                                .enumerate()
+                                .map(|(index, item)| match item {
+                                    Item::Instruction(instruction) => {
+                                        let mut expected = instruction.for_exit_copy();
+                                        if index == 0 {
+                                            // The existing copy pass carries the removed
+                                            // source jump as one pre-fold slot on this load.
+                                            expected.add_pre_fold_extra_instructions(1);
+                                        }
+                                        Item::Instruction(expected)
+                                    }
+                                    Item::Label(_) => *item,
+                                }))
+                });
+            if inline_borrowed_tuple_exit
+                || inline_unprotected_local_pair
+                || inline_keyword_return_pair
+            {
                 let first_instruction = copied
                     .iter()
                     .position(|item| matches!(item, Item::Instruction(_)))

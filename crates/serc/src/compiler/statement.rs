@@ -4250,6 +4250,34 @@ impl Compiler<'_> {
                 let context = self.control.loops.contexts.last().copied().ok_or_else(|| {
                     CompileError::invalid_syntax("'continue' not properly in loop", statement.range)
                 })?;
+                // This direct named handler contributes two original POP_BLOCKs before
+                // its four name-cleanup records. No other unwind may add hidden records.
+                let continued_handler_origin = (self.context.target_specific_rules_enabled()
+                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
+                    && self.control.withs.active_with_exits.is_empty()
+                    && self.control.exceptions.active_try_marker_slots.is_empty()
+                    && self.control.exceptions.active_exception_group_handlers == 0
+                    && self.control.finally.active_finally_try_bodies == 1
+                    && self.control.finally.active_finally_end_blocks == 0
+                    && self.control.finally.active_normal_finally_bodies == 0
+                    && self.control.finally.active_copied_finally_bodies == 0
+                    && self.control.finally.active_overriding_finally_returns == 0
+                    && self.control.finally.preserved_return_value_contexts.is_empty()
+                    && self.control.finally.copied_return_finally_preserved_values == 0
+                    && self.control.finally.active_pass_finally_locations.is_empty()
+                    && matches!(self.control.exceptions.active_exception_handlers.as_slice(), [handler]
+                        if handler.name.is_some()
+                            && handler.with_depth == 0
+                            && handler.loop_depth == self.control.loops.contexts.len()
+                            && self.control.exceptions.active_exception_region_exclusions.len()
+                                == handler.exception_region_depth + 1
+                            && matches!(self.control.finally.active_loop_finally_contexts.as_slice(), [finally]
+                                if finally.handler_depth == 0
+                                    && finally.with_depth == 0
+                                    && finally.loop_depth == handler.loop_depth
+                                    && finally.exception_region_depth + 1 == handler.exception_region_depth
+                                    && finally.exception_region_depth == context.exception_region_depth)))
+                    .then(|| self.assembler.item_count());
                 let continued_finally_pop_blocks = self.continued_finally_pop_blocks(context);
                 let copied_finally_exclusion_lengths = self
                     .control
@@ -4387,6 +4415,10 @@ impl Compiler<'_> {
                     context.with_depth,
                     Some(context.continue_label),
                 )?;
+                if let Some(origin) = continued_handler_origin {
+                    self.assembler
+                        .record_copied_continue_handler_cleanup(origin);
+                }
                 if exclusion_start.is_some()
                     && finally_end_unwind_start.is_none()
                     && !with_unwind_starts.is_empty()
@@ -18081,7 +18113,10 @@ impl Compiler<'_> {
             };
             self.assembler.record_short_circuit_owner_continuation();
             self.compile_exceptional_finally_suite(&final_if.body)?;
-            if !suite_terminates(&final_if.body) {
+            // Keep an ordinary guard's original end label before RERAISE. Inner joins
+            // still fall through during initial small-exit classification; the assembler
+            // duplicates the shared exceptional exit later while resolving locations.
+            if condition_false.len() > 1 && !suite_terminates(&final_if.body) {
                 self.assembler.set_location(SourceLocation::NONE);
                 self.emit_reraise(ReraiseStackState::ActiveExceptionHandler)?;
             }

@@ -4497,7 +4497,136 @@ impl Assembler {
                 return_nop,
                 instructions,
                 missing_null_pops: if named { 2 } else { 0 },
+                continued_call: None,
             });
+    }
+
+    /// Captures a direct named-handler continue and its first copied call condition.
+    pub(crate) fn record_copied_continue_handler_cleanup(&mut self, continue_item: usize) {
+        use crate::target::opcodes::CALL;
+
+        let items = self.linear_items();
+        let records = items
+            .iter()
+            .enumerate()
+            .skip(continue_item)
+            .filter_map(|(index, item)| match item {
+                Item::Instruction(instruction) => Some((index, *instruction)),
+                Item::Label(_) => None,
+            })
+            .take(12)
+            .collect::<Vec<_>>();
+        if records.len() != 12 || records[0].0 != continue_item {
+            return;
+        }
+        let continuation = records[0].1;
+        let cleanup = records[1..5]
+            .iter()
+            .map(|(_, instruction)| *instruction)
+            .collect::<Vec<_>>();
+        let call: [Instruction; 6] = std::array::from_fn(|index| records[index + 5].1);
+        let marker = records[11].1;
+        if continuation.opcode != NOP
+            || continuation.location.line < 0
+            || cleanup[0].opcode != POP_EXCEPT
+            || cleanup[1].opcode != LOAD_CONST
+            || cleanup[2].opcode != STORE_FAST
+            || cleanup[3].opcode != DELETE_FAST
+            || cleanup[2].operand() != cleanup[3].operand()
+            || cleanup
+                .iter()
+                .any(|instruction| instruction.location != continuation.location)
+            || call[0].opcode != LOAD_GLOBAL
+            || !matches!(call[0].operand(), Operand::Value(argument) if argument & 1 != 0)
+            || call[1].opcode != LOAD_FAST
+            || call[2].opcode != LOAD_GLOBAL
+            || !matches!(call[2].operand(), Operand::Value(argument) if argument & 1 == 0)
+            || call[3].opcode != CALL
+            || call[3].operand() != Operand::Value(2)
+            || call[4].opcode != TO_BOOL
+            || !matches!(call[5].opcode, POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE)
+            || !matches!(call[5].operand(), Operand::Forward(_))
+            || marker.opcode != NOT_TAKEN
+            || marker.operand() != Operand::Value(0)
+            || marker.location != call[5].location
+            || records.iter().any(|(_, instruction)| {
+                instruction.local_policy.hidden_exception_owner_slots() != 0
+                    || instruction.pre_fold_extra_instructions() != 0
+                    || instruction.no_location_policy.borrow_fallthrough()
+                        != BorrowFallthrough::Reachable
+            })
+            || cleanup
+                .iter()
+                .chain(&call)
+                .any(|instruction| instruction.exception_policy() != ExceptionPolicy::default())
+        {
+            return;
+        }
+        let labels = items[continue_item..records[11].0]
+            .iter()
+            .filter_map(|item| match item {
+                Item::Label(label) => Some(*label),
+                Item::Instruction(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let provenance = &self.exception_owner_provenance;
+        if labels.iter().any(|label| {
+            provenance.source_boundaries.contains(label)
+                || provenance.block_boundaries.contains(label)
+                || provenance.fusion_boundaries.contains(label)
+                || provenance.setups.iter().any(|(setup, _)| setup == label)
+                || provenance.omitted_nop_counts.contains_key(label)
+                || provenance.omitted_nop_locations.contains_key(label)
+                || self.preserved_block_boundaries.contains(label)
+                || self
+                    .exception_regions
+                    .iter()
+                    .any(|region| region.target == *label)
+        }) || items.iter().any(|item| {
+            matches!(item, Item::Instruction(instruction)
+            if matches!(instruction.operand(), Operand::Forward(target) | Operand::Backward(target)
+                if labels.contains(&target)))
+        }) {
+            return;
+        }
+        let Some(start) = items[continue_item + 1..records[1].0]
+            .iter()
+            .find_map(|item| {
+                if let Item::Label(label) = item {
+                    Some(*label)
+                } else {
+                    None
+                }
+            })
+        else {
+            return;
+        };
+        let Some(end) = items[records[4].0 + 1..records[5].0]
+            .iter()
+            .find_map(|item| {
+                if let Item::Label(label) = item {
+                    Some(*label)
+                } else {
+                    None
+                }
+            })
+        else {
+            return;
+        };
+        let previous_count = self
+            .exception_owner_provenance
+            .copied_handler_cleanups
+            .len();
+        self.record_copied_handler_cleanup(start, end, continue_item, true);
+        if self
+            .exception_owner_provenance
+            .copied_handler_cleanups
+            .len()
+            == previous_count + 1
+        {
+            self.exception_owner_provenance.copied_handler_cleanups[previous_count]
+                .continued_call = Some((call, marker));
+        }
     }
 
     /// Records an authored return NOP immediately before its direct finally POP.

@@ -514,3 +514,22 @@ def positional(flag, value, other):
 "#;
     common::assert_matches_cpython_marshal(source, "copied_operator_local_fusion.py");
 }
+
+#[test]
+fn matches_cpython_local_fusion_at_keyword_return_seams_after_comprehensions() {
+    common::assert_matches_cpython_marshal(
+        r"async def f(values, selected, tail):
+    items = [item for item in values]
+    candidate = await fetch(items)
+    return pack(items=items, chosen=candidate if selected else None, tail=tail)
+",
+        "async_comprehension_conditional_keyword_tail.py",
+    );
+    common::assert_matches_cpython_marshal(
+        r"def f(values, candidate, selected, tail):
+    items = [item.copy() for item in values]
+    return pack(items, chosen=candidate if selected else None, tail=tail)
+",
+        "comprehension_conditional_keyword_tail.py",
+    );
+}

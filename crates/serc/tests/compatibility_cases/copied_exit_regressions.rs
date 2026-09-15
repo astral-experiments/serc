@@ -442,3 +442,53 @@ fn keeps_try_else_final_match_failure_location() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_marshal_for_nested_lambda_call_tail() {
+    common::assert_matches_cpython_marshal(
+        r"convert = lambda value: (
+    value
+    if is_ready(value)
+    else factory()(
+        transform(value) if fast(value) and valid(value) else value
+    )
+)
+",
+        "nested_lambda_call_tail.py",
+    );
+}
+
+#[test]
+fn matches_cpython_marshal_for_nested_lambda_following_arg_tail() {
+    common::assert_matches_cpython_marshal(
+        r"key = lambda item: (
+    score(item.value if ready else fallback(), item.kind)
+    if item is not None
+    else 0
+)
+",
+        "nested_lambda_following_arg_tail.py",
+    );
+}
+
+#[test]
+fn matches_cpython_marshal_for_joined_lambda_call_control() {
+    common::assert_matches_cpython_marshal(
+        r"convert = lambda value: factory()(
+    transform(value) if fast(value) and valid(value) else value
+)
+",
+        "joined_lambda_call_control.py",
+    );
+}
+
+#[test]
+fn matches_cpython_marshal_for_lambda_chained_condition_tail() {
+    common::assert_matches_cpython_marshal(
+        r#"select = lambda item: (
+    item if lower <= item.metadata.get("length", 0) <= upper else None
+)
+"#,
+        "lambda_chained_condition_tail.py",
+    );
+}

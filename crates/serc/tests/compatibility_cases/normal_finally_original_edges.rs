@@ -567,3 +567,85 @@ fn matches_cpython_marshal_for_loop_finally_owner_cell_none_owner() {
 ";
     common::assert_matches_cpython_marshal(source, "loop_finally_cell_none_owner.py");
 }
+
+#[test]
+fn matches_cpython_marshal_for_guarded_finally_keyword_join() {
+    common::assert_matches_cpython_marshal(
+        r"def guarded(guard, choice, value, other, work, sink):
+    try:
+        work()
+    finally:
+        if guard:
+            sink(first=value, last=value if choice else other)
+",
+        "guarded_finally_keyword_join.py",
+    );
+}
+
+#[test]
+fn matches_cpython_marshal_for_guarded_try_assignment() {
+    common::assert_matches_cpython_marshal(
+        r"def guarded_try(resource, work):
+    try:
+        work()
+    finally:
+        if resource is not None:
+            try:
+                resource.close()
+            except Exception:
+                pass
+            resource = None
+",
+        "guarded_try_assignment.py",
+    );
+}
+
+#[test]
+fn matches_cpython_marshal_for_unguarded_finally_keyword_join_control() {
+    common::assert_matches_cpython_marshal(
+        r"def unguarded(guard, choice, value, other, work, sink):
+    try:
+        work()
+    finally:
+        sink(first=value, last=value if choice else other)
+",
+        "unguarded_finally_keyword_join_control.py",
+    );
+}
+
+#[test]
+fn matches_cpython_marshal_for_guarded_finally_linear_keyword_control() {
+    common::assert_matches_cpython_marshal(
+        r"def guarded_linear(guard, choice, value, other, work, sink):
+    try:
+        work()
+    finally:
+        if guard:
+            sink(first=value, last=other)
+",
+        "guarded_finally_linear_keyword_control.py",
+    );
+}
+
+#[test]
+fn matches_cpython_marshal_for_named_continue_finally_call_owner() {
+    let source = r"async def target(items, value, recover):
+    for item in items:
+        try:
+            await work(item)
+        except Exception as error:
+            if recover:
+                first()
+                second()
+                third()
+                fourth()
+                continue
+            raise
+        finally:
+            if isinstance(value, Kind):
+                value.ready = False
+            if isinstance(item, str):
+                record(item)
+";
+    common::assert_matches_cpython_marshal(source, "named_continue_finally_call_owner.py");
+}

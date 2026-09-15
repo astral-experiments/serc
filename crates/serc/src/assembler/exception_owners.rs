@@ -128,6 +128,7 @@ pub(super) struct CopiedHandlerCleanup {
     pub(super) return_nop: Instruction,
     pub(super) instructions: Vec<Instruction>,
     pub(super) missing_null_pops: usize,
+    pub(super) continued_call: Option<([Instruction; 6], Instruction)>,
 }
 
 /// A single-line source None comparison whose three removed records precede late SETUP cleanup.
@@ -2095,6 +2096,7 @@ impl LayoutAssembler {
                                 instruction_index,
                                 tail.early_removals,
                                 original.missing_null_pops,
+                                original.continued_call,
                             ));
                         }
                     }
@@ -3880,14 +3882,31 @@ impl LayoutAssembler {
                         && owners
                             .get(&instruction_index)
                             .is_none_or(|decision| !decision.definitive)
-                        && let Some((array, start, end, end_removed, missing)) =
+                        && let Some((array, start, end, end_removed, missing, continued_call)) =
                             copied_handler_prefix
                         && array == original_array_start
                         && end <= instruction_index
                         && tail.early_removals >= end_removed
-                        && previous.is_some_and(|previous: Instruction| {
-                            matches!(previous.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
-                                && previous.local_policy.hidden_exception_owner_slots() == 3
+                        && (if let Some((prefix, marker)) = continued_call {
+                            instruction_index - end == prefix.len()
+                                && *instruction == marker
+                                && indexed_instructions[end..instruction_index]
+                                    .iter()
+                                    .zip(prefix)
+                                    .all(|(actual, mut expected)| {
+                                        if expected.opcode == crate::target::opcodes::LOAD_FAST
+                                            && actual.opcode
+                                                == crate::target::opcodes::LOAD_FAST_BORROW
+                                        {
+                                            expected.opcode = actual.opcode;
+                                        }
+                                        **actual == expected
+                                    })
+                        } else {
+                            previous.is_some_and(|previous: Instruction| {
+                                matches!(previous.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+                                    && previous.local_policy.hidden_exception_owner_slots() == 3
+                            })
                         })
                         && let Some(removed) = tail.early_removals.checked_add(missing)
                     {

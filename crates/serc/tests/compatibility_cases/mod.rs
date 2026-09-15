@@ -156,6 +156,7 @@ mod named_handler_else_bare_raise_compatibility;
 mod named_handler_shared_cleanup;
 mod named_outer_handler_return_owners;
 mod negated_chained_comparison_filters;
+mod negated_conditional_filter_join_locations;
 mod negated_filter_recursion;
 mod negated_literal_filter;
 mod negated_none_comprehension_filters;

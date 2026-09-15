@@ -5152,7 +5152,13 @@ impl Compiler<'_> {
         let exit_location = if shared_body_exit {
             SourceLocation::NONE
         } else {
-            self.source_location(conditional.body.range())
+            let range = if comprehension_filter_truthiness(&conditional.body).is_none() {
+                // Branch lowering strips transparent `not`; the operand owns this exit.
+                synthetic_condition_exit_range(&conditional.body)
+            } else {
+                conditional.body.range()
+            };
+            self.source_location(range)
         };
         self.assembler.set_location(exit_location);
         self.emit_jump_forward(JUMP_FORWARD, accepted, 0)?;
@@ -6537,7 +6543,32 @@ impl Compiler<'_> {
         expression: &Expr,
         return_location: SourceLocation,
     ) -> Result<(), CompileError> {
-        self.compile_tail_return_expression_inner(expression, return_location, false)
+        fn has_only_runtime_tail_conditions(expression: &Expr) -> bool {
+            let Expr::If(conditional) = expression else {
+                return true;
+            };
+            early_condition_truthiness(&conditional.test).is_none()
+                && has_only_runtime_tail_conditions(&conditional.body)
+                && has_only_runtime_tail_conditions(&conditional.orelse)
+        }
+
+        // Keep each original conditional join before the shared return. Distributing
+        // returns first can make an inner argument join a small exit too early.
+        // Folded selectors retain their existing discarded-cache admission boundaries.
+        let defer_return = matches!(expression, Expr::If(_))
+            && has_only_runtime_tail_conditions(expression)
+            && !expression_contains_yield(expression);
+        self.compile_tail_return_expression_inner(
+            expression,
+            return_location,
+            false,
+            defer_return,
+        )?;
+        if defer_return {
+            self.assembler.set_location(return_location);
+            self.emit(RETURN_VALUE, 0, -1)?;
+        }
+        Ok(())
     }
 
     fn compile_tail_return_expression_inner(
@@ -6545,14 +6576,17 @@ impl Compiler<'_> {
         expression: &Expr,
         return_location: SourceLocation,
         final_fallthrough: bool,
+        defer_return: bool,
     ) -> Result<(), CompileError> {
         let Expr::If(conditional) = expression else {
             self.compile_with_strict_owned_loads(
                 final_fallthrough && matches!(expression, Expr::Name(_)),
                 |compiler| compiler.compile_expression(expression),
             )?;
-            self.assembler.set_location(return_location);
-            self.emit(RETURN_VALUE, 0, -1)?;
+            if !defer_return {
+                self.assembler.set_location(return_location);
+                self.emit(RETURN_VALUE, 0, -1)?;
+            }
             return Ok(());
         };
 
@@ -6580,6 +6614,7 @@ impl Compiler<'_> {
                 selected,
                 return_location,
                 final_fallthrough,
+                defer_return,
             )?;
             if truthiness {
                 self.pre_register_discarded_expression(&conditional.orelse, None)?;
@@ -6589,13 +6624,38 @@ impl Compiler<'_> {
 
         let base_depth = self.control.stack.depth;
         let otherwise = self.assembler.label();
-        self.compile_jump_if(&conditional.test, false, otherwise)?;
-        self.compile_tail_return_expression_inner(&conditional.body, return_location, false)?;
+        let end = defer_return.then(|| self.assembler.label());
+        if defer_return {
+            self.compile_if_expression_condition(&conditional.test, otherwise)?;
+        } else {
+            self.compile_jump_if(&conditional.test, false, otherwise)?;
+        }
+        self.compile_tail_return_expression_inner(
+            &conditional.body,
+            return_location,
+            false,
+            defer_return,
+        )?;
+        if let Some(end) = end {
+            self.assembler.set_location(SourceLocation::NONE);
+            self.emit_jump_forward(JUMP_FORWARD, end, 0)?;
+        }
 
         self.assembler.mark(otherwise);
         self.set_depth(base_depth);
-        self.compile_tail_return_expression_inner(&conditional.orelse, return_location, true)?;
-        self.set_depth(base_depth);
+        self.compile_tail_return_expression_inner(
+            &conditional.orelse,
+            return_location,
+            true,
+            defer_return,
+        )?;
+        if let Some(end) = end {
+            self.assembler.preserve_block_boundary_if_new(end);
+            self.assembler.mark(end);
+            self.set_depth(base_depth + 1);
+        } else {
+            self.set_depth(base_depth);
+        }
         Ok(())
     }
 
