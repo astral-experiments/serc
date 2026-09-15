@@ -440,3 +440,47 @@ fn matches_cpython_named_handler_exit_retains_inner_manager_owner() {
         "manager_before_outer_try.py",
     );
 }
+
+#[test]
+fn matches_cpython_unmanaged_copied_handler_finally_slot_owners() {
+    common::assert_matches_cpython_marshal(
+        r"def close_on_exit(resource):
+    try:
+        work()
+    except Error:
+        report()
+        return 0
+    finally:
+        if resource is not None:
+            resource.close()
+",
+        "unmanaged_handler_finally_owner.py",
+    );
+    common::assert_matches_cpython_marshal(
+        r"def close_on_exit(manager, resource):
+    with manager:
+        try:
+            work()
+        except Error:
+            report()
+            return 0
+        finally:
+            if resource is not None:
+                resource.close()
+",
+        "managed_handler_finally_owner_control.py",
+    );
+    common::assert_matches_cpython_marshal(
+        r"def close_on_exit(resource, report):
+    try:
+        work()
+    except Error:
+        report()
+        return 0
+    finally:
+        if resource is not None:
+            resource.close()
+",
+        "unmanaged_handler_finally_local_call_control.py",
+    );
+}

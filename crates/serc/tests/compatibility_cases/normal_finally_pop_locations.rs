@@ -250,3 +250,81 @@ fn matches_cpython_nested_else_while_normal_exit_location() {
         "protected_direct_while_exit_location_control.py",
     );
 }
+
+#[test]
+fn matches_cpython_conditional_finally_before_split_tail_if() {
+    for (filename, source) in [
+        (
+            "conditional_finally_sync_target.py",
+            r"def retry():
+    while active():
+        try:
+            work()
+            return
+        except Error:
+            recover()
+        finally:
+            if resource is not None:
+                close(resource)
+        if stop():
+            return
+",
+        ),
+        (
+            "conditional_finally_async_target.py",
+            r"async def reconnect():
+    while running():
+        try:
+            await work()
+        except Error:
+            recover()
+        finally:
+            if connected():
+                await close()
+                state.connected = False
+        if running():
+            await pause()
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn preserves_conditional_finally_tail_boundaries() {
+    for (filename, source) in [
+        (
+            "conditional_finally_direct_backedge_control.py",
+            r"def retry():
+    while active():
+        try:
+            work()
+            return
+        except Error:
+            recover()
+        finally:
+            if resource is not None:
+                close(resource)
+",
+        ),
+        (
+            "conditional_finally_folded_true_control.py",
+            r"def retry():
+    while active():
+        try:
+            work()
+            return
+        except Error:
+            recover()
+        finally:
+            if resource is not None:
+                close(resource)
+        if True:
+            return
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

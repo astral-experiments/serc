@@ -5792,7 +5792,6 @@ impl Compiler<'_> {
                                     && handler_count == 1
                                     && next_finally == 1
                                     && !preserve_named_handler_pop_slots
-                                    && with_depth > 0
                                     && next_with == with_depth
                                     // Matching saved depths and the exact emitted prefix
                                     // exclude iterator cleanup before this pending finally.
@@ -18039,10 +18038,13 @@ impl Compiler<'_> {
             if matches!(conditional_exit, Some(NestedIfExitLocation::Unlocated))
                 && (self.control.loops.contexts.is_empty()
                     || self.control.statements.current_statement_has_following
-                    || self.control.statements.inherited_statement_has_following)
+                    || self.control.statements.inherited_statement_has_following
+                    || self.control.loops.synthesized_loop_tail_predecessor
+                        == Some(statement.range))
             {
-                // A shared normal continuation stays unlocated. A loop continuation instead
-                // inherits its predecessor's range when the backedge is copied into the exit.
+                // A shared normal continuation stays unlocated, including a separately
+                // lowered final loop condition. A direct backedge instead inherits its
+                // predecessor's range when copied into the exit.
                 self.assembler
                     .preserve_no_location(normal_exit.instruction());
             }
