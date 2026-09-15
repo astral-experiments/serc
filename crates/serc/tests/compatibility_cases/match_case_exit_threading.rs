@@ -639,3 +639,30 @@ fn wildcard_match_try_exit_source(following_call: &str) -> String {
 "#
     )
 }
+
+#[test]
+fn wildcard_match_try_exit_async_call_continuation() {
+    common::assert_matches_cpython_marshal(
+        &wildcard_match_try_exit_async_source("    return finish(value, instruction)\n"),
+        "wildcard_match_try_exit_async_call.py",
+    );
+}
+
+#[test]
+fn wildcard_match_try_exit_async_local_return_control() {
+    common::assert_matches_cpython_marshal(
+        &wildcard_match_try_exit_async_source("    return value\n"),
+        "wildcard_match_try_exit_async_local.py",
+    );
+}
+
+fn wildcard_match_try_exit_async_source(continuation: &str) -> String {
+    wildcard_match_try_exit_source("")
+        .replacen("def update(", "async def update(", 1)
+        .replacen(
+            "        content =",
+            "        await prepare(value)\n        content =",
+            1,
+        )
+        .replacen("    return value\n", continuation, 1)
+}

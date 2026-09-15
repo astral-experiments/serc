@@ -2834,12 +2834,38 @@ impl OptimizationPipeline {
                 // turns it backward. The original synthetic cleanup edge remains no-interrupt.
                 instruction.opcode = JUMP_BACKWARD;
             }
+            // A short keyword-call raise is also a scope exit in CPython's
+            // original array. Keep the same empty-join provenance and location
+            // guards as returns; admit only its three unchanged records here.
+            let inline_unprotected_keyword_raise = inline_small_exit
+                && target_chain_end == target_position
+                && target_pre_fusion_size == 3
+                && graph[target]
+                    .items()
+                    .iter()
+                    .filter_map(|item| match item {
+                        Item::Instruction(instruction) => Some(instruction.opcode),
+                        Item::Label(_) => None,
+                    })
+                    .eq([LOAD_CONST, CALL_KW, RAISE_VARARGS])
+                && graph[target]
+                    .last_instruction()
+                    .is_some_and(|instruction| instruction.operand() == Operand::Value(1))
+                && region_memberships
+                    .iter()
+                    .enumerate()
+                    .all(|(index, membership)| {
+                        self.exception_regions[index].is_scope_fallback
+                            || (!membership.contains(&source_position)
+                                && !membership.contains(&target_position))
+                    });
             // Keep an isolated unlocated join's replaced-jump NOP until its
             // remaining fallthrough predecessor supplies a location. Earlier jump
             // threading may already have removed its other incoming edges.
             // Exception bookkeeping can split a block without creating an original
             // CFG boundary, so only retain markers on recorded original blocks.
-            let preserve_unlocated_join_nop = inline_unprotected_return
+            let preserve_unlocated_join_nop = (inline_unprotected_return
+                || inline_unprotected_keyword_raise)
                 && target_chain_end == target_position
                 && source_location.line < 0
                 && graph[source].items().iter().any(|item| {
@@ -2877,7 +2903,8 @@ impl OptimizationPipeline {
             // original-empty-join certificate survives retargeting even when the
             // direct-edge line policy is cleared. Current block width alone cannot
             // prove this: earlier folding may have removed original instructions.
-            let preserve_threaded_join_nop = inline_unprotected_return
+            let preserve_threaded_join_nop = (inline_unprotected_return
+                || inline_unprotected_keyword_raise)
                 && target_chain_end == target_position
                 && source_location.line >= 0
                 && graph[source].items().iter().any(|item| {

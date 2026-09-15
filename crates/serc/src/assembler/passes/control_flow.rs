@@ -1769,6 +1769,61 @@ impl OptimizationPipeline {
         &mut self,
         finalize_borrow_empty_blocks: bool,
     ) {
+        // A removed original POP_BLOCK can leave its entry and end labels in
+        // separate empty graph blocks. Bind them to the next physical record;
+        // renamed labels from copied cleanup arrays cannot certify this jump.
+        let mut wildcard_fallthrough_exits = Vec::new();
+        if finalize_borrow_empty_blocks
+            && !self
+                .exception_owner_provenance
+                .normal_try_wildcard_fallthroughs
+                .is_empty()
+        {
+            let mut next_instructions = FxHashMap::default();
+            let mut pending_labels = Vec::new();
+            for &block in self.graph.order() {
+                for (offset, item) in self.graph[block].items().iter().enumerate() {
+                    match item {
+                        Item::Label(label) => pending_labels.push(*label),
+                        Item::Instruction(_) => {
+                            let position = ItemPosition::new(block, offset);
+                            for label in pending_labels.drain(..) {
+                                next_instructions.insert(label, position);
+                            }
+                        }
+                    }
+                }
+            }
+            for &(entry, target) in &self.exception_owner_provenance.normal_try_exits {
+                let Some((_, pop)) = self
+                    .exception_owner_provenance
+                    .normal_try_wildcard_fallthroughs
+                    .get(&entry)
+                else {
+                    continue;
+                };
+                let Some(&position) = next_instructions.get(&entry) else {
+                    continue;
+                };
+                let retired = &self
+                    .exception_owner_provenance
+                    .retired_normal_try_copy_labels;
+                if !retired.contains(&entry)
+                    && self
+                        .exception_owner_provenance
+                        .normal_try_copy_pop_ranges
+                        .iter()
+                        .any(|(start, end)| {
+                            !retired.contains(start)
+                                && !retired.contains(end)
+                                && next_instructions.get(start) == Some(&position)
+                                && next_instructions.get(end) == Some(&position)
+                        })
+                {
+                    wildcard_fallthrough_exits.push((position, target, *pop));
+                }
+            }
+        }
         // Count only labels certified to enter the same original instruction array.
         // Two separate arrays must not become shared merely because later passes merge them.
         let mut shared_entries = FxHashMap::<Label, usize>::default();
@@ -2020,7 +2075,30 @@ impl OptimizationPipeline {
                                                 .any(|item| *item == Item::Label(*entry))
                                     })
                         });
-                    if (!instruction.jump_policy.always_retains_nop() || absorbed_normal_try_exit)
+                    // CPython resets the preceding line at the original cleanup array.
+                    // Its physical wildcard donor belongs to the preceding array, so the
+                    // late redundant jump becomes a NOP even with the same source line.
+                    let preserves_wildcard_fallthrough_nop = !absorbed_normal_try_exit
+                        && !crosses_exception_boundary
+                        && !instruction.fusion_policy.is_authored_break()
+                        && instruction.pre_fold_extra_instructions() == 0
+                        && previous == previous_at_block_entry
+                        && instruction.location.line >= 0
+                        && next_line
+                            .is_some_and(|line| line >= 0 && line != instruction.location.line)
+                        && wildcard_fallthrough_exits.iter().any(
+                            |(original, original_target, pop)| {
+                                *original == position
+                                    && *original_target == target
+                                    && instruction.location == pop.location
+                                    && previous.is_some_and(|previous| {
+                                        graph.item(previous) == &Item::Instruction(*pop)
+                                    })
+                            },
+                        );
+                    if !preserves_wildcard_fallthrough_nop
+                        && (!instruction.jump_policy.always_retains_nop()
+                            || absorbed_normal_try_exit)
                         && (instruction.location.line < 0
                             || previous_line == Some(instruction.location.line)
                             || next_line == Some(instruction.location.line))

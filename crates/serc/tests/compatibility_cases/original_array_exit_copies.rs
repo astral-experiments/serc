@@ -430,3 +430,37 @@ fn matches_cpython_optimized_tuple_conditional_attribute_plain_control() {
         "plain_call_conditional_attribute_control.py",
     );
 }
+
+#[test]
+fn matches_cpython_optimized_tuple_conditional_keyword_join() {
+    common::assert_matches_cpython_marshal(
+        r"def probe(values, enabled, fail):
+    raise fail(
+        code=1,
+        values=(
+            tuple(value.code for value in values)
+            if enabled
+            else ()
+        ),
+    )
+",
+        "optimized_tuple_conditional_keyword.py",
+    );
+}
+
+#[test]
+fn matches_cpython_optimized_tuple_conditional_keyword_plain_control() {
+    common::assert_matches_cpython_marshal(
+        r"def probe(values, enabled, fail, collect):
+    raise fail(
+        code=1,
+        values=(
+            collect(values)
+            if enabled
+            else ()
+        ),
+    )
+",
+        "plain_call_conditional_keyword_control.py",
+    );
+}
