@@ -11275,6 +11275,48 @@ def final_elif(action, first, second):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_generator_two_handlers_in_ordinary_try_generator() {
+        let source = r"def f(value):
+    yield value
+    try:
+        prepare(value)
+        try:
+            first(value)
+        except FirstError:
+            try:
+                second(value)
+            except SecondError as error:
+                observe(error)
+                return None
+        return value
+    except OuterError:
+        return None
+";
+        assert_matches_cpython_marshal(source, "generator_inner_named_excluded.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_generator_two_handlers_in_ordinary_try_async_generator() {
+        let source = r"async def f(value):
+    yield value
+    try:
+        await prepare(value)
+        try:
+            first(value)
+        except FirstError:
+            try:
+                second(value)
+            except SecondError as error:
+                observe(error)
+                return
+        return
+    except OuterError:
+        return
+";
+        assert_matches_cpython_marshal(source, "async_generator_inner_named_excluded.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_manager_handler_enclosing_try_owners() {
         let source = include_str!("fixtures/manager_handler_enclosing_try_owners.py");
         assert_matches_cpython_marshal(source, "manager_handler_enclosing_try_owners.py");

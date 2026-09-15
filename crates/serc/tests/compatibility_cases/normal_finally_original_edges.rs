@@ -492,3 +492,20 @@ fn matches_cpython_marshal_for_large_tuple_cell_assert() {
 ";
     common::assert_matches_cpython_marshal(source, "large_tuple_cell_assert.py");
 }
+
+#[test]
+fn matches_cpython_marshal_for_loop_finally_owner_call_owner() {
+    let source = r"async def f(manager, values, writer, kind):
+    with manager:
+        try:
+            for value in values:
+                await consume(value)
+                if value.stop:
+                    break
+        finally:
+            if isinstance(writer, kind):
+                writer.close()
+            finish()
+";
+    common::assert_matches_cpython_marshal(source, "loop_finally_call_owner.py");
+}

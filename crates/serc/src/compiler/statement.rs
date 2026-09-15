@@ -4962,7 +4962,6 @@ impl Compiler<'_> {
                         .active_exception_region_exclusions
                         .len()
                         == 3
-                    && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
                     && self.control.exceptions.active_exception_group_handlers == 0
                     && self.control.withs.active_with_exits.is_empty()
                     && self.control.loops.contexts.is_empty()
@@ -11484,6 +11483,11 @@ impl Compiler<'_> {
             }
         }
         if has_break {
+            if self.assembler.has_authored_forward_break_to(end) {
+                // An emitted break targets a separate original array after END_FOR
+                // and POP_ITER. Its cleanup conditions cannot borrow earlier slots.
+                self.assembler.record_exception_owner_block_boundary(end);
+            }
             self.assembler.mark(end);
         }
         self.set_depth(base_depth);
