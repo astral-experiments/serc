@@ -20822,6 +20822,9 @@ fn with_body_match_exit_location(body: &[Stmt]) -> Option<TextRange> {
         return None;
     };
     let (fallback, preceding) = statement.cases.split_last()?;
+    if let Some(location) = with_match_manager_exit_location(statement) {
+        return Some(location);
+    }
     if fallback.guard.is_none()
         && matches!(
             fallback.pattern,
@@ -20869,6 +20872,44 @@ fn with_body_match_exit_location(body: &[Stmt]) -> Option<TextRange> {
     // The other cases exit directly. The irrefutable case's normal edge alone
     // locates the original match join containing the manager's converted POP_BLOCK.
     Some(expression.value.range())
+}
+
+/// Locates a match join reached only by one inner manager's suppression exit.
+fn with_match_manager_exit_location(statement: &ruff_python_ast::StmtMatch) -> Option<TextRange> {
+    let (fallback, preceding) = statement.cases.split_last()?;
+    if preceding.is_empty()
+        || !is_wildcard_pattern(&fallback.pattern)
+        || statement.cases.iter().any(|case| case.guard.is_some())
+    {
+        return None;
+    }
+    let mut location = None;
+    for case in &statement.cases {
+        if suite_terminates(&case.body) {
+            if !matches!(case.body.last(), Some(Stmt::Return(_) | Stmt::Raise(_))) {
+                return None;
+            }
+            continue;
+        }
+        let Some(Stmt::With(manager)) = case.body.last() else {
+            return None;
+        };
+        if manager.is_async
+            || manager.items.len() != 1
+            || !matches!(manager.body.last(), Some(Stmt::Return(_)))
+        {
+            return None;
+        }
+        // A return skips normal inner cleanup. Only exception suppression reaches
+        // the outer manager's POP_BLOCK, carrying this inner manager's location.
+        if location
+            .replace(manager.items[0].context_expr.range())
+            .is_some()
+        {
+            return None;
+        }
+    }
+    location
 }
 
 // A complete conditional with one direct terminal arm leaves the other arm as the sole

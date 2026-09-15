@@ -16,6 +16,8 @@ use crate::target::{is_conditional_jump, is_scope_exit};
 #[derive(Debug, Default)]
 pub(super) struct ExceptionOwnerProvenance {
     pub(super) setups: Vec<(Label, Option<SourceLocation>)>,
+    // Original ordinary-await suspension regions, resolved alongside their live regions.
+    pub(super) ordinary_await_cleanups: Vec<super::ExceptionRegion>,
     // Authored return NOP, immediately following finally POP, and original try target.
     pub(super) early_return_nop_pairs: Vec<(Instruction, Instruction, Label)>,
     pub(super) copied_handler_cleanups: Vec<CopiedHandlerCleanup>,

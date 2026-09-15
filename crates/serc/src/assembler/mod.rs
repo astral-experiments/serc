@@ -4866,6 +4866,28 @@ impl Assembler {
             .push((label, nop_location));
     }
 
+    /// Records a completed ordinary await separately from async-manager protocol awaits.
+    pub(crate) fn record_ordinary_await_cleanup(&mut self, yielded: Label, cleanup: Label) {
+        let mut regions = self
+            .exception_regions
+            .iter()
+            .filter(|region| region.start == yielded && region.target == cleanup);
+        let Some(&region) = regions.next() else {
+            return;
+        };
+        if regions.next().is_some()
+            || region.is_scope_fallback
+            || region.preserve_lasti
+            || !matches!(region.priority, ExceptionRegionPriority::OriginalRange(start, end)
+                if start == region.start && end == region.end)
+        {
+            return;
+        }
+        self.exception_owner_provenance
+            .ordinary_await_cleanups
+            .push(region);
+    }
+
     /// Authenticates the original `SEND`/`END_SEND` array before an async manager's setup.
     pub(crate) fn record_async_with_exception_setup(&mut self, label: Label) {
         self.record_exception_setup(label, false);

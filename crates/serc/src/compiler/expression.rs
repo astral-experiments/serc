@@ -2351,6 +2351,10 @@ impl Compiler<'_> {
         self.assembler.mark(end);
         self.set_depth(base_depth + 2);
         self.emit(END_SEND, 0, -1)?;
+        if get_awaitable_argument == 0 {
+            self.assembler
+                .record_ordinary_await_cleanup(yielded, cleanup);
+        }
         Ok(())
     }
 

@@ -666,3 +666,25 @@ fn wildcard_match_try_exit_async_source(continuation: &str) -> String {
         )
         .replacen("    return value\n", continuation, 1)
 }
+
+#[test]
+fn wildcard_match_try_exit_await_later_arm() {
+    let source = wildcard_match_try_exit_async_source("    return finish(value, instruction)\n")
+        .replacen(
+            "content.instructions.append(instruction)",
+            "await content.instructions.append(instruction)",
+            1,
+        );
+    common::assert_matches_cpython_marshal(&source, "wildcard_match_try_exit_await_later.py");
+}
+
+#[test]
+fn wildcard_match_try_exit_await_first_arm_control() {
+    let source = wildcard_match_try_exit_async_source("    return finish(value, instruction)\n")
+        .replacen(
+            "content.parts.append(instruction)",
+            "await content.parts.append(instruction)",
+            1,
+        );
+    common::assert_matches_cpython_marshal(&source, "wildcard_match_try_exit_await_first.py");
+}

@@ -1,10 +1,11 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::super::block_graph::ItemPosition;
+use super::super::block_graph::{BasicBlockId, ItemPosition};
 use super::super::exception_owners::TupleJoinLocationOrigin;
 use super::super::is_unconditional_jump;
 use super::super::{
-    ExceptionRegion, Instruction, Item, Label, Operand, OptimizationPipeline, SourceLocation,
+    ExceptionRegion, ExceptionRegionPriority, Instruction, Item, Label, Operand,
+    OptimizationPipeline, SourceLocation,
 };
 use super::normal_try_copy_plan::{OriginalNode, OriginalTail, PrefixSlot, plan_normal_try_copies};
 use crate::target::opcodes::{JUMP_BACKWARD, JUMP_FORWARD, NOP};
@@ -420,6 +421,118 @@ impl OptimizationPipeline {
         self.exception_owner_provenance.normal_try_copy_steps = copy_steps;
     }
 
+    /// Recognizes intact compiler-generated ordinary-await handlers inside a case interval.
+    fn ordinary_await_cleanup_labels(&self, blocks: &[BasicBlockId]) -> FxHashSet<Label> {
+        use crate::target::opcodes::{CLEANUP_THROW, END_SEND, SEND, YIELD_VALUE};
+
+        let mut labels = FxHashSet::default();
+        for original in &self.exception_owner_provenance.ordinary_await_cleanups {
+            let (yielded, cleanup) = (original.start, original.target);
+            let (Some(yield_block), Some(cleanup_block)) = (
+                self.graph.label_block(yielded),
+                self.graph.label_block(cleanup),
+            ) else {
+                continue;
+            };
+            let (Some(yield_position), Some(cleanup_position)) = (
+                blocks.iter().position(|block| *block == yield_block),
+                blocks.iter().position(|block| *block == cleanup_block),
+            ) else {
+                continue;
+            };
+            let mut setups = self
+                .exception_owner_provenance
+                .setups
+                .iter()
+                .filter(|(label, _)| *label == yielded || *label == cleanup);
+            if setups.next() != Some(&(yielded, None)) || setups.next().is_some() {
+                continue;
+            }
+            let mut regions = self
+                .exception_regions
+                .iter()
+                .filter(|region| region.target == yielded || region.target == cleanup);
+            let Some(region) = regions.next() else {
+                continue;
+            };
+            if regions.next().is_some()
+                || region.start != original.start
+                || region.end != original.end
+                || region.target != original.target
+                || region.depth != original.depth
+                || region.is_scope_fallback != original.is_scope_fallback
+                || region.preserve_lasti != original.preserve_lasti
+                || region.is_scope_fallback
+                || region.preserve_lasti
+                || !matches!((region.priority, original.priority),
+                    (ExceptionRegionPriority::Resolved { start, end },
+                     ExceptionRegionPriority::Resolved { start: original_start, end: original_end })
+                        if start == original_start && end == original_end)
+            {
+                continue;
+            }
+            let [Item::Label(yield_label), Item::Instruction(yield_value)] =
+                self.graph[yield_block].items()
+            else {
+                continue;
+            };
+            let [Item::Label(cleanup_label), Item::Instruction(cleanup_throw)] =
+                self.graph[cleanup_block].items()
+            else {
+                continue;
+            };
+            let Some(end_block) = blocks.get(cleanup_position + 1) else {
+                continue;
+            };
+            let [Item::Label(end), Item::Instruction(end_send), ..] =
+                self.graph[*end_block].items()
+            else {
+                continue;
+            };
+            if *yield_label != yielded
+                || *cleanup_label != cleanup
+                || yield_position == 0
+                || yield_position + 1 >= cleanup_position
+                || self.graph.label_block(region.end) != Some(blocks[yield_position + 1])
+                || yield_value.opcode != YIELD_VALUE
+                || yield_value.operand() != Operand::Value(1)
+                || cleanup_throw.opcode != CLEANUP_THROW
+                || cleanup_throw.operand() != Operand::Value(0)
+                || end_send.opcode != END_SEND
+                || end_send.operand() != Operand::Value(0)
+                || yield_value.depth_after() != Some(region.depth)
+                || cleanup_throw.depth_after() != Some(region.depth)
+                || end_send.depth_after() != region.depth.checked_sub(1)
+                || !self
+                    .exception_owner_provenance
+                    .source_boundaries
+                    .contains(end)
+                || !self.graph[blocks[yield_position - 1]]
+                    .last_instruction()
+                    .is_some_and(|send| {
+                        send.opcode == SEND && send.operand() == Operand::Forward(*end)
+                    })
+                || super::super::block_has_fallthrough(
+                    self.graph[blocks[cleanup_position - 1]].items(),
+                )
+            {
+                continue;
+            }
+            // Exact one-label blocks reject aliases. The paired SEND is the only
+            // normal input to these records or their END_SEND continuation.
+            if self.graph.iter_items().filter(|item| matches!(item,
+                Item::Instruction(instruction)
+                    if matches!(instruction.operand(), Operand::Forward(label) | Operand::Backward(label)
+                        if label == yielded || label == cleanup || label == *end)))
+                .count() != 1
+            {
+                continue;
+            }
+            labels.extend([yielded, cleanup]);
+        }
+        labels
+    }
+
     /// Restores a shared original cleanup before its successful edges are copied.
     pub(in crate::assembler) fn prepare_conditional_normal_try_joins(&mut self) {
         // A scheduled original-array plan owns this graph's copy order.
@@ -626,6 +739,8 @@ impl OptimizationPipeline {
                 else {
                     continue;
                 };
+                let ordinary_await_labels =
+                    self.ordinary_await_cleanup_labels(&order[first_success..position]);
                 if !successful_sources
                     .iter()
                     .all(|source| order[..position - 1].contains(source))
@@ -633,8 +748,9 @@ impl OptimizationPipeline {
                         .iter()
                         .flat_map(|block| self.graph[*block].items())
                         .any(|item| matches!(item, Item::Label(label)
-                            if self.exception_regions.iter().any(|region| region.target == *label)
-                                || self.exception_owner_provenance.setups.iter().any(|(entry, _)| entry == label)))
+                            if !ordinary_await_labels.contains(label)
+                                && (self.exception_regions.iter().any(|region| region.target == *label)
+                                    || self.exception_owner_provenance.setups.iter().any(|(entry, _)| entry == label))))
                 {
                     continue;
                 }

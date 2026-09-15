@@ -465,3 +465,36 @@ fn retains_cpython_coroutine_return_join_without_inner_try() {
 ";
     common::assert_matches_cpython_marshal(source, "coroutine_return_join_no_try_control.py");
 }
+
+#[test]
+fn nested_manager_suppression_match_exit() {
+    let source = r#"
+def make_runner(outer, inner, kind):
+    with outer:
+        match kind:
+            case "primary":
+                with inner:
+                    def run(value):
+                        return consume(value)
+                    return run
+            case _:
+                raise ValueError(kind)
+"#;
+    common::assert_matches_cpython_marshal(source, "nested_manager_match_suppression.py");
+}
+
+#[test]
+fn nested_manager_suppression_if_exit_control() {
+    let source = r#"
+def make_runner(outer, inner, kind):
+    with outer:
+        if kind == "primary":
+            with inner:
+                def run(value):
+                    return consume(value)
+                return run
+        else:
+            raise ValueError(kind)
+"#;
+    common::assert_matches_cpython_marshal(source, "nested_manager_if_suppression.py");
+}

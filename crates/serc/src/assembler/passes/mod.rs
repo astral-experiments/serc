@@ -227,6 +227,10 @@ impl Assembler {
                 .exception_owner_provenance
                 .normal_try_jump_owners
                 .is_empty()
+            || !self
+                .exception_owner_provenance
+                .ordinary_await_cleanups
+                .is_empty()
         {
             // Original setup order expresses nesting even when copied cleanup code makes an
             // inner range longer than its parent, or exclusions split the parent into fragments.
@@ -238,12 +242,29 @@ impl Assembler {
                     Item::Instruction(_) => None,
                 })
                 .collect::<rustc_hash::FxHashMap<_, _>>();
-            for region in self.exception_regions.iter_mut().chain(
-                self.exception_owner_provenance
-                    .normal_try_jump_owners
-                    .values_mut()
-                    .flatten(),
-            ) {
+            // Removed source labels cannot certify an intact original await.
+            self.exception_owner_provenance
+                .ordinary_await_cleanups
+                .retain(|region| {
+                    label_positions.contains_key(&region.start)
+                        && label_positions.contains_key(&region.end)
+                        && label_positions.contains_key(&region.target)
+                });
+            for region in self
+                .exception_regions
+                .iter_mut()
+                .chain(
+                    self.exception_owner_provenance
+                        .normal_try_jump_owners
+                        .values_mut()
+                        .flatten(),
+                )
+                .chain(
+                    self.exception_owner_provenance
+                        .ordinary_await_cleanups
+                        .iter_mut(),
+                )
+            {
                 if let super::ExceptionRegionPriority::OriginalRange(start, end) = region.priority {
                     region.priority = super::ExceptionRegionPriority::Resolved {
                         start: label_positions[&start],
