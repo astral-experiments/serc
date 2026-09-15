@@ -716,3 +716,124 @@ fn matches_cpython_marshal_for_terminal_raise_early_call_finally() {
 "#;
     common::assert_matches_cpython_marshal(source, "conditional_finally_early_call_control.py");
 }
+
+#[test]
+fn matches_cpython_marshal_for_boolean_finally_entry_after_dispatch() {
+    let source = r#"def run_job(config, session):
+    session.start()
+    try:
+        wait_ready(session, retry_count=config.retry_count)
+        runner = lambda harness, args: run(harness, args, timeout=config.timeout)
+        if config.first:
+            first(config.harness, first_args(), runner=runner)
+        elif config.second:
+            second(config.harness, second_args(), runner=runner)
+        elif config.third:
+            third(config.harness, third_args(), runner=runner)
+        else:
+            run(config.harness, config.args, runner=runner)
+    except Exception as error:
+        if config.wait_on_failure:
+            report(str(error))
+            report("Waiting for interruption")
+            try:
+                while True:
+                    idle()
+            except KeyboardInterrupt:
+                report("Stopping")
+        else:
+            raise
+    finally:
+        if session.started and not config.wait_on_failure:
+            session.stop()
+    return 0
+"#;
+    common::assert_matches_cpython_marshal(source, "boolean_finally_dispatch.py");
+}
+
+#[test]
+fn matches_cpython_marshal_for_single_condition_finally_entry_after_dispatch() {
+    let source = r#"def run_job(config, session):
+    session.start()
+    try:
+        wait_ready(session, retry_count=config.retry_count)
+        runner = lambda harness, args: run(harness, args, timeout=config.timeout)
+        if config.first:
+            first(config.harness, first_args(), runner=runner)
+        elif config.second:
+            second(config.harness, second_args(), runner=runner)
+        elif config.third:
+            third(config.harness, third_args(), runner=runner)
+        else:
+            run(config.harness, config.args, runner=runner)
+    except Exception as error:
+        if config.wait_on_failure:
+            report(str(error))
+            report("Waiting for interruption")
+            try:
+                while True:
+                    idle()
+            except KeyboardInterrupt:
+                report("Stopping")
+        else:
+            raise
+    finally:
+        if session.started:
+            session.stop()
+    return 0
+"#;
+    common::assert_matches_cpython_marshal(source, "single_condition_finally_dispatch.py");
+}
+
+#[test]
+fn matches_cpython_marshal_for_coroutine_manager_arm_finally_entry() {
+    let source = r#"async def prepare(mode, phases, task, measure, tracer, cleanup, record, now):
+    try:
+        if mode is phases.ACTIVE:
+            with measure():
+                span = tracer.current()
+                token = tracer.token
+                if span is not None and token is not None:
+                    span.mark(token)
+                await task
+        else:
+            await task
+    except InterruptedError:
+        record("interrupted")
+        await cleanup()
+        raise
+    except Exception:
+        record("failed")
+        await cleanup()
+        raise
+    finally:
+        if mode is phases.ACTIVE:
+            finished = now()
+            record(finished)
+"#;
+    common::assert_matches_cpython_marshal(source, "coroutine_manager_arm_finally_entry.py");
+}
+
+#[test]
+fn matches_cpython_marshal_for_coroutine_plain_arm_finally_entry() {
+    let source = r#"async def prepare(mode, phases, task, measure, tracer, cleanup, record, now):
+    try:
+        if mode is phases.ACTIVE:
+            await task
+        else:
+            await task
+    except InterruptedError:
+        record("interrupted")
+        await cleanup()
+        raise
+    except Exception:
+        record("failed")
+        await cleanup()
+        raise
+    finally:
+        if mode is phases.ACTIVE:
+            finished = now()
+            record(finished)
+"#;
+    common::assert_matches_cpython_marshal(source, "coroutine_plain_arm_finally_entry.py");
+}

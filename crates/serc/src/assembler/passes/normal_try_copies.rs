@@ -535,9 +535,31 @@ impl OptimizationPipeline {
                 .iter()
                 .position(|candidate| *candidate == target_block)
                 .unwrap();
+            let fallthrough_source = position
+                .checked_sub(1)
+                .map(|index| order[index])
+                .filter(|source| super::super::block_has_fallthrough(self.graph[*source].items()));
+            // A final wildcard has no conditional failure edge into this cleanup.
+            // Certify its unchanged authored call/discard on the physical predecessor;
+            // ordinary fallthroughs cannot replace the conditional-origin rule below.
+            let wildcard_fallthrough =
+                fallthrough_source.is_some_and(|source| {
+                    self.exception_owner_provenance
+                        .normal_try_wildcard_fallthroughs
+                        .get(&entry)
+                        .is_some_and(|(call, pop)| {
+                            let mut instructions =
+                                self.graph[source].items().iter().rev().filter_map(
+                                    |item| match item {
+                                        Item::Instruction(instruction) => Some(instruction),
+                                        Item::Label(_) => None,
+                                    },
+                                );
+                            instructions.next() == Some(pop) && instructions.next() == Some(call)
+                        })
+                });
             if position >= target_position
-                || (position > 0
-                    && super::super::block_has_fallthrough(self.graph[order[position - 1]].items()))
+                || (fallthrough_source.is_some() && !wildcard_fallthrough)
             {
                 continue;
             }
@@ -588,10 +610,35 @@ impl OptimizationPipeline {
                     unknown_edge = true;
                 }
             }
-            if success_edges == 0 || failure_edges != 1 || unknown_edge {
+            if success_edges == 0
+                || failure_edges != usize::from(!wildcard_fallthrough)
+                || unknown_edge
+            {
                 continue;
             }
-            if intact_local_return {
+            if wildcard_fallthrough {
+                // Earlier case-success arrays precede the final wildcard donor.
+                // Exclude outer bypasses and nested cleanup arrays; these cannot
+                // establish the original match-success copy order.
+                let Some(first_success) = order
+                    .iter()
+                    .position(|block| successful_sources.contains(block))
+                else {
+                    continue;
+                };
+                if !successful_sources
+                    .iter()
+                    .all(|source| order[..position - 1].contains(source))
+                    || order[first_success..position]
+                        .iter()
+                        .flat_map(|block| self.graph[*block].items())
+                        .any(|item| matches!(item, Item::Label(label)
+                            if self.exception_regions.iter().any(|region| region.target == *label)
+                                || self.exception_owner_provenance.setups.iter().any(|(entry, _)| entry == label)))
+                {
+                    continue;
+                }
+            } else if intact_local_return {
                 let conditional_position = order
                     .iter()
                     .position(|candidate| Some(*candidate) == conditional_source)
@@ -1553,8 +1600,8 @@ mod tests {
             next_label: 10,
             ..Assembler::default()
         };
-        assembler.record_normal_try_exit(Label(2), Label(4));
-        assembler.record_normal_try_exit(Label(4), Label(6));
+        assembler.record_normal_try_exit(Label(2), Label(4), None);
+        assembler.record_normal_try_exit(Label(4), Label(6), None);
         assembler.into_optimization_pipeline()
     }
 
@@ -1804,7 +1851,7 @@ mod tests {
                 next_label: 8,
                 ..Assembler::default()
             };
-            assembler.record_normal_try_exit(entry, end);
+            assembler.record_normal_try_exit(entry, end, None);
             if case == "folded_condition" {
                 assembler.record_folded_condition_predecessor(entry);
             }

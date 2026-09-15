@@ -13769,7 +13769,12 @@ impl Compiler<'_> {
                 && statement.finalbody.is_empty()
                 && !suite_terminates(&statement.body)
             {
-                self.assembler.record_normal_try_exit(try_end, end);
+                let wildcard_call_location = (!statement.is_star)
+                    .then(|| normal_try_wildcard_call_exit(&statement.body))
+                    .flatten()
+                    .map(|range| self.source_location(range));
+                self.assembler
+                    .record_normal_try_exit(try_end, end, wildcard_call_location);
             }
             if statement.orelse.is_empty()
                 && !statement.finalbody.is_empty()
@@ -16520,6 +16525,44 @@ impl Compiler<'_> {
                 if loop_statement.orelse.is_empty()
                     && fold_constant(&loop_statement.test).is_none()
                     && !expression_contains_inline_branch(&loop_statement.test));
+        // A synchronous manager in a coroutine emits a located normal __exit__
+        // call after its terminal await. That original array can jump from a live
+        // conditional arm into normal cleanup; the suppression copy stays separate.
+        let coroutine_manager_arm_reaches_finally = |body: &[Stmt]| {
+            matches!(self.unit.scope, Scope::Function { .. })
+                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                    == CO_COROUTINE
+                && self.control.loops.contexts.is_empty()
+                && self.control.withs.active_with_exits.is_empty()
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .is_empty()
+                && !self.control.in_exception_handler()
+                && self.control.finally.active_copied_finally_bodies == 0
+                && self.control.finally.active_finally_try_bodies == 0
+                && matches!(body, [Stmt::With(manager)]
+                if !manager.is_async
+                    && manager.items.len() == 1
+                    && manager.items[0].optional_vars.is_none()
+                    && !expression_contains_inline_branch(&manager.items[0].context_expr)
+                    && !expression_suspends_current_scope(&manager.items[0].context_expr)
+                    && manager.body.split_last().is_some_and(|(last, leading)| {
+                        matches!(last, Stmt::Expr(expression)
+                            if matches!(expression.value.as_ref(), Expr::Await(await_)
+                                if !expression_contains_inline_branch(&await_.value)))
+                            && leading.iter().all(|statement| {
+                                suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement))
+                                    || matches!(statement, Stmt::If(guard)
+                                        if condition_has_only_runtime_tests(&guard.test)
+                                            && condition_has_linear_runtime_leaves(&guard.test)
+                                            && !expression_suspends_current_scope(&guard.test)
+                                            && guard.elif_else_clauses.is_empty()
+                                            && suite_has_linear_borrow_fallthrough(&guard.body))
+                            })
+                    }))
+        };
         // A live linear arm before the final else keeps a reachable jump directly
         // into normal cleanup after handlers move cold. Folded assertions can leave
         // that jump behind an empty block, so a merely nonterminal arm is insufficient.
@@ -16552,7 +16595,17 @@ impl Compiler<'_> {
                 })
                 || matches!(statement.finalbody.as_slice(), [Stmt::If(cleanup)]
                 if condition_has_only_runtime_tests(&cleanup.test)
-                    && !expression_contains_inline_branch(&cleanup.test)
+                    && (!expression_contains_inline_branch(&cleanup.test)
+                        || (matches!(self.unit.scope, Scope::Function { .. })
+                            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                            && self.control.loops.contexts.is_empty()
+                            && self.control.withs.active_with_exits.is_empty()
+                            && self.control.exceptions.active_exception_region_exclusions.is_empty()
+                            && !self.control.in_exception_handler()
+                            && self.control.finally.active_copied_finally_bodies == 0
+                            && self.control.finally.active_finally_try_bodies == 0
+                            && matches!(cleanup.test.as_ref(), Expr::BoolOp(_))
+                            && condition_has_linear_runtime_leaves(&cleanup.test)))
                     && suite_has_linear_borrow_fallthrough(&cleanup.body)
                     && cleanup.elif_else_clauses.iter().all(|clause| {
                         clause.test.as_ref().is_none_or(|test| {
@@ -16572,9 +16625,11 @@ impl Compiler<'_> {
                     }) && !suite_contains_abrupt_control_flow(&clause.body)
                 })
                 && (suite_has_linear_borrow_fallthrough(&conditional.body)
+                    || coroutine_manager_arm_reaches_finally(&conditional.body)
                     || conditional.elif_else_clauses.iter().any(|clause| {
                         clause.test.is_some()
-                            && suite_has_linear_borrow_fallthrough(&clause.body)
+                            && (suite_has_linear_borrow_fallthrough(&clause.body)
+                                || coroutine_manager_arm_reaches_finally(&clause.body))
                     })));
         // A live arm before a raising else keeps its original jump into normal cleanup.
         // The raising alternative does not make that jump cross the empty handler exit.
@@ -21508,6 +21563,25 @@ fn non_final_try_can_inline_loop_tail(statement: &ruff_python_ast::StmtTry) -> b
                 Stmt::Expr(statement) => !matches!(statement.value.as_ref(), Expr::BoolOp(_)),
                 _ => true,
             }))
+}
+
+// An unguarded final wildcard supplies a physical donor for the normal try exit.
+// A following try-body statement or branching wildcard body has a different array.
+fn normal_try_wildcard_call_exit(body: &[Stmt]) -> Option<TextRange> {
+    let Stmt::Match(statement) = body.last()? else {
+        return None;
+    };
+    if !match_has_multiple_normal_case_exits(statement) {
+        return None;
+    }
+    let case = statement.cases.last()?;
+    let [Stmt::Expr(expression)] = case.body.as_slice() else {
+        return None;
+    };
+    (is_wildcard_pattern(&case.pattern)
+        && matches!(expression.value.as_ref(), Expr::Call(_))
+        && !expression_contains_inline_branch(&expression.value))
+    .then_some(expression.value.range())
 }
 
 // Distinct normal case exits share an unlocated handler-cleanup block. Copy that

@@ -603,3 +603,39 @@ fn manager_capture_exit_source(pattern: &str) -> String {
 "
     )
 }
+
+#[test]
+fn wildcard_match_try_exit_baseline() {
+    common::assert_matches_cpython_marshal(
+        &wildcard_match_try_exit_source(""),
+        "wildcard_match_try_exit.py",
+    );
+}
+
+#[test]
+fn wildcard_match_try_exit_following_call_control() {
+    common::assert_matches_cpython_marshal(
+        &wildcard_match_try_exit_source("        after_match(content)\n"),
+        "wildcard_match_try_exit_following_call.py",
+    );
+}
+
+fn wildcard_match_try_exit_source(following_call: &str) -> String {
+    format!(
+        r#"def update(source, instruction):
+    value = clone(source)
+    try:
+        content = value.messages[0].content
+        match content.kind:
+            case Kind.text:
+                content.parts.append(instruction)
+            case Kind.system:
+                content.instructions.append(instruction)
+            case _:
+                print("Unknown kind; leaving value unchanged")
+{following_call}    except Exception as error:
+        print(f"Unable to update value: {{error}}")
+    return value
+"#
+    )
+}

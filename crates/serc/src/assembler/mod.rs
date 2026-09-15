@@ -3467,10 +3467,48 @@ impl Assembler {
     }
 
     /// Records the original two-slot normal exit of an ordinary try without an else suite.
-    pub(crate) fn record_normal_try_exit(&mut self, entry: Label, target: Label) {
+    pub(crate) fn record_normal_try_exit(
+        &mut self,
+        entry: Label,
+        target: Label,
+        wildcard_call_location: Option<SourceLocation>,
+    ) {
         self.exception_owner_provenance
             .normal_try_exits
             .push((entry, target));
+        let Some(location) = wildcard_call_location else {
+            return;
+        };
+        let mut instructions = self
+            .linear_items()
+            .iter()
+            .rev()
+            .filter_map(|item| match item {
+                Item::Instruction(instruction) => Some(instruction),
+                Item::Label(_) => None,
+            });
+        let (Some(jump), Some(pop), Some(call)) = (
+            instructions.next(),
+            instructions.next(),
+            instructions.next(),
+        ) else {
+            return;
+        };
+        if jump.opcode == JUMP_FORWARD
+            && jump.operand() == Operand::Forward(target)
+            && pop.opcode == POP_TOP
+            && matches!(
+                call.opcode,
+                crate::target::opcodes::CALL | crate::target::opcodes::CALL_KW
+            )
+            && pop.location == location
+            && call.location == location
+        {
+            let origin = (*call, *pop);
+            self.exception_owner_provenance
+                .normal_try_wildcard_fallthroughs
+                .insert(entry, origin);
+        }
     }
 
     /// Records an inner try/except `POP_BLOCK` exit for owner transfer and redundant-jump removal.

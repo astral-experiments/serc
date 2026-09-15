@@ -51,6 +51,8 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) removed_pop_block_widths: FxHashMap<Label, u16>,
     // Original ordinary-try exits contain POP_BLOCK followed by JUMP_NO_INTERRUPT.
     pub(super) normal_try_exits: Vec<(Label, Label)>,
+    // Exact final wildcard call and discard falling through to an ordinary try exit.
+    pub(super) normal_try_wildcard_fallthroughs: FxHashMap<Label, (Instruction, Instruction)>,
     // First records of the original manager cleanup arrays, before line resolution.
     pub(super) original_manager_pop_blocks: Vec<Label>,
     // Original try/except POP_BLOCK exits inside their own finally, for owner transfer
