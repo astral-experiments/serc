@@ -9,6 +9,29 @@ use super::super::{
 use super::normal_try_copy_plan::{OriginalNode, OriginalTail, PrefixSlot, plan_normal_try_copies};
 use crate::target::opcodes::{JUMP_BACKWARD, JUMP_FORWARD, NOP};
 
+/// Recognizes two intact, located slots of an explicit local return.
+pub(super) fn original_local_return(items: &[Item]) -> bool {
+    use crate::target::opcodes::{LOAD_FAST, RETURN_VALUE};
+
+    let head_len = items
+        .iter()
+        .take_while(|item| matches!(item, Item::Label(_)))
+        .count();
+    matches!(&items[head_len..],
+    [Item::Instruction(load), Item::Instruction(ret)]
+        if load.opcode == LOAD_FAST
+            && matches!(load.operand(), Operand::Value(_))
+            && ret.opcode == RETURN_VALUE
+            && ret.operand() == Operand::Value(0)
+            && [load, ret].iter().all(|instruction| {
+                instruction.location.line >= 0
+                    && instruction.pre_fold_extra_instructions() == 0
+                    && instruction.local_policy.hidden_exception_owner_slots() == 0
+                    && !instruction.fusion_policy.is_converted_pop_block()
+                    && !instruction.fusion_policy.is_authored_break()
+            }))
+}
+
 /// Recognizes four intact original slots of an explicit two-local tuple return.
 pub(super) fn original_local_tuple_return(items: &[Item]) -> Option<[bool; 4]> {
     use crate::target::opcodes::{BUILD_TUPLE, LOAD_FAST, RETURN_VALUE};
@@ -444,7 +467,13 @@ impl OptimizationPipeline {
                     }
                 }
             }
-            if (target_slots <= 4 && !target_is_conditional) || !target_is_located {
+            // An intact local return is copied after the original cleanup array.
+            // Keep that array's POP_BLOCK and normal JUMP until line propagation;
+            // the closed constant/tuple-copy plan above still owns its own exits.
+            let intact_local_return = original_local_return(self.graph[target_block].items());
+            if (target_slots <= 4 && !target_is_conditional && !intact_local_return)
+                || !target_is_located
+            {
                 continue;
             }
             let items = self.graph[block].items();
@@ -513,7 +542,9 @@ impl OptimizationPipeline {
                 continue;
             }
             let mut success_edges = 0;
+            let mut successful_sources = Vec::new();
             let mut failure_edges = 0;
+            let mut conditional_source = None;
             let mut unknown_edge = false;
             for (source_block, item) in self.graph.iter().flat_map(|(block, contents)| {
                 contents.items().iter().map(move |item| (block, item))
@@ -547,16 +578,44 @@ impl OptimizationPipeline {
                     unknown_edge = true;
                 } else if is_unconditional_jump(instruction.opcode) {
                     success_edges += 1;
+                    successful_sources.push(source_block);
                 } else if super::super::is_conditional_jump(instruction.opcode)
                     && instruction.location.line >= 0
                 {
                     failure_edges += 1;
+                    conditional_source = Some(source_block);
                 } else {
                     unknown_edge = true;
                 }
             }
             if success_edges == 0 || failure_edges != 1 || unknown_edge {
                 continue;
+            }
+            if intact_local_return {
+                let conditional_position = order
+                    .iter()
+                    .position(|candidate| Some(*candidate) == conditional_source)
+                    .expect("one conditional predecessor");
+                // Restore only interleaved original success and failure arrays.
+                // An outer condition that bypasses every successful arm retains
+                // the existing direct-return folding and its original line donation.
+                // Nested handler arrays already carry their own cleanup slots.
+                if conditional_position >= position
+                    || !order[..conditional_position]
+                        .iter()
+                        .any(|block| successful_sources.contains(block))
+                    || !order[conditional_position + 1..position]
+                        .iter()
+                        .any(|block| successful_sources.contains(block))
+                    || order[conditional_position + 1..position]
+                        .iter()
+                        .flat_map(|block| self.graph[*block].items())
+                        .any(|item| matches!(item, Item::Label(label)
+                            if self.exception_regions.iter().any(|region| region.target == *label)
+                                || self.exception_owner_provenance.setups.iter().any(|(entry, _)| entry == label)))
+                {
+                    continue;
+                }
             }
             if !selected.contains(&block) {
                 selected.push(block);

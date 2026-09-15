@@ -539,3 +539,90 @@ fn matches_cpython_iterator_finally_entry_after_handler_reraise_guard() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_guarded_handler_finally_borrows_inside_manager() {
+    for (filename, source) in [
+        (
+            "manager_guarded_handler_finally.py",
+            r"def recover(items, manager, keep_going):
+    results = {}
+    with manager as progress:
+        for item in items:
+            try:
+                key, value = item.result()
+                results[key] = value
+            except Exception as error:
+                results[item] = str(error)
+                if not keep_going:
+                    raise
+            finally:
+                progress.update(1)
+    return results
+",
+        ),
+        (
+            "guarded_handler_finally_no_manager_control.py",
+            r"def recover(items, progress, keep_going):
+    results = {}
+    for item in items:
+        try:
+            key, value = item.result()
+            results[key] = value
+        except Exception as error:
+            results[item] = str(error)
+            if not keep_going:
+                raise
+        finally:
+            progress.update(1)
+    return results
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn matches_cpython_awaited_terminal_if_finally_borrows() {
+    for (filename, source) in [
+        (
+            "awaited_named_terminal_if_branching_cleanup.py",
+            r#"async def collect(load, refresh, record, finish):
+    status = None
+    try:
+        if item := await load():
+            if item.ready:
+                result = await refresh(item)
+                if result:
+                    return result
+            return item.value
+    except ValueError as error:
+        status = error.__class__.__name__
+    finally:
+        record(tags=[f"status:{'ok' if not status else 'error'}", f"detail:{status}"])
+    result = await refresh(status)
+    if result is None:
+        record(status)
+        raise ValueError(status)
+    return result
+"#,
+        ),
+        (
+            "awaited_named_nonterminal_if_control.py",
+            r"async def collect(load, record, finish):
+    status = None
+    try:
+        if item := await load():
+            record(item)
+    except ValueError as error:
+        status = error.__class__.__name__
+    finally:
+        record(status)
+    return finish(status)
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

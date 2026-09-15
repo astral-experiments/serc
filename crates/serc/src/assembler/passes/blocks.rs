@@ -881,6 +881,90 @@ fn unlocated_prefix_has_located_continuation(
     }
 }
 
+/// Certifies the original normal jump immediately following a recorded `POP_BLOCK`.
+fn source_has_original_pop_jump<'a>(
+    graph: &'a BlockGraph,
+    source: BasicBlockId,
+    ranges: &[(Label, Label)],
+    provenance: &super::super::exception_owners::ExceptionOwnerProvenance,
+    preserved_boundaries: &FxHashSet<Label>,
+    exception_regions: &[ExceptionRegion],
+    pending_items: impl Iterator<Item = &'a Item>,
+) -> bool {
+    let Some((Item::Instruction(jump), prefix)) = graph[source].items().split_last() else {
+        return false;
+    };
+    if !is_unconditional_jump(jump.opcode)
+        || !matches!(jump.operand(), Operand::Forward(_))
+        || jump.pre_fold_extra_instructions() != 0
+        || jump.local_policy.hidden_exception_owner_slots() != 0
+    {
+        return false;
+    }
+    let Some(pop_offset) = prefix
+        .iter()
+        .rposition(|item| matches!(item, Item::Instruction(_)))
+    else {
+        return false;
+    };
+    let Item::Instruction(pop) = prefix[pop_offset] else {
+        unreachable!();
+    };
+    if pop.opcode != NOP
+        || !pop.fusion_policy.is_converted_pop_block()
+        || pop.pre_fold_extra_instructions() != 0
+        || pop.local_policy.hidden_exception_owner_slots() != 0
+    {
+        return false;
+    }
+    let Some(&(_, end)) = ranges.iter().find(|(start, end)| {
+        if provenance.retired_normal_try_copy_labels.contains(start)
+            || provenance.retired_normal_try_copy_labels.contains(end)
+        {
+            return false;
+        }
+        let start = prefix
+            .iter()
+            .position(|item| matches!(item, Item::Label(label) if label == start));
+        let end = prefix
+            .iter()
+            .position(|item| matches!(item, Item::Label(label) if label == end));
+        matches!((start, end), (Some(start), Some(end))
+            if start < pop_offset
+                && pop_offset < end
+                && prefix[start..pop_offset].iter().all(|item| matches!(item, Item::Label(_))))
+    }) else {
+        return false;
+    };
+    let continuation_labels = prefix[pop_offset + 1..]
+        .iter()
+        .filter_map(|item| match item {
+            Item::Label(label) => Some(*label),
+            Item::Instruction(_) => None,
+        })
+        .collect::<FxHashSet<_>>();
+    if continuation_labels.iter().any(|label| {
+        provenance.retired_normal_try_copy_labels.contains(label)
+            || (*label != end
+                && !provenance.normal_try_copy_internal_labels.contains(label)
+                && !provenance.normal_try_copy_inline_labels.contains(label))
+            || preserved_boundaries.contains(label)
+            || exception_regions
+                .iter()
+                .any(|region| region.target == *label)
+            || provenance.setups.iter().any(|(entry, _)| entry == label)
+    }) {
+        return false;
+    }
+    // A genuine internal endpoint is not an independently entered jump array.
+    // Include copies waiting to be appended so their edges cannot hide an entry.
+    !graph.iter_items().chain(pending_items).any(|item| {
+        matches!(item, Item::Instruction(instruction)
+            if matches!(instruction.operand(), Operand::Forward(label) | Operand::Backward(label)
+                if continuation_labels.contains(&label)))
+    })
+}
+
 // The original pass performs these location repairs even when it creates no copies, so the fast
 // path must preserve them before returning.
 
@@ -2907,8 +2991,27 @@ impl OptimizationPipeline {
                     }
                 })
                 .collect::<Vec<_>>();
-            let generic_original_copy =
-                generic_original_arrays && !source_has_fallthrough && !copied_pop_ranges.is_empty();
+            let generic_original_source_copy = generic_original_arrays
+                && !source_has_fallthrough
+                && inline_unprotected_return
+                && target_chain_end == target_position
+                && super::normal_try_copies::original_local_return(graph[target].items())
+                && source_has_original_pop_jump(
+                    graph,
+                    source,
+                    &original_pop_ranges,
+                    &self.exception_owner_provenance,
+                    &self.preserved_block_boundaries,
+                    &self.exception_regions,
+                    inline_copies
+                        .values()
+                        .chain(target_copies.values())
+                        .flatten()
+                        .flatten(),
+                );
+            let generic_original_copy = generic_original_arrays
+                && !source_has_fallthrough
+                && (!copied_pop_ranges.is_empty() || generic_original_source_copy);
             if generic_original_copy {
                 // Only labels physically copied from the original array certify adjacency.
                 // The exception-end aliases added below have no original instruction slot.
@@ -3127,7 +3230,8 @@ impl OptimizationPipeline {
                     .last_instruction()
                     .map_or(0, Instruction::pre_fold_extra_instructions);
                 instruction.add_pre_fold_extra_instructions(
-                    u8::from(!preserve_inlined_jump_nop).saturating_add(jump_extra),
+                    u8::from(!preserve_inlined_jump_nop && !generic_original_source_copy)
+                        .saturating_add(jump_extra),
                 );
             }
             if let Some(instruction) = copied.iter_mut().find_map(|item| match item {
@@ -3876,15 +3980,16 @@ impl OptimizationPipeline {
                     });
                 } else if !region.is_scope_fallback && exclusions.len() > 1 {
                     // Revisited predecessors can add excluded ranges out of emission order.
-                    // Reorder only disjoint holes whose complete ranges are already present
-                    // inside the original protected region.
+                    // Sort and merge complete holes inside the original protected region.
+                    // Later copies can extend an earlier hole; applying discovery order
+                    // would incorrectly protect part of that copied exit again.
                     let Some((&region_start, &region_end)) = label_positions
                         .get(&region.start)
                         .zip(label_positions.get(&region.end))
                     else {
                         continue;
                     };
-                    let Some(mut ranges) = exclusions
+                    let Some(ranges) = exclusions
                         .iter()
                         .map(|(start, end)| {
                             Some((*label_positions.get(start)?, *label_positions.get(end)?))
@@ -3898,11 +4003,20 @@ impl OptimizationPipeline {
                     }) {
                         continue;
                     }
-                    ranges.sort_unstable();
-                    if ranges.windows(2).any(|pair| pair[0].1 > pair[1].0) {
-                        continue;
-                    }
                     exclusions.sort_by_key(|(start, _)| label_positions[start]);
+                    let mut merged = Vec::<(Label, Label)>::with_capacity(exclusions.len());
+                    for &(start, end) in exclusions.iter() {
+                        if let Some((_, previous_end)) = merged.last_mut()
+                            && label_positions[&start] < label_positions[previous_end]
+                        {
+                            if label_positions[&end] > label_positions[previous_end] {
+                                *previous_end = end;
+                            }
+                        } else {
+                            merged.push((start, end));
+                        }
+                    }
+                    *exclusions = merged;
                 }
             }
             let original_regions = std::mem::take(&mut self.exception_regions);

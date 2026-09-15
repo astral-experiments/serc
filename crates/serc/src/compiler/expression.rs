@@ -4800,14 +4800,23 @@ impl Compiler<'_> {
                 )?;
                 self.assembler.mark(next);
             }
-            return self.compile_filter_condition(
+            let empty_folded_tail = jump_constant_truthiness(last)
+                .is_some_and(|truthiness| truthiness != negated)
+                && self.assembler.at_empty_borrow_block();
+            self.compile_filter_condition(
                 last,
                 element_location,
                 (accepted, restart),
                 include_comprehension_cleanup,
                 include_protected_region_exclusion,
                 negated,
-            );
+            )?;
+            if empty_folded_tail {
+                // The last Boolean operand has its own original fallthrough block.
+                // Removing its folded condition stops borrowing through that block.
+                self.assembler.mark_last_nop_borrow_barrier_if_removed();
+            }
+            return Ok(());
         }
         if let Expr::BoolOp(boolean) = condition
             && (boolean.op == BoolOp::And) == negated

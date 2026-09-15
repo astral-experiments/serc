@@ -55,3 +55,25 @@ def outside_control(item, first, second):
 "#;
     common::assert_matches_cpython_marshal(source, "negated_or_comprehension_filters.py");
 }
+
+#[test]
+fn matches_cpython_negated_filter_folded_tail_borrow_boundary() {
+    for (filename, source) in [
+        (
+            "negated_filter_false_tail.py",
+            r#"def collect(mapping, items):
+    result = [item for item in items if not (mapping.get(item) or "")]
+    return result
+"#,
+        ),
+        (
+            "negated_filter_no_tail_control.py",
+            r"def collect(mapping, items):
+    result = [item for item in items if not mapping.get(item)]
+    return result
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

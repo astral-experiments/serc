@@ -198,3 +198,53 @@ fn matches_cpython_protected_while_breaks_before_small_return() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_folded_while_false_exit_location() {
+    for (filename, source) in [
+        (
+            "folded_while_false_exit_location.py",
+            r#"async def backfill(limit, fetch, write, report, finish):
+    offset = 0
+    try:
+        while True and offset < limit:
+            page = await fetch()
+            if not page:
+                break
+            await write(page)
+            offset += len(page)
+            if len(page) < limit:
+                report("last page")
+                break
+    except Exception:
+        report("failed")
+    finally:
+        await finish()
+        report("finished")
+"#,
+        ),
+        (
+            "runtime_while_false_exit_location_control.py",
+            r#"async def backfill(limit, fetch, write, report, finish):
+    offset = 0
+    try:
+        while offset < limit:
+            page = await fetch()
+            if not page:
+                break
+            await write(page)
+            offset += len(page)
+            if len(page) < limit:
+                report("last page")
+                break
+    except Exception:
+        report("failed")
+    finally:
+        await finish()
+        report("finished")
+"#,
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

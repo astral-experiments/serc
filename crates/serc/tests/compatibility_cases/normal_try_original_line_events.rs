@@ -1,6 +1,44 @@
 use crate::common;
 
 #[test]
+fn preserves_outer_condition_before_multiple_shared_return_paths() {
+    for (first, second) in [
+        ("value = first", "value = second"),
+        ("first(value)", "second(value)"),
+    ] {
+        let source = format!(
+            "def select(value, active, choose, first, second):\n    try:\n        if active:\n            if choose == 0:\n                {first}\n            elif choose == 1:\n                {second}\n            else:\n                raise ValueError()\n    except ValueError:\n        raise\n    return value\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "outer_condition_shared_return.py");
+    }
+}
+
+#[test]
+fn preserves_single_successful_assignment_before_shared_return() {
+    common::assert_matches_cpython_marshal(
+        r"def repair(value, mismatch, enabled, replace, cleanup):
+    try:
+        if mismatch:
+            changed = None
+            if enabled:
+                changed = replace()
+            if changed is not None:
+                value = changed
+            else:
+                raise ValueError()
+    except Exception:
+        try:
+            cleanup()
+        except Exception:
+            pass
+        raise
+    return value
+",
+        "shared_assignment_return.py",
+    );
+}
+
+#[test]
 fn matches_cpython_shared_inner_try_exit_line_events() {
     for (name, tail) in [
         ("call", "if inner:\n    work(value)"),

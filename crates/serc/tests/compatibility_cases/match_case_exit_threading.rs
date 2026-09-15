@@ -548,3 +548,23 @@ fn matches_cpython_protected_match_failure_cleanup() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_protected_match_call_exit_copy() {
+    for (filename, source) in [
+        (
+            "protected_if_elif_call.py",
+            "def select(value, first, second, fallback):\n    try:\n        if value == \"first\":\n            first()\n        elif value == \"second\":\n            second()\n    except ValueError:\n        fallback()\n    return value\n",
+        ),
+        (
+            "protected_match_try_call.py",
+            "def select(value, first, second, fallback):\n    try:\n        match value:\n            case \"first\":\n                first()\n            case \"second\":\n                second()\n    except ValueError:\n        fallback()\n    return value\n",
+        ),
+        (
+            "try_else_erased_pop_prefix_zero_control.py",
+            "def f(value, enabled):\n    try:\n        result = value\n    except Error:\n        return None\n    else:\n        if enabled:\n            record(result)\n    return result\n",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

@@ -77,3 +77,56 @@ fn matches_cpython_control_authored_pass() {
 ";
     common::assert_matches_cpython_marshal(source, "control_authored_pass.py");
 }
+
+#[test]
+fn matches_cpython_named_handler_terminal_while_break() {
+    for (filename, source) in [
+        (
+            "named_handler_terminal_while_break.py",
+            r"async def consume(queue, process, fail):
+    pending = []
+    closed = False
+    while pending or not closed:
+        try:
+            await process()
+        except Exception as error:
+            fail(error)
+            pending.clear()
+            while True:
+                try:
+                    queued = queue.get_nowait()
+                except LookupError:
+                    break
+                if queued is None:
+                    closed = True
+                else:
+                    fail(queued, error)
+",
+        ),
+        (
+            "named_handler_terminal_while_pass_control.py",
+            r"async def consume(queue, process, fail):
+    pending = []
+    closed = False
+    while pending or not closed:
+        try:
+            await process()
+        except Exception as error:
+            fail(error)
+            pending.clear()
+            while True:
+                try:
+                    queued = queue.get_nowait()
+                except LookupError:
+                    break
+                if queued is None:
+                    closed = True
+                else:
+                    fail(queued, error)
+            pass
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

@@ -10918,6 +10918,9 @@ impl Compiler<'_> {
                 self.emit_while_backedge(&statement.body, body_start, start)?;
             }
             self.pre_register_conditionally_discarded_suite(&statement.orelse)?;
+            // The break destination starts an original array after the loop's backedge,
+            // even when folding removes the condition's separate false edge.
+            self.assembler.record_exception_owner_block_boundary(end);
             self.assembler.mark(end);
             // Small exit duplication copies a direct name return onto each authored break edge
             // before redundant break jumps are removed. The copied load therefore remains
@@ -13436,6 +13439,17 @@ impl Compiler<'_> {
                 && statement.orelse.is_empty()
                 && statement.finalbody.is_empty()
                 && suite_has_shared_guarded_match_failure(&statement.body);
+            // Line resolution precedes constant folding. A shared original false
+            // anchor cannot inherit the final break's location through the empty exit.
+            let shared_loop_condition_exit = statement.orelse.is_empty()
+                && matches!(statement.body.last(), Some(Stmt::While(loop_statement))
+                if loop_statement.orelse.is_empty()
+                    && !is_break_only_loop(loop_statement)
+                    && condition_jump_target_count(&loop_statement.test, false) == 1
+                    && !original_condition_has_unique_jump_target(
+                        &loop_statement.test,
+                        false,
+                    ));
             let loop_exit_location = statement
                 .orelse
                 .is_empty()
@@ -13445,7 +13459,12 @@ impl Compiler<'_> {
                     }
                     Stmt::While(loop_statement)
                         if loop_statement.orelse.is_empty()
-                            && (condition_jump_target_count(&loop_statement.test, false) == 1
+                            && ((condition_jump_target_count(&loop_statement.test, false)
+                                == 1
+                                && original_condition_has_unique_jump_target(
+                                    &loop_statement.test,
+                                    false,
+                                ))
                                 || (matches!(loop_statement.test.as_ref(), Expr::Compare(comparison)
                                         if comparison.ops.len() > 1)
                                     && !suite_contains_loop_break(&loop_statement.body))) =>
@@ -13540,6 +13559,7 @@ impl Compiler<'_> {
                 self.assembler
                     .set_location(self.source_location(condition_fallthrough_range(test)));
             } else if shared_conditional_exit
+                || shared_loop_condition_exit
                 || shared_guarded_match_exit
                 || drop_multi_condition_exit_nop
             {
@@ -13767,7 +13787,7 @@ impl Compiler<'_> {
                 self.assembler
                     .prepare_no_location_block_for_inlining(normal_exit);
             }
-            if shared_conditional_exit {
+            if shared_conditional_exit || shared_loop_condition_exit {
                 // Preserve the original shared jump's missing location while allowing
                 // copied exits to inherit the location of their own predecessor.
                 self.assembler.preserve_shared_jump_no_location(normal_exit);
@@ -16805,7 +16825,23 @@ impl Compiler<'_> {
                             suite_has_linear_reraise_guards(&handler.body)
                         })
                     })))
-            && self.control.withs.active_with_region_exclusions.is_empty()
+            && (self.control.withs.active_with_region_exclusions.is_empty()
+                || (synchronous_recovery
+                    && self.control.finally.active_copied_finally_bodies == 0
+                    && self.control.finally.active_finally_try_bodies == 0
+                    && !self.control.in_exception_handler()
+                    && suite_has_linear_borrow_fallthrough(&statement.body)
+                    && matches!(statement.handlers.as_slice(), [handler]
+                        if handler.as_except_handler().is_some_and(|handler| {
+                            handler.type_.is_some()
+                                && handler.name.is_some()
+                                && suite_has_linear_reraise_guards(&handler.body)
+                        }))
+                    && matches!(statement.finalbody.as_slice(), [Stmt::Expr(cleanup)]
+                        if simple_cleanup_call(&cleanup.value)
+                            && matches!(cleanup.value.as_ref(), Expr::Call(call)
+                                if matches!(call.func.as_ref(), Expr::Attribute(attribute)
+                                    if matches!(attribute.value.as_ref(), Expr::Name(_)))))))
             && self.control.finally.active_normal_finally_bodies == 0
             && self.control.finally.active_finally_end_blocks == 0
             && !suite_contains_loop_break(&statement.body)
@@ -16983,6 +17019,42 @@ impl Compiler<'_> {
                     && original_condition_has_unique_jump_target(&conditional.test, false)
                     && conditional.elif_else_clauses.is_empty()
                     && matches!(conditional.body.as_slice(), [Stmt::Return(_)]));
+        // An awaited runtime test still has one false edge after END_SEND. When
+        // every successful path returns, that edge reaches the normal cleanup's
+        // located normal-exit marker, including when a return copies the finalizer.
+        let awaited_terminal_if_reaches_finally = !statement.is_star
+            && statement.orelse.is_empty()
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
+            && self.control.loops.contexts.is_empty()
+            && self.control.withs.active_with_region_exclusions.is_empty()
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+            && !statement.handlers.is_empty()
+            && statement.handlers.iter().all(|handler| {
+                handler.as_except_handler().is_some_and(|handler| {
+                    handler.type_.is_some()
+                        && (handler
+                            .body
+                            .iter()
+                            .all(|statement| matches!(statement, Stmt::Pass(_)))
+                            || suite_has_linear_borrow_fallthrough(&handler.body))
+                })
+            })
+            && matches!(statement.body.as_slice(), [Stmt::If(conditional)]
+                if conditional.elif_else_clauses.is_empty()
+                    && expression_suspends_current_scope(&conditional.test)
+                    && condition_has_linear_runtime_leaves(&conditional.test)
+                    && original_condition_has_unique_jump_target(&conditional.test, false)
+                    && suite_terminates_before_constant_folding(&conditional.body))
+            && matches!(statement.finalbody.as_slice(), [Stmt::Expr(cleanup)]
+                if matches!(cleanup.value.as_ref(), Expr::Call(call)
+                    if (matches!(call.func.as_ref(), Expr::Name(_))
+                        || matches!(call.func.as_ref(), Expr::Attribute(attribute)
+                            if matches!(attribute.value.as_ref(), Expr::Name(_))))
+                        && !expression_suspends_current_scope(&cleanup.value)
+                        && call.arguments.args.iter().all(|argument| !matches!(argument, Expr::Starred(_)))
+                        && call.arguments.keywords.iter().all(|keyword| keyword.arg.is_some())));
         let normal_finally_is_borrow_reachable = (simple_fallthrough_handlers_reach_finally
             || compound_fallthrough_handlers_reach_finally
             || runtime_while_handlers_reach_finally)
@@ -16993,7 +17065,8 @@ impl Compiler<'_> {
             || dispatcher_break_reaches_finally
             || inner_try_break_loop_range.is_some()
             || conditional_handler_reaches_finally
-            || terminal_if_false_edge_reaches_finally;
+            || terminal_if_false_edge_reaches_finally
+            || awaited_terminal_if_reaches_finally;
         let for_break_reaches_finally = !statement.handlers.is_empty()
             && !normal_finally_is_borrow_reachable
             && !statement.is_star
