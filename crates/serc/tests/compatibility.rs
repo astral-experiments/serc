@@ -1792,6 +1792,47 @@ def try_finally(values):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_selected_try_else_loop_backedges() {
+        for (filename, source) in [
+            (
+                "backward_join_selected_try_else_conditional_following_call_control.py",
+                r#"def collect(rows, parse, output, report, ignore_errors, finish):
+    for kind, payload in rows:
+        if kind == "record":
+            try:
+                value = parse(payload)
+            except ValueError as error:
+                if not ignore_errors:
+                    raise error
+                report(payload)
+            else:
+                if value is not None:
+                    output.append(value)
+            finish()
+"#,
+            ),
+            (
+                "backward_join_selected_try_else_conditional_tail.py",
+                r#"def collect(rows, parse, output, report, ignore_errors, finish):
+    for kind, payload in rows:
+        if kind == "record":
+            try:
+                value = parse(payload)
+            except ValueError as error:
+                if not ignore_errors:
+                    raise error
+                report(payload)
+            else:
+                if value is not None:
+                    output.append(value)
+"#,
+            ),
+        ] {
+            assert_matches_cpython_marshal(source, filename);
+        }
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_nested_try_else_loop_backedges() {
         let source = r"def nested_try_else_loop(first, second):
     try:

@@ -498,3 +498,53 @@ fn matches_cpython_final_value_pattern_before_literal_return() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_protected_match_failure_cleanup() {
+    for (filename, source) in [
+        (
+            "protected_match_try_return.py",
+            r#"def select(value, first, second, fallback):
+    try:
+        match value:
+            case "first":
+                return first()
+            case "second":
+                return second()
+    except ValueError:
+        return fallback()
+    raise ValueError("unmatched")
+"#,
+        ),
+        (
+            "protected_match_with_return.py",
+            r#"def select(value, manager, first, second):
+    with manager():
+        match value:
+            case "first":
+                return first()
+            case "second":
+                return second()
+    raise ValueError("unmatched")
+"#,
+        ),
+        (
+            "protected_match_try_wildcard_control.py",
+            r#"def select(value, first, second, fallback):
+    try:
+        match value:
+            case "first":
+                return first()
+            case "second":
+                return second()
+            case _:
+                return fallback()
+    except ValueError:
+        return fallback()
+    raise ValueError("unmatched")
+"#,
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

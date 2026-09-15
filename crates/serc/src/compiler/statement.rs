@@ -10003,7 +10003,15 @@ impl Compiler<'_> {
                 )?;
                 if nested_tail == LoopBackedge::Required && !suite_terminates(body) {
                     self.set_branch_end_location(body, body_start);
-                    self.emit_jump_backward(JUMP_BACKWARD, restart, 0)?;
+                    let backedge = self.emit_jump_backward_instruction(JUMP_BACKWARD, restart)?;
+                    if body
+                        .last()
+                        .is_some_and(try_has_conditional_shared_loop_exit)
+                    {
+                        // The selected try's shared exit copies this backedge onto each
+                        // conditional fallthrough before predecessor locations propagate.
+                        self.assembler.mark_as_artificial_eval_break(backedge);
+                    }
                 }
                 return Ok(LoopBackedge::Emitted);
             }
@@ -13251,7 +13259,17 @@ impl Compiler<'_> {
             .active_exception_region_exclusions
             .pop()
             .expect("active try region has exclusion collector");
-        let removed_try_pop_block = !statement.orelse.is_empty()
+        // Every successful case exits the suite, leaving the final pattern failure
+        // as the sole predecessor of the original normal POP_BLOCK. Keep that
+        // instruction unlocated until its predecessor supplies the pattern line.
+        let match_body_pop_block = !statement.is_star
+            && statement.finalbody.is_empty()
+            && suite_match_failure_range(&statement.body).is_some()
+            && matches!(statement.body.last(), Some(Stmt::Match(matched))
+            if matched.cases.iter().all(|case| {
+                suite_terminates_before_constant_folding(&case.body)
+            }));
+        let removed_try_pop_block = (!statement.orelse.is_empty() || match_body_pop_block)
             && !suite_terminates(&statement.body)
             && !self.assembler.last_instruction_is_nop();
         let deferred_try_pop_block = removed_try_pop_block && self.assembler.at_jump_target();
@@ -13510,7 +13528,15 @@ impl Compiler<'_> {
                 && matches!(normal_exit_suite.last(), Some(Stmt::Pass(pass))
                     if self.assembler.has_single_omitted_fallthrough_nop_before_label(
                         try_end, self.source_location(pass.range)));
-            if let Some(test) = forwarded_conditional_exit {
+            if match_body_pop_block
+                && statement.orelse.is_empty()
+                && deferred_try_pop_block
+                && !removed_shared_try_pop_block
+            {
+                // This jump follows the original unlocated POP_BLOCK. Resolve
+                // their shared location only after case-success exit copying.
+                self.assembler.set_location(SourceLocation::NONE);
+            } else if let Some(test) = forwarded_conditional_exit {
                 self.assembler
                     .set_location(self.source_location(condition_fallthrough_range(test)));
             } else if shared_conditional_exit
@@ -20602,12 +20628,26 @@ fn with_body_handler_exit_location(body: &[Stmt]) -> Option<TextRange> {
     }
 }
 
-/// Locates the manager `POP_BLOCK` reached only by a match's final wildcard body.
+/// Locates the manager `POP_BLOCK` reached by a match's sole normal exit.
 fn with_body_match_exit_location(body: &[Stmt]) -> Option<TextRange> {
     let Some(Stmt::Match(statement)) = body.last() else {
         return None;
     };
     let (fallback, preceding) = statement.cases.split_last()?;
+    if fallback.guard.is_none()
+        && matches!(
+            fallback.pattern,
+            Pattern::MatchValue(_) | Pattern::MatchSingleton(_)
+        )
+        && statement
+            .cases
+            .iter()
+            .all(|case| suite_terminates_before_constant_folding(&case.body))
+    {
+        // Successful cases leave through their own cleanup. Only the final
+        // refutable pattern reaches the manager's original normal POP_BLOCK.
+        return Some(fallback.pattern.range());
+    }
     if preceding.is_empty()
         || fallback.guard.is_some()
         || !is_wildcard_pattern(&fallback.pattern)
