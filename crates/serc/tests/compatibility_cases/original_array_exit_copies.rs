@@ -402,3 +402,31 @@ fn matches_cpython_authored_pass_after_exit_threading() {
 ";
     common::assert_matches_cpython_marshal(source, "pass_same_line_nested_join_control.py");
 }
+
+#[test]
+fn matches_cpython_optimized_tuple_conditional_attribute_join() {
+    common::assert_matches_cpython_marshal(
+        r"def probe(obj, values):
+    obj.value = (
+        tuple(float(value) for value in values)
+        if values
+        else (0.0,)
+    )
+",
+        "optimized_tuple_conditional_attribute.py",
+    );
+}
+
+#[test]
+fn matches_cpython_optimized_tuple_conditional_attribute_plain_control() {
+    common::assert_matches_cpython_marshal(
+        r"def probe(obj, values, collect):
+    obj.value = (
+        collect(values)
+        if values
+        else (0.0,)
+    )
+",
+        "plain_call_conditional_attribute_control.py",
+    );
+}

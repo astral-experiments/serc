@@ -1449,6 +1449,8 @@ pub(crate) struct Assembler {
     pub(super) retained_pop_block_origins: FxHashMap<Label, Vec<Label>>,
     /// Shared jumps whose copies can acquire their new predecessor's source location.
     pub(super) shared_jump_copy_location_blocks: FxHashSet<Label>,
+    /// Nested joins awaiting their source-authored match-case successor; emission only.
+    pub(super) nested_if_unlocated_join_blocks: FxHashSet<Label>,
     /// Unique joins reached by the synthetic exits of early-folded conditions.
     pub(super) folded_condition_exit_targets: FxHashSet<Label>,
     pub(super) load_fast_borrowing_enabled: bool,
@@ -1650,6 +1652,7 @@ impl Default for Assembler {
             deferred_shared_jump_blocks: FxHashSet::default(),
             retained_pop_block_origins: FxHashMap::default(),
             shared_jump_copy_location_blocks: FxHashSet::default(),
+            nested_if_unlocated_join_blocks: FxHashSet::default(),
             folded_condition_exit_targets: FxHashSet::default(),
         }
     }

@@ -3471,7 +3471,12 @@ impl Compiler<'_> {
         match assignment.targets.as_slice() {
             [Expr::Name(_)] => true,
             [Expr::Attribute(attribute)] => {
+                // Keep an optimized tuple call's original join until the assembler
+                // copies the attribute-store exit and accounts for its jump slot.
                 matches!(attribute.value.as_ref(), Expr::Name(_))
+                    && !matches!(assignment.value.as_ref(), Expr::If(expression)
+                        if matches!(expression.body.as_ref(), Expr::Call(call)
+                            if optimized_generator_callable(call) == Some("tuple")))
             }
             _ => false,
         }
@@ -8170,6 +8175,9 @@ impl Compiler<'_> {
                     {
                         self.assembler
                             .preserve_no_location(branch_exit.instruction());
+                        if matches!(nested_if_exit, Some(NestedIfExitLocation::Unlocated)) {
+                            self.assembler.record_nested_if_unlocated_join(branch_exit);
+                        }
                     } else if pass_only_body && is_none_pass_assignment_branch(statement) {
                         self.assembler
                             .preserve_redundant_jump_nop_after_threading(branch_exit);
@@ -23765,7 +23773,24 @@ fn suite_ends_in_terminal_conditional_break(body: &[Stmt]) -> bool {
                         && loop_statement.orelse.is_empty()
                         && !expression_contains_inline_branch(&loop_statement.iter)
                         && !expression_contains_inline_branch(&loop_statement.target)
-                        && suite_has_linear_borrow_fallthrough(&loop_statement.body)
+                        && (suite_has_linear_borrow_fallthrough(&loop_statement.body)
+                            || loop_statement.body.iter().all(|statement| {
+                                if let Stmt::If(guard) = statement {
+                                    // An inner break rejoins this for's end before the
+                                    // later async break; it cannot enter the outer exit.
+                                    condition_reaches_async_break_entry(&guard.test)
+                                        && guard.elif_else_clauses.is_empty()
+                                        && guard.body.split_last().is_some_and(|(last, leading)| {
+                                            matches!(last, Stmt::Break(_))
+                                                && (leading.is_empty()
+                                                    || suite_has_linear_borrow_fallthrough(leading))
+                                        })
+                                } else {
+                                    suite_has_linear_borrow_fallthrough(std::slice::from_ref(
+                                        statement,
+                                    ))
+                                }
+                            }))
                 }
                 Stmt::Continue(_) => conditional && index + 1 == body.len(),
                 _ => suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement)),

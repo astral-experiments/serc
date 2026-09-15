@@ -3662,6 +3662,94 @@ impl Assembler {
             .preserve_location();
     }
 
+    /// Records a nested join until its original match-case successor is emitted.
+    pub(crate) fn record_nested_if_unlocated_join(&mut self, emitted: EmittedJump) {
+        let index = usize::try_from(emitted.instruction().item_index)
+            .expect("emitted instruction index should fit in usize");
+        if let Some(Item::Label(label)) = self.linear_items().get(index.wrapping_sub(1)) {
+            self.nested_if_unlocated_join_blocks.insert(*label);
+        }
+    }
+
+    /// Lets private copies inherit locations when the original join reaches a case exit.
+    pub(crate) fn inherit_nested_if_match_exit_locations(&mut self, emitted: EmittedJump) {
+        if self.nested_if_unlocated_join_blocks.is_empty() {
+            return;
+        }
+        let index = usize::try_from(emitted.instruction().item_index)
+            .expect("emitted instruction index should fit in usize");
+        let items = self.linear_items();
+        let Some(Item::Instruction(exit)) = items.get(index) else {
+            return;
+        };
+        if exit.opcode != JUMP_FORWARD
+            || !exit.jump_policy.is_interruptible()
+            || !exit.no_location_policy.is_artificial_eval_break()
+            || exit.pre_fold_extra_instructions() != 0
+            || exit.local_policy.hidden_exception_owner_slots() != 0
+            || exit.jump_policy.always_retains_nop()
+        {
+            return;
+        }
+        let exit_labels = items[..index]
+            .iter()
+            .rev()
+            .map_while(|item| match item {
+                Item::Label(label) => Some(*label),
+                Item::Instruction(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let clean_labels = |labels: &[Label]| {
+            !labels.is_empty()
+                && labels.iter().all(|label| {
+                    !self.original_nop_targets.contains(label)
+                        && !self
+                            .exception_owner_provenance
+                            .omitted_nop_counts
+                            .contains_key(label)
+                        && !self
+                            .exception_owner_provenance
+                            .omitted_nop_locations
+                            .contains_key(label)
+                })
+        };
+        if !clean_labels(&exit_labels) {
+            return;
+        }
+        let mut labels = Vec::new();
+        let mut promoted = Vec::new();
+        for item in &items[..index] {
+            match item {
+                Item::Label(label) => labels.push(*label),
+                Item::Instruction(jump) => {
+                    if jump.opcode == JUMP_FORWARD
+                        && jump.location == SourceLocation::NONE
+                        && jump.no_location_policy.preserves_location()
+                        && !jump.jump_policy.is_interruptible()
+                        && !jump.no_location_policy.is_artificial_eval_break()
+                        && !jump.jump_policy.always_retains_nop()
+                        && jump.pre_fold_extra_instructions() == 0
+                        && jump.local_policy.hidden_exception_owner_slots() == 0
+                        && clean_labels(&labels)
+                        && let Operand::Forward(target) = jump.operand()
+                        && exit_labels.contains(&target)
+                    {
+                        promoted.extend(
+                            labels.iter().copied().filter(|label| {
+                                self.nested_if_unlocated_join_blocks.contains(label)
+                            }),
+                        );
+                    }
+                    labels.clear();
+                }
+            }
+        }
+        // CPython first inlines this original NO_LOCATION case-success JUMP. The
+        // nested join then owns that eval-check exit before locations are resolved.
+        // Its copies and sole surviving original follow the existing copy policy.
+        self.shared_jump_copy_location_blocks.extend(promoted);
+    }
+
     /// Keeps an original shared jump unlocated while allowing its copies to inherit locations.
     pub(crate) fn preserve_shared_jump_no_location(&mut self, emitted: EmittedJump) {
         self.preserve_no_location(emitted.instruction());

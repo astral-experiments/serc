@@ -769,6 +769,10 @@ impl Compiler<'_> {
                             // A surviving case-success edge is CPython's JUMP. Cleanup
                             // predecessors threaded through it keep its eval-breaker check.
                             self.assembler.mark_jump_as_interruptible(success_exit);
+                            if original_unlocated_head {
+                                self.assembler
+                                    .inherit_nested_if_match_exit_locations(success_exit);
+                            }
                         }
                     }
                 }
@@ -6435,6 +6439,9 @@ impl Compiler<'_> {
             self.assembler.set_location(SourceLocation::NONE);
             false
         };
+        let optimized_tuple_join = matches!(expression.body.as_ref(), Expr::Call(call)
+            if optimized_generator_callable(call) == Some("tuple"))
+            && self.assembler.at_jump_target();
         let body_exit = self.emit_jump_forward_instruction(JUMP_FORWARD, end)?;
         if let Expr::If(nested) = expression.body.as_ref()
             && early_condition_truthiness(&nested.test).is_none()
@@ -6443,6 +6450,11 @@ impl Compiler<'_> {
             // The nested conditional's fallthrough enters a separate original join block.
             // Only copying its direct exit keeps that jump as a source-position NOP.
             self.assembler.preserve_direct_inlined_jump_nop(body_exit);
+        } else if optimized_tuple_join {
+            // Optimized and fallback calls end at a separate original array. Its
+            // jump slot survives copying before the fallback supplies its line.
+            self.assembler
+                .preserve_empty_join_inlined_jump_nop(body_exit);
         }
         if self.control.statements.terminal_if_call_expression {
             self.assembler.prevent_jump_inlining(body_exit);

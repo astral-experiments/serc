@@ -167,6 +167,7 @@ mod nested_generator_dispatch_owners;
 mod nested_handler_loop_transfers;
 mod nested_handler_return_swap_owner_compatibility;
 mod nested_if_continuation_locations;
+mod nested_if_original_join_locations;
 mod nested_loop_handler_backedges;
 mod nested_scope_first_constant_order;
 mod nested_try_branch_exit_markers;

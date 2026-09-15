@@ -570,6 +570,25 @@ fn protected_async_completed_break_prefixes_preserve_borrow_reachability() {
 ",
             "async_earlier_break_survives_control.py",
         ),
+        (
+            r"async def f(stream, values, value, should_stop, should_finish, consume):
+    try:
+        async for item in stream:
+            if should_stop(item):
+                for inner in values:
+                    if should_finish(inner):
+                        break
+                    consume(inner)
+                if should_finish(item):
+                    value = item
+                    break
+        consume(value)
+        consume(value)
+    finally:
+        consume(value)
+",
+            "async_nested_for_break_excluded_control.py",
+        ),
     ] {
         common::assert_matches_cpython_marshal(source, filename);
     }
