@@ -13602,9 +13602,7 @@ impl Compiler<'_> {
                     .set_location(self.source_location(synthetic_condition_exit_range(test)));
             } else if !statement.is_star
                 && statement.finalbody.is_empty()
-                && self.control.in_iterator_loop()
-                && self.control.loops.uncopied_loop_tail_statement == Some(statement.range)
-                && self.control.in_loop_tail_without_nested_cleanup()
+                && !self.control.loops.contexts.is_empty()
                 && let Some(Stmt::If(nested)) = statement.orelse.last()
                 && nested.elif_else_clauses.is_empty()
                 && matches!(nested.body.as_slice(), [Stmt::Break(_)])
@@ -13613,7 +13611,7 @@ impl Compiler<'_> {
                 && original_condition_has_unique_jump_target(test, false)
                 && let Some(donor) = unique_condition_jump_target(test, false)
             {
-                // Only the false condition reaches this generic iterator backedge;
+                // Only the false condition reaches the normal try-else exit;
                 // the break exits the loop and cannot donate its location.
                 self.assembler
                     .set_location(self.source_location(donor.range()));
@@ -23995,8 +23993,50 @@ fn condition_reaches_async_break_entry(expression: &Expr) -> bool {
     }
 }
 
-/// Finds a terminal break behind nested runtime conditions without a final else.
+/// Finds a terminal break behind runtime conditions, including returning arms.
 fn suite_ends_in_terminal_conditional_break(body: &[Stmt]) -> bool {
+    // Boolean argument edges rejoin before CALL/CALL_KW. The discarded call
+    // keeps that join nonempty before the later iterator discard and break.
+    fn call_has_completed_boolean_argument(expression: &Expr) -> bool {
+        let Expr::Call(call) = expression else {
+            return false;
+        };
+        if !(matches!(call.func.as_ref(), Expr::Name(_))
+            || matches!(call.func.as_ref(), Expr::Attribute(attribute)
+                if matches!(attribute.value.as_ref(), Expr::Name(_))))
+            || expression_suspends_current_scope(expression)
+            || call.arguments.args.len() + call.arguments.keywords.len() * 2
+                > super::CPYTHON_STACK_USE_GUIDELINE
+            || call
+                .arguments
+                .keywords
+                .iter()
+                .any(|keyword| keyword.arg.is_none())
+        {
+            return false;
+        }
+        let mut boolean_arguments = 0;
+        call.arguments
+            .args
+            .iter()
+            .chain(call.arguments.keywords.iter().map(|keyword| &keyword.value))
+            .all(|argument| match argument {
+                Expr::BoolOp(boolean) => {
+                    boolean_arguments += 1;
+                    boolean_arguments == 1
+                        && boolean.values.iter().enumerate().all(|(index, value)| {
+                            !expression_contains_inline_branch(value)
+                                && (index + 1 == boolean.values.len()
+                                    || (fold_constant(value).is_none()
+                                        && early_condition_truthiness(value).is_none()))
+                        })
+                }
+                Expr::Starred(_) => false,
+                _ => !expression_contains_inline_branch(argument),
+            })
+            && boolean_arguments == 1
+    }
+
     // Completed conditions and for exhaustion can precede the final break
     // without adding an entry beyond its iterator discard. A conditional
     // continue returns to the async header; it does not reach the loop exit.
@@ -24004,6 +24044,11 @@ fn suite_ends_in_terminal_conditional_break(body: &[Stmt]) -> bool {
         body.iter()
             .enumerate()
             .all(|(index, statement)| match statement {
+                Stmt::Expr(expression)
+                    if call_has_completed_boolean_argument(&expression.value) =>
+                {
+                    true
+                }
                 Stmt::If(guard) => {
                     condition_reaches_async_break_entry(&guard.test)
                         && guard.elif_else_clauses.is_empty()
@@ -24047,21 +24092,41 @@ fn suite_ends_in_terminal_conditional_break(body: &[Stmt]) -> bool {
             return false;
         }
         let body = if let Some((last, earlier)) = tail.elif_else_clauses.split_last() {
-            if !suite_has_linear_borrow_fallthrough(&tail.body)
-                || tail.elif_else_clauses.iter().any(|clause| {
+            // Returning arms cannot enter the loop exit. A final else-break still
+            // loses its jump before borrowing and stops at the empty original join.
+            let returning_arms_before_else_break = last.test.is_none()
+                && matches!(last.body.last(), Some(Stmt::Break(_)))
+                && std::iter::once(&tail.body)
+                    .chain(earlier.iter().map(|clause| &clause.body))
+                    .all(|body| {
+                        matches!(body.last(), Some(Stmt::Return(_)))
+                            && !suite_contains_loop_break(body)
+                            && !suite_contains_loop_continue(body)
+                    })
+                && earlier.iter().all(|clause| {
                     clause
                         .test
                         .as_ref()
-                        .is_none_or(|test| !condition_reaches_async_break_entry(test))
-                })
-                || earlier
-                    .iter()
-                    .any(|clause| !suite_has_linear_borrow_fallthrough(&clause.body))
+                        .is_some_and(condition_reaches_async_break_entry)
+                });
+            if !returning_arms_before_else_break
+                && ((!suite_has_linear_borrow_fallthrough(&tail.body)
+                    && !suite_has_linear_raise_exit(&tail.body))
+                    || tail.elif_else_clauses.iter().any(|clause| {
+                        clause
+                            .test
+                            .as_ref()
+                            .is_none_or(|test| !condition_reaches_async_break_entry(test))
+                    })
+                    || earlier.iter().any(|clause| {
+                        !suite_has_linear_borrow_fallthrough(&clause.body)
+                            && !suite_has_linear_raise_exit(&clause.body)
+                    }))
             {
                 return false;
             }
-            // Earlier arms rejoin the loop backedge. Only the final tested arm
-            // reaches the iterator discard and the original empty loop exit.
+            // Earlier arms rejoin the loop backedge or exit the scope. Only the
+            // final arm reaches the iterator discard and original empty loop exit.
             &last.body
         } else {
             &tail.body

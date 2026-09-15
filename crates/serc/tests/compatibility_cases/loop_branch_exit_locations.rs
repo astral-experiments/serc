@@ -482,3 +482,36 @@ fn matches_cpython_finally_context_manager_condition_exit_nops() {
         );
     }
 }
+
+#[test]
+fn matches_cpython_try_else_break_while_location() {
+    let source = r#"def monitor(read, active, accept):
+    while active():
+        try:
+            value = read()
+        except Error as error:
+            report(error)
+        else:
+            if not accept(value):
+                break
+        report("tick")
+"#;
+    common::assert_matches_cpython_marshal(source, "try_else_break_while_location.py");
+}
+
+#[test]
+fn matches_cpython_try_else_break_while_following_call() {
+    let source = r#"def monitor(read, active, accept):
+    while active():
+        try:
+            value = read()
+        except Error as error:
+            report(error)
+        else:
+            if not accept(value):
+                break
+            report(value)
+        report("tick")
+"#;
+    common::assert_matches_cpython_marshal(source, "try_else_break_while_following_call.py");
+}

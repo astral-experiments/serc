@@ -637,3 +637,126 @@ fn protected_async_completed_break_prefixes_preserve_borrow_reachability() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn protected_async_return_else_break_preserves_borrow_reachability() {
+    for (source, filename) in [
+        (
+            r"async def route(self, stream, manager, choose, consume):
+    try:
+        async with manager:
+            async for item in stream:
+                if choose(item):
+                    return item
+                else:
+                    consume(item)
+                    break
+            return self.fallback()
+    except Exception:
+        return self.fallback()
+",
+            "async_return_else_break.py",
+        ),
+        (
+            r"async def route(self, stream, manager, choose, consume):
+    try:
+        async with manager:
+            async for item in stream:
+                if choose(item):
+                    return item
+                consume(item)
+                break
+            return self.fallback()
+    except Exception:
+        return self.fallback()
+",
+            "async_return_then_break_control.py",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn protected_async_tested_raise_arm_preserves_borrow_reachability() {
+    for (source, filename) in [
+        (
+            r"async def sample(stream, receiver, is_error, is_message, stop, consume):
+    try:
+        async for item in stream:
+            if is_error(item):
+                raise item
+            elif is_message(item):
+                should_stop = stop(item)
+                if should_stop:
+                    break
+        receiver.first()
+        receiver.second()
+    finally:
+        receiver.finish()
+",
+            "async_tested_raise_arm.py",
+        ),
+        (
+            r"async def sample(stream, receiver, is_error, is_message, stop, consume):
+    try:
+        async for item in stream:
+            if is_error(item):
+                consume(item)
+            elif is_message(item):
+                should_stop = stop(item)
+                if should_stop:
+                    break
+        receiver.first()
+        receiver.second()
+    finally:
+        receiver.finish()
+",
+            "async_tested_linear_arm.py",
+        ),
+        (
+            r"async def sample(stream, receiver, is_error, is_message, stop, consume):
+    try:
+        async for item in stream:
+            if is_error(item):
+                if stop(item):
+                    break
+                raise item
+            elif is_message(item):
+                should_stop = stop(item)
+                if should_stop:
+                    break
+        receiver.first()
+        receiver.second()
+    finally:
+        receiver.finish()
+",
+            "async_tested_earlier_break.py",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn protected_async_break_after_boolean_call_argument_preserves_borrow_reachability() {
+    let source = r"async def f(stream, value, should_stop, should_log, should_retry, consume):
+    try:
+        async for item in stream:
+            if should_stop(item):
+                if should_log(item):
+                    consume(item)
+                    if value:
+                        consume(value or 0)
+                if should_retry(item):
+                    value = item
+                    continue
+                value = item
+                break
+        consume(value)
+        consume(value)
+    except RuntimeError:
+        consume(value)
+";
+    common::assert_matches_cpython_marshal(source, "async_break_boolean_call_argument.py");
+}
