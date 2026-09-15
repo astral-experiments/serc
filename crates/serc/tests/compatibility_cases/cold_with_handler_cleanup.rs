@@ -1,6 +1,46 @@
 use crate::common;
 
 #[test]
+fn matches_cpython_module_with_discarded_tail_boundaries() {
+    for (filename, source) in [
+        (
+            "with_then_constant_terminal_if.py",
+            "if enabled:\n    with manager:\n        use()\n    \"ignored\"\n",
+        ),
+        (
+            "with_then_false_terminal_if.py",
+            "with manager:\n    use()\nif False:\n    ignored()\n",
+        ),
+        (
+            "terminal_with_control.py",
+            "if enabled:\n    with manager:\n        use()\n",
+        ),
+        (
+            "with_then_call_control.py",
+            "with manager:\n    use()\nfinish()\n",
+        ),
+        (
+            "module_with_string_single.py",
+            "with manager:\n    use()\n\"ignored\"\n",
+        ),
+        (
+            "module_with_string_multiline.py",
+            "with manager:\n    use()\n\"\"\"ignored\nsecond line\n\"\"\"\n",
+        ),
+        (
+            "module_nested_with_string_multiline.py",
+            "with first:\n    with second:\n        use()\n\"\"\"ignored\nsecond line\n\"\"\"\n",
+        ),
+        (
+            "folded_true_with_string_control.py",
+            "if True:\n    with manager:\n        use()\n    \"ignored\"\n",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
 fn matches_cpython_terminal_named_with_cleanup_copies() {
     for (scope, prefix, with_keyword) in [
         ("def", "", "with"),

@@ -1667,6 +1667,21 @@ impl Compiler<'_> {
                         self.control.statements.emitted_fallthrough_return = true;
                         continue;
                     }
+                    Stmt::If(statement)
+                        if matches!(self.unit.scope, Scope::Module)
+                            && statement.elif_else_clauses.is_empty()
+                            && early_condition_truthiness(&statement.test) == Some(false)
+                            && matches!(body.get(index.wrapping_sub(1)), Some(Stmt::With(previous))
+                                if !previous.is_async) =>
+                    {
+                        // Keep the original folded condition before the implicit return.
+                        // The preceding manager's suppression edge must still target a
+                        // non-exiting block during small-exit copying.
+                        self.compile_if(statement)?;
+                        self.emit_deferred_implicit_return()?;
+                        self.control.statements.emitted_fallthrough_return = true;
+                        continue;
+                    }
                     Stmt::If(statement) => {
                         self.compile_terminal_if(statement)?;
                         self.control.statements.emitted_fallthrough_return = true;
@@ -1869,6 +1884,10 @@ impl Compiler<'_> {
                 if index + 1 < body.len()
                     || (!final_expression_becomes_return
                         && !matches!(self.unit.scope, Scope::Class { .. }))
+                    || (matches!(self.unit.scope, Scope::Module)
+                        && self.control.statements.in_terminal_if_branch_suite
+                        && matches!(body.get(index.wrapping_sub(1)), Some(Stmt::With(previous))
+                            if !previous.is_async))
                 {
                     let noop_start = self.assembler.label();
                     self.assembler.mark(noop_start);
@@ -15182,6 +15201,17 @@ impl Compiler<'_> {
             );
             if terminal_handler_exclusions.is_none() && !terminal_handler_suite_return {
                 self.assembler.record_unlocated_cleanup_targets();
+                // Multiple false edges share one original artificial cleanup, whether or not
+                // the handler binds the exception. Keep it unlocated until exit duplication.
+                let handler_has_shared_terminal_false_cleanup = terminal
+                    && matches!(
+                        handler.body.last(),
+                        Some(Stmt::If(tail))
+                            if tail.elif_else_clauses.is_empty()
+                                && matches!(tail.body.last(), Some(Stmt::Raise(_)))
+                                && condition_has_linear_runtime_leaves(&tail.test)
+                                && condition_jump_target_count(&tail.test, false) > 1
+                    );
                 // Multi-edge joins and folded unconditional false exits leave this cleanup
                 // source-less; a sole runtime-tested false edge carries its operand's location.
                 let handler_ends_with_terminating_unlocated_cleanup = matches!(
@@ -15231,6 +15261,7 @@ impl Compiler<'_> {
                 // normal cleanup block, even when code follows the enclosing try statement.
                 if handler_cleanup_from_original_join
                     || handler_ends_with_unlocated_bare_raise_branch_cleanup
+                    || handler_has_shared_terminal_false_cleanup
                 {
                     self.assembler.set_location(SourceLocation::NONE);
                 } else if terminal
@@ -16031,13 +16062,22 @@ impl Compiler<'_> {
                 && matches!(body.last(), Some(Stmt::With(statement))
                     if !statement.is_async && !suite_terminates(&statement.body))
                 && self.assembler.at_original_unconditional_join();
-            if inline_manager_cleanup {
+            // A nested runtime conditional's normal edges also reach one original
+            // artificial cleanup. Assign each copied exit its own predecessor's location.
+            let shared_conditional_cleanup = matches!(
+                body.last(),
+                Some(Stmt::If(tail))
+                    if handler_cleanup_has_runtime_if_join(tail)
+                        && condition_has_linear_runtime_leaves(&tail.test)
+                        && if_normal_exit_count(tail) > 1
+            );
+            if inline_manager_cleanup || shared_conditional_cleanup {
                 self.assembler.record_unlocated_cleanup_targets();
             }
             exclusions.push(self.emit_terminal_exception_handler_action(
                 name,
                 handler_depth,
-                if inline_manager_cleanup {
+                if inline_manager_cleanup || shared_conditional_cleanup {
                     SourceLocation::NONE
                 } else {
                     action_location
@@ -16054,10 +16094,20 @@ impl Compiler<'_> {
             }
         }
         if !has_else {
+            // CPython duplicates this unlocated exit once per original false edge before
+            // propagating line numbers. A sole false edge retains its operand's location.
+            let location = if condition_has_linear_runtime_leaves(last_test)
+                && condition_jump_target_count(last_test, false) > 1
+            {
+                self.assembler.record_unlocated_cleanup_targets();
+                SourceLocation::NONE
+            } else {
+                self.source_location(condition_fallthrough_range(last_test))
+            };
             exclusions.push(self.emit_terminal_exception_handler_action(
                 name,
                 handler_depth,
-                self.source_location(condition_fallthrough_range(last_test)),
+                location,
             )?);
         }
         Ok(exclusions)

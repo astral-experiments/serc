@@ -63,3 +63,56 @@ fn matches_cpython_terminating_handler_shared_false_join_before_else() {
         }
     }
 }
+
+#[test]
+fn matches_cpython_terminal_unnamed_handler_shared_cleanup() {
+    for (filename, source) in [
+        (
+            "unnamed_async_and.py",
+            r"async def run_handler(action, current_task):
+    try:
+        await action()
+    except CancelledError:
+        task = current_task()
+        if task is not None and task.cancelling():
+            raise
+",
+        ),
+        (
+            "unnamed_async_or_and.py",
+            r"async def run_handler(action, current_task, terminal_seen):
+    try:
+        await action()
+    except CancelledError:
+        task = current_task()
+        if not terminal_seen or (task is not None and task.cancelling()):
+            raise
+",
+        ),
+        (
+            "unnamed_single_false_control.py",
+            r"async def run_handler(action, current_task):
+    try:
+        await action()
+    except CancelledError:
+        task = current_task()
+        if task is not None:
+            raise
+",
+        ),
+        (
+            "unnamed_pass_control.py",
+            r"async def run_handler(action, current_task):
+    try:
+        await action()
+    except CancelledError:
+        task = current_task()
+        if task is not None and task.cancelling():
+            raise
+        pass
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

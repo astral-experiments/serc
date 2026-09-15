@@ -154,6 +154,7 @@ mod named_handler_and_cleanup_location_compatibility;
 mod named_handler_boolean_cleanup_order;
 mod named_handler_else_bare_raise_compatibility;
 mod named_handler_shared_cleanup;
+mod named_handler_terminal_cleanup_locations;
 mod named_outer_handler_return_owners;
 mod negated_chained_comparison_filters;
 mod negated_conditional_filter_join_locations;
