@@ -1004,6 +1004,7 @@ impl LayoutAssembler {
                 .count();
             let mut tail = ExceptionOwnerTail::default();
             let mut previous = Some(*marker);
+            let mut unchanged_prefix = true;
             for (offset, item) in self.items[cursor..].iter().enumerate() {
                 // Even an apparently empty foreign label can stand for a different
                 // original array. Captured aliases above are the only permitted joins.
@@ -1024,8 +1025,12 @@ impl LayoutAssembler {
                 {
                     break;
                 }
+                unchanged_prefix &=
+                    instruction.exception_policy() == super::ExceptionPolicy::default();
                 tail.instruction(*instruction, previous);
-                if tail.early_removals != usize::from(none_tail) * 3
+                // Global-call and boolean-comparison folding also remove protected
+                // records. Their complete prefix must retain its original owner policy.
+                if (tail.early_removals != usize::from(none_tail) * 3 && !unchanged_prefix)
                     || tail.insertions != 0
                     || tail.late_removals != 0
                     || tail.post_compaction_fusions != 0
@@ -1034,10 +1039,10 @@ impl LayoutAssembler {
                 }
                 if is_conditional_jump(instruction.opcode) {
                     if matches!(instruction.operand(), Operand::Forward(_)) {
-                        let owner = if none_tail {
-                            // The three specialized None records are the only removals.
-                            // The new append index is the old IS_OP cell, whose owner
-                            // belongs to this protected suffix after the NULL POP_BLOCK.
+                        let owner = if tail.early_removals > 0 {
+                            // All removed records are in this uniformly protected suffix.
+                            // Compaction leaves its old tail available for the appended
+                            // marker, beyond the retained NULL-owned POP_BLOCK.
                             let Some(owner) = self.uniform_exception_owner(
                                 logical_start,
                                 logical_start + offset + 1,
@@ -1932,6 +1937,52 @@ impl LayoutAssembler {
             })
             .collect::<FxHashMap<_, _>>();
         let retained_setup_nops = self.retained_setup_nops(&label_positions);
+        // An original entry prefix with no SETUP, region, or policy owner can
+        // supply only NULL records, including its certified early-folded slots.
+        let null_original_entry_prefix =
+            |start: usize,
+             setup_label: Label,
+             owners: &FxHashMap<usize, ExceptionOwnerDecision>| {
+                start
+                    .checked_sub(1)
+                    .is_some_and(|index| retained_setup_nops.contains(&index))
+                    && self
+                        .exception_owner_provenance
+                        .setups
+                        .iter()
+                        .all(|(label, _)| {
+                            *label == setup_label
+                                || label_positions
+                                    .get(label)
+                                    .is_some_and(|position| *position > start)
+                        })
+                    && self.exception_regions.iter().all(|region| {
+                        match (
+                            label_positions.get(&region.start),
+                            label_positions.get(&region.end),
+                        ) {
+                            (Some(begin), Some(end)) => *begin >= start || *end == 0,
+                            _ => false,
+                        }
+                    })
+                    && indexed_instructions[..start]
+                        .iter()
+                        .enumerate()
+                        .all(|(index, previous)| {
+                            matches!(
+                                previous.exception_policy(),
+                                super::ExceptionPolicy::NoneUnchanged
+                                    | super::ExceptionPolicy::AlwaysUnchanged
+                            ) && !owners.contains_key(&index)
+                                && previous.no_location_policy.borrow_fallthrough()
+                                    != super::BorrowFallthrough::Barrier
+                                && (previous.opcode != NOP
+                                    || (retained_setup_nops.contains(&index)
+                                        && previous.local_policy.hidden_exception_owner_slots()
+                                            == 0
+                                        && previous.pre_fold_extra_instructions() == 0))
+                        })
+            };
         let retained_setup_null_markers =
             self.retained_setup_null_markers(&label_positions, &jump_targets, &retained_setup_nops);
         let retained_normal_pop_terminators =
@@ -2733,8 +2784,20 @@ impl LayoutAssembler {
                                                 && nop.pre_fold_extra_instructions() == 0
                                         })
                                 });
+                            // Prefix insertion can consume the later fusion tail before
+                            // this marker is appended. Keep the policy's COPY/TO_BOOL
+                            // insertion adjustment in both original-width calculations.
+                            let prologue_consumed_fusion_prefix = instruction.opcode == NOT_TAKEN
+                                && original_array_start == 0
+                                && tail.insertions > 0
+                                && tail.insertions <= start
+                                && tail.insertions == setup_tail.insertions
+                                && tail.post_compaction_fusions <= tail.insertions
+                                && insertions <= instruction_index - start
+                                && null_original_entry_prefix(start, setup_label, &owners);
                             proven_unprotected_slot = owner_history_exact
-                                && tail.post_compaction_fusions == 0
+                                && (tail.post_compaction_fusions == 0
+                                    || prologue_consumed_fusion_prefix)
                                 && stale_slots > protected_original_instructions
                                 && (retained_setup_cell || {
                                     let first_unprotected_setup = self
@@ -2815,17 +2878,17 @@ impl LayoutAssembler {
                             },
                         );
                     }
-                    // The last compaction determines which stale array the marker reuses.
-                    // Local fusion compacts the already optimized live array; otherwise,
-                    // the first peephole pass leaves the original suffix untouched.
+                    // Local fusion leaves a newer stale suffix inside the original array.
+                    // Entry prologue insertion consumes that suffix first; once all fusion
+                    // slots are used, the marker reuses the older peephole-compaction tail.
                     if instruction.opcode == NOT_TAKEN
                         && instruction.exception_policy().owner()
                             == NormalizedExceptionOwner::Present
                         && tail.late_removals == 0
-                        && let Some((start, setup_tail, _)) = protected_suffix
+                        && let Some((start, setup_tail, setup_label)) = protected_suffix
                     {
                         let (removed, protected_before_compaction) =
-                            if tail.post_compaction_fusions > 0 {
+                            if tail.post_compaction_fusions > tail.insertions {
                                 (
                                     tail.post_compaction_fusions,
                                     instruction_index - start + tail.post_compaction_fusions
@@ -2844,12 +2907,13 @@ impl LayoutAssembler {
                             tail.insertions > 0 && tail.early_removals <= tail.insertions;
                         // Entry prologue insertion can move the append onto the retained
                         // NULL SETUP immediately before this protected suffix. Certify
-                        // that exact original cell; earlier prefix owners remain unknown.
-                        let prologue_reuses_null_setup = owner_history_exact
+                        // that specific original cell before considering the wider prefix.
+                        let prologue_reuses_original_tail = owner_history_exact
                             && original_array_start == 0
                             && tail.insertions > 0
                             && tail.insertions == setup_tail.insertions
-                            && tail.post_compaction_fusions == 0
+                            && tail.post_compaction_fusions <= tail.insertions;
+                        let prologue_reuses_null_setup = prologue_reuses_original_tail
                             && tail.early_removals.checked_sub(tail.insertions)
                                 == protected_before_compaction.checked_add(1)
                             && start.checked_sub(1).is_some_and(|index| {
@@ -2878,8 +2942,19 @@ impl LayoutAssembler {
                                                 != super::BorrowFallthrough::Barrier
                                     })
                             });
+                        // An earlier donor is also NULL when the entire original entry
+                        // prefix was unprotected. Reject erased SETUP origins as well as
+                        // surviving owners before relying on the compacted prefix.
+                        let prologue_reuses_null_prefix = prologue_reuses_original_tail
+                            && tail.insertions <= start
+                            && tail
+                                .early_removals
+                                .checked_sub(tail.insertions)
+                                .is_some_and(|remaining| remaining > protected_before_compaction)
+                            && null_original_entry_prefix(start, setup_label, &owners);
                         if prologue_consumed_all_slots
                             || prologue_reuses_null_setup
+                            || prologue_reuses_null_prefix
                             || (tail.insertions == 0 && removed > protected_before_compaction)
                         {
                             owners.insert(
@@ -3324,7 +3399,7 @@ impl LayoutAssembler {
                         pending_null_append = Some(instruction_index + 1);
                     }
                     // This separate origin proof starts with one retained normal POP_BLOCK.
-                    // A specialized None tail reuses its old IS_OP owner. Carry that
+                    // Known protected folds leave an owned stale tail. Carry that
                     // certificate across the marker's exception-range endpoints, using
                     // the same path as other exact compacted-source owners.
                     if owner_history_exact
@@ -5543,14 +5618,17 @@ mod tests {
             LayoutAssembler, NormalizedExceptionOwner, Operand, SourceLocation,
         };
         use crate::target::opcodes::{
-            LOAD_ATTR, LOAD_FAST, NOP, NOT_TAKEN, POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE, RERAISE,
-            RETURN_VALUE,
+            COMPARE_OP, LOAD_ATTR, LOAD_FAST, LOAD_GLOBAL, NOP, NOT_TAKEN, POP_JUMP_IF_NONE,
+            POP_JUMP_IF_NOT_NONE, POP_JUMP_IF_TRUE, RERAISE, RETURN_VALUE,
         };
 
         for case in [
             "none",
             "not none",
             "present",
+            "global fold",
+            "boolean compare",
+            "excluded folded prefix",
             "hidden two",
             "prior fold",
             "foreign label",
@@ -5574,16 +5652,27 @@ mod tests {
             pop.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS);
             pop.fusion_policy.mark_converted_pop_block();
             pop.jump_policy.preserve_explicit_nop();
-            let opcode = if case == "not none" {
+            let opcode = if case == "boolean compare" {
+                POP_JUMP_IF_TRUE
+            } else if case == "not none" {
                 POP_JUMP_IF_NOT_NONE
             } else {
                 POP_JUMP_IF_NONE
             };
             let mut conditional = plain(opcode, Operand::Forward(exit));
-            conditional
-                .local_policy
-                .add_hidden_exception_owner_slots(if case == "hidden two" { 2 } else { 3 });
-            let mut first = plain(LOAD_FAST, Operand::Value(0));
+            if case != "boolean compare" {
+                conditional
+                    .local_policy
+                    .add_hidden_exception_owner_slots(if case == "hidden two" { 2 } else { 3 });
+            }
+            let mut first = if matches!(case, "global fold" | "excluded folded prefix") {
+                plain(LOAD_GLOBAL, Operand::Value(1))
+            } else {
+                plain(LOAD_FAST, Operand::Value(0))
+            };
+            if case == "excluded folded prefix" {
+                first.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS);
+            }
             if case == "prior fold" {
                 first.add_pre_fold_extra_instructions(1);
             }
@@ -5609,7 +5698,11 @@ mod tests {
                 Item::Instruction(pop),
                 Item::Label(body),
                 Item::Instruction(first),
-                Item::Instruction(plain(LOAD_ATTR, Operand::Value(0))),
+                Item::Instruction(if case == "boolean compare" {
+                    plain(COMPARE_OP, Operand::Value(88))
+                } else {
+                    plain(LOAD_ATTR, Operand::Value(0))
+                }),
                 Item::Instruction(conditional),
                 Item::Label(marker_start),
                 Item::Instruction(marker),
@@ -5692,14 +5785,25 @@ mod tests {
                 .collect();
             let certified = assembler
                 .retained_normal_pop_terminators(&[exit].into_iter().collect(), &positions);
-            let expected = matches!(case, "none" | "not none" | "present" | "excluded marker");
+            let expected = matches!(
+                case,
+                "none"
+                    | "not none"
+                    | "present"
+                    | "global fold"
+                    | "boolean compare"
+                    | "excluded marker"
+            );
             assert_eq!(
                 certified.get(&3).copied(),
                 expected.then_some(Some(0)),
                 "{case}"
             );
             let decisions = assembler.dynamic_exception_owners();
-            if matches!(case, "none" | "not none" | "present") {
+            if matches!(
+                case,
+                "none" | "not none" | "present" | "global fold" | "boolean compare"
+            ) {
                 let decision = decisions.get(&4).expect("marker after region-end label");
                 assert_eq!(decision.source_region, Some(0), "{case}");
                 assert!(
@@ -5717,21 +5821,23 @@ mod tests {
 
     #[test]
     fn saturated_literal_fold_rejects_changed_and_copied_origins() {
+        use crate::assembler::OperandPatchId;
         use crate::assembler::ir::UnoptimizedCode;
         use crate::assembler::{
             Assembler, ExceptionPolicy, Instruction, Item, Operand, SourceLocation,
         };
-        use crate::target::opcodes::{LIST_EXTEND, NOP, SET_UPDATE};
+        use crate::target::opcodes::{LIST_EXTEND, LOAD_CONST, NOP, SET_UPDATE};
 
-        for opcode in [LIST_EXTEND, SET_UPDATE] {
-            for count in [4, 9, 28] {
+        for (opcode, operand) in [
+            (LIST_EXTEND, Operand::Value(1)),
+            (SET_UPDATE, Operand::Value(1)),
+            (LOAD_CONST, Operand::Deferred(OperandPatchId(0))),
+        ] {
+            for count in [4, 9, 28, 30] {
                 let location = SourceLocation::new(1, 1, 0, 12);
                 let mut assembler = Assembler {
                     code: UnoptimizedCode::Linear(vec![Item::Instruction(Instruction::new(
-                        opcode,
-                        Operand::Value(1),
-                        location,
-                        None,
+                        opcode, operand, location, None,
                     ))]),
                     ..Assembler::default()
                 };
@@ -5750,7 +5856,7 @@ mod tests {
 
                 let mut unchanged = original;
                 unchanged.add_pre_fold_extra_instructions(0);
-                unchanged.set_operand(Operand::Value(1));
+                unchanged.set_operand(operand);
                 unchanged.set_exception_policy(ExceptionPolicy::NoneUnchanged);
                 assert!(
                     provenance
@@ -5774,7 +5880,7 @@ mod tests {
 
                 let mut changed_operand = original;
                 changed_operand.set_operand(Operand::Value(2));
-                changed_operand.set_operand(Operand::Value(1));
+                changed_operand.set_operand(operand);
                 assert!(
                     provenance
                         .original_uniform_fold_positions(&[&changed_operand])
@@ -5800,7 +5906,7 @@ mod tests {
                 );
                 let fused = Instruction::fused(
                     opcode,
-                    Operand::Value(1),
+                    operand,
                     original,
                     Instruction::new(NOP, Operand::Value(0), location, None),
                 );
@@ -5834,6 +5940,140 @@ mod tests {
                         .is_empty()
                 );
             }
+        }
+    }
+
+    #[test]
+    fn deferred_tuple_fold_resolution_preserves_only_unchanged_origins() {
+        use crate::assembler::{Assembler, ExceptionPolicy, Item, Operand};
+        use crate::target::opcodes::LOAD_CONST;
+
+        for (count, mutation) in [
+            (4, "none"),
+            (9, "none"),
+            (30, "none"),
+            (31, "none"),
+            (1023, "none"),
+            (9, "foreign fold"),
+            (9, "operand round trip"),
+            (9, "policy round trip"),
+            (9, "extra hidden slot"),
+            (9, "physical copy"),
+            (9, "duplicate witness"),
+        ] {
+            let mut assembler = Assembler::default();
+            let patch = assembler.emit_placeholder_with_depth(LOAD_CONST, 1);
+            assembler.add_last_constant_fold_slots(count);
+            assembler.record_last_uniform_fold_owner_slots(count);
+            let Item::Instruction(mut instruction) = assembler.linear_items()[0] else {
+                unreachable!();
+            };
+            match mutation {
+                "foreign fold" => instruction.add_pre_fold_extra_instructions(1),
+                "operand round trip" => {
+                    instruction.set_operand(Operand::Value(1));
+                    instruction.set_operand(Operand::Deferred(patch));
+                }
+                "policy round trip" => {
+                    instruction.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS);
+                    instruction.set_exception_policy(ExceptionPolicy::NoneUnchanged);
+                }
+                "extra hidden slot" => instruction.local_policy.add_hidden_exception_owner_slots(1),
+                "physical copy" => instruction = instruction.for_exit_copy(),
+                "duplicate witness" => assembler
+                    .exception_owner_provenance
+                    .original_uniform_folds
+                    .push(instruction),
+                "none" => {}
+                _ => unreachable!(),
+            }
+            assembler.linear_items_mut()[0] = Item::Instruction(instruction);
+            assembler.patch_argument(patch, 17).unwrap();
+            assembler.resolve_operand_patches().unwrap();
+            let Item::Instruction(resolved) = assembler.linear_items()[0] else {
+                unreachable!();
+            };
+            assert_eq!(resolved.operand(), Operand::Value(17));
+            assert_eq!(
+                assembler
+                    .exception_owner_provenance
+                    .original_uniform_fold_positions(&[&resolved])
+                    .contains(&0),
+                count <= 30 && mutation == "none",
+                "{count}: {mutation}",
+            );
+        }
+    }
+
+    #[test]
+    fn tuple_fold_constant_remapping_preserves_identity_and_duplicates() {
+        use crate::assembler::{Assembler, ExceptionPolicy, Item, Operand};
+        use crate::target::opcodes::{LOAD_CONST, NOP};
+
+        for mutation in [
+            "none",
+            "foreign fold",
+            "operand round trip",
+            "policy round trip",
+            "extra hidden slot",
+            "physical copy",
+            "duplicate survivor",
+            "duplicate witness",
+            "removed constant",
+        ] {
+            let mut assembler = Assembler::default();
+            let patch = assembler.emit_placeholder_with_depth(LOAD_CONST, 1);
+            assembler.add_last_constant_fold_slots(9);
+            assembler.record_last_uniform_fold_owner_slots(9);
+            assembler.patch_argument(patch, 2).unwrap();
+            assembler.resolve_operand_patches().unwrap();
+            let Item::Instruction(mut instruction) = assembler.linear_items()[0] else {
+                unreachable!();
+            };
+            match mutation {
+                "foreign fold" => instruction.add_pre_fold_extra_instructions(1),
+                "operand round trip" => {
+                    instruction.set_operand(Operand::Value(1));
+                    instruction.set_operand(Operand::Value(2));
+                }
+                "policy round trip" => {
+                    instruction.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS);
+                    instruction.set_exception_policy(ExceptionPolicy::NoneUnchanged);
+                }
+                "extra hidden slot" => instruction.local_policy.add_hidden_exception_owner_slots(1),
+                "physical copy" => instruction = instruction.for_exit_copy(),
+                "duplicate survivor" => assembler.push_linear_item(Item::Instruction(instruction)),
+                "duplicate witness" => assembler
+                    .exception_owner_provenance
+                    .original_uniform_folds
+                    .push(instruction),
+                "none" | "removed constant" => {}
+                _ => unreachable!(),
+            }
+            assembler.linear_items_mut()[0] = Item::Instruction(instruction);
+            let retained = mutation != "removed constant";
+            assembler.remap_constant_indices(LOAD_CONST, &[Some(0), None, retained.then_some(1)]);
+            let instructions = assembler
+                .linear_items()
+                .iter()
+                .filter_map(|item| match item {
+                    Item::Instruction(instruction) => Some(instruction),
+                    Item::Label(_) => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                instructions[0].opcode,
+                if retained { LOAD_CONST } else { NOP }
+            );
+            assert_eq!(
+                instructions[0].operand(),
+                Operand::Value(u32::from(retained))
+            );
+            let certified = assembler
+                .exception_owner_provenance
+                .original_uniform_fold_positions(&instructions);
+            assert_eq!(certified.contains(&0), mutation == "none", "{mutation}");
+            assert!(certified.len() <= 1, "{mutation}");
         }
     }
 }

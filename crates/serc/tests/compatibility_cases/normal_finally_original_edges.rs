@@ -329,3 +329,166 @@ def target() -> None:
 ";
     common::assert_matches_cpython_marshal(source, "cell_prologue_folded_tuple_assert.py");
 }
+
+#[test]
+fn matches_cpython_marshal_for_cell_prologue_consuming_local_fusion_slots() {
+    for (source, filename) in [
+        (
+            r"def target():
+    value = make_value((1, 2, 3))
+    captured = value
+
+    def capture():
+        return captured
+
+    first, second = make_pair()
+    try:
+        assert second == ()
+    finally:
+        cleanup()
+",
+            "cell_consumes_one_fusion.py",
+        ),
+        (
+            r"def target():
+    value = make_value((1, 2))
+    captured = value
+    extra = None
+
+    def capture():
+        return captured, extra
+
+    first, second = make_pair()
+    third, fourth = make_pair()
+    try:
+        assert fourth == ()
+    finally:
+        cleanup()
+",
+            "cells_consume_two_fusions.py",
+        ),
+        (
+            r"def target():
+    value = make_value((1, 2, 3))
+    captured = value
+
+    def capture():
+        return captured
+
+    first = make_pair()
+    try:
+        assert first == ()
+    finally:
+        cleanup()
+",
+            "one_cell_no_fusion_control.py",
+        ),
+        (
+            r"def target():
+    value = make_value((1, 2, 3))
+    captured = value
+    extra = None
+
+    def capture():
+        return captured, extra
+
+    first, second = make_pair()
+    try:
+        assert second == ()
+    finally:
+        cleanup()
+",
+            "two_cells_one_fusion_control.py",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn matches_cpython_marshal_for_loop_finally_owner_assert_owner() {
+    let source = r#"async def f(manager, values, stream):
+    async with manager:
+        try:
+            async for value in values:
+                pass
+        finally:
+            assert stream.metadata().get("key", None) == "expected"
+            checked = True
+    return checked
+"#;
+    common::assert_matches_cpython_marshal(source, "loop_finally_assert_owner.py");
+}
+
+#[test]
+fn matches_cpython_marshal_for_cells_consume_fusion_before_null_prefix() {
+    let source = r"def target():
+    first_value = make_value()
+    second_value = make_value(make_value())
+
+    def capture():
+        return first_value, second_value
+
+    context = make_context()
+    observe()
+    first, second = make_pair(make_more())
+    try:
+        assert second == ()
+    finally:
+        cleanup()
+";
+    common::assert_matches_cpython_marshal(source, "cells_consume_fusion_before_null_prefix.py");
+}
+
+#[test]
+fn matches_cpython_marshal_for_cells_consume_three_fusions_before_null_prefix() {
+    let source = r"def target():
+    a = make_value((1, 2))
+    b = make_value()
+    c = make_value()
+    d = make_value()
+    e = make_value()
+    f = make_value()
+
+    def capture():
+        return a, b, c, d, e, f
+
+    first, second = make_pair()
+    third, fourth = make_pair()
+    fifth, sixth = make_pair()
+    observe()
+    observe()
+    observe()
+    observe()
+    try:
+        assert a.wait(timeout=1)
+    finally:
+        cleanup()
+";
+    common::assert_matches_cpython_marshal(
+        source,
+        "cells_consume_three_fusions_before_null_prefix.py",
+    );
+}
+
+#[test]
+fn matches_cpython_marshal_for_large_tuple_cell_assert() {
+    let source = r"def target():
+    bindings = (1, 2, 3, 4, 5, 6, 7, 8, 9)
+
+    def configure(connection):
+        connection.apply(bindings)
+
+    engine = make_engine(configure=configure)
+    sessions = make_sessions(engine)
+    try:
+        result, first_id, second_id = make_result(sessions)
+        assert result.attempt_id is not None
+        with sessions() as session:
+            plan = make_plan(session, result.attempt_id)
+        assert plan.ready is True
+    finally:
+        engine.close()
+";
+    common::assert_matches_cpython_marshal(source, "large_tuple_cell_assert.py");
+}

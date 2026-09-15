@@ -3080,10 +3080,16 @@ impl Assembler {
     pub(crate) fn record_last_uniform_fold_owner_slots(&mut self, count: usize) {
         if count >= 4 && count < usize::from(LocalPolicy::MAX_HIDDEN_EXCEPTION_OWNER_SLOTS) {
             let instruction = self.required_last_instruction_mut("recording original literal fold");
-            if matches!(
-                instruction.opcode,
-                crate::target::opcodes::LIST_EXTEND | crate::target::opcodes::SET_UPDATE
-            ) && instruction.operand() == Operand::Value(1)
+            let original_literal = match (instruction.opcode, instruction.operand()) {
+                (
+                    crate::target::opcodes::LIST_EXTEND | crate::target::opcodes::SET_UPDATE,
+                    Operand::Value(1),
+                ) => true,
+                // Larger tuples use LIST_APPEND and have a different original slot count.
+                (LOAD_CONST, Operand::Deferred(_)) => count <= 30,
+                _ => false,
+            };
+            if original_literal
                 && instruction.exception_policy() == ExceptionPolicy::NoneUnchanged
                 && instruction.pre_fold_extra_instructions() == 4
                 && usize::from(instruction.local_policy.hidden_exception_owner_slots()) == count
@@ -4780,7 +4786,28 @@ impl Assembler {
                     id.0
                 )));
             };
+            // This patch resolves one uniquely attached source operand. Carry an
+            // unchanged tuple-fold witness across that resolution, but never revive
+            // a witness retired by an intervening mutation or physical copy.
+            let original_uniform_fold = if instruction.opcode == LOAD_CONST
+                && instruction.jump_policy.has_original_uniform_fold()
+            {
+                let mut originals = self
+                    .exception_owner_provenance
+                    .original_uniform_folds
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, original)| **original == *instruction);
+                let original = originals.next().map(|(index, _)| index);
+                original.filter(|_| originals.next().is_none())
+            } else {
+                None
+            };
             instruction.set_operand(Operand::Value(argument));
+            if let Some(index) = original_uniform_fold {
+                instruction.jump_policy.mark_original_uniform_fold();
+                self.exception_owner_provenance.original_uniform_folds[index] = *instruction;
+            }
         }
 
         self.operand_patches.clear();
@@ -4868,6 +4895,9 @@ impl Assembler {
             });
         }
         let deferred_none = self.deferred_none_constant_index;
+        // Retain the pre-remap witnesses throughout the pass so duplicate live
+        // survivors stay duplicates when their constant indices change together.
+        let original_uniform_folds = &self.exception_owner_provenance.original_uniform_folds;
         let remap = |instruction: &mut Instruction| {
             if instruction.opcode != load_const {
                 return;
@@ -4875,6 +4905,7 @@ impl Assembler {
             let Operand::Value(mut index) = instruction.operand() else {
                 unreachable!("LOAD_CONST has a jump operand");
             };
+            let mut original_uniform_fold = false;
             if index == u32::MAX {
                 let old_index = usize::try_from(
                     deferred_none.expect("deferred None constant should be resolved"),
@@ -4882,6 +4913,13 @@ impl Assembler {
                 .expect("constant index should fit in usize");
                 index = index_map[old_index].expect("deferred None constant should be retained");
             } else if let Some(new_index) = index_map[usize::try_from(index).unwrap()] {
+                original_uniform_fold = instruction.opcode == LOAD_CONST
+                    && instruction.jump_policy.has_original_uniform_fold()
+                    && original_uniform_folds
+                        .iter()
+                        .filter(|original| **original == *instruction)
+                        .count()
+                        == 1;
                 index = new_index;
             } else {
                 // This unreachable load's constant was removed from the pool. Retain
@@ -4891,6 +4929,9 @@ impl Assembler {
                 index = 0;
             }
             instruction.set_operand(Operand::Value(index));
+            if original_uniform_fold {
+                instruction.jump_policy.mark_original_uniform_fold();
+            }
         };
         match &mut self.code {
             UnoptimizedCode::Linear(items) => {
@@ -4901,6 +4942,20 @@ impl Assembler {
                 }
             }
             UnoptimizedCode::Prepared { graph, .. } => graph.for_each_instruction_mut(remap),
+        }
+        // retain_used moves the same constants without changing their identity.
+        // Apply its mapping to every original witness only after all live records.
+        for original in &mut self.exception_owner_provenance.original_uniform_folds {
+            if original.opcode == LOAD_CONST
+                && load_const == LOAD_CONST
+                && original.jump_policy.has_original_uniform_fold()
+                && let Operand::Value(index) = original.operand()
+                && index != u32::MAX
+                && let Some(Some(new_index)) = index_map.get(index as usize)
+            {
+                original.set_operand(Operand::Value(*new_index));
+                original.jump_policy.mark_original_uniform_fold();
+            }
         }
     }
 
