@@ -11317,6 +11317,44 @@ def final_elif(action, first, second):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_two_named_handlers_inside_ordinary_try() {
+        let source = r"async def f(value):
+    try:
+        await prepare(value)
+        try:
+            first(value)
+        except FirstError as outer_error:
+            try:
+                second(value)
+            except SecondError as error:
+                observe(error)
+                return None
+        return value
+    except OuterError:
+        return None
+";
+        assert_matches_cpython_marshal(source, "coro_outer_named_excluded.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_coroutine_handler_return_through_older_iterator() {
+        let source = r"async def f(values):
+    try:
+        for value in values:
+            try:
+                first(value)
+            except FirstError:
+                try:
+                    return second(value)
+                except SecondError:
+                    observe(value)
+    except OuterError:
+        return None
+";
+        assert_matches_cpython_marshal(source, "coro_single_handler_iterator_excluded.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_manager_handler_enclosing_try_owners() {
         let source = include_str!("fixtures/manager_handler_enclosing_try_owners.py");
         assert_matches_cpython_marshal(source, "manager_handler_enclosing_try_owners.py");

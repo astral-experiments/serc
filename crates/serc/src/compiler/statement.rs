@@ -4950,8 +4950,8 @@ impl Compiler<'_> {
                                     == Some(pair[1].exception_region_depth)
                         });
                 // Two contiguous handlers retire their own collectors before the ordinary
-                // try surrounding them. The outer handler is unnamed; an inner name
-                // is cleared while the outer handler still owns its cleanup.
+                // try surrounding them. Each name is cleared after its own handler exits,
+                // while the enclosing handler or try still owns the cleanup.
                 let tracks_two_handlers_inside_ordinary_try = !return_is_overridden
                     && self.context.target_specific_rules_enabled()
                     && handler_count == 2
@@ -4993,9 +4993,7 @@ impl Compiler<'_> {
                         .active_exception_handlers
                         .first()
                         .is_some_and(|handler| {
-                            handler.name.is_none()
-                                && handler.try_body_depth == 1
-                                && handler.exception_region_depth == 1
+                            handler.try_body_depth == 1 && handler.exception_region_depth == 1
                         })
                     && self
                         .control
@@ -5207,8 +5205,6 @@ impl Compiler<'_> {
                 let tracks_handler_enclosing_try_unwinds = !return_is_overridden
                     && preserve_tos
                     && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
-                    && (self.unit.flags & CO_COROUTINE == 0
-                        || self.control.loops.contexts.is_empty())
                     && self.context.target_specific_rules_enabled()
                     && handler_count == 1
                     && self.control.exceptions.active_exception_group_handlers == 0
@@ -21895,7 +21891,8 @@ fn suite_contains_orphan_cold_cleanup(body: &[Stmt]) -> bool {
     }
     // Recovery exits can copy a loop's unlocated backedge even when more
     // handler statements follow. Its empty original stays on the normal try
-    // fallthrough after cold ordering. Folded and async loops have other exits.
+    // fallthrough after cold ordering. A terminating else cannot connect that
+    // empty backedge to the continuation. Folded and async loops have other exits.
     let has_recovery_tail = |body: &[Stmt]| {
         matches!(body.last(), Some(Stmt::Try(statement))
             if !statement.is_star
@@ -21905,7 +21902,10 @@ fn suite_contains_orphan_cold_cleanup(body: &[Stmt]) -> bool {
     };
     if body.iter().any(|statement| match statement {
         Stmt::For(statement) => {
-            !statement.is_async && statement.orelse.is_empty() && has_recovery_tail(&statement.body)
+            !statement.is_async
+                && (statement.orelse.is_empty()
+                    || suite_terminates_before_constant_folding(&statement.orelse))
+                && has_recovery_tail(&statement.body)
         }
         Stmt::While(statement) => {
             condition_has_only_runtime_tests(&statement.test)

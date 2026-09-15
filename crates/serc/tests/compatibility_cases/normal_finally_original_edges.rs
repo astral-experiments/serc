@@ -509,3 +509,44 @@ fn matches_cpython_marshal_for_loop_finally_owner_call_owner() {
 ";
     common::assert_matches_cpython_marshal(source, "loop_finally_call_owner.py");
 }
+
+#[test]
+fn matches_cpython_marshal_for_retry_terminal_else_borrow() {
+    let source = r"async def target(item):
+    try:
+        value = await load(item)
+    except Failure:
+        error = explain()
+        for attempt in range(2):
+            try:
+                value = await retry(item)
+                yield value
+                break
+            except Failure:
+                error = explain()
+        else:
+            yield error
+            return
+    yield pack(item.first, item.second, item.third, item.fourth, item.fifth)
+";
+    common::assert_matches_cpython_marshal(source, "retry_terminal_else_borrow.py");
+}
+
+#[test]
+fn matches_cpython_marshal_for_retry_without_else_control() {
+    let source = r"async def target(item):
+    try:
+        value = await load(item)
+    except Failure:
+        error = explain()
+        for attempt in range(2):
+            try:
+                value = await retry(item)
+                yield value
+                break
+            except Failure:
+                error = explain()
+    yield pack(item.first, item.second, item.third, item.fourth, item.fifth)
+";
+    common::assert_matches_cpython_marshal(source, "retry_without_else_control.py");
+}
