@@ -4713,3 +4713,52 @@ fn named_return_plain_cleanup_control() {
         "named_return_plain_cleanup_control.py",
     );
 }
+
+#[test]
+fn named_return_for_cleanup_target() {
+    common::assert_matches_cpython_marshal(
+        &named_return_for_cleanup_source(
+            "        for handle in admission:\n            handle.close()\n",
+        ),
+        "named_return_for_cleanup_target.py",
+    );
+}
+
+#[test]
+fn named_return_for_cleanup_call_control() {
+    common::assert_matches_cpython_marshal(
+        &named_return_for_cleanup_source("        close_all(admission)\n"),
+        "named_return_for_cleanup_call_control.py",
+    );
+}
+
+fn named_return_for_cleanup_source(cleanup: &str) -> String {
+    format!(
+        r"def acquire(pool, deadline):
+    admission = reserve(pool)
+    if admission is None:
+        raise Unavailable(pool)
+    try:
+        next_notice = clock()
+        while True:
+            handles = receive(pool)
+            if handles is not None:
+                waited = clock()
+                try:
+                    announce(handles, waited)
+                except BaseException:
+                    for handle in handles:
+                        handle.close()
+                    raise
+                return handles
+            now = clock()
+            if now >= deadline:
+                raise Unavailable(pool)
+            if now >= next_notice:
+                announce(pool, now)
+                next_notice = now + 1
+            pause()
+    finally:
+{cleanup}"
+    )
+}

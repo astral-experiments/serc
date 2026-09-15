@@ -13944,6 +13944,15 @@ impl Compiler<'_> {
                                     if matches!(expression.value.as_ref(), Expr::Call(_))
                                         && !expression_contains_inline_branch(&expression.value)
                                         && !expression_suspends_current_scope(&expression.value)))
+                        || matches!(context.body.as_slice(), [Stmt::For(loop_statement)]
+                            if !loop_statement.is_async
+                                && matches!(loop_statement.target.as_ref(), Expr::Name(_))
+                                && matches!(loop_statement.iter.as_ref(), Expr::Name(_))
+                                && loop_statement.orelse.is_empty()
+                                && matches!(loop_statement.body.as_slice(), [Stmt::Expr(expression)]
+                                    if matches!(expression.value.as_ref(), Expr::Call(_))
+                                        && !expression_contains_inline_branch(&expression.value)
+                                        && !expression_suspends_current_scope(&expression.value)))
                 });
             if (terminal_handler_exit
                 && !(self
@@ -13972,8 +13981,8 @@ impl Compiler<'_> {
                 // an enclosing branch or loop. A direct following name return is copied onto
                 // the normal edge first, so its load remains reachable and borrowed. Pending
                 // manager cleanup or a copied finally call makes that exit too large to
-                // copy. A copied runtime condition ends the original array before RETURN,
-                // so it is not a small scope exit either. A pass-only finalizer can still fit.
+                // copy. A copied condition or iterator loop ends the original array before
+                // RETURN, so it is not a small scope exit either. A pass-only finalizer can fit.
                 self.assembler
                     .mark_borrow_fallthrough_barrier(normal_exit.instruction());
             }
