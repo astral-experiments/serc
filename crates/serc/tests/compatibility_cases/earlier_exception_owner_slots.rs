@@ -150,3 +150,47 @@ def collect(key: str, client_factory) -> Iterator[None]:
 "#
     )
 }
+
+#[test]
+fn copied_return_none_marker_reuses_retained_pop_slot() {
+    let source =
+        copied_return_pop_slot_source(r#"request_json(http, "GET", f"/sessions/{session_id}")"#);
+    common::assert_matches_cpython_marshal(&source, "copied_return_retained_pop_slot.py");
+}
+
+#[test]
+fn copied_return_none_marker_preserves_slot_after_pop() {
+    let source =
+        copied_return_pop_slot_source(r#"request(http, "GET", f"/sessions/{session_id}")"#);
+    common::assert_matches_cpython_marshal(&source, "copied_return_slot_after_pop.py");
+}
+
+#[test]
+fn copied_return_none_marker_preserves_authored_return_slot() {
+    let source = copied_return_pop_slot_source(
+        r#"normalize(request_json(http, "GET", f"/sessions/{session_id}"))"#,
+    );
+    common::assert_matches_cpython_marshal(&source, "copied_return_authored_return_slot.py");
+}
+
+fn copied_return_pop_slot_source(request: &str) -> String {
+    format!(
+        r#"async def main(http, request, stream_output):
+    session_id = None
+    sandbox = None
+    try:
+        session_id = "session"
+        sandbox = http.sandbox()
+        await stream_output(http, session_id, sandbox)
+        final_session = {request}
+        print(f"final status: {{final_session['status']}}")
+        return 0
+    finally:
+        if session_id is not None:
+            with suppress(Exception):
+                request_json(http, "POST", f"/sessions/{{session_id}}/stop", {{}})
+        if sandbox is not None:
+            await sandbox.close()
+"#
+    )
+}

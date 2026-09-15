@@ -4038,8 +4038,9 @@ impl LayoutAssembler {
                             },
                         );
                     }
-                    // Early compaction keeps this exact authored return NOP in its old
-                    // array cell. The adjacent retained POP is NULL and is never included.
+                    // Early compaction leaves the authored return NOP and its adjacent
+                    // POP_BLOCK in their old array cells. The first retains its try owner;
+                    // the second is NULL even when the marker has a scope fallback.
                     if instruction.opcode == NOT_TAKEN
                         && owner_history_exact
                         && tail.insertions == 0
@@ -4057,7 +4058,8 @@ impl LayoutAssembler {
                             .is_none_or(|decision| !decision.definitive)
                         && let Some((array, pop, slot, region)) = early_return_nop_slot
                         && original_array_start == array
-                        && instruction_index == slot
+                        && (instruction_index == slot
+                            || slot.checked_add(1) == Some(instruction_index))
                         && instruction_index - pop == 3
                         && matches!(
                             indexed_instructions[pop + 1].opcode,
@@ -4073,11 +4075,12 @@ impl LayoutAssembler {
                                 && previous.local_policy.hidden_exception_owner_slots() == 3
                         })
                     {
+                        let source_region = (instruction_index == slot).then_some(region);
                         owners.insert(
                             instruction_index,
                             ExceptionOwnerDecision {
-                                has_owner: true,
-                                source_region: Some(region),
+                                has_owner: source_region.is_some(),
+                                source_region,
                                 definitive: true,
                                 override_existing: true,
                             },

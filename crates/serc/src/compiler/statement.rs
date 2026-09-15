@@ -17066,6 +17066,51 @@ impl Compiler<'_> {
                         && !expression_suspends_current_scope(&cleanup.value)
                         && call.arguments.args.iter().all(|argument| !matches!(argument, Expr::Starred(_)))
                         && call.arguments.keywords.iter().all(|keyword| keyword.arg.is_some())));
+        // The false edge of one terminal raising guard reaches a nonempty normal
+        // cleanup. Raising does not create the copied cleanup exits of a return.
+        let terminal_raise_if_reaches_finally = !statement.is_star
+            && statement.orelse.is_empty()
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && self.control.loops.contexts.is_empty()
+            && self.control.withs.active_with_exits.is_empty()
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            && !self.control.in_exception_handler()
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+            && self.control.finally.active_finally_try_bodies == 0
+            && matches!(statement.handlers.as_slice(), [handler]
+            if handler.as_except_handler().is_some_and(|handler| {
+                handler.type_.is_some()
+                    && handler.name.is_some()
+                    && suite_has_linear_borrow_fallthrough(&handler.body)
+            }))
+            && statement.body.split_last().is_some_and(|(last, leading)| {
+                suite_has_normal_fallthrough(leading)
+                    && !suite_contains_return(leading)
+                    && matches!(last, Stmt::If(guard)
+                        if condition_has_only_runtime_tests(&guard.test)
+                            && !expression_contains_inline_branch(&guard.test)
+                            && original_condition_has_unique_jump_target(&guard.test, false)
+                            && guard.elif_else_clauses.is_empty()
+                            && matches!(guard.body.as_slice(), [Stmt::Raise(_)])
+                            && suite_has_linear_raise_exit(&guard.body))
+            })
+            && !suite_contains_abrupt_control_flow(&statement.finalbody)
+            && statement.finalbody.first().is_some_and(|entry| {
+                suite_has_linear_borrow_fallthrough(std::slice::from_ref(entry))
+                    || matches!(entry, Stmt::If(cleanup)
+                        if condition_has_only_runtime_tests(&cleanup.test)
+                            && !expression_contains_inline_branch(&cleanup.test)
+                            && original_condition_has_unique_jump_target(&cleanup.test, false)
+                            && cleanup.elif_else_clauses.is_empty()
+                            && suite_has_linear_borrow_fallthrough(&cleanup.body))
+            });
         let normal_finally_is_borrow_reachable = (simple_fallthrough_handlers_reach_finally
             || compound_fallthrough_handlers_reach_finally
             || runtime_while_handlers_reach_finally)
@@ -17077,7 +17122,8 @@ impl Compiler<'_> {
             || inner_try_break_loop_range.is_some()
             || conditional_handler_reaches_finally
             || terminal_if_false_edge_reaches_finally
-            || awaited_terminal_if_reaches_finally;
+            || awaited_terminal_if_reaches_finally
+            || terminal_raise_if_reaches_finally;
         let for_break_reaches_finally = !statement.handlers.is_empty()
             && !normal_finally_is_borrow_reachable
             && !statement.is_star
@@ -20735,9 +20781,22 @@ fn with_body_match_exit_location(body: &[Stmt]) -> Option<TextRange> {
         // refutable pattern reaches the manager's original normal POP_BLOCK.
         return Some(fallback.pattern.range());
     }
+    let bare_capture_call = match (&fallback.pattern, fallback.body.as_slice()) {
+        (Pattern::MatchAs(pattern), [Stmt::Expr(expression)]) => {
+            pattern.pattern.is_none()
+                && pattern.name.as_ref().is_some_and(|captured| {
+                    matches!(expression.value.as_ref(), Expr::Call(call)
+                        if matches!(call.func.as_ref(), Expr::Name(_))
+                            && call.arguments.keywords.is_empty()
+                            && matches!(call.arguments.args.as_ref(), [Expr::Name(argument)]
+                                if argument.id.as_str() == captured.as_str()))
+                })
+        }
+        _ => false,
+    };
     if preceding.is_empty()
         || fallback.guard.is_some()
-        || !is_wildcard_pattern(&fallback.pattern)
+        || !(is_wildcard_pattern(&fallback.pattern) || bare_capture_call)
         || !preceding.iter().all(|case| {
             matches!(case.body.last(), Some(Stmt::Return(_) | Stmt::Raise(_)))
                 && suite_terminates(&case.body)
@@ -20752,8 +20811,8 @@ fn with_body_match_exit_location(body: &[Stmt]) -> Option<TextRange> {
     if !matches!(expression.value.as_ref(), Expr::Call(_)) {
         return None;
     }
-    // The other cases exit directly. The wildcard's normal edge alone locates the
-    // original match join containing the manager's converted POP_BLOCK.
+    // The other cases exit directly. The irrefutable case's normal edge alone
+    // locates the original match join containing the manager's converted POP_BLOCK.
     Some(expression.value.range())
 }
 
@@ -21711,6 +21770,31 @@ fn suite_has_located_finally_arm(body: &[Stmt]) -> bool {
                 && condition_has_only_runtime_tests(&guard.test)
                 && suite_has_linear_raise_exit(&guard.body)
                 && suite_has_linear_borrow_fallthrough(rest))
+}
+
+/// Detect returns in this function while leaving nested function/class bodies separate.
+fn suite_contains_return(body: &[Stmt]) -> bool {
+    #[derive(Default)]
+    struct ReturnDetector(bool);
+
+    impl<'ast> Visitor<'ast> for ReturnDetector {
+        fn visit_stmt(&mut self, statement: &'ast Stmt) {
+            if self.0 || matches!(statement, Stmt::FunctionDef(_) | Stmt::ClassDef(_)) {
+                return;
+            }
+            if matches!(statement, Stmt::Return(_)) {
+                self.0 = true;
+            } else {
+                walk_stmt(self, statement);
+            }
+        }
+    }
+
+    let mut detector = ReturnDetector::default();
+    for statement in body {
+        detector.visit_stmt(statement);
+    }
+    detector.0
 }
 
 fn suite_contains_abrupt_control_flow(body: &[Stmt]) -> bool {

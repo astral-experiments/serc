@@ -568,3 +568,38 @@ fn matches_cpython_protected_match_call_exit_copy() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn preserves_manager_pop_after_single_call_capture_case() {
+    common::assert_matches_cpython_marshal(
+        &manager_capture_exit_source("captured"),
+        "manager_capture_exit.py",
+    );
+}
+
+#[test]
+fn preserves_manager_pop_after_guarded_capture_case() {
+    common::assert_matches_cpython_marshal(
+        &manager_capture_exit_source("captured if ready"),
+        "manager_guarded_capture_exit.py",
+    );
+}
+
+fn manager_capture_exit_source(pattern: &str) -> String {
+    format!(
+        r"def select(value, manager, build, prepare, finalize, fallback, ready):
+    with manager():
+        prepare(value)
+        match value:
+            case First() | Second() | Third():
+                return build(value)
+            case Fourth() | Fifth():
+                result = build(value)
+                if ready:
+                    finalize(result)
+                return result
+            case {pattern}:
+                fallback(captured)
+"
+    )
+}
