@@ -8049,11 +8049,14 @@ impl Compiler<'_> {
             label,
             -1,
         )?;
-        if matches!(
-            expression,
-            Expr::Name(_) | Expr::Attribute(_) | Expr::Call(_)
-        ) {
-            // The direct codegen_jump_if path ends an original CP array.
+        if comparison_is_boolean
+            || matches!(
+                expression,
+                Expr::Name(_) | Expr::Attribute(_) | Expr::Call(_)
+            )
+        {
+            // The direct codegen_jump_if path ends an original CP array. A single
+            // comparison can compact its predecessor without changing this boundary.
             // Both its target and normalized backward fallthrough are original
             // boundaries, unlike analysis-only labels or copied jump targets.
             self.assembler

@@ -789,15 +789,47 @@ impl OptimizationPipeline {
                 .checked_sub(1)
                 .map(|index| order[index])
                 .filter(|source| super::super::block_has_fallthrough(self.graph[*source].items()));
-            // A final wildcard has no conditional failure edge into this cleanup.
-            // Certify its unchanged authored call/discard on the physical predecessor;
-            // ordinary fallthroughs cannot replace the conditional-origin rule below.
-            let wildcard_fallthrough =
+            // A wildcard call/discard or class-pattern failure cleanup falls through
+            // to this original array. Replay both captured instructions exactly;
+            // unrelated fallthroughs cannot replace the conditional-origin rule below.
+            let original_fallthrough =
                 fallthrough_source.is_some_and(|source| {
                     self.exception_owner_provenance
-                        .normal_try_wildcard_fallthroughs
+                        .normal_try_fallthrough_donors
                         .get(&entry)
-                        .is_some_and(|(call, pop)| {
+                        .is_some_and(|(first, pop)| {
+                            if let Some(&(first_label, last_label)) = self
+                                .exception_owner_provenance
+                                .normal_try_class_pattern_donor_labels
+                                .get(&entry)
+                            {
+                                let Some(previous) = position.checked_sub(2).map(|index| order[index])
+                                else {
+                                    return false;
+                                };
+                                // Replay the two separately labeled original arrays, never
+                                // flattening their boundary or accepting renamed copy labels.
+                                return self.graph.label_block(first_label) == Some(previous)
+                                    && self.graph.label_block(last_label) == Some(source)
+                                    && self.graph[previous].items()
+                                        == [Item::Label(first_label), Item::Instruction(*first)]
+                                    && self.graph[source].items()
+                                        == [Item::Label(last_label), Item::Instruction(*pop)]
+                                    && self.graph.iter_items().all(|item| {
+                                        !matches!(item, Item::Instruction(instruction)
+                                            if matches!(instruction.operand(), Operand::Forward(label) | Operand::Backward(label)
+                                                if label == last_label))
+                                    })
+                                    && self.exception_regions.iter().all(|region| {
+                                        region.target != first_label
+                                            && region.target != last_label
+                                            && region.start != last_label
+                                            && region.end != last_label
+                                    })
+                                    && self.exception_owner_provenance.setups.iter().all(
+                                        |(label, _)| *label != first_label && *label != last_label,
+                                    );
+                            }
                             let mut instructions =
                                 self.graph[source].items().iter().rev().filter_map(
                                     |item| match item {
@@ -805,11 +837,11 @@ impl OptimizationPipeline {
                                         Item::Label(_) => None,
                                     },
                                 );
-                            instructions.next() == Some(pop) && instructions.next() == Some(call)
+                            instructions.next() == Some(pop) && instructions.next() == Some(first)
                         })
                 });
             if position >= target_position
-                || (fallthrough_source.is_some() && !wildcard_fallthrough)
+                || (fallthrough_source.is_some() && !original_fallthrough)
             {
                 continue;
             }
@@ -861,13 +893,13 @@ impl OptimizationPipeline {
                 }
             }
             if success_edges == 0
-                || failure_edges != usize::from(!wildcard_fallthrough)
+                || failure_edges != usize::from(!original_fallthrough)
                 || unknown_edge
             {
                 continue;
             }
-            if wildcard_fallthrough {
-                // Earlier case-success arrays precede the final wildcard donor.
+            if original_fallthrough {
+                // Case-success arrays precede the final physical fallthrough donor.
                 // Exclude outer bypasses and nested cleanup arrays; these cannot
                 // establish the original match-success copy order.
                 let Some(first_success) = order

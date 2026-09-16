@@ -488,12 +488,17 @@ mod keyword_cleanup_borrow;
 
 mod awaited_assignment_finally_borrow;
 
+mod original_try_boundary;
 mod runtime_prefix_owner;
 
 mod copied_inner_finally_owner;
+
+mod sync_with_return_finally_owner;
 
 mod awaited_recovery_nested_handler_regression;
 
 mod retained_finally_closure_receiver;
 
 mod awaited_retry_minimal;
+
+mod missing_nop_source_probes;

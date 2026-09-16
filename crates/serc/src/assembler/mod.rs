@@ -3548,6 +3548,77 @@ impl Assembler {
             .prevent_small_exit_inlining();
     }
 
+    /// Captures the exact final class-pattern failure cleanup before a normal try exit.
+    pub(crate) fn record_normal_try_class_pattern_fallthrough(
+        &mut self,
+        entry: Label,
+        target: Label,
+        location: SourceLocation,
+    ) {
+        let items = self.linear_items();
+        let mut instructions =
+            items
+                .iter()
+                .enumerate()
+                .rev()
+                .filter_map(|(index, item)| match item {
+                    Item::Instruction(instruction) => Some((index, instruction)),
+                    Item::Label(_) => None,
+                });
+        let (Some((_, jump)), Some((last_index, last_pop)), Some((first_index, first_pop))) = (
+            instructions.next(),
+            instructions.next(),
+            instructions.next(),
+        ) else {
+            return;
+        };
+        let Some(start) = first_index.checked_sub(1) else {
+            return;
+        };
+        let [
+            Item::Label(first_label),
+            Item::Instruction(_),
+            Item::Label(last_label),
+            Item::Instruction(_),
+        ] = &items[start..=last_index]
+        else {
+            return;
+        };
+        // The second cleanup array has only the first pop as an original
+        // predecessor. A guard or a nested cleanup must not acquire this route.
+        if items.iter().any(|item| {
+            matches!(item, Item::Instruction(instruction)
+                if matches!(instruction.operand(), Operand::Forward(label) | Operand::Backward(label)
+                    if label == *last_label))
+        }) {
+            return;
+        }
+        if jump.opcode == JUMP_FORWARD
+            && jump.operand() == Operand::Forward(target)
+            && last_pop.opcode == POP_TOP
+            && first_pop.opcode == POP_TOP
+            && last_pop.location == location
+            && first_pop.location == location
+            && last_pop.operand() == Operand::Value(0)
+            && first_pop.operand() == Operand::Value(0)
+            && first_pop.depth_after().is_some_and(|depth| {
+                depth.checked_sub(1).is_some_and(|next_depth| {
+                    last_pop.depth_after() == Some(next_depth)
+                        && jump.depth_after() == last_pop.depth_after()
+                })
+            })
+        {
+            let origin = (*first_pop, *last_pop);
+            let labels = (*first_label, *last_label);
+            self.exception_owner_provenance
+                .normal_try_class_pattern_donor_labels
+                .insert(entry, labels);
+            self.exception_owner_provenance
+                .normal_try_fallthrough_donors
+                .insert(entry, origin);
+        }
+    }
+
     /// Records the original two-slot normal exit of an ordinary try without an else suite.
     pub(crate) fn record_normal_try_exit(
         &mut self,
@@ -3588,7 +3659,7 @@ impl Assembler {
         {
             let origin = (*call, *pop);
             self.exception_owner_provenance
-                .normal_try_wildcard_fallthroughs
+                .normal_try_fallthrough_donors
                 .insert(entry, origin);
         }
     }
@@ -5293,6 +5364,19 @@ impl Assembler {
         self.exception_owner_provenance
             .setups
             .push((label, nop_location));
+    }
+
+    /// Retains the authored handler identity of an ordinary try's original SETUP.
+    pub(crate) fn record_ordinary_try_exception_setup(
+        &mut self,
+        label: Label,
+        retained_nop: bool,
+        handler: Label,
+    ) {
+        self.record_exception_setup(label, retained_nop);
+        self.exception_owner_provenance
+            .ordinary_try_setups
+            .insert(label, handler);
     }
 
     /// Records a completed ordinary await separately from async-manager protocol awaits.

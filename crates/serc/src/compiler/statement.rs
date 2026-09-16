@@ -8517,8 +8517,13 @@ impl Compiler<'_> {
                             .preserve_redundant_jump_nop_after_threading(branch_exit);
                     } else if pass_only_body {
                         self.assembler.preserve_authored_pass_jump_nop(branch_exit);
-                    } else if retain_assertion_exit
-                        || matches!(body.last(), Some(Stmt::For(statement))
+                    } else if retain_assertion_exit {
+                        // The assertion-success label starts an original empty array.
+                        // Keep that identity when its branch jump threads through another
+                        // join before a small return is copied onto the success edge.
+                        self.assembler
+                            .preserve_empty_join_inlined_jump_nop(branch_exit);
+                    } else if matches!(body.last(), Some(Stmt::For(statement))
                             if suite_contains_loop_break(&statement.body))
                         || matches!(body.last(), Some(Stmt::While(statement))
                             if statement.orelse.is_empty()
@@ -13057,8 +13062,11 @@ impl Compiler<'_> {
                 handler_starts_with_optimized_boolean_generator: false,
             })
         });
-        self.assembler
-            .record_exception_setup(try_start, emit_statement_nop);
+        self.assembler.record_ordinary_try_exception_setup(
+            try_start,
+            emit_statement_nop,
+            handler_start,
+        );
         self.assembler.mark(try_start);
         self.control
             .exceptions
@@ -14073,6 +14081,15 @@ impl Compiler<'_> {
                     .map(|range| self.source_location(range));
                 self.assembler
                     .record_normal_try_exit(try_end, end, wildcard_call_location);
+                if !statement.is_star
+                    && let Some(range) = normal_try_class_pattern_failure_exit(&statement.body)
+                {
+                    self.assembler.record_normal_try_class_pattern_fallthrough(
+                        try_end,
+                        end,
+                        self.source_location(range),
+                    );
+                }
             }
             if statement.orelse.is_empty()
                 && !statement.finalbody.is_empty()
@@ -22251,6 +22268,28 @@ fn normal_try_wildcard_call_exit(body: &[Stmt]) -> Option<TextRange> {
         && matches!(expression.value.as_ref(), Expr::Call(_))
         && !expression_contains_inline_branch(&expression.value))
     .then_some(expression.value.range())
+}
+
+// A final class pattern with an as-binding leaves two failure pops before the
+// shared normal exit. Its successful case jumps past that physical donor.
+fn normal_try_class_pattern_failure_exit(body: &[Stmt]) -> Option<TextRange> {
+    let Stmt::Match(statement) = body.last()? else {
+        return None;
+    };
+    if !match_has_multiple_normal_case_exits(statement) {
+        return None;
+    }
+    let case = statement.cases.last()?;
+    let Pattern::MatchAs(pattern) = &case.pattern else {
+        return None;
+    };
+    let Pattern::MatchClass(class_pattern) = pattern.pattern.as_deref()? else {
+        return None;
+    };
+    (pattern.name.is_some()
+        && class_pattern.arguments.patterns.is_empty()
+        && class_pattern.arguments.keywords.is_empty())
+    .then_some(case.pattern.range())
 }
 
 // Distinct normal case exits share an unlocated handler-cleanup block. Copy that

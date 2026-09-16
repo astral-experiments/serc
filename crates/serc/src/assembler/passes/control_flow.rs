@@ -1067,6 +1067,84 @@ impl OptimizationPipeline {
             }
         }
 
+        // A folded loop's original exit can contain only its enclosing branch jump.
+        // CPython copies that unlocated jump before the four-record method return,
+        // retaining the authored break line across both copies. Our earlier threading
+        // must not discard that direct-copy request. Validate the original loop end
+        // and complete small return; arbitrary retargeted breaks remain unchanged.
+        let folded_loop_return_heads = self
+            .folded_predecessor_sources
+            .iter()
+            .filter_map(|(source, entry, location)| {
+                if !self.exception_regions.is_empty()
+                    || !self
+                        .exception_owner_provenance
+                        .source_boundaries
+                        .contains(source)
+                    || !self
+                        .exception_owner_provenance
+                        .block_boundaries
+                        .contains(source)
+                    || !self
+                        .exception_owner_provenance
+                        .source_boundaries
+                        .contains(entry)
+                    || !self
+                        .exception_owner_provenance
+                        .block_boundaries
+                        .contains(entry)
+                {
+                    return None;
+                }
+                let (Item::Instruction(jump), labels) =
+                    graph[graph.label_block(*entry)?].items().split_last()?
+                else {
+                    return None;
+                };
+                let Operand::Forward(target) = jump.operand() else {
+                    return None;
+                };
+                if labels.is_empty()
+                    || labels.iter().any(|item| !matches!(item, Item::Label(_)))
+                    || jump.opcode != JUMP_FORWARD
+                    || jump.location != *location
+                    || jump.jump_policy.retained_nop()
+                        != super::super::ir::RetainedJumpNop::DirectTarget
+                    || jump.pre_fold_extra_instructions() != 0
+                    || jump.local_policy.hidden_exception_owner_slots() != 0
+                    || jump.fusion_policy.is_authored_break()
+                {
+                    return None;
+                }
+                let target_items = graph[graph.label_block(target)?].items();
+                let first = target_items
+                    .iter()
+                    .position(|item| matches!(item, Item::Instruction(_)))?;
+                let [
+                    Item::Instruction(load),
+                    Item::Instruction(attribute),
+                    Item::Instruction(call),
+                    Item::Instruction(return_),
+                ] = &target_items[first..]
+                else {
+                    return None;
+                };
+                (load.opcode == crate::target::opcodes::LOAD_FAST
+                    && attribute.opcode == crate::target::opcodes::LOAD_ATTR
+                    && matches!(attribute.operand(), Operand::Value(argument) if argument & 1 != 0)
+                    && call.opcode == crate::target::opcodes::CALL
+                    && call.operand() == Operand::Value(0)
+                    && return_.opcode == RETURN_VALUE
+                    && [load, attribute, call, return_].iter().all(|instruction| {
+                        matches!(instruction.operand(), Operand::Value(_))
+                            && instruction.pre_fold_extra_instructions() == 0
+                            && instruction.local_policy.hidden_exception_owner_slots() == 0
+                            && instruction.location.line == return_.location.line
+                            && instruction.location.line >= 0
+                    }))
+                .then_some(*entry)
+            })
+            .collect::<FxHashSet<_>>();
         let authored_finally_break_targets = Self::take_authored_finally_break_threading_targets(
             &self.graph,
             &mut self.borrow_authored_finally_break_origins,
@@ -1194,7 +1272,7 @@ impl OptimizationPipeline {
             }
             if authored_break_copy_nop
                 && threaded_jump_count == 1
-                && crosses_normal_try_exit
+                && (crosses_normal_try_exit || folded_loop_return_heads.contains(&original_target))
                 && matches!(operand, Operand::Forward(_))
                 && !instruction.jump_policy.is_interruptible()
             {
@@ -1916,11 +1994,11 @@ impl OptimizationPipeline {
         // A removed original POP_BLOCK can leave its entry and end labels in
         // separate empty graph blocks. Bind them to the next physical record;
         // renamed labels from copied cleanup arrays cannot certify this jump.
-        let mut wildcard_fallthrough_exits = Vec::new();
+        let mut original_fallthrough_exits = Vec::new();
         if finalize_borrow_empty_blocks
             && !self
                 .exception_owner_provenance
-                .normal_try_wildcard_fallthroughs
+                .normal_try_fallthrough_donors
                 .is_empty()
         {
             let mut next_instructions = FxHashMap::default();
@@ -1941,7 +2019,7 @@ impl OptimizationPipeline {
             for &(entry, target) in &self.exception_owner_provenance.normal_try_exits {
                 let Some((_, pop)) = self
                     .exception_owner_provenance
-                    .normal_try_wildcard_fallthroughs
+                    .normal_try_fallthrough_donors
                     .get(&entry)
                 else {
                     continue;
@@ -1964,7 +2042,7 @@ impl OptimizationPipeline {
                                 && next_instructions.get(end) == Some(&position)
                         })
                 {
-                    wildcard_fallthrough_exits.push((position, target, *pop));
+                    original_fallthrough_exits.push((position, target, *pop));
                 }
             }
         }
@@ -2271,9 +2349,9 @@ impl OptimizationPipeline {
                                     })
                         });
                     // CPython resets the preceding line at the original cleanup array.
-                    // Its physical wildcard donor belongs to the preceding array, so the
+                    // Its captured fallthrough donor belongs to the preceding array, so the
                     // late redundant jump becomes a NOP even with the same source line.
-                    let preserves_wildcard_fallthrough_nop = !absorbed_normal_try_exit
+                    let preserves_original_fallthrough_nop = !absorbed_normal_try_exit
                         && !crosses_exception_boundary
                         && !instruction.fusion_policy.is_authored_break()
                         && instruction.pre_fold_extra_instructions() == 0
@@ -2281,7 +2359,7 @@ impl OptimizationPipeline {
                         && instruction.location.line >= 0
                         && next_line
                             .is_some_and(|line| line >= 0 && line != instruction.location.line)
-                        && wildcard_fallthrough_exits.iter().any(
+                        && original_fallthrough_exits.iter().any(
                             |(original, original_target, pop)| {
                                 *original == position
                                     && *original_target == target
@@ -2326,7 +2404,7 @@ impl OptimizationPipeline {
                                     && !self.borrow_block_aliases.contains(label)
                                     && !self.original_nop_targets.contains(label))
                         });
-                    if !preserves_wildcard_fallthrough_nop
+                    if !preserves_original_fallthrough_nop
                         && !preserves_copied_finally_break_nop
                         && (!instruction.jump_policy.always_retains_nop()
                             || absorbed_normal_try_exit)

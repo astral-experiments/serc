@@ -16,6 +16,8 @@ use crate::target::{is_conditional_jump, is_scope_exit};
 #[derive(Debug, Default)]
 pub(super) struct ExceptionOwnerProvenance {
     pub(super) setups: Vec<(Label, Option<SourceLocation>)>,
+    // Authored ordinary-try SETUP and its original handler, independently of split ranges.
+    pub(super) ordinary_try_setups: FxHashMap<Label, Label>,
     // Original ordinary-await suspension regions, resolved alongside their live regions.
     pub(super) ordinary_await_cleanups: Vec<super::ExceptionRegion>,
     // Authored return NOP, immediately following finally POP, and original try target.
@@ -57,8 +59,10 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) removed_pop_block_widths: FxHashMap<Label, u16>,
     // Original ordinary-try exits contain POP_BLOCK followed by JUMP_NO_INTERRUPT.
     pub(super) normal_try_exits: Vec<(Label, Label)>,
-    // Exact final wildcard call and discard falling through to an ordinary try exit.
-    pub(super) normal_try_wildcard_fallthroughs: FxHashMap<Label, (Instruction, Instruction)>,
+    // Exact final wildcard call/discard or class-pattern failure pops at a normal try exit.
+    pub(super) normal_try_fallthrough_donors: FxHashMap<Label, (Instruction, Instruction)>,
+    // Original adjacent arrays containing the two final class-pattern failure pops.
+    pub(super) normal_try_class_pattern_donor_labels: FxHashMap<Label, (Label, Label)>,
     // First records of the original manager cleanup arrays, before line resolution.
     pub(super) original_manager_pop_blocks: Vec<Label>,
     // Original try/except POP_BLOCK exits inside their own finally, for owner transfer
@@ -3436,6 +3440,36 @@ impl LayoutAssembler {
                             },
                         );
                     }
+                    // Late SETUP compaction can leave an ordinary-try record behind
+                    // a manager return. Its owner survives in the appended marker slot.
+                    if instruction.opcode == NOT_TAKEN
+                        && instruction.exception_policy() == super::ExceptionPolicy::NonePresent
+                        && original_array_start == 0
+                        && owner_history_exact
+                        && tail.insertions == 2
+                        && tail.late_removals == 3
+                        && tail.post_compaction_fusions == 0
+                        && owners
+                            .get(&instruction_index)
+                            .is_none_or(|owner| !owner.definitive)
+                        && let Some(region) = self.entry_manager_return_setup_owner(
+                            instruction_index,
+                            &indexed_instructions,
+                            &label_positions,
+                            &jump_targets,
+                            &late_setup_positions,
+                        )
+                    {
+                        owners.insert(
+                            instruction_index,
+                            ExceptionOwnerDecision {
+                                has_owner: true,
+                                source_region: Some(region),
+                                definitive: true,
+                                override_existing: true,
+                            },
+                        );
+                    }
                     // Resolve the exact normal-finally None prefix before a marker's
                     // range-end label can erase the preceding try's array certificate.
                     let original_none_marker =
@@ -4509,6 +4543,111 @@ impl LayoutAssembler {
             );
         }
         owners
+    }
+
+    /// Reconstructs one entry-array marker slot after three authenticated SETUP removals.
+    fn entry_manager_return_setup_owner(
+        &self,
+        marker: usize,
+        instructions: &[&Instruction],
+        positions: &FxHashMap<Label, usize>,
+        jump_targets: &FxHashSet<Label>,
+        removed_positions: &[usize],
+    ) -> Option<usize> {
+        let condition = instructions.get(marker.checked_sub(1)?)?;
+        if !matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+            || condition.local_policy.hidden_exception_owner_slots() != 3
+            || jump_targets
+                .iter()
+                .chain(&self.exception_owner_provenance.block_boundaries)
+                .chain(&self.exception_owner_provenance.source_boundaries)
+                .any(|label| {
+                    positions
+                        .get(label)
+                        .is_some_and(|position| 0 < *position && *position <= marker)
+                })
+            || instructions[..marker - 1].iter().any(|instruction| {
+                matches!(
+                    instruction.operand(),
+                    Operand::Forward(_) | Operand::Backward(_)
+                )
+            })
+        {
+            return None;
+        }
+        let mut removed = Vec::new();
+        let mut retained = Vec::new();
+        for (label, location) in &self.exception_owner_provenance.setups {
+            let &position = positions.get(label)?;
+            if position > marker {
+                continue;
+            }
+            if location.is_some_and(|location| {
+                position.checked_sub(1).is_some_and(|index| {
+                    instructions[index].opcode == NOP && instructions[index].location == location
+                })
+            }) {
+                retained.push(position);
+            } else {
+                removed.push((position, *label));
+            }
+        }
+        removed.sort_unstable_by_key(|(position, _)| *position);
+        let [
+            (scope_start, scope),
+            (try_start, ordinary),
+            (manager_start, manager),
+        ] = removed.as_slice()
+        else {
+            return None;
+        };
+        let handler = *self
+            .exception_owner_provenance
+            .ordinary_try_setups
+            .get(ordinary)?;
+        if *scope_start >= *try_start
+            || *try_start >= *manager_start
+            || retained.as_slice() != [*try_start]
+            || !self
+                .exception_regions
+                .iter()
+                .any(|region| region.is_scope_fallback && region.start == *scope)
+            || !self
+                .exception_owner_provenance
+                .synchronous_with_setups
+                .contains(manager)
+            || removed
+                .iter()
+                .enumerate()
+                .map(|(offset, (position, _))| position + offset)
+                .ne(removed_positions.iter().copied())
+            || removed_positions
+                .last()
+                .is_none_or(|position| *position >= marker)
+        {
+            return None;
+        }
+        // Compaction copies complete records left without clearing the old suffix.
+        // The appended slot retains the corresponding pre-compaction record's owner.
+        let source = marker.checked_sub(removed_positions.len())?;
+        let original = *instructions.get(source)?;
+        if source < *manager_start
+            || original.opcode != POP_TOP
+            || original.operand() != Operand::Value(0)
+            || original.exception_policy() != super::ExceptionPolicy::NoneUnchanged
+            || original.local_policy.hidden_exception_owner_slots() != 0
+            || original.pre_fold_extra_instructions() != 0
+        {
+            return None;
+        }
+        let region = self.uniform_exception_owner(source, source + 1, positions)?;
+        let owner = self.exception_regions[region];
+        let current = self.uniform_exception_owner(marker, marker + 1, positions)?;
+        (!owner.is_scope_fallback
+            && !owner.preserve_lasti
+            && owner.target == handler
+            && self.exception_regions[current].is_scope_fallback)
+            .then_some(region)
     }
 
     /// Finds unchanged, unambiguous terminal pairs from the actual threading pass.
