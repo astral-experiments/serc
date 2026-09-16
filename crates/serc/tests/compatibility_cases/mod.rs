@@ -459,3 +459,5 @@ mod split_loop_tail_owner_continuations;
 mod terminal_while_cleanup;
 
 mod extra_not_taken_owner;
+
+mod outer_branch_try_tail;

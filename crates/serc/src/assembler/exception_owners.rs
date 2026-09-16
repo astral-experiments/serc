@@ -2926,6 +2926,22 @@ impl LayoutAssembler {
                                     first_unprotected_setup || unprotected_array_prefix
                                 });
                         }
+                        // Entry prologue insertion consumes the exact early-compaction
+                        // tail before jump normalization appends this marker. With no
+                        // later vacancies, the next record has a fresh NULL owner.
+                        let prologue_consumed_all_slots = instruction.opcode == NOT_TAKEN
+                            && instruction.exception_policy().owner()
+                                == NormalizedExceptionOwner::DynamicCondition
+                            && original_array_start == 0
+                            && owner_history_exact
+                            && tail.insertions > 0
+                            && tail.early_removals <= tail.insertions
+                            && tail.late_removals == 0
+                            && tail.post_compaction_fusions == 0
+                            && !has_owner
+                            && owners
+                                .get(&instruction_index)
+                                .is_none_or(|owner| !owner.definitive);
                         // Presence is already proved for a value-preserving Boolean
                         // marker. Retained array provenance supplies its exact source owner.
                         let source_region = (has_owner
@@ -2961,6 +2977,7 @@ impl LayoutAssembler {
                                 source_region,
                                 override_existing: false,
                                 definitive: proven_unprotected_slot
+                                    || prologue_consumed_all_slots
                                     || instruction.exception_policy().owner()
                                         != NormalizedExceptionOwner::DynamicCondition,
                             },

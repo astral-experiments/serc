@@ -280,3 +280,50 @@ fn missing_not_taken_owner_single_store_control() {
         "missing_not_taken_owner_single_store_control.py",
     );
 }
+
+fn cell_try_else_ternary_owner_source() -> &'static str {
+    r#"def select_values(rows, fraction=0.10):
+    values = (
+        rows.map(lambda item: item.get("value"))
+        .filter(lambda value: value is not None)
+        .map(lambda value: (float(value),))
+        .persist()
+    )
+    threshold = None
+    try:
+        try:
+            values.first()
+        except Exception:
+            threshold = None
+        else:
+            session = Session.builder.config(conf=rows.context.getConf()).getOrCreate()
+            table = session.createDataFrame(values, schema=["value"])
+            samples = table.approxQuantile("value", [fraction], 0.001)
+            threshold = samples[0] if samples else None
+    finally:
+        values.unpersist()
+    if threshold is None:
+        return rows.context.parallelize([])
+    return rows.filter(lambda item: item.get("value") is not None and float(item["value"]) <= threshold)
+"#
+}
+
+#[test]
+fn cell_try_else_ternary_owner() {
+    common::assert_matches_cpython_marshal(
+        cell_try_else_ternary_owner_source(),
+        "cell_try_else_ternary_owner.py",
+    );
+}
+
+#[test]
+fn cell_try_else_ternary_owner_uncaptured_control() {
+    let source = cell_try_else_ternary_owner_source().replace(
+        "float(item[\"value\"]) <= threshold",
+        "float(item[\"value\"]) <= 0",
+    );
+    common::assert_matches_cpython_marshal(
+        &source,
+        "cell_try_else_ternary_owner_uncaptured_control.py",
+    );
+}

@@ -844,6 +844,65 @@ impl OptimizationPipeline {
                     .then_some(entry_index)
             })
             .collect::<FxHashSet<_>>();
+        // CPython copies an unlocated branch-tail array before resolving the
+        // ordinary try cleanup's line. Preserve its existing line event through
+        // our earlier threading; the small-exit copier still decides whether a
+        // physical NOP is needed. Do not infer this from an optimized empty head.
+        let transparent_normal_try_tails = normal_try_exits
+            .iter()
+            .copied()
+            .filter(|entry_index| {
+                let (block, offset) = instruction_positions[*entry_index];
+                let items = graph[block].items();
+                let Item::Instruction(jump) = items[offset] else {
+                    return false;
+                };
+                let Operand::Forward(target) = jump.operand() else {
+                    return false;
+                };
+                if offset + 1 != items.len()
+                    || items[..offset]
+                        .iter()
+                        .any(|item| !matches!(item, Item::Label(_)))
+                    || !items[..offset].iter().any(|item| {
+                        matches!(item, Item::Label(label)
+                        if self.exception_owner_provenance.block_boundaries.contains(label))
+                    })
+                    || jump.location.line < 0
+                    || !jump.jump_policy.retains_nop_for(jump.operand())
+                    || jump.jump_policy.always_retains_nop()
+                    || jump.local_policy.hidden_exception_owner_slots() != 0
+                {
+                    return false;
+                }
+                let Some(target_block) = graph.label_block(target) else {
+                    return false;
+                };
+                let Some((Item::Instruction(tail), head)) =
+                    graph[target_block].items().split_last()
+                else {
+                    return false;
+                };
+                let mut tail_policy = super::super::ir::JumpPolicy::default();
+                tail_policy.mark_borrow_empty_block();
+                !head.is_empty()
+                    && head.iter().all(|item| matches!(item, Item::Label(_)))
+                    && head.iter().any(|item| {
+                        matches!(item, Item::Label(label)
+                        if self.exception_owner_provenance.source_boundaries.contains(label))
+                    })
+                    && tail.opcode == JUMP_FORWARD
+                    && matches!(tail.operand(), Operand::Forward(_))
+                    && tail.location == SourceLocation::NONE
+                    && tail.jump_policy == tail_policy
+                    && tail.no_location_policy == super::super::ir::NoLocationPolicy::default()
+                    && tail.exception_policy() == super::super::ExceptionPolicy::default()
+                    && tail.pre_fold_extra_instructions() == 0
+                    && tail.local_policy.hidden_exception_owner_slots() == 0
+                    && !tail.fusion_policy.is_authored_break()
+                    && !tail.fusion_policy.is_converted_pop_block()
+            })
+            .collect::<FxHashSet<_>>();
         // A compound try still has the inner try/except POP_BLOCK before its jump.
         // Validate this owner-only origin separately from ordinary-try copy eligibility.
         let compound_try_owner_exits = self
@@ -1118,6 +1177,13 @@ impl OptimizationPipeline {
                 // A break's direct copy request survives the original POP_BLOCK/JUMP
                 // exit. The small-exit copier still decides whether the target fits,
                 // and gives the copied NOP this break's own location and exit owner.
+                instruction.jump_policy.retain_nop_for_direct_target();
+            }
+            if transparent_normal_try_tails.contains(&source_index)
+                && threaded_jump_count == 1
+                && matches!(operand, Operand::Forward(_))
+                && !instruction.jump_policy.is_interruptible()
+            {
                 instruction.jump_policy.retain_nop_for_direct_target();
             }
             if let Some(target_index) = copied_owner
