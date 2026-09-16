@@ -156,6 +156,7 @@ mod multiline_with_return_markers;
 mod named_handler_and_cleanup_location_compatibility;
 mod named_handler_boolean_cleanup_order;
 mod named_handler_else_bare_raise_compatibility;
+mod named_handler_global_fold_owners;
 mod named_handler_inner_try_return;
 mod named_handler_shared_cleanup;
 mod named_handler_terminal_cleanup_locations;
@@ -468,6 +469,7 @@ mod outer_branch_try_tail;
 
 mod coroutine_nested_value_owners;
 
+mod queue_worker_match_cleanup;
 mod ternary_tuple_exit;
 
 mod empty_try_nop_owner;

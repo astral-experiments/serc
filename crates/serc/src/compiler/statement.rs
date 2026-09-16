@@ -5873,7 +5873,6 @@ impl Compiler<'_> {
                                     && !preserve_tos
                                     && handler_count == 1
                                     && next_finally == 1
-                                    && !preserve_named_handler_pop_slots
                                     && next_with == with_depth
                                     // Matching saved depths and the exact emitted prefix
                                     // exclude iterator cleanup before this pending finally.
@@ -14240,6 +14239,33 @@ impl Compiler<'_> {
                     self.assembler
                         .mark_retained_nop_borrow_fallthrough_if_unblocked(normal_exit);
                 }
+            }
+            if !statement.is_star
+                && statement.orelse.is_empty()
+                && !self.control.loops.contexts.is_empty()
+                && !self.control.statements.current_statement_has_following
+                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                && let Some(range) = terminal_class_pattern_break_failure_range(&statement.body)
+                && self.assembler.last_instruction_location() == Some(self.source_location(range))
+                && matches!(statement.handlers.as_slice(), [handler]
+                if handler.as_except_handler().is_some_and(|handler| {
+                    handler.type_.is_some()
+                        && handler.name.is_some()
+                        && matches!(handler.body.as_slice(), [Stmt::Assign(_)])
+                }))
+                && let [Stmt::Expr(finalizer)] = statement.finalbody.as_slice()
+                && let Expr::Call(call) = finalizer.value.as_ref()
+                && call.arguments.is_empty()
+                && matches!(call.func.as_ref(), Expr::Attribute(attribute)
+                    if matches!(attribute.value.as_ref(), Expr::Name(_)))
+                && self.source_location(finalizer.range).line != self.source_location(range).line
+            {
+                // The final pattern's POP_TOP precedes a separate normal-try jump.
+                // Case-success and handler edges bypass it, while its located finally
+                // call prevents exit copying. Cold ordering removes the jump but keeps
+                // its pattern-line NOP with the enclosing finally's exception owner.
+                self.assembler
+                    .preserve_redundant_jump_nop_after_threading(normal_exit);
             }
             if statement.orelse.is_empty()
                 && (body_noop_location.is_some() || omitted_fallthrough_pass_exit)
@@ -23290,6 +23316,26 @@ pub(super) fn nested_if_exit_location(
             NestedIfExitLocation::Unlocated
         },
     )
+}
+
+// An abrupt final class case leaves its POP_TOP cleanup as the physical fallthrough
+// into the normal try exit; earlier successful cases jump past that cleanup.
+fn terminal_class_pattern_break_failure_range(body: &[Stmt]) -> Option<TextRange> {
+    let Stmt::Match(statement) = body.last()? else {
+        return None;
+    };
+    let (case, earlier) = statement.cases.split_last()?;
+    let Pattern::MatchClass(pattern) = &case.pattern else {
+        return None;
+    };
+    (case.guard.is_none()
+        && pattern.arguments.patterns.is_empty()
+        && pattern.arguments.keywords.is_empty()
+        && matches!(case.body.as_slice(), [Stmt::Break(_)])
+        && earlier
+            .iter()
+            .any(|case| suite_has_normal_fallthrough(&case.body)))
+    .then_some(pattern.range)
 }
 
 // A final value pattern and runtime guard share the original zero-pop failure

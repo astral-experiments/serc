@@ -155,6 +155,7 @@ pub(super) struct CopiedHandlerCleanup {
     pub(super) return_nop: Instruction,
     pub(super) instructions: Vec<Instruction>,
     pub(super) missing_null_pops: usize,
+    pub(super) removed_prefix_slots: u16,
     pub(super) continued_call: Option<([Instruction; 6], Instruction)>,
 }
 
@@ -2158,13 +2159,9 @@ impl LayoutAssembler {
                         {
                             continue;
                         }
-                        // The return NOP is already represented by one hidden record.
-                        // Unnamed cleanup has its emitted NULL POP as a second record.
-                        let hidden = if original.missing_null_pops == 2 {
-                            1
-                        } else {
-                            2
-                        };
+                        // The return NOP and any emitted NULL POPs compact into
+                        // POP_EXCEPT. Omitted POPs are counted separately during replay.
+                        let hidden = original.removed_prefix_slots;
                         let exact =
                             original
                                 .instructions

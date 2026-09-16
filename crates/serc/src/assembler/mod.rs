@@ -4708,12 +4708,31 @@ impl Assembler {
                 Item::Label(_) => None,
             })
             .collect::<Vec<_>>();
-        if prefix.len() != if named { 1 } else { 2 }
-            || (!named
-                && (prefix[1].opcode != NOP || !prefix[1].fusion_policy.is_converted_pop_block()))
-        {
-            return;
-        }
+        let (missing_null_pops, removed_prefix_slots) = match (named, prefix.as_slice()) {
+            (true, [_]) => (2, 1),
+            (true, [_, first, second])
+                if return_nop.exception_policy() == ExceptionPolicy::NoneUnchanged
+                    && return_nop.local_policy.hidden_exception_owner_slots() == 0
+                    && return_nop.pre_fold_extra_instructions() == 0
+                    && [first, second].into_iter().all(|pop| {
+                        pop.opcode == NOP
+                            && pop.operand() == Operand::Value(0)
+                            && pop.fusion_policy.is_converted_pop_block()
+                            && pop.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
+                            && pop.local_policy.hidden_exception_owner_slots() == 0
+                            && pop.pre_fold_extra_instructions() == 0
+                            && pop.location == return_nop.location
+                    }) =>
+            {
+                (0, 3)
+            }
+            (false, [_, pop])
+                if pop.opcode == NOP && pop.fusion_policy.is_converted_pop_block() =>
+            {
+                (0, 2)
+            }
+            _ => return,
+        };
         let instructions = items[start_at..end_at]
             .iter()
             .filter_map(|item| match item {
@@ -4738,7 +4757,8 @@ impl Assembler {
                 end,
                 return_nop,
                 instructions,
-                missing_null_pops: if named { 2 } else { 0 },
+                missing_null_pops,
+                removed_prefix_slots,
                 continued_call: None,
             });
     }
