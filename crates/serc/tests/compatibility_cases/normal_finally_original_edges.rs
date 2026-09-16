@@ -892,3 +892,94 @@ fn matches_cpython_marshal_for_async_else_conditional_finally_following_call_con
         "async_else_conditional_finally_following_call_control.py",
     );
 }
+
+fn nonlinear_arm_nested_finally_source() -> &'static str {
+    r#"async def finish(state, *, publish=True):
+    session = await refresh(state)
+    session_key = state.key
+    if session is None or session_key is None:
+        return False
+    durable = False
+    info: tuple[str, str] | None = None
+    saved = not state.dirty
+    try:
+        if state.flush:
+            await flush(state, force=True)
+        elif state.chunk is not None and state.chunk.buffer:
+            record("drop", extra={"key": session_key, "value": state.value, "size": len(state.chunk.buffer)})
+        info = await upload(state)
+        if info is not None:
+            committed = await commit(state, info=info)
+            durable = committed and available(state)
+            if not durable:
+                record_blocked(kind="state", reason="commit")
+        else:
+            durable = available(state)
+    except PrimaryError:
+        if info is not None:
+            record_blocked(kind="state", reason="primary")
+        raise
+    except errors.Cancelled:
+        if info is not None:
+            record_blocked(kind="state", reason="cancelled")
+        record_error("cancelled", extra={"key": session_key, "value": state.value})
+        raise
+    except Exception:
+        if info is not None:
+            record_blocked(kind="state", reason="failure")
+        record_error("failure", extra={"key": session_key, "value": state.value})
+    finally:
+        if state.dirty:
+            try:
+                await session.save(condition=WriteMode.Unchanged)
+                state.dirty = False
+                saved = True
+            except ConflictError:
+                record("conflict", extra={"key": session_key})
+                saved = False
+            except Exception:
+                record_error("save", extra={"key": session_key})
+                saved = False
+        if saved and durable and state.publish and publish:
+            await notify(state)
+        state.chunk = None
+    return saved and durable
+"#
+}
+
+#[test]
+fn matches_cpython_marshal_for_nonlinear_arm_nested_finally_target() {
+    common::assert_matches_cpython_marshal(
+        nonlinear_arm_nested_finally_source(),
+        "nonlinear_arm_nested_finally_target.py",
+    );
+}
+
+#[test]
+fn matches_cpython_marshal_for_nonlinear_arm_nested_finally_linear_arm_control() {
+    let source = nonlinear_arm_nested_finally_source().replace(
+        r#"            durable = committed and available(state)
+            if not durable:
+                record_blocked(kind="state", reason="commit")
+"#,
+        r#"            durable = merge_commit(committed, state)
+            record_blocked(kind="state", reason="commit")
+"#,
+    );
+    common::assert_matches_cpython_marshal(
+        &source,
+        "nonlinear_arm_nested_finally_linear_arm_control.py",
+    );
+}
+
+#[test]
+fn matches_cpython_marshal_for_nonlinear_arm_nested_finally_entry_call_control() {
+    let source = nonlinear_arm_nested_finally_source().replace(
+        "    finally:\n        if state.dirty:\n",
+        "    finally:\n        cleanup_started()\n        if state.dirty:\n",
+    );
+    common::assert_matches_cpython_marshal(
+        &source,
+        "nonlinear_arm_nested_finally_entry_call_control.py",
+    );
+}

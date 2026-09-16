@@ -1537,6 +1537,47 @@ impl Assembler {
         count
     }
 
+    /// Certifies a single comprehension restore followed by its result assignment.
+    pub(crate) fn current_original_block_is_single_comprehension_assignment(&self) -> bool {
+        let [
+            ..,
+            Item::Label(entry),
+            Item::Instruction(swap),
+            Item::Instruction(restore),
+            Item::Instruction(store),
+        ] = self.linear_items()
+        else {
+            return false;
+        };
+        swap.opcode == SWAP
+            && swap.operand() == Operand::Value(2)
+            && restore.opcode == STORE_FAST
+            && restore.local_policy.may_store_null()
+            && store.opcode == STORE_FAST
+            && !store.local_policy.may_store_null()
+            && restore.operand() != store.operand()
+            && self
+                .exception_owner_provenance
+                .original_comprehension_normal_restores
+                .get(entry)
+                .is_some_and(|original| original.as_slice() == [*swap, *restore])
+            && self
+                .exception_owner_provenance
+                .original_comprehension_normal_exits
+                .iter()
+                .any(|(target, jump)| {
+                    target == entry
+                        && jump.opcode == JUMP_FORWARD
+                        && jump.operand() == Operand::Forward(*entry)
+                })
+            && [swap, restore, store].into_iter().all(|instruction| {
+                instruction.pre_fold_extra_instructions() == 0
+                    && !instruction.jump_policy.borrow_empty_block()
+                    && instruction.no_location_policy.borrow_fallthrough()
+                        == BorrowFallthrough::Reachable
+            })
+    }
+
     /// Records the real entry and cleanup owner of a later typed-handler dispatch.
     pub(crate) fn record_handler_dispatch_array(
         &mut self,

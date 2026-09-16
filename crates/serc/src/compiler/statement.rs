@@ -16630,6 +16630,64 @@ impl Compiler<'_> {
                             })
                     }))
         };
+        // A trailing runtime guard leaves the earlier case's success jump in an
+        // unlocated join. That original jump still reaches conditional cleanup after
+        // handlers move cold, even without a linear prefix or a cleanup-entry CALL.
+        let coroutine_guarded_recovery_entry = matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
+            && self.control.loops.contexts.is_empty()
+            && self.control.withs.active_with_exits.is_empty()
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            && !self.control.in_exception_handler()
+            && self.control.finally.active_copied_finally_bodies == 0
+            && self.control.finally.active_finally_try_bodies == 0
+            && !statement.handlers.is_empty()
+            && !suite_contains_return(&statement.body)
+            && matches!(statement.body.last(), Some(Stmt::If(branch))
+                if matches!(branch.body.as_slice(), [Stmt::Assign(awaited), Stmt::Assign(combined), Stmt::If(guard)]
+                    if matches!(awaited.targets.as_slice(), [Expr::Name(_)])
+                        && matches!(awaited.value.as_ref(), Expr::Await(_))
+                        && !expression_contains_inline_branch(&awaited.value)
+                        && matches!(combined.targets.as_slice(), [Expr::Name(_)])
+                        && matches!(combined.value.as_ref(), Expr::BoolOp(boolean)
+                            if boolean.op == BoolOp::And
+                                && matches!(boolean.values.as_slice(), [Expr::Name(_), Expr::Call(_)])
+                                && condition_has_linear_runtime_leaves(&combined.value)
+                                && !expression_suspends_current_scope(&combined.value))
+                        && guard.elif_else_clauses.is_empty()
+                        && condition_has_only_runtime_tests(&guard.test)
+                        && !expression_contains_inline_branch(&guard.test)
+                        && !expression_suspends_current_scope(&guard.test)
+                        && original_condition_has_unique_jump_target(&guard.test, false)
+                        && matches!(nested_if_exit_location(guard, false), Some(NestedIfExitLocation::Unlocated))
+                        && matches!(guard.body.as_slice(), [Stmt::Expr(call)]
+                            if matches!(call.value.as_ref(), Expr::Call(_))
+                                && !expression_contains_inline_branch(&call.value)
+                                && !expression_suspends_current_scope(&call.value))))
+            && !suite_contains_abrupt_control_flow(&statement.finalbody)
+            && matches!(statement.finalbody.first(), Some(Stmt::If(cleanup))
+            if cleanup.elif_else_clauses.is_empty()
+                && condition_has_only_runtime_tests(&cleanup.test)
+                && !expression_contains_inline_branch(&cleanup.test)
+                && !expression_suspends_current_scope(&cleanup.test)
+                && original_condition_has_unique_jump_target(&cleanup.test, false)
+                && matches!(cleanup.body.as_slice(), [Stmt::Try(recovery)]
+                    if !recovery.is_star
+                        && recovery.orelse.is_empty()
+                        && recovery.finalbody.is_empty()
+                        && !recovery.handlers.is_empty()
+                        && suite_has_linear_borrow_fallthrough(&recovery.body)
+                        && recovery.handlers.iter().all(|handler| {
+                            handler.as_except_handler().is_some_and(|handler| {
+                                handler.type_.is_some()
+                                    && handler.name.is_none()
+                                    && suite_has_linear_borrow_fallthrough(&handler.body)
+                            })
+                        })));
         // A live linear arm before the final else keeps a reachable jump directly
         // into normal cleanup after handlers move cold. Folded assertions can leave
         // that jump behind an empty block, so a merely nonterminal arm is insufficient.
@@ -16643,6 +16701,7 @@ impl Compiler<'_> {
             && self.control.finally.active_finally_end_blocks == 0
             && !suite_contains_loop_break(&statement.body)
             && (self.suite_has_nonempty_borrow_entry(&statement.finalbody)
+                || coroutine_guarded_recovery_entry
                 || statement.finalbody.iter().all(|statement| match statement {
                     Stmt::Expr(expression) => {
                         fold_constant(&expression.value).is_none()
@@ -16692,6 +16751,7 @@ impl Compiler<'_> {
                     }) && !suite_contains_abrupt_control_flow(&clause.body)
                 })
                 && (suite_has_linear_borrow_fallthrough(&conditional.body)
+                    || coroutine_guarded_recovery_entry
                     || coroutine_manager_arm_reaches_finally(&conditional.body)
                     || conditional.elif_else_clauses.iter().any(|clause| {
                         clause.test.is_some()
@@ -18299,20 +18359,33 @@ impl Compiler<'_> {
             let finalizer_tail_count = self
                 .assembler
                 .current_original_block_pre_fusion_instruction_count();
+            let comprehension_restore_tail = finalizer_tail_count == 3
+                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                && statement.handlers.is_empty()
+                && statement.orelse.is_empty()
+                && self.control.finally.active_normal_finally_bodies == 0
+                && self.control.finally.active_copied_finally_bodies == 0
+                && self.control.finally.active_finally_end_blocks == 0
+                && matches!(statement.finalbody.last(), Some(Stmt::Assign(assignment))
+                    if matches!(assignment.value.as_ref(), Expr::ListComp(_)))
+                && self
+                    .assembler
+                    .current_original_block_is_single_comprehension_assignment();
             if finalizer_tail_count > 0
                 && finalizer_tail_count < 4
-                && statement
-                    .finalbody
-                    .iter()
-                    .rposition(
-                        |statement| matches!(statement, Stmt::Try(recovery) if !recovery.is_star),
-                    )
-                    .is_some_and(|index| {
-                        index + 1 < statement.finalbody.len()
-                            && finalizer_tail_has_matching_linear_copies(
-                                &statement.finalbody[index + 1..],
-                            )
-                    })
+                && (comprehension_restore_tail
+                    || statement
+                        .finalbody
+                        .iter()
+                        .rposition(
+                            |statement| matches!(statement, Stmt::Try(recovery) if !recovery.is_star),
+                        )
+                        .is_some_and(|index| {
+                            index + 1 < statement.finalbody.len()
+                                && finalizer_tail_has_matching_linear_copies(
+                                    &statement.finalbody[index + 1..],
+                                )
+                        }))
             {
                 // In the exceptional copy, the short suffix and RERAISE fit CPython's
                 // four-instruction exit-copy limit. Inlining it leaves an orphan empty
