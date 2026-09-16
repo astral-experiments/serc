@@ -2951,7 +2951,13 @@ impl Compiler<'_> {
                 self.emit_deferred_implicit_return()?;
                 return Ok(());
             };
-            let emitted_fallthrough = if matches!(body.last(), Some(Stmt::If(_))) {
+            // A folded terminal branch still copies an implicit return onto each loop break.
+            // Use terminal loop lowering so each copy inherits its own break location.
+            let emitted_fallthrough = if matches!(body.last(), Some(Stmt::If(_)))
+                || matches!(body.last(), Some(Stmt::While(statement))
+                    if statement.orelse.is_empty()
+                        && suite_contains_loop_break(&statement.body))
+            {
                 let ((), emitted_fallthrough) = self.with_fallthrough_tracking(|compiler| {
                     compiler.compile_suite_inner(body, true)
                 })?;
@@ -10845,7 +10851,10 @@ impl Compiler<'_> {
                 && !leading
                     .iter()
                     .any(|statement| matches!(statement, Stmt::Try(_)))
-                && !matches!(statement.body.as_slice(), [Stmt::With(_)])
+                // Each elif starts its own original conditional array. A manager in
+                // the first arm cannot locate that later arm's shared false exit.
+                && (!statement.elif_else_clauses.is_empty()
+                    || !matches!(statement.body.as_slice(), [Stmt::With(_)]))
                 && condition_jump_target_count(fallthrough_test, false) > 1
                 && let Expr::BoolOp(boolean) = fallthrough_test
             {

@@ -140,11 +140,14 @@ impl OptimizationPipeline {
                 || nop.operand() != Operand::Value(0)
                 || nop.fusion_policy.is_converted_pop_block()
                 || nop.location.line < 0
-                // The complete protected body must end with a discarded call.
-                // A return value or unwind marker needs its separate exit-copy proof.
+                // A discarded call or assignment to one fast local leaves this
+                // complete protected array nonempty. A return or unwind marker
+                // still needs its separate exit-copy proof.
                 || !matches!(body.get(body.len().saturating_sub(2)..),
-                    Some([Item::Instruction(call), Item::Instruction(discard)])
-                        if call.opcode == CALL && discard.opcode == POP_TOP)
+                    Some([Item::Instruction(call), Item::Instruction(consumer)])
+                        if (call.opcode == CALL && consumer.opcode == POP_TOP)
+                            || (matches!(call.opcode, CALL | CALL_KW)
+                                && consumer.opcode == STORE_FAST))
                 || [pop, nop, first].iter().any(|instruction| {
                     instruction.jump_policy.borrow_empty_block()
                         || instruction.no_location_policy.borrow_fallthrough() != BorrowFallthrough::Reachable

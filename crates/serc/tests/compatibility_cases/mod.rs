@@ -502,3 +502,9 @@ mod retained_finally_closure_receiver;
 mod awaited_retry_minimal;
 
 mod missing_nop_source_probes;
+
+mod extra_nop_terminal_loop;
+
+mod terminal_conditional_loops_borrow;
+
+mod bare_handler_manager_backedge;
