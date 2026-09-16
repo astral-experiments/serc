@@ -694,6 +694,47 @@ impl Assembler {
         true
     }
 
+    /// Recognizes the complete current original array beginning at an await's completion.
+    pub(crate) fn current_original_block_starts_with_await_completion(&self) -> bool {
+        let mut first = None;
+        for item in self.linear_items().iter().rev() {
+            match item {
+                Item::Label(label) => {
+                    if self.preserved_block_boundaries.contains(label) {
+                        return false;
+                    }
+                    if self
+                        .exception_owner_provenance
+                        .block_boundaries
+                        .contains(label)
+                    {
+                        return self
+                            .exception_owner_provenance
+                            .source_boundaries
+                            .contains(label)
+                            && first.is_some_and(|instruction: &Instruction| {
+                                instruction.opcode == END_SEND
+                                    && instruction.operand() == Operand::Value(0)
+                            });
+                    }
+                }
+                Item::Instruction(instruction) => {
+                    if instruction.opcode == NOT_TAKEN
+                        || !matches!(instruction.operand(), Operand::Value(_))
+                        || ends_scope(instruction.opcode)
+                        || instruction.jump_policy.borrow_empty_block()
+                        || instruction.no_location_policy.borrow_fallthrough()
+                            != BorrowFallthrough::Reachable
+                    {
+                        return false;
+                    }
+                    first = Some(instruction);
+                }
+            }
+        }
+        false
+    }
+
     /// Finds the last located record in the current original instruction array.
     /// Exception-range aliases do not interrupt CPython's within-array line donation.
     pub(crate) fn current_original_block_location(&self) -> Option<SourceLocation> {

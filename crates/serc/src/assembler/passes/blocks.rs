@@ -159,6 +159,53 @@ fn original_entry_has_no_location_donor(items: &[Item], absent: &FxHashSet<Label
     has_label
 }
 
+/// Keeps a surviving original shared synthetic forward-jump array source-less after exit copying.
+/// Authored breaks retain deferred cleanup donors that can resolve after later jump threading.
+fn preserve_original_shared_jump_location(
+    graph: &mut BlockGraph,
+    target: BasicBlockId,
+    predecessors: usize,
+    original_location_absence: &FxHashSet<Label>,
+) -> bool {
+    if predecessors <= 1
+        || !original_entry_has_no_location_donor(graph[target].items(), original_location_absence)
+    {
+        return false;
+    }
+    let mut instructions = graph[target].items().iter().filter_map(|item| match item {
+        Item::Instruction(instruction) => Some(instruction),
+        Item::Label(_) => None,
+    });
+    let Some(jump) = instructions.next() else {
+        return false;
+    };
+    if instructions.next().is_some()
+        || jump.opcode != JUMP_FORWARD
+        || !matches!(jump.operand(), Operand::Forward(_))
+        || jump.location.line >= 0
+        || !matches!(
+            jump.jump_policy.retained_nop(),
+            super::super::ir::RetainedJumpNop::DirectTarget
+        )
+        || jump.jump_policy.is_interruptible()
+        || jump.fusion_policy.is_authored_break()
+        || jump.fusion_policy.location_from_next()
+        || jump.no_location_policy.percent_target_location != 0
+    {
+        return false;
+    }
+    // Copies have new labels, and an original array that became private has one
+    // predecessor. Both retain their own donor; only the still-shared original
+    // has the certified absence, which later location writers must also respect.
+    graph
+        .instructions_mut(target)
+        .next()
+        .expect("certified original forward jump")
+        .no_location_policy
+        .preserve_location();
+    true
+}
+
 // A bare raise has no copied finally cleanup: it propagates through the active exception
 // handler. Restrictions on try/with exits therefore do not increase this exit's original size.
 // An omitted authored NOP means the optimized singleton does not certify the original size.
@@ -1042,6 +1089,14 @@ fn propagate_exit_block_locations(
         if analysis.exception_handler_blocks[target.index()] {
             continue;
         }
+        if preserve_original_shared_jump_location(
+            graph,
+            target,
+            analysis.predecessors[target.index()],
+            original_location_absence,
+        ) {
+            continue;
+        }
         // A shared discard or conditional cleanup join has no unique source. Exit copies
         // acquire their branch's location separately when the continuation can be copied.
         if analysis.predecessors[target.index()] > 1
@@ -1721,6 +1776,12 @@ impl OptimizationPipeline {
                 .flatten()
                 .and_then(|target| graph.label_block(target))?;
             let start = order.iter().position(|block| *block == target)?;
+            // Cold-block ordering preserves the relative order of warm blocks. A
+            // backward edge to a warm loop header is not a deferred terminal restore,
+            // even when the header's conditional fallthrough ends with a return.
+            if start <= position && temperatures[target.index()] == WARM_BLOCK {
+                return None;
+            }
             let mut end = start;
             while end + 1 < order.len()
                 && block_has_fallthrough(graph[order[end]].items())
@@ -4107,6 +4168,14 @@ impl OptimizationPipeline {
 
         for target in order.iter().copied() {
             if exception_handler_blocks[target.index()] {
+                continue;
+            }
+            if preserve_original_shared_jump_location(
+                graph,
+                target,
+                remaining_predecessors[target.index()],
+                original_location_absence,
+            ) {
                 continue;
             }
             if planned_blocks.contains(&target)

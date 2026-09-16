@@ -2,6 +2,7 @@ mod assert_call_none_compatibility;
 mod async_cleanup_order;
 mod async_comprehension_assignment_exit_locations;
 mod async_comprehension_restoration;
+mod async_loop_header_relocation;
 mod async_with_literal_return_owners;
 mod async_with_terminal_condition_owner_compatibility;
 mod authored_pass_join_locations;
@@ -30,6 +31,7 @@ mod conditional_generator_join_nops;
 mod conditional_handler_cleanup_compatibility;
 mod conditional_handler_cleanup_order;
 mod conditional_handler_none_admission;
+mod conditional_jump_join_locations;
 mod conditional_value_boolean_continuation;
 mod constant_assertion_exit_slots;
 mod constant_condition_admission;
@@ -43,6 +45,7 @@ mod copied_finally_global_fold_owners;
 mod copied_finally_handler_reachability;
 mod copied_finally_local_order;
 mod copied_finally_loop_control;
+mod copied_finally_manager_boundary;
 mod copied_finally_manager_break_exit;
 mod copied_finally_none_comparison_compatibility;
 mod coroutine_assert_finally_nop_owner_compatibility;
@@ -351,6 +354,7 @@ mod protected_loop_condition_exit_locations;
 mod terminating_handler_shared_false_join_locations;
 
 mod try_else_pop_block_prefixes;
+mod try_entry_import_owner;
 
 mod async_generator_builtin_calls;
 
@@ -479,3 +483,17 @@ mod ternary_tuple_exit;
 mod empty_try_nop_owner;
 
 mod terminal_await_try_join;
+
+mod keyword_cleanup_borrow;
+
+mod awaited_assignment_finally_borrow;
+
+mod runtime_prefix_owner;
+
+mod copied_inner_finally_owner;
+
+mod awaited_recovery_nested_handler_regression;
+
+mod retained_finally_closure_receiver;
+
+mod awaited_retry_minimal;

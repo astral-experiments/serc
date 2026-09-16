@@ -48,6 +48,8 @@ pub(super) struct RetainedFinallyOrigin {
     // Empty for a retained jump NOP; otherwise this complete prefix must survive
     // unchanged after the ordinary jump disappears.
     source_prefix: Vec<Instruction>,
+    // A recorded try-range end can split the physical graph without ending this array.
+    source_exit_alias: Option<Label>,
     target_labels: Vec<Label>,
     target: Label,
     jump_location: crate::assembler::SourceLocation,
@@ -236,10 +238,16 @@ impl OptimizationPipeline {
         if self.borrow_finally_entries.is_empty() {
             return Vec::new();
         }
-        self.graph
+        let blocks = self
+            .graph
             .iter()
-            .filter_map(|(_, contents)| {
-                let (Item::Instruction(jump), leading) = contents.items().split_last()? else {
+            .map(|(_, block)| block.items())
+            .collect::<Vec<_>>();
+        blocks
+            .iter()
+            .enumerate()
+            .filter_map(|(block_index, contents)| {
+                let (Item::Instruction(jump), leading) = contents.split_last()? else {
                     return None;
                 };
                 if jump.opcode != crate::target::opcodes::JUMP_FORWARD
@@ -248,6 +256,42 @@ impl OptimizationPipeline {
                 {
                     return None;
                 }
+                // An await's completion starts a populated original array at END_SEND.
+                // Capture its complete straight-line suffix through the try-range end,
+                // which is an exception alias rather than a new CPython block. The
+                // generic prefix checks below reject empty, branching, or barred spans.
+                let source_exit_alias = if let [Item::Label(alias)] = leading
+                    && let Operand::Forward(target) = jump.operand()
+                    && self.exception_owner_provenance.compound_try_owner_exits
+                        .iter().filter(|origin| **origin == (*alias, target)).count() == 1
+                    && !self.exception_owner_provenance.block_boundaries.contains(alias)
+                    && !self.exception_owner_provenance.source_boundaries.contains(alias)
+                    && !self.preserved_block_boundaries.contains(alias)
+                    && !self.borrow_unreachable_blocks.contains(alias)
+                    && !self.borrow_jump_entry_labels.contains(alias)
+                    && !self.borrow_finally_entries.contains_key(alias)
+                    && !self.exception_regions.iter().any(|region| region.target == *alias)
+                    && !self.graph.iter_items().any(|item| {
+                        matches!(item, Item::Instruction(instruction)
+                            if matches!(instruction.operand(), Operand::Forward(target) | Operand::Backward(target)
+                                if target == *alias))
+                    })
+                    && let Some([Item::Label(source), Item::Instruction(end_send), suffix @ ..]) =
+                        block_index.checked_sub(1).and_then(|index| blocks.get(index)).copied()
+                    && self.exception_owner_provenance.source_boundaries.contains(source)
+                    && end_send.opcode == END_SEND
+                    && end_send.operand() == Operand::Value(0)
+                    && !suffix.is_empty()
+                {
+                    Some(*alias)
+                } else {
+                    None
+                };
+                let leading = if source_exit_alias.is_some() {
+                    blocks[block_index - 1]
+                } else {
+                    leading
+                };
                 let source_label_count = leading
                     .iter()
                     .take_while(|item| matches!(item, Item::Label(_)))
@@ -392,6 +436,7 @@ impl OptimizationPipeline {
                 Some(RetainedFinallyOrigin {
                     source_labels,
                     source_prefix,
+                    source_exit_alias,
                     target_labels,
                     target,
                     jump_location: jump.location,
@@ -462,7 +507,8 @@ impl OptimizationPipeline {
                         .enumerate()
                         .all(|(offset, expected)| {
                             matches!(items.get(cursor + offset), Some(Item::Instruction(actual))
-                            if actual.opcode == expected.opcode
+                            if origin.source_exit_alias.is_none_or(|_| actual == expected)
+                                && actual.opcode == expected.opcode
                                 && actual.operand() == expected.operand()
                                 && actual.location == expected.location
                                 && !actual.jump_policy.borrow_empty_block()
@@ -473,6 +519,25 @@ impl OptimizationPipeline {
                     continue;
                 }
                 cursor += origin.source_prefix.len();
+            }
+            if let Some(alias) = origin.source_exit_alias {
+                if !matches!(items.get(cursor), Some(Item::Label(actual)) if *actual == alias)
+                    || self.exception_owner_provenance.block_boundaries.contains(&alias)
+                    || self.exception_owner_provenance.source_boundaries.contains(&alias)
+                    || self.preserved_block_boundaries.contains(&alias)
+                    || self.borrow_unreachable_blocks.contains(&alias)
+                    || self.borrow_jump_entry_labels.contains(&alias)
+                    || self.borrow_finally_entries.contains_key(&alias)
+                    || self.exception_regions.iter().any(|region| region.target == alias)
+                    || items.iter().any(|item| {
+                        matches!(item, Item::Instruction(instruction)
+                            if matches!(instruction.operand(), Operand::Forward(target) | Operand::Backward(target)
+                                if target == alias))
+                    })
+                {
+                    continue;
+                }
+                cursor += 1;
             }
             // Exact adjacency excludes intervening empty arrays and newly merged labels.
             let target_start = cursor;
@@ -494,10 +559,12 @@ impl OptimizationPipeline {
             {
                 continue;
             }
-            let source = *origin
-                .source_labels
-                .last()
-                .expect("one original source label");
+            let source = origin.source_exit_alias.unwrap_or_else(|| {
+                *origin
+                    .source_labels
+                    .last()
+                    .expect("one original source label")
+            });
             entries.insert(source, origin.target);
         }
         entries

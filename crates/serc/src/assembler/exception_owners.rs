@@ -473,9 +473,9 @@ impl ExceptionOwnerProvenance {
         source_head: bool,
     ) -> bool {
         use crate::target::opcodes::{
-            BINARY_OP, CALL, IMPORT_NAME, LOAD_ATTR, LOAD_CONST, LOAD_FAST, LOAD_GLOBAL, LOAD_NAME,
-            LOAD_SMALL_INT, POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE, PUSH_NULL, STORE_FAST, STORE_NAME,
-            TO_BOOL,
+            BINARY_OP, BUILD_STRING, CALL, CALL_KW, FORMAT_SIMPLE, IMPORT_FROM, IMPORT_NAME,
+            LOAD_ATTR, LOAD_CONST, LOAD_FAST, LOAD_GLOBAL, LOAD_NAME, LOAD_SMALL_INT,
+            POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE, PUSH_NULL, STORE_FAST, STORE_NAME, TO_BOOL,
         };
 
         let leading_labels = prefix
@@ -541,7 +541,8 @@ impl ExceptionOwnerProvenance {
             .collect::<FxHashSet<_>>();
         let mut instructions = Vec::new();
         let mut labels = FxHashSet::default();
-        for item in prefix {
+        let mut from_import_members = FxHashSet::default();
+        for (item_index, item) in prefix.iter().enumerate() {
             match item {
                 Item::Label(label) => {
                     if !labels.insert(*label)
@@ -561,7 +562,41 @@ impl ExceptionOwnerProvenance {
                         return false;
                     }
                 }
-                Item::Instruction(instruction) => instructions.push(*instruction),
+                Item::Instruction(instruction) => {
+                    // This complete single-name import retains all six original records.
+                    // Certify its module-stack discard without admitting arbitrary POPs
+                    // or import fragments separated by labels.
+                    if instruction.opcode == IMPORT_FROM
+                        && let Some(start) = item_index.checked_sub(3)
+                        && let Some(
+                            [
+                                Item::Instruction(level),
+                                Item::Instruction(names),
+                                Item::Instruction(module),
+                                Item::Instruction(imported),
+                                Item::Instruction(store),
+                                Item::Instruction(discard),
+                            ],
+                        ) = prefix.get(start..start + 6)
+                        && level.opcode == LOAD_SMALL_INT
+                        && names.opcode == LOAD_CONST
+                        && module.opcode == IMPORT_NAME
+                        && imported.opcode == IMPORT_FROM
+                        && store.opcode == STORE_FAST
+                        && discard.opcode == POP_TOP
+                        && discard.operand() == Operand::Value(0)
+                        && [level, names, module, imported, store, discard]
+                            .iter()
+                            .all(|part| {
+                                part.location == level.location
+                                    && matches!(part.operand(), Operand::Value(_))
+                            })
+                    {
+                        from_import_members.insert(instructions.len());
+                        from_import_members.insert(instructions.len() + 2);
+                    }
+                    instructions.push(*instruction);
+                }
             }
         }
         let [body @ .., condition, marker] = instructions.as_slice() else {
@@ -669,11 +704,11 @@ impl ExceptionOwnerProvenance {
                     }
                 }
                 PUSH_NULL => {
-                    // Imported attribute calls retain this separate record;
+                    // Attribute and module-name calls retain this separate record;
                     // a direct global call instead folds it into LOAD_GLOBAL.
                     if instructions
                         .get(index.wrapping_sub(1))
-                        .is_none_or(|previous| previous.opcode != LOAD_ATTR)
+                        .is_none_or(|previous| !matches!(previous.opcode, LOAD_ATTR | LOAD_NAME))
                     {
                         return false;
                     }
@@ -715,12 +750,51 @@ impl ExceptionOwnerProvenance {
                         return false;
                     }
                 }
-                POP_TOP if source_head => {
-                    // CALL's discarded result retains both original records. Constant
-                    // and COPY/POP pairs can compact and cannot certify a fresh slot.
+                CALL_KW => {
+                    // The keyword-name tuple is loaded directly, not built and folded.
+                    // The call retains its own record just like positional CALL.
                     if instructions
                         .get(index.wrapping_sub(1))
-                        .is_none_or(|previous| previous.opcode != CALL)
+                        .is_none_or(|previous| previous.opcode != LOAD_CONST)
+                    {
+                        return false;
+                    }
+                }
+                FORMAT_SIMPLE => {
+                    // Runtime interpolation keeps both the value and format records.
+                    // Constant and conversion paths need their own compaction proof.
+                    if instruction.operand() != Operand::Value(0)
+                        || instructions
+                            .get(index.wrapping_sub(1))
+                            .is_none_or(|previous| {
+                                !matches!(
+                                    previous.opcode,
+                                    LOAD_FAST | LOAD_NAME | LOAD_ATTR | CALL | CALL_KW
+                                )
+                            })
+                    {
+                        return false;
+                    }
+                }
+                BUILD_STRING => {
+                    // This is the direct small-string producer, ending in a runtime
+                    // interpolation. Large joined-string lowering is not covered.
+                    if !matches!(instruction.operand(), Operand::Value(2..=30))
+                        || instructions
+                            .get(index.wrapping_sub(1))
+                            .is_none_or(|previous| previous.opcode != FORMAT_SIMPLE)
+                    {
+                        return false;
+                    }
+                }
+                IMPORT_FROM | POP_TOP if from_import_members.contains(&index) => {}
+                POP_TOP => {
+                    // Discarding a call result retains both original records at an
+                    // authenticated source or branch head. Constant and COPY/POP
+                    // pairs can compact and cannot certify a fresh slot.
+                    if instructions
+                        .get(index.wrapping_sub(1))
+                        .is_none_or(|previous| !matches!(previous.opcode, CALL | CALL_KW))
                     {
                         return false;
                     }

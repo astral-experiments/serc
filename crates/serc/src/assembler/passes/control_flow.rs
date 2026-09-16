@@ -2099,6 +2099,8 @@ impl OptimizationPipeline {
 
                     let mut target_is_next = false;
                     let mut crosses_exception_boundary = false;
+                    let mut original_cleanup_boundaries = 0;
+                    let mut crosses_only_original_cleanup = true;
                     let mut crosses_removed_line_event = false;
                     let mut removed_line_events_are_unlocated = true;
                     let mut next = None;
@@ -2118,6 +2120,41 @@ impl OptimizationPipeline {
                                     target_is_next |= *label == target;
                                     crosses_exception_boundary |=
                                         exception_boundaries.contains(label);
+                                    if finalize_borrow_empty_blocks
+                                        && instruction.fusion_policy.is_authored_break()
+                                        && exception_boundaries.contains(label)
+                                    {
+                                        original_cleanup_boundaries += 1;
+                                        let mut ending = self
+                                            .exception_regions
+                                            .iter()
+                                            .filter(|region| region.end == *label);
+                                        let original = ending.next();
+                                        crosses_only_original_cleanup &= *label != target
+                                            && self.exception_owner_provenance.source_boundaries.contains(label)
+                                            && self.exception_owner_provenance.block_boundaries.contains(label)
+                                            && !self.borrow_block_aliases.contains(label)
+                                            && !self.original_nop_targets.contains(label)
+                                            && ending.next().is_none()
+                                            && original.is_some_and(|original| {
+                                                !original.is_scope_fallback
+                                                    && original.preserve_lasti
+                                                    && Some(original.depth) == instruction.depth_after()
+                                                    && self.exception_regions.iter().all(|region| {
+                                                        region.target != *label
+                                                            && (region.start != *label
+                                                                || (region.target == original.target
+                                                                    && region.depth == original.depth
+                                                                    && region.preserve_lasti == original.preserve_lasti
+                                                                    && region.is_scope_fallback == original.is_scope_fallback
+                                                                    && match (region.priority, original.priority) {
+                                                                        (super::super::ExceptionRegionPriority::OriginalRange(a, b), super::super::ExceptionRegionPriority::OriginalRange(c, d)) => a == c && b == d,
+                                                                        (super::super::ExceptionRegionPriority::Resolved { start: a, end: b }, super::super::ExceptionRegionPriority::Resolved { start: c, end: d }) => a == c && b == d,
+                                                                        _ => false,
+                                                                    }))
+                                                    })
+                                            });
+                                    }
                                 }
                                 Item::Instruction(removed) => {
                                     if is_unlocated_borrow_marker(removed) {
@@ -2258,8 +2295,12 @@ impl OptimizationPipeline {
                     // array after its condition threads past the authored break. CPython
                     // resets the preceding line there, so its located jump becomes a NOP
                     // even when the physical fallthrough donor has that same location.
+                    // An original cleanup end does not merge the jump's source array.
+                    // A range beginning there must be a split of that same protected region;
+                    // unrelated setup/handler boundaries keep the general boundary guard.
                     let preserves_copied_finally_break_nop = finalize_borrow_empty_blocks
-                        && !crosses_exception_boundary
+                        && (!crosses_exception_boundary
+                            || (original_cleanup_boundaries == 1 && crosses_only_original_cleanup))
                         && instruction.fusion_policy.is_authored_break()
                         && !instruction.jump_policy.allows_threading_target()
                         && instruction.pre_fold_extra_instructions() == 0
