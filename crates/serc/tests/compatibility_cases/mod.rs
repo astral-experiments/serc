@@ -307,6 +307,7 @@ mod return_copy_original_slots;
 mod try_exit_borrows;
 
 mod constant_assertion_try_star_locations;
+mod copied_finally_intervening_manager;
 mod copied_finally_manager_return;
 mod folded_conditional_borrow_entries;
 mod folded_statement_borrow_entries;

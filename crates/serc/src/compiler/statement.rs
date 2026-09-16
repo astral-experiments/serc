@@ -6426,14 +6426,33 @@ impl Compiler<'_> {
                     ) {
                         let copied_finally_end = self.assembler.label();
                         self.assembler.mark(copied_finally_end);
-                        self.add_exception_regions_with_exclusions(
-                            copied_finally_start,
-                            copied_finally_end,
-                            &copied_finally_exclusions,
-                            outer_context.handler,
-                            outer_context.depth,
-                            false,
-                        );
+                        // A manager entered between these finally contexts still owns
+                        // this copy. Its existing region supplies the handler and stack
+                        // depth; a synthetic outer-finally region would hide that owner.
+                        // Abrupt copies can unwind the manager partway through the body.
+                        let retained_manager_owns_copy = finally_context.with_depth
+                            > outer_context.with_depth
+                            && self
+                                .control
+                                .withs
+                                .active_with_exits
+                                .get(finally_context.with_depth - 1)
+                                .is_some_and(|manager| {
+                                    manager.exception_region_depth
+                                        == finally_context.exception_region_depth
+                                })
+                            && !suite_contains_abrupt_control_flow(&finally_context.body)
+                            && !suite_contains_yield(&finally_context.body);
+                        if !retained_manager_owns_copy {
+                            self.add_exception_regions_with_exclusions(
+                                copied_finally_start,
+                                copied_finally_end,
+                                &copied_finally_exclusions,
+                                outer_context.handler,
+                                outer_context.depth,
+                                false,
+                            );
+                        }
                     }
                     // The copied finally body has its own source locations. CPython makes
                     // the resumed unwind artificial so each incoming branch can supply its
