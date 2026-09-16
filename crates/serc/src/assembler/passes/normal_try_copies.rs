@@ -533,6 +533,142 @@ impl OptimizationPipeline {
         labels
     }
 
+    /// Restores the owner of an empty try's unchanged jump into a large live prefix.
+    fn restore_uncopied_empty_try_jump_owners(&mut self) {
+        let graph = &self.graph;
+        if !self
+            .exception_owner_provenance
+            .normal_try_jump_owners
+            .iter()
+            .any(|(&(start, _), owners)| {
+                !owners.is_empty()
+                    && graph.label_block(start).is_some_and(|block| {
+                        matches!(graph[block].items().last(), Some(Item::Instruction(jump))
+                            if jump.opcode == JUMP_FORWARD
+                                && jump.exception_policy()
+                                    == super::super::ExceptionPolicy::EXCLUDE_ALWAYS)
+                    })
+            })
+        {
+            return;
+        }
+        let mut offsets = FxHashMap::default();
+        let mut instructions = Vec::new();
+        for item in graph.iter_items() {
+            match item {
+                Item::Label(label) => {
+                    offsets.insert(*label, instructions.len());
+                }
+                Item::Instruction(instruction) => instructions.push(instruction),
+            }
+        }
+        let mut selected = Vec::new();
+        let mut jump_owners: Vec<_> = self
+            .exception_owner_provenance
+            .normal_try_jump_owners
+            .iter()
+            .collect();
+        jump_owners.sort_by_key(|&(&(start, end), _)| (start.0, end.0));
+        for (&(start, end), owners) in jump_owners {
+            let (Some(&start_offset), Some(&end_offset), Some(block)) = (
+                offsets.get(&start),
+                offsets.get(&end),
+                graph.label_block(start),
+            ) else {
+                continue;
+            };
+            let Some((Item::Instruction(jump), head)) = graph[block].items().split_last() else {
+                continue;
+            };
+            let Operand::Forward(target) = jump.operand() else {
+                continue;
+            };
+            if owners.is_empty()
+                || end_offset != start_offset + 1
+                || instructions.get(start_offset).copied() != Some(jump)
+                || head.is_empty()
+                || head.iter().any(|item| !matches!(item, Item::Label(_)))
+                || jump.opcode != JUMP_FORWARD
+                || jump.location.line < 0
+                || jump.exception_policy() != super::super::ExceptionPolicy::EXCLUDE_ALWAYS
+                || jump.pre_fold_extra_instructions() != 0
+                || jump.local_policy.hidden_exception_owner_slots() != 0
+                || jump.fusion_policy.is_converted_pop_block()
+                || jump.fusion_policy.is_authored_break()
+                || jump.jump_policy.borrow_empty_block()
+                || jump.jump_policy.defers_redundant_removal()
+                || jump.jump_policy.retained_nop()
+                    != super::super::ir::RetainedJumpNop::DirectTarget
+                || self
+                    .exception_owner_provenance
+                    .normal_try_exits
+                    .iter()
+                    .filter(|(entry, original_target)| {
+                        *original_target == target && head.contains(&Item::Label(*entry))
+                    })
+                    .count()
+                    != 1
+            {
+                continue;
+            }
+            let Some(target_block) = graph.label_block(target) else {
+                continue;
+            };
+            let mut prefix = 0;
+            for item in graph[target_block].items() {
+                match item {
+                    Item::Label(label) => {
+                        if prefix > 0
+                            || self.original_nop_targets.contains(label)
+                            || self.folded_original_predecessor_targets.contains(label)
+                            || self.folded_condition_exit_targets.contains(label)
+                            || self
+                                .exception_owner_provenance
+                                .omitted_nop_counts
+                                .contains_key(label)
+                            || self
+                                .exception_owner_provenance
+                                .omitted_nop_locations
+                                .contains_key(label)
+                        {
+                            break;
+                        }
+                    }
+                    Item::Instruction(instruction) => {
+                        if instruction.location.line < 0
+                            || instruction.opcode == NOP
+                            || super::super::ends_scope(instruction.opcode)
+                            || !matches!(instruction.operand(), Operand::Value(_))
+                            || instruction.pre_fold_extra_instructions() != 0
+                            || instruction.local_policy.hidden_exception_owner_slots() != 0
+                            || instruction.fusion_policy.is_converted_pop_block()
+                        {
+                            break;
+                        }
+                        prefix += 1;
+                        if prefix == 5 {
+                            break;
+                        }
+                    }
+                }
+            }
+            // CPython copies at most four original exit records; a located runtime
+            // prefix also excludes unlocated-exit copying and jump-to-jump threading.
+            if prefix == 5 {
+                selected.push((start_offset, start.0, end.0, block, owners.clone()));
+            }
+        }
+        selected.sort_by_key(|(offset, start, end, _, _)| (*offset, *start, *end));
+        for (_, _, _, block, owners) in selected {
+            self.graph
+                .instructions_mut(block)
+                .next_back()
+                .expect("original normal jump")
+                .set_exception_policy(super::super::ExceptionPolicy::default());
+            self.exception_regions.extend(owners);
+        }
+    }
+
     /// Restores a shared original cleanup before its successful edges are copied.
     pub(in crate::assembler) fn prepare_conditional_normal_try_joins(&mut self) {
         // A scheduled original-array plan owns this graph's copy order.
@@ -543,6 +679,7 @@ impl OptimizationPipeline {
         {
             return;
         }
+        self.restore_uncopied_empty_try_jump_owners();
         let mut selected = Vec::new();
         for &(entry, target) in &self.exception_owner_provenance.normal_try_exits {
             let (Some(block), Some(target_block)) = (
@@ -1478,6 +1615,9 @@ impl OptimizationPipeline {
                 let end_offset = *original_offsets.get(&end)?;
                 let jump = graph[source].last_instruction()?;
                 if !sources.contains(&source)
+                    // Empty-body exits keep their exclusion unless a separate intact
+                    // runtime prefix proves that their original jump survives copying.
+                    || jump.exception_policy() == super::super::ExceptionPolicy::EXCLUDE_ALWAYS
                     || end_offset != start_offset + 1
                     || original_instructions.get(start_offset).copied() != Some(jump)
                     || jump.opcode != JUMP_FORWARD

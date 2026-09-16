@@ -5,6 +5,7 @@ mod async_comprehension_restoration;
 mod async_with_literal_return_owners;
 mod async_with_terminal_condition_owner_compatibility;
 mod authored_pass_join_locations;
+mod bare_return_manager_iterator;
 mod boolean_negation_nops;
 mod boolean_value_end_owner_boundary;
 mod branch_expression_name_scopes;
@@ -465,3 +466,5 @@ mod extra_not_taken_owner;
 mod outer_branch_try_tail;
 
 mod coroutine_nested_value_owners;
+
+mod empty_try_nop_owner;

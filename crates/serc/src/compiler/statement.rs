@@ -5992,8 +5992,10 @@ impl Compiler<'_> {
                     let retained_managers_surround_finally =
                         remaining_with == finally_context.with_depth;
                     // These iterators were created in the same manager that is
-                    // still pending here, before any inner ordinary try began.
-                    let retained_manager_surrounds_iterators = nested_call_finally_return
+                    // still pending here, before any inner ordinary try began. A bare
+                    // return has the same unwind boundary as an explicit `return None`.
+                    let retained_manager_surrounds_iterators = (nested_call_finally_return
+                        || statement.value.is_none())
                         && remaining_with > finally_context.with_depth
                         && finally_context.loop_depth < next_loop
                         && self.control.loops.contexts[finally_context.loop_depth..next_loop]
@@ -14246,6 +14248,18 @@ impl Compiler<'_> {
             if let Some(exit_exclusion_start) = exit_exclusion_start {
                 let exit_exclusion_end = self.assembler.label();
                 self.assembler.mark(exit_exclusion_end);
+                if body_noop_location.is_some()
+                    && statement.orelse.is_empty()
+                    && statement.finalbody.is_empty()
+                    && pass_only_handlers
+                    && exception_policy == ExceptionPolicy::EXCLUDE_ALWAYS
+                    && self.control.finally.active_overriding_finally_returns == 0
+                {
+                    // A real continuation can retain this original normal jump. Keep
+                    // its outer owner available until the emitted target is known.
+                    self.assembler
+                        .record_normal_try_jump_exclusion(exit_exclusion_start, exit_exclusion_end);
+                }
                 for exclusions in &mut self.control.exceptions.active_exception_region_exclusions {
                     exclusions.push((exit_exclusion_start, exit_exclusion_end));
                 }
