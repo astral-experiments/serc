@@ -6563,8 +6563,24 @@ impl Compiler<'_> {
                         // The intervening ordinary try likewise supplies its existing
                         // owner until the outer finalizer starts. Do not mask that region
                         // with a synthetic outer-finally owner for this inner copy.
-                        let retained_try_owns_copy =
-                            tracks_try_between_finally_unwinds && context_index == 1;
+                        let retained_try_owns_copy = (tracks_try_between_finally_unwinds
+                            && context_index == 1)
+                            || (self.context.target_specific_rules_enabled()
+                                && handler_count == 0
+                                && finally_context.with_depth == outer_context.with_depth
+                                && finally_context.loop_depth == outer_context.loop_depth
+                                && finally_context.exception_region_depth
+                                    == outer_context.exception_region_depth + 2
+                                && finally_context.try_body_depth
+                                    == outer_context.try_body_depth + 1
+                                && handler_region_unwind_starts
+                                    .as_ref()
+                                    .and_then(|starts| {
+                                        starts.get(outer_context.exception_region_depth + 1)
+                                    })
+                                    .is_some_and(Option::is_none)
+                                && !suite_contains_abrupt_control_flow(&finally_context.body)
+                                && !suite_contains_yield(&finally_context.body));
                         if !retained_manager_owns_copy && !retained_try_owns_copy {
                             self.add_exception_regions_with_exclusions(
                                 copied_finally_start,
@@ -11243,6 +11259,9 @@ impl Compiler<'_> {
             // Folding the test preserves the authored loop body's separate original array.
             let body = self.assembler.label();
             self.assembler.record_exception_owner_block_boundary(body);
+            // Borrowed-reference producers are indexed within that original array,
+            // including CPython's shadowed index for IMPORT_FROM and similar opcodes.
+            self.assembler.record_folded_condition_borrow_boundary(body);
             self.assembler.mark(body);
             let context = self.loop_context(
                 start,
@@ -17806,6 +17825,38 @@ impl Compiler<'_> {
                             && cleanup.elif_else_clauses.is_empty()
                             && suite_has_linear_borrow_fallthrough(&cleanup.body))
             });
+        // Natural for-loop exhaustion retains its original END_FOR/POP_ITER array.
+        // That live normal edge reaches linear cleanup independently of abrupt
+        // handlers. A break or else suite can introduce a separate exit array;
+        // copied finalizers and structured cleanup need their own certificates.
+        let for_exhaustion_reaches_finally = !statement.is_star
+            && statement.orelse.is_empty()
+            && !statement.handlers.is_empty()
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+            && !self.control.in_exception_handler()
+            && self.control.finally.active_copied_finally_bodies == 0
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
+            && self.control.finally.active_finally_try_bodies == 0
+            && matches!(statement.body.last(), Some(Stmt::For(loop_statement))
+                if !loop_statement.is_async
+                    && loop_statement.orelse.is_empty()
+                    && !suite_contains_loop_break(&loop_statement.body)
+                    && !expression_contains_inline_branch(&loop_statement.iter)
+                    && !expression_suspends_current_scope(&loop_statement.iter)
+                    && !expression_contains_inline_branch(&loop_statement.target)
+                    && !expression_suspends_current_scope(&loop_statement.target))
+            && statement.handlers.iter().all(|handler| {
+                handler
+                    .as_except_handler()
+                    .is_some_and(|handler| handler.type_.is_some())
+            })
+            && !suite_contains_return(&statement.body)
+            && matches!(statement.finalbody.as_slice(), [Stmt::Expr(cleanup)]
+                if matches!(cleanup.value.as_ref(), Expr::Call(_))
+                    && !expression_contains_inline_branch(&cleanup.value)
+                    && !expression_suspends_current_scope(&cleanup.value));
         let normal_finally_is_borrow_reachable = (simple_fallthrough_handlers_reach_finally
             || compound_fallthrough_handlers_reach_finally
             || runtime_while_handlers_reach_finally)
@@ -17819,7 +17870,8 @@ impl Compiler<'_> {
             || conditional_handler_reaches_finally
             || terminal_if_false_edge_reaches_finally
             || awaited_terminal_if_reaches_finally
-            || terminal_raise_if_reaches_finally;
+            || terminal_raise_if_reaches_finally
+            || for_exhaustion_reaches_finally;
         let for_break_reaches_finally = !statement.handlers.is_empty()
             && !normal_finally_is_borrow_reachable
             && !statement.is_star

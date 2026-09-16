@@ -508,3 +508,10 @@ mod extra_nop_terminal_loop;
 mod terminal_conditional_loops_borrow;
 
 mod bare_handler_manager_backedge;
+
+mod async_manager_assert_owner;
+mod terminal_for_finally_borrow;
+
+mod folded_while_import_borrow;
+
+mod intervening_try_finally_copy;

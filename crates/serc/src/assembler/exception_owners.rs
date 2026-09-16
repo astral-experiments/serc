@@ -2608,11 +2608,15 @@ impl LayoutAssembler {
                             value_jump_setup_history_known &= known_setup;
                         }
                         tail.late_removals += usize::from(!retained);
+                        // A certified async SEND continuation has the same late-SETUP
+                        // suffix. Its captured entry, cleanup, and incoming edges must all
+                        // remain unchanged before this array can donate the marker's owner.
                         uniform_with_suffix = (!retained
-                            && self
+                            && (self
                                 .exception_owner_provenance
                                 .synchronous_with_setups
-                                .contains(label))
+                                .contains(label)
+                                || original_async_with_setups.contains(label)))
                         .then_some(instruction_index);
                         ended_uniform_with_suffix = false;
                         protected_suffix = (retained && unprotected_setups.contains(label))
