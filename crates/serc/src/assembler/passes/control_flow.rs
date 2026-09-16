@@ -1995,6 +1995,14 @@ impl OptimizationPipeline {
         if !finalize_borrow_empty_blocks && !graph.features().has_forward_jump() {
             return;
         }
+        // Unlocated borrow markers always disappear after local analysis. Keep the
+        // barrier in the graph, but exclude it from physical jump adjacency.
+        let is_unlocated_borrow_marker = |instruction: &Instruction| {
+            finalize_borrow_empty_blocks
+                && instruction.opcode == NOP
+                && instruction.jump_policy.borrow_empty_block()
+                && instruction.location.line < 0
+        };
         let mut target = None;
         let mut has_work = false;
         for item in graph.iter_items() {
@@ -2004,6 +2012,7 @@ impl OptimizationPipeline {
                     break;
                 }
                 Item::Label(_) => {}
+                Item::Instruction(instruction) if is_unlocated_borrow_marker(instruction) => {}
                 Item::Instruction(instruction) => {
                     target = None;
                     if instruction.opcode != JUMP_FORWARD {
@@ -2038,6 +2047,7 @@ impl OptimizationPipeline {
         let mut first_scan = true;
         loop {
             let removed_before = redundant.len();
+            let mut unlocated_borrow_marker_created = false;
             let mut previous = None;
             for (block_index, block) in order.iter().copied().enumerate() {
                 let previous_at_block_entry = previous;
@@ -2103,6 +2113,9 @@ impl OptimizationPipeline {
                                         exception_boundaries.contains(label);
                                 }
                                 Item::Instruction(removed) => {
+                                    if is_unlocated_borrow_marker(removed) {
+                                        continue;
+                                    }
                                     let position = ItemPosition::new(next_block, next_offset);
                                     if !redundant.contains(&position) {
                                         next = Some(position);
@@ -2159,6 +2172,7 @@ impl OptimizationPipeline {
                         let instruction = graph.instruction_mut(position).unwrap();
                         instruction.opcode = NOP;
                         instruction.set_operand(Operand::Value(0));
+                        unlocated_borrow_marker_created |= instruction.location.line < 0;
                         previous = Some(position);
                         continue;
                     }
@@ -2320,7 +2334,9 @@ impl OptimizationPipeline {
             // CPython repeats jump and NOP removal when an emptied block exposes an
             // earlier jump. Retry only late jumps whose targets were not adjacent:
             // deferred jumps and retained NOPs must keep their one-scan behavior.
-            if revisit.is_empty() || redundant.len() == removed_before {
+            if revisit.is_empty()
+                || (redundant.len() == removed_before && !unlocated_borrow_marker_created)
+            {
                 break;
             }
             first_scan = false;

@@ -3715,6 +3715,72 @@ impl Assembler {
             .extend(labels.into_iter().map(|label| (label, location)));
     }
 
+    /// Certifies a conditional join that starts at the jump after copied finalizer cleanup.
+    pub(crate) fn record_copied_finally_break_head(
+        &mut self,
+        emitted: EmittedJump,
+        target: Label,
+        unwind_start: usize,
+    ) {
+        let jump = *self.emitted_jump_mut(emitted, "recording a copied-finally break head");
+        if jump.opcode != JUMP_FORWARD
+            || jump.operand() != Operand::Forward(target)
+            || jump.location != SourceLocation::NONE
+            || jump.pre_fold_extra_instructions() != 0
+        {
+            return;
+        }
+        let Some((Item::Instruction(_), head)) = self.linear_items().split_last() else {
+            return;
+        };
+        let Some(unwind) = head.get(unwind_start..) else {
+            return;
+        };
+        let labels = unwind
+            .iter()
+            .rev()
+            .map_while(|item| match item {
+                Item::Label(label) => Some(*label),
+                Item::Instruction(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let mut matching = unwind.iter().filter_map(|item| match item {
+            Item::Instruction(instruction)
+                if matches!(
+                    instruction.opcode,
+                    POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE | POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE
+                ) =>
+            {
+                match instruction.operand() {
+                    Operand::Forward(label) if labels.contains(&label) => Some(label),
+                    _ => None,
+                }
+            }
+            _ => None,
+        });
+        let Some(label) = matching.next() else {
+            return;
+        };
+        if matching.next().is_some()
+            || !self
+                .exception_owner_provenance
+                .source_boundaries
+                .contains(&label)
+            || !self
+                .exception_owner_provenance
+                .block_boundaries
+                .contains(&label)
+            || self.borrow_block_aliases.contains(&label)
+            || self.original_nop_targets.contains(&label)
+        {
+            return;
+        }
+        // The authored break NOP precedes this unwind. The selected label enters
+        // the final jump itself, so its original array can participate in threading.
+        self.conditional_threading_targets
+            .insert(label, SourceLocation::NONE);
+    }
+
     /// Certifies the actual false-edge head emitted after a copied finalizer unwinds.
     pub(crate) fn record_copied_finally_continue_head(
         &mut self,

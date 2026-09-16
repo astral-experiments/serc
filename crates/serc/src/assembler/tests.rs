@@ -4421,3 +4421,90 @@ fn copied_regions_retarget_only_handlers_copied_with_instructions() {
         }
     }
 }
+
+#[test]
+fn unlocated_borrow_marker_does_not_block_redundant_jump_removal() {
+    for location in [SourceLocation::NONE, SourceLocation::new(2, 2, 0, 0)] {
+        let target = super::Label(1);
+        let mut marker = Instruction::new(NOP, Operand::Value(0), location, None);
+        marker.jump_policy.mark_borrow_empty_block();
+        let mut assembler = optimization_pipeline(vec![
+            pass_instruction(LOAD_CONST, 0, 1),
+            Item::Instruction(Instruction::new(
+                JUMP_FORWARD,
+                Operand::Forward(target),
+                SourceLocation::new(1, 1, 0, 0),
+                None,
+            )),
+            Item::Label(super::Label(0)),
+            Item::Instruction(marker),
+            Item::Label(target),
+            pass_instruction(RETURN_VALUE, 0, 3),
+        ]);
+
+        assembler.remove_redundant_forward_jumps(true);
+
+        let instructions = assembler
+            .graph
+            .iter_items()
+            .filter_map(|item| match item {
+                Item::Instruction(instruction) => Some(instruction),
+                Item::Label(_) => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            instructions
+                .iter()
+                .filter(|instruction| instruction.opcode == JUMP_FORWARD)
+                .count(),
+            usize::from(location.line >= 0),
+        );
+        assert!(instructions.contains(&&marker));
+    }
+}
+
+#[test]
+fn borrow_marker_conversion_retries_without_another_jump_deletion() {
+    let target = super::Label(1);
+    let mut marker = Instruction::new(
+        JUMP_FORWARD,
+        Operand::Forward(target),
+        SourceLocation::NONE,
+        None,
+    );
+    marker.jump_policy.mark_borrow_empty_block();
+    let mut assembler = optimization_pipeline(vec![
+        pass_instruction(LOAD_CONST, 0, 1),
+        Item::Instruction(Instruction::new(
+            JUMP_FORWARD,
+            Operand::Forward(target),
+            SourceLocation::new(1, 1, 0, 0),
+            None,
+        )),
+        Item::Label(super::Label(0)),
+        Item::Instruction(marker),
+        Item::Label(target),
+        pass_instruction(RETURN_VALUE, 0, 3),
+    ]);
+
+    assembler.remove_redundant_forward_jumps(true);
+
+    let instructions = assembler
+        .graph
+        .iter_items()
+        .filter_map(|item| match item {
+            Item::Instruction(instruction) => Some(instruction),
+            Item::Label(_) => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        instructions
+            .iter()
+            .map(|instruction| instruction.opcode)
+            .collect::<Vec<_>>(),
+        [LOAD_CONST, NOP, RETURN_VALUE]
+    );
+    assert!(instructions[1].jump_policy.borrow_empty_block());
+    assert_eq!(instructions[1].location, SourceLocation::NONE);
+    assert_eq!(instructions[1].operand(), Operand::Value(0));
+}

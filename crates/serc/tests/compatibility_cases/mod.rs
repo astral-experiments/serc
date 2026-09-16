@@ -36,6 +36,7 @@ mod constant_condition_admission;
 mod constant_false_comprehension_filters;
 mod context_manager_return_handler_nesting;
 mod copied_exit_borrow_fusion_compatibility;
+mod copied_finally_break_threading;
 mod copied_finally_call_return_compatibility;
 mod copied_finally_global_fold_owners;
 mod copied_finally_handler_reachability;
@@ -474,3 +475,5 @@ mod queue_worker_match_cleanup;
 mod ternary_tuple_exit;
 
 mod empty_try_nop_owner;
+
+mod terminal_await_try_join;

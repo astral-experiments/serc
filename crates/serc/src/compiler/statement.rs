@@ -4112,6 +4112,7 @@ impl Compiler<'_> {
                     self.assembler.mark(start);
                     Some(start)
                 };
+                let finally_unwind_start = self.assembler.item_count();
                 let LoopControlUnwind {
                     with_starts: with_unwind_starts,
                     region_starts: region_unwind_starts,
@@ -4199,6 +4200,11 @@ impl Compiler<'_> {
                     // through this exit before redundant instructions are removed.
                     self.assembler.prevent_jump_threading_target(break_jump);
                     self.assembler.mark_jump_as_authored_break(break_jump);
+                    self.assembler.record_copied_finally_break_head(
+                        break_jump,
+                        context.break_label,
+                        finally_unwind_start,
+                    );
                     if copied_finally_with_join {
                         // Both manager exits copy this synthetic loop cleanup before copying
                         // the final return, so preserve it for repeated no-location inlining.
