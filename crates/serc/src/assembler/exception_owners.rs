@@ -257,6 +257,7 @@ impl ExceptionOwnerTail {
 pub(super) struct UncompactedConditionalArray {
     prefix: Vec<Item>,
     comprehension_entry: Option<Label>,
+    source_entry: Option<Label>,
 }
 
 impl ExceptionOwnerProvenance {
@@ -315,21 +316,26 @@ impl ExceptionOwnerProvenance {
                     && matches!(items[end], Item::Instruction(marker) if marker.opcode == NOT_TAKEN)
                 {
                     let prefix = &items[begin..=end];
-                    let certified = if self.uncompacted_prefix(prefix, items, 0) {
-                        Some((prefix, None))
+                    let certified = if self.uncompacted_prefix(prefix, items, 0, false) {
+                        Some((prefix, None, None))
                     } else if let Some((entry, prefix, restore_count)) =
                         self.comprehension_normal_prefix(prefix, items)
-                        && self.uncompacted_prefix(prefix, items, restore_count)
+                        && self.uncompacted_prefix(prefix, items, restore_count, false)
                     {
-                        Some((prefix, Some(entry)))
+                        Some((prefix, Some(entry), None))
+                    } else if let Some((entry, prefix)) = self.original_source_prefix(prefix)
+                        && self.uncompacted_prefix(prefix, items, 0, true)
+                    {
+                        Some((prefix, None, Some(entry)))
                     } else {
                         None
                     };
-                    if let Some((prefix, comprehension_entry)) = certified {
+                    if let Some((prefix, comprehension_entry, source_entry)) = certified {
                         self.uncompacted_conditional_arrays
                             .push(UncompactedConditionalArray {
                                 prefix: prefix.to_vec(),
                                 comprehension_entry,
+                                source_entry,
                             });
                     }
                 }
@@ -437,11 +443,30 @@ impl ExceptionOwnerProvenance {
         None
     }
 
+    /// Selects the original array after an already-folded source condition.
+    fn original_source_prefix<'a>(&self, prefix: &'a [Item]) -> Option<(Label, &'a [Item])> {
+        let boundary = prefix.iter().rposition(|item| {
+            matches!(item, Item::Label(label)
+                if self.block_boundaries.contains(label) && self.source_boundaries.contains(label))
+        })?;
+        let Item::Label(entry) = prefix[boundary] else {
+            unreachable!()
+        };
+        // Keep every adjacent label so a second original array cannot disappear
+        // behind a selected alias. Range-only labels may share the same head.
+        let begin = prefix[..boundary]
+            .iter()
+            .rposition(|item| matches!(item, Item::Instruction(_)))
+            .map_or(0, |index| index + 1);
+        Some((entry, &prefix[begin..]))
+    }
+
     fn uncompacted_prefix(
         &self,
         prefix: &[Item],
         all: &[Item],
         comprehension_restore_count: usize,
+        source_head: bool,
     ) -> bool {
         use crate::target::opcodes::{
             BINARY_OP, CALL, IMPORT_NAME, LOAD_ATTR, LOAD_CONST, LOAD_FAST, LOAD_GLOBAL, LOAD_NAME,
@@ -471,7 +496,19 @@ impl ExceptionOwnerProvenance {
                 && matches!(instruction.operand(), Operand::Forward(label) | Operand::Backward(label)
                     if leading_labels.contains(&label)))
         });
-        if !has_original_target && comprehension_restore_count == 0 {
+        if source_head {
+            // Graph jump targets alone include copied exits. Require the compiler's
+            // original source boundary and exactly one original array at this head.
+            let mut boundaries = leading_labels
+                .iter()
+                .filter(|label| self.block_boundaries.contains(*label));
+            let Some(entry) = boundaries.next() else {
+                return false;
+            };
+            if boundaries.next().is_some() || !self.source_boundaries.contains(entry) {
+                return false;
+            }
+        } else if !has_original_target && comprehension_restore_count == 0 {
             return false;
         }
         let positions = all
@@ -505,6 +542,9 @@ impl ExceptionOwnerProvenance {
                 Item::Label(label) => {
                     if !labels.insert(*label)
                         || (!instructions.is_empty() && targets.contains(label))
+                        || (source_head
+                            && !instructions.is_empty()
+                            && self.block_boundaries.contains(label))
                         || self.removed_pop_block_boundaries.contains(label)
                         || self.omitted_nop_counts.contains_key(label)
                         || self.omitted_nop_locations.contains_key(label)
@@ -671,6 +711,16 @@ impl ExceptionOwnerProvenance {
                         return false;
                     }
                 }
+                POP_TOP if source_head => {
+                    // CALL's discarded result retains both original records. Constant
+                    // and COPY/POP pairs can compact and cannot certify a fresh slot.
+                    if instructions
+                        .get(index.wrapping_sub(1))
+                        .is_none_or(|previous| previous.opcode != CALL)
+                    {
+                        return false;
+                    }
+                }
                 LOAD_NAME | LOAD_ATTR | LOAD_CONST | STORE_NAME | CALL | IMPORT_NAME => {}
                 crate::target::opcodes::SWAP if comprehension_restore_count > 0 && index == 0 => {}
                 _ => return false,
@@ -807,6 +857,18 @@ impl LayoutAssembler {
             let Some(Item::Label(entry)) = origin.prefix.first() else {
                 continue;
             };
+            if let Some(source_entry) = origin.source_entry
+                && (!self
+                    .exception_owner_provenance
+                    .block_boundaries
+                    .contains(&source_entry)
+                    || !self
+                        .exception_owner_provenance
+                        .source_boundaries
+                        .contains(&source_entry))
+            {
+                continue;
+            }
             if let Some(original_entry) = origin.comprehension_entry
                 && (original_entry != *entry
                     || self
@@ -5740,6 +5802,109 @@ mod tests {
             };
             assert_eq!(
                 assembler.uncompacted_conditional_null_markers(&targets),
+                expected,
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn uncompacted_source_arrays_require_one_head_and_retained_call_discard() {
+        use super::ExceptionOwnerProvenance;
+        use crate::assembler::{
+            Instruction, Item, Label, LayoutAssembler, Operand, SourceLocation,
+        };
+        use crate::target::opcodes::{
+            CALL, LOAD_ATTR, LOAD_CONST, LOAD_FAST, NOP, NOT_TAKEN, POP_JUMP_IF_FALSE, POP_TOP,
+            TO_BOOL,
+        };
+
+        for case in [
+            "original",
+            "block only",
+            "source only",
+            "adjacent boundary",
+            "interior boundary",
+            "constant discard",
+            "hidden record",
+            "copied entry",
+            "retired source",
+            "retired block",
+        ] {
+            let location = |line| SourceLocation::new(line, line, 0, 4);
+            let plain = |opcode, operand, line| {
+                Item::Instruction(Instruction::new(opcode, operand, location(line), None))
+            };
+            let entry = Label(0);
+            let mut items = vec![
+                // The folded while test belongs to an earlier original array.
+                plain(NOP, Operand::Value(0), 1),
+                Item::Label(entry),
+                Item::Label(Label(1)),
+                plain(NOP, Operand::Value(0), 2),
+                Item::Label(Label(2)),
+                Item::Label(Label(3)),
+                plain(LOAD_FAST, Operand::Value(0), 3),
+                plain(LOAD_ATTR, Operand::Value(1), 3),
+                plain(CALL, Operand::Value(0), 3),
+                plain(POP_TOP, Operand::Value(0), 3),
+                plain(LOAD_FAST, Operand::Value(0), 4),
+                plain(LOAD_ATTR, Operand::Value(0), 4),
+                plain(TO_BOOL, Operand::Value(0), 4),
+                plain(POP_JUMP_IF_FALSE, Operand::Forward(Label(4)), 4),
+                plain(NOT_TAKEN, Operand::Value(0), 4),
+            ];
+            let mut provenance = ExceptionOwnerProvenance {
+                block_boundaries: [entry].into_iter().collect(),
+                source_boundaries: [entry].into_iter().collect(),
+                setups: vec![(Label(3), Some(location(2)))],
+                setup_nop_ranges: vec![(Label(1), Label(2))],
+                ..ExceptionOwnerProvenance::default()
+            };
+            match case {
+                "block only" => provenance.source_boundaries.clear(),
+                "source only" => provenance.block_boundaries.clear(),
+                "adjacent boundary" => {
+                    provenance.block_boundaries.insert(Label(5));
+                    provenance.source_boundaries.insert(Label(5));
+                    items.insert(1, Item::Label(Label(5)));
+                }
+                "interior boundary" => {
+                    provenance.block_boundaries.insert(Label(3));
+                    provenance.source_boundaries.insert(Label(3));
+                }
+                "constant discard" => items[8] = plain(LOAD_CONST, Operand::Value(0), 3),
+                "hidden record" => {
+                    let Item::Instruction(instruction) = &mut items[6] else {
+                        unreachable!()
+                    };
+                    instruction.local_policy.add_hidden_exception_owner_slots(1);
+                }
+                _ => {}
+            }
+            provenance.capture_uncompacted_conditional_arrays(&items);
+            match case {
+                "copied entry" => items[1] = Item::Label(Label(6)),
+                "retired source" => provenance.source_boundaries.clear(),
+                "retired block" => provenance.block_boundaries.clear(),
+                _ => {}
+            }
+            let assembler = LayoutAssembler {
+                items,
+                exception_owner_provenance: provenance,
+                exception_regions: vec![],
+                preserved_block_boundaries: rustc_hash::FxHashSet::default(),
+                removed_max_depth: None,
+                next_label: 7,
+                has_next_location: false,
+            };
+            let expected = if case == "original" {
+                [10].into_iter().collect()
+            } else {
+                rustc_hash::FxHashSet::default()
+            };
+            assert_eq!(
+                assembler.uncompacted_conditional_null_markers(&[Label(4)].into_iter().collect()),
                 expected,
                 "{case}"
             );

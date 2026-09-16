@@ -457,3 +457,5 @@ mod original_cleanup_provenance;
 mod split_loop_tail_owner_continuations;
 
 mod terminal_while_cleanup;
+
+mod extra_not_taken_owner;

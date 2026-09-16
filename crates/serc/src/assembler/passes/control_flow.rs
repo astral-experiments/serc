@@ -303,12 +303,59 @@ impl OptimizationPipeline {
     /// Removes copy/pop pairs before local analysis and superinstruction fusion.
     pub(in crate::assembler) fn remove_redundant_copy_pop_pairs(&mut self) -> Option<u32> {
         let mut redundant = Vec::new();
+        let mut vacated_slots = Vec::new();
         for block in self.graph.order().iter().copied() {
+            let removed = redundant_copy_pop_indices(self.graph[block].items());
+            if removed.is_empty() {
+                continue;
+            }
+            let mut removed_offsets = removed.iter().copied().peekable();
+            let mut pending_slots = 0_u16;
+            let mut pending_folds = 0_u8;
+            for (offset, item) in self.graph[block].items().iter().enumerate() {
+                if removed_offsets.peek() == Some(&offset) {
+                    let Item::Instruction(instruction) = item else {
+                        unreachable!("a redundant copy/pop is an instruction");
+                    };
+                    removed_offsets.next();
+                    pending_slots = pending_slots
+                        .saturating_add(1)
+                        .saturating_add(instruction.local_policy.hidden_exception_owner_slots());
+                    pending_folds =
+                        pending_folds.saturating_add(instruction.pre_fold_extra_instructions());
+                } else if pending_slots > 0 {
+                    if matches!(item, Item::Instruction(_)) {
+                        vacated_slots.push((
+                            ItemPosition::new(block, offset),
+                            pending_slots,
+                            pending_folds,
+                        ));
+                    }
+                    // A label or the end of this block cannot donate erased cells
+                    // to a different original array.
+                    pending_slots = 0;
+                    pending_folds = 0;
+                }
+            }
             redundant.extend(
-                redundant_copy_pop_indices(self.graph[block].items())
+                removed
                     .into_iter()
                     .map(|offset| ItemPosition::new(block, offset)),
             );
+        }
+        for (position, slots, folds) in vacated_slots {
+            let instruction = self
+                .graph
+                .instruction_mut(position)
+                .expect("surviving copy/pop successor");
+            // CPython compacts these cells before local fusion and marker insertion.
+            // Preserve earlier fold uncertainty, without creating a late fold record.
+            instruction
+                .local_policy
+                .add_hidden_exception_owner_slots(slots);
+            if folds > 0 {
+                instruction.add_pre_fold_extra_instructions(folds);
+            }
         }
         let mut removed_max_depth = None;
         for position in redundant.into_iter().rev() {
