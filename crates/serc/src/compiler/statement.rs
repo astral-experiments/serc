@@ -5204,10 +5204,90 @@ impl Compiler<'_> {
                             == self.control.finally.active_return_finally_contexts[0]
                                 .exception_region_depth
                                 + 2;
+                // An ordinary try surrounding a direct handler/finally pair still owns
+                // the copied finalizer after the handler and finally collectors unwind.
+                // Track those boundaries separately without changing handler POP slots.
+                let tracks_outer_try_handler_finally_unwinds = self
+                    .context
+                    .target_specific_rules_enabled()
+                    && self.control.withs.active_with_exits.is_empty()
+                    && self.control.loops.contexts.is_empty()
+                    && self.control.exceptions.active_exception_group_handlers == 0
+                    && self.control.finally.active_finally_end_blocks == 0
+                    && self.control.finally.active_normal_finally_bodies == 0
+                    && self.control.finally.active_copied_finally_bodies == 0
+                    && self
+                        .control
+                        .finally
+                        .preserved_return_value_contexts
+                        .is_empty()
+                    && matches!(
+                        (
+                            self.control.exceptions.active_exception_handlers.as_slice(),
+                            self.control.finally.active_return_finally_contexts.as_slice(),
+                        ),
+                        ([handler], [finally])
+                            if handler.name.is_none()
+                                && finally.handler_depth == 0
+                                && finally.exception_region_depth > 0
+                                && finally.exception_region_depth == finally.try_body_depth
+                                && handler.try_body_depth == finally.try_body_depth
+                                && handler.try_body_depth
+                                    == self.control.exceptions.active_try_marker_slots.len()
+                                && handler.exception_region_depth
+                                    == finally.exception_region_depth + 1
+                                && self.control.exceptions.active_exception_region_exclusions.len()
+                                    == handler.exception_region_depth + 1
+                    );
+                // Two named handlers can return through an ordinary try nested inside a
+                // pending finally. The outer handler's name cleanup still belongs to that
+                // try; retire each handler collector before retiring the ordinary try.
+                let tracks_two_named_handlers_before_finally = self
+                    .context
+                    .target_specific_rules_enabled()
+                    && !return_is_overridden
+                    && self.control.withs.active_with_exits.is_empty()
+                    && self.control.loops.contexts.is_empty()
+                    && self.control.exceptions.active_exception_group_handlers == 0
+                    && self.control.finally.active_finally_end_blocks == 0
+                    && self.control.finally.active_normal_finally_bodies == 0
+                    && self.control.finally.active_copied_finally_bodies == 0
+                    && self
+                        .control
+                        .finally
+                        .active_pass_finally_locations
+                        .is_empty()
+                    && self
+                        .control
+                        .finally
+                        .preserved_return_value_contexts
+                        .is_empty()
+                    && matches!(
+                        (
+                            self.control.exceptions.active_exception_handlers.as_slice(),
+                            self.control.finally.active_return_finally_contexts.as_slice(),
+                        ),
+                        ([outer, inner], [finally])
+                            if outer.name.is_some()
+                                && inner.name.is_some()
+                                && finally.handler_depth == 0
+                                && finally.exception_region_depth == 0
+                                && finally.try_body_depth == 0
+                                && outer.exception_region_depth == finally.exception_region_depth + 2
+                                && inner.exception_region_depth == outer.exception_region_depth + 1
+                                && self.control.exceptions.active_exception_region_exclusions.len()
+                                    == inner.exception_region_depth + 1
+                                && outer.try_body_depth == finally.try_body_depth + 1
+                                && inner.try_body_depth == outer.try_body_depth
+                                && inner.try_body_depth
+                                    == self.control.exceptions.active_try_marker_slots.len()
+                    );
                 let tracks_finally_region_unwinds = !return_is_overridden
                     && (handler_count == 0
                         || tracks_handler_finally_iterator_unwinds
                         || preserves_enclosing_try_return_owner
+                        || tracks_outer_try_handler_finally_unwinds
+                        || tracks_two_named_handlers_before_finally
                         || unwinds_handler_and_with
                         || self
                             .control
@@ -5295,8 +5375,7 @@ impl Compiler<'_> {
                         .active_exception_handlers
                         .last()
                         .is_some_and(|handler| {
-                            handler.name.is_none()
-                                && handler.with_depth == 0
+                            handler.with_depth == 0
                                 && handler.finally_end_depth == 0
                                 && handler.loop_depth == self.control.loops.contexts.len()
                                 && ((handler.try_body_depth
@@ -5719,12 +5798,15 @@ impl Compiler<'_> {
                                     .as_ref()
                                     .and_then(|starts| starts.get(region_depth - 1))
                                     .is_some_and(Option::is_none);
+                        // A tracked outer try already owns this handler cleanup.
+                        let tracked_outer_try_owns_pop_except =
+                            tracks_handler_outer_try_iterator_unwinds
+                                || (tracks_two_named_handlers_before_finally && handler_index == 0);
                         let protected_pop_except = (protects_outer_handler
                             || (!return_is_overridden
                                 && !preserves_enclosing_try_return_owner
                                 && !enclosing_try_owns_pop_except
-                                // The tracked outer try already owns this handler cleanup.
-                                && !tracks_handler_outer_try_iterator_unwinds
+                                && !tracked_outer_try_owns_pop_except
                                 && self
                                     .control
                                     .finally

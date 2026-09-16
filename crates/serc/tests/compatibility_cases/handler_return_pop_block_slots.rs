@@ -129,3 +129,111 @@ fn matches_cpython_inner_handler_return_preserves_copied_finally_marker_owners()
         assert_matches_cpython_marshal(&source, "inner_handler_copied_finally_marker_owners.py");
     }
 }
+
+#[test]
+fn matches_cpython_outer_try_owner_on_copied_handler_return_finally() {
+    let source = r"def run():
+    try:
+        started = clock.read()
+        try:
+            work()
+            return 0
+        except Exception:
+            failed()
+            return 1
+        finally:
+            duration((clock.read() - started) * 1000)
+    except Exception:
+        return 1
+";
+    assert_matches_cpython_marshal(source, "outer_try_handler_return_finally.py");
+}
+
+#[test]
+fn matches_cpython_outer_try_owner_on_handler_raise_finally_control() {
+    let source = r"def run():
+    try:
+        started = clock.read()
+        try:
+            work()
+            return 0
+        except Exception:
+            failed()
+            raise
+        finally:
+            duration((clock.read() - started) * 1000)
+    except Exception:
+        return 1
+";
+    assert_matches_cpython_marshal(source, "outer_try_handler_raise_finally_control.py");
+}
+
+#[test]
+fn matches_cpython_two_named_handler_return_cleanup_before_finally() {
+    let source = r"async def run():
+    result = None
+    try:
+        try:
+            await work()
+        except Exception as outer_error:
+            if recoverable(outer_error):
+                try:
+                    await recover()
+                except Exception as inner_error:
+                    if cancelled(inner_error):
+                        raise
+                    failed(inner_error)
+                    result = make_result()
+                    return result
+            else:
+                raise
+        result = make_result()
+        return result
+    except Exception as run_error:
+        failed(run_error)
+        raise
+    finally:
+        finish()
+        try:
+            await publish(result)
+        except Exception as publish_error:
+            failed(publish_error)
+            raise
+";
+    assert_matches_cpython_marshal(source, "two_named_handler_return_finally.py");
+}
+
+#[test]
+fn matches_cpython_two_named_handler_raise_cleanup_before_finally_control() {
+    let source = r"async def run():
+    result = None
+    try:
+        try:
+            await work()
+        except Exception as outer_error:
+            if recoverable(outer_error):
+                try:
+                    await recover()
+                except Exception as inner_error:
+                    if cancelled(inner_error):
+                        raise
+                    failed(inner_error)
+                    result = make_result()
+                    raise
+            else:
+                raise
+        result = make_result()
+        return result
+    except Exception as run_error:
+        failed(run_error)
+        raise
+    finally:
+        finish()
+        try:
+            await publish(result)
+        except Exception as publish_error:
+            failed(publish_error)
+            raise
+";
+    assert_matches_cpython_marshal(source, "two_named_handler_raise_finally_control.py");
+}
