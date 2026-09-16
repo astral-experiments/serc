@@ -4649,6 +4649,13 @@ impl Assembler {
             .insert(label);
     }
 
+    /// Identifies a synthetic range start immediately before a value-preserving jump.
+    pub(crate) fn record_value_jump_owner_continuation(&mut self, label: Label) {
+        self.exception_owner_provenance
+            .value_jump_continuation_boundaries
+            .insert(label);
+    }
+
     /// Captures the exact emitted records of a constant-return handler cleanup.
     pub(crate) fn record_copied_handler_cleanup(
         &mut self,

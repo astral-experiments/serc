@@ -296,6 +296,7 @@ impl Assembler {
             folded_predecessor_sources: self.folded_predecessor_sources,
             discarded_fold_admissions: self.discarded_fold_admissions,
             initial_reachable,
+            retired_exception_handler_targets: rustc_hash::FxHashSet::default(),
             next_label: self.next_label,
             exception_regions: self.exception_regions,
             exception_owner_provenance: self.exception_owner_provenance,

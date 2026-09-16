@@ -62,6 +62,7 @@ mod coroutine_with_finally_cast_await_compatibility;
 mod coroutine_with_finally_condition_compatibility;
 mod coroutine_with_terminal_conjunction_raise_compatibility;
 mod dead_comprehension_name_scopes;
+mod dead_handler_exit_locations;
 mod debug_callable_constants;
 mod deferred_implicit_none_constants;
 mod dict_comprehension_filter_locations;
@@ -461,3 +462,5 @@ mod terminal_while_cleanup;
 mod extra_not_taken_owner;
 
 mod outer_branch_try_tail;
+
+mod coroutine_nested_value_owners;

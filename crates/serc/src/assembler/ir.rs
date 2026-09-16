@@ -1506,6 +1506,8 @@ pub(super) struct OptimizationPipeline {
     /// First-fold admissions retained before their next surviving source label.
     pub(super) discarded_fold_admissions: FxHashMap<Label, Vec<u32>>,
     pub(super) initial_reachable: Option<Vec<bool>>,
+    /// Erased handler entries must not mark a later block reached through label aliasing.
+    pub(super) retired_exception_handler_targets: FxHashSet<Label>,
     pub(super) next_label: u32,
     pub(super) exception_regions: Vec<ExceptionRegion>,
     pub(super) exception_owner_provenance: super::exception_owners::ExceptionOwnerProvenance,

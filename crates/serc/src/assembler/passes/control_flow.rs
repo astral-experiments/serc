@@ -378,6 +378,14 @@ impl OptimizationPipeline {
             .initial_reachable
             .take()
             .unwrap_or_else(|| graph.reachable_blocks(&self.exception_regions));
+        // CPython clears handler status when erasing an unreachable block. Keep that
+        // decision on its original labels before normalization can attach them to a
+        // live ordinary exit; the exception regions themselves retain their identity.
+        self.retired_exception_handler_targets
+            .extend(self.exception_regions.iter().filter_map(|region| {
+                let target = graph.label_block(region.target)?;
+                (!reachable[target.index()]).then_some(region.target)
+            }));
         let mut removed_max_depth = None;
         let order = graph.order().to_vec();
         let mut empty = FxHashSet::default();
@@ -771,6 +779,22 @@ impl OptimizationPipeline {
                             let instruction = self.graph.instruction_mut(position).unwrap();
                             instruction.set_exception_owner(NormalizedExceptionOwner::Unchanged);
                             instruction.exclude_from_exception_table(ExceptionExclusion::Always);
+                        }
+                        let marker = positions[index + 1..]
+                            .iter()
+                            .find_map(|position| match *self.graph.item(*position) {
+                                Item::Instruction(instruction) => Some(instruction),
+                                Item::Label(_) => None,
+                            });
+                        if let Some(marker) = marker
+                            && marker.opcode == NOT_TAKEN
+                            && marker.exception_policy().owner()
+                                == NormalizedExceptionOwner::Dynamic
+                        {
+                            let condition = *self.graph.instruction_mut(position).unwrap();
+                            self.exception_owner_provenance
+                                .threaded_condition_origins
+                                .push((condition, marker));
                         }
                     }
                 }

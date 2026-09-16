@@ -6907,6 +6907,8 @@ impl Compiler<'_> {
                 && exception_type_marker_owner.is_none();
             let exclusion_start = self.assembler.label();
             self.assembler.mark(exclusion_start);
+            self.assembler
+                .record_value_jump_owner_continuation(exclusion_start);
             self.emit(COPY, 1, 1)?;
             self.emit(TO_BOOL, 0, 0)?;
             self.emit_jump_forward(jump, end, -1)?;

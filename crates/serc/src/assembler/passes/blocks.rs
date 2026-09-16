@@ -268,6 +268,7 @@ fn exit_block_analysis(
     graph: &BlockGraph,
     order: &[BasicBlockId],
     exception_regions: &[ExceptionRegion],
+    retired_exception_handler_targets: &FxHashSet<Label>,
     original_nop_targets: &FxHashSet<Label>,
     return_region_reentries: &FxHashSet<Label>,
 ) -> ExitBlockAnalysis {
@@ -285,6 +286,7 @@ fn exit_block_analysis(
     let mut exception_handler_blocks = vec![false; vector_len];
     for target in exception_regions
         .iter()
+        .filter(|region| !retired_exception_handler_targets.contains(&region.target))
         .filter_map(|region| graph.label_block(region.target))
     {
         exception_handler_blocks[target.index()] = true;
@@ -2107,6 +2109,7 @@ impl OptimizationPipeline {
             graph,
             &order,
             &self.exception_regions,
+            &self.retired_exception_handler_targets,
             &self.original_nop_targets,
             &self.exception_owner_provenance.return_region_reentries,
         );

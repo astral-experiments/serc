@@ -28,6 +28,8 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) borrow_only_block_boundaries: FxHashSet<Label>,
     pub(super) source_boundaries: FxHashSet<Label>,
     pub(super) continuation_boundaries: FxHashSet<Label>,
+    // Synthetic range starts before value-preserving boolean jumps.
+    pub(super) value_jump_continuation_boundaries: FxHashSet<Label>,
     // Region re-entry after a return emits no original instruction or unwind slot.
     pub(super) return_region_reentries: FxHashSet<Label>,
     pub(super) fusion_boundaries: FxHashSet<Label>,
@@ -2120,6 +2122,7 @@ impl LayoutAssembler {
         let mut uniform_with_suffix = None;
         let mut late_setup_positions = Vec::new();
         let mut late_setup_history_known = true;
+        let mut value_jump_setup_history_known = true;
         let mut ended_uniform_with_suffix = false;
         let mut ended_owned_suffix = None;
         let mut ended_pop_slot = None;
@@ -2292,6 +2295,7 @@ impl LayoutAssembler {
                         tail = ExceptionOwnerTail::default();
                         late_setup_positions.clear();
                         late_setup_history_known = true;
+                        value_jump_setup_history_known = true;
                         previous = None;
                         has_instruction = false;
                         source_block = false;
@@ -2467,6 +2471,17 @@ impl LayoutAssembler {
                                 })))
                     {
                         late_setup_history_known = false;
+                        // A value-jump range start adds no original record or join.
+                        // Keep the older position-sensitive history conservative.
+                        value_jump_setup_history_known &= !jump_targets.contains(label)
+                            && !self
+                                .exception_owner_provenance
+                                .removed_pop_block_boundaries
+                                .contains(label)
+                            && self
+                                .exception_owner_provenance
+                                .value_jump_continuation_boundaries
+                                .contains(label);
                     }
                     source_block |= self
                         .exception_owner_provenance
@@ -2505,7 +2520,7 @@ impl LayoutAssembler {
                         if !retained {
                             late_setup_positions
                                 .push(instruction_index + late_setup_positions.len());
-                            late_setup_history_known &= self
+                            let known_setup = self
                                 .exception_owner_provenance
                                 .synchronous_with_setups
                                 .contains(label)
@@ -2513,6 +2528,8 @@ impl LayoutAssembler {
                                 || self.exception_regions.iter().any(|region| {
                                     region.is_scope_fallback && region.start == *label
                                 });
+                            late_setup_history_known &= known_setup;
+                            value_jump_setup_history_known &= known_setup;
                         }
                         tail.late_removals += usize::from(!retained);
                         uniform_with_suffix = (!retained
@@ -2724,6 +2741,7 @@ impl LayoutAssembler {
                             == super::BorrowFallthrough::Barrier
                     {
                         late_setup_history_known = false;
+                        value_jump_setup_history_known = false;
                         has_uninterrupted_fusion = false;
                         // An exact retained SETUP NOP is a known live array record.
                         // It preserves an existing POP_BLOCK epoch without reviving
@@ -3771,7 +3789,8 @@ impl LayoutAssembler {
                     // source-level cleanup exclusions hide it around the late marker.
                     if is_conditional_jump(instruction.opcode)
                         && matches!(instruction.operand(), Operand::Forward(_))
-                        && !threaded_conditions.contains(&instruction_index)
+                        && threaded_conditions.get(&instruction_index)
+                            != Some(&NormalizedExceptionOwner::DynamicConditionStrict)
                         && owner_history_exact
                         && has_uninterrupted_fusion
                         && tail.insertions == 0
@@ -3832,7 +3851,8 @@ impl LayoutAssembler {
                     // suffix. Account for every removed record before trusting that slot.
                     if is_conditional_jump(instruction.opcode)
                         && matches!(instruction.operand(), Operand::Forward(_))
-                        && !threaded_conditions.contains(&instruction_index)
+                        && threaded_conditions.get(&instruction_index)
+                            != Some(&NormalizedExceptionOwner::DynamicConditionStrict)
                         && owner_history_exact
                         && tail.insertions == 0
                         && tail.late_removals == 0
@@ -3963,12 +3983,25 @@ impl LayoutAssembler {
                     // conditional) in the first stale slot, irrespective of earlier NOPs.
                     // Late SETUP removal or prologue insertion would change that slot.
                     // A fusion before an unknown source join does not belong to this array.
-                    if threaded_conditions.contains(&instruction_index)
+                    if threaded_conditions.get(&instruction_index)
+                        == Some(&NormalizedExceptionOwner::DynamicConditionStrict)
                         && owner_history_exact
                         && has_uninterrupted_fusion
                         && tail.post_compaction_fusions == 1
                         && tail.insertions == 0
                         && tail.late_removals == 0
+                    {
+                        pending_threaded_null_append = Some(instruction_index + 1);
+                    }
+                    // Value-jump expansion writes three NULL-owned tail cells. Known
+                    // late SETUP compaction by one to three records makes the appended
+                    // marker reuse one of those cells, regardless of earlier folds or
+                    // prologue insertions. Zero removals can expose an older stale cell.
+                    if threaded_conditions.get(&instruction_index)
+                        == Some(&NormalizedExceptionOwner::Dynamic)
+                        && owner_history_exact
+                        && value_jump_setup_history_known
+                        && (1..=3).contains(&tail.late_removals)
                     {
                         pending_threaded_null_append = Some(instruction_index + 1);
                     }
@@ -4265,6 +4298,7 @@ impl LayoutAssembler {
                     if matches!(instruction.opcode, FOR_ITER | SEND) {
                         has_uninterrupted_fusion = false;
                         late_setup_history_known = false;
+                        value_jump_setup_history_known = false;
                         source_block = false;
                         protected_suffix = None;
                         uniform_with_suffix = None;
@@ -4285,6 +4319,7 @@ impl LayoutAssembler {
                         has_uninterrupted_fusion = false;
                         late_setup_positions.clear();
                         late_setup_history_known = true;
+                        value_jump_setup_history_known = true;
                         previous = None;
                         has_instruction = false;
                         source_block = false;
@@ -4322,10 +4357,10 @@ impl LayoutAssembler {
     }
 
     /// Finds unchanged, unambiguous terminal pairs from the actual threading pass.
-    fn threaded_condition_positions(&self) -> FxHashSet<usize> {
+    fn threaded_condition_positions(&self) -> FxHashMap<usize, NormalizedExceptionOwner> {
         let origins = &self.exception_owner_provenance.threaded_condition_origins;
         if origins.is_empty() {
-            return FxHashSet::default();
+            return FxHashMap::default();
         }
         let instructions = self
             .items
@@ -4342,8 +4377,11 @@ impl LayoutAssembler {
                     || origin.0.exception_policy().exclusion() != super::ExceptionExclusion::Always
                     || origin.0.exception_policy().owner() != NormalizedExceptionOwner::Unchanged
                     || origin.1.exception_policy().exclusion() != super::ExceptionExclusion::None
-                    || origin.1.exception_policy().owner()
-                        != NormalizedExceptionOwner::DynamicConditionStrict
+                    || !matches!(
+                        origin.1.exception_policy().owner(),
+                        NormalizedExceptionOwner::DynamicConditionStrict
+                            | NormalizedExceptionOwner::Dynamic
+                    )
                 {
                     return None;
                 }
@@ -4356,7 +4394,29 @@ impl LayoutAssembler {
                     .enumerate()
                     .filter(|(_, pair)| pair[0] == origin.0 && pair[1] == origin.1);
                 let (position, _) = matches.next()?;
-                matches.next().is_none().then_some(position)
+                if matches.next().is_some() {
+                    return None;
+                }
+                let owner = origin.1.exception_policy().owner();
+                if owner == NormalizedExceptionOwner::Dynamic {
+                    let start = position.checked_sub(2)?;
+                    let [copy, to_bool] = &instructions[start..position] else {
+                        return None;
+                    };
+                    if copy.opcode != crate::target::opcodes::COPY
+                        || copy.operand() != Operand::Value(1)
+                        || to_bool.opcode != crate::target::opcodes::TO_BOOL
+                        || [copy, to_bool].iter().any(|instruction| {
+                            instruction.exception_policy()
+                                != super::ExceptionPolicy::AlwaysUnchanged
+                                || instruction.pre_fold_extra_instructions() != 0
+                                || instruction.local_policy.hidden_exception_owner_slots() != 0
+                        })
+                    {
+                        return None;
+                    }
+                }
+                Some((position, owner))
             })
             .collect()
     }
