@@ -26,7 +26,9 @@ use crate::assembler::block_graph::ItemMut;
 use crate::assembler::ir::{ThreadedBorrowEntries, ThreadedBorrowSnapshot};
 use crate::target::{
     is_unconditional_jump,
-    opcodes::{CALL, CALL_KW, END_FOR, GET_AWAITABLE, POP_JUMP_IF_FALSE},
+    opcodes::{
+        CALL, CALL_KW, END_FOR, GET_AWAITABLE, POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE, TO_BOOL,
+    },
 };
 
 /// Original block entries retained for CPython's final borrowing traversal.
@@ -2326,6 +2328,32 @@ impl OptimizationPipeline {
                             .filter(|pair| pair[0].opcode == CALL && pair[1].opcode == POP_TOP)
                             .nth(1)
                             .is_some();
+                    // A local condition ends this original cleanup array before any
+                    // call. Its first load cannot fold or fuse with the following
+                    // conversion/jump, so it can witness a surviving authored-break entry.
+                    // Match the complete primitive head; interior NOPs and extra prefixes
+                    // must not borrow a witness from a different original array.
+                    let primitive_condition = match instructions.as_slice() {
+                        [_, load, to_bool, jump] => {
+                            load.opcode == LOAD_FAST
+                                && matches!(load.operand(), Operand::Value(_))
+                                && to_bool.opcode == TO_BOOL
+                                && to_bool.operand() == Operand::Value(0)
+                                && jump.opcode == POP_JUMP_IF_FALSE
+                                && matches!(jump.operand(), Operand::Forward(_))
+                        }
+                        [_, load, jump] => {
+                            load.opcode == LOAD_FAST
+                                && matches!(load.operand(), Operand::Value(_))
+                                && jump.opcode == POP_JUMP_IF_NONE
+                                && matches!(jump.operand(), Operand::Forward(_))
+                        }
+                        _ => false,
+                    } && instructions.iter().all(|instruction| {
+                        !instruction.jump_policy.borrow_empty_block()
+                            && instruction.no_location_policy.borrow_fallthrough()
+                                == BorrowFallthrough::Reachable
+                    });
                     // Preserve any existing CALL witness before considering the
                     // authored-break-only alternatives later in the same original block.
                     let candidates = instructions
@@ -2347,7 +2375,8 @@ impl OptimizationPipeline {
                                 && !scope_exit
                                 && (instruction.opcode == CALL_KW
                                     || (instruction.opcode == GET_AWAITABLE
-                                        && instruction.operand() == Operand::Value(0)));
+                                        && instruction.operand() == Operand::Value(0))
+                                    || (primitive_condition && index == 1));
                         if (instruction.opcode != CALL && !authored_finally_witness)
                             || instruction.location.line < 0
                         {
@@ -3172,9 +3201,31 @@ impl OptimizationPipeline {
                                                                 false
                                                             }
                                                             Item::Instruction(instruction) => {
-                                                                at_target
-                                                                    && instruction.opcode
-                                                                        == call.opcode
+                                                                if !at_target {
+                                                                    return false;
+                                                                }
+                                                                if call.opcode == LOAD_FAST {
+                                                                    // A primitive condition
+                                                                    // witnesses this entry's
+                                                                    // first live instruction,
+                                                                    // never a later equal load.
+                                                                    if instruction.opcode == NOP
+                                                                        && instruction
+                                                                            .fusion_policy
+                                                                            .is_converted_pop_block()
+                                                                        && !instruction
+                                                                            .jump_policy
+                                                                            .borrow_empty_block()
+                                                                        && instruction
+                                                                            .no_location_policy
+                                                                            .borrow_fallthrough()
+                                                                            == BorrowFallthrough::Reachable
+                                                                    {
+                                                                        return false;
+                                                                    }
+                                                                    at_target = false;
+                                                                }
+                                                                instruction.opcode == call.opcode
                                                                     && instruction.operand()
                                                                         == Operand::Value(
                                                                             call.argument,

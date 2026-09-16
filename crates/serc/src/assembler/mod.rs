@@ -4501,6 +4501,80 @@ impl Assembler {
         }
     }
 
+    /// Captures the actual manager unwind and first None test of its copied finally.
+    pub(crate) fn record_copied_manager_return_compaction(
+        &mut self,
+        pop_item: usize,
+        ordinary_try_pops: usize,
+    ) {
+        use crate::target::opcodes::{CALL, LOAD_CONST, SWAP};
+
+        let items = self.linear_items();
+        let Some(before) = items.get(..pop_item) else {
+            return;
+        };
+        let cleanup = before
+            .iter()
+            .rev()
+            .filter_map(|item| match item {
+                Item::Instruction(instruction) => Some(*instruction),
+                Item::Label(_) => None,
+            })
+            .take(7)
+            .collect::<Vec<_>>();
+        let Ok(mut cleanup): Result<[Instruction; 7], _> = cleanup.try_into() else {
+            return;
+        };
+        cleanup.reverse();
+        if cleanup.iter().map(|instruction| instruction.opcode).ne([
+            SWAP, SWAP, LOAD_CONST, LOAD_CONST, LOAD_CONST, CALL, POP_TOP,
+        ]) || cleanup[0].operand() != Operand::Value(3)
+            || cleanup[1].operand() != Operand::Value(2)
+            || cleanup[2].operand() != cleanup[3].operand()
+            || cleanup[3].operand() != cleanup[4].operand()
+            || cleanup[5].operand() != Operand::Value(3)
+            || cleanup.iter().any(|instruction| {
+                instruction.local_policy.hidden_exception_owner_slots() != 0
+                    || instruction.pre_fold_extra_instructions() != 0
+                    || instruction.exception_policy() != ExceptionPolicy::NoneUnchanged
+            })
+        {
+            return;
+        }
+        let mut suffix = items[pop_item..].iter().filter_map(|item| match item {
+            Item::Instruction(instruction) => Some(*instruction),
+            Item::Label(_) => None,
+        });
+        let (Some(pop), Some(load), Some(condition)) =
+            (suffix.next(), suffix.next(), suffix.next())
+        else {
+            return;
+        };
+        if pop.opcode == NOP
+            && pop.fusion_policy.is_converted_pop_block()
+            && pop.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
+            && pop.local_policy.hidden_exception_owner_slots() == 0
+            && pop.pre_fold_extra_instructions() == 0
+            && load.opcode == LOAD_FAST
+            && load.local_policy.hidden_exception_owner_slots() == 0
+            && load.pre_fold_extra_instructions() == 0
+            && matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+            && matches!(condition.operand(), Operand::Forward(_))
+            && condition.local_policy.hidden_exception_owner_slots() == 3
+            && condition.pre_fold_extra_instructions() == 0
+        {
+            self.exception_owner_provenance
+                .copied_manager_return_compactions
+                .push(exception_owners::CopiedManagerReturnCompaction {
+                    ordinary_try_pops,
+                    cleanup,
+                    pop,
+                    load,
+                    condition,
+                });
+        }
+    }
+
     /// Captures the unchanged first array of an ordinary normal-finally entry.
     pub(crate) fn record_original_normal_finally_array(&mut self, ordinal: usize) {
         let items = self.linear_items();
@@ -4767,6 +4841,79 @@ impl Assembler {
         if prefix.contains(&entry) {
             self.retained_pop_block_origins.insert(entry, prefix);
         }
+    }
+
+    /// Records an ordinary handler exit copied from an original empty join.
+    pub(crate) fn record_original_handler_cleanup_join_exit(&mut self, end: Label) {
+        let items = self.linear_items();
+        let Some([Item::Instruction(pop), Item::Instruction(jump)]) =
+            items.get(items.len().saturating_sub(2)..)
+        else {
+            return;
+        };
+        if pop.opcode == POP_EXCEPT
+            && pop.location == SourceLocation::NONE
+            && jump.opcode == JUMP_FORWARD
+            && jump.operand() == Operand::Forward(end)
+            && jump.location == SourceLocation::NONE
+        {
+            self.exception_owner_provenance
+                .original_handler_cleanup_join_exits
+                .insert(end);
+        }
+    }
+
+    /// Finds the original manager exit following a completed cold handler cleanup.
+    pub(crate) fn original_manager_cleanup_join(&self, protected_end: Label) -> Option<Label> {
+        let items = self.linear_items();
+        let aliases = items
+            .iter()
+            .rev()
+            .map_while(|item| match item {
+                Item::Label(label) => Some(*label),
+                Item::Instruction(_) => None,
+            })
+            .collect::<Vec<_>>();
+        if !aliases.contains(&protected_end) {
+            return None;
+        }
+        let start = items.len() - aliases.len();
+        let [
+            Item::Instruction(copy),
+            Item::Instruction(pop),
+            Item::Instruction(reraise),
+        ] = items.get(start.checked_sub(3)?..start)?
+        else {
+            return None;
+        };
+        if copy.opcode != COPY
+            || copy.operand() != Operand::Value(3)
+            || pop.opcode != POP_EXCEPT
+            || reraise.opcode != RERAISE
+            || reraise.operand() != Operand::Value(1)
+            || [copy, pop, reraise].iter().any(|instruction| {
+                instruction.location != SourceLocation::NONE
+                    || instruction.pre_fold_extra_instructions() != 0
+                    || instruction.local_policy.hidden_exception_owner_slots() != 0
+            })
+        {
+            return None;
+        }
+        let provenance = &self.exception_owner_provenance;
+        let mut entries = aliases
+            .iter()
+            .copied()
+            .filter(|label| provenance.block_boundaries.contains(label));
+        let entry = entries.next()?;
+        if entries.next().is_some()
+            || !provenance.source_boundaries.contains(&entry)
+            || !provenance
+                .original_handler_cleanup_join_exits
+                .contains(&entry)
+        {
+            return None;
+        }
+        Some(entry)
     }
 
     /// Records a manager's original `POP_BLOCK` at the head of its cleanup array.

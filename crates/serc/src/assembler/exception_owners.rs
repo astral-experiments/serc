@@ -46,6 +46,7 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) copied_return_none_prefixes: Vec<CopiedReturnNonePrefix>,
     pub(super) copied_return_truth_prefixes: Vec<CopiedReturnTruthPrefix>,
     pub(super) copied_manager_return_none_prefixes: Vec<CopiedManagerReturnNonePrefix>,
+    pub(super) copied_manager_return_compactions: Vec<CopiedManagerReturnCompaction>,
     pub(super) uncompacted_conditional_arrays: Vec<UncompactedConditionalArray>,
     pub(super) original_primitive_condition_boundaries: Vec<Instruction>,
     // Authored normal exits and their immediate, fully emitted restore records.
@@ -66,6 +67,8 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) normal_try_class_pattern_donor_labels: FxHashMap<Label, (Label, Label)>,
     // First records of the original manager cleanup arrays, before line resolution.
     pub(super) original_manager_pop_blocks: Vec<Label>,
+    // Ordinary handler exits copied from an original unlocated POP_EXCEPT/jump array.
+    pub(super) original_handler_cleanup_join_exits: FxHashSet<Label>,
     // Original try/except POP_BLOCK exits inside their own finally, for owner transfer
     // and late redundant-exit removal, but not ordinary-try exit copying.
     pub(super) compound_try_owner_exits: Vec<(Label, Label)>,
@@ -157,6 +160,16 @@ pub(super) struct CopiedReturnTruthPrefix {
 pub(super) struct CopiedManagerReturnNonePrefix {
     pub(super) entry: Label,
     pub(super) prefix: [Instruction; 10],
+    pub(super) pop: Instruction,
+    pub(super) load: Instruction,
+    pub(super) condition: Instruction,
+}
+
+/// Exact manager cleanup and first copied-finally test, before either compaction pass.
+#[derive(Debug)]
+pub(super) struct CopiedManagerReturnCompaction {
+    pub(super) ordinary_try_pops: usize,
+    pub(super) cleanup: [Instruction; 7],
     pub(super) pop: Instruction,
     pub(super) load: Instruction,
     pub(super) condition: Instruction,
@@ -3580,6 +3593,28 @@ impl LayoutAssembler {
                             },
                         );
                     }
+                    // The original manager POP precedes its cleanup. A later local-load
+                    // fusion compacts the live array again, superseding those early slots.
+                    if instruction.opcode == NOT_TAKEN
+                        && instruction.exception_policy() == super::ExceptionPolicy::NonePresent
+                        && owner_history_exact
+                        && pop_slot_epoch_known
+                        && tail.insertions == 0
+                        && tail.late_removals == 0
+                        && owners
+                            .get(&instruction_index)
+                            .is_none_or(|owner| !owner.definitive)
+                        && let Some(decision) = self.copied_manager_return_compaction_owner(
+                            instruction_index,
+                            original_array_start,
+                            tail,
+                            &indexed_instructions,
+                            &label_positions,
+                            &jump_targets,
+                        )
+                    {
+                        owners.insert(instruction_index, decision);
+                    }
                     // Resolve the exact normal-finally None prefix before a marker's
                     // range-end label can erase the preceding try's array certificate.
                     let original_none_marker =
@@ -4690,6 +4725,124 @@ impl LayoutAssembler {
             );
         }
         owners
+    }
+
+    /// Projects the appended marker through the last compaction of a captured manager return.
+    fn copied_manager_return_compaction_owner(
+        &self,
+        marker: usize,
+        array_start: usize,
+        tail: ExceptionOwnerTail,
+        instructions: &[&Instruction],
+        positions: &FxHashMap<Label, usize>,
+        jump_targets: &FxHashSet<Label>,
+    ) -> Option<ExceptionOwnerDecision> {
+        use crate::target::opcodes::LOAD_FAST_BORROW;
+
+        let condition_index = marker.checked_sub(1)?;
+        let load_index = marker.checked_sub(2)?;
+        let start = load_index.checked_sub(7)?;
+        if array_start > start
+            || jump_targets
+                .iter()
+                .chain(&self.exception_owner_provenance.source_boundaries)
+                .chain(&self.exception_owner_provenance.block_boundaries)
+                .any(|label| {
+                    positions
+                        .get(label)
+                        .is_some_and(|position| start < *position && *position <= marker)
+                })
+        {
+            return None;
+        }
+        let condition = *instructions.get(condition_index)?;
+        let load = *instructions.get(load_index)?;
+        let mut origins = self
+            .exception_owner_provenance
+            .copied_manager_return_compactions
+            .iter()
+            .filter(|origin| {
+                let mut expected_load = origin.load;
+                expected_load
+                    .local_policy
+                    .add_hidden_exception_owner_slots(1);
+                if load.opcode == LOAD_FAST_BORROW {
+                    expected_load.opcode = LOAD_FAST_BORROW;
+                }
+                *condition == origin.condition
+                    && *load == expected_load
+                    && origin.pop.opcode == NOP
+                    && origin.pop.fusion_policy.is_converted_pop_block()
+                    && origin.pop.exception_policy() == super::ExceptionPolicy::EXCLUDE_ALWAYS
+                    && instructions[start..load_index]
+                        .iter()
+                        .zip(origin.cleanup)
+                        .all(|(actual, expected)| **actual == expected)
+            });
+        let origin = origins.next()?;
+        if origins.next().is_some() {
+            return None;
+        }
+        // The prefix must contain only the known LOAD_GLOBAL and local-pair folds.
+        // In particular, no unrelated erased POP can shift the manager's old cells.
+        let mut prefix_tail = ExceptionOwnerTail::default();
+        for instruction in &instructions[array_start..start] {
+            if instruction.local_policy.hidden_exception_owner_slots() != 0
+                || instruction.pre_fold_extra_instructions() != 0
+                || instruction.exception_policy() != super::ExceptionPolicy::NoneUnchanged
+                || instruction.opcode == NOP
+                || instruction.no_location_policy.borrow_fallthrough()
+                    == super::BorrowFallthrough::Barrier
+                || instruction.only_allows_unconditional_inlining()
+                || matches!((instruction.opcode, instruction.operand()),
+                    (COMPARE_OP, Operand::Value(argument)) if argument & 16 != 0)
+                || !matches!(instruction.operand(), Operand::Value(_))
+                || is_scope_exit(instruction.opcode)
+            {
+                return None;
+            }
+            prefix_tail.instruction(**instruction, None);
+        }
+        if prefix_tail.insertions != 0
+            || prefix_tail.early_removals.checked_add(4) != Some(tail.early_removals)
+            || prefix_tail.post_compaction_fusions != tail.post_compaction_fusions
+        {
+            return None;
+        }
+        let owns_cleanup_record = if tail.post_compaction_fusions > 0 {
+            // Local-load fusion copies full live records left. The stale append cell
+            // therefore refers to that live array, after the earlier POP removals.
+            let source = marker.checked_sub(tail.post_compaction_fusions)?;
+            if !(start..load_index).contains(&source) {
+                return None;
+            }
+            true
+        } else {
+            // The manager's omitted POP is immediately before these seven records;
+            // the optional ordinary-try POP and captured finally POP follow them.
+            // These original POP records are NULL before compaction removes them.
+            let original_start = start
+                .checked_add(prefix_tail.early_removals)?
+                .checked_add(1)?;
+            match marker.checked_sub(original_start)? {
+                0..=6 => true,
+                7 => false,
+                8 if origin.ordinary_try_pops == 1 => false,
+                _ => return None,
+            }
+        };
+        let region = self.uniform_exception_owner(start, load_index, positions)?;
+        let owner = self.exception_regions[region];
+        let current = self.uniform_exception_owner(marker, marker + 1, positions)?;
+        (!owner.is_scope_fallback
+            && !owner.preserve_lasti
+            && self.exception_regions[current].is_scope_fallback)
+            .then_some(ExceptionOwnerDecision {
+                has_owner: owns_cleanup_record,
+                source_region: owns_cleanup_record.then_some(region),
+                definitive: true,
+                override_existing: true,
+            })
     }
 
     /// Reconstructs one entry-array marker slot after three authenticated SETUP removals.

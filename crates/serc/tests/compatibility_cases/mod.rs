@@ -518,3 +518,12 @@ mod intervening_try_finally_copy;
 
 mod async_generator_finally_owner;
 mod conditional_finally_return_owner;
+
+mod located_manager_handler_join;
+mod manager_return_finally_expressions;
+
+mod dict_or_finally;
+
+mod iterator_inner_finally_owner;
+
+mod conditional_finally_break_entry;
