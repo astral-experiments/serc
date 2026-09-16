@@ -4338,6 +4338,76 @@ impl Assembler {
             });
     }
 
+    /// Captures the original return POP pair and its direct local truth test.
+    pub(crate) fn record_copied_return_truth_prefix(
+        &mut self,
+        return_item: usize,
+        first_pop_item: usize,
+    ) {
+        let Some(
+            [
+                Item::Instruction(first_pop),
+                Item::Instruction(final_pop),
+                Item::Instruction(load),
+                Item::Instruction(to_bool),
+                Item::Instruction(condition),
+                ..,
+            ],
+        ) = self.linear_items().get(first_pop_item..)
+        else {
+            return;
+        };
+        let pops = [*first_pop, *final_pop];
+        let load = *load;
+        let to_bool = *to_bool;
+        let condition = *condition;
+        if pops.iter().any(|pop| {
+            pop.opcode != NOP
+                || pop.operand() != Operand::Value(0)
+                || !pop.fusion_policy.is_converted_pop_block()
+                || pop.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
+        }) || load.opcode != LOAD_FAST
+            || !matches!(load.operand(), Operand::Value(_))
+            || to_bool.opcode != TO_BOOL
+            || to_bool.operand() != Operand::Value(0)
+            || !matches!(condition.opcode, POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE)
+            || !matches!(condition.operand(), Operand::Forward(_))
+            || [pops[0], pops[1], load, to_bool, condition]
+                .iter()
+                .any(|instruction| {
+                    instruction.local_policy.hidden_exception_owner_slots() != 0
+                        || instruction.pre_fold_extra_instructions() != 0
+                })
+        {
+            return;
+        }
+        let return_nop = match self.linear_items().get(return_item..first_pop_item) {
+            Some([Item::Instruction(authored), labels @ ..])
+                if authored.opcode == NOP
+                    && authored.operand() == Operand::Value(0)
+                    && authored.exception_policy() == ExceptionPolicy::NoneUnchanged
+                    && !authored.fusion_policy.is_converted_pop_block()
+                    && authored.local_policy.hidden_exception_owner_slots() == 0
+                    && authored.pre_fold_extra_instructions() == 0
+                    && authored.location == pops[0].location
+                    && authored.depth_after() == pops[0].depth_after()
+                    && labels.iter().all(|item| matches!(item, Item::Label(_))) =>
+            {
+                *authored
+            }
+            _ => return,
+        };
+        self.exception_owner_provenance
+            .copied_return_truth_prefixes
+            .push(exception_owners::CopiedReturnTruthPrefix {
+                return_nop,
+                pops,
+                load,
+                to_bool,
+                condition,
+            });
+    }
+
     /// Captures an awaited manager return whose two omitted POPs precede its finally POP.
     pub(crate) fn record_copied_manager_return_none_prefix(
         &mut self,
@@ -4862,6 +4932,29 @@ impl Assembler {
         return_item: usize,
         named: bool,
     ) {
+        self.record_copied_handler_cleanup_inner(start, end, return_item, named, None);
+    }
+
+    /// Captures an unnamed handler unwind and its immediately copied local assignment.
+    pub(crate) fn record_copied_handler_assignment_cleanup(
+        &mut self,
+        start: Label,
+        handler_end: Label,
+        end: Label,
+        return_item: usize,
+    ) {
+        self.record_copied_handler_cleanup_inner(start, end, return_item, false, Some(handler_end));
+    }
+
+    fn record_copied_handler_cleanup_inner(
+        &mut self,
+        start: Label,
+        end: Label,
+        return_item: usize,
+        named: bool,
+        assignment_pop_boundary: Option<Label>,
+    ) {
+        let copied_assignment = assignment_pop_boundary.is_some();
         let items = self.linear_items();
         let Some(Item::Instruction(return_nop)) = items.get(return_item) else {
             return;
@@ -4911,14 +5004,62 @@ impl Assembler {
             }
             _ => return,
         };
-        let instructions = items[start_at..end_at]
+        let mut instructions = items[start_at..end_at]
             .iter()
             .filter_map(|item| match item {
                 Item::Instruction(instruction) => Some(*instruction),
                 Item::Label(_) => None,
             })
             .collect::<Vec<_>>();
-        if instructions.len() != if named { 4 } else { 1 }
+        let assignment_pop = if let Some(boundary) = assignment_pop_boundary {
+            let Some(pop_at) = items.iter().position(|item| *item == Item::Label(boundary)) else {
+                return;
+            };
+            if start_at >= pop_at
+                || pop_at >= end_at
+                || items[start_at..pop_at]
+                    .iter()
+                    .filter(|item| matches!(item, Item::Instruction(_)))
+                    .count()
+                    != 1
+            {
+                return;
+            }
+            let [_, pop, constant, store] = instructions.as_slice() else {
+                return;
+            };
+            if named
+                || return_nop.exception_policy() != ExceptionPolicy::NoneUnchanged
+                || return_nop.local_policy.hidden_exception_owner_slots() != 0
+                || return_nop.pre_fold_extra_instructions() != 0
+                || pop.opcode != NOP
+                || pop.operand() != Operand::Value(0)
+                || !pop.fusion_policy.is_converted_pop_block()
+                || pop.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
+                || pop.local_policy.hidden_exception_owner_slots() != 0
+                || pop.pre_fold_extra_instructions() != 0
+                || constant.opcode != crate::target::opcodes::LOAD_CONST
+                || store.opcode != crate::target::opcodes::STORE_FAST
+                || [constant, store].into_iter().any(|instruction| {
+                    instruction.exception_policy() != ExceptionPolicy::NoneUnchanged
+                        || instruction.local_policy.hidden_exception_owner_slots() != 0
+                        || instruction.pre_fold_extra_instructions() != 0
+                })
+            {
+                return;
+            }
+            Some((boundary, instructions.remove(1)))
+        } else {
+            None
+        };
+        let expected_len = if copied_assignment {
+            3
+        } else if named {
+            4
+        } else {
+            1
+        };
+        if instructions.len() != expected_len
             || instructions[0].opcode != crate::target::opcodes::POP_EXCEPT
             || (named
                 && (instructions[1].opcode != crate::target::opcodes::LOAD_CONST
@@ -4937,6 +5078,7 @@ impl Assembler {
                 instructions,
                 missing_null_pops,
                 removed_prefix_slots,
+                assignment_pop,
                 continued_call: None,
             });
     }

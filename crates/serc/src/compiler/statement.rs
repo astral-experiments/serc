@@ -5599,6 +5599,7 @@ impl Compiler<'_> {
                 // that handler restores the exception state. Outer finallys run afterward.
                 let mut next_handler = handler_count;
                 let mut next_finally = return_finally_contexts.len();
+                let mut copied_handler_assignment_span = None;
                 while next_handler > 0
                     || next_finally > 0
                     || (!return_is_overridden
@@ -6008,6 +6009,53 @@ impl Compiler<'_> {
                                         copied_handler_return_item,
                                         name.is_some(),
                                     );
+                                }
+                                // Preserve the exact handler span until the copied inner
+                                // assignment has acquired its enclosing finally owner.
+                                if self.context.target_specific_rules_enabled()
+                                    && !preserve_tos
+                                    && !return_is_overridden
+                                    && handler_count == 1
+                                    && name.is_none()
+                                    && next_finally == 2
+                                    && let [outer, inner] = return_finally_contexts.as_slice()
+                                    && next_with == with_depth
+                                    && next_loop == loop_depth
+                                    && self.control.withs.active_with_exits.is_empty()
+                                    && self.control.finally.active_finally_end_blocks == 0
+                                    && self.control.finally.active_normal_finally_bodies == 0
+                                    && self.control.finally.active_copied_finally_bodies == 0
+                                    && self
+                                        .control
+                                        .finally
+                                        .preserved_return_value_contexts
+                                        .is_empty()
+                                    && inner.handler_depth == handler_index
+                                    && outer.handler_depth == handler_index
+                                    && inner.with_depth == with_depth
+                                    && outer.with_depth == with_depth
+                                    && inner.loop_depth == loop_depth
+                                    && outer.loop_depth <= inner.loop_depth
+                                    && self.control.loops.contexts
+                                        [outer.loop_depth..inner.loop_depth]
+                                        .iter()
+                                        .all(|context| {
+                                            context.iterator_cleanup == IteratorCleanup::None
+                                        })
+                                    && inner.exception_region_depth + 1 == region_depth
+                                    && inner.exception_region_depth
+                                        == outer.exception_region_depth + 1
+                                    && inner.try_body_depth == outer.try_body_depth
+                                    && let [Stmt::Assign(assignment)] = inner.body.as_slice()
+                                    && matches!(assignment.value.as_ref(), Expr::NoneLiteral(_))
+                                    && let [Expr::Name(assigned)] = assignment.targets.as_slice()
+                                    && let Some(Stmt::If(entry)) = outer.body.first()
+                                    && let Expr::Compare(test) = entry.test.as_ref()
+                                    && matches!(test.left.as_ref(), Expr::Name(tested) if tested.id == assigned.id)
+                                    && matches!(test.ops.as_ref(), [CmpOp::Is | CmpOp::IsNot])
+                                    && matches!(test.comparators.as_ref(), [Expr::NoneLiteral(_)])
+                                {
+                                    copied_handler_assignment_span = Some((start, end));
                                 }
                                 if let Some(context) = pending_finally_owner {
                                     self.assembler.add_exception_region(
@@ -6488,6 +6536,10 @@ impl Compiler<'_> {
                             copied_handler_return_item,
                             first_pop_item,
                         );
+                        self.assembler.record_copied_return_truth_prefix(
+                            copied_handler_return_item,
+                            first_pop_item,
+                        );
                     }
                     if result.is_ok()
                         && let Some(pop_item) = copied_manager_none_pop
@@ -6590,6 +6642,17 @@ impl Compiler<'_> {
                                 outer_context.depth,
                                 false,
                             );
+                            if context_index == 1
+                                && let Some((start, handler_end)) =
+                                    copied_handler_assignment_span.take()
+                            {
+                                self.assembler.record_copied_handler_assignment_cleanup(
+                                    start,
+                                    handler_end,
+                                    copied_finally_end,
+                                    copied_handler_return_item,
+                                );
+                            }
                         }
                     }
                     // The copied finally body has its own source locations. CPython makes

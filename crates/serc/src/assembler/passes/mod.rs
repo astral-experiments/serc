@@ -454,6 +454,11 @@ impl OptimizationPipeline {
                     origin.condition = *after;
                 }
             }
+            for origin in &mut self.exception_owner_provenance.copied_return_truth_prefixes {
+                if origin.condition == *before {
+                    origin.condition = *after;
+                }
+            }
             for origin in &mut self
                 .exception_owner_provenance
                 .copied_manager_return_none_prefixes

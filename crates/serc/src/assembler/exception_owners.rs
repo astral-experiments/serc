@@ -44,6 +44,7 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) original_normal_finally_arrays: Vec<OriginalNormalFinallyArray>,
     pub(super) normal_finally_none_prefixes: Vec<(Instruction, Instruction, Instruction)>,
     pub(super) copied_return_none_prefixes: Vec<CopiedReturnNonePrefix>,
+    pub(super) copied_return_truth_prefixes: Vec<CopiedReturnTruthPrefix>,
     pub(super) copied_manager_return_none_prefixes: Vec<CopiedManagerReturnNonePrefix>,
     pub(super) uncompacted_conditional_arrays: Vec<UncompactedConditionalArray>,
     pub(super) original_primitive_condition_boundaries: Vec<Instruction>,
@@ -141,6 +142,16 @@ pub(super) struct CopiedReturnNonePrefix {
     pub(super) condition: Instruction,
 }
 
+/// A constant return's original POP pair and complete local truthiness test.
+#[derive(Debug)]
+pub(super) struct CopiedReturnTruthPrefix {
+    pub(super) return_nop: Instruction,
+    pub(super) pops: [Instruction; 2],
+    pub(super) load: Instruction,
+    pub(super) to_bool: Instruction,
+    pub(super) condition: Instruction,
+}
+
 /// Exact awaited return and manager unwind, with two omitted POPs before its finally POP.
 #[derive(Debug)]
 pub(super) struct CopiedManagerReturnNonePrefix {
@@ -160,6 +171,8 @@ pub(super) struct CopiedHandlerCleanup {
     pub(super) instructions: Vec<Instruction>,
     pub(super) missing_null_pops: usize,
     pub(super) removed_prefix_slots: u16,
+    // Exact inner-finally POP removed immediately before the captured local assignment.
+    pub(super) assignment_pop: Option<(Label, Instruction)>,
     pub(super) continued_call: Option<([Instruction; 6], Instruction)>,
 }
 
@@ -2196,6 +2209,7 @@ impl LayoutAssembler {
         let mut transferred_pop_setup: Option<(Label, usize)> = None;
         let mut retained_pop_prefix = None;
         let mut early_return_nop_slot = None;
+        let mut early_return_truth_slot = None;
         let mut owner_history_exact = true;
         let mut pop_slot_epoch_known = true;
         let mut retained_epoch_known = true;
@@ -2237,6 +2251,43 @@ impl LayoutAssembler {
                         {
                             continue;
                         }
+                        if let Some((boundary, _)) = original.assignment_pop
+                            && (original_array_start + 1 != start
+                                || indexed_instructions[original_array_start].opcode != POP_TOP
+                                || indexed_instructions[original_array_start]
+                                    .local_policy
+                                    .hidden_exception_owner_slots()
+                                    != 0
+                                || tail.early_removals != 3
+                                || label_positions.get(&boundary) != Some(&(start + 1))
+                                || !self
+                                    .exception_owner_provenance
+                                    .removed_pop_block_boundaries
+                                    .contains(&boundary)
+                                || self
+                                    .exception_owner_provenance
+                                    .removed_pop_block_widths
+                                    .get(&boundary)
+                                    .copied()
+                                    .unwrap_or(1)
+                                    != 1
+                                || jump_targets.iter().any(|label| {
+                                    label_positions.get(label).is_some_and(|position| {
+                                        start < *position && *position < instruction_index
+                                    })
+                                })
+                                || self
+                                    .uniform_exception_owner(
+                                        start + 1,
+                                        instruction_index,
+                                        &label_positions,
+                                    )
+                                    .is_none_or(|region| {
+                                        self.exception_regions[region].is_scope_fallback
+                                    }))
+                        {
+                            continue;
+                        }
                         // The return NOP and any emitted NULL POPs compact into
                         // POP_EXCEPT. Omitted POPs are counted separately during replay.
                         let hidden = original.removed_prefix_slots;
@@ -2251,6 +2302,11 @@ impl LayoutAssembler {
                                         expected
                                             .local_policy
                                             .add_hidden_exception_owner_slots(hidden);
+                                    } else if offset == 1 && original.assignment_pop.is_some() {
+                                        // The captured inner POP compacts into LOAD_CONST.
+                                        // Its NULL slot remains distinct from both owned
+                                        // assignment records when replay selects the old slot.
+                                        expected.local_policy.add_hidden_exception_owner_slots(1);
                                     }
                                     *indexed_instructions[start + offset] == expected
                                 });
@@ -2703,6 +2759,7 @@ impl LayoutAssembler {
                     }
                     if instruction.opcode == NOP {
                         early_return_nop_slot = None;
+                        early_return_truth_slot = None;
                         if owner_history_exact
                             && tail.insertions == 0
                             && tail.late_removals == 0
@@ -2782,6 +2839,55 @@ impl LayoutAssembler {
                             {
                                 early_return_nop_slot =
                                     Some((original_array_start, instruction_index, slot, region));
+                            }
+                            // Truthiness retains TO_BOOL as a separate original cell.
+                            // Replay the complete captured prefix before locating its two
+                            // NULL POP cells in the uncompacted instruction array.
+                            if matching_pairs == 0
+                                && instruction.local_policy.hidden_exception_owner_slots() == 2
+                                && self
+                                    .exception_owner_provenance
+                                    .copied_return_truth_prefixes
+                                    .iter()
+                                    .filter(|origin| {
+                                        let mut pop = origin.pops[1];
+                                        pop.local_policy.add_hidden_exception_owner_slots(2);
+                                        let Some(load) =
+                                            indexed_instructions.get(instruction_index + 1)
+                                        else {
+                                            return false;
+                                        };
+                                        let mut expected_load = origin.load;
+                                        if load.opcode == crate::target::opcodes::LOAD_FAST_BORROW {
+                                            expected_load.opcode = load.opcode;
+                                        }
+                                        pop == *instruction
+                                            && origin.return_nop.location == instruction.location
+                                            && origin.return_nop.depth_after()
+                                                == instruction.depth_after()
+                                            && expected_load == **load
+                                            && indexed_instructions
+                                                .get(instruction_index + 2)
+                                                .is_some_and(|to_bool| **to_bool == origin.to_bool)
+                                            && indexed_instructions
+                                                .get(instruction_index + 3)
+                                                .is_some_and(|condition| {
+                                                    **condition == origin.condition
+                                                })
+                                            && jump_targets.iter().all(|target| {
+                                                label_positions.get(target).is_none_or(|position| {
+                                                    *position <= instruction_index
+                                                        || *position > instruction_index + 4
+                                                })
+                                            })
+                                    })
+                                    .count()
+                                    == 1
+                                && let Some(slot) =
+                                    instruction_index.checked_add(tail.early_removals)
+                            {
+                                early_return_truth_slot =
+                                    Some((original_array_start, instruction_index, slot));
                             }
                         }
                     }
@@ -4395,6 +4501,43 @@ impl LayoutAssembler {
                             ExceptionOwnerDecision {
                                 has_owner: true,
                                 source_region: Some(region),
+                                definitive: true,
+                                override_existing: true,
+                            },
+                        );
+                    }
+                    // The explicit TO_BOOL places a truthiness marker one cell later
+                    // than a None test. Either original POP cell is still NULL; the
+                    // preceding authored return NOP retains its protected owner.
+                    if instruction.opcode == NOT_TAKEN
+                        && owner_history_exact
+                        && tail.insertions == 0
+                        && tail.late_removals == 0
+                        && tail.post_compaction_fusions == 0
+                        && instruction.exception_policy().exclusion()
+                            == super::ExceptionExclusion::None
+                        && matches!(
+                            instruction.exception_policy().owner(),
+                            NormalizedExceptionOwner::Present
+                                | NormalizedExceptionOwner::DynamicCondition
+                        )
+                        && instruction.local_policy.hidden_exception_owner_slots() == 0
+                        && instruction.pre_fold_extra_instructions() == 0
+                        && owners
+                            .get(&instruction_index)
+                            .is_none_or(|decision| !decision.definitive)
+                        && let Some((array, pop, slot)) = early_return_truth_slot
+                        && original_array_start == array
+                        && instruction_index - pop == 4
+                        && (slot.checked_add(1) == Some(instruction_index)
+                            || slot.checked_add(2) == Some(instruction_index))
+                        && instruction.location == indexed_instructions[pop + 3].location
+                    {
+                        owners.insert(
+                            instruction_index,
+                            ExceptionOwnerDecision {
+                                has_owner: false,
+                                source_region: None,
                                 definitive: true,
                                 override_existing: true,
                             },
