@@ -4006,6 +4006,40 @@ impl Compiler<'_> {
                 let context = self.control.loops.contexts.last().copied().ok_or_else(|| {
                     CompileError::invalid_syntax("'break' outside loop", statement.range)
                 })?;
+                // The direct coroutine break unwinds the same two original try
+                // records as continue. Keep them for stale exception-owner slots.
+                let copied_break_pop_pair = context.iterator_cleanup == IteratorCleanup::None
+                    && self.continued_finally_pop_blocks(context) == 2;
+                let copied_break_item = self.assembler.item_count();
+                // A direct named handler has the same two omitted POP_BLOCKs and
+                // four cleanup records already certified for copied continues.
+                let copied_break_handler_origin = (self.context.target_specific_rules_enabled()
+                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
+                    && context.iterator_cleanup == IteratorCleanup::None
+                    && self.control.withs.active_with_exits.is_empty()
+                    && self.control.exceptions.active_try_marker_slots.is_empty()
+                    && self.control.exceptions.active_exception_group_handlers == 0
+                    && self.control.finally.active_finally_try_bodies == 1
+                    && self.control.finally.active_finally_end_blocks == 0
+                    && self.control.finally.active_normal_finally_bodies == 0
+                    && self.control.finally.active_copied_finally_bodies == 0
+                    && self.control.finally.active_overriding_finally_returns == 0
+                    && self.control.finally.preserved_return_value_contexts.is_empty()
+                    && self.control.finally.copied_return_finally_preserved_values == 0
+                    && self.control.finally.active_pass_finally_locations.is_empty()
+                    && matches!(self.control.exceptions.active_exception_handlers.as_slice(), [handler]
+                        if handler.name.is_some()
+                            && handler.with_depth == 0
+                            && handler.loop_depth == self.control.loops.contexts.len()
+                            && self.control.exceptions.active_exception_region_exclusions.len()
+                                == handler.exception_region_depth + 1
+                            && matches!(self.control.finally.active_loop_finally_contexts.as_slice(), [finally]
+                                if finally.handler_depth == 0
+                                    && finally.with_depth == 0
+                                    && finally.loop_depth == handler.loop_depth
+                                    && finally.exception_region_depth + 1 == handler.exception_region_depth
+                                    && finally.exception_region_depth == context.exception_region_depth)))
+                    .then_some(copied_break_item);
                 let is_first_emitted_body_instruction =
                     self.assembler.instruction_count() == context.body_start;
                 let break_continues_line = self
@@ -4037,7 +4071,9 @@ impl Compiler<'_> {
                     NOP,
                     0,
                     0,
-                    if self
+                    if copied_break_pop_pair {
+                        ExceptionPolicy::default()
+                    } else if self
                         .control
                         .finally
                         .active_loop_finally_contexts
@@ -4116,7 +4152,14 @@ impl Compiler<'_> {
                 let LoopControlUnwind {
                     with_starts: with_unwind_starts,
                     region_starts: region_unwind_starts,
-                } = self.emit_loop_control_finally_unwind(context.with_depth, None)?;
+                } = self.emit_loop_control_finally_unwind(
+                    context.with_depth,
+                    None,
+                    copied_break_pop_pair.then_some(copied_break_item),
+                )?;
+                if let Some(origin) = copied_break_handler_origin {
+                    self.assembler.record_copied_break_handler_cleanup(origin);
+                }
                 if exclusion_start.is_some()
                     && finally_end_unwind_start.is_none()
                     && !with_unwind_starts.is_empty()
@@ -4439,6 +4482,7 @@ impl Compiler<'_> {
                 } = self.emit_loop_control_finally_unwind(
                     context.with_depth,
                     Some(context.continue_label),
+                    None,
                 )?;
                 if let Some(origin) = continued_handler_origin {
                     self.assembler
@@ -9099,6 +9143,7 @@ impl Compiler<'_> {
         &mut self,
         with_depth: usize,
         continue_target: Option<Label>,
+        copied_break_item: Option<usize>,
     ) -> Result<LoopControlUnwind, CompileError> {
         let loop_depth = self.control.loops.contexts.len();
         let loop_exception_region_depth = self
@@ -9206,6 +9251,22 @@ impl Compiler<'_> {
                         self.control.exceptions.active_exception_region_exclusions[index].len(),
                     ));
                 }
+                let copied_break_pop_pair =
+                    if copied_break_item.is_some() && index + 1 == finally_contexts.len() {
+                        let first_pop = self.assembler.item_count();
+                        for _ in 0..2 {
+                            self.emit_with_exception_policy(
+                                NOP,
+                                0,
+                                0,
+                                ExceptionPolicy::EXCLUDE_ALWAYS,
+                            )?;
+                            self.assembler.mark_last_as_converted_pop_block();
+                        }
+                        Some(first_pop)
+                    } else {
+                        None
+                    };
                 let unwound_withs = self.control.withs.active_with_exits.split_off(next_with);
                 let active_try_bodies = self.control.finally.active_finally_try_bodies;
                 self.control.finally.active_finally_try_bodies =
@@ -9289,6 +9350,13 @@ impl Compiler<'_> {
                         )
                     },
                 );
+                if result.is_ok()
+                    && let (Some(break_item), Some(first_pop)) =
+                        (copied_break_item, copied_break_pop_pair)
+                {
+                    self.assembler
+                        .record_copied_return_none_prefix(break_item, first_pop);
+                }
                 if let Some(regions) = unwound_loop_return_regions {
                     self.control
                         .exceptions
@@ -9494,9 +9562,14 @@ impl Compiler<'_> {
         non_final_branch: bool,
     ) -> Result<(), CompileError> {
         let base_depth = self.control.stack.depth;
-        if non_final_branch && !self.has_active_control_flow_region() {
-            // CPython leaves an unprotected inner loop's body as the fallthrough block and
-            // targets the enclosing backedge when its condition is false.
+        if non_final_branch
+            && (!self.has_active_control_flow_region()
+                || (self.control.in_loop_tail_without_nested_cleanup()
+                    && condition_has_only_runtime_tests(&statement.test)))
+        {
+            // An enclosing protected region does not change this original branch exit
+            // when reaching the backedge crosses no nested cleanup. Keep the inner
+            // body first and target the enclosing backedge when its condition is false.
             let start = self.assembler.label();
             let exit = self.assembler.label();
             self.assembler.mark(start);

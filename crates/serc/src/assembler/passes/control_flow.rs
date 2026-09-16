@@ -1793,6 +1793,7 @@ impl OptimizationPipeline {
         let mut changed = false;
         let mut threaded_condition = None;
         let origins = &mut self.exception_owner_provenance.threaded_condition_origins;
+        let paired_none_prefixes = &mut self.exception_owner_provenance.copied_return_none_prefixes;
         self.graph.for_each_instruction_mut(|instruction| {
             if let Some((condition, retargeted)) = threaded_condition.take()
                 && instruction.opcode == NOT_TAKEN
@@ -1809,9 +1810,15 @@ impl OptimizationPipeline {
             ) && let Operand::Forward(target) = instruction.operand()
                 && let Some(operand) = targets.get(&target)
             {
+                let original_condition = *instruction;
                 instruction.retarget(*operand);
                 // CPython replaces the old jump with a NOP and appends a fresh, ownerless jump.
                 instruction.exclude_from_exception_table(ExceptionExclusion::Always);
+                for origin in &mut *paired_none_prefixes {
+                    if origin.condition == original_condition {
+                        origin.condition = *instruction;
+                    }
+                }
                 threaded_condition = Some((*instruction, *operand != Operand::Forward(target)));
                 changed = true;
             }
@@ -2247,7 +2254,39 @@ impl OptimizationPipeline {
                                     })
                             },
                         );
+                    // A copied finalizer's conditional join remains a separate original
+                    // array after its condition threads past the authored break. CPython
+                    // resets the preceding line there, so its located jump becomes a NOP
+                    // even when the physical fallthrough donor has that same location.
+                    let preserves_copied_finally_break_nop = finalize_borrow_empty_blocks
+                        && !crosses_exception_boundary
+                        && instruction.fusion_policy.is_authored_break()
+                        && !instruction.jump_policy.allows_threading_target()
+                        && instruction.pre_fold_extra_instructions() == 0
+                        && previous == previous_at_block_entry
+                        && instruction.location.line >= 0
+                        && next_line
+                            .is_some_and(|line| line >= 0 && line != instruction.location.line)
+                        && previous.is_some_and(|previous| {
+                            matches!(graph.item(previous), Item::Instruction(donor)
+                                if donor.location == instruction.location
+                                    && !ends_scope(donor.opcode)
+                                    && !is_unconditional_jump(donor.opcode))
+                        })
+                        && graph[block].items()[..offset]
+                            .iter()
+                            .all(|item| matches!(item, Item::Label(_)))
+                        && graph[block].items()[..offset].iter().any(|item| {
+                            matches!(item, Item::Label(label)
+                                if self.conditional_threading_targets.get(label)
+                                    == Some(&SourceLocation::NONE)
+                                    && self.exception_owner_provenance.source_boundaries.contains(label)
+                                    && self.exception_owner_provenance.block_boundaries.contains(label)
+                                    && !self.borrow_block_aliases.contains(label)
+                                    && !self.original_nop_targets.contains(label))
+                        });
                     if !preserves_wildcard_fallthrough_nop
+                        && !preserves_copied_finally_break_nop
                         && (!instruction.jump_policy.always_retains_nop()
                             || absorbed_normal_try_exit)
                         && (instruction.location.line < 0

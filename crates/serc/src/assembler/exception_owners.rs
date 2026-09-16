@@ -4288,9 +4288,38 @@ impl LayoutAssembler {
                             },
                         );
                     }
-                    // Early compaction leaves the authored return NOP and its adjacent
-                    // POP_BLOCK in their old array cells. The first retains its try owner;
-                    // the second is NULL even when the marker has a scope fallback.
+                    // A captured POP pair remains the same original array when
+                    // the actual threading pass retargets its terminal condition.
+                    // Only that exact rewritten condition/marker pair can supersede
+                    // the generic Strict presence estimate below.
+                    let threaded_paired_pop_marker = instruction.opcode == NOT_TAKEN
+                        && instruction.exception_policy().owner()
+                            == NormalizedExceptionOwner::DynamicConditionStrict
+                        && early_return_nop_slot.is_some_and(|(_, pop, _, _)| {
+                            indexed_instructions[pop]
+                                .local_policy
+                                .hidden_exception_owner_slots()
+                                == 2
+                        })
+                        && previous.is_some_and(|condition| {
+                            self.exception_owner_provenance
+                                .threaded_condition_origins
+                                .contains(&(condition, *instruction))
+                                // Another copied condition can leave an identical
+                                // historical origin after later normalization.
+                                // The captured POP prefix must identify the sole
+                                // surviving condition/marker pair.
+                                && indexed_instructions
+                                    .windows(2)
+                                    .filter(|pair| {
+                                        *pair[0] == condition && *pair[1] == *instruction
+                                    })
+                                    .count()
+                                    == 1
+                        });
+                    // Early compaction leaves the authored exit NOP and its adjacent
+                    // POP_BLOCK records in their old array cells. The first retains its
+                    // try owner; either captured POP is NULL despite a scope fallback.
                     if instruction.opcode == NOT_TAKEN
                         && owner_history_exact
                         && tail.insertions == 0
@@ -4298,18 +4327,27 @@ impl LayoutAssembler {
                         && tail.post_compaction_fusions == 0
                         && instruction.exception_policy().exclusion()
                             == super::ExceptionExclusion::None
-                        && matches!(
+                        && (matches!(
                             instruction.exception_policy().owner(),
                             NormalizedExceptionOwner::Present
                                 | NormalizedExceptionOwner::DynamicCondition
-                        )
-                        && owners
-                            .get(&instruction_index)
-                            .is_none_or(|decision| !decision.definitive)
+                        ) || threaded_paired_pop_marker)
+                        && owners.get(&instruction_index).is_none_or(|decision| {
+                            !decision.definitive
+                                || (threaded_paired_pop_marker
+                                    && decision.has_owner
+                                    && decision.source_region.is_none()
+                                    && !decision.override_existing)
+                        })
                         && let Some((array, pop, slot, region)) = early_return_nop_slot
                         && original_array_start == array
                         && (instruction_index == slot
-                            || slot.checked_add(1) == Some(instruction_index))
+                            || slot.checked_add(1) == Some(instruction_index)
+                            || (indexed_instructions[pop]
+                                .local_policy
+                                .hidden_exception_owner_slots()
+                                == 2
+                                && slot.checked_add(2) == Some(instruction_index)))
                         && instruction_index - pop == 3
                         && matches!(
                             indexed_instructions[pop + 1].opcode,

@@ -4829,6 +4829,104 @@ impl Assembler {
             });
     }
 
+    /// Captures a direct named-handler break followed by its copied local None test.
+    pub(crate) fn record_copied_break_handler_cleanup(&mut self, break_item: usize) {
+        let items = self.linear_items();
+        let records = items
+            .iter()
+            .enumerate()
+            .skip(break_item)
+            .filter_map(|(index, item)| match item {
+                Item::Instruction(instruction) => Some((index, *instruction)),
+                Item::Label(_) => None,
+            })
+            .take(8)
+            .collect::<Vec<_>>();
+        if records.len() != 8 || records[0].0 != break_item {
+            return;
+        }
+        let authored = records[0].1;
+        let cleanup = &records[1..5];
+        let load = records[5].1;
+        let condition = records[6].1;
+        let marker = records[7].1;
+        if authored.opcode != NOP
+            || authored.location.line < 0
+            || cleanup[0].1.opcode != POP_EXCEPT
+            || cleanup[1].1.opcode != LOAD_CONST
+            || cleanup[2].1.opcode != STORE_FAST
+            || cleanup[3].1.opcode != DELETE_FAST
+            || cleanup[2].1.operand() != cleanup[3].1.operand()
+            || cleanup.iter().any(|(_, instruction)| {
+                instruction.location != authored.location
+                    || instruction.exception_policy() != ExceptionPolicy::default()
+            })
+            || !matches!(load.opcode, LOAD_FAST | crate::target::opcodes::LOAD_DEREF)
+            || !matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+            || !matches!(condition.operand(), Operand::Forward(_))
+            || condition.local_policy.hidden_exception_owner_slots() != 3
+            || condition.pre_fold_extra_instructions() != 0
+            || condition.exception_policy() != ExceptionPolicy::default()
+            || marker.opcode != NOT_TAKEN
+            || marker.location != condition.location
+            || marker.operand() != Operand::Value(0)
+            || records.iter().enumerate().any(|(index, (_, instruction))| {
+                (index != 6 && instruction.local_policy.hidden_exception_owner_slots() != 0)
+                    || instruction.pre_fold_extra_instructions() != 0
+                    || instruction.no_location_policy.borrow_fallthrough()
+                        != BorrowFallthrough::Reachable
+            })
+        {
+            return;
+        }
+        let labels = items[break_item..records[7].0]
+            .iter()
+            .filter_map(|item| match item {
+                Item::Label(label) => Some(*label),
+                Item::Instruction(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let provenance = &self.exception_owner_provenance;
+        if labels.iter().any(|label| {
+            provenance.source_boundaries.contains(label)
+                || provenance.block_boundaries.contains(label)
+                || provenance.fusion_boundaries.contains(label)
+                || provenance.setups.iter().any(|(setup, _)| setup == label)
+                || provenance.omitted_nop_counts.contains_key(label)
+                || provenance.omitted_nop_locations.contains_key(label)
+                || self.preserved_block_boundaries.contains(label)
+                || self
+                    .exception_regions
+                    .iter()
+                    .any(|region| region.target == *label)
+        }) || items.iter().any(|item| {
+            matches!(item, Item::Instruction(instruction)
+            if matches!(instruction.operand(), Operand::Forward(target) | Operand::Backward(target)
+                if labels.contains(&target)))
+        }) {
+            return;
+        }
+        let Some(start) = items[break_item + 1..records[1].0]
+            .iter()
+            .find_map(|item| match item {
+                Item::Label(label) => Some(*label),
+                Item::Instruction(_) => None,
+            })
+        else {
+            return;
+        };
+        let Some(end) = items[records[4].0 + 1..records[5].0]
+            .iter()
+            .find_map(|item| match item {
+                Item::Label(label) => Some(*label),
+                Item::Instruction(_) => None,
+            })
+        else {
+            return;
+        };
+        self.record_copied_handler_cleanup(start, end, break_item, true);
+    }
+
     /// Captures a direct named-handler continue and its first copied call condition.
     pub(crate) fn record_copied_continue_handler_cleanup(&mut self, continue_item: usize) {
         use crate::target::opcodes::CALL;
