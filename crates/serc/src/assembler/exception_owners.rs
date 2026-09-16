@@ -131,6 +131,7 @@ pub(super) struct TupleJoinLocationOrigin {
 /// Two adjacent original NULL POP records followed by a copied-finally local None test.
 #[derive(Debug)]
 pub(super) struct CopiedReturnNonePrefix {
+    pub(super) return_nop: Option<Instruction>,
     pub(super) pops: [Instruction; 2],
     pub(super) load: Instruction,
     pub(super) condition: Instruction,
@@ -2627,7 +2628,10 @@ impl LayoutAssembler {
                             && tail.insertions == 0
                             && tail.late_removals == 0
                             && tail.post_compaction_fusions == 0
-                            && instruction.local_policy.hidden_exception_owner_slots() == 1
+                            && matches!(
+                                instruction.local_policy.hidden_exception_owner_slots(),
+                                1 | 2
+                            )
                             && instruction.pre_fold_extra_instructions() == 0
                             && instruction.no_location_policy.borrow_fallthrough()
                                 != super::BorrowFallthrough::Barrier
@@ -2640,17 +2644,59 @@ impl LayoutAssembler {
                             && !self.exception_regions[region].is_scope_fallback
                             && !self.exception_regions[region].preserve_lasti
                         {
-                            let matching_pairs = self
-                                .exception_owner_provenance
-                                .early_return_nop_pairs
-                                .iter()
-                                .filter(|(_, pop, target)| {
-                                    let mut expected = *pop;
-                                    expected.local_policy.add_hidden_exception_owner_slots(1);
-                                    expected == *instruction
-                                        && self.exception_regions[region].target == *target
-                                })
-                                .count();
+                            let matching_pairs = if instruction
+                                .local_policy
+                                .hidden_exception_owner_slots()
+                                == 1
+                            {
+                                self.exception_owner_provenance
+                                    .early_return_nop_pairs
+                                    .iter()
+                                    .filter(|(_, pop, target)| {
+                                        let mut expected = *pop;
+                                        expected.local_policy.add_hidden_exception_owner_slots(1);
+                                        expected == *instruction
+                                            && self.exception_regions[region].target == *target
+                                    })
+                                    .count()
+                            } else {
+                                // The authored return NOP and ordinary-try POP compact
+                                // into the finally POP. Their old cells remain owned and
+                                // NULL respectively, before the retained POP's NULL cell.
+                                self.exception_owner_provenance
+                                    .copied_return_none_prefixes
+                                    .iter()
+                                    .filter(|origin| {
+                                        let mut expected_pop = origin.pops[1];
+                                        expected_pop
+                                            .local_policy
+                                            .add_hidden_exception_owner_slots(2);
+                                        let Some(load) =
+                                            indexed_instructions.get(instruction_index + 1)
+                                        else {
+                                            return false;
+                                        };
+                                        let mut expected_load = origin.load;
+                                        if load.opcode == crate::target::opcodes::LOAD_FAST_BORROW {
+                                            expected_load.opcode = load.opcode;
+                                        }
+                                        origin.return_nop.is_some()
+                                            && expected_pop == *instruction
+                                            && expected_load == **load
+                                            && indexed_instructions
+                                                .get(instruction_index + 2)
+                                                .is_some_and(|condition| {
+                                                    **condition == origin.condition
+                                                })
+                                            && jump_targets.iter().all(|target| {
+                                                label_positions.get(target).is_none_or(|position| {
+                                                    *position <= instruction_index
+                                                        || *position > instruction_index + 3
+                                                })
+                                            })
+                                    })
+                                    .count()
+                            };
                             if matching_pairs == 1
                                 && let Some(slot) =
                                     instruction_index.checked_add(tail.early_removals)

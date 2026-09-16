@@ -37,6 +37,7 @@ mod constant_false_comprehension_filters;
 mod context_manager_return_handler_nesting;
 mod copied_exit_borrow_fusion_compatibility;
 mod copied_finally_call_return_compatibility;
+mod copied_finally_global_fold_owners;
 mod copied_finally_handler_reachability;
 mod copied_finally_local_order;
 mod copied_finally_loop_control;
@@ -466,5 +467,7 @@ mod extra_not_taken_owner;
 mod outer_branch_try_tail;
 
 mod coroutine_nested_value_owners;
+
+mod ternary_tuple_exit;
 
 mod empty_try_nop_owner;

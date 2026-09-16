@@ -6579,6 +6579,11 @@ impl Compiler<'_> {
         )?;
         if defer_return {
             self.assembler.set_location(return_location);
+            if self.source_location(expression.range()).line != return_location.line {
+                // CPython keeps the return-line marker through early exit copying.
+                // It counts toward the original block's four-instruction copy limit.
+                self.emit(NOP, 0, 0)?;
+            }
             self.emit(RETURN_VALUE, 0, -1)?;
         }
         Ok(())

@@ -4098,7 +4098,11 @@ impl Assembler {
     }
 
     /// Records two adjacent emitted return-unwind POPs and their direct local None test.
-    pub(crate) fn record_copied_return_none_prefix(&mut self, first_pop_item: usize) {
+    pub(crate) fn record_copied_return_none_prefix(
+        &mut self,
+        return_item: usize,
+        first_pop_item: usize,
+    ) {
         let Some(
             [
                 Item::Instruction(first_pop),
@@ -4131,9 +4135,25 @@ impl Assembler {
         {
             return;
         }
+        let return_nop = match self.linear_items().get(return_item..first_pop_item) {
+            Some([Item::Instruction(authored), labels @ ..])
+                if authored.opcode == NOP
+                    && authored.exception_policy() == ExceptionPolicy::NoneUnchanged
+                    && !authored.fusion_policy.is_converted_pop_block()
+                    && authored.local_policy.hidden_exception_owner_slots() == 0
+                    && authored.pre_fold_extra_instructions() == 0
+                    && authored.location == pops[0].location
+                    && authored.depth_after() == pops[0].depth_after()
+                    && labels.iter().all(|item| matches!(item, Item::Label(_))) =>
+            {
+                Some(*authored)
+            }
+            _ => None,
+        };
         self.exception_owner_provenance
             .copied_return_none_prefixes
             .push(exception_owners::CopiedReturnNonePrefix {
+                return_nop,
                 pops,
                 load,
                 condition,

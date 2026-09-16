@@ -6368,8 +6368,10 @@ impl Compiler<'_> {
                     if result.is_ok()
                         && let Some(first_pop_item) = copied_return_none_pop_pair
                     {
-                        self.assembler
-                            .record_copied_return_none_prefix(first_pop_item);
+                        self.assembler.record_copied_return_none_prefix(
+                            copied_handler_return_item,
+                            first_pop_item,
+                        );
                     }
                     if result.is_ok()
                         && let Some(pop_item) = copied_manager_none_pop
