@@ -455,3 +455,5 @@ mod nested_exit_regression_controls;
 mod original_cleanup_provenance;
 
 mod split_loop_tail_owner_continuations;
+
+mod terminal_while_cleanup;

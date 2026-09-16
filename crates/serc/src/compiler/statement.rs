@@ -6046,6 +6046,7 @@ impl Compiler<'_> {
                     // expression with multiple exits can leave this marker at their join.
                     let starts_jump_target = self.assembler.at_jump_target();
                     self.assembler.set_location(unwind_location);
+                    let mut copied_return_none_pop_pair = None;
                     if return_finally_contexts.len() == 1
                         && handler_count == 0
                         && let Some(ordinary_try_count) = self
@@ -6069,6 +6070,9 @@ impl Compiler<'_> {
                     {
                         // Ordinary tries nested inside this finally unwind first. Each
                         // POP_BLOCK remains a distinct NULL record after NOP compaction.
+                        if ordinary_try_count == 1 {
+                            copied_return_none_pop_pair = Some(self.assembler.item_count());
+                        }
                         for _ in 0..ordinary_try_count {
                             self.emit_with_exception_policy(
                                 NOP,
@@ -6277,6 +6281,12 @@ impl Compiler<'_> {
                             }
                         },
                     );
+                    if result.is_ok()
+                        && let Some(first_pop_item) = copied_return_none_pop_pair
+                    {
+                        self.assembler
+                            .record_copied_return_none_prefix(first_pop_item);
+                    }
                     if result.is_ok()
                         && let Some(pop_item) = copied_manager_none_pop
                     {
@@ -16600,6 +16610,60 @@ impl Compiler<'_> {
                 if loop_statement.orelse.is_empty()
                     && fold_constant(&loop_statement.test).is_none()
                     && !expression_contains_inline_branch(&loop_statement.test));
+        // The retry's successful else-break survives as a jump into normal cleanup.
+        // Its dynamic false edge keeps the shared loop exit located after cold movement.
+        // A raising outer handler does not erase that independent entry. Keep the
+        // source-edge barrier and original-label checks for all other entry routes.
+        let runtime_retry_break_reaches_finally = !statement.is_star
+            && statement.orelse.is_empty()
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && self.control.loops.contexts.is_empty()
+            && self.control.withs.active_with_exits.is_empty()
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            && !self.control.in_exception_handler()
+            && self.control.finally.active_finally_try_bodies == 0
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+            && matches!(statement.handlers.as_slice(), [handler]
+            if handler.as_except_handler().is_some_and(|handler| {
+                handler.type_.as_deref().is_some_and(|type_| {
+                    !expression_contains_inline_branch(type_)
+                }) && handler.name.is_some()
+                    && suite_has_linear_raise_exit(&handler.body)
+            }))
+            && statement.body.split_last().is_some_and(|(last, leading)| {
+                (leading.is_empty() || suite_has_linear_borrow_fallthrough(leading))
+                    && matches!(last, Stmt::While(retry)
+                    if retry.orelse.is_empty()
+                        && condition_has_only_runtime_tests(&retry.test)
+                        && !expression_contains_inline_branch(&retry.test)
+                        && original_condition_has_unique_jump_target(&retry.test, false)
+                        && matches!(retry.body.as_slice(), [Stmt::Try(attempt)]
+                            if !attempt.is_star
+                                && attempt.finalbody.is_empty()
+                                && suite_has_linear_borrow_fallthrough(&attempt.body)
+                                && matches!(attempt.orelse.as_slice(), [Stmt::Break(_)])
+                                && matches!(attempt.handlers.as_slice(), [handler]
+                                    if handler.as_except_handler().is_some_and(|handler| {
+                                        handler.type_.as_deref().is_some_and(|type_| {
+                                            !expression_contains_inline_branch(type_)
+                                        }) && handler.name.is_some()
+                                            && suite_has_linear_borrow_fallthrough(&handler.body)
+                                    }))))
+            })
+            && matches!(statement.finalbody.as_slice(), [Stmt::If(cleanup)]
+                if cleanup.elif_else_clauses.is_empty()
+                    && matches!(cleanup.test.as_ref(), Expr::Compare(compare)
+                        if matches!(compare.left.as_ref(), Expr::Name(_))
+                            && compare.ops[..] == [CmpOp::IsNot]
+                            && matches!(&compare.comparators[..], [Expr::NoneLiteral(_)]))
+                    && suite_has_linear_borrow_fallthrough(&cleanup.body));
         // A synchronous manager in a coroutine emits a located normal __exit__
         // call after its terminal await. That original array can jump from a live
         // conditional arm into normal cleanup; the suppression copy stays separate.
@@ -17419,6 +17483,7 @@ impl Compiler<'_> {
             || compound_fallthrough_handlers_reach_finally
             || runtime_while_handlers_reach_finally)
             && (!has_empty_handler_or_else_exit || else_bypasses_empty_handler_exit)
+            || runtime_retry_break_reaches_finally
             || conditional_body_reaches_finally
             || raising_alternative_reaches_finally
             || conditional_break_reaches_finally

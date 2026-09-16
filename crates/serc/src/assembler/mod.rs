@@ -4097,6 +4097,49 @@ impl Assembler {
         }
     }
 
+    /// Records two adjacent emitted return-unwind POPs and their direct local None test.
+    pub(crate) fn record_copied_return_none_prefix(&mut self, first_pop_item: usize) {
+        let Some(
+            [
+                Item::Instruction(first_pop),
+                Item::Instruction(final_pop),
+                Item::Instruction(load),
+                Item::Instruction(condition),
+                ..,
+            ],
+        ) = self.linear_items().get(first_pop_item..)
+        else {
+            return;
+        };
+        let pops = [*first_pop, *final_pop];
+        let load = *load;
+        let condition = *condition;
+        if pops.iter().any(|pop| {
+            pop.opcode != NOP
+                || pop.operand() != Operand::Value(0)
+                || !pop.fusion_policy.is_converted_pop_block()
+                || pop.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
+                || pop.local_policy.hidden_exception_owner_slots() != 0
+                || pop.pre_fold_extra_instructions() != 0
+        }) || !matches!(load.opcode, LOAD_FAST | crate::target::opcodes::LOAD_DEREF)
+            || load.local_policy.hidden_exception_owner_slots() != 0
+            || load.pre_fold_extra_instructions() != 0
+            || !matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+            || !matches!(condition.operand(), Operand::Forward(_))
+            || condition.local_policy.hidden_exception_owner_slots() != 3
+            || condition.pre_fold_extra_instructions() != 0
+        {
+            return;
+        }
+        self.exception_owner_provenance
+            .copied_return_none_prefixes
+            .push(exception_owners::CopiedReturnNonePrefix {
+                pops,
+                load,
+                condition,
+            });
+    }
+
     /// Captures an awaited manager return whose two omitted POPs precede its finally POP.
     pub(crate) fn record_copied_manager_return_none_prefix(
         &mut self,

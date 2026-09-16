@@ -194,3 +194,34 @@ fn copied_return_pop_slot_source(request: &str) -> String {
 "#
     )
 }
+
+#[test]
+fn copied_call_return_none_marker_after_completed_async_manager() {
+    common::assert_matches_cpython_marshal(
+        copied_call_return_none_source(),
+        "copied_call_return_none_after_async_manager.py",
+    );
+}
+
+#[test]
+fn copied_call_return_none_marker_without_handler_control() {
+    let source = copied_call_return_none_source().replace(
+        "    except Exception:\n        return Result(value=None)\n",
+        "",
+    );
+    common::assert_matches_cpython_marshal(&source, "copied_call_return_none_without_handler.py");
+}
+
+fn copied_call_return_none_source() -> &'static str {
+    r"async def collect(resource, payload):
+    try:
+        async with channel(resource):
+            await ready()
+        return Result(value=payload)
+    except Exception:
+        return Result(value=None)
+    finally:
+        if resource is not None:
+            await resource.close()
+"
+}

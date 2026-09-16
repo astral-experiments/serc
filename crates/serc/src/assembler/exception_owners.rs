@@ -39,6 +39,7 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) retained_normal_pop_blocks: FxHashMap<Label, RetainedNormalPopBlock>,
     pub(super) original_normal_finally_arrays: Vec<OriginalNormalFinallyArray>,
     pub(super) normal_finally_none_prefixes: Vec<(Instruction, Instruction, Instruction)>,
+    pub(super) copied_return_none_prefixes: Vec<CopiedReturnNonePrefix>,
     pub(super) copied_manager_return_none_prefixes: Vec<CopiedManagerReturnNonePrefix>,
     pub(super) uncompacted_conditional_arrays: Vec<UncompactedConditionalArray>,
     pub(super) original_primitive_condition_boundaries: Vec<Instruction>,
@@ -123,6 +124,14 @@ pub(super) struct TupleJoinLocationOrigin {
     pub(super) predecessor: Label,
     pub(super) store: Instruction,
     pub(super) jump: Instruction,
+}
+
+/// Two adjacent original NULL POP records followed by a copied-finally local None test.
+#[derive(Debug)]
+pub(super) struct CopiedReturnNonePrefix {
+    pub(super) pops: [Instruction; 2],
+    pub(super) load: Instruction,
+    pub(super) condition: Instruction,
 }
 
 /// Exact awaited return and manager unwind, with two omitted POPs before its finally POP.
@@ -3524,22 +3533,37 @@ impl LayoutAssembler {
                             .exception_owner_provenance
                             .normal_finally_none_prefixes
                             .iter()
-                            .map(|(pop, load, condition)| (pop, load, condition, None));
+                            .map(|(pop, load, condition)| (pop, load, condition, None, false));
                         let copied_prefixes = self
                             .exception_owner_provenance
                             .copied_manager_return_none_prefixes
                             .iter()
                             .map(|origin| {
-                                (&origin.pop, &origin.load, &origin.condition, Some(origin))
+                                (
+                                    &origin.pop,
+                                    &origin.load,
+                                    &origin.condition,
+                                    Some(origin),
+                                    false,
+                                )
                             });
-                        for (original_pop, original_load, original_condition, copied) in
-                            normal_prefixes.chain(copied_prefixes)
+                        let paired_prefixes = self
+                            .exception_owner_provenance
+                            .copied_return_none_prefixes
+                            .iter()
+                            .map(|origin| {
+                                (&origin.pops[1], &origin.load, &origin.condition, None, true)
+                            });
+                        for (original_pop, original_load, original_condition, copied, paired) in
+                            normal_prefixes
+                                .chain(copied_prefixes)
+                                .chain(paired_prefixes)
                         {
                             if instruction != original_condition {
                                 continue;
                             }
                             let removed_pop = load.local_policy.hidden_exception_owner_slots();
-                            if removed_pop > 1 {
+                            if (paired && removed_pop != 2) || (!paired && removed_pop > 1) {
                                 continue;
                             }
                             let mut expected_load = *original_load;
@@ -3633,15 +3657,19 @@ impl LayoutAssembler {
                                 .checked_add(omitted_pops)
                                 .and_then(|removed| {
                                     removed
-                                        .checked_sub(comparison_removals + usize::from(removed_pop))
+                                        // A captured pair's first POP precedes the final NULL
+                                        // POP. Keep its removal in the earlier-slot count.
+                                        .checked_sub(
+                                            comparison_removals + usize::from(removed_pop > 0),
+                                        )
                                 })
                                 .and_then(|removed_before| load_index.checked_add(removed_before));
-                            if removed_pop == 1 && original_pop_slot == Some(instruction_index + 1)
-                            {
+                            if removed_pop > 0 && original_pop_slot == Some(instruction_index + 1) {
                                 pending_normal_none_owner = Some((instruction_index + 1, None));
                                 continue;
                             }
-                            if copied.is_some()
+                            if paired
+                                || copied.is_some()
                                 || tail.early_removals != 3 + usize::from(removed_pop)
                             {
                                 continue;
