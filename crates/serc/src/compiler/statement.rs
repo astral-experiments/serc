@@ -6960,7 +6960,13 @@ impl Compiler<'_> {
         let mut first_branch_max_depth = None;
         for (branch_index, (test, body)) in branches.into_iter().enumerate() {
             if let Some(test) = test {
-                let next = self.assembler.label();
+                // CPython uses one original array for the false edge and the end
+                // of a final branch without an else suite.
+                let next = if branch_index + 1 == branch_count {
+                    end
+                } else {
+                    self.assembler.label()
+                };
                 let negated_method_call_condition = matches!(test, Expr::UnaryOp(unary)
                     if unary.op == UnaryOp::Not
                         && matches!(unary.operand.as_ref(), Expr::Call(call)
@@ -8393,8 +8399,10 @@ impl Compiler<'_> {
                     }
                 }
                 // The false branch starts its own original instruction array.
-                self.assembler.record_exception_owner_block_boundary(next);
-                self.assembler.mark(next);
+                if next != end {
+                    self.assembler.record_exception_owner_block_boundary(next);
+                    self.assembler.mark(next);
+                }
                 self.set_depth(base_depth);
             } else {
                 let body_start = self.assembler.instruction_count();

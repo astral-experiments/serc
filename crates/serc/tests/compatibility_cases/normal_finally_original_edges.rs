@@ -983,3 +983,78 @@ fn matches_cpython_marshal_for_nonlinear_arm_nested_finally_entry_call_control()
         "nonlinear_arm_nested_finally_entry_call_control.py",
     );
 }
+
+fn conditional_handler_guarded_cleanup_source() -> &'static str {
+    r#"class Processor:
+    def execute(self, key, text, mode, payload):
+        worker: object | None = None
+        try:
+            workspace = self.prepare(key)
+            self.journal.record(key, phase="starting")
+            session, environment = self.backend.create(mode, key)
+            self.journal.record(key, session=session, environment=environment)
+            worker = self.backend.start(session, environment, workspace)
+            self.journal.record(key, phase="running", identifier=self.backend.identifier(worker))
+            self.backend.submit(session, self.render(text, payload))
+            terminal = False
+            for event in self.backend.events(session, worker):
+                self.journal.append(key, event)
+                projection = project(event)
+                if projection.terminal:
+                    terminal = True
+                    if not self.action_required(key):
+                        self.journal.record(key, phase=projection.phase or "complete", error=projection.error)
+                    break
+            if not terminal:
+                raise RuntimeError("stream ended before completion")
+        except ActionRequired as error:
+            self.journal.record(key, phase="needs input", error=None, required_action=error.action)
+        except Exception as error:
+            if not self.action_required(key):
+                self.journal.record(key, phase="failed", error=str(error))
+        finally:
+            if worker is not None:
+                try:
+                    self.backend.stop(worker)
+                except Exception as error:
+                    if not self.action_required(key):
+                        self.journal.record(key, phase="failed", error=f"cleanup failed: {error}")
+"#
+}
+
+#[test]
+fn matches_cpython_marshal_for_conditional_handler_guarded_cleanup_target() {
+    common::assert_matches_cpython_marshal(
+        conditional_handler_guarded_cleanup_source(),
+        "conditional_handler_guarded_cleanup_target.py",
+    );
+}
+
+#[test]
+fn matches_cpython_marshal_for_conditional_handler_guarded_cleanup_entry_call_control() {
+    let source = conditional_handler_guarded_cleanup_source().replace(
+        "        finally:\n            if worker is not None:\n",
+        "        finally:\n            cleanup_started()\n            if worker is not None:\n",
+    );
+    common::assert_matches_cpython_marshal(
+        &source,
+        "conditional_handler_guarded_cleanup_entry_call_control.py",
+    );
+}
+
+#[test]
+fn matches_cpython_marshal_for_conditional_handler_guarded_cleanup_body_call_control() {
+    let source = conditional_handler_guarded_cleanup_source().replace(
+        r#"                raise RuntimeError("stream ended before completion")
+        except ActionRequired as error:
+"#,
+        r#"                raise RuntimeError("stream ended before completion")
+            body_finished()
+        except ActionRequired as error:
+"#,
+    );
+    common::assert_matches_cpython_marshal(
+        &source,
+        "conditional_handler_guarded_cleanup_body_call_control.py",
+    );
+}
