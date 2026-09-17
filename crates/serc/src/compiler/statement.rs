@@ -280,6 +280,8 @@ struct TryCompileOptions {
     terminal: bool,
     emit_statement_nop: bool,
     exclude_terminal_body_not_taken: bool,
+    // Only the owning finally producer can certify this original else-exit NOP.
+    retained_else_break_exit: bool,
     loop_tail: Option<(Label, bool)>,
 }
 
@@ -288,6 +290,7 @@ impl TryCompileOptions {
         terminal: false,
         emit_statement_nop: true,
         exclude_terminal_body_not_taken: false,
+        retained_else_break_exit: false,
         loop_tail: None,
     };
     const TERMINAL: Self = Self {
@@ -302,6 +305,7 @@ impl TryCompileOptions {
         terminal: false,
         emit_statement_nop: false,
         exclude_terminal_body_not_taken: false,
+        retained_else_break_exit: false,
         loop_tail: None,
     };
 
@@ -5637,6 +5641,56 @@ impl Compiler<'_> {
                 } else {
                     Vec::new()
                 };
+                // This manager encloses the complete handler/iterator/finally unwind.
+                // Its asynchronous exit runs afterwards, outside this original POP array.
+                let retains_async_manager_handler_iterator_pops = preserve_tos
+                    && !return_is_overridden
+                    && self.context.target_specific_rules_enabled()
+                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                        == CO_COROUTINE
+                    && handler_count == 1
+                    && self.control.exceptions.active_try_marker_slots.is_empty()
+                    && self.control.finally.active_finally_end_blocks == 0
+                    && self.control.finally.active_normal_finally_bodies == 0
+                    && self.control.finally.active_copied_finally_bodies == 0
+                    && self
+                        .control
+                        .finally
+                        .active_pass_finally_locations
+                        .is_empty()
+                    && self
+                        .control
+                        .finally
+                        .preserved_return_value_contexts
+                        .is_empty()
+                    && matches!(
+                        (
+                            self.control.exceptions.active_exception_handlers.as_slice(),
+                            return_finally_contexts.as_slice(),
+                            self.control.withs.active_with_exits.as_slice(),
+                            self.control.loops.contexts.as_slice(),
+                        ),
+                        ([handler], [finally], [manager], [iterator])
+                            if handler.name.is_some()
+                                && handler.with_depth == 1
+                                && handler.loop_depth == 1
+                                && handler.try_body_depth == 0
+                                && handler.exception_region_depth == finally.exception_region_depth + 1
+                                && self.control.exceptions.active_exception_region_exclusions.len()
+                                    == handler.exception_region_depth + 1
+                                && finally.handler_depth == 0
+                                && finally.with_depth == 1
+                                && finally.loop_depth == 0
+                                && finally.try_body_depth == 0
+                                && manager.is_async
+                                && manager.loop_depth == 0
+                                && manager.normal_finally_depth == 0
+                                && manager.exception_region_depth == finally.exception_region_depth
+                                && iterator.iterator_cleanup == IteratorCleanup::Sync
+                                && iterator.with_depth == 1
+                                && iterator.finally_end_depth == 0
+                                && iterator.exception_region_depth == handler.exception_region_depth
+                    );
                 let unwinds_return_finally = !return_finally_contexts.is_empty();
                 let preserved_return_value_contexts =
                     self.control.finally.preserved_return_value_contexts.clone();
@@ -5783,6 +5837,7 @@ impl Compiler<'_> {
                             && self.control.finally.active_finally_end_blocks == 0
                             && self.control.finally.active_normal_finally_bodies == 0
                             && (self.control.withs.active_with_exits.is_empty()
+                                || retains_async_manager_handler_iterator_pops
                                 // Enclosing managers unwind after this handler and its finally.
                                 // Their presence does not remove either original handler POP.
                                 || (preserve_tos
@@ -6504,7 +6559,8 @@ impl Compiler<'_> {
                         && !return_is_overridden
                         && handler_count == 1
                         && return_finally_contexts.len() == 1
-                        && self.control.withs.active_with_exits.is_empty()
+                        && (self.control.withs.active_with_exits.is_empty()
+                            || retains_async_manager_handler_iterator_pops)
                         && finally_context.loop_depth < next_loop
                         && self.control.loops.contexts[finally_context.loop_depth..next_loop]
                             .iter()
@@ -12972,6 +13028,7 @@ impl Compiler<'_> {
             terminal,
             emit_statement_nop,
             exclude_terminal_body_not_taken,
+            retained_else_break_exit,
             loop_tail,
         } = options;
         if statement.is_star {
@@ -14597,6 +14654,12 @@ impl Compiler<'_> {
                     // CPython removes this jump but keeps the empty CFG block, which
                     // stops borrowed-load traversal through its physical fallthrough.
                     self.assembler.mark_borrow_empty_block(normal_exit);
+                }
+                if retained_else_break_exit {
+                    // This exact original join retains its false-edge location. Keep its
+                    // NOP traversable as well as admitting the owning finally's target.
+                    self.assembler
+                        .mark_retained_nop_borrow_fallthrough_if_unblocked(normal_exit);
                 }
                 // Recovery handlers keep this located normal exit connected to the following
                 // suite. Cold cleanup or an unlocated join can leave an empty block in between.
@@ -17216,7 +17279,37 @@ impl Compiler<'_> {
                             && cleanup.handlers.is_empty()
                             && cleanup.orelse.is_empty()
                             && suite_has_linear_borrow_fallthrough(&cleanup.body)
-                            && suite_has_linear_borrow_fallthrough(&cleanup.finalbody))))
+                            && suite_has_linear_borrow_fallthrough(&cleanup.finalbody)))
+                // A separate-line recovery starts with a retained SETUP_FINALLY NOP.
+                // Its discarded call and linear continuation keep the normal cleanup
+                // nonempty; the assembler still verifies the original setup span.
+                || (matches!(self.unit.scope, Scope::Function { .. })
+                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                    && self.control.loops.contexts.is_empty()
+                    && self.control.withs.active_with_exits.is_empty()
+                    && self.control.exceptions.active_exception_region_exclusions.is_empty()
+                    && !self.control.in_exception_handler()
+                    && self.control.finally.active_finally_try_bodies == 0
+                    && self.control.finally.active_normal_finally_bodies == 0
+                    && self.control.finally.active_finally_end_blocks == 0
+                    && self.control.finally.active_copied_finally_bodies == 0
+                    && self.suite_has_nonempty_borrow_entry(&statement.finalbody)
+                    && matches!(statement.finalbody.as_slice(), [Stmt::Try(cleanup), tail @ ..]
+                        if !cleanup.is_star
+                            && cleanup.orelse.is_empty()
+                            && cleanup.finalbody.is_empty()
+                            && matches!(cleanup.body.as_slice(), [Stmt::Expr(call)]
+                                if matches!(call.value.as_ref(), Expr::Call(_))
+                                    && !expression_contains_inline_branch(&call.value))
+                            && matches!(cleanup.handlers.as_slice(), [handler]
+                                if handler.as_except_handler().is_some_and(|handler| {
+                                    handler.type_.as_deref().is_some_and(|type_| {
+                                        !expression_contains_inline_branch(type_)
+                                    }) && handler.name.is_none()
+                                        && (suite_has_linear_borrow_fallthrough(&handler.body)
+                                            || matches!(handler.body.as_slice(), [Stmt::Pass(_)]))
+                                }))
+                            && suite_has_linear_borrow_fallthrough(tail))))
             && matches!(statement.body.last(), Some(Stmt::While(loop_statement))
                 if loop_statement.orelse.is_empty()
                     && fold_constant(&loop_statement.test).is_none()
@@ -17371,6 +17464,37 @@ impl Compiler<'_> {
                                     && suite_has_linear_borrow_fallthrough(&handler.body)
                             })
                         })));
+        // A runtime guard after linear work leaves a shared first-arm jump into
+        // normal cleanup. Its false edge and nonempty true arm keep that jump
+        // reachable; the final else has a separate normal-exit marker.
+        let synchronous_guarded_recovery_entry = matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && self.control.loops.contexts.is_empty()
+            && self.control.withs.active_with_exits.is_empty()
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            && !self.control.in_exception_handler()
+            && self.control.finally.active_copied_finally_bodies == 0
+            && self.control.finally.active_finally_try_bodies == 0
+            && !statement.handlers.is_empty()
+            && suite_has_linear_borrow_fallthrough(&statement.finalbody)
+            && matches!(statement.body.as_slice(), [Stmt::If(branch)]
+                if branch.body.split_last().is_some_and(|(last, leading)| {
+                    suite_has_linear_borrow_fallthrough(leading)
+                        && matches!(last, Stmt::If(guard)
+                            if guard.elif_else_clauses.is_empty()
+                                && condition_has_only_runtime_tests(&guard.test)
+                                && !expression_contains_inline_branch(&guard.test)
+                                && original_condition_has_unique_jump_target(&guard.test, false)
+                                && matches!(nested_if_exit_location(guard, false), Some(NestedIfExitLocation::Unlocated))
+                                && suite_has_linear_borrow_fallthrough(&guard.body))
+                })
+                && matches!(branch.elif_else_clauses.as_slice(), [clause]
+                    if clause.test.is_none()
+                        && suite_has_linear_borrow_fallthrough(&clause.body)));
         // A live linear arm before the final else keeps a reachable jump directly
         // into normal cleanup after handlers move cold. Folded assertions can leave
         // that jump behind an empty block, so a merely nonterminal arm is insufficient.
@@ -17434,6 +17558,7 @@ impl Compiler<'_> {
                     }) && !suite_contains_abrupt_control_flow(&clause.body)
                 })
                 && (suite_has_linear_borrow_fallthrough(&conditional.body)
+                    || synchronous_guarded_recovery_entry
                     || coroutine_guarded_recovery_entry
                     || coroutine_manager_arm_reaches_finally(&conditional.body)
                     || conditional.elif_else_clauses.iter().any(|clause| {
@@ -17576,12 +17701,62 @@ impl Compiler<'_> {
                     && !expression_suspends_current_scope(&cleanup.test)
                     && cleanup.elif_else_clauses.is_empty()
                     && suite_has_linear_borrow_fallthrough(&cleanup.body));
+        // A sole else-false edge retains its original JUMP_NO_INTERRUPT join:
+        // its condition donates a location before cold movement turns it into a NOP.
+        // The copied break bypasses that join; the nonempty normal array still reaches
+        // the distinct-line cleanup. Keep iterator, nested cleanup and shared joins out.
+        let terminal_else_break_bypasses_empty_exit = !statement.is_star
+            && simple_fallthrough_handlers_reach_finally
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
+            && matches!(self.control.loops.contexts.as_slice(), [context]
+                if context.iterator_cleanup == IteratorCleanup::None && !context.has_orelse)
+            && self.control.withs.active_with_exits.is_empty()
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            && !self.control.in_exception_handler()
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+            && self.control.finally.active_finally_try_bodies == 0
+            && matches!(statement.handlers.as_slice(), [handler]
+            if handler.as_except_handler().is_some_and(|handler| {
+                handler.type_.as_deref().is_some_and(|type_| {
+                    !expression_contains_inline_branch(type_)
+                        && !expression_suspends_current_scope(type_)
+                }) && handler.name.is_none()
+                    && matches!(handler.body.as_slice(), [Stmt::Pass(_)])
+            }))
+            && matches!(statement.body.as_slice(), [Stmt::Expr(body)]
+                if matches!(body.value.as_ref(), Expr::Await(awaited)
+                    if matches!(awaited.value.as_ref(), Expr::Call(_))
+                        && !expression_contains_inline_branch(&awaited.value)
+                        && !expression_suspends_current_scope(&awaited.value)))
+            && matches!(statement.orelse.as_slice(), [Stmt::If(guard)]
+                if condition_has_only_runtime_tests(&guard.test)
+                    && !expression_contains_inline_branch(&guard.test)
+                    && !expression_suspends_current_scope(&guard.test)
+                    && original_condition_has_unique_jump_target(&guard.test, false)
+                    && guard.elif_else_clauses.is_empty()
+                    && matches!(guard.body.as_slice(), [Stmt::Break(_)])
+                    && matches!(statement.finalbody.as_slice(), [Stmt::Expr(cleanup)]
+                        if matches!(cleanup.value.as_ref(), Expr::Call(call)
+                            if call.arguments.is_empty()
+                                && matches!(call.func.as_ref(), Expr::Attribute(method)
+                                    if matches!(method.value.as_ref(), Expr::Attribute(receiver)
+                                        if matches!(receiver.value.as_ref(), Expr::Name(_)))))
+                            && self.source_location(cleanup.range).line
+                                != self.source_location(guard.test.range()).line));
         // A live conditional arm can jump directly to the finally body and bypass those
         // empty blocks. A single plain If arm only falls through the empty else exit.
         let else_bypasses_empty_handler_exit = match statement.orelse.last() {
             Some(tail_statement @ Stmt::If(tail)) => {
                 statement_threads_through_empty_join(tail_statement)
                     || terminal_else_raise_bypasses_empty_exit
+                    || terminal_else_break_bypasses_empty_exit
                     || (tail.elif_else_clauses.is_empty()
                         && tail
                             .body
@@ -18520,8 +18695,14 @@ impl Compiler<'_> {
                         |control| &mut control.exceptions.prevent_try_exit_inlining,
                         true,
                         |compiler| {
-                            compiler
-                                .compile_try_except(statement, TryCompileOptions::NESTED_HANDLER)
+                            compiler.compile_try_except(
+                                statement,
+                                TryCompileOptions {
+                                    retained_else_break_exit:
+                                        terminal_else_break_bypasses_empty_exit,
+                                    ..TryCompileOptions::NESTED_HANDLER
+                                },
+                            )
                         },
                     )?;
                     Ok((true, None))

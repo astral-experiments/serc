@@ -551,3 +551,11 @@ mod mixed_handler_finally_borrow;
 mod normal_finally_handler_fallthrough;
 
 mod nested_match_donated_location;
+
+mod calculated_handler_return_retained_async_manager;
+
+mod guarded_arm_finally_borrow;
+
+mod runtime_while_recovery_cleanup;
+
+mod else_break_finally_borrow;
