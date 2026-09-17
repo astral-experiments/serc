@@ -13022,6 +13022,171 @@ def filled(action, self, mask, result):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_worker_recovery_finally_cleanup() {
+        for (filename, source) in [
+            (
+                "async_conditional_recovery.py",
+                r"async def worker(queue, process):
+    while True:
+        item = await queue.get()
+        await prepare()
+        try:
+            if item is None:
+                return
+            try:
+                result = await process(item.value)
+            except Error as error:
+                if not item.done():
+                    item.set_error(error)
+            else:
+                if not item.done():
+                    item.set_result(result)
+        finally:
+            queue.task_done()
+",
+            ),
+            (
+                "sync_nested_recovery.py",
+                r#"def worker(queue, output, metric, logger, sentinel):
+    while True:
+        item = queue.get()
+        try:
+            if item is sentinel:
+                queue.put(sentinel)
+                return
+            try:
+                prepare(item)
+                result = item.convert()
+                output.put(result)
+            except Error:
+                logger.report(item)
+                try:
+                    metric.update(item)
+                except Error:
+                    logger.report("failed")
+        finally:
+            queue.task_done()
+"#,
+            ),
+            (
+                "async_populated_suffix_control.py",
+                r"async def worker(queue, process):
+    while True:
+        item = await queue.get()
+        await prepare()
+        try:
+            if item is None:
+                return
+            try:
+                result = await process(item.value)
+            except Error as error:
+                if not item.done():
+                    item.set_error(error)
+            else:
+                if not item.done():
+                    item.set_result(result)
+            record(item)
+        finally:
+            queue.task_done()
+",
+            ),
+            (
+                "sync_populated_suffix_control.py",
+                r#"def worker(queue, output, metric, logger, sentinel):
+    while True:
+        item = queue.get()
+        try:
+            if item is sentinel:
+                queue.put(sentinel)
+                return
+            try:
+                prepare(item)
+                result = item.convert()
+                output.put(result)
+            except Error:
+                logger.report(item)
+                try:
+                    metric.update(item)
+                except Error:
+                    logger.report("failed")
+            record(item)
+        finally:
+            queue.task_done()
+"#,
+            ),
+        ] {
+            assert_matches_cpython_marshal(source, filename);
+        }
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_protected_async_surviving_break() {
+        let source = r"async def run(manager, source, value):
+    async with manager:
+        try:
+            async for item in source:
+                if selected(item):
+                    break
+                consume(item)
+        except Error:
+            pass
+        consume(value)
+        consume(source)
+";
+        assert_matches_cpython_marshal(source, "protected_async_surviving_break_control.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_terminal_finally_while_controls() {
+        for (filename, source) in [
+            (
+                "finally_terminal_while_multi_false.py",
+                r"def run(service, release, clock):
+    try:
+        start(service)
+    finally:
+        release()
+        deadline = clock() + 2
+        while service.pending and clock() < deadline:
+            pause()
+    assert service.pending == {}
+",
+            ),
+            (
+                "finally_terminal_while_suffix_control.py",
+                r"def run(service, release, clock):
+    try:
+        start(service)
+    finally:
+        release()
+        deadline = clock() + 2
+        while service.pending and clock() < deadline:
+            pause()
+        complete()
+    assert service.pending == {}
+",
+            ),
+            (
+                "finally_terminal_while_break_control.py",
+                r"def run(service, release, clock):
+    try:
+        start(service)
+    finally:
+        release()
+        deadline = clock() + 2
+        while service.pending and clock() < deadline:
+            if stop():
+                break
+            pause()
+    assert service.pending == {}
+",
+            ),
+        ] {
+            assert_matches_cpython_marshal(source, filename);
+        }
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_copied_finally_prefix_owners() {
         let source = include_str!("fixtures/copied_finally_prefix_owners.py");
         assert_matches_cpython_marshal(source, "copied_finally_prefix_owners.py");
@@ -13663,3 +13828,50 @@ mod original_empty_loop_backedge;
 
 #[path = "compatibility_cases/original_named_cleanup_join.rs"]
 mod original_named_cleanup_join;
+
+#[test]
+fn matches_cpython_name_returns_after_terminal_handlers_with_awaited_finally() {
+    for (source, filename) in [
+        (
+            r"async def run(channel, result):
+    try:
+        try:
+            await channel.work()
+        except Error as error:
+            raise convert(error) from error
+        return result
+    finally:
+        await channel.close()
+",
+            "awaited_finally_name_return.py",
+        ),
+        (
+            r"async def run(channel, result):
+    try:
+        try:
+            await channel.work()
+        except Error as error:
+            raise convert(error) from error
+        return result
+    finally:
+        channel.close()
+",
+            "synchronous_call_finally_name_return_control.py",
+        ),
+        (
+            r"async def run(channel, result):
+    try:
+        try:
+            await channel.work()
+        except Error as error:
+            raise convert(error) from error
+        return result
+    finally:
+        pass
+",
+            "pass_finally_name_return_control.py",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

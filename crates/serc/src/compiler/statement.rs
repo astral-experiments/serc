@@ -13537,8 +13537,47 @@ impl Compiler<'_> {
             self.control.statements.current_statement_has_following
                 || self.control.loops.synthesized_loop_tail_predecessor == Some(statement.range)
                 || self.control.loops.split_loop_tail_prefix_end == Some(statement.range);
-        let borrow_exit_has_successor =
-            borrow_exit_has_source_successor || normal_exit_reaches_enclosing_manager;
+        // A direct tail recovery also has the enclosing finally's normal cleanup
+        // as its successor. Its original empty join still stops borrowing even
+        // though that cleanup is outside this statement's source suite.
+        let normal_exit_reaches_enclosing_finally = statement.finalbody.is_empty()
+            && !statement.is_star
+            && suite_has_linear_borrow_fallthrough(&statement.body)
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+            && matches!(self.control.loops.contexts.as_slice(), [context]
+                if context.iterator_cleanup == IteratorCleanup::None && !context.has_orelse)
+            && self.control.withs.active_with_exits.is_empty()
+            && self.control.exceptions.active_exception_handlers.is_empty()
+            && self.control.finally.active_finally_try_bodies == 1
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+            && self.control.exceptions.direct_try_body_statements.last() == Some(&statement.range)
+            && self
+                .control
+                .finally
+                .active_return_finally_contexts
+                .last()
+                .is_some_and(|context| {
+                    context.loop_depth == self.control.loops.contexts.len()
+                        && context.with_depth == 0
+                        && context.handler_depth == 0
+                        && context.exception_region_depth.checked_add(1)
+                            == Some(
+                                self.control
+                                    .exceptions
+                                    .active_exception_region_exclusions
+                                    .len(),
+                            )
+                        && matches!(context.body.as_slice(), [Stmt::Expr(cleanup)]
+                        if matches!(cleanup.value.as_ref(), Expr::Call(_))
+                            && !expression_contains_inline_branch(&cleanup.value)
+                            && !expression_suspends_current_scope(&cleanup.value))
+                });
+        let borrow_exit_has_successor = borrow_exit_has_source_successor
+            || normal_exit_reaches_enclosing_manager
+            || normal_exit_reaches_enclosing_finally;
         let handler_has_orphan_cold_cleanup = statement.handlers.iter().any(|handler| {
             handler
                 .as_except_handler()
@@ -14875,6 +14914,11 @@ impl Compiler<'_> {
                     matches!(context.body.as_slice(), [Stmt::Expr(expression)]
                         if matches!(expression.value.as_ref(), Expr::Call(_))
                             && !expression_contains_inline_branch(&expression.value))
+                        || matches!(context.body.as_slice(), [Stmt::Expr(expression)]
+                            if matches!(expression.value.as_ref(), Expr::Await(awaited)
+                                if matches!(awaited.value.as_ref(), Expr::Call(_))
+                                    && !expression_contains_inline_branch(&awaited.value)
+                                    && !expression_suspends_current_scope(&awaited.value)))
                         || matches!(context.body.as_slice(), [Stmt::If(conditional)]
                             if conditional.elif_else_clauses.is_empty()
                                 && matches!(conditional.test.as_ref(), Expr::Compare(comparison)
@@ -19764,6 +19808,13 @@ impl Compiler<'_> {
                 || matches!(statement.finalbody.last(), Some(Stmt::For(tail))
                     if tail.orelse.is_empty()
                         && suite_ends_in_empty_try_exit_block(&tail.body, false))
+                || (!preserve_exit_nop
+                    && finalizer_tail_count == 0
+                    && matches!(statement.finalbody.last(), Some(Stmt::While(tail))
+                        if tail.orelse.is_empty()
+                            && condition_has_linear_runtime_leaves(&tail.test)
+                            && condition_jump_target_count(&tail.test, false) > 1
+                            && suite_has_linear_borrow_fallthrough(&tail.body)))
                 || (!preserve_exit_nop
                     && statement
                         .finalbody
