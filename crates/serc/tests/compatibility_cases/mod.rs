@@ -559,3 +559,11 @@ mod guarded_arm_finally_borrow;
 mod runtime_while_recovery_cleanup;
 
 mod else_break_finally_borrow;
+
+mod terminal_chained_assert_success_locations;
+
+mod nested_or_break_position;
+
+mod terminal_try_while_exit_locations;
+
+mod nested_else_return_location;

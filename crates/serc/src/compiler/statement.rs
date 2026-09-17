@@ -3314,7 +3314,9 @@ impl Compiler<'_> {
         self.assembler.mark(body);
         self.set_depth(base_depth);
         self.compile_suite(&statement.body)?;
-        if let Some(last) = statement.body.last() {
+        if let Some(range) = suite_assert_success_fallthrough_range(&statement.body) {
+            self.assembler.set_location(self.source_location(range));
+        } else if let Some(last) = statement.body.last() {
             // CPython's implicit exit inherits the final store's target location.
             let location = if matches!(last, Stmt::Assign(_) | Stmt::AugAssign(_))
                 && !statement_uses_implicit_return_location(last)
@@ -8668,9 +8670,17 @@ impl Compiler<'_> {
                         let Some(Stmt::If(statement)) = body.last() else {
                             unreachable!();
                         };
-                        self.assembler.set_location(
-                            self.source_location(synthetic_condition_exit_range(&statement.test)),
-                        );
+                        // The sole false edge donates its operand's location to this
+                        // original join. Shared or folded exits keep their prior range.
+                        let range = if statement.elif_else_clauses.is_empty()
+                            && condition_has_only_runtime_tests(&statement.test)
+                            && original_condition_has_unique_jump_target(&statement.test, false)
+                        {
+                            condition_fallthrough_range(&statement.test)
+                        } else {
+                            synthetic_condition_exit_range(&statement.test)
+                        };
+                        self.assembler.set_location(self.source_location(range));
                     } else if let Some(NestedIfExitLocation::Located(test)) = nested_if_exit {
                         self.assembler
                             .set_location(self.source_location(condition_fallthrough_range(test)));
@@ -14008,6 +14018,19 @@ impl Compiler<'_> {
                 && terminal_for_break_exit_inherits_predecessor(&statement.body)
             {
                 self.assembler.set_location(SourceLocation::NONE);
+            } else if statement.orelse.is_empty()
+                && let Some(Stmt::While(loop_statement)) = statement.body.last()
+                && loop_statement.orelse.is_empty()
+                && !suite_contains_loop_break(&loop_statement.body)
+                && early_condition_truthiness(&loop_statement.test).is_none()
+                && condition_jump_target_count(&loop_statement.test, false) == 1
+                && original_condition_has_unique_jump_target(&loop_statement.test, false)
+            {
+                // The sole original false edge supplies the normal try exit's location;
+                // the last emitted loop-body instruction can belong to a nested iterator.
+                self.assembler.set_location(
+                    self.source_location(while_condition_exit_range(&loop_statement.test)),
+                );
             } else if let Some(location) = self.assembler.last_instruction_location() {
                 self.assembler.set_location(location);
             }
@@ -22456,9 +22479,27 @@ fn direct_try_body_exit_location(body: &[Stmt]) -> Option<DirectTryBodyExitLocat
     {
         return None;
     }
-    let test = match nested_if_exit_location(statement, false)? {
-        NestedIfExitLocation::Located(test) => test,
-        NestedIfExitLocation::Unlocated => return None,
+    let test = match nested_if_exit_location(statement, false) {
+        Some(NestedIfExitLocation::Located(test)) => test,
+        Some(NestedIfExitLocation::Unlocated) => return None,
+        None => {
+            let [clause] = statement.elif_else_clauses.as_slice() else {
+                return None;
+            };
+            let [prefix @ .., Stmt::If(_)] = clause.body.as_slice() else {
+                return None;
+            };
+            if clause.test.is_some()
+                || !condition_has_only_runtime_tests(&statement.test)
+                || !suite_has_linear_borrow_fallthrough(&statement.body)
+                || (!prefix.is_empty() && !suite_has_linear_borrow_fallthrough(prefix))
+            {
+                return None;
+            }
+            // The earlier linear arm copies the unlocated normal try exit. Follow
+            // only the explicit else's nested join to its original false-edge donor.
+            return direct_try_body_exit_location(&clause.body);
+        }
     };
     (early_condition_truthiness(&statement.test).is_none())
         .then(|| {
