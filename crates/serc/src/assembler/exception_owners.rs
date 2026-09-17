@@ -5220,6 +5220,7 @@ impl LayoutAssembler {
                             indexed_instructions[pop + 1].opcode,
                             crate::target::opcodes::LOAD_FAST
                                 | crate::target::opcodes::LOAD_FAST_BORROW
+                                | crate::target::opcodes::LOAD_DEREF
                         )
                         && indexed_instructions[pop + 1]
                             .local_policy

@@ -4023,10 +4023,13 @@ impl Compiler<'_> {
                 let copied_break_pop_pair = context.iterator_cleanup == IteratorCleanup::None
                     && self.continued_finally_pop_blocks(context, true) == 2;
                 let copied_break_item = self.assembler.item_count();
-                // A direct named handler has the same two omitted POP_BLOCKs and
-                // four cleanup records already certified for copied continues.
+                // Direct named handlers in ordinary functions and coroutines have
+                // the same two omitted POP_BLOCKs and four cleanup records.
                 let copied_break_handler_origin = (self.context.target_specific_rules_enabled()
-                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
+                    && matches!(
+                        self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR),
+                        0 | CO_COROUTINE
+                    )
                     && context.iterator_cleanup == IteratorCleanup::None
                     && self.control.withs.active_with_exits.is_empty()
                     && self.control.exceptions.active_try_marker_slots.is_empty()
@@ -6581,7 +6584,32 @@ impl Compiler<'_> {
                             .iter()
                             .map(|unwind| unwind.index)
                             .eq((0..self.control.withs.active_with_exits.len()).rev())
-                        && self.control.loops.contexts.is_empty()
+                        && (self.control.loops.contexts.is_empty()
+                            // This iterator emits retained SWAP/POP_TOP records before
+                            // its manager's seven cleanup records. It adds no omitted POP.
+                            || matches!(
+                                (
+                                    self.control.loops.contexts.as_slice(),
+                                    self.control.withs.active_with_exits.as_slice(),
+                                ),
+                                ([iterator], [manager])
+                                    if self.unit.flags
+                                        & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                                        == 0
+                                        && iterator.iterator_cleanup == IteratorCleanup::Sync
+                                        && iterator.with_depth == 1
+                                        && iterator.finally_end_depth == 0
+                                        && iterator.exception_region_depth
+                                            == finally_context.exception_region_depth + 2
+                                        && iterator.exception_region_depth
+                                            == self.control.exceptions.active_exception_region_exclusions.len()
+                                        && manager.exception_region_depth == iterator.exception_region_depth
+                                        && manager.loop_depth == 0
+                                        && manager.normal_finally_depth == 0
+                                        && finally_context.loop_depth == 0
+                                        && finally_context.with_depth == 0
+                                        && next_loop == 1
+                            ))
                         && self.control.finally.active_finally_end_blocks == 0
                         && self.control.finally.active_normal_finally_bodies == 0
                         && self.control.finally.active_copied_finally_bodies == 0)
@@ -9414,6 +9442,17 @@ impl Compiler<'_> {
                 Ok(LoopBackedge::Required)
             }
             _ => {
+                // A breaking inner while in a non-final arm keeps a shared forward exit.
+                // Its initial condition still belongs to the original header array; the
+                // enclosing backedge follows that exit instead of replacing the condition.
+                // Keep the whole suite together so leading-statement context is unchanged.
+                let suite_fallthrough_to_loop_backedge = !(mode.non_final_branch
+                    && matches!(body.last(), Some(Stmt::While(statement))
+                        if statement.orelse.is_empty()
+                            && early_condition_truthiness(&statement.test).is_none()
+                            && suite_contains_loop_break(&statement.body)
+                            && !matches!(statement.body.last(), Some(Stmt::Try(statement))
+                                if try_requires_loop_tail_inlining(statement))));
                 let non_final_match = if mode.non_final_branch {
                     body.last().and_then(|statement| match statement {
                         Stmt::Match(statement) => Some(statement.range),
@@ -9428,7 +9467,7 @@ impl Compiler<'_> {
                     |compiler| {
                         compiler.with_control_override(
                             |control| &mut control.loops.suite_fallthrough_to_loop_backedge,
-                            true,
+                            suite_fallthrough_to_loop_backedge,
                             |compiler| {
                                 compiler.with_control_override(
                                     |control| &mut control.loops.uncopied_loop_tail_statement,

@@ -637,3 +637,11 @@ mod async_generator_handler_iterator_return;
 mod copied_handler_return_none;
 
 mod sync_manager_finally_owner;
+
+mod delegated_while_owner;
+
+mod sync_iterator_manager_finally_none;
+
+mod sync_named_handler_break_no_fallthrough;
+
+mod early_return_nop_captured_cell;
