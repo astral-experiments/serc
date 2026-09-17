@@ -23,7 +23,8 @@ pub(super) struct ExceptionOwnerProvenance {
     // Authored return NOP, immediately following finally POP, and original try target.
     pub(super) early_return_nop_pairs: Vec<(Instruction, Instruction, Label)>,
     pub(super) copied_handler_cleanups: Vec<CopiedHandlerCleanup>,
-    pub(super) named_handler_pop_pairs: Vec<NamedHandlerPopPair>,
+    pub(super) named_handler_pop_pairs: Vec<OriginalPopBlockSpan>,
+    pub(super) copied_handler_finally_pops: Vec<OriginalPopBlockSpan>,
     pub(super) fused_manager_owners: Vec<(Instruction, Instruction, super::ExceptionRegion)>,
     pub(super) handler_dispatch_arrays: Vec<HandlerDispatchArray>,
     pub(super) block_boundaries: FxHashSet<Label>,
@@ -109,9 +110,9 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) threaded_condition_origins: Vec<(Instruction, Instruction)>,
 }
 
-/// An original array's exact `POP_BLOCK/SWAP/POP_BLOCK/POP_EXCEPT` span.
+/// Exact original `POP_BLOCK` records and the successors receiving their erased slots.
 #[derive(Debug)]
-pub(super) struct NamedHandlerPopPair {
+pub(super) struct OriginalPopBlockSpan {
     pub(super) entry: Label,
     pub(super) items: Vec<Item>,
 }
@@ -1093,8 +1094,8 @@ impl LayoutAssembler {
 }
 
 impl LayoutAssembler {
-    /// Replays only the two erased POPs, retaining exact labels and successor records.
-    fn named_handler_pop_slots(
+    /// Replays captured `POP_BLOCK` spans, retaining exact labels and successor records.
+    fn captured_pop_slots(
         &self,
         jump_targets: &FxHashSet<Label>,
         label_positions: &FxHashMap<Label, usize>,
@@ -1118,10 +1119,23 @@ impl LayoutAssembler {
         };
         let mut slots = FxHashMap::default();
         let mut aliases = FxHashSet::default();
-        for origin in &provenance.named_handler_pop_pairs {
+        for (origin, pop_count) in provenance
+            .named_handler_pop_pairs
+            .iter()
+            .map(|origin| (origin, 2))
+            .chain(
+                provenance
+                    .copied_handler_finally_pops
+                    .iter()
+                    .map(|origin| (origin, 1)),
+            )
+        {
             let Some(&array) = label_positions.get(&origin.entry) else {
                 continue;
             };
+            if pop_count == 1 && !slots.values().any(|entry| *entry == array) {
+                continue;
+            }
             if copied(&origin.entry)
                 || !provenance.block_boundaries.contains(&origin.entry)
                 || self
@@ -1185,7 +1199,7 @@ impl LayoutAssembler {
                 }
             }
             if pending_pop
-                || successors.len() != 2
+                || successors.len() != pop_count
                 || !matches!(expected.first(), Some(Item::Label(_)))
             {
                 continue;
@@ -1197,7 +1211,20 @@ impl LayoutAssembler {
             else {
                 continue;
             };
-            if self.items.get(begin..begin + expected.len()) != Some(expected.as_slice()) {
+            let Some(current) = self.items.get(begin..begin + expected.len()) else {
+                continue;
+            };
+            if !expected.iter().zip(current).all(|(expected, current)| {
+                let mut expected = *expected;
+                if let (Item::Instruction(expected), Item::Instruction(current)) =
+                    (&mut expected, current)
+                    && expected.opcode == super::LOAD_FAST
+                    && current.opcode == super::LOAD_FAST_BORROW
+                {
+                    expected.opcode = super::LOAD_FAST_BORROW;
+                }
+                expected == *current
+            }) {
                 continue;
             }
             let first = self.items[..begin]
@@ -2332,8 +2359,8 @@ impl LayoutAssembler {
             self.retained_setup_null_markers(&label_positions, &jump_targets, &retained_setup_nops);
         let retained_normal_pop_terminators =
             self.retained_normal_pop_terminators(&jump_targets, &label_positions);
-        let (named_handler_pop_slots, named_handler_pop_aliases) =
-            self.named_handler_pop_slots(&jump_targets, &label_positions);
+        let (captured_pop_slots, captured_pop_aliases) =
+            self.captured_pop_slots(&jump_targets, &label_positions);
         let original_normal_finally_null_markers =
             self.original_normal_finally_null_markers(&jump_targets);
         let unprotected_setups: FxHashSet<_> = setups
@@ -2385,7 +2412,7 @@ impl LayoutAssembler {
         let mut ended_uniform_with_suffix = false;
         let mut ended_owned_suffix = None;
         let mut ended_pop_slot = None;
-        let mut named_handler_null_slots = Vec::new();
+        let mut captured_null_slots = Vec::new();
         let mut pending_null_append = None;
         let mut pending_fresh_null_append = None;
         let mut pending_normal_pop_null_append = None;
@@ -2407,7 +2434,7 @@ impl LayoutAssembler {
                             .source_boundaries
                             .contains(label)
                     {
-                        named_handler_null_slots.clear();
+                        captured_null_slots.clear();
                     }
                     for original in &self.exception_owner_provenance.copied_handler_cleanups {
                         if original.end != *label || !owner_history_exact {
@@ -2600,7 +2627,7 @@ impl LayoutAssembler {
                     if has_instruction && boundaries.contains(label) {
                         retained_pop_prefix = None;
                         original_array_start = instruction_index;
-                        named_handler_null_slots.clear();
+                        captured_null_slots.clear();
                         tail = ExceptionOwnerTail::default();
                         late_setup_positions.clear();
                         late_setup_history_known = true;
@@ -2793,7 +2820,7 @@ impl LayoutAssembler {
                                 .contains(label);
                     }
                     if has_instruction
-                        && !named_handler_pop_aliases.contains(label)
+                        && !captured_pop_aliases.contains(label)
                         && !continues_original_block
                         && !self
                             .exception_owner_provenance
@@ -2804,7 +2831,7 @@ impl LayoutAssembler {
                             is_conditional_jump(instruction.opcode)
                         })
                     {
-                        named_handler_null_slots.clear();
+                        captured_null_slots.clear();
                     }
                     source_block |= self
                         .exception_owner_provenance
@@ -3172,7 +3199,7 @@ impl LayoutAssembler {
                             && instruction.no_location_policy.borrow_fallthrough()
                                 != super::BorrowFallthrough::Barrier;
                         ended_pop_slot = None;
-                        named_handler_null_slots.clear();
+                        captured_null_slots.clear();
                         pending_null_append = None;
                         pending_fresh_null_append = None;
                         pending_normal_pop_null_append = None;
@@ -3207,15 +3234,14 @@ impl LayoutAssembler {
                                 && instruction.local_policy.hidden_exception_owner_slots() == *width
                         });
                     }
-                    if named_handler_pop_slots.get(&instruction_index)
-                        == Some(&original_array_start)
+                    if captured_pop_slots.get(&instruction_index) == Some(&original_array_start)
                         && owner_history_exact
                         && pop_slot_epoch_known
                         && tail.insertions == 0
                         && tail.late_removals == 0
                         && tail.post_compaction_fusions == 0
                     {
-                        named_handler_null_slots.push((instruction_index, tail.early_removals));
+                        captured_null_slots.push((instruction_index, tail.early_removals));
                     }
                     let previous_fusions = tail.post_compaction_fusions;
                     tail.instruction(*instruction, previous);
@@ -4006,8 +4032,8 @@ impl LayoutAssembler {
                     {
                         pending_null_append = Some(instruction_index + 1);
                     }
-                    // A captured handler pair can contribute either earlier NULL cell;
-                    // the later finally POP must not replace those physical records.
+                    // Captured handler and finalizer POPs retain their own NULL cells.
+                    // A later POP must not replace an earlier physical record.
                     if is_conditional_jump(instruction.opcode)
                         && matches!(instruction.operand(), Operand::Forward(_))
                         && owner_history_exact
@@ -4015,7 +4041,7 @@ impl LayoutAssembler {
                         && tail.insertions == 0
                         && tail.late_removals == 0
                         && tail.post_compaction_fusions == 0
-                        && named_handler_null_slots.iter().any(|(start, removed)| {
+                        && captured_null_slots.iter().any(|(start, removed)| {
                             *start >= original_array_start
                                 && start.checked_add(*removed) == Some(instruction_index + 1)
                         })
@@ -4926,7 +4952,7 @@ impl LayoutAssembler {
                     {
                         retained_pop_prefix = None;
                         original_array_start = instruction_index;
-                        named_handler_null_slots.clear();
+                        captured_null_slots.clear();
                         tail = ExceptionOwnerTail::default();
                         has_uninterrupted_fusion = false;
                         late_setup_positions.clear();

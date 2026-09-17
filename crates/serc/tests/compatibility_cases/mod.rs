@@ -544,7 +544,10 @@ mod sync_with_one_fallthrough;
 mod finally_for_borrow;
 
 mod calculated_handler_return;
+mod calculated_handler_return_iterators;
 
 mod calculated_handler_return_two_managers;
 mod mixed_handler_finally_borrow;
 mod normal_finally_handler_fallthrough;
+
+mod nested_match_donated_location;

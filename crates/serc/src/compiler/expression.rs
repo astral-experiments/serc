@@ -953,6 +953,7 @@ impl Compiler<'_> {
                 false_exit,
                 self.source_location(synthetic_condition_exit_range(&statement.test)),
             );
+            let original_unlocated_head = self.assembler.at_jump_target();
             let success_exit = self.emit_jump_forward_instruction(JUMP_FORWARD, match_end)?;
             if final_case {
                 // The final case's jump crosses an empty pattern-failure block. Delay its
@@ -967,6 +968,8 @@ impl Compiler<'_> {
                     .preserve_direct_inlined_jump_nop(success_exit);
             } else {
                 self.assembler.mark_jump_as_interruptible(success_exit);
+                self.assembler
+                    .inherit_nested_if_match_exit_locations(success_exit, original_unlocated_head);
             }
         }
         Ok(())

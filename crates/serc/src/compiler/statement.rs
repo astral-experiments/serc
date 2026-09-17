@@ -6500,6 +6500,16 @@ impl Compiler<'_> {
                                         == self.source_location(statement.range).line)
                         })
                         .map(|(pop_item, _)| pop_item);
+                    let copied_handler_finally_pop = (preserve_tos
+                        && !return_is_overridden
+                        && handler_count == 1
+                        && return_finally_contexts.len() == 1
+                        && self.control.withs.active_with_exits.is_empty()
+                        && finally_context.loop_depth < next_loop
+                        && self.control.loops.contexts[finally_context.loop_depth..next_loop]
+                            .iter()
+                            .all(|context| context.iterator_cleanup == IteratorCleanup::Sync))
+                    .then(|| self.assembler.item_count());
                     self.emit_with_exception_policy(NOP, 0, 0, ExceptionPolicy::EXCLUDE_ALWAYS)?;
                     if !starts_jump_target
                         || matches!(finally_context.body.as_slice(), [Stmt::Pass(_)])
@@ -6641,6 +6651,12 @@ impl Compiler<'_> {
                             }
                         },
                     );
+                    if result.is_ok()
+                        && let Some(pop_item) = copied_handler_finally_pop
+                    {
+                        self.assembler
+                            .record_copied_handler_finally_pop_prefix(pop_item);
+                    }
                     if result.is_ok()
                         && let Some(first_pop_item) = copied_return_none_pop_pair
                     {

@@ -5121,7 +5121,75 @@ impl Assembler {
         }
         self.exception_owner_provenance
             .named_handler_pop_pairs
-            .push(exception_owners::NamedHandlerPopPair {
+            .push(exception_owners::OriginalPopBlockSpan {
+                entry,
+                items: original,
+            });
+    }
+
+    /// Captures an iterator return's final `POP_BLOCK` and its first local load.
+    pub(crate) fn record_copied_handler_finally_pop_prefix(&mut self, pop_item: usize) {
+        let items = self.linear_items();
+        let Some(Item::Instruction(pop)) = items.get(pop_item) else {
+            return;
+        };
+        let Some((offset, Item::Instruction(load))) = items[pop_item + 1..]
+            .iter()
+            .enumerate()
+            .find(|(_, item)| matches!(item, Item::Instruction(_)))
+        else {
+            return;
+        };
+        if pop.opcode != NOP
+            || pop.operand() != Operand::Value(0)
+            || !pop.fusion_policy.is_converted_pop_block()
+            || pop.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
+            || load.opcode != LOAD_FAST
+            || !matches!(load.operand(), Operand::Value(_))
+            || [pop, load].iter().any(|instruction| {
+                instruction.local_policy.hidden_exception_owner_slots() != 0
+                    || instruction.pre_fold_extra_instructions() != 0
+                    || instruction.jump_policy.borrow_empty_block()
+                    || instruction.no_location_policy.borrow_fallthrough()
+                        != BorrowFallthrough::Reachable
+            })
+        {
+            return;
+        }
+        let mut start = pop_item;
+        while start > 0 && matches!(items[start - 1], Item::Label(_)) {
+            start -= 1;
+        }
+        if start == pop_item {
+            return;
+        }
+        let Some(entry) = items[..start].iter().rev().find_map(|item| match item {
+            Item::Label(label)
+                if self
+                    .exception_owner_provenance
+                    .block_boundaries
+                    .contains(label) =>
+            {
+                Some(*label)
+            }
+            _ => None,
+        }) else {
+            return;
+        };
+        // The already captured handler pair authenticates this original return array.
+        // Its replay must also succeed before this later POP can donate a NULL cell.
+        if !self
+            .exception_owner_provenance
+            .named_handler_pop_pairs
+            .iter()
+            .any(|pair| pair.entry == entry)
+        {
+            return;
+        }
+        let original = items[start..=pop_item + 1 + offset].to_vec();
+        self.exception_owner_provenance
+            .copied_handler_finally_pops
+            .push(exception_owners::OriginalPopBlockSpan {
                 entry,
                 items: original,
             });
