@@ -621,3 +621,9 @@ mod nested_manager_first_condition_owner;
 mod named_handler_shared_false_cleanup_location;
 
 mod three_owner_probes;
+
+mod match_success_normal_try_copies;
+
+mod terminal_cold_join_probes;
+
+mod nested_manager_none_slot;

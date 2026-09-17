@@ -542,6 +542,7 @@ impl JumpPolicy {
     const ORIGINAL_SHARED_EMPTY_JOIN: u16 = 1 << 11;
     const ORIGINAL_UNIFORM_FOLD: u16 = 1 << 12;
     const RETAIN_NOP_AFTER_RETARGETING: u16 = 1 << 13;
+    const ORIGINAL_MATCH_SUCCESS: u16 = 1 << 14;
 
     const SYNTHETIC: Self = Self(Self::PREVENT_SMALL_EXIT_INLINING);
     const DEFAULT: Self = Self(0);
@@ -689,6 +690,19 @@ impl JumpPolicy {
 
     pub(super) fn retire_original_uniform_fold(&mut self) {
         self.0 &= !Self::ORIGINAL_UNIFORM_FOLD;
+    }
+
+    /// Identifies an emitted case-success edge before early cleanup-copy planning.
+    pub(super) const fn is_original_match_success(self) -> bool {
+        self.0 & Self::ORIGINAL_MATCH_SUCCESS != 0
+    }
+
+    pub(super) fn mark_original_match_success(&mut self) {
+        self.0 |= Self::ORIGINAL_MATCH_SUCCESS;
+    }
+
+    fn retire_original_match_success(&mut self) {
+        self.0 &= !Self::ORIGINAL_MATCH_SUCCESS;
     }
 
     pub(super) const fn is_original_empty_join(self) -> bool {
@@ -1266,6 +1280,7 @@ impl Instruction {
     pub(super) fn set_operand(&mut self, operand: Operand) {
         if self.operand() != operand {
             self.jump_policy.retire_original_uniform_fold();
+            self.jump_policy.retire_original_match_success();
             self.metadata = self.metadata.with_initial_borrow_entry(false);
         }
         self.operand_payload = self.fusion_policy.set_operand(operand);

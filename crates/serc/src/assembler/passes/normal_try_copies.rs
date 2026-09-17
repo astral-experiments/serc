@@ -730,13 +730,21 @@ impl OptimizationPipeline {
             let Some((Item::Instruction(jump), head)) = items.split_last() else {
                 continue;
             };
+            // A terminal condition can retain its direct normal jump while a separate
+            // cold recovery array still stops borrowing. Certify that original head
+            // below without clearing its borrowed-load boundary.
+            let borrowed_terminal_head = jump.jump_policy.borrow_empty_block()
+                && jump.jump_policy.retained_nop()
+                    == super::super::ir::RetainedJumpNop::DirectTarget
+                && jump.location.line >= 0
+                && target_slots > 4;
             if head.is_empty()
                 || head.iter().any(|item| !matches!(item, Item::Label(_)))
                 || jump.opcode != JUMP_FORWARD
                 || jump.operand() != Operand::Forward(target)
                 || jump.pre_fold_extra_instructions() != 0
                 || jump.jump_policy.always_retains_nop()
-                || jump.jump_policy.borrow_empty_block()
+                || (jump.jump_policy.borrow_empty_block() && !borrowed_terminal_head)
                 || jump.jump_policy.defers_redundant_removal()
                 || jump.fusion_policy.is_authored_break()
             {
@@ -892,7 +900,39 @@ impl OptimizationPipeline {
                     unknown_edge = true;
                 }
             }
-            if success_edges == 0
+            // The sole original condition must still donate this exact location.
+            // Shared, folded, copied, or fallthrough entries retain the existing
+            // rejection; a live success edge still belongs to the ordinary copy path.
+            let borrowed_terminal_join = borrowed_terminal_head
+                && success_edges == 0
+                && failure_edges == 1
+                && !unknown_edge
+                && fallthrough_source.is_none()
+                && !original_fallthrough
+                && conditional_source.is_some_and(|source| {
+                    order[..position].contains(&source)
+                        && self.graph[source].items().iter().any(|item| {
+                            matches!(item, Item::Label(label)
+                                if self.exception_owner_provenance.block_boundaries.contains(label))
+                        })
+                        && self.graph[source]
+                            .items()
+                            .iter()
+                            .rev()
+                            .find_map(|item| match item {
+                                Item::Instruction(instruction) => Some(instruction),
+                                Item::Label(_) => None,
+                            })
+                            .is_some_and(|instruction| {
+                                super::super::is_conditional_jump(instruction.opcode)
+                                    && instruction.location == jump.location
+                                    && instruction.pre_fold_extra_instructions() == 0
+                                    && instruction.local_policy.hidden_exception_owner_slots() == 0
+                                    && matches!(instruction.operand(), Operand::Forward(label)
+                                        if labels.contains(&label))
+                            })
+                });
+            if (borrowed_terminal_head || success_edges == 0) && !borrowed_terminal_join
                 || failure_edges != usize::from(!original_fallthrough)
                 || unknown_edge
             {
@@ -983,6 +1023,11 @@ impl OptimizationPipeline {
             jump.no_location_policy.clear_preserved_location();
             jump.no_location_policy.allow_block_inlining();
             jump.jump_policy.prevent_threading_target();
+            if jump.jump_policy.borrow_empty_block() {
+                // Selection admits this barrier only for a certified terminal head.
+                // Retain its late jump NOP without changing borrowed-load reachability.
+                jump.jump_policy.retain_redundant_nop_after_threading();
+            }
             jump.allow_unconditional_block_inlining();
             let depth = jump.depth_after();
             let offset = self.graph[block]
@@ -1392,16 +1437,19 @@ impl OptimizationPipeline {
             // A real branch entry can reach the same original cleanup array without
             // a loop. Its complete source and every competing predecessor are still
             // admitted by the closed copy graph below; a cleanup's own edge alone
-            // does not provide this additional entry certificate.
+            // does not provide this additional entry certificate. A match-success
+            // fallthrough block may have no label; its compiler-emitted edge carries
+            // the same original-entry evidence without adding a CFG boundary.
             let ordinary_branch_entry = jump.opcode == JUMP_FORWARD
                 && jump.jump_policy.inline_small_exit()
                 && !jump.jump_policy.always_retains_nop()
                 && jump.pre_fold_extra_instructions() == 0
                 && !exits.contains_key(&source)
-                && graph[source].items().iter().any(|item| {
-                    matches!(item, Item::Label(label)
-                        if self.exception_owner_provenance.block_boundaries.contains(label))
-                });
+                && (jump.jump_policy.is_original_match_success()
+                    || graph[source].items().iter().any(|item| {
+                        matches!(item, Item::Label(label)
+                            if self.exception_owner_provenance.block_boundaries.contains(label))
+                    }));
             if !authored_break && !ordinary_branch_entry {
                 continue;
             }
@@ -1522,6 +1570,11 @@ impl OptimizationPipeline {
                 && !jump.jump_policy.always_retains_nop()
                 && jump.pre_fold_extra_instructions() == 0
                 && (selected_joins.contains(&block)
+                    // The original final case jumps across its empty failure block.
+                    // Its deferred removal keeps this edge live until exit copying,
+                    // even when its target is the next physical instruction.
+                    || (jump.jump_policy.is_original_match_success()
+                        && jump.jump_policy.defers_redundant_removal())
                     || graph.label_block(target).is_some_and(|target| {
                         // Certified join sources are protected by the pre-copy plan guard.
                         // Early jump removal skips label-only blocks. Compare its next

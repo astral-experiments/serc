@@ -4321,16 +4321,18 @@ impl LayoutAssembler {
                     {
                         let removed_before = late_setup_positions
                             .partition_point(|position| *position < instruction_index);
-                        let source_region = if late_setup_positions.get(removed_before)
-                            == Some(&instruction_index)
-                        {
+                        let reuses_null_setup =
+                            late_setup_positions.get(removed_before) == Some(&instruction_index);
+                        let source_region = if reuses_null_setup {
                             None
                         } else {
                             let source = instruction_index - removed_before;
                             self.uniform_exception_owner(source, source + 1, &label_positions)
                         };
                         // A structural override is weaker than a certified old-array
-                        // region, but must not replace an earlier definitive decision.
+                        // region or NULL SETUP, but must not replace an earlier
+                        // definitive decision. Only an exact SETUP position proves NULL;
+                        // failure to recover a source owner does not.
                         if instruction.exception_policy().owner()
                             != NormalizedExceptionOwner::OverridePresent
                             || (source_region.is_some_and(|region| {
@@ -4338,6 +4340,10 @@ impl LayoutAssembler {
                             }) && owners
                                 .get(&instruction_index)
                                 .is_none_or(|owner| !owner.definitive))
+                            || (reuses_null_setup
+                                && owners
+                                    .get(&instruction_index)
+                                    .is_none_or(|owner| !owner.definitive))
                         {
                             owners.insert(
                                 instruction_index,

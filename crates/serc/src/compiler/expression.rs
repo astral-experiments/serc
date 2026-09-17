@@ -685,6 +685,7 @@ impl Compiler<'_> {
                     } else {
                         let original_unlocated_head = self.assembler.at_jump_target();
                         let success_exit = self.emit_jump_forward_instruction(JUMP_FORWARD, end)?;
+                        self.assembler.record_original_match_success(success_exit);
                         if original_unlocated_head {
                             self.assembler.mark_as_artificial_eval_break(success_exit);
                             if let Some(Stmt::If(tail)) = case.body.last()

@@ -3985,6 +3985,13 @@ impl Assembler {
             .retain_nop();
     }
 
+    /// Certifies an original case-success edge without introducing a block boundary.
+    pub(crate) fn record_original_match_success(&mut self, emitted: EmittedJump) {
+        let instruction = self.emitted_jump_mut(emitted, "recording an original match success");
+        debug_assert_eq!(instruction.opcode, JUMP_FORWARD);
+        instruction.jump_policy.mark_original_match_success();
+    }
+
     pub(crate) fn preserve_inlined_jump_nop(&mut self, emitted: EmittedJump) {
         self.emitted_jump_mut(emitted, "retaining an inlined jump NOP")
             .jump_policy
