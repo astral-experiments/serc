@@ -531,3 +531,7 @@ mod conditional_finally_break_entry;
 mod tuple_genexpr_keyword_return_compatibility;
 
 mod async_for_nonterminal_join_compatibility;
+
+mod handler_return_cell_guard;
+mod inner_try_first_finally_owner;
+mod nested_setup_await_borrow;

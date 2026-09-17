@@ -94,7 +94,7 @@ impl OptimizationPipeline {
             .map(|(_, block)| block.items())
             .collect::<Vec<_>>();
         let mut origins = Vec::new();
-        for window in blocks.windows(3) {
+        for (block_index, window) in blocks.windows(3).enumerate() {
             let [head, setup, body] = window else {
                 unreachable!()
             };
@@ -142,14 +142,37 @@ impl OptimizationPipeline {
                 || nop.operand() != Operand::Value(0)
                 || nop.fusion_policy.is_converted_pop_block()
                 || nop.location.line < 0
-                // A discarded call or assignment to one fast local leaves this
-                // complete protected array nonempty. A return or unwind marker
-                // still needs its separate exit-copy proof.
-                || !matches!(body.get(body.len().saturating_sub(2)..),
+                // A discarded or assigned call leaves this protected array nonempty.
+                // An awaited call does too: its arguments are consumed before the
+                // following SEND array, while borrowing still checks values kept live.
+                // Returns and unwind markers need their separate exit-copy proof.
+                || !(matches!(body.get(body.len().saturating_sub(2)..),
                     Some([Item::Instruction(call), Item::Instruction(consumer)])
                         if (call.opcode == CALL && consumer.opcode == POP_TOP)
                             || (matches!(call.opcode, CALL | CALL_KW)
                                 && consumer.opcode == STORE_FAST))
+                    || matches!(body.get(body.len().saturating_sub(3)..),
+                        Some([Item::Instruction(call), Item::Instruction(awaitable), Item::Instruction(value)])
+                            if matches!(call.opcode, CALL | CALL_KW)
+                                && matches!(call.operand(), Operand::Value(_))
+                                && awaitable.opcode == GET_AWAITABLE
+                                && awaitable.operand() == Operand::Value(0)
+                                && value.opcode == LOAD_CONST
+                                && matches!(value.operand(), Operand::Value(_))
+                                && value.location == awaitable.location
+                                && matches!((blocks.get(block_index + 3), blocks.get(block_index + 4)),
+                                    (Some([Item::Label(_), Item::Instruction(send)]),
+                                     Some([Item::Label(yielded), Item::Instruction(yield_value)]))
+                                        if send.opcode == SEND
+                                            && matches!(send.operand(), Operand::Forward(_))
+                                            && send.location == awaitable.location
+                                            && yield_value.opcode == crate::target::opcodes::YIELD_VALUE
+                                            && yield_value.operand() == Operand::Value(1)
+                                            && provenance.ordinary_await_cleanups.iter().filter(|region| {
+                                                region.start == *yielded
+                                                    && !region.is_scope_fallback
+                                                    && !region.preserve_lasti
+                                            }).count() == 1)))
                 || [pop, nop, first].iter().any(|instruction| {
                     instruction.jump_policy.borrow_empty_block()
                         || instruction.no_location_policy.borrow_fallthrough() != BorrowFallthrough::Reachable

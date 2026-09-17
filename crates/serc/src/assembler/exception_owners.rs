@@ -4442,6 +4442,7 @@ impl LayoutAssembler {
                                 indexed_instructions[end].opcode,
                                 crate::target::opcodes::LOAD_FAST
                                     | crate::target::opcodes::LOAD_FAST_BORROW
+                                    | crate::target::opcodes::LOAD_DEREF
                             )
                             && indexed_instructions[end]
                                 .local_policy
@@ -4664,6 +4665,40 @@ impl LayoutAssembler {
                             },
                         );
                     }
+                    // The last SETUP compaction copies live records left and leaves
+                    // their old tail cells intact. Revalidate this original entry array
+                    // separately: retained SETUP NOPs can carry earlier POP annotations
+                    // that intentionally invalidate the generic early-history proofs.
+                    if instruction.opcode == NOT_TAKEN
+                        && original_array_start == 0
+                        && owner_history_exact
+                        && tail.late_removals == late_setup_positions.len()
+                        && tail.post_compaction_fusions == 0
+                        && instruction.exception_policy().exclusion()
+                            == super::ExceptionExclusion::None
+                        && instruction.exception_policy().owner()
+                            == NormalizedExceptionOwner::Present
+                        && owners
+                            .get(&instruction_index)
+                            .is_none_or(|decision| !decision.definitive)
+                        && self.entry_retained_setup_null_marker(
+                            instruction_index,
+                            &indexed_instructions,
+                            &label_positions,
+                            &jump_targets,
+                            &late_setup_positions,
+                        )
+                    {
+                        owners.insert(
+                            instruction_index,
+                            ExceptionOwnerDecision {
+                                has_owner: false,
+                                source_region: None,
+                                definitive: true,
+                                override_existing: true,
+                            },
+                        );
+                    }
                     instruction_index += 1;
                     has_instruction = true;
                     if matches!(instruction.opcode, FOR_ITER | SEND) {
@@ -4843,6 +4878,178 @@ impl LayoutAssembler {
                 definitive: true,
                 override_existing: true,
             })
+    }
+
+    /// Locates a retained NULL SETUP record in an entry array's last compacted tail.
+    fn entry_retained_setup_null_marker(
+        &self,
+        marker: usize,
+        instructions: &[&Instruction],
+        positions: &FxHashMap<Label, usize>,
+        jump_targets: &FxHashSet<Label>,
+        removed_positions: &[usize],
+    ) -> bool {
+        let Some(condition) = marker
+            .checked_sub(1)
+            .and_then(|index| instructions.get(index))
+        else {
+            return false;
+        };
+        let Some(append) = instructions.get(marker) else {
+            return false;
+        };
+        let Some(source) = marker.checked_sub(removed_positions.len()) else {
+            return false;
+        };
+        let provenance = &self.exception_owner_provenance;
+        if removed_positions.is_empty()
+            || removed_positions
+                .last()
+                .is_none_or(|position| *position >= marker)
+            || !matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+            || !matches!(condition.operand(), Operand::Forward(_))
+            || condition.local_policy.hidden_exception_owner_slots() != 3
+            || condition.pre_fold_extra_instructions() != 0
+            || condition.exception_policy() != super::ExceptionPolicy::NoneUnchanged
+            || append.opcode != NOT_TAKEN
+            || append.operand() != Operand::Value(0)
+            || append.location != condition.location
+            || append.local_policy.hidden_exception_owner_slots() != 0
+            || append.pre_fold_extra_instructions() != 0
+            || append.no_location_policy.borrow_fallthrough() != super::BorrowFallthrough::Reachable
+            || append.jump_policy.borrow_empty_block()
+            || jump_targets
+                .iter()
+                .chain(&provenance.block_boundaries)
+                .chain(&provenance.source_boundaries)
+                .chain(&self.preserved_block_boundaries)
+                .chain(self.exception_regions.iter().map(|region| &region.target))
+                .any(|label| {
+                    positions
+                        .get(label)
+                        .is_some_and(|position| 0 < *position && *position <= marker)
+                })
+            || provenance
+                .normal_try_copy_blocks
+                .iter()
+                .chain(&provenance.normal_try_copy_jump_nop_successors)
+                .chain(&provenance.normal_try_copy_inline_labels)
+                .chain(&provenance.normal_try_copy_internal_labels)
+                .chain(
+                    provenance
+                        .normal_try_copy_steps
+                        .iter()
+                        .flat_map(|(a, b, _)| [a, b]),
+                )
+                .chain(
+                    provenance
+                        .normal_try_copy_pop_ranges
+                        .iter()
+                        .flat_map(|(a, b)| [a, b]),
+                )
+                .any(|label| {
+                    positions
+                        .get(label)
+                        .is_some_and(|position| *position <= marker)
+                })
+            || instructions[..marker]
+                .iter()
+                .enumerate()
+                .any(|(index, instruction)| {
+                    (index + 1 < marker && !matches!(instruction.operand(), Operand::Value(_)))
+                        || matches!(instruction.opcode, NOT_TAKEN | FOR_ITER | SEND)
+                        || (is_scope_exit(instruction.opcode)
+                            && instruction.opcode != RETURN_GENERATOR)
+                        || instruction.no_location_policy.borrow_fallthrough()
+                            != super::BorrowFallthrough::Reachable
+                        || instruction.jump_policy.borrow_empty_block()
+                })
+        {
+            return false;
+        }
+        let mut removed = Vec::new();
+        let mut retained = FxHashSet::default();
+        for (label, location) in &provenance.setups {
+            let Some(&position) = positions.get(label) else {
+                return false;
+            };
+            if position > marker {
+                continue;
+            }
+            if let Some(location) = location {
+                let Some(index) = position.checked_sub(1) else {
+                    return false;
+                };
+                let instruction = instructions[index];
+                if instruction.opcode != NOP
+                    || instruction.operand() != Operand::Value(0)
+                    || instruction.location != *location
+                    || instruction.fusion_policy.is_converted_pop_block()
+                    || instruction.pre_fold_extra_instructions() != 0
+                    || instruction.exception_policy() != super::ExceptionPolicy::NoneUnchanged
+                    || provenance
+                        .setup_nop_ranges
+                        .iter()
+                        .filter(|(start, end)| {
+                            positions.get(start) == Some(&index)
+                                && positions.get(end) == Some(&position)
+                        })
+                        .count()
+                        != 1
+                    || !retained.insert(index)
+                {
+                    return false;
+                }
+            } else if provenance.synchronous_with_setups.contains(label)
+                || self
+                    .exception_regions
+                    .iter()
+                    .any(|region| region.is_scope_fallback && region.start == *label)
+            {
+                removed.push(position);
+            } else {
+                return false;
+            }
+        }
+        removed.sort_unstable();
+        if removed
+            .iter()
+            .enumerate()
+            .map(|(offset, position)| position + offset)
+            .ne(removed_positions.iter().copied())
+            || !retained.contains(&source)
+            || instructions[..marker]
+                .iter()
+                .enumerate()
+                .any(|(index, instruction)| instruction.opcode == NOP && !retained.contains(&index))
+        {
+            return false;
+        }
+        // Earlier POP compaction can annotate this surviving SETUP with one hidden
+        // record. It does not change the SETUP's NULL owner or its final live slot.
+        let hidden = instructions[source]
+            .local_policy
+            .hidden_exception_owner_slots();
+        hidden == 0
+            || (hidden == 1
+                && provenance.removed_pop_block_boundaries.iter().any(|label| {
+                    positions.get(label) == Some(&source)
+                        && provenance
+                            .removed_pop_block_widths
+                            .get(label)
+                            .copied()
+                            .unwrap_or(1)
+                            == 1
+                })
+                && !provenance
+                    .omitted_nop_counts
+                    .keys()
+                    .chain(provenance.omitted_nop_locations.keys())
+                    .any(|label| {
+                        positions
+                            .get(label)
+                            .is_some_and(|position| *position == source || *position == source + 1)
+                    }))
     }
 
     /// Reconstructs one entry-array marker slot after three authenticated SETUP removals.
@@ -7046,6 +7253,216 @@ mod tests {
                 .original_uniform_fold_positions(&instructions);
             assert_eq!(certified.contains(&0), mutation == "none", "{mutation}");
             assert!(certified.len() <= 1, "{mutation}");
+        }
+    }
+
+    mod entry_retained_setup_null_marker_tests {
+        use super::super::ExceptionOwnerProvenance;
+        use crate::assembler::{
+            BorrowFallthrough, ExceptionRegion, ExceptionRegionPriority, Instruction, Item, Label,
+            LayoutAssembler, NormalizedExceptionOwner, Operand, SourceLocation,
+        };
+        use crate::target::opcodes::{
+            CALL, LOAD_CONST, LOAD_FAST, NOP, NOT_TAKEN, POP_JUMP_IF_NONE, POP_TOP, RESUME,
+            RETURN_GENERATOR, RETURN_VALUE, YIELD_VALUE,
+        };
+
+        fn fixture(intervening_call: bool) -> LayoutAssembler {
+            let location = SourceLocation::new(1, 1, 0, 1);
+            let outer_location = SourceLocation::new(4, 4, 4, 8);
+            let inner_location = SourceLocation::new(8, 8, 8, 12);
+            let guard_location = SourceLocation::new(9, 9, 12, 32);
+            let plain = |opcode| Instruction::new(opcode, Operand::Value(0), location, None);
+            let outer = Instruction::new(NOP, Operand::Value(0), outer_location, None);
+            let mut inner = Instruction::new(NOP, Operand::Value(0), inner_location, None);
+            let mut condition = Instruction::new(
+                POP_JUMP_IF_NONE,
+                Operand::Forward(Label(12)),
+                guard_location,
+                None,
+            );
+            condition.local_policy.add_hidden_exception_owner_slots(3);
+            let mut marker = Instruction::new(NOT_TAKEN, Operand::Value(0), guard_location, None);
+            marker.set_exception_owner(NormalizedExceptionOwner::Present);
+
+            let mut items = vec![
+                Item::Label(Label(0)),
+                Item::Instruction(plain(RETURN_GENERATOR)), // 0: inserted generator prologue.
+                Item::Instruction(plain(POP_TOP)),
+                Item::Label(Label(1)), // Removed scope SETUP: compact position 2, old position 2.
+                Item::Instruction(plain(RESUME)),
+                Item::Instruction(plain(LOAD_CONST)),
+                Item::Label(Label(2)), // First manager SETUP: compact position 4, old position 5.
+                Item::Instruction(plain(LOAD_CONST)),
+                Item::Label(Label(3)), // Second manager SETUP: compact position 5, old position 7.
+                Item::Label(Label(4)),
+                Item::Instruction(outer), // 5: retained outer SETUP.
+                Item::Label(Label(5)),
+                Item::Label(Label(6)),
+                Item::Instruction(plain(LOAD_CONST)),
+                Item::Instruction(plain(YIELD_VALUE)),
+                Item::Instruction(plain(RESUME)),
+                Item::Instruction(plain(POP_TOP)),
+                Item::Label(Label(7)), // Erased outer normal POP_BLOCK, compact position 10.
+            ];
+            if intervening_call {
+                // The earlier POP vacancy moves to the call, leaving the inner SETUP unchanged.
+                let mut receiver = plain(LOAD_FAST);
+                receiver.local_policy.add_hidden_exception_owner_slots(1);
+                items.extend([
+                    Item::Instruction(receiver),
+                    Item::Instruction(plain(CALL)),
+                    Item::Instruction(plain(POP_TOP)),
+                ]);
+            } else {
+                inner.local_policy.add_hidden_exception_owner_slots(1);
+            }
+            items.extend([
+                Item::Label(Label(8)),
+                Item::Instruction(inner), // Target source 10; control source 13.
+                Item::Label(Label(9)),
+                Item::Label(Label(10)),
+                Item::Instruction(plain(LOAD_FAST)),
+                Item::Instruction(condition),
+                Item::Label(Label(11)), // A bookkeeping marker alias is not a new original array.
+                Item::Instruction(marker), // Target m=13; control m=16; both select m-3.
+                Item::Label(Label(12)),
+                Item::Instruction(plain(LOAD_CONST)),
+                Item::Instruction(plain(RETURN_VALUE)),
+                Item::Label(Label(13)),
+                Item::Label(Label(14)),
+                Item::Instruction(plain(LOAD_CONST)),
+                Item::Instruction(plain(RETURN_VALUE)),
+            ]);
+            LayoutAssembler {
+                items,
+                exception_regions: vec![ExceptionRegion {
+                    is_scope_fallback: true,
+                    priority: ExceptionRegionPriority::OriginalRange(Label(1), Label(13)),
+                    start: Label(1),
+                    end: Label(13),
+                    target: Label(14),
+                    depth: 0,
+                    preserve_lasti: false,
+                }],
+                exception_owner_provenance: ExceptionOwnerProvenance {
+                    setups: vec![
+                        (Label(1), None),
+                        (Label(2), None),
+                        (Label(3), None),
+                        (Label(6), Some(outer_location)),
+                        (Label(10), Some(inner_location)),
+                    ],
+                    block_boundaries: [Label(0)].into_iter().collect(),
+                    source_boundaries: [Label(0)].into_iter().collect(),
+                    synchronous_with_setups: [Label(2), Label(3)].into_iter().collect(),
+                    setup_nop_boundaries: [Label(4), Label(5), Label(8), Label(9)]
+                        .into_iter()
+                        .collect(),
+                    setup_nop_ranges: vec![(Label(4), Label(5)), (Label(8), Label(9))],
+                    removed_pop_block_boundaries: [Label(7)].into_iter().collect(),
+                    removed_pop_block_widths: [(Label(7), 1)].into_iter().collect(),
+                    ..ExceptionOwnerProvenance::default()
+                },
+                preserved_block_boundaries: rustc_hash::FxHashSet::default(),
+                removed_max_depth: None,
+                next_label: 15,
+                has_next_location: false,
+            }
+        }
+
+        fn recognizes(assembler: &LayoutAssembler) -> bool {
+            let mut instructions = Vec::new();
+            let mut positions = rustc_hash::FxHashMap::default();
+            for item in &assembler.items {
+                match item {
+                    Item::Label(label) => {
+                        positions.insert(*label, instructions.len());
+                    }
+                    Item::Instruction(instruction) => instructions.push(instruction),
+                }
+            }
+            assembler.entry_retained_setup_null_marker(
+                positions[&Label(11)],
+                &instructions,
+                &positions,
+                &[Label(12)].into_iter().collect(),
+                &[2, 5, 7],
+            )
+        }
+
+        #[test]
+        fn last_setup_compaction_selects_the_retained_null_record() {
+            assert!(
+                recognizes(&fixture(false)),
+                "POP transferred to the retained SETUP"
+            );
+            assert!(
+                recognizes(&fixture(true)),
+                "POP transferred to an intervening call"
+            );
+        }
+
+        #[test]
+        fn last_setup_compaction_rejects_unproven_records_and_array_boundaries() {
+            let rejects = |name: &str, change: fn(&mut LayoutAssembler)| {
+                let mut assembler = fixture(false);
+                change(&mut assembler);
+                assert!(!recognizes(&assembler), "{name}");
+            };
+            rejects("changed retained range", |assembler| {
+                assembler.exception_owner_provenance.setup_nop_ranges[1].1 = Label(11);
+            });
+            rejects("uncertified hidden POP", |assembler| {
+                assembler
+                    .exception_owner_provenance
+                    .removed_pop_block_boundaries
+                    .clear();
+            });
+            rejects("real original join", |assembler| {
+                assembler
+                    .exception_owner_provenance
+                    .block_boundaries
+                    .insert(Label(7));
+            });
+            rejects("unknown removed SETUP", |assembler| {
+                assembler
+                    .exception_owner_provenance
+                    .synchronous_with_setups
+                    .remove(&Label(3));
+            });
+            rejects("earlier condition marker", |assembler| {
+                let instruction = assembler
+                    .items
+                    .iter_mut()
+                    .filter_map(|item| match item {
+                        Item::Instruction(instruction) => Some(instruction),
+                        Item::Label(_) => None,
+                    })
+                    .nth(6)
+                    .unwrap();
+                instruction.opcode = NOT_TAKEN;
+            });
+            rejects("copied original array", |assembler| {
+                assembler
+                    .exception_owner_provenance
+                    .normal_try_copy_blocks
+                    .insert(Label(7));
+            });
+            rejects("borrow barrier", |assembler| {
+                let instruction = assembler
+                    .items
+                    .iter_mut()
+                    .filter_map(|item| match item {
+                        Item::Instruction(instruction) => Some(instruction),
+                        Item::Label(_) => None,
+                    })
+                    .nth(3)
+                    .unwrap();
+                instruction
+                    .no_location_policy
+                    .set_borrow_fallthrough(BorrowFallthrough::Barrier);
+            });
         }
     }
 }
