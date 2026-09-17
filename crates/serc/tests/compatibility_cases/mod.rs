@@ -607,3 +607,11 @@ mod p90_fresh_try_prefix;
 mod post_finally_older_iterator_owner;
 
 mod populated_try_else_finally_borrow;
+
+mod nested_loop_tail_boolean_discard_location;
+
+mod p91_fresh_try_nonterminal_cell_prefix;
+
+mod conditional_else_finally_borrow;
+
+mod p92_fresh_try_dynamic_binary_prefix;

@@ -80,6 +80,8 @@ pub(super) struct ExceptionOwnerProvenance {
     // Original try/except POP_BLOCK exits inside their own finally, for owner transfer
     // and late redundant-exit removal, but not ordinary-try exit copying.
     pub(super) compound_try_owner_exits: Vec<(Label, Label)>,
+    // Populated authored else arrays with direct normal edges into their own finally.
+    pub(super) populated_try_else_borrow_exits: Vec<(Label, Label)>,
     pub(super) omitted_nop_locations: FxHashMap<Label, SourceLocation>,
     pub(super) omitted_nop_counts: FxHashMap<Label, usize>,
     // One omitted fallthrough marker with no original label: item offset, location, count.
@@ -834,9 +836,9 @@ impl ExceptionOwnerProvenance {
                     }
                 }
                 BINARY_OP => {
-                    // Subscript is one original record unless constant folding
-                    // consumes both preceding constant loads with it.
-                    if instruction.operand() != Operand::Value(26)
+                    // Binary operations retain one original record unless constant
+                    // folding consumes both preceding constant loads with it.
+                    if !matches!(instruction.operand(), Operand::Value(0..=26))
                         || instructions[..index]
                             .iter()
                             .rev()

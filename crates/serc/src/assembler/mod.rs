@@ -3888,6 +3888,66 @@ impl Assembler {
             .push((entry, target));
     }
 
+    /// Records the live original else array without crossing a preserved empty boundary.
+    pub(crate) fn record_populated_try_else_borrow_exit(&mut self, emitted: EmittedJump) {
+        let jump = *self.emitted_jump_mut(emitted, "recording a populated try-else exit");
+        let Operand::Forward(target) = jump.operand() else {
+            return;
+        };
+        if jump.opcode != JUMP_FORWARD
+            || jump.jump_policy.borrow_empty_block()
+            || !jump.jump_policy.allows_borrow_threading_target()
+            || jump.no_location_policy.borrow_fallthrough() != BorrowFallthrough::Reachable
+        {
+            return;
+        }
+        let index = usize::try_from(emitted.instruction().item_index)
+            .expect("emitted instruction index should fit in usize");
+        let mut populated = false;
+        let mut source = None;
+        for item in self.linear_items()[..index].iter().rev() {
+            match item {
+                Item::Label(label) => {
+                    if self
+                        .exception_owner_provenance
+                        .block_boundaries
+                        .contains(label)
+                    {
+                        if populated
+                            && self
+                                .exception_owner_provenance
+                                .source_boundaries
+                                .contains(label)
+                        {
+                            source = Some(*label);
+                        }
+                        break;
+                    }
+                    if self.preserved_block_boundaries.contains(label) {
+                        return;
+                    }
+                }
+                Item::Instruction(instruction) => {
+                    if matches!(instruction.opcode, NOP | NOT_TAKEN)
+                        || !matches!(instruction.operand(), Operand::Value(_))
+                        || ends_scope(instruction.opcode)
+                        || instruction.jump_policy.borrow_empty_block()
+                        || instruction.no_location_policy.borrow_fallthrough()
+                            != BorrowFallthrough::Reachable
+                    {
+                        return;
+                    }
+                    populated = true;
+                }
+            }
+        }
+        if let Some(source) = source {
+            self.exception_owner_provenance
+                .populated_try_else_borrow_exits
+                .push((source, target));
+        }
+    }
+
     /// Allows a direct jump to copy a return split by an exception-region boundary.
     pub(crate) fn allow_split_return_copy(&mut self, emitted: EmittedJump) {
         self.emitted_jump_mut(emitted, "allowing a split return copy")
@@ -4885,7 +4945,27 @@ impl Assembler {
         while matches!(items.get(end), Some(Item::Label(_))) {
             end += 1;
         }
-        while let Some(Item::Instruction(instruction)) = items.get(end) {
+        while let Some(item) = items.get(end) {
+            let (instruction, crossed_setup_labels) = match item {
+                Item::Instruction(instruction) => (instruction, false),
+                Item::Label(_) => {
+                    if retained_setup.is_some() {
+                        return;
+                    }
+                    while matches!(items.get(end), Some(Item::Label(_))) {
+                        end += 1;
+                    }
+                    let Some(Item::Instruction(instruction)) = items.get(end) else {
+                        return;
+                    };
+                    if instruction.opcode != NOP {
+                        return;
+                    }
+                    // This lookahead is provisional: the exact retained SETUP
+                    // proof below must accept before any later record is scanned.
+                    (instruction, true)
+                }
+            };
             end += 1;
             if is_conditional_jump(instruction.opcode) {
                 if matches!(instruction.operand(), Operand::Forward(_)) {
@@ -4999,6 +5079,8 @@ impl Assembler {
                     }
                     retained_setup = Some(origin);
                     end = after;
+                } else if crossed_setup_labels {
+                    return;
                 }
             }
         }

@@ -425,9 +425,31 @@ impl OptimizationPipeline {
                         Item::Instruction(_) => None,
                     })
                     .collect::<Vec<_>>();
+                // A producer-certified populated else join may itself be a preserved
+                // source boundary. We start in that array; we never cross an empty
+                // preserved boundary. Exact prefix replay below must keep it populated.
+                let preserved_else_source = if source_exit_alias.is_none()
+                    && !source_prefix.is_empty()
+                {
+                    let mut origins = self.exception_owner_provenance
+                        .populated_try_else_borrow_exits.iter().filter(|(source, destination)| {
+                            *destination == target && source_labels.contains(source)
+                        });
+                    origins.next().and_then(|&(source, _)| {
+                        (origins.next().is_none()
+                            && self.exception_owner_provenance.source_boundaries.contains(&source)
+                            && self.preserved_block_boundaries.contains(&source))
+                        .then_some(source)
+                    })
+                } else {
+                    None
+                };
                 // Consecutive exception aliases may share one original array. A second
-                // original boundary or preserved empty boundary is not such an alias.
-                for labels in [&source_labels, &target_labels] {
+                // original boundary or an uncertified preserved boundary is not an alias.
+                for (labels, preserved_source) in [
+                    (&source_labels, preserved_else_source),
+                    (&target_labels, None),
+                ] {
                     if labels
                         .iter()
                         .filter(|label| {
@@ -437,9 +459,10 @@ impl OptimizationPipeline {
                         })
                         .count()
                         != 1
-                        || labels
-                            .iter()
-                            .any(|label| self.preserved_block_boundaries.contains(label))
+                        || labels.iter().any(|label| {
+                            self.preserved_block_boundaries.contains(label)
+                                && Some(*label) != preserved_source
+                        })
                     {
                         return None;
                     }

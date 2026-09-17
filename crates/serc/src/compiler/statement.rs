@@ -9207,6 +9207,28 @@ impl Compiler<'_> {
         result
     }
 
+    /// Prepares a final discarded Boolean value for its loop backedge.
+    fn prepare_loop_tail_boolean_discard(&mut self, body: &[Stmt]) -> bool {
+        let Some(Stmt::Expr(expression)) = body.last() else {
+            return false;
+        };
+        let Expr::BoolOp(boolean) = expression.value.as_ref() else {
+            return false;
+        };
+        // Early folding can remove the final conditional that supplies CPython's
+        // original discard location. Preserve that fallback separately from the
+        // discard's unlocated provenance; runtime tails resolve from their final call.
+        let preserve_folded_location = folded_bool_operand(&expression.value).is_some()
+            || boolean.values.last().is_some_and(|last| {
+                matches!(last, Expr::BoolOp(inner)
+                    if inner.op != boolean.op && folded_bool_operand(last).is_some())
+            });
+        self.assembler
+            .prepare_loop_tail_discard(preserve_folded_location);
+        self.assembler.set_location(SourceLocation::NONE);
+        true
+    }
+
     fn compile_loop_tail_suite(
         &mut self,
         body: &[Stmt],
@@ -10715,6 +10737,9 @@ impl Compiler<'_> {
                 )?;
                 if nested_tail == LoopBackedge::Required && !suite_terminates(body) {
                     self.set_branch_end_location(body, body_start);
+                    // The Boolean value join falls through to the enclosing if's backedge.
+                    // Its shared discard keeps the original unlocated block during assembly.
+                    self.prepare_loop_tail_boolean_discard(body);
                     let backedge = self.emit_jump_backward_instruction(JUMP_BACKWARD, restart)?;
                     if body
                         .last()
@@ -12185,23 +12210,7 @@ impl Compiler<'_> {
                 self.assembler
                     .set_location(self.source_location(statement.range()));
             }
-            let loop_tail_boolean = matches!(statement.body.last(), Some(Stmt::Expr(expression))
-                if matches!(expression.value.as_ref(), Expr::BoolOp(_)));
-            if let Some(Stmt::Expr(expression)) = statement.body.last()
-                && let Expr::BoolOp(boolean) = expression.value.as_ref()
-            {
-                // Early folding can remove the final conditional that supplies CPython's
-                // original discard location. Preserve that fallback separately from the
-                // discard's unlocated provenance; runtime tails resolve from their final call.
-                let preserve_folded_location = folded_bool_operand(&expression.value).is_some()
-                    || boolean.values.last().is_some_and(|last| {
-                        matches!(last, Expr::BoolOp(inner)
-                            if inner.op != boolean.op && folded_bool_operand(last).is_some())
-                    });
-                self.assembler
-                    .prepare_loop_tail_discard(preserve_folded_location);
-                self.assembler.set_location(SourceLocation::NONE);
-            }
+            let loop_tail_boolean = self.prepare_loop_tail_boolean_discard(&statement.body);
             let backedge = self.emit_jump_backward_instruction(JUMP_BACKWARD, start)?;
             if unlocated_original_backedge {
                 self.assembler
@@ -15041,6 +15050,25 @@ impl Compiler<'_> {
                 // The emitted return can include erased try POPs and iterator cleanup.
                 // Keep this exemption only until its original target width is known.
                 self.assembler.defer_name_return_borrow_exit(normal_exit);
+            }
+            if !statement.is_star
+                && !statement.orelse.is_empty()
+                && !statement.finalbody.is_empty()
+                && !handler_has_orphan_cold_cleanup
+                && !handler_contains_terminal_nested_try
+                && !handler_contains_nested_handler_cold_join
+                && !statement.handlers.iter().any(|handler| {
+                    handler
+                        .as_except_handler()
+                        .is_some_and(|handler| suite_ends_in_recovery_cleanup(&handler.body))
+                })
+            {
+                // A conditional expression can leave a populated original else
+                // join even when guarded handlers block ordinary finally admission.
+                // Capture that normal edge; borrowing must still replay its complete
+                // source array and target after copying and cold-block movement.
+                self.assembler
+                    .record_populated_try_else_borrow_exit(normal_exit);
             }
         }
         if deferred_try_pop_block && !removed_shared_try_pop_block {
