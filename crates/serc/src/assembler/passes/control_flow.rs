@@ -441,6 +441,9 @@ impl OptimizationPipeline {
                     if let Item::Label(label) = item {
                         self.exception_owner_provenance
                             .retire_async_with_setup(*label);
+                        self.exception_owner_provenance
+                            .copied_return_pop_prefixes
+                            .retain(|origin| origin.entry != *label);
                     }
                     if let Item::Label(label) = item
                         && self

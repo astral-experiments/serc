@@ -12662,6 +12662,163 @@ def filled(action, self, mask, result):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_copied_finally_outer_iterator() {
+        for (filename, source) in [
+            (
+                "outer_iterator_copied_return_none_target.py",
+                r#"async def run(items, resource):
+    for item in items:
+        try:
+            value = await obtain(item)
+            return finish(value).result
+        except Error as error:
+            if retry(error):
+                await pause()
+        finally:
+            if resource is not None:
+                close = getattr(resource, "close", None)
+                if close is not None:
+                    await close()
+"#,
+            ),
+            (
+                "outer_iterator_copied_return_none_no_call_control.py",
+                r#"async def run(items, resource):
+    for item in items:
+        try:
+            value = await obtain(item)
+            return value.result
+        except Error as error:
+            if retry(error):
+                await pause()
+        finally:
+            if resource is not None:
+                close = getattr(resource, "close", None)
+                if close is not None:
+                    await close()
+"#,
+            ),
+            (
+                "outer_iterator_copied_return_none_two_calls_control.py",
+                r#"async def run(items, resource):
+    for item in items:
+        try:
+            value = await obtain(item)
+            return finish(convert(value)).result
+        except Error as error:
+            if retry(error):
+                await pause()
+        finally:
+            if resource is not None:
+                close = getattr(resource, "close", None)
+                if close is not None:
+                    await close()
+"#,
+            ),
+            (
+                "outer_iterator_copied_return_none_sync_control.py",
+                r#"def run(items, resource):
+    for item in items:
+        try:
+            value = obtain(item)
+            return finish(value).result
+        except Error as error:
+            if retry(error):
+                pause()
+        finally:
+            if resource is not None:
+                close = getattr(resource, "close", None)
+                if close is not None:
+                    close()
+"#,
+            ),
+        ] {
+            assert_matches_cpython_marshal(source, filename);
+        }
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_copied_finally_outer_async_manager_membership() {
+        for (filename, source) in [
+            (
+                "membership_return_4_global_calls_target.py",
+                r#"async def run(manager, resource, result, selected):
+    async with manager:
+        try:
+            if selected:
+                tick()
+                tick()
+                tick()
+                tick()
+                return result
+            else:
+                return None
+        except Error as error:
+            report(error)
+            return None
+        finally:
+            if "resource" in locals():
+                try:
+                    await resource.close()
+                except Error:
+                    report_failure()
+"#,
+            ),
+            (
+                "membership_return_3_global_calls_upper_owned_control.py",
+                r#"async def run(manager, resource, result, selected):
+    async with manager:
+        try:
+            if selected:
+                tick()
+                tick()
+                tick()
+                return result
+            else:
+                return None
+        except Error as error:
+            report(error)
+            return None
+        finally:
+            if "resource" in locals():
+                try:
+                    await resource.close()
+                except Error:
+                    report_failure()
+"#,
+            ),
+            (
+                "membership_return_6_global_calls_lower_owned_control.py",
+                r#"async def run(manager, resource, result, selected):
+    async with manager:
+        try:
+            if selected:
+                tick()
+                tick()
+                tick()
+                tick()
+                tick()
+                tick()
+                return result
+            else:
+                return None
+        except Error as error:
+            report(error)
+            return None
+        finally:
+            if "resource" in locals():
+                try:
+                    await resource.close()
+                except Error:
+                    report_failure()
+"#,
+            ),
+        ] {
+            assert_matches_cpython_marshal(source, filename);
+        }
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_copied_finally_prefix_owners() {
         let source = include_str!("fixtures/copied_finally_prefix_owners.py");
         assert_matches_cpython_marshal(source, "copied_finally_prefix_owners.py");

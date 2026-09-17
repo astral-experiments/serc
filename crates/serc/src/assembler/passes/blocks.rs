@@ -3905,6 +3905,10 @@ impl OptimizationPipeline {
                         .iter()
                         .rposition(|item| matches!(item, Item::Instruction(_)))
                         .expect("a transitive exit-copy predecessor must end in a jump");
+                    // A copied exit cannot inherit its predecessor's original POP prefix.
+                    self.exception_owner_provenance
+                        .copied_return_pop_prefixes
+                        .retain(|origin| graph.label_block(origin.entry) != Some(predecessor));
                     graph.remove_item_at(predecessor, jump_position);
                     inline_copies
                         .entry(predecessor)
@@ -3944,6 +3948,10 @@ impl OptimizationPipeline {
                     .iter()
                     .rposition(|item| matches!(item, Item::Instruction(_)))
                 {
+                    // Replacing the original jump can append equal records from another array.
+                    self.exception_owner_provenance
+                        .copied_return_pop_prefixes
+                        .retain(|origin| graph.label_block(origin.entry) != Some(source));
                     graph.remove_item_at(source, position);
                 }
             } else if let Some(instruction) = graph.instructions_mut(source).next_back() {
@@ -4721,6 +4729,9 @@ impl OptimizationPipeline {
                     if let Item::Label(label) = item {
                         self.exception_owner_provenance
                             .retire_async_with_setup(*label);
+                        self.exception_owner_provenance
+                            .copied_return_pop_prefixes
+                            .retain(|origin| origin.entry != *label);
                         // Labels retained without their array cannot certify a later seam.
                         self.exception_owner_provenance
                             .normal_try_copy_inline_labels

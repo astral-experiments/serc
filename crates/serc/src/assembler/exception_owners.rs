@@ -50,6 +50,7 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) original_normal_finally_arrays: Vec<OriginalNormalFinallyArray>,
     pub(super) normal_finally_none_prefixes: Vec<(Instruction, Instruction, Instruction)>,
     pub(super) copied_return_none_prefixes: Vec<CopiedReturnNonePrefix>,
+    pub(super) copied_return_pop_prefixes: Vec<CopiedReturnPopPrefix>,
     pub(super) copied_return_truth_prefixes: Vec<CopiedReturnTruthPrefix>,
     pub(super) copied_handler_return_none_prefixes: Vec<(Label, [Instruction; 6])>,
     pub(super) copied_manager_return_none_prefixes: Vec<CopiedManagerReturnNonePrefix>,
@@ -172,6 +173,13 @@ pub(super) struct CopiedReturnNonePrefix {
     pub(super) pops: [Instruction; 2],
     pub(super) load: Instruction,
     pub(super) condition: Instruction,
+}
+
+/// Two adjacent NULL return POPs and their unchanged first cleanup record.
+#[derive(Debug)]
+pub(super) struct CopiedReturnPopPrefix {
+    pub(super) entry: Label,
+    pub(super) records: [Instruction; 3],
 }
 
 /// A constant return's original POP pair and complete local truthiness test.
@@ -3365,6 +3373,63 @@ impl LayoutAssembler {
                         && tail.post_compaction_fusions == 0
                     {
                         captured_null_slots.push((instruction_index, tail.early_removals));
+                    }
+                    // Locate the two original NULL cells before their transferred count
+                    // is consumed. A surrounding manager has not unwound at this point.
+                    // Literal replay of its unique original entry and successor keeps
+                    // folded records elsewhere in the prefix from becoming POP witnesses.
+                    if owner_history_exact
+                        && pop_slot_epoch_known
+                        && tail.insertions == 0
+                        && tail.late_removals == 0
+                        && tail.post_compaction_fusions == 0
+                        && instruction.local_policy.hidden_exception_owner_slots() == 2
+                    {
+                        for origin in &self.exception_owner_provenance.copied_return_pop_prefixes {
+                            let mut expected = origin.records[2];
+                            expected.local_policy.add_hidden_exception_owner_slots(2);
+                            let provenance = &self.exception_owner_provenance;
+                            if *instruction == expected
+                                && label_positions.get(&origin.entry) == Some(&original_array_start)
+                                && provenance.block_boundaries.contains(&origin.entry)
+                                && self
+                                    .items
+                                    .iter()
+                                    .filter(|item| **item == Item::Label(origin.entry))
+                                    .count()
+                                    == 1
+                                && indexed_instructions
+                                    .iter()
+                                    .filter(|candidate| ***candidate == expected)
+                                    .count()
+                                    == 1
+                                && !provenance.normal_try_copy_blocks.contains(&origin.entry)
+                                && !provenance
+                                    .normal_try_copy_jump_nop_successors
+                                    .contains(&origin.entry)
+                                && !provenance
+                                    .normal_try_copy_inline_labels
+                                    .contains(&origin.entry)
+                                && !provenance
+                                    .normal_try_copy_internal_labels
+                                    .contains(&origin.entry)
+                                && !provenance
+                                    .retired_normal_try_copy_labels
+                                    .contains(&origin.entry)
+                                && !provenance
+                                    .normal_try_copy_steps
+                                    .iter()
+                                    .any(|(a, b, _)| *a == origin.entry || *b == origin.entry)
+                                && !provenance
+                                    .normal_try_copy_pop_ranges
+                                    .iter()
+                                    .any(|(a, b)| *a == origin.entry || *b == origin.entry)
+                            {
+                                captured_null_slots.push((instruction_index, tail.early_removals));
+                                captured_null_slots
+                                    .push((instruction_index, tail.early_removals + 1));
+                            }
+                        }
                     }
                     let previous_fusions = tail.post_compaction_fusions;
                     tail.instruction(*instruction, previous);
@@ -7003,6 +7068,78 @@ mod tests {
                 rustc_hash::FxHashSet::default()
             };
             assert_eq!(markers, expected, "{boundary}");
+        }
+    }
+
+    #[test]
+    fn copied_return_pop_constants_remap_without_reviving_removed_or_changed_records() {
+        use crate::assembler::{Assembler, ExceptionPolicy, Item, Operand, SourceLocation};
+        use crate::target::opcodes::{LOAD_CONST, NOP};
+
+        for change in ["surviving constant", "removed constant", "changed location"] {
+            let mut assembler = Assembler::default();
+            let entry = assembler.label();
+            assembler.record_exception_owner_block_boundary(entry);
+            assembler.mark(entry);
+            let first_pop_item = assembler.item_count();
+            for _ in 0..2 {
+                assembler.emit_with_depth(NOP, 0, 0, ExceptionPolicy::EXCLUDE_ALWAYS);
+                assembler.mark_last_as_converted_pop_block();
+            }
+            assembler.set_location(SourceLocation::new(9, 9, 4, 12));
+            let load_item = assembler.item_count();
+            assembler.emit(LOAD_CONST, 2);
+            assembler.record_copied_return_pop_prefix(first_pop_item);
+            assert_eq!(
+                assembler
+                    .exception_owner_provenance
+                    .copied_return_pop_prefixes
+                    .len(),
+                1,
+            );
+            let original_records = assembler
+                .exception_owner_provenance
+                .copied_return_pop_prefixes[0]
+                .records;
+            if change == "changed location" {
+                let Item::Instruction(load) = &mut assembler.linear_items_mut()[load_item] else {
+                    unreachable!();
+                };
+                load.location = SourceLocation::new(8, 8, 4, 12);
+            }
+            let retained = change != "removed constant";
+            assembler.remap_constant_indices(LOAD_CONST, &[Some(0), None, retained.then_some(1)]);
+            let Item::Instruction(live) = assembler.linear_items()[load_item] else {
+                unreachable!();
+            };
+            assert_eq!(
+                live.opcode,
+                if retained { LOAD_CONST } else { NOP },
+                "{change}"
+            );
+            assert_eq!(
+                live.operand(),
+                Operand::Value(u32::from(retained)),
+                "{change}"
+            );
+            let origins = &assembler
+                .exception_owner_provenance
+                .copied_return_pop_prefixes;
+            assert_eq!(origins.len(), usize::from(retained), "{change}");
+            if retained {
+                assert_eq!(origins[0].entry, entry, "{change}");
+                assert_eq!(origins[0].records[..2], original_records[..2], "{change}");
+                assert_eq!(
+                    origins[0].records[2].operand(),
+                    Operand::Value(1),
+                    "{change}"
+                );
+                assert_eq!(
+                    origins[0].records[2] == live,
+                    change == "surviving constant",
+                    "{change}",
+                );
+            }
         }
     }
 

@@ -635,6 +635,7 @@ mod authored_finally_empty_heads;
 mod async_generator_handler_iterator_return;
 
 mod copied_handler_return_none;
+mod copied_handler_split_return_none;
 
 mod sync_manager_finally_owner;
 

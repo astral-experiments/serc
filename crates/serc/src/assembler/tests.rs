@@ -3167,6 +3167,62 @@ fn empty_exception_regions_follow_their_original_entry() {
 }
 
 #[test]
+fn copied_return_pop_origins_retire_only_with_erased_unreachable_arrays() {
+    for reachable in [false, true] {
+        let mut assembler = Assembler::default();
+        let origin = assembler.label();
+        let exit = assembler.label();
+        assembler.emit_forward_with_depth(
+            JUMP_FORWARD,
+            if reachable { origin } else { exit },
+            0,
+            ExceptionPolicy::default(),
+        );
+        assembler.record_exception_owner_block_boundary(origin);
+        assembler.mark(origin);
+        let first_pop_item = assembler.item_count();
+        for _ in 0..2 {
+            assembler.emit_with_depth(NOP, 0, 0, ExceptionPolicy::EXCLUDE_ALWAYS);
+            assembler.mark_last_as_converted_pop_block();
+        }
+        assembler.set_location(SourceLocation::new(2, 2, 0, 4));
+        assembler.emit(LOAD_CONST, 1);
+        assembler.record_copied_return_pop_prefix(first_pop_item);
+        assembler.emit(POP_TOP, 0);
+        assembler.emit_forward_with_depth(JUMP_FORWARD, exit, 0, ExceptionPolicy::default());
+        assembler.mark(exit);
+        assembler.emit(LOAD_CONST, 0);
+        assembler.emit(RETURN_VALUE, 0);
+        assert_eq!(
+            assembler
+                .exception_owner_provenance
+                .copied_return_pop_prefixes
+                .len(),
+            1
+        );
+        let mut pipeline = assembler.into_optimization_pipeline();
+        pipeline.remove_unreachable_instructions();
+        assert_eq!(
+            pipeline
+                .exception_owner_provenance
+                .copied_return_pop_prefixes
+                .len(),
+            usize::from(reachable),
+            "reachable={reachable}",
+        );
+        if reachable {
+            assert_eq!(
+                pipeline
+                    .exception_owner_provenance
+                    .copied_return_pop_prefixes[0]
+                    .entry,
+                origin,
+            );
+        }
+    }
+}
+
+#[test]
 fn no_location_block_inlining_reaches_a_fixed_point() {
     let restart = super::Label(0);
     let source = super::Label(1);
@@ -3209,9 +3265,33 @@ fn no_location_block_inlining_reaches_a_fixed_point() {
         Item::Instruction(second_cleanup_jump),
     ]);
 
+    // Track only origin lifecycle here; existing assertions below verify the copied CFG.
+    // Source is replaced by inlined records, both cleanup originals disappear, and restart survives.
+    let records = [
+        Instruction::new(NOP, Operand::Value(0), SourceLocation::NONE, None),
+        Instruction::new(NOP, Operand::Value(0), SourceLocation::NONE, None),
+        Instruction::new(LOAD_CONST, Operand::Value(0), SourceLocation::NONE, None),
+    ];
+    assembler
+        .exception_owner_provenance
+        .copied_return_pop_prefixes = [restart, source, first_cleanup, second_cleanup]
+        .into_iter()
+        .map(|entry| super::exception_owners::CopiedReturnPopPrefix { entry, records })
+        .collect();
+
     let original_location_absence = assembler.capture_original_location_absence();
     assembler.duplicate_exit_blocks(&original_location_absence, &mut Vec::new());
     assembler.propagate_locations_within_blocks();
+
+    assert_eq!(
+        assembler
+            .exception_owner_provenance
+            .copied_return_pop_prefixes
+            .iter()
+            .map(|origin| origin.entry)
+            .collect::<Vec<_>>(),
+        [restart],
+    );
 
     assert_eq!(
         graph_opcodes(&assembler),
@@ -4507,4 +4587,88 @@ fn borrow_marker_conversion_retries_without_another_jump_deletion() {
     assert!(instructions[1].jump_policy.borrow_empty_block());
     assert_eq!(instructions[1].location, SourceLocation::NONE);
     assert_eq!(instructions[1].operand(), Operand::Value(0));
+}
+
+#[test]
+fn split_return_condition_transports_only_a_unique_exact_source_witness() {
+    use super::Label;
+    use super::exception_owners::SourceNoneCondition;
+
+    let location = SourceLocation::new(13, 13, 15, 35);
+    let mut condition = Instruction::new(
+        POP_JUMP_IF_NOT_NONE,
+        Operand::Forward(Label(3)),
+        location,
+        Some(2),
+    );
+    condition.local_policy.add_hidden_exception_owner_slots(3);
+    let mut updated = condition;
+    updated.no_location_policy.allow_split_return_exit_copy();
+    let marker = Instruction::new(NOT_TAKEN, Operand::Value(0), location, Some(2));
+
+    for change in [
+        "unique",
+        "no origin",
+        "duplicate origin",
+        "original clone",
+        "updated clone",
+        "different operand",
+        "different location",
+        "different hidden slots",
+    ] {
+        let mut items = vec![Item::Label(Label(0))];
+        match change {
+            "original clone" => items.push(Item::Instruction(condition)),
+            "updated clone" => items.push(Item::Instruction(updated)),
+            _ => {}
+        }
+        items.push(Item::Instruction(condition));
+        items.push(Item::Instruction(marker));
+        let mut assembler = Assembler::from_linear_items(items.clone());
+        let mut source = condition;
+        match change {
+            "different operand" => source.set_operand(Operand::Forward(Label(4))),
+            "different location" => source.location = SourceLocation::new(14, 14, 15, 35),
+            "different hidden slots" => source.local_policy.add_hidden_exception_owner_slots(1),
+            _ => {}
+        }
+        let source_count = match change {
+            "no origin" => 0,
+            "duplicate origin" => 2,
+            _ => 1,
+        };
+        for _ in 0..source_count {
+            assembler
+                .exception_owner_provenance
+                .source_none_conditions
+                .push(SourceNoneCondition {
+                    entry: Label(0),
+                    labels: vec![Label(0)],
+                    instruction: source,
+                    entry_prefix: Some(vec![Item::Label(Label(0))]),
+                });
+        }
+        let condition_item = items.len() - 2;
+        items[condition_item] = Item::Instruction(updated);
+        for _ in 0..2 {
+            assembler.allow_last_condition_split_return_copy();
+            assert_eq!(assembler.linear_items(), items.as_slice(), "{change}");
+            let origins = &assembler.exception_owner_provenance.source_none_conditions;
+            assert_eq!(origins.len(), source_count, "{change}");
+            for origin in origins {
+                assert_eq!(
+                    origin.instruction,
+                    if change == "unique" { updated } else { source },
+                    "{change}"
+                );
+                assert_eq!(origin.entry, Label(0), "{change}");
+                assert_eq!(origin.labels, vec![Label(0)], "{change}");
+                assert_eq!(
+                    origin.entry_prefix,
+                    Some(vec![Item::Label(Label(0))]),
+                    "{change}"
+                );
+            }
+        }
+    }
 }

@@ -6164,7 +6164,19 @@ impl Compiler<'_> {
                                     && return_finally_contexts[next_finally - 1].handler_depth
                                         == handler_index
                                     && return_finally_contexts[next_finally - 1].with_depth == with_depth
-                                    && return_finally_contexts[next_finally - 1].loop_depth == loop_depth
+                                    && (return_finally_contexts[next_finally - 1].loop_depth == loop_depth
+                                        // A while between this handler and its sole finally
+                                        // emits no unwind records before the captured POP.
+                                        || (name.is_none()
+                                            && next_finally == 1
+                                            && return_finally_contexts.len() == 1
+                                            && return_finally_contexts[0].loop_depth < loop_depth
+                                            && self.control.loops.contexts
+                                                [return_finally_contexts[0].loop_depth..loop_depth]
+                                                .iter()
+                                                .all(|context| {
+                                                    context.iterator_cleanup == IteratorCleanup::None
+                                                })))
                                     && return_finally_contexts[next_finally - 1].exception_region_depth + 1
                                         == region_depth
                                 {
@@ -6459,6 +6471,48 @@ impl Compiler<'_> {
                     // expression with multiple exits can leave this marker at their join.
                     let starts_jump_target = self.assembler.at_jump_target();
                     self.assembler.set_location(unwind_location);
+                    // This surrounding iterator stays live until after the copied finally.
+                    // It contributes no unwind record between the return and the POP pair.
+                    let copied_return_keeps_outer_iterator =
+                        self.context.target_specific_rules_enabled()
+                            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                                == CO_COROUTINE
+                            && preserve_tos
+                            && !return_is_overridden
+                            && context_index == 0
+                            && finally_context.loop_depth == 1
+                            && next_loop == 1
+                            && self.control.finally.active_copied_finally_bodies == 0
+                            && self.control.withs.active_with_exits.is_empty()
+                            && matches!(self.control.loops.contexts.as_slice(), [iterator]
+                            if iterator.iterator_cleanup == IteratorCleanup::Sync
+                                && iterator.with_depth == 0
+                                && iterator.finally_end_depth == 0
+                                && iterator.exception_region_depth
+                                    == finally_context.exception_region_depth);
+                    // This manager surrounds the entire try/finally and remains live
+                    // during the copied finalizer. Only the ordinary try and finally
+                    // contribute POP_BLOCK records before the copied condition.
+                    let copied_return_keeps_outer_async_manager =
+                        self.context.target_specific_rules_enabled()
+                            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                                == CO_COROUTINE
+                            && preserve_tos
+                            && !return_is_overridden
+                            && context_index == 0
+                            && return_finally_contexts.len() == 1
+                            && handler_count == 0
+                            && self.control.loops.contexts.is_empty()
+                            && finally_context.with_depth == 1
+                            && next_with == 1
+                            && with_unwind_starts.is_empty()
+                            && finally_context.exception_region_depth == 0
+                            && self.control.finally.active_copied_finally_bodies == 0
+                            && matches!(self.control.withs.active_with_exits.as_slice(), [manager]
+                            if manager.is_async
+                                && manager.exception_region_depth == 0
+                                && manager.loop_depth == 0
+                                && manager.normal_finally_depth == 0);
                     let mut copied_return_none_pop_pair = None;
                     if return_finally_contexts.len() == 1
                         && handler_count == 0
@@ -6476,8 +6530,10 @@ impl Compiler<'_> {
                             .len()
                             .checked_sub(finally_context.exception_region_depth)
                             == Some(ordinary_try_count + 1)
-                        && self.control.withs.active_with_exits.is_empty()
+                        && (self.control.withs.active_with_exits.is_empty()
+                            || (copied_return_keeps_outer_async_manager && ordinary_try_count == 1))
                         && (self.control.loops.contexts.is_empty()
+                            || (copied_return_keeps_outer_iterator && ordinary_try_count == 1)
                             || (self.context.target_specific_rules_enabled()
                                 && self.unit.flags & CO_ASYNC_GENERATOR != 0
                                 && !preserve_tos
@@ -6512,7 +6568,10 @@ impl Compiler<'_> {
                         // emitted its POP_TOP above. The try still contributes its own
                         // original NULL POP before the finally POP. Keep the direct-return
                         // prefix certificate restricted to returns without iterator cleanup.
-                        if ordinary_try_count == 1 && self.control.loops.contexts.is_empty() {
+                        if ordinary_try_count == 1
+                            && (self.control.loops.contexts.is_empty()
+                                || copied_return_keeps_outer_iterator)
+                        {
                             copied_return_none_pop_pair = Some(self.assembler.item_count());
                         }
                         for _ in 0..ordinary_try_count {
@@ -6826,6 +6885,10 @@ impl Compiler<'_> {
                             copied_handler_return_item,
                             first_pop_item,
                         );
+                        if copied_return_keeps_outer_async_manager {
+                            self.assembler
+                                .record_copied_return_pop_prefix(first_pop_item);
+                        }
                     }
                     if result.is_ok()
                         && let Some((pop_item, ordinary_try_pops, managers)) =

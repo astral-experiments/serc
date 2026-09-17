@@ -3976,7 +3976,34 @@ impl Assembler {
             matches!(jump.operand(), Operand::Forward(_) | Operand::Backward(_)),
             "condition marker should follow a jump"
         );
+        let original = *jump;
         jump.no_location_policy.allow_split_return_exit_copy();
+        let updated = *jump;
+        // Keep the exact source witness in sync with this authored policy change.
+        // An ambiguous origin or instruction copy cannot acquire that witness.
+        let mut origins = self
+            .exception_owner_provenance
+            .source_none_conditions
+            .iter()
+            .enumerate()
+            .filter(|(_, origin)| origin.instruction == original);
+        let Some((origin_index, _)) = origins.next() else {
+            return;
+        };
+        if origins.next().is_some()
+            || self
+                .linear_items()
+                .iter()
+                .filter(|item| {
+                    **item == Item::Instruction(original) || **item == Item::Instruction(updated)
+                })
+                .take(2)
+                .count()
+                != 1
+        {
+            return;
+        }
+        self.exception_owner_provenance.source_none_conditions[origin_index].instruction = updated;
     }
 
     pub(crate) fn preserve_last_inlined_jump_nop(&mut self) {
@@ -4719,6 +4746,61 @@ impl Assembler {
                 load,
                 condition,
             });
+    }
+
+    /// Captures an outer-manager return's two adjacent NULL POPs and first cleanup constant.
+    pub(crate) fn record_copied_return_pop_prefix(&mut self, first_pop_item: usize) {
+        let items = self.linear_items();
+        let Some(
+            [
+                Item::Instruction(first),
+                Item::Instruction(second),
+                Item::Instruction(load),
+                ..,
+            ],
+        ) = items.get(first_pop_item..)
+        else {
+            return;
+        };
+        let pops = [*first, *second];
+        if pops.iter().any(|pop| {
+            pop.opcode != NOP
+                || pop.operand() != Operand::Value(0)
+                || !pop.fusion_policy.is_converted_pop_block()
+                || pop.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
+                || pop.local_policy.hidden_exception_owner_slots() != 0
+                || pop.pre_fold_extra_instructions() != 0
+        }) || load.opcode != LOAD_CONST
+            || !matches!(load.operand(), Operand::Value(_))
+            || load.exception_policy() != ExceptionPolicy::NoneUnchanged
+            || load.local_policy.hidden_exception_owner_slots() != 0
+            || load.pre_fold_extra_instructions() != 0
+            || load.no_location_policy.borrow_fallthrough() != BorrowFallthrough::Reachable
+            || load.jump_policy.borrow_empty_block()
+        {
+            return;
+        }
+        let Some(entry) = items[..first_pop_item]
+            .iter()
+            .rev()
+            .find_map(|item| match item {
+                Item::Label(label)
+                    if self
+                        .exception_owner_provenance
+                        .block_boundaries
+                        .contains(label) =>
+                {
+                    Some(*label)
+                }
+                _ => None,
+            })
+        else {
+            return;
+        };
+        let records = [pops[0], pops[1], *load];
+        self.exception_owner_provenance
+            .copied_return_pop_prefixes
+            .push(exception_owners::CopiedReturnPopPrefix { entry, records });
     }
 
     /// Captures the original return POP pair and its direct local truth test.
@@ -6801,6 +6883,22 @@ impl Assembler {
         // Transport only surviving constant identities; replay still compares every
         // complete instruction and rejects any other change to the original array.
         if load_const == LOAD_CONST {
+            self.exception_owner_provenance
+                .copied_return_pop_prefixes
+                .retain_mut(|origin| {
+                    let load = &mut origin.records[2];
+                    if load.opcode != LOAD_CONST {
+                        return false;
+                    }
+                    let Operand::Value(index) = load.operand() else {
+                        return false;
+                    };
+                    let Some(Some(remapped)) = index_map.get(index as usize) else {
+                        return false;
+                    };
+                    load.set_operand(Operand::Value(*remapped));
+                    true
+                });
             self.exception_owner_provenance
                 .original_normal_finally_arrays
                 .retain_mut(|origin| {
