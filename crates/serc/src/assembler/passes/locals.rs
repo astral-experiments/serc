@@ -309,10 +309,10 @@ impl OptimizationPipeline {
                 {
                     return None;
                 }
-                // An await's completion starts a populated original array at END_SEND.
-                // Capture its complete straight-line suffix through the try-range end,
-                // which is an exception alias rather than a new CPython block. The
-                // generic prefix checks below reject empty, branching, or barred spans.
+                // A try-range end can split a populated original source array.
+                // Its leading exception aliases do not create another CPython block.
+                // Capture the complete span; the checks below require exactly one
+                // original boundary and a nonempty, straight-line surviving prefix.
                 let source_exit_alias = if let [Item::Label(alias)] = leading
                     && let Operand::Forward(target) = jump.operand()
                     && self.exception_owner_provenance.compound_try_owner_exits
@@ -329,12 +329,14 @@ impl OptimizationPipeline {
                             if matches!(instruction.operand(), Operand::Forward(target) | Operand::Backward(target)
                                 if target == *alias))
                     })
-                    && let Some([Item::Label(source), Item::Instruction(end_send), suffix @ ..]) =
+                    && let Some(source_items) =
                         block_index.checked_sub(1).and_then(|index| blocks.get(index)).copied()
-                    && self.exception_owner_provenance.source_boundaries.contains(source)
-                    && end_send.opcode == END_SEND
-                    && end_send.operand() == Operand::Value(0)
-                    && !suffix.is_empty()
+                    && source_items.iter().take_while(|item| matches!(item, Item::Label(_))).any(|item| {
+                        matches!(item, Item::Label(source)
+                            if self.exception_owner_provenance.source_boundaries.contains(source)
+                                && self.exception_owner_provenance.block_boundaries.contains(source))
+                    })
+                    && source_items.iter().any(|item| matches!(item, Item::Instruction(_)))
                 {
                     Some(*alias)
                 } else {
@@ -5184,6 +5186,133 @@ mod retained_finally_origin_tests {
         MergedSourceAlias,
         LateUnrelatedTargetMarker,
         ErasedJumpNop,
+    }
+
+    #[test]
+    fn retained_finally_source_aliases_require_one_surviving_original_array() {
+        use crate::target::opcodes::{CALL, POP_JUMP_IF_FALSE, PUSH_NULL, STORE_FAST};
+
+        for change in [
+            "ordinary call",
+            "original exit boundary",
+            "second source boundary",
+            "preserved exit boundary",
+            "shared exit",
+            "conditional source",
+            "late boundary",
+            "changed prefix",
+        ] {
+            let source = Label(0);
+            let alias = Label(1);
+            let cold = Label(2);
+            let target = Label(3);
+            let finally = Label(4);
+            let mut prefix = vec![
+                instruction(LOAD_FAST, Operand::Value(0)),
+                instruction(PUSH_NULL, Operand::Value(0)),
+                instruction(CALL, Operand::Value(0)),
+                instruction(POP_TOP, Operand::Value(0)),
+            ];
+            if change == "conditional source" {
+                prefix.splice(
+                    0..0,
+                    [
+                        instruction(LOAD_FAST, Operand::Value(1)),
+                        instruction(POP_JUMP_IF_FALSE, Operand::Forward(cold)),
+                    ],
+                );
+            }
+            let cleanup = [
+                Item::Label(target),
+                Item::Label(finally),
+                instruction(LOAD_FAST, Operand::Value(1)),
+                instruction(POP_TOP, Operand::Value(0)),
+                instruction(LOAD_CONST, Operand::Value(0)),
+                instruction(RETURN_VALUE, Operand::Value(0)),
+            ];
+            let source_alias = Label(5);
+            let mut original = vec![Item::Label(source_alias), Item::Label(source)];
+            original.extend(prefix.iter().copied());
+            original.extend([
+                Item::Label(alias),
+                instruction(JUMP_FORWARD, Operand::Forward(target)),
+                Item::Label(cold),
+            ]);
+            if change == "shared exit" {
+                original.push(instruction(
+                    JUMP_BACKWARD_NO_INTERRUPT,
+                    Operand::Backward(alias),
+                ));
+            } else {
+                original.extend([
+                    instruction(LOAD_CONST, Operand::Value(0)),
+                    instruction(RETURN_VALUE, Operand::Value(0)),
+                ]);
+            }
+            original.extend(cleanup);
+            let mut assembler = Assembler::from_linear_items(original);
+            assembler.next_label = 6;
+            assembler.exception_owner_provenance.block_boundaries =
+                [source, cold, target].into_iter().collect();
+            assembler
+                .exception_owner_provenance
+                .source_boundaries
+                .insert(source);
+            assembler
+                .exception_owner_provenance
+                .compound_try_owner_exits
+                .push((alias, target));
+            if change == "second source boundary" {
+                assembler
+                    .exception_owner_provenance
+                    .block_boundaries
+                    .insert(source_alias);
+            }
+            if change == "original exit boundary" {
+                assembler
+                    .exception_owner_provenance
+                    .block_boundaries
+                    .insert(alias);
+            }
+            if change == "preserved exit boundary" {
+                assembler.preserved_block_boundaries.insert(alias);
+            }
+            let mut pipeline = assembler.into_optimization_pipeline();
+            pipeline.borrow_finally_entries.insert(finally, None);
+            pipeline.borrow_unreachable_blocks.insert(finally);
+            pipeline.borrow_jump_entry_labels.insert(finally);
+            let origins = pipeline.capture_retained_finally_origins();
+            let captured = matches!(change, "ordinary call" | "late boundary" | "changed prefix");
+            assert_eq!(origins.len(), usize::from(captured), "{change}");
+            if !captured {
+                continue;
+            }
+            assert_eq!(origins[0].source_exit_alias, Some(alias));
+            // Remove only the original normal jump and move its cold neighbor.
+            // The range-end alias and complete source array must still survive.
+            let mut live = vec![Item::Label(source_alias), Item::Label(source)];
+            if change == "changed prefix" {
+                *prefix.last_mut().unwrap() = instruction(STORE_FAST, Operand::Value(0));
+            }
+            live.extend(prefix);
+            live.push(Item::Label(alias));
+            live.extend(cleanup);
+            live.extend([
+                Item::Label(cold),
+                instruction(LOAD_CONST, Operand::Value(0)),
+                instruction(RETURN_VALUE, Operand::Value(0)),
+            ]);
+            if change == "late boundary" {
+                pipeline.preserved_block_boundaries.insert(alias);
+            }
+            pipeline.graph = BlockGraph::from_items(live, &pipeline.preserved_block_boundaries);
+            let retained = pipeline.retained_finally_entries(&origins);
+            assert_eq!(
+                retained.get(&alias).copied(),
+                (change == "ordinary call").then_some(target),
+                "{change}",
+            );
+        }
     }
 
     #[test]

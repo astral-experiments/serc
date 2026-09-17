@@ -20,6 +20,8 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) ordinary_try_setups: FxHashMap<Label, Label>,
     // Original ordinary-await suspension regions, resolved alongside their live regions.
     pub(super) ordinary_await_cleanups: Vec<super::ExceptionRegion>,
+    // Authored SEND, completion entry, and END_SEND before any cleanup or copying.
+    pub(super) ordinary_await_ends: Vec<OrdinaryAwaitEnd>,
     // Authored return NOP, immediately following finally POP, and original try target.
     pub(super) early_return_nop_pairs: Vec<(Instruction, Instruction, Label)>,
     pub(super) copied_handler_cleanups: Vec<CopiedHandlerCleanup>,
@@ -134,6 +136,17 @@ pub(super) struct AsyncWithSetup {
     pub(super) prefix: Vec<Item>,
     pub(super) cleanup: Vec<Item>,
     // Filled only where the cold pass converts this original fallthrough to a jump.
+    pub(super) bridge: Option<(Label, Instruction)>,
+}
+
+/// An ordinary await's completion and the original cleanup fallthrough entering it.
+#[derive(Debug)]
+pub(super) struct OrdinaryAwaitEnd {
+    pub(super) send: Instruction,
+    pub(super) entry: Label,
+    pub(super) end_send: Instruction,
+    pub(super) cleanup: Vec<Item>,
+    // Set only where the cold pass converts this exact original fallthrough.
     pub(super) bridge: Option<(Label, Instruction)>,
 }
 
@@ -306,6 +319,11 @@ pub(super) struct UncompactedConditionalArray {
 impl ExceptionOwnerProvenance {
     /// Retires an async entry before erased labels can migrate to another live array.
     pub(super) fn retire_async_with_setup(&mut self, label: Label) {
+        self.ordinary_await_ends.retain(|origin| {
+            origin.entry != label
+                && !origin.cleanup.contains(&Item::Label(label))
+                && origin.bridge.is_none_or(|(bridge, _)| bridge != label)
+        });
         self.async_with_setups.retain(|origin| {
             origin.setup != label
                 && !origin.prefix.contains(&Item::Label(label))
@@ -2415,6 +2433,7 @@ impl LayoutAssembler {
         let mut captured_null_slots = Vec::new();
         let mut pending_null_append = None;
         let mut pending_fresh_null_append = None;
+        let mut pending_await_null_append = None;
         let mut pending_normal_pop_null_append = None;
         let mut original_array_start = 0;
         let mut pending_compacted_append = None;
@@ -2599,6 +2618,28 @@ impl LayoutAssembler {
                             .contains(label)
                     {
                         pending_threaded_null_append = None;
+                    }
+                    // Only range endpoints and recorded bookkeeping continuations may
+                    // intervene between this authenticated await condition and its marker.
+                    // An authored entry or an unknown label ends the original-array proof.
+                    if boundaries.contains(label)
+                        || jump_targets.contains(label)
+                        || setups.contains_key(label)
+                        || self
+                            .exception_owner_provenance
+                            .source_boundaries
+                            .contains(label)
+                        || self
+                            .exception_owner_provenance
+                            .removed_pop_block_boundaries
+                            .contains(label)
+                        || !(region_ends.contains(label)
+                            || self
+                                .exception_owner_provenance
+                                .continuation_boundaries
+                                .contains(label))
+                    {
+                        pending_await_null_append = None;
                     }
                     if boundaries.contains(label)
                         || jump_targets.contains(label)
@@ -3202,12 +3243,16 @@ impl LayoutAssembler {
                         captured_null_slots.clear();
                         pending_null_append = None;
                         pending_fresh_null_append = None;
+                        pending_await_null_append = None;
                         pending_normal_pop_null_append = None;
                     }
                     let appends_to_null_slot =
                         pending_null_append.take() == Some(instruction_index);
-                    let appends_to_fresh_null_slot =
-                        pending_fresh_null_append.take() == Some(instruction_index);
+                    let appends_to_await_null_slot =
+                        pending_await_null_append.take() == Some(instruction_index);
+                    let appends_to_fresh_null_slot = pending_fresh_null_append.take()
+                        == Some(instruction_index)
+                        || appends_to_await_null_slot;
                     let appends_to_normal_pop_null_slot =
                         pending_normal_pop_null_append.take() == Some(instruction_index);
                     if ended_uniform_with_suffix && instruction.opcode != NOT_TAKEN {
@@ -3996,10 +4041,17 @@ impl LayoutAssembler {
                                     .is_some_and(|position| *position < start)
                             }))
                             // A later SETUP also owns a fresh original array when its
-                            // retained NOP is the only record before the protected body.
+                            // retained NOP is the only record before the protected body,
+                            // or follows an unchanged ordinary-await completion and discard.
                             // Earlier arrays cannot contribute stale slots across this
                             // authored boundary, even if an enclosing region began earlier.
-                            || (start == original_array_start + 1
+                            || ((start == original_array_start + 1
+                                || (start == original_array_start + 3
+                                    && self.unchanged_discarded_await_end(
+                                        original_array_start,
+                                        &indexed_instructions,
+                                        &label_positions,
+                                    )))
                                 && self
                                     .exception_owner_provenance
                                     .block_boundaries
@@ -4014,6 +4066,15 @@ impl LayoutAssembler {
                                     })))
                     {
                         pending_fresh_null_append = Some(instruction_index + 1);
+                        if start == original_array_start + 3
+                            && self.unchanged_discarded_await_end(
+                                original_array_start,
+                                &indexed_instructions,
+                                &label_positions,
+                            )
+                        {
+                            pending_await_null_append = Some(instruction_index + 1);
+                        }
                     }
                     // If the appended slot falls within an exact erased POP_BLOCK run,
                     // it reuses a NULL record. Resolve the original terminator before
@@ -4992,6 +5053,123 @@ impl LayoutAssembler {
             );
         }
         owners
+    }
+
+    /// Recognizes the unchanged result discard at an authored ordinary-await entry.
+    fn unchanged_discarded_await_end(
+        &self,
+        start: usize,
+        instructions: &[&Instruction],
+        positions: &FxHashMap<Label, usize>,
+    ) -> bool {
+        let Some([end_send, discard]) = instructions.get(start..start + 2) else {
+            return false;
+        };
+        if discard.opcode != POP_TOP
+            || discard.operand() != Operand::Value(0)
+            || discard.location != end_send.location
+            || !matches!(
+                (discard.depth_after(), end_send.depth_after()),
+                (Some(discard_depth), Some(end_depth))
+                    if discard_depth.checked_add(1) == Some(end_depth)
+            )
+            || discard.exception_policy() != super::ExceptionPolicy::NoneUnchanged
+            || discard.local_policy.hidden_exception_owner_slots() != 0
+            || discard.pre_fold_extra_instructions() != 0
+            || discard.no_location_policy.borrow_fallthrough()
+                != super::BorrowFallthrough::Reachable
+        {
+            return false;
+        }
+        let mut origins = self
+            .exception_owner_provenance
+            .ordinary_await_ends
+            .iter()
+            .filter(|origin| {
+                origin.end_send == **end_send && positions.get(&origin.entry) == Some(&start)
+            });
+        let Some(origin) = origins.next() else {
+            return false;
+        };
+        let entry = &origin.entry;
+        if origins.next().is_some()
+            || !self
+                .exception_owner_provenance
+                .block_boundaries
+                .contains(entry)
+            || self
+                .exception_owner_provenance
+                .normal_try_copy_blocks
+                .contains(entry)
+            || self
+                .exception_owner_provenance
+                .normal_try_copy_inline_labels
+                .contains(entry)
+            || self
+                .exception_owner_provenance
+                .normal_try_copy_internal_labels
+                .contains(entry)
+            || self
+                .exception_owner_provenance
+                .normal_try_copy_jump_nop_successors
+                .contains(entry)
+        {
+            return false;
+        }
+        let Some(first_cleanup) = origin.cleanup.first() else {
+            return false;
+        };
+        let mut cleanups = self
+            .items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| *item == first_cleanup);
+        let Some((cleanup_start, _)) = cleanups.next() else {
+            return false;
+        };
+        let cleanup_end = cleanup_start + origin.cleanup.len();
+        if cleanups.next().is_some()
+            || self.items.get(cleanup_start..cleanup_end) != Some(origin.cleanup.as_slice())
+        {
+            return false;
+        }
+        if let Some((label, bridge)) = origin.bridge {
+            if self.items.get(cleanup_end..cleanup_end + 2)
+                != Some([Item::Label(label), Item::Instruction(bridge)].as_slice())
+                || self
+                    .items
+                    .iter()
+                    .filter(|item| **item == Item::Label(label))
+                    .count()
+                    != 1
+            {
+                return false;
+            }
+        } else if self.items.get(cleanup_end) != Some(&Item::Label(*entry)) {
+            return false;
+        }
+        let mut incoming = instructions.iter().filter(|instruction| {
+            matches!(instruction.operand(), Operand::Forward(label) | Operand::Backward(label)
+                if positions.get(&label) == Some(&start))
+        });
+        let mut seen_send = false;
+        let mut seen_bridge = false;
+        let exact = incoming.all(|instruction| {
+            if **instruction == origin.send && !seen_send {
+                seen_send = true;
+                true
+            } else if origin
+                .bridge
+                .is_some_and(|(_, bridge)| bridge == **instruction)
+                && !seen_bridge
+            {
+                seen_bridge = true;
+                true
+            } else {
+                false
+            }
+        });
+        exact && seen_send && seen_bridge == origin.bridge.is_some()
     }
 
     /// Projects the appended marker through the last compaction of a captured manager return.

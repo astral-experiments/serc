@@ -1810,6 +1810,26 @@ impl OptimizationPipeline {
                     origin.bridge = Some((label, bridge));
                 }
             }
+            for origin in &mut self.exception_owner_provenance.ordinary_await_ends {
+                if origin.bridge.is_some()
+                    || graph[current].items() != origin.cleanup.as_slice()
+                    || !graph[next].items().starts_with(&[
+                        Item::Label(origin.entry),
+                        Item::Instruction(origin.end_send),
+                    ])
+                {
+                    continue;
+                }
+                let mut incoming = graph.iter().flat_map(|(_, block)| block.items()).filter_map(|item| match item {
+                    Item::Instruction(instruction)
+                        if matches!(instruction.operand(), Operand::Forward(entry) | Operand::Backward(entry)
+                            if graph.label_block(entry) == Some(next)) => Some(instruction),
+                    _ => None,
+                });
+                if incoming.next() == Some(&origin.send) && incoming.next().is_none() {
+                    origin.bridge = Some((label, bridge));
+                }
+            }
             let block = graph.insert_block(
                 position + 1,
                 vec![Item::Label(label), Item::Instruction(bridge)],

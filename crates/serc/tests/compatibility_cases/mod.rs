@@ -581,3 +581,11 @@ mod folded_nested_if_exit;
 mod async_for_direct_assert_exit;
 
 mod async_manager_nested_while_exit;
+
+mod coroutine_guarded_break_finally;
+
+mod finally_source_recovery;
+
+mod manager_assertion_arm_cleanup;
+
+mod await_completion_condition_owners;

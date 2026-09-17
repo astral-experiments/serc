@@ -14407,12 +14407,12 @@ impl Compiler<'_> {
                 && self
                     .assembler
                     .current_original_block_ends_with_discarded_call();
-            let awaited_finally_normal_source = !statement.is_star
+            let retained_finally_normal_source = !statement.is_star
                 && statement.orelse.is_empty()
                 && !statement.finalbody.is_empty()
                 && self
                     .assembler
-                    .current_original_block_starts_with_await_completion();
+                    .current_original_block_has_nonempty_borrow_source();
             let normal_exit = self.emit_jump_forward_instruction_with_exception_policy(
                 JUMP_FORWARD,
                 end,
@@ -14446,29 +14446,32 @@ impl Compiler<'_> {
                 // Its owner origin is independent of ordinary-try copy-plan eligibility.
                 self.assembler.record_compound_try_owner_exit(try_end, end);
             }
-            if awaited_finally_normal_source
+            if retained_finally_normal_source
                 && statement.handlers.iter().any(|handler| {
                     handler.as_except_handler().is_some_and(|handler| {
                         suite_ends_in_recovery_cleanup(&handler.body)
-                            || matches!(handler.body.last(), Some(Stmt::If(conditional))
-                                if early_condition_truthiness(&conditional.test).is_none()
-                                    && conditional.elif_else_clauses.is_empty()
-                                    && matches!(conditional.body.last(), Some(Stmt::For(loop_statement))
-                                        if !loop_statement.is_async
-                                            && loop_statement.orelse.is_empty()
-                                            && matches!(loop_statement.body.last(), Some(Stmt::Try(recovery))
-                                                if !recovery.is_star
-                                                    && recovery.orelse.is_empty()
-                                                    && recovery.finalbody.is_empty()
-                                                    && !recovery.handlers.is_empty()))
-                                    && suite_contains_orphan_cold_cleanup(&conditional.body))
+                            || handler.body.iter().any(|statement| {
+                                matches!(statement, Stmt::If(conditional)
+                                    if early_condition_truthiness(&conditional.test).is_none()
+                                        && conditional.elif_else_clauses.is_empty()
+                                        && matches!(conditional.body.last(), Some(Stmt::For(loop_statement))
+                                            if !loop_statement.is_async
+                                                && loop_statement.orelse.is_empty()
+                                                && matches!(loop_statement.body.last(), Some(Stmt::Try(recovery))
+                                                    if !recovery.is_star
+                                                        && recovery.orelse.is_empty()
+                                                        && recovery.finalbody.is_empty()
+                                                        && !recovery.handlers.is_empty()))
+                                        && suite_contains_orphan_cold_cleanup(&conditional.body))
+                            })
                     })
                 })
             {
                 // Inlining the recovery's unlocated cleanup or retry-loop backedge
                 // leaves its original array empty and outside the relocated cold blocks.
-                // The complete awaited source can include later stores, but borrowing
-                // stops at that intervening empty array after its exit jump disappears.
+                // A later handler statement does not repopulate the loop's backedge array.
+                // A populated original source, including one beginning after a condition,
+                // cannot bridge that empty array when its normal exit jump disappears.
                 self.assembler
                     .prevent_borrow_jump_threading_target(normal_exit);
             }
@@ -22220,6 +22223,14 @@ fn with_body_conditional_exit_location(
     match fallthrough.last()? {
         statement @ (Stmt::Expr(_) | Stmt::Assign(_) | Stmt::Pass(_)) => {
             Some(implicit_return_range(compiler, statement))
+        }
+        Stmt::Assert(assertion)
+            if condition_has_only_runtime_tests(&assertion.test)
+                && original_condition_has_unique_jump_target(&assertion.test, true) =>
+        {
+            // The other arm exits directly. The assertion's sole successful edge
+            // locates this arm's jump and the manager's original normal POP_BLOCK.
+            unique_condition_jump_target(&assertion.test, true).map(Ranged::range)
         }
         Stmt::With(manager)
             if manager.items.len() == 1

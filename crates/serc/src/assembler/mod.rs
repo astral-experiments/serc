@@ -695,8 +695,8 @@ impl Assembler {
         true
     }
 
-    /// Recognizes the complete current original array beginning at an await's completion.
-    pub(crate) fn current_original_block_starts_with_await_completion(&self) -> bool {
+    /// Recognizes a nonempty, straight-line original source for a normal finally edge.
+    pub(crate) fn current_original_block_has_nonempty_borrow_source(&self) -> bool {
         let mut first = None;
         for item in self.linear_items().iter().rev() {
             match item {
@@ -713,10 +713,7 @@ impl Assembler {
                             .exception_owner_provenance
                             .source_boundaries
                             .contains(label)
-                            && first.is_some_and(|instruction: &Instruction| {
-                                instruction.opcode == END_SEND
-                                    && instruction.operand() == Operand::Value(0)
-                            });
+                            && first.is_some();
                     }
                 }
                 Item::Instruction(instruction) => {
@@ -5955,6 +5952,44 @@ impl Assembler {
         self.exception_owner_provenance
             .ordinary_await_cleanups
             .push(region);
+
+        let [.., Item::Label(entry), Item::Instruction(end_send)] = self.linear_items() else {
+            return;
+        };
+        if end_send.opcode != END_SEND {
+            return;
+        }
+        let (entry, end_send) = (*entry, *end_send);
+        let mut incoming = self.linear_items().iter().filter_map(|item| match item {
+            Item::Instruction(instruction)
+                if instruction.opcode == SEND
+                    && instruction.operand() == Operand::Forward(entry) =>
+            {
+                Some(*instruction)
+            }
+            _ => None,
+        });
+        let Some(send) = incoming.next() else {
+            return;
+        };
+        if incoming.next().is_some() {
+            return;
+        }
+        let items = self.linear_items();
+        let Some(cleanup_start) = items.iter().rposition(|item| *item == Item::Label(cleanup))
+        else {
+            return;
+        };
+        let original_cleanup = items[cleanup_start..items.len() - 2].to_vec();
+        self.exception_owner_provenance.ordinary_await_ends.push(
+            exception_owners::OrdinaryAwaitEnd {
+                send,
+                entry,
+                end_send,
+                cleanup: original_cleanup,
+                bridge: None,
+            },
+        );
     }
 
     /// Authenticates the original `SEND`/`END_SEND` array before an async manager's setup.
