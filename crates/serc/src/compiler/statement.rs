@@ -5782,7 +5782,20 @@ impl Compiler<'_> {
                             && next_loop == loop_depth
                             && self.control.finally.active_finally_end_blocks == 0
                             && self.control.finally.active_normal_finally_bodies == 0
-                            && self.control.withs.active_with_exits.is_empty();
+                            && (self.control.withs.active_with_exits.is_empty()
+                                // Enclosing managers unwind after this handler and its finally.
+                                // Their presence does not remove either original handler POP.
+                                || (preserve_tos
+                                    && next_finally == 1
+                                    && return_finally_contexts.len() == 1
+                                    && next_with == with_depth
+                                    && with_depth == self.control.withs.active_with_exits.len()
+                                    && return_finally_contexts[0].handler_depth == handler_index
+                                    && return_finally_contexts[0].with_depth == with_depth
+                                    && return_finally_contexts[0].loop_depth == loop_depth
+                                    && return_finally_contexts[0].exception_region_depth + 1 == region_depth
+                                    && self.control.exceptions.active_try_marker_slots.is_empty()
+                                    && self.control.withs.active_with_exits.iter().all(|manager| !manager.is_async)));
                         if preserve_named_handler_pop_slots && preserves_enclosing_try_return_owner
                         {
                             // Ordinary tries entered inside this handler unwind before its
@@ -17085,13 +17098,44 @@ impl Compiler<'_> {
                     statement.body.last(),
                     Some(Stmt::If(_) | Stmt::Try(_) | Stmt::While(_) | Stmt::With(_))
                 );
+        // A guarded break copies cleanup on its taken edge. Runtime work on the
+        // other edge keeps a separate nonempty normal array before the finalizer.
+        let linear_tail_after_guarded_break = statement.orelse.is_empty()
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && !self.control.loops.contexts.is_empty()
+            && self.control.withs.active_with_exits.is_empty()
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            && !self.control.in_exception_handler()
+            && self.control.finally.active_finally_try_bodies == 0
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+            && matches!(statement.finalbody.as_slice(), [Stmt::Expr(cleanup)]
+                if matches!(cleanup.value.as_ref(), Expr::Call(_))
+                    && !expression_contains_inline_branch(&cleanup.value))
+            && matches!(statement.body.as_slice(), [Stmt::If(guard), tail @ ..]
+                if guard.elif_else_clauses.is_empty()
+                    && condition_has_only_runtime_tests(&guard.test)
+                    && !expression_contains_inline_branch(&guard.test)
+                    && original_condition_has_unique_jump_target(&guard.test, false)
+                    && guard.body.split_last().is_some_and(|(last, leading)| {
+                        matches!(last, Stmt::Break(_))
+                            && (leading.is_empty() || suite_has_linear_borrow_fallthrough(leading))
+                    })
+                    && suite_has_linear_borrow_fallthrough(tail)
+                    && !suite_contains_yield(&statement.body));
         let compound_fallthrough_handlers_reach_finally = !statement.is_star
             && statement.handlers.iter().all(|handler| {
                 handler.as_except_handler().is_some_and(|handler| {
                     handler.type_.is_some() && !suite_contains_abrupt_control_flow(&handler.body)
                 })
             })
-            && !suite_contains_loop_break(&statement.body)
+            && (!suite_contains_loop_break(&statement.body) || linear_tail_after_guarded_break)
             && !matches!(
                 statement.body.last(),
                 Some(Stmt::If(_) | Stmt::Try(_) | Stmt::While(_) | Stmt::With(_))

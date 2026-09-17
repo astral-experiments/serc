@@ -27,7 +27,8 @@ use crate::assembler::ir::{ThreadedBorrowEntries, ThreadedBorrowSnapshot};
 use crate::target::{
     is_unconditional_jump,
     opcodes::{
-        CALL, CALL_KW, END_FOR, GET_AWAITABLE, POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE, TO_BOOL,
+        CALL, CALL_KW, END_FOR, GET_AWAITABLE, GET_ITER, POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE,
+        TO_BOOL,
     },
 };
 
@@ -2322,159 +2323,184 @@ impl OptimizationPipeline {
             .difference(&self.borrow_block_aliases)
             .copied()
             .collect();
-        let calls = self
-            .borrow_loop_exit_blocks
-            .keys()
-            .chain(self.borrow_finally_entries.keys())
-            .copied()
-            .collect::<FxHashSet<_>>()
-            .into_iter()
-            .map(|label| {
-                let call = (|| {
-                    // Only a recorded nested SETUP_FINALLY span can extend this
-                    // original physical block. Other empty blocks remain barriers.
-                    let original = self.graph.label_block(label)?;
-                    let items = origins
-                        .iter()
-                        .find(|origin| origin.entry == label)
-                        .map_or_else(
-                            || self.graph[original].items(),
-                            |origin| origin.items.as_slice(),
-                        );
-                    let (blocks, label_blocks, _) = borrow_block_ranges(
-                        items,
-                        &boundaries,
-                        &self.borrow_unreachable_blocks,
-                        &preserved,
-                    );
-                    let range =
-                        blocks.get(*label_blocks.get(usize::try_from(label.0).unwrap())?)?;
-                    let instructions = items[range.clone()]
-                        .iter()
-                        .filter_map(|item| match item {
-                            Item::Instruction(instruction) => Some(instruction),
-                            Item::Label(_) => None,
-                        })
-                        .collect::<Vec<_>>();
-                    let first = instructions.first()?;
-                    if first.opcode != NOP || !first.fusion_policy.is_converted_pop_block() {
-                        return None;
-                    }
-                    let live = instructions
-                        .iter()
-                        .copied()
-                        .filter(|instruction| instruction.opcode != NOP)
-                        .collect::<Vec<_>>();
-                    let scope_exit = live.last().is_some_and(|last| ends_scope(last.opcode));
-                    // Two discarded calls and the scope exit contribute at least five
-                    // surviving instructions, beyond CPython's four-instruction copy limit.
-                    // CALL/POP_TOP pairs survive constant folding and local fusion.
-                    let large_terminal_cleanup = scope_exit
-                        && live
-                            .windows(2)
-                            .filter(|pair| pair[0].opcode == CALL && pair[1].opcode == POP_TOP)
-                            .nth(1)
-                            .is_some();
-                    // A local condition ends this original cleanup array before any
-                    // call. Its first load cannot fold or fuse with the following
-                    // conversion/jump, so it can witness a surviving authored-break entry.
-                    // Match the complete primitive head; interior NOPs and extra prefixes
-                    // must not borrow a witness from a different original array.
-                    let primitive_condition = match instructions.as_slice() {
-                        [_, load, to_bool, jump] => {
-                            load.opcode == LOAD_FAST
-                                && matches!(load.operand(), Operand::Value(_))
-                                && to_bool.opcode == TO_BOOL
-                                && to_bool.operand() == Operand::Value(0)
-                                && jump.opcode == POP_JUMP_IF_FALSE
-                                && matches!(jump.operand(), Operand::Forward(_))
-                        }
-                        [_, load, jump] => {
-                            load.opcode == LOAD_FAST
-                                && matches!(load.operand(), Operand::Value(_))
-                                && jump.opcode == POP_JUMP_IF_NONE
-                                && matches!(jump.operand(), Operand::Forward(_))
-                        }
-                        _ => false,
-                    } && instructions.iter().all(|instruction| {
-                        !instruction.jump_policy.borrow_empty_block()
-                            && instruction.no_location_policy.borrow_fallthrough()
-                                == BorrowFallthrough::Reachable
-                    });
-                    // Preserve any existing CALL witness before considering the
-                    // authored-break-only alternatives later in the same original block.
-                    let candidates = instructions
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, instruction)| instruction.opcode == CALL)
-                        .chain(
-                            instructions
-                                .iter()
-                                .enumerate()
-                                .filter(|(_, instruction)| instruction.opcode != CALL),
-                        );
-                    for (index, instruction) in candidates {
-                        // Keyword calls and plain await entry operations also keep
-                        // this original array nonempty. Only the captured authored-break
-                        // route may use these witnesses; ordinary call routes stay unchanged.
-                        let authored_finally_witness =
-                            self.borrow_finally_entries.contains_key(&label)
-                                && !scope_exit
-                                && (instruction.opcode == CALL_KW
-                                    || (instruction.opcode == GET_AWAITABLE
-                                        && instruction.operand() == Operand::Value(0))
-                                    || (primitive_condition && index == 1));
-                        if (instruction.opcode != CALL && !authored_finally_witness)
-                            || instruction.location.line < 0
-                        {
-                            continue;
-                        }
-                        let Operand::Value(argument) = instruction.operand() else {
-                            continue;
-                        };
-                        // These five operations survive constant/NOP folding before exit copying:
-                        // LOAD_FAST, LOAD_ATTR, CALL, POP_TOP, and the scope exit. The receiver
-                        // load cannot form a fast-fast fusion with LOAD_ATTR. Small return calls
-                        // lack POP_TOP and retain the existing empty-exit behavior.
-                        if scope_exit
-                            && !large_terminal_cleanup
-                            && !(live.first().is_some_and(|first| first.opcode == LOAD_FAST)
-                                && live.get(1).is_some_and(|second| second.opcode == LOAD_ATTR)
-                                && instructions
-                                    .get(index + 1)
-                                    .is_some_and(|next| next.opcode == POP_TOP))
-                        {
-                            continue;
-                        }
-                        if instructions[..index].iter().any(|candidate| {
-                            candidate.jump_policy.borrow_empty_block()
-                                || candidate.no_location_policy.borrow_fallthrough()
-                                    != BorrowFallthrough::Reachable
-                        }) {
-                            continue;
-                        }
-                        let aliases = items[range.clone()]
+        let calls =
+            self.borrow_loop_exit_blocks
+                .keys()
+                .chain(self.borrow_finally_entries.keys())
+                .copied()
+                .collect::<FxHashSet<_>>()
+                .into_iter()
+                .map(|label| {
+                    let call = (|| {
+                        // Only a recorded nested SETUP_FINALLY span can extend this
+                        // original physical block. Other empty blocks remain barriers.
+                        let original = self.graph.label_block(label)?;
+                        let items = origins
                             .iter()
-                            .take_while(|item| matches!(item, Item::Label(_)))
+                            .find(|origin| origin.entry == label)
+                            .map_or_else(
+                                || self.graph[original].items(),
+                                |origin| origin.items.as_slice(),
+                            );
+                        let (blocks, label_blocks, _) = borrow_block_ranges(
+                            items,
+                            &boundaries,
+                            &self.borrow_unreachable_blocks,
+                            &preserved,
+                        );
+                        let range =
+                            blocks.get(*label_blocks.get(usize::try_from(label.0).unwrap())?)?;
+                        let instructions = items[range.clone()]
+                            .iter()
                             .filter_map(|item| match item {
-                                Item::Label(label) => Some(*label),
-                                Item::Instruction(_) => None,
+                                Item::Instruction(instruction) => Some(instruction),
+                                Item::Label(_) => None,
                             })
                             .collect::<Vec<_>>();
-                        return Some((
-                            BorrowCleanupCall {
-                                opcode: instruction.opcode,
-                                argument,
-                                location: instruction.location,
-                            },
-                            aliases,
-                        ));
-                    }
-                    None
-                })();
-                (label, call)
-            })
-            .collect::<Vec<_>>();
+                        let first = instructions.first()?;
+                        if first.opcode != NOP || !first.fusion_policy.is_converted_pop_block() {
+                            return None;
+                        }
+                        let live = instructions
+                            .iter()
+                            .copied()
+                            .filter(|instruction| instruction.opcode != NOP)
+                            .collect::<Vec<_>>();
+                        let scope_exit = live.last().is_some_and(|last| ends_scope(last.opcode));
+                        // Two discarded calls and the scope exit contribute at least five
+                        // surviving instructions, beyond CPython's four-instruction copy limit.
+                        // CALL/POP_TOP pairs survive constant folding and local fusion.
+                        let large_terminal_cleanup = scope_exit
+                            && live
+                                .windows(2)
+                                .filter(|pair| pair[0].opcode == CALL && pair[1].opcode == POP_TOP)
+                                .nth(1)
+                                .is_some();
+                        // A local condition ends this original cleanup array before any
+                        // call. Its first load cannot fold or fuse with the following
+                        // conversion/jump, so it can witness a surviving authored-break entry.
+                        // Match the complete primitive head; interior NOPs and extra prefixes
+                        // must not borrow a witness from a different original array.
+                        let primitive_condition = match instructions.as_slice() {
+                            [_, load, to_bool, jump] => {
+                                load.opcode == LOAD_FAST
+                                    && matches!(load.operand(), Operand::Value(_))
+                                    && to_bool.opcode == TO_BOOL
+                                    && to_bool.operand() == Operand::Value(0)
+                                    && jump.opcode == POP_JUMP_IF_FALSE
+                                    && matches!(jump.operand(), Operand::Forward(_))
+                            }
+                            [_, load, jump] => {
+                                load.opcode == LOAD_FAST
+                                    && matches!(load.operand(), Operand::Value(_))
+                                    && jump.opcode == POP_JUMP_IF_NONE
+                                    && matches!(jump.operand(), Operand::Forward(_))
+                            }
+                            _ => false,
+                        } && instructions.iter().all(|instruction| {
+                            !instruction.jump_policy.borrow_empty_block()
+                                && instruction.no_location_policy.borrow_fallthrough()
+                                    == BorrowFallthrough::Reachable
+                        });
+                        // A for cleanup starts a separate loop block after GET_ITER.
+                        // This complete local/attribute prefix survives folding and cannot
+                        // fuse its local load across the iterator conversion.
+                        let primitive_iteration = match instructions.as_slice() {
+                            [_, load, attributes @ .., get_iter] => load.opcode == LOAD_FAST
+                                && matches!(load.operand(), Operand::Value(_))
+                                && attributes.len() <= 1
+                                && attributes.iter().all(|attribute| {
+                                    attribute.opcode == LOAD_ATTR
+                                        && matches!(attribute.operand(), Operand::Value(argument)
+                                            if argument & 1 == 0)
+                                })
+                                && get_iter.opcode == GET_ITER
+                                && get_iter.operand() == Operand::Value(0),
+                            _ => false,
+                        } && items[range.clone()]
+                            .iter()
+                            .skip_while(|item| matches!(item, Item::Label(_)))
+                            .all(|item| matches!(item, Item::Instruction(_)))
+                            && instructions.iter().all(|instruction| {
+                                !instruction.jump_policy.borrow_empty_block()
+                                    && instruction.no_location_policy.borrow_fallthrough()
+                                        == BorrowFallthrough::Reachable
+                            });
+                        // Preserve any existing CALL witness before considering the
+                        // other entry witnesses in the same original block.
+                        let candidates = instructions
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, instruction)| instruction.opcode == CALL)
+                            .chain(
+                                instructions
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, instruction)| instruction.opcode != CALL),
+                            );
+                        for (index, instruction) in candidates {
+                            // A captured iterator prefix is also nonempty for an ordinary
+                            // original jump. Other alternate witnesses remain restricted to
+                            // the captured authored-break route during traversal.
+                            let alternate_finally_witness =
+                                self.borrow_finally_entries.contains_key(&label)
+                                    && !scope_exit
+                                    && (instruction.opcode == CALL_KW
+                                        || (instruction.opcode == GET_AWAITABLE
+                                            && instruction.operand() == Operand::Value(0))
+                                        || (primitive_iteration && instruction.opcode == GET_ITER)
+                                        || (primitive_condition && index == 1));
+                            if (instruction.opcode != CALL && !alternate_finally_witness)
+                                || instruction.location.line < 0
+                            {
+                                continue;
+                            }
+                            let Operand::Value(argument) = instruction.operand() else {
+                                continue;
+                            };
+                            // These five operations survive constant/NOP folding before exit copying:
+                            // LOAD_FAST, LOAD_ATTR, CALL, POP_TOP, and the scope exit. The receiver
+                            // load cannot form a fast-fast fusion with LOAD_ATTR. Small return calls
+                            // lack POP_TOP and retain the existing empty-exit behavior.
+                            if scope_exit
+                                && !large_terminal_cleanup
+                                && !(live.first().is_some_and(|first| first.opcode == LOAD_FAST)
+                                    && live.get(1).is_some_and(|second| second.opcode == LOAD_ATTR)
+                                    && instructions
+                                        .get(index + 1)
+                                        .is_some_and(|next| next.opcode == POP_TOP))
+                            {
+                                continue;
+                            }
+                            if instructions[..index].iter().any(|candidate| {
+                                candidate.jump_policy.borrow_empty_block()
+                                    || candidate.no_location_policy.borrow_fallthrough()
+                                        != BorrowFallthrough::Reachable
+                            }) {
+                                continue;
+                            }
+                            let aliases = items[range.clone()]
+                                .iter()
+                                .take_while(|item| matches!(item, Item::Label(_)))
+                                .filter_map(|item| match item {
+                                    Item::Label(label) => Some(*label),
+                                    Item::Instruction(_) => None,
+                                })
+                                .collect::<Vec<_>>();
+                            return Some((
+                                BorrowCleanupCall {
+                                    opcode: instruction.opcode,
+                                    argument,
+                                    location: instruction.location,
+                                },
+                                aliases,
+                            ));
+                        }
+                        None
+                    })();
+                    (label, call)
+                })
+                .collect::<Vec<_>>();
         let mut finally_entries = FxHashMap::default();
         for (label, entry) in calls {
             if let Some(policy) = self.borrow_loop_exit_blocks.get_mut(&label) {
@@ -3153,8 +3179,8 @@ impl OptimizationPipeline {
                                                 }
                                                 Item::Instruction(instruction) => {
                                                     at_target
-                                                        && instruction.opcode == CALL
-                                                        && call.opcode == CALL
+                                                        && matches!(call.opcode, CALL | GET_ITER)
+                                                        && instruction.opcode == call.opcode
                                                         && instruction.operand()
                                                             == Operand::Value(call.argument)
                                                         && instruction.location == call.location

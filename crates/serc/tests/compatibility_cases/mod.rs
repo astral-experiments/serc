@@ -540,3 +540,9 @@ mod handler_continue_guards;
 mod nested_setup_conditional_argument;
 mod related_finally_truth_owners;
 mod sync_with_one_fallthrough;
+
+mod finally_for_borrow;
+
+mod calculated_handler_return;
+
+mod normal_finally_handler_fallthrough;
