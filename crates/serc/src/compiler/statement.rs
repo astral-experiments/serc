@@ -11902,6 +11902,19 @@ impl Compiler<'_> {
                 {
                     self.assembler.allow_borrow_surviving_break_entry(end);
                 }
+                // A following statement stays inside the same protected body. A
+                // surviving authored break can enter that nonempty continuation in
+                // generators, outer loops, and managers too; the assembler still
+                // rejects removed breaks and merged empty original targets.
+                if self.control.statements.current_statement_has_following
+                    && self.control.exceptions.active_exception_handlers.is_empty()
+                    && self.control.exceptions.active_exception_group_handlers == 0
+                    && self.control.finally.active_copied_finally_bodies == 0
+                    && self.control.finally.active_normal_finally_bodies == 0
+                    && self.control.finally.active_finally_end_blocks == 0
+                {
+                    self.assembler.allow_borrow_surviving_break_entry(end);
+                }
                 // Manager exit calls retain a nonempty original target for any
                 // break jump that survives, even when the terminal break is removed.
                 // A finally body can erase another continuation after this cleanup;
@@ -17034,6 +17047,8 @@ impl Compiler<'_> {
                 .set_location(self.source_location(statement.range));
             self.emit(NOP, 0, 0)?;
         }
+        // The exception-group continuation begins a new original instruction array.
+        self.assembler.record_exception_owner_block_boundary(end);
         self.assembler.mark(end);
         self.set_depth(base_depth);
         if terminal {
@@ -22707,7 +22722,12 @@ fn suite_retained_try_exit_has_normal_fallthrough(body: &[Stmt]) -> bool {
                     .iter()
                     .map(|clause| clause.body.as_slice()),
             )
-            .any(|body| matches!(body.last(), Some(Stmt::Return(_) | Stmt::Raise(_))))
+            .any(|body| {
+                matches!(
+                    body.last(),
+                    Some(Stmt::Break(_) | Stmt::Continue(_) | Stmt::Return(_) | Stmt::Raise(_))
+                )
+            })
 }
 
 // A nested try with a terminal protected body has no normal edge to the branch join.
@@ -25918,6 +25938,10 @@ fn suite_ends_in_terminal_conditional_break(body: &[Stmt]) -> bool {
 
 fn suite_contains_borrow_reachable_conditional_loop_break(body: &[Stmt]) -> bool {
     fn has_reachable_explicit_fallthrough(statement: &ruff_python_ast::StmtIf) -> bool {
+        // A folded true condition leaves no edge into the later clauses.
+        if condition_jump_target_count(&statement.test, false) == 0 {
+            return false;
+        }
         for clause in &statement.elif_else_clauses {
             let falls_through = !suite_terminates(&clause.body);
             let Some(test) = &clause.test else {

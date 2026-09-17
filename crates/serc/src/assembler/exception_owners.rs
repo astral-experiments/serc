@@ -460,7 +460,7 @@ impl ExceptionOwnerProvenance {
         prefix: &'a [Item],
         all: &[Item],
     ) -> Option<(Label, &'a [Item], usize)> {
-        use crate::target::opcodes::{CALL, STORE_FAST, SWAP};
+        use crate::target::opcodes::{CALL, LOAD_ATTR, STORE_FAST, SWAP};
 
         let leading = prefix
             .iter()
@@ -530,12 +530,12 @@ impl ExceptionOwnerProvenance {
                 .collect::<Vec<_>>();
             // All authored restores are STORE_FAST_MAYBE_NULL in CPython,
             // including cells. They remain distinct through superinstruction
-            // insertion. CALL prevents static elimination of SWAP(n + 1),
-            // because only n swappable restores precede it.
+            // insertion. CALL and LOAD_ATTR prevent static elimination of SWAP(n + 1),
+            // because only n swappable restores precede either operation.
             if instructions.starts_with(original)
                 && instructions
                     .get(original.len())
-                    .is_some_and(|call| call.opcode == CALL)
+                    .is_some_and(|next| matches!(next.opcode, CALL | LOAD_ATTR))
             {
                 return Some((*entry, &prefix[start..], restores.len()));
             }
@@ -7343,10 +7343,12 @@ mod tests {
             Instruction, Item, Label, LayoutAssembler, Operand, SourceLocation,
         };
         use crate::target::opcodes::{
-            CALL, JUMP_FORWARD, NOT_TAKEN, POP_JUMP_IF_FALSE, STORE_FAST, SWAP, TO_BOOL,
+            CALL, JUMP_FORWARD, LOAD_ATTR, NOT_TAKEN, POP_JUMP_IF_FALSE, STORE_FAST, SWAP, TO_BOOL,
         };
 
-        for case in ["original", "unsealed", "cloned", "retired"] {
+        for (opcode, case) in [CALL, LOAD_ATTR].into_iter().flat_map(|opcode| {
+            ["original", "unsealed", "cloned", "retired"].map(|case| (opcode, case))
+        }) {
             let entry = Label(0);
             let exit = Label(1);
             let clone = Label(2);
@@ -7363,7 +7365,7 @@ mod tests {
             let mut items = vec![Item::Instruction(incoming), Item::Label(entry)];
             items.extend(restores.iter().copied().map(Item::Instruction));
             items.extend([
-                Item::Instruction(plain(CALL, Operand::Value(0))),
+                Item::Instruction(plain(opcode, Operand::Value(0))),
                 Item::Instruction(plain(TO_BOOL, Operand::Value(0))),
                 Item::Instruction(plain(POP_JUMP_IF_FALSE, Operand::Forward(exit))),
                 Item::Instruction(plain(NOT_TAKEN, Operand::Value(0))),
@@ -7381,7 +7383,7 @@ mod tests {
             assert_eq!(
                 provenance.uncompacted_conditional_arrays.len(),
                 usize::from(case != "unsealed"),
-                "{case}"
+                "{opcode:?}: {case}"
             );
             if case == "cloned" {
                 // The original is gone; its sole live replacement has a fresh entry.
@@ -7413,7 +7415,7 @@ mod tests {
             assert_eq!(
                 assembler.uncompacted_conditional_null_markers(&targets),
                 expected,
-                "{case}"
+                "{opcode:?}: {case}"
             );
         }
     }

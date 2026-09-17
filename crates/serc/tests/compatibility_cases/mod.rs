@@ -645,3 +645,11 @@ mod sync_iterator_manager_finally_none;
 mod sync_named_handler_break_no_fallthrough;
 
 mod early_return_nop_captured_cell;
+
+mod borrow_loop_exit_compatibility;
+
+mod comprehension_method_ifexp;
+
+mod except_star_finally_source_boundary;
+
+mod protected_loop_surviving_break;
