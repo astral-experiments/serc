@@ -2947,9 +2947,20 @@ impl OptimizationPipeline {
                     !instruction.no_location_policy.preserves_location()
                         && instruction.exception_policy() == ExceptionPolicy::default()
                 })
-                && region_memberships.iter().all(|membership| {
-                    !membership.contains(&source_position) && !membership.contains(&target_position)
-                })
+                && region_memberships
+                    .iter()
+                    .enumerate()
+                    .all(|(index, membership)| {
+                        let source_owned = membership.contains(&source_position);
+                        let target_owned = membership.contains(&target_position);
+                        // The scope fallback does not split this original empty join.
+                        // Its replaced jump keeps the same owner as the copied return.
+                        if self.exception_regions[index].is_scope_fallback {
+                            source_owned == target_owned
+                        } else {
+                            !source_owned && !target_owned
+                        }
+                    })
                 && source_position.checked_sub(1).is_some_and(|position| {
                     let previous = order[position];
                     !drop_blocks[previous.index()]

@@ -13,8 +13,8 @@ use crate::assembler::block_graph::{BlockGraph, ItemMut, ItemPosition};
 use crate::code_object::Constant;
 use crate::target::Opcode;
 use crate::target::opcodes::{
-    LOAD_CONST, LOAD_GLOBAL, POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE, RAISE_VARARGS, RERAISE,
-    RETURN_VALUE, SWAP,
+    END_ASYNC_FOR, LOAD_CONST, LOAD_GLOBAL, POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE, RAISE_VARARGS,
+    RERAISE, RETURN_VALUE, SWAP,
 };
 use crate::target::operands::ComparisonOperation;
 
@@ -2404,12 +2404,48 @@ impl OptimizationPipeline {
                                     && !self.borrow_block_aliases.contains(label)
                                     && !self.original_nop_targets.contains(label))
                         });
+                    // Async exhaustion starts an original empty continuation array after
+                    // END_ASYNC_FOR. Cold ordering can make its branch jump redundant, but
+                    // CPython resets the preceding line at that certified array boundary.
+                    let original_async_for_join = finalize_borrow_empty_blocks
+                        && !crosses_exception_boundary
+                        && !absorbed_normal_try_exit
+                        && !instruction.fusion_policy.is_authored_break()
+                        && !instruction.fusion_policy.is_converted_pop_block()
+                        && instruction.pre_fold_extra_instructions() == 0
+                        && instruction.local_policy.hidden_exception_owner_slots() == 0
+                        && instruction.exception_policy() == super::super::ExceptionPolicy::default()
+                        && instruction.location.line >= 0
+                        && next_line
+                            .is_some_and(|line| line >= 0 && line != instruction.location.line)
+                        && previous == previous_at_block_entry
+                        && previous.is_some_and(|previous| {
+                            matches!(graph.item(previous), Item::Instruction(donor)
+                                if donor.opcode == END_ASYNC_FOR
+                                    && donor.location == instruction.location)
+                        })
+                        && graph[block].items()[..offset]
+                            .iter()
+                            .all(|item| {
+                                matches!(item, Item::Label(label)
+                                    if !self.original_nop_targets.contains(label)
+                                        && !self.exception_owner_provenance.omitted_nop_counts.contains_key(label)
+                                        && !self.exception_owner_provenance.omitted_nop_locations.contains_key(label))
+                            })
+                        && graph[block].items()[..offset].iter().any(|item| {
+                            matches!(item, Item::Label(label)
+                                if self.exception_owner_provenance.source_boundaries.contains(label)
+                                    && self.exception_owner_provenance.block_boundaries.contains(label)
+                                    && !self.borrow_block_aliases.contains(label)
+                                    && !self.original_nop_targets.contains(label))
+                        });
                     if !preserves_original_fallthrough_nop
                         && !preserves_copied_finally_break_nop
                         && (!instruction.jump_policy.always_retains_nop()
                             || absorbed_normal_try_exit)
                         && (instruction.location.line < 0
-                            || previous_line == Some(instruction.location.line)
+                            || (!original_async_for_join
+                                && previous_line == Some(instruction.location.line))
                             || next_line == Some(instruction.location.line))
                     {
                         redundant.insert(position);
