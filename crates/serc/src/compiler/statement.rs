@@ -7369,6 +7369,15 @@ impl Compiler<'_> {
                     let end = self.assembler.label();
                     let exit = self.emit_jump_forward_instruction(JUMP_FORWARD, end)?;
                     self.assembler.mark_folded_condition_exit(exit);
+                    if self.context.target_specific_rules_enabled()
+                        && let Some(Stmt::If(nested)) = statement.body.last()
+                        && nested.elif_else_clauses.last().is_some_and(|clause| {
+                            clause.test.is_none()
+                                && suite_has_linear_borrow_fallthrough(&clause.body)
+                        })
+                    {
+                        self.assembler.preserve_folded_nested_if_exit(exit);
+                    }
                     self.assembler.mark(end);
                 } else if !suite_terminates(&statement.body) {
                     let end = self.assembler.label();
@@ -11939,13 +11948,11 @@ impl Compiler<'_> {
                 .active_with_exits
                 .last()
                 .is_none_or(|context| {
-                    context.is_async
-                        || self
-                            .control
-                            .exceptions
-                            .active_exception_region_exclusions
-                            .len()
-                            != context.exception_region_depth
+                    self.control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .len()
+                        != context.exception_region_depth
                         || matches!(context.normal_exit, WithBodyNormalExit::Unknown)
                         || matches!(context.normal_exit, WithBodyNormalExit::While(range) if range == statement.range)
                 })
@@ -13469,15 +13476,15 @@ impl Compiler<'_> {
                     && original_condition_has_unique_jump_target(&assertion.test, true));
         // A sole normal predecessor locates the outer finally POP_BLOCK. Keep that
         // original ownerless marker instead of forcing the inner assertion marker.
-        let retained_assertion_exit = (self.control.statements.current_statement_has_following
-            || (self.control.statements.inherited_statement_has_following
-                // A breakless async loop reaches the suffix only through its cold
-                // exhaustion handler. The surviving exit jump already keeps this line.
-                && !statement.body.iter().any(|statement| {
-                    matches!(statement, Stmt::For(loop_statement)
-                        if loop_statement.is_async
-                            && !suite_contains_loop_break(&loop_statement.body))
-                }))
+        let retained_assertion_exit = ((self.control.statements.current_statement_has_following
+            || self.control.statements.inherited_statement_has_following)
+            // A breakless async loop reaches either continuation only through its cold
+            // exhaustion handler. The surviving exit jump already keeps this line.
+            && !statement.body.iter().any(|statement| {
+                matches!(statement, Stmt::For(loop_statement)
+                    if loop_statement.is_async
+                        && !suite_contains_loop_break(&loop_statement.body))
+            })
             || !statement.orelse.is_empty()
             || direct_with_exit
             || shared_finally_assertion_exit)
@@ -15778,6 +15785,11 @@ impl Compiler<'_> {
                         .is_some_and(|test| jump_constant_truthiness(test).is_none())
                 })
                 && self.assembler.at_original_unconditional_join();
+            let handler_match_failure_location = (self.context.target_specific_rules_enabled()
+                && handler.name.is_some()
+                && matches!(handler.body.last(), Some(Stmt::Match(_))))
+            .then(|| self.assembler.original_match_failure_location())
+            .flatten();
             // CPython keeps this simple conditional handler cleanup source-less before copying
             // its exit, rather than inheriting the call location from the taken branch. Loop
             // backedges inherit each predecessor's location even when code follows the loop.
@@ -16062,6 +16074,10 @@ impl Compiler<'_> {
                     || handler_has_shared_terminal_false_cleanup
                 {
                     self.assembler.set_location(SourceLocation::NONE);
+                } else if let Some(location) = handler_match_failure_location {
+                    // Only the final pattern failure reaches this named-handler cleanup.
+                    // The physically preceding terminating arm has no fallthrough edge.
+                    self.assembler.set_location(location);
                 } else if terminal
                     && handler.name.is_none()
                     && self.control.generators.generator_region_start.is_none()
@@ -20644,7 +20660,11 @@ impl Compiler<'_> {
             } else {
                 None
             },
-            normal_exit: WithBodyNormalExit::Unknown,
+            normal_exit: if remaining.is_empty() {
+                with_body_normal_exit(body)
+            } else {
+                WithBodyNormalExit::Unknown
+            },
             terminal_condition_preceded_by_finally: false,
             exception_region_depth: self
                 .control

@@ -866,27 +866,7 @@ impl Assembler {
         if !(ends_scope(previous.opcode)
             || is_unconditional_jump(previous.opcode)
             || match_join.is_some())
-            || labels.iter().any(|label| {
-                self.original_nop_targets.contains(label)
-                    || self.borrow_block_aliases.contains(label)
-                    || self
-                        .exception_owner_provenance
-                        .fusion_boundaries
-                        .contains(label)
-                    || self
-                        .exception_owner_provenance
-                        .continuation_boundaries
-                        .contains(label)
-                    || self
-                        .exception_owner_provenance
-                        .setups
-                        .iter()
-                        .any(|(target, _)| target == label)
-                    || self
-                        .exception_regions
-                        .iter()
-                        .any(|region| region.target == *label)
-            })
+            || self.join_labels_have_authored_location(&labels)
         {
             return false;
         }
@@ -898,6 +878,67 @@ impl Assembler {
                             && (match_join == Some(label)
                                 || (self.exception_owner_provenance.source_boundaries.contains(&label)
                                     && self.exception_owner_provenance.block_boundaries.contains(&label)))))
+        })
+    }
+
+    /// Returns the sole conditional donor at a source-authored match failure join.
+    pub(crate) fn original_match_failure_location(&self) -> Option<SourceLocation> {
+        let end = self.original_match_join?;
+        let items = self.linear_items();
+        let labels = items
+            .iter()
+            .rev()
+            .map_while(|item| match item {
+                Item::Label(label) => Some(*label),
+                Item::Instruction(_) => None,
+            })
+            .collect::<Vec<_>>();
+        if !labels.contains(&end) || self.join_labels_have_authored_location(&labels) {
+            return None;
+        }
+        let Item::Instruction(previous) = items.get(items.len().checked_sub(labels.len() + 1)?)?
+        else {
+            return None;
+        };
+        if !ends_scope(previous.opcode) && !is_unconditional_jump(previous.opcode) {
+            return None;
+        }
+        let mut incoming = items.iter().filter_map(|item| match item {
+            Item::Instruction(instruction)
+                if matches!(instruction.operand(), Operand::Forward(label) | Operand::Backward(label)
+                    if labels.contains(&label)) => Some(instruction),
+            _ => None,
+        });
+        let edge = incoming.next()?;
+        (incoming.next().is_none()
+            && is_conditional_jump(edge.opcode)
+            && matches!(edge.operand(), Operand::Forward(_))
+            && edge.location.line >= 0)
+            .then_some(edge.location)
+    }
+
+    /// Excludes labels with authored locations or non-source boundary provenance.
+    fn join_labels_have_authored_location(&self, labels: &[Label]) -> bool {
+        labels.iter().any(|label| {
+            self.original_nop_targets.contains(label)
+                || self.borrow_block_aliases.contains(label)
+                || self
+                    .exception_owner_provenance
+                    .fusion_boundaries
+                    .contains(label)
+                || self
+                    .exception_owner_provenance
+                    .continuation_boundaries
+                    .contains(label)
+                || self
+                    .exception_owner_provenance
+                    .setups
+                    .iter()
+                    .any(|(target, _)| target == label)
+                || self
+                    .exception_regions
+                    .iter()
+                    .any(|region| region.target == *label)
         })
     }
 
@@ -3816,6 +3857,25 @@ impl Assembler {
     pub(crate) fn preserve_empty_join_inlined_jump_nop(&mut self, emitted: EmittedJump) {
         self.preserve_direct_inlined_jump_nop(emitted);
         self.record_original_empty_join(emitted);
+    }
+
+    /// Retains a folded branch's exit when it starts in a nested if's original empty join.
+    pub(crate) fn preserve_folded_nested_if_exit(&mut self, emitted: EmittedJump) {
+        let original_policy = self
+            .emitted_jump_mut(emitted, "inspecting a folded nested-if exit")
+            .jump_policy;
+        self.record_original_empty_join(emitted);
+        let instruction = self.emitted_jump_mut(emitted, "retaining a folded nested-if exit");
+        let original_empty_join = instruction.jump_policy.is_original_empty_join();
+        // This certificate must not enroll the folded marker in an ordinary join-copy plan.
+        instruction.jump_policy = original_policy;
+        if original_empty_join {
+            // Let incoming branches thread past this empty array before retaining its NOP.
+            // Borrow-marker cleanup still requires one current predecessor for its line.
+            instruction
+                .jump_policy
+                .retain_redundant_nop_after_threading();
+        }
     }
 
     /// Records original empty-join identity independently of its jump-retention policy.

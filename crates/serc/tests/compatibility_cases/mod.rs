@@ -573,3 +573,11 @@ mod match_handler_cleanup_join;
 mod match_comprehension_exit_positions;
 
 mod match_handler_tuple_fallthrough_donor;
+
+mod named_handler_match_failure_cleanup;
+
+mod folded_nested_if_exit;
+
+mod async_for_direct_assert_exit;
+
+mod async_manager_nested_while_exit;
