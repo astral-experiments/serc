@@ -1306,10 +1306,12 @@ impl OptimizationPipeline {
             } else if artificial_eval_break {
                 instruction.no_location_policy.mark_artificial_eval_break();
             }
-            if crosses_empty_block
-                || (crosses_fallthrough_barrier
-                    && original_borrow_route != Some(target)
-                    && authored_finally_break_targets.get(&source_index) != Some(&target))
+            // A captured authored break still enters its exact nonempty finally
+            // array after an intermediate jump-only array empties. Its original
+            // source and surviving cleanup are checked again before borrowing.
+            if (crosses_empty_block
+                || (crosses_fallthrough_barrier && original_borrow_route != Some(target)))
+                && authored_finally_break_targets.get(&source_index) != Some(&target)
             {
                 // Both captured ordinary jumps and authored finally breaks can prove an
                 // independent entry. A fallthrough barrier must not revoke those routes.
@@ -1872,6 +1874,9 @@ impl OptimizationPipeline {
         let mut threaded_condition = None;
         let origins = &mut self.exception_owner_provenance.threaded_condition_origins;
         let paired_none_prefixes = &mut self.exception_owner_provenance.copied_return_none_prefixes;
+        let handler_none_prefixes = &mut self
+            .exception_owner_provenance
+            .copied_handler_return_none_prefixes;
         self.graph.for_each_instruction_mut(|instruction| {
             if let Some((condition, retargeted)) = threaded_condition.take()
                 && instruction.opcode == NOT_TAKEN
@@ -1895,6 +1900,11 @@ impl OptimizationPipeline {
                 for origin in &mut *paired_none_prefixes {
                     if origin.condition == original_condition {
                         origin.condition = *instruction;
+                    }
+                }
+                for (_, records) in &mut *handler_none_prefixes {
+                    if records[5] == original_condition {
+                        records[5] = *instruction;
                     }
                 }
                 threaded_condition = Some((*instruction, *operand != Operand::Forward(target)));

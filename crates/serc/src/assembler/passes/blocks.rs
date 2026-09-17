@@ -7,8 +7,8 @@ use super::super::{
 };
 use crate::assembler::block_graph::{BasicBlockId, BlockGraph, ItemPosition};
 use crate::target::opcodes::{
-    BUILD_TUPLE, CALL, CALL_KW, END_ASYNC_FOR, END_SEND, FOR_ITER, LOAD_CONST, LOAD_FAST,
-    LOAD_GLOBAL, NOP, NOT_TAKEN, POP_EXCEPT, POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE,
+    BUILD_TUPLE, CALL, CALL_KW, DELETE_FAST, END_ASYNC_FOR, END_SEND, FOR_ITER, LOAD_CONST,
+    LOAD_FAST, LOAD_GLOBAL, NOP, NOT_TAKEN, POP_EXCEPT, POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE,
     POP_JUMP_IF_NOT_NONE, POP_JUMP_IF_TRUE, POP_TOP, RAISE_VARARGS, RETURN_VALUE, STORE_ATTR,
     STORE_FAST, SWAP,
 };
@@ -1132,6 +1132,45 @@ fn comprehension_assignment_exit_location(
         return None;
     }
     static_swap_tail_location(tail, *instructions)
+}
+
+/// Carries a named-handler cleanup's line across its exception-end split.
+fn named_handler_cleanup_exit_location(source: &[Item], target: &[Item]) -> Option<SourceLocation> {
+    let source_entry_len = source
+        .iter()
+        .take_while(|item| matches!(item, Item::Label(_)))
+        .count();
+    let [
+        Item::Instruction(pop),
+        Item::Instruction(load),
+        Item::Instruction(store),
+        Item::Instruction(delete),
+    ] = &source[source_entry_len..]
+    else {
+        return None;
+    };
+    let target_entry_len = target
+        .iter()
+        .take_while(|item| matches!(item, Item::Label(_)))
+        .count();
+    let [Item::Instruction(jump)] = &target[target_entry_len..] else {
+        return None;
+    };
+    (pop.opcode == POP_EXCEPT
+        && pop.location.line >= 0
+        && load.opcode == LOAD_CONST
+        && store.opcode == STORE_FAST
+        && delete.opcode == DELETE_FAST
+        && store.operand() == delete.operand()
+        && [load, store, delete].iter().all(|instruction| {
+            instruction.location.line < 0 && !instruction.no_location_policy.preserves_location()
+        })
+        && target_entry_len > 0
+        && is_unconditional_jump(jump.opcode)
+        && jump.location.line < 0
+        && jump.no_location_policy.allows_block_inlining()
+        && !jump.no_location_policy.preserves_location())
+    .then_some(pop.location)
 }
 
 /// Resolves only an original match cleanup whose complete fallthrough array still matches.
@@ -4515,6 +4554,44 @@ impl OptimizationPipeline {
                     graph[target].items(),
                     &self.comprehension_assignment_exits,
                 ) {
+                    return Some(location);
+                }
+                if remaining_predecessors[target.index()] == 1
+                    && positions[source.index()] + 1 == target_position
+                    && block_has_fallthrough(graph[source].items())
+                    && let Some(location) = named_handler_cleanup_exit_location(
+                        graph[source].items(),
+                        graph[target].items(),
+                    )
+                    && graph[target]
+                        .items()
+                        .iter()
+                        .take_while(|item| matches!(item, Item::Label(_)))
+                        .all(|item| {
+                            let Item::Label(label) = item else {
+                                unreachable!();
+                            };
+                            self.exception_regions
+                                .iter()
+                                .any(|region| region.end == *label)
+                                && !self.preserved_block_boundaries.contains(label)
+                                && !self
+                                    .exception_owner_provenance
+                                    .source_boundaries
+                                    .contains(label)
+                                && !self
+                                    .exception_owner_provenance
+                                    .block_boundaries
+                                    .contains(label)
+                                && !self
+                                    .exception_owner_provenance
+                                    .setups
+                                    .iter()
+                                    .any(|(setup, _)| setup == label)
+                        })
+                {
+                    // The POP_EXCEPT donor is already resolved. Its name-clearing tail
+                    // receives that line later, after this original exit is visited.
                     return Some(location);
                 }
                 if let Some(&start) = copied_split_eval_starts.get(&target)

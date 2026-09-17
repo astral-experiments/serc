@@ -5472,6 +5472,41 @@ impl Compiler<'_> {
                         .is_empty();
                 let unwinds_finally_end_inside_handler =
                     handler_count > 0 && self.control.finally.active_finally_end_blocks > 0;
+                // An async iterator created in a new try inside an unnamed handler keeps
+                // that try through POP_TOP. The handler then exits before the enclosing
+                // ordinary try, which still owns POP_EXCEPT but not the return constant.
+                let tracks_async_generator_handler_iterator = statement.value.is_none()
+                    && !preserve_tos
+                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                        == CO_ASYNC_GENERATOR
+                    && self.control.exceptions.active_exception_group_handlers == 0
+                    && self.control.exceptions.active_try_marker_slots.len() == 2
+                    && self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .len()
+                        == 3
+                    && self
+                        .control
+                        .finally
+                        .active_return_finally_contexts
+                        .is_empty()
+                    && self.control.finally.active_loop_finally_contexts.is_empty()
+                    && self.control.finally.active_copied_finally_bodies == 0
+                    && self.control.finally.active_finally_try_bodies == 0
+                    && self.control.finally.copied_return_finally_preserved_values == 0
+                    && matches!(self.control.exceptions.active_exception_handlers.as_slice(),
+                        [handler] if handler.name.is_none()
+                            && handler.try_body_depth == 1
+                            && handler.exception_region_depth == 1
+                            && handler.loop_depth == 0
+                            && handler.with_depth == 0
+                            && handler.finally_end_depth == 0)
+                    && matches!(self.control.loops.contexts.as_slice(),
+                        [context] if context.iterator_cleanup == IteratorCleanup::Async
+                            && context.exception_region_depth == 3
+                            && context.with_depth == 0);
                 // A return pops inner try blocks before discarding an iterator from an
                 // enclosing handler. Preserve each loop's exception depth during that unwind.
                 let tracks_handler_iterator_region_unwinds = !return_is_overridden
@@ -5496,18 +5531,19 @@ impl Compiler<'_> {
                         .active_return_finally_contexts
                         .iter()
                         .all(|context| context.handler_depth == 0)
-                    && self.control.loops.contexts
-                        [self.control.exceptions.active_exception_handlers[0].loop_depth..]
-                        .iter()
-                        .any(|context| {
-                            context.iterator_cleanup != IteratorCleanup::None
-                                && context.exception_region_depth
-                                    < self
-                                        .control
-                                        .exceptions
-                                        .active_exception_region_exclusions
-                                        .len()
-                        });
+                    && (tracks_async_generator_handler_iterator
+                        || self.control.loops.contexts
+                            [self.control.exceptions.active_exception_handlers[0].loop_depth..]
+                            .iter()
+                            .any(|context| {
+                                context.iterator_cleanup != IteratorCleanup::None
+                                    && context.exception_region_depth
+                                        < self
+                                            .control
+                                            .exceptions
+                                            .active_exception_region_exclusions
+                                            .len()
+                            }));
                 // A handler restores its exception state before retiring an enclosing try.
                 // Preserve the existing older-iterator path, and also track an ordinary try
                 // when another try entered inside the handler must unwind before POP_EXCEPT.
@@ -6509,8 +6545,10 @@ impl Compiler<'_> {
                         }
                     }
                     let copied_manager_return_pop = (self.context.target_specific_rules_enabled()
-                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
-                            == CO_COROUTINE
+                        && matches!(
+                            self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR),
+                            0 | CO_COROUTINE
+                        )
                         && preserve_tos
                         && !return_is_overridden
                         && context_index == 0
@@ -6531,11 +6569,18 @@ impl Compiler<'_> {
                             ),
                             (1, Some(0)) | (2, Some(1))
                         )
-                        && self.control.withs.active_with_exits.len() == 1
-                        && !self.control.withs.active_with_exits[0].is_async
+                        && (1..=2).contains(&self.control.withs.active_with_exits.len())
+                        && self
+                            .control
+                            .withs
+                            .active_with_exits
+                            .iter()
+                            .all(|manager| !manager.is_async)
                         && next_with == 0
-                        && with_unwind_starts.len() == 1
-                        && with_unwind_starts[0].index == 0
+                        && with_unwind_starts
+                            .iter()
+                            .map(|unwind| unwind.index)
+                            .eq((0..self.control.withs.active_with_exits.len()).rev())
                         && self.control.loops.contexts.is_empty()
                         && self.control.finally.active_finally_end_blocks == 0
                         && self.control.finally.active_normal_finally_bodies == 0
@@ -6548,16 +6593,36 @@ impl Compiler<'_> {
                                     .active_exception_region_exclusions
                                     .len()
                                     - 1,
+                                self.control.withs.active_with_exits.len(),
                             )
                         });
                     let copied_manager_none_pop = copied_manager_return_pop
-                        .filter(|(_, ordinary_try_pops)| {
-                            *ordinary_try_pops == 1
+                        .filter(|(_, ordinary_try_pops, managers)| {
+                            self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                                == CO_COROUTINE
+                                && *managers == 1
+                                && *ordinary_try_pops == 1
                                 && matches!(statement.value.as_deref(), Some(Expr::Name(name))
                                     if self.source_location(name.range).line
                                         == self.source_location(statement.range).line)
                         })
-                        .map(|(pop_item, _)| pop_item);
+                        .map(|(pop_item, _, _)| pop_item);
+                    let copied_handler_none_pop = (self.context.target_specific_rules_enabled()
+                        && preserve_tos
+                        && !return_is_overridden
+                        && context_index == 0
+                        && handler_count == 1
+                        && return_finally_contexts.len() == 1
+                        && finally_context.handler_depth == 0
+                        && self.control.exceptions.active_exception_handlers[0]
+                            .name
+                            .is_none()
+                        && self.control.withs.active_with_exits.is_empty()
+                        && self.control.loops.contexts.is_empty()
+                        && self.control.finally.active_finally_end_blocks == 0
+                        && self.control.finally.active_normal_finally_bodies == 0
+                        && self.control.finally.active_copied_finally_bodies == 0)
+                        .then(|| self.assembler.item_count());
                     let copied_handler_finally_pop = (preserve_tos
                         && !return_is_overridden
                         && handler_count == 1
@@ -6711,6 +6776,12 @@ impl Compiler<'_> {
                         },
                     );
                     if result.is_ok()
+                        && let Some(pop_item) = copied_handler_none_pop
+                    {
+                        self.assembler
+                            .record_copied_handler_return_none_prefix(pop_item);
+                    }
+                    if result.is_ok()
                         && let Some(pop_item) = copied_handler_finally_pop
                     {
                         self.assembler
@@ -6729,10 +6800,14 @@ impl Compiler<'_> {
                         );
                     }
                     if result.is_ok()
-                        && let Some((pop_item, ordinary_try_pops)) = copied_manager_return_pop
+                        && let Some((pop_item, ordinary_try_pops, managers)) =
+                            copied_manager_return_pop
                     {
-                        self.assembler
-                            .record_copied_manager_return_compaction(pop_item, ordinary_try_pops);
+                        self.assembler.record_copied_manager_return_compaction(
+                            pop_item,
+                            ordinary_try_pops,
+                            managers,
+                        );
                     }
                     if result.is_ok()
                         && let Some(pop_item) = copied_manager_none_pop

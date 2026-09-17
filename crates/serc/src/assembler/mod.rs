@@ -4578,6 +4578,86 @@ impl Assembler {
         }
     }
 
+    /// Captures an unnamed-handler return through a finally's first local None test.
+    pub(crate) fn record_copied_handler_return_none_prefix(&mut self, final_pop_item: usize) {
+        let items = self.linear_items();
+        let preceding = items[..final_pop_item]
+            .iter()
+            .enumerate()
+            .rev()
+            .filter_map(|(index, item)| match item {
+                Item::Instruction(instruction) => Some((index, *instruction)),
+                Item::Label(_) => None,
+            })
+            .take(3)
+            .collect::<Vec<_>>();
+        let [(.., pop_except), (.., handler_pop), (swap_item, swap)] = preceding.as_slice() else {
+            return;
+        };
+        let following = items[final_pop_item..]
+            .iter()
+            .filter_map(|item| match item {
+                Item::Instruction(instruction) => Some(*instruction),
+                Item::Label(_) => None,
+            })
+            .take(3)
+            .collect::<Vec<_>>();
+        let [final_pop, load, condition] = following.as_slice() else {
+            return;
+        };
+        let records = [
+            *swap,
+            *handler_pop,
+            *pop_except,
+            *final_pop,
+            *load,
+            *condition,
+        ];
+        if swap.opcode != SWAP
+            || swap.operand() != Operand::Value(2)
+            || pop_except.opcode != POP_EXCEPT
+            || pop_except.operand() != Operand::Value(0)
+            || [handler_pop, final_pop].iter().any(|pop| {
+                pop.opcode != NOP
+                    || pop.operand() != Operand::Value(0)
+                    || !pop.fusion_policy.is_converted_pop_block()
+                    || pop.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
+            })
+            || !matches!(load.opcode, LOAD_FAST | crate::target::opcodes::LOAD_DEREF)
+            || !matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+            || !matches!(condition.operand(), Operand::Forward(_))
+            || condition.local_policy.hidden_exception_owner_slots() != 3
+            || records[..5]
+                .iter()
+                .any(|record| record.local_policy.hidden_exception_owner_slots() != 0)
+            || records
+                .iter()
+                .any(|record| record.pre_fold_extra_instructions() != 0)
+        {
+            return;
+        }
+        let Some(entry) = items[..*swap_item]
+            .iter()
+            .rev()
+            .find_map(|item| match item {
+                Item::Label(label)
+                    if self
+                        .exception_owner_provenance
+                        .block_boundaries
+                        .contains(label) =>
+                {
+                    Some(*label)
+                }
+                _ => None,
+            })
+        else {
+            return;
+        };
+        self.exception_owner_provenance
+            .copied_handler_return_none_prefixes
+            .push((entry, records));
+    }
+
     /// Records two adjacent emitted return-unwind POPs and their direct local None test.
     pub(crate) fn record_copied_return_none_prefix(
         &mut self,
@@ -4809,6 +4889,7 @@ impl Assembler {
         &mut self,
         pop_item: usize,
         ordinary_try_pops: usize,
+        manager_count: usize,
     ) {
         use crate::target::opcodes::{CALL, LOAD_CONST, SWAP};
 
@@ -4816,34 +4897,45 @@ impl Assembler {
         let Some(before) = items.get(..pop_item) else {
             return;
         };
-        let cleanup = before
+        if !(1..=2).contains(&manager_count) {
+            return;
+        }
+        let mut records = before
             .iter()
             .rev()
             .filter_map(|item| match item {
                 Item::Instruction(instruction) => Some(*instruction),
                 Item::Label(_) => None,
             })
-            .take(7)
+            .take(7 * manager_count)
             .collect::<Vec<_>>();
-        let Ok(mut cleanup): Result<[Instruction; 7], _> = cleanup.try_into() else {
-            return;
-        };
-        cleanup.reverse();
-        if cleanup.iter().map(|instruction| instruction.opcode).ne([
-            SWAP, SWAP, LOAD_CONST, LOAD_CONST, LOAD_CONST, CALL, POP_TOP,
-        ]) || cleanup[0].operand() != Operand::Value(3)
-            || cleanup[1].operand() != Operand::Value(2)
-            || cleanup[2].operand() != cleanup[3].operand()
-            || cleanup[3].operand() != cleanup[4].operand()
-            || cleanup[5].operand() != Operand::Value(3)
-            || cleanup.iter().any(|instruction| {
-                instruction.local_policy.hidden_exception_owner_slots() != 0
-                    || instruction.pre_fold_extra_instructions() != 0
-                    || instruction.exception_policy() != ExceptionPolicy::NoneUnchanged
+        records.reverse();
+        if records.len() != 7 * manager_count
+            || records.as_chunks::<7>().0.iter().any(|cleanup| {
+                cleanup.iter().map(|instruction| instruction.opcode).ne([
+                    SWAP, SWAP, LOAD_CONST, LOAD_CONST, LOAD_CONST, CALL, POP_TOP,
+                ]) || cleanup[0].operand() != Operand::Value(3)
+                    || cleanup[1].operand() != Operand::Value(2)
+                    || cleanup[2].operand() != cleanup[3].operand()
+                    || cleanup[3].operand() != cleanup[4].operand()
+                    || cleanup[5].operand() != Operand::Value(3)
+                    || cleanup.iter().any(|instruction| {
+                        instruction.local_policy.hidden_exception_owner_slots() != 0
+                            || instruction.pre_fold_extra_instructions() != 0
+                            || instruction.exception_policy() != ExceptionPolicy::NoneUnchanged
+                    })
             })
         {
             return;
         }
+        let cleanup = records[records.len() - 7..]
+            .try_into()
+            .expect("seven cleanup records");
+        let earlier_cleanup = (manager_count == 2).then(|| {
+            records[..7]
+                .try_into()
+                .expect("seven earlier cleanup records")
+        });
         let mut suffix = items[pop_item..].iter().filter_map(|item| match item {
             Item::Instruction(instruction) => Some(*instruction),
             Item::Label(_) => None,
@@ -4871,6 +4963,7 @@ impl Assembler {
                 .push(exception_owners::CopiedManagerReturnCompaction {
                     ordinary_try_pops,
                     cleanup,
+                    earlier_cleanup,
                     pop,
                     load,
                     condition,

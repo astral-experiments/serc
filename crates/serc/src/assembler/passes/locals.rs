@@ -4909,6 +4909,17 @@ mod tests {
                     .contains_key(&Label(1)),
                 reachable,
             );
+            // The real pipeline records the intermediate jump-only array as
+            // empty after the original authored route has been captured.
+            pipeline.record_borrow_empty_jump_heads();
+            let intermediate = pipeline.graph.label_block(Label(2)).unwrap();
+            assert!(
+                pipeline.graph[intermediate]
+                    .last_instruction()
+                    .unwrap()
+                    .jump_policy
+                    .borrow_empty_block()
+            );
             pipeline.thread_forward_jumps();
             let entries = super::OptimizationPipeline::take_pre_copy_authored_finally_break_entries(
                 &pipeline.graph,

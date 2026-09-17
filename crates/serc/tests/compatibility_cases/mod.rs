@@ -627,3 +627,13 @@ mod match_success_normal_try_copies;
 mod terminal_cold_join_probes;
 
 mod nested_manager_none_slot;
+
+mod named_handler_jump_locations;
+
+mod authored_finally_empty_heads;
+
+mod async_generator_handler_iterator_return;
+
+mod copied_handler_return_none;
+
+mod sync_manager_finally_owner;
