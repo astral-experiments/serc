@@ -5071,6 +5071,62 @@ impl Assembler {
             .insert(label);
     }
 
+    /// Captures the two original NULL POP records around a saved handler return value.
+    pub(crate) fn record_named_handler_pop_pair(&mut self, start: usize) {
+        let items = self.linear_items();
+        let Some(entry) = items[..start].iter().rev().find_map(|item| match item {
+            Item::Label(label)
+                if self
+                    .exception_owner_provenance
+                    .block_boundaries
+                    .contains(label) =>
+            {
+                Some(*label)
+            }
+            _ => None,
+        }) else {
+            return;
+        };
+        let original = items[start..].to_vec();
+        let records = original
+            .iter()
+            .filter_map(|item| match item {
+                Item::Instruction(instruction) => Some(instruction),
+                Item::Label(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let [first, swap, second, pop_except] = records.as_slice() else {
+            return;
+        };
+        if swap.opcode != SWAP
+            || swap.operand() != Operand::Value(2)
+            || pop_except.opcode != POP_EXCEPT
+            || pop_except.operand() != Operand::Value(0)
+            || [first, second].iter().any(|pop| {
+                pop.opcode != NOP
+                    || pop.operand() != Operand::Value(0)
+                    || !pop.fusion_policy.is_converted_pop_block()
+                    || pop.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
+            })
+            || records.iter().any(|instruction| {
+                instruction.local_policy.hidden_exception_owner_slots() != 0
+                    || instruction.pre_fold_extra_instructions() != 0
+                    || instruction.location != swap.location
+                    || instruction.jump_policy.borrow_empty_block()
+                    || instruction.no_location_policy.borrow_fallthrough()
+                        != BorrowFallthrough::Reachable
+            })
+        {
+            return;
+        }
+        self.exception_owner_provenance
+            .named_handler_pop_pairs
+            .push(exception_owners::NamedHandlerPopPair {
+                entry,
+                items: original,
+            });
+    }
+
     /// Captures the exact emitted records of a constant-return handler cleanup.
     pub(crate) fn record_copied_handler_cleanup(
         &mut self,

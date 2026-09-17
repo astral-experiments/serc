@@ -5813,6 +5813,9 @@ impl Compiler<'_> {
                                 self.assembler.mark_last_as_converted_pop_block();
                             }
                         }
+                        let named_handler_pop_start = (preserve_named_handler_pop_slots
+                            && preserve_tos)
+                            .then(|| self.assembler.item_count());
                         if preserve_named_handler_pop_slots {
                             // Named handlers unwind their name-cleanup block before a saved
                             // value's SWAP, then their handler block before POP_EXCEPT. Both
@@ -6001,6 +6004,9 @@ impl Compiler<'_> {
                             start
                         });
                         self.emit(POP_EXCEPT, 0, -1)?;
+                        if let Some(start) = named_handler_pop_start {
+                            self.assembler.record_named_handler_pop_pair(start);
+                        }
                         if preserve_named_handler_pop_slots
                             && (protected_pop_except.is_some()
                                 || preserves_enclosing_try_return_owner)
@@ -17784,6 +17790,34 @@ impl Compiler<'_> {
                             && suite_has_linear_reraise_guards(&handler.body)
                     })
                 }));
+        // A guarded recovery retains a live POP_EXCEPT route into normal cleanup.
+        // A plain companion containing work or only pass statements does not remove
+        // that route. Copied loop and nested cleanup exits keep their separate rules.
+        let plain_handler_shares_guarded_cleanup = synchronous_recovery
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && statement.orelse.is_empty()
+            && self.control.loops.contexts.is_empty()
+            && self.control.withs.active_with_exits.is_empty()
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            && !self.control.in_exception_handler()
+            && self.control.finally.active_copied_finally_bodies == 0
+            && self.control.finally.active_finally_try_bodies == 0
+            && suite_has_linear_borrow_fallthrough(&statement.body)
+            && !suite_contains_abrupt_control_flow(&statement.finalbody)
+            && statement.handlers.iter().all(|handler| {
+                handler
+                    .as_except_handler()
+                    .is_some_and(|handler| handler.name.is_none())
+            })
+            && statement.handlers.iter().any(|handler| {
+                handler
+                    .as_except_handler()
+                    .is_some_and(|handler| suite_has_linear_reraise_guards(&handler.body))
+            });
         let conditional_handler_reaches_finally = !statement.is_star
             && (statement.orelse.is_empty()
                 || (suite_has_linear_borrow_fallthrough(&statement.orelse)
@@ -17943,7 +17977,13 @@ impl Compiler<'_> {
                                     || suite_has_linear_borrow_fallthrough(leading))
                                 && (trailing.is_empty()
                                     || suite_has_linear_borrow_fallthrough(trailing))
-                        }) || suite_has_linear_reraise_guards(&handler.body))
+                        }) || suite_has_linear_reraise_guards(&handler.body)
+                            || (plain_handler_shares_guarded_cleanup
+                                && (suite_has_linear_borrow_fallthrough(&handler.body)
+                                    || (!handler.body.is_empty()
+                                        && handler.body.iter().all(|statement| {
+                                            matches!(statement, Stmt::Pass(_))
+                                        })))))
                 })
             });
         // A single false edge around a terminal return keeps a located normal

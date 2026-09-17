@@ -545,4 +545,6 @@ mod finally_for_borrow;
 
 mod calculated_handler_return;
 
+mod calculated_handler_return_two_managers;
+mod mixed_handler_finally_borrow;
 mod normal_finally_handler_fallthrough;
