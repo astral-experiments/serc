@@ -535,3 +535,8 @@ mod async_for_nonterminal_join_compatibility;
 mod handler_return_cell_guard;
 mod inner_try_first_finally_owner;
 mod nested_setup_await_borrow;
+
+mod handler_continue_guards;
+mod nested_setup_conditional_argument;
+mod related_finally_truth_owners;
+mod sync_with_one_fallthrough;

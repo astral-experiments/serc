@@ -119,6 +119,29 @@ impl OptimizationPipeline {
                 continue;
             };
             let provenance = &self.exception_owner_provenance;
+            // An earlier call keeps a primitive conditional prefix nonempty even
+            // when the enclosing call continues in successor arrays. Keep the
+            // original branch and complete prefix for the same late identity check.
+            let conditional_call_prefix = matches!(body.get(body.len().saturating_sub(3)..),
+                Some([Item::Instruction(load), Item::Instruction(test), Item::Instruction(jump)])
+                    if load.opcode == LOAD_FAST
+                        && matches!(load.operand(), Operand::Value(_))
+                        && test.opcode == TO_BOOL
+                        && test.operand() == Operand::Value(0)
+                        && jump.opcode == POP_JUMP_IF_FALSE
+                        && matches!(jump.operand(), Operand::Forward(_))
+                        && load.location.line >= 0
+                        && load.location == test.location
+                        && test.location == jump.location)
+                && body.iter().any(|item| {
+                    matches!(item, Item::Instruction(call)
+                        if call.opcode == CALL && matches!(call.operand(), Operand::Value(_)))
+                })
+                && body[2..].iter().all(|item| {
+                    matches!(item, Item::Instruction(instruction)
+                        if !instruction.jump_policy.borrow_empty_block()
+                            && instruction.no_location_policy.borrow_fallthrough() == BorrowFallthrough::Reachable)
+                });
             if self.borrow_finally_entries.get(entry) != Some(&None)
                 || self.borrow_loop_exit_blocks.contains_key(entry)
                 || !self.borrow_jump_entry_labels.contains(entry)
@@ -172,7 +195,8 @@ impl OptimizationPipeline {
                                                 region.start == *yielded
                                                     && !region.is_scope_fallback
                                                     && !region.preserve_lasti
-                                            }).count() == 1)))
+                                            }).count() == 1))
+                    || conditional_call_prefix)
                 || [pop, nop, first].iter().any(|instruction| {
                     instruction.jump_policy.borrow_empty_block()
                         || instruction.no_location_policy.borrow_fallthrough() != BorrowFallthrough::Reachable

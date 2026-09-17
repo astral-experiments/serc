@@ -1345,6 +1345,15 @@ impl LayoutAssembler {
             {
                 continue;
             }
+            // Captured head aliases share the original array's first cell.
+            let retained_setup_head = |label: Label| {
+                retained_setup_nop.is_some()
+                    && origin
+                        .prefix
+                        .iter()
+                        .take_while(|item| matches!(item, Item::Label(_)))
+                        .any(|item| *item == Item::Label(label))
+            };
             let labels = origin
                 .prefix
                 .iter()
@@ -1357,14 +1366,10 @@ impl LayoutAssembler {
                 || labels.first() != Some(&origin.entry)
                 || labels.iter().any(|label| {
                     (jump_targets.contains(label)
-                        && !(authored_break_location.is_some() && *label == origin.entry))
+                        && !((authored_break_location.is_some() || retained_setup_nop.is_some())
+                            && *label == origin.entry))
                         || (self.preserved_block_boundaries.contains(label)
-                            && !(retained_setup_nop.is_some()
-                                && origin
-                                    .prefix
-                                    .iter()
-                                    .take_while(|item| matches!(item, Item::Label(_)))
-                                    .any(|item| *item == Item::Label(*label))))
+                            && !retained_setup_head(*label))
                         || self
                             .exception_regions
                             .iter()
@@ -1423,10 +1428,11 @@ impl LayoutAssembler {
                                 .exception_owner_provenance
                                 .source_boundaries
                                 .contains(label)
-                                || self
+                                || (self
                                     .exception_owner_provenance
                                     .block_boundaries
-                                    .contains(label)))
+                                    .contains(label)
+                                    && !retained_setup_head(*label))))
                 })
             {
                 continue;
@@ -1512,6 +1518,14 @@ impl LayoutAssembler {
             };
             // Location propagation changes the retained POP_BLOCK's line, not its record identity.
             original_marker.location = marker.location;
+            // Normal-finally lowering can refine this excluded POP_BLOCK's owner
+            // after capture without changing its original instruction cell.
+            let excluded_pop_owner_refined = retained_setup_nop.is_some()
+                && original_marker.exception_policy() == super::ExceptionPolicy::EXCLUDE_ALWAYS
+                && marker.exception_policy() == super::ExceptionPolicy::AlwaysAbsent;
+            if excluded_pop_owner_refined {
+                original_marker.set_exception_owner(NormalizedExceptionOwner::Absent);
+            }
             if let Some(location) = authored_break_location {
                 // CP propagates its sole jump predecessor's location before
                 // NOP removal. A distinct next line retains this original slot.
@@ -1552,7 +1566,8 @@ impl LayoutAssembler {
             if current != expected
                 || marker.opcode != NOP
                 || !marker.fusion_policy.is_converted_pop_block()
-                || marker.exception_policy() != super::ExceptionPolicy::EXCLUDE_ALWAYS
+                || (marker.exception_policy() != super::ExceptionPolicy::EXCLUDE_ALWAYS
+                    && !excluded_pop_owner_refined)
                 || marker.local_policy.hidden_exception_owner_slots() != 0
                 || marker.pre_fold_extra_instructions() != 0
                 || marker.jump_policy.borrow_empty_block()
