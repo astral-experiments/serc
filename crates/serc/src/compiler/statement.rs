@@ -6947,7 +6947,11 @@ impl Compiler<'_> {
                     if tracks_iterator_region_unwinds
                         || tracks_handler_enclosing_try_unwinds
                         || (tracks_handler_iterator_region_unwinds && unwinds_return_finally)
+                        || (tracks_finally_region_unwinds
+                            && copied_finally_iterator_location.is_some())
                     {
+                        // After the copied finally, inner tries end before older iterators.
+                        // Each iterator's saved depth retains tries that enclose the loop.
                         handler_region_unwind_starts.as_deref_mut()
                     } else {
                         None
@@ -17313,10 +17317,13 @@ impl Compiler<'_> {
                 })
             })
             && (!suite_contains_loop_break(&statement.body) || linear_tail_after_guarded_break)
-            && !matches!(
+            // A populated linear else suite supplies the normal source array
+            // after the protected body, including a terminal manager or join.
+            // Keep the existing structured-else routes and their empty-exit vetoes.
+            && (!matches!(
                 statement.body.last(),
                 Some(Stmt::If(_) | Stmt::Try(_) | Stmt::While(_) | Stmt::With(_))
-            );
+            ) || suite_has_linear_borrow_fallthrough(&statement.orelse));
         // A single runtime test without an else suite leaves a located normal-exit
         // jump, retained as a NOP after cold handlers move. Linear cleanup or a
         // certified runtime condition keeps its entry nonempty. Branching tests

@@ -601,3 +601,9 @@ mod iterator_finally_return_cleanup_location;
 mod try_entry_none_fallback;
 
 mod nested_recovery_source_array_borrow;
+
+mod p90_fresh_try_prefix;
+
+mod post_finally_older_iterator_owner;
+
+mod populated_try_else_finally_borrow;

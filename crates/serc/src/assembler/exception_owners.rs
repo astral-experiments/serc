@@ -565,9 +565,10 @@ impl ExceptionOwnerProvenance {
         source_head: bool,
     ) -> bool {
         use crate::target::opcodes::{
-            BINARY_OP, BUILD_STRING, CALL, CALL_KW, FORMAT_SIMPLE, IMPORT_FROM, IMPORT_NAME,
-            LOAD_ATTR, LOAD_CONST, LOAD_FAST, LOAD_GLOBAL, LOAD_NAME, LOAD_SMALL_INT,
-            POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE, PUSH_NULL, STORE_FAST, STORE_NAME, TO_BOOL,
+            BINARY_OP, BUILD_MAP, BUILD_STRING, CALL, CALL_KW, FORMAT_SIMPLE, IMPORT_FROM,
+            IMPORT_NAME, LOAD_ATTR, LOAD_CONST, LOAD_DEREF, LOAD_FAST, LOAD_GLOBAL, LOAD_NAME,
+            LOAD_SMALL_INT, POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE, PUSH_NULL, STORE_FAST, STORE_NAME,
+            TO_BOOL,
         };
 
         let leading_labels = prefix
@@ -775,6 +776,27 @@ impl ExceptionOwnerProvenance {
                         return false;
                     }
                 }
+                LOAD_DEREF => {
+                    // A cell load feeding the terminal truth conversion keeps its
+                    // original record; local superinstructions do not fuse it.
+                    if index + 2 != body.len() {
+                        return false;
+                    }
+                }
+                BUILD_MAP => {
+                    // The certified restore is followed by CALL, whose runtime
+                    // result is the last value of this nonempty dictionary. Both
+                    // records survive without constant folding or compaction.
+                    if comprehension_restore_count == 0
+                        || index != comprehension_restore_count + 2
+                        || !matches!(instruction.operand(), Operand::Value(1..))
+                        || instructions
+                            .get(index.wrapping_sub(1))
+                            .is_none_or(|previous| previous.opcode != CALL)
+                    {
+                        return false;
+                    }
+                }
                 STORE_FAST => {
                     // Certified comprehension restores are still MAYBE_NULL
                     // pseudo instructions during CP superinstruction insertion.
@@ -836,7 +858,10 @@ impl ExceptionOwnerProvenance {
                         || instructions
                             .get(index.wrapping_sub(1))
                             .is_none_or(|previous| {
-                                !matches!(previous.opcode, LOAD_FAST | LOAD_NAME | LOAD_ATTR | CALL)
+                                !matches!(
+                                    previous.opcode,
+                                    LOAD_FAST | LOAD_DEREF | LOAD_NAME | LOAD_ATTR | CALL
+                                )
                             })
                     {
                         return false;
