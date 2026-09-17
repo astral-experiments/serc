@@ -294,6 +294,7 @@ impl Assembler {
                 .copied()
                 .collect(),
             folded_predecessor_sources: self.folded_predecessor_sources,
+            folded_loop_exit_anchors: self.folded_loop_exit_anchors,
             discarded_fold_admissions: self.discarded_fold_admissions,
             initial_reachable,
             retired_exception_handler_targets: rustc_hash::FxHashSet::default(),

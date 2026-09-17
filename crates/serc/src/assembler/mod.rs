@@ -378,6 +378,7 @@ impl Assembler {
             && self.preserved_block_boundaries.is_empty()
             && self.borrow_unreachable_blocks.is_empty()
             && self.borrow_omitted_for_backedges.is_empty()
+            && self.folded_loop_exit_anchors.is_empty()
             && !self.has_synthesized_percent_target_locations
             && assertion_constant_indices(items, LOAD_CONST, &mut []).unwrap_or(false)
     }
@@ -942,6 +943,12 @@ impl Assembler {
     /// Records an original conditional target whose edge folded into fallthrough.
     pub(crate) fn record_folded_condition_predecessor(&mut self, target: Label) {
         self.folded_away_condition_targets.insert(target);
+    }
+
+    /// Records the empty original anchor before a folded while loop's shared exit.
+    pub(crate) fn record_folded_loop_exit_anchor(&mut self, target: Label) {
+        self.record_folded_condition_predecessor(target);
+        self.folded_loop_exit_anchors.insert(target);
     }
 
     /// Records a discarded linear loop else suite's original normal exit.
@@ -1696,6 +1703,35 @@ impl Assembler {
         entries.reverse();
         self.comprehension_assignment_exits
             .insert(exit, (entries, instructions));
+    }
+
+    /// Certifies that the current empty join follows its captured comprehension assignment.
+    pub(crate) fn at_comprehension_assignment_exit(&self) -> bool {
+        let items = self.linear_items();
+        let entry_len = items
+            .iter()
+            .rev()
+            .take_while(|item| matches!(item, Item::Label(_)))
+            .count();
+        let source_end = items.len() - entry_len;
+        items[source_end..].iter().any(|item| {
+            let Item::Label(exit) = item else {
+                return false;
+            };
+            let Some((entries, instructions)) = self.comprehension_assignment_exits.get(exit)
+            else {
+                return false;
+            };
+            let Some(source_start) = source_end.checked_sub(entries.len() + instructions.len())
+            else {
+                return false;
+            };
+            items[source_start..source_end].iter().copied().eq(entries
+                .iter()
+                .copied()
+                .map(Item::Label)
+                .chain(instructions.iter().copied().map(Item::Instruction)))
+        })
     }
 
     /// Records the real entry and cleanup owner of a later typed-handler dispatch.
@@ -2897,6 +2933,66 @@ impl Assembler {
         self.exception_owner_provenance
             .return_region_reentries
             .insert(boundary);
+    }
+
+    /// Captures a copied finalizer's donor across only artificial iterator disposal.
+    pub(crate) fn record_copied_finally_iterator_return(
+        &mut self,
+        cleanup_end: usize,
+        iterators: usize,
+    ) {
+        let Some(start) = cleanup_end.checked_sub(2) else {
+            return;
+        };
+        let Some(items) = self.linear_items().get(start..) else {
+            return;
+        };
+        let [Item::Instruction(call), Item::Instruction(pop), tail @ ..] = items else {
+            return;
+        };
+        if call.opcode != crate::target::opcodes::CALL
+            || !matches!(call.operand(), Operand::Value(_))
+            || call.location.line < 0
+            || pop.opcode != POP_TOP
+            || pop.operand() != Operand::Value(0)
+            || pop.location != call.location
+            || iterators == 0
+            || !tail.iter().any(|item| matches!(item, Item::Label(_)))
+        {
+            return;
+        }
+        let mut offset = 0;
+        for item in tail {
+            let Item::Instruction(instruction) = item else {
+                continue;
+            };
+            let (opcode, operand) = if offset == 2 * iterators {
+                (RETURN_VALUE, Operand::Value(0))
+            } else if offset < 2 * iterators && offset.is_multiple_of(2) {
+                (SWAP, Operand::Value(2))
+            } else {
+                (POP_TOP, Operand::Value(0))
+            };
+            if instruction.opcode != opcode
+                || instruction.operand() != operand
+                || instruction.location != SourceLocation::NONE
+                || instruction.no_location_policy.preserves_location()
+                || instruction.pre_fold_extra_instructions() != 0
+            {
+                return;
+            }
+            offset += 1;
+        }
+        if offset != 2 * iterators + 1
+            || !matches!(items.last(), Some(Item::Instruction(instruction))
+                if instruction.opcode == RETURN_VALUE)
+        {
+            return;
+        }
+        let origin = items.to_vec();
+        self.exception_owner_provenance
+            .copied_finally_iterator_returns
+            .push(origin);
     }
 
     /// Records the first erased ordinary-try POP before a return's remaining unwind.
@@ -5754,6 +5850,34 @@ impl Assembler {
             .push((*authored, *pop, target));
     }
 
+    /// Records a simple For target without inserting a physical fusion boundary.
+    pub(crate) fn record_for_target_owner_prefix(&mut self, entry: Label) {
+        let items = self.linear_items();
+        let Some(
+            [
+                Item::Label(label),
+                Item::Instruction(nop),
+                Item::Instruction(store),
+            ],
+        ) = items.get(items.len().saturating_sub(3)..)
+        else {
+            return;
+        };
+        if *label != entry
+            || store.opcode != STORE_FAST
+            || !matches!(store.operand(), Operand::Value(_))
+            || store.local_policy.hidden_exception_owner_slots() != 0
+            || store.pre_fold_extra_instructions() != 0
+            || *nop != Instruction::new(NOP, Operand::Value(0), store.location, nop.depth_after())
+        {
+            return;
+        }
+        let store = *store;
+        self.exception_owner_provenance
+            .for_target_owner_prefixes
+            .push((entry, store));
+    }
+
     /// Starts a protected prefix within the same original instruction array.
     pub(crate) fn record_exception_owner_prefix(&mut self, label: Label) {
         self.record_exception_owner_continuation(label);
@@ -6391,6 +6515,7 @@ impl Assembler {
             && self.preserved_block_boundaries.is_empty()
             && self.borrow_unreachable_blocks.is_empty()
             && self.borrow_omitted_for_backedges.is_empty()
+            && self.folded_loop_exit_anchors.is_empty()
             && !self.has_synthesized_percent_target_locations
             && let Some(linear_eligible) =
                 assertion_constant_indices(self.linear_items(), load_const, &mut used)

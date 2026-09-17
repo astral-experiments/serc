@@ -1408,6 +1408,8 @@ pub(crate) struct Assembler {
     pub(super) folded_away_loop_else_targets: FxHashSet<Label>,
     /// Existing source marker, target, and marker location of an original folded edge.
     pub(super) folded_predecessor_sources: Vec<(Label, Label, SourceLocation)>,
+    /// Empty original anchors before folded constant-while exits without else suites.
+    pub(super) folded_loop_exit_anchors: FxHashSet<Label>,
     pub(super) operand_patches: Vec<OperandPatch>,
     pub(super) deferred_none_constant_index: Option<u32>,
     pub(super) discarded_fold_admissions: FxHashMap<Label, Vec<u32>>,
@@ -1509,6 +1511,8 @@ pub(super) struct OptimizationPipeline {
     pub(super) folded_original_predecessor_targets: FxHashSet<Label>,
     /// Source markers retained to prove that a folded edge was originally reachable.
     pub(super) folded_predecessor_sources: Vec<(Label, Label, SourceLocation)>,
+    /// Empty original anchors before folded constant-while exits without else suites.
+    pub(super) folded_loop_exit_anchors: FxHashSet<Label>,
     /// First-fold admissions retained before their next surviving source label.
     pub(super) discarded_fold_admissions: FxHashMap<Label, Vec<u32>>,
     pub(super) initial_reachable: Option<Vec<bool>>,
@@ -1629,6 +1633,7 @@ impl Default for Assembler {
             folded_away_condition_targets: FxHashSet::default(),
             folded_away_loop_else_targets: FxHashSet::default(),
             folded_predecessor_sources: Vec::new(),
+            folded_loop_exit_anchors: FxHashSet::default(),
             operand_patches: Vec::new(),
             deferred_none_constant_index: None,
             discarded_fold_admissions: FxHashMap::default(),

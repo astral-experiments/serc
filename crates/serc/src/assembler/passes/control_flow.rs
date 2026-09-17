@@ -2582,6 +2582,105 @@ impl OptimizationPipeline {
                 }
             }
         }
+        self.propagate_copied_finally_iterator_return_locations();
+    }
+
+    /// Replays a finalizer donor only through its unchanged original cleanup array.
+    fn propagate_copied_finally_iterator_return_locations(&mut self) {
+        let origins = std::mem::take(
+            &mut self
+                .exception_owner_provenance
+                .copied_finally_iterator_returns,
+        );
+        if origins.is_empty() {
+            return;
+        }
+        let mut forbidden = self.exception_owner_provenance.block_boundaries.clone();
+        forbidden.extend(&self.exception_owner_provenance.source_boundaries);
+        forbidden.extend(&self.preserved_block_boundaries);
+        forbidden.extend(self.exception_regions.iter().map(|region| region.target));
+        forbidden.extend(
+            self.exception_owner_provenance
+                .setups
+                .iter()
+                .map(|(label, _)| *label),
+        );
+        let items = self
+            .graph
+            .iter()
+            .flat_map(|(block, contents)| {
+                contents
+                    .items()
+                    .iter()
+                    .enumerate()
+                    .map(move |(offset, item)| (ItemPosition::new(block, offset), *item))
+            })
+            .collect::<Vec<_>>();
+        let mut labels = FxHashMap::default();
+        for (index, (_, item)) in items.iter().enumerate() {
+            match item {
+                Item::Label(label) => {
+                    labels.insert(*label, index);
+                }
+                Item::Instruction(instruction) => {
+                    if let Operand::Forward(label) | Operand::Backward(label) =
+                        instruction.operand()
+                    {
+                        forbidden.insert(label);
+                    }
+                }
+            }
+        }
+        for origin in origins {
+            let Some((anchor, label)) =
+                origin
+                    .iter()
+                    .enumerate()
+                    .find_map(|(index, item)| match item {
+                        Item::Label(label) => Some((index, *label)),
+                        Item::Instruction(_) => None,
+                    })
+            else {
+                continue;
+            };
+            let Some(start) = labels
+                .get(&label)
+                .and_then(|index| index.checked_sub(anchor))
+            else {
+                continue;
+            };
+            let Some(current) = items.get(start..start + origin.len()) else {
+                continue;
+            };
+            let Item::Instruction(donor) = origin[0] else {
+                continue;
+            };
+            if !current.iter().zip(&origin).all(|((_, current), original)| {
+                match (*current, *original) {
+                    (Item::Label(actual), Item::Label(expected)) => {
+                        actual == expected && !forbidden.contains(&actual)
+                    }
+                    (Item::Instruction(mut actual), Item::Instruction(expected)) => {
+                        // The existing within-array pass may already have located the
+                        // iterator's SWAP/POP. No other record or metadata may change.
+                        if expected.location == SourceLocation::NONE
+                            && actual.location == donor.location
+                        {
+                            actual.location = SourceLocation::NONE;
+                        }
+                        actual == expected
+                    }
+                    _ => false,
+                }
+            }) {
+                continue;
+            }
+            let (position, _) = current.last().expect("captured return array is nonempty");
+            self.graph
+                .instruction_mut(*position)
+                .expect("captured original return")
+                .location = donor.location;
+        }
     }
 
     pub(in crate::assembler) fn remove_redundant_nops(&mut self) {

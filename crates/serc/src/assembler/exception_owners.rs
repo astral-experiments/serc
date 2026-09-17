@@ -38,6 +38,8 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) value_jump_continuation_boundaries: FxHashSet<Label>,
     // Region re-entry after a return emits no original instruction or unwind slot.
     pub(super) return_region_reentries: FxHashSet<Label>,
+    // Exact copied-finally CALL/POP and its artificial iterator-disposal/return array.
+    pub(super) copied_finally_iterator_returns: Vec<Vec<Item>>,
     pub(super) fusion_boundaries: FxHashSet<Label>,
     pub(super) setup_nop_boundaries: FxHashSet<Label>,
     pub(super) setup_nop_ranges: Vec<(Label, Label)>,
@@ -56,6 +58,8 @@ pub(super) struct ExceptionOwnerProvenance {
     // Authored normal exits and their immediate, fully emitted restore records.
     pub(super) original_comprehension_normal_exits: Vec<(Label, Instruction)>,
     pub(super) original_comprehension_normal_restores: FxHashMap<Label, Vec<Instruction>>,
+    // Original simple For target stores, before their tracing NOP is compacted.
+    pub(super) for_target_owner_prefixes: Vec<(Label, Instruction)>,
     // Exact final normal restore, after its fusion policies are complete.
     pub(super) comprehension_restore_owner_prefixes: Vec<(Label, Instruction)>,
     pub(super) retired_comprehension_normal_entries: FxHashSet<Label>,
@@ -330,6 +334,37 @@ impl ExceptionOwnerProvenance {
                 && !origin.cleanup.contains(&Item::Label(label))
                 && origin.bridge.is_none_or(|(bridge, _)| bridge != label)
         });
+    }
+
+    /// Finds unchanged For target stores with exactly their original tracing NOP removed.
+    fn original_for_target_prefix_positions(&self, items: &[Item]) -> FxHashMap<usize, usize> {
+        self.for_target_owner_prefixes
+            .iter()
+            .filter_map(|(entry, store)| {
+                if !self.source_boundaries.contains(entry)
+                    || !self.block_boundaries.contains(entry)
+                    || self.retired_normal_try_copy_labels.contains(entry)
+                    || self.normal_try_copy_blocks.contains(entry)
+                    || self.for_target_owner_prefixes.iter().filter(|(label, _)| label == entry).count() != 1
+                {
+                    return None;
+                }
+                let mut entries = items.iter().enumerate().filter_map(|(index, item)| {
+                    (*item == Item::Label(*entry)).then_some(index)
+                });
+                let index = entries.next()?;
+                if entries.next().is_some() {
+                    return None;
+                }
+                let mut expected = *store;
+                expected.local_policy.add_hidden_exception_owner_slots(1);
+                if !matches!(items.get(index + 1), Some(Item::Instruction(actual)) if *actual == expected) {
+                    return None;
+                }
+                let position = items[..index].iter().filter(|item| matches!(item, Item::Instruction(_))).count();
+                Some((position, position))
+            })
+            .collect()
     }
 
     /// Finds a unique unchanged survivor whose literal-fold witness has not retired.
@@ -2326,6 +2361,9 @@ impl LayoutAssembler {
                 (index >= start && matches.next().is_none()).then_some((index, start))
             })
             .collect::<FxHashMap<_, _>>();
+        let for_target_prefixes = self
+            .exception_owner_provenance
+            .original_for_target_prefix_positions(&self.items);
         let retained_setup_nops = self.retained_setup_nops(&label_positions);
         // An original entry prefix with no SETUP, region, or policy owner can
         // supply only NULL records, including its certified early-folded slots.
@@ -3332,6 +3370,16 @@ impl LayoutAssembler {
                     {
                         retained_owned_suffix = None;
                         source_owned_prefix = None;
+                    }
+                    // The exact For target store carries its removed tracing NOP. Start
+                    // after that record; later clean cells can donate an owner without
+                    // assuming the hidden slot itself has the same exception handler.
+                    if owner_history_exact
+                        && source_owned_prefix.is_none()
+                        && for_target_prefixes.get(&instruction_index)
+                            == Some(&original_array_start)
+                    {
+                        source_owned_prefix = Some((instruction_index + 1, tail));
                     }
                     // A completed normal restore supplies a protected suffix within its
                     // original array. Static SWAP elimination may move this exact record;
@@ -5690,6 +5738,92 @@ impl LayoutAssembler {
 #[cfg(test)]
 mod tests {
     use super::ExceptionOwnerTail;
+
+    #[test]
+    fn for_target_owner_prefix_requires_the_exact_surviving_entry() {
+        use super::ExceptionOwnerProvenance;
+        use crate::assembler::{
+            ExceptionPolicy, Instruction, Item, Label, Operand, SourceLocation,
+        };
+        use crate::target::opcodes::{LOAD_CONST, POP_TOP, STORE_FAST, STORE_FAST_LOAD_FAST};
+
+        for case in [
+            "valid",
+            "intervening label",
+            "changed operand",
+            "changed policy",
+            "fused store",
+            "hidden zero",
+            "hidden two",
+            "duplicate body",
+            "duplicate origin",
+            "missing source boundary",
+            "missing block boundary",
+            "retired entry",
+            "copied entry",
+        ] {
+            let body = Label(2);
+            let location = SourceLocation::new(4, 4, 8, 12);
+            let original = Instruction::new(STORE_FAST, Operand::Value(4), location, None);
+            let mut surviving = original;
+            surviving
+                .local_policy
+                .add_hidden_exception_owner_slots(match case {
+                    "hidden zero" => 0,
+                    "hidden two" => 2,
+                    _ => 1,
+                });
+            match case {
+                "changed operand" => surviving.set_operand(Operand::Value(5)),
+                "changed policy" => surviving.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS),
+                "fused store" => surviving.opcode = STORE_FAST_LOAD_FAST,
+                _ => {}
+            }
+
+            // The body starts at instruction 2, although its store is item 5.
+            let mut items = vec![
+                Item::Label(Label(0)),
+                Item::Instruction(Instruction::new(
+                    LOAD_CONST,
+                    Operand::Value(0),
+                    location,
+                    None,
+                )),
+                Item::Label(Label(1)),
+                Item::Instruction(Instruction::new(POP_TOP, Operand::Value(0), location, None)),
+                Item::Label(body),
+                Item::Instruction(surviving),
+            ];
+            let mut provenance = ExceptionOwnerProvenance {
+                for_target_owner_prefixes: vec![(body, original)],
+                source_boundaries: [body].into_iter().collect(),
+                block_boundaries: [body].into_iter().collect(),
+                ..ExceptionOwnerProvenance::default()
+            };
+            match case {
+                "intervening label" => items.insert(5, Item::Label(Label(3))),
+                "duplicate body" => items.push(Item::Label(body)),
+                "duplicate origin" => provenance.for_target_owner_prefixes.push((body, original)),
+                "missing source boundary" => provenance.source_boundaries.clear(),
+                "missing block boundary" => provenance.block_boundaries.clear(),
+                "retired entry" => {
+                    provenance.retired_normal_try_copy_labels.insert(body);
+                }
+                "copied entry" => {
+                    provenance.normal_try_copy_blocks.insert(body);
+                }
+                _ => {}
+            }
+
+            let positions = provenance.original_for_target_prefix_positions(&items);
+            let expected = if case == "valid" {
+                [(2, 2)].into_iter().collect()
+            } else {
+                rustc_hash::FxHashMap::default()
+            };
+            assert_eq!(positions, expected, "{case}");
+        }
+    }
 
     #[test]
     fn setup_removal_follows_boolean_and_prologue_insertions() {

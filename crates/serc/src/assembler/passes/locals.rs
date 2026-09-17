@@ -528,8 +528,36 @@ impl OptimizationPipeline {
             else {
                 continue;
             };
-            if start > 0 && matches!(items[start - 1], Item::Label(_)) {
-                continue;
+            if let Some(Item::Label(alias)) =
+                start.checked_sub(1).and_then(|index| items.get(index))
+            {
+                // Removing a preceding ordinary try's normal jump can leave its
+                // range-end alias beside this unchanged original source array.
+                // Authenticate that original edge; an arbitrary merged label or
+                // an actual original block boundary must still stop replay.
+                if origin.source_exit_alias.is_none()
+                    || origin.source_prefix.is_empty()
+                    || self.exception_owner_provenance.normal_try_exits.iter().filter(|&&(entry, target)| {
+                        entry == *alias
+                            && origin.source_labels.contains(&target)
+                            && self.exception_owner_provenance.block_boundaries.contains(&target)
+                    }).count() != 1
+                    || self.exception_owner_provenance.block_boundaries.contains(alias)
+                    || self.exception_owner_provenance.source_boundaries.contains(alias)
+                    || self.preserved_block_boundaries.contains(alias)
+                    || self.borrow_unreachable_blocks.contains(alias)
+                    || self.borrow_jump_entry_labels.contains(alias)
+                    || self.borrow_finally_entries.contains_key(alias)
+                    || self.exception_regions.iter().any(|region| region.target == *alias)
+                    || items.iter().any(|item| {
+                        matches!(item, Item::Instruction(instruction)
+                            if matches!(instruction.operand(), Operand::Forward(target) | Operand::Backward(target)
+                                if target == *alias))
+                    })
+                    || start.checked_sub(2).is_some_and(|index| matches!(items[index], Item::Label(_)))
+                {
+                    continue;
+                }
             }
             if !origin.source_labels.iter().enumerate().all(|(offset, label)| {
                 matches!(items.get(start + offset), Some(Item::Label(candidate)) if candidate == label)

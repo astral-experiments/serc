@@ -1100,13 +1100,26 @@ fn comprehension_assignment_exit_location(
     target: &[Item],
     origins: &FxHashMap<Label, (Vec<Label>, [Instruction; 3])>,
 ) -> Option<SourceLocation> {
-    let [Item::Label(exit), Item::Instruction(jump)] = target else {
-        return None;
+    let entry_len = target
+        .iter()
+        .take_while(|item| matches!(item, Item::Label(_)))
+        .count();
+    let jump = match &target[entry_len..] {
+        [Item::Instruction(jump)] if entry_len == 1 => jump,
+        [Item::Instruction(pop), Item::Instruction(jump)]
+            if pop.opcode == POP_EXCEPT && pop.location.line < 0 =>
+        {
+            jump
+        }
+        _ => return None,
     };
     if jump.opcode != JUMP_FORWARD || jump.location.line >= 0 {
         return None;
     }
-    let (entries, instructions) = origins.get(exit)?;
+    let (entries, instructions) = target[..entry_len].iter().find_map(|item| match item {
+        Item::Label(exit) => origins.get(exit),
+        Item::Instruction(_) => None,
+    })?;
     if source.len() != entries.len() + 3 {
         return None;
     }
@@ -1622,6 +1635,41 @@ impl OptimizationPipeline {
         if graph.len() < 2 {
             normalize_unmoved_interruptible_jumps(graph);
             return FxHashSet::default();
+        }
+
+        // Constant-true while lowering aliases CPython's empty condition anchor
+        // with the shared loop exit. Restore that original array before cold
+        // relocation: its synthetic bridge cannot inherit a line from the earlier
+        // break across the empty anchor. Ordinary nonempty cleanup bridges retain
+        // their existing location propagation.
+        let loop_anchor_targets = self
+            .folded_predecessor_sources
+            .iter()
+            .filter_map(|&(source, target, location)| {
+                if !self.folded_loop_exit_anchors.contains(&target) {
+                    return None;
+                }
+                let source = graph.label_block(source)?;
+                let marker = graph[source].items().iter().find_map(|item| match item {
+                    Item::Instruction(instruction) => Some(instruction),
+                    Item::Label(_) => None,
+                })?;
+                // A removed marker can leave a label alias on unrelated live code.
+                (marker.opcode == NOP && marker.location == location)
+                    .then(|| graph.label_block(target))
+                    .flatten()
+            })
+            .collect::<FxHashSet<_>>();
+        let loop_anchor_positions = graph
+            .order()
+            .iter()
+            .enumerate()
+            .filter_map(|(position, block)| loop_anchor_targets.contains(block).then_some(position))
+            .collect::<Vec<_>>();
+        for position in loop_anchor_positions.into_iter().rev() {
+            let anchor = Label(self.next_label);
+            self.next_label += 1;
+            graph.insert_block(position, vec![Item::Label(anchor)]);
         }
 
         // Loop-tail lowering can omit the original array containing the final backedge.

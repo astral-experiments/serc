@@ -5703,6 +5703,7 @@ impl Compiler<'_> {
                 let mut next_handler = handler_count;
                 let mut next_finally = return_finally_contexts.len();
                 let mut copied_handler_assignment_span = None;
+                let mut copied_finally_iterator_location = None;
                 while next_handler > 0
                     || next_finally > 0
                     || (!return_is_overridden
@@ -6861,6 +6862,35 @@ impl Compiler<'_> {
                             }
                         }
                     }
+                    if self.context.target_specific_rules_enabled()
+                        && preserve_tos
+                        && handler_count == 0
+                        && return_finally_contexts.len() == 1
+                        && self.control.withs.active_with_exits.is_empty()
+                        && self.control.finally.active_finally_end_blocks == 0
+                        && self.control.finally.active_normal_finally_bodies == 0
+                        && self.control.finally.active_copied_finally_bodies == 0
+                        && finally_context.exception_region_depth > 0
+                        && matches!(finally_context.body.as_slice(), [Stmt::Expr(expression)]
+                            if matches!(expression.value.as_ref(), Expr::Call(_)))
+                        && self.control.loops.contexts[..finally_context.loop_depth]
+                            .iter()
+                            .all(|context| {
+                                matches!(
+                                    context.iterator_cleanup,
+                                    IteratorCleanup::None | IteratorCleanup::Sync
+                                )
+                            })
+                    {
+                        let iterators = self.control.loops.contexts[..finally_context.loop_depth]
+                            .iter()
+                            .filter(|context| context.iterator_cleanup == IteratorCleanup::Sync)
+                            .count();
+                        if iterators > 0 {
+                            copied_finally_iterator_location =
+                                Some((self.assembler.item_count(), iterators));
+                        }
+                    }
                     // The copied finally body has its own source locations. CPython makes
                     // the resumed unwind artificial so each incoming branch can supply its
                     // location when the shared return block is duplicated.
@@ -7161,6 +7191,10 @@ impl Compiler<'_> {
                             .set_location(self.source_location(name.range));
                     }
                     self.emit(RETURN_VALUE, 0, -1)?;
+                    if let Some((cleanup_end, iterators)) = copied_finally_iterator_location {
+                        self.assembler
+                            .record_copied_finally_iterator_return(cleanup_end, iterators);
+                    }
                     // Pass finalizers leave a shared, unlocated handler cleanup. Its synthetic
                     // region labels must not prevent CPython's exit-block duplication.
                     if unwinds_return_finally
@@ -9011,6 +9045,20 @@ impl Compiler<'_> {
                 .last_mut()
                 .expect("retained try-body if exit requires an active try")
                 .push((exit_start, exit_end));
+        }
+        if self.context.target_specific_rules_enabled()
+            && self
+                .control
+                .exceptions
+                .active_exception_handlers
+                .last()
+                .is_some_and(|handler| {
+                    handler.name.is_none() && handler.trailing_statement == Some(statement.range)
+                })
+        {
+            // The final comprehension falls through to the handler's source-less cleanup.
+            // Preserve its result-store donor before static SWAP elimination moves it.
+            self.assembler.record_comprehension_assignment_exit(end);
         }
         self.assembler.record_exception_owner_block_boundary(end);
         self.assembler.mark(end);
@@ -11551,7 +11599,7 @@ impl Compiler<'_> {
             // Without an else suite, the original condition anchor aliases this
             // end label before constant folding removes the true test's exit edge.
             if statement.orelse.is_empty() {
-                self.assembler.record_folded_condition_predecessor(end);
+                self.assembler.record_folded_loop_exit_anchor(end);
             } else if suite_has_linear_borrow_fallthrough(&statement.orelse) {
                 // Before folding, this normal else exit is another predecessor
                 // beside an authored break. It is not a conditional target edge.
@@ -12048,6 +12096,7 @@ impl Compiler<'_> {
             .set_location(self.source_location(statement.target.range()));
         self.emit(NOP, 0, 0)?;
         self.compile_store_target(&statement.target)?;
+        self.assembler.record_for_target_owner_prefix(body);
 
         let mut context = self.loop_context(
             start,
@@ -15586,7 +15635,8 @@ impl Compiler<'_> {
                     && suite_has_normal_fallthrough(&handler.body)
                     && matches!(handler.body.last(), Some(Stmt::If(tail))
                         if handler_cleanup_has_runtime_jump_exit(tail)
-                            && handler_cleanup_has_stable_fallthrough_location(tail)
+                            && (handler_cleanup_has_stable_fallthrough_location(tail)
+                                || self.assembler.at_comprehension_assignment_exit())
                             && (!cleanup_has_small_return_successor
                                 || !handler_cleanup_has_nested_branch_exit(tail))))
                 || handler.body.last().is_some_and(|tail| match tail {

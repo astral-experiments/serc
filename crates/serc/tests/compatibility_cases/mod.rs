@@ -589,3 +589,15 @@ mod finally_source_recovery;
 mod manager_assertion_arm_cleanup;
 
 mod await_completion_condition_owners;
+
+mod async_retry_cold_break;
+
+mod async_retry_named_break_marker;
+
+mod handler_comprehension_join;
+
+mod iterator_finally_return_cleanup_location;
+
+mod try_entry_none_fallback;
+
+mod nested_recovery_source_array_borrow;
