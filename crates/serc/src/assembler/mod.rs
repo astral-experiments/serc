@@ -6697,6 +6697,31 @@ impl Assembler {
                 original.jump_policy.mark_original_uniform_fold();
             }
         }
+        // These source arrays were captured before unused constants were pruned.
+        // Transport only surviving constant identities; replay still compares every
+        // complete instruction and rejects any other change to the original array.
+        if load_const == LOAD_CONST {
+            self.exception_owner_provenance
+                .original_normal_finally_arrays
+                .retain_mut(|origin| {
+                    for item in &mut origin.prefix {
+                        let Item::Instruction(instruction) = item else {
+                            continue;
+                        };
+                        if instruction.opcode != LOAD_CONST {
+                            continue;
+                        }
+                        let Operand::Value(index) = instruction.operand() else {
+                            return false;
+                        };
+                        let Some(Some(remapped)) = index_map.get(index as usize) else {
+                            return false;
+                        };
+                        instruction.set_operand(Operand::Value(*remapped));
+                    }
+                    true
+                });
+        }
     }
 
     pub(crate) const fn deferred_none_constant_index(&self) -> Option<u32> {

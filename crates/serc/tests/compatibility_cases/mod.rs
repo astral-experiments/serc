@@ -615,3 +615,9 @@ mod p91_fresh_try_nonterminal_cell_prefix;
 mod conditional_else_finally_borrow;
 
 mod p92_fresh_try_dynamic_binary_prefix;
+
+mod nested_manager_first_condition_owner;
+
+mod named_handler_shared_false_cleanup_location;
+
+mod three_owner_probes;

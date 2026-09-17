@@ -5857,6 +5857,24 @@ impl Compiler<'_> {
                         elements,
                         elements.len(),
                     ));
+                // Each literal and BUILD_TUPLE belongs to this same original array.
+                // Larger tuples use LIST_APPEND and have different slot accounting.
+                if elements.len() <= 30
+                    && elements.iter().all(|element| {
+                        matches!(
+                            element,
+                            Expr::NoneLiteral(_)
+                                | Expr::BooleanLiteral(_)
+                                | Expr::NumberLiteral(_)
+                                | Expr::StringLiteral(_)
+                                | Expr::BytesLiteral(_)
+                                | Expr::EllipsisLiteral(_)
+                        )
+                    })
+                {
+                    self.assembler
+                        .record_last_uniform_fold_owner_slots(elements.len());
+                }
                 return Ok(());
             }
             if elements.len() > 30 {

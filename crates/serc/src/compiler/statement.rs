@@ -16109,6 +16109,20 @@ impl Compiler<'_> {
                     );
                 // Multi-edge joins and folded unconditional false exits leave this cleanup
                 // source-less; a sole runtime-tested false edge carries its operand's location.
+                // Named cleanup after a raise has only the condition's false predecessors.
+                // A normal enclosing finalizer is a successor at the same loop depth, just
+                // like a following statement; exceptional and copied finalizers stay separate.
+                let handler_cleanup_has_normal_finally_successor = self
+                    .control
+                    .finally
+                    .protected_try_loop_depths
+                    .iter()
+                    .rev()
+                    .find(|(depth, _)| *depth == self.control.finally.active_finally_try_bodies)
+                    .is_some_and(|(_, loop_depth)| {
+                        *loop_depth == self.control.loops.contexts.len()
+                            || has_lowered_loop_condition_successor
+                    });
                 let handler_ends_with_terminating_unlocated_cleanup = matches!(
                     handler.body.last(),
                     Some(Stmt::If(tail))
@@ -16151,6 +16165,33 @@ impl Compiler<'_> {
                             && condition_has_only_runtime_tests(&tail.test)
                             && !expression_contains_chained_comparison(&tail.test)
                             && condition_jump_target_count(&tail.test, false) > 1
+                ) || matches!(
+                    handler.body.last(),
+                    Some(Stmt::If(tail))
+                        if handler.name.is_some()
+                            && loop_tail.is_none()
+                            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                            && statement.orelse.is_empty()
+                            && statement.finalbody.is_empty()
+                            && self.control.finally.exceptional_finally_continuation_depths.is_none()
+                            && self.control.finally.copied_return_finally_loop_depth.is_none()
+                            && (self.control.statements.current_statement_has_following
+                                || self.control.statements.inherited_statement_has_following
+                                || has_lowered_loop_condition_successor
+                                || handler_cleanup_has_normal_finally_successor)
+                            && tail.elif_else_clauses.is_empty()
+                            && matches!(tail.body.last(), Some(Stmt::Raise(_)))
+                            && !expression_contains_chained_comparison(&tail.test)
+                            && condition_jump_target_count(&tail.test, false) > 1
+                            && match tail.test.as_ref() {
+                                Expr::If(conditional) => {
+                                    condition_has_linear_runtime_leaves(&conditional.test)
+                                        && condition_has_linear_runtime_leaves(&conditional.body)
+                                        && condition_has_linear_runtime_leaves(&conditional.orelse)
+                                }
+                                _ => handler_cleanup_has_normal_finally_successor
+                                    && condition_has_linear_runtime_leaves(&tail.test),
+                            }
                 );
                 // CPython propagates a handler's sole condition-fallthrough edge onto the
                 // normal cleanup block, even when code follows the enclosing try statement.

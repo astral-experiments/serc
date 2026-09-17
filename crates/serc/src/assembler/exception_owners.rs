@@ -2496,6 +2496,7 @@ impl LayoutAssembler {
         let mut ended_owned_suffix = None;
         let mut ended_pop_slot = None;
         let mut captured_null_slots = Vec::new();
+        let mut captured_handler_owner_slots = Vec::new();
         let mut pending_null_append = None;
         let mut pending_fresh_null_append = None;
         let mut pending_await_null_append = None;
@@ -2519,6 +2520,7 @@ impl LayoutAssembler {
                             .contains(label)
                     {
                         captured_null_slots.clear();
+                        captured_handler_owner_slots.clear();
                     }
                     for original in &self.exception_owner_provenance.copied_handler_cleanups {
                         if original.end != *label || !owner_history_exact {
@@ -2734,6 +2736,7 @@ impl LayoutAssembler {
                         retained_pop_prefix = None;
                         original_array_start = instruction_index;
                         captured_null_slots.clear();
+                        captured_handler_owner_slots.clear();
                         tail = ExceptionOwnerTail::default();
                         late_setup_positions.clear();
                         late_setup_history_known = true;
@@ -2938,6 +2941,7 @@ impl LayoutAssembler {
                         })
                     {
                         captured_null_slots.clear();
+                        captured_handler_owner_slots.clear();
                     }
                     source_block |= self
                         .exception_owner_provenance
@@ -3295,7 +3299,13 @@ impl LayoutAssembler {
                         || instruction.no_location_policy.borrow_fallthrough()
                             == super::BorrowFallthrough::Barrier
                     {
-                        late_setup_history_known = false;
+                        // A retained SETUP NOP remains a live record during the final
+                        // SETUP compaction. Unlike an unknown folded NOP, it preserves
+                        // this array's exact late-removal positions.
+                        late_setup_history_known &= retained_setup_nops
+                            .contains(&instruction_index)
+                            && instruction.no_location_policy.borrow_fallthrough()
+                                != super::BorrowFallthrough::Barrier;
                         value_jump_setup_history_known = false;
                         has_uninterrupted_fusion = false;
                         // An exact retained SETUP NOP is a known live array record.
@@ -3306,6 +3316,7 @@ impl LayoutAssembler {
                                 != super::BorrowFallthrough::Barrier;
                         ended_pop_slot = None;
                         captured_null_slots.clear();
+                        captured_handler_owner_slots.clear();
                         pending_null_append = None;
                         pending_fresh_null_append = None;
                         pending_await_null_append = None;
@@ -3355,6 +3366,36 @@ impl LayoutAssembler {
                     }
                     let previous_fusions = tail.post_compaction_fusions;
                     tail.instruction(*instruction, previous);
+                    // The exact named-handler POP span also certifies its surviving
+                    // SWAP and POP_EXCEPT cells. After counting the preceding erased
+                    // POP, this is the survivor's old slot, with its own structural owner.
+                    if captured_pop_slots.get(&instruction_index) == Some(&original_array_start)
+                        && owner_history_exact
+                        && pop_slot_epoch_known
+                        && tail.insertions == 0
+                        && tail.late_removals == 0
+                        && tail.post_compaction_fusions == 0
+                        && matches!(
+                            instruction.opcode,
+                            crate::target::opcodes::SWAP | crate::target::opcodes::POP_EXCEPT
+                        )
+                        && instruction.local_policy.hidden_exception_owner_slots() == 1
+                        && instruction.pre_fold_extra_instructions() == 0
+                        && instruction.exception_policy().exclusion()
+                            == super::ExceptionExclusion::None
+                        && instruction.exception_policy().owner()
+                            == NormalizedExceptionOwner::Unchanged
+                        && !owners.contains_key(&instruction_index)
+                        && let Some(region) = self.uniform_exception_owner(
+                            instruction_index,
+                            instruction_index + 1,
+                            &label_positions,
+                        )
+                        && !self.exception_regions[region].is_scope_fallback
+                        && let Some(slot) = instruction_index.checked_add(tail.early_removals)
+                    {
+                        captured_handler_owner_slots.push((original_array_start, slot, region));
+                    }
                     if tail.post_compaction_fusions > previous_fusions
                         && instruction.no_location_policy.borrow_fallthrough()
                             != super::BorrowFallthrough::Barrier
@@ -4008,11 +4049,14 @@ impl LayoutAssembler {
                         && tail.late_removals == 0
                         && let Some((start, end, start_tail, end_tail)) = ended_owned_prefix
                         && (tail.insertions == 0
-                            || (tail.post_compaction_fusions == 0
+                            || (tail.post_compaction_fusions <= tail.insertions
                                 && start_tail.insertions == tail.insertions))
                     {
+                        // Prologue insertion consumes the newer fusion suffix first. Once
+                        // exhausted, the marker reuses the earlier compaction tail, as it
+                        // does for a protected suffix that has not reached its cleanup.
                         let (removed, suffix_width, prefix_width) = if tail.post_compaction_fusions
-                            > 0
+                            > tail.insertions
                         {
                             (
                                 tail.post_compaction_fusions,
@@ -4184,6 +4228,37 @@ impl LayoutAssembler {
                     {
                         pending_null_append = Some(instruction_index + 1);
                     }
+                    // Range endpoints between the condition and its marker do not
+                    // change an authenticated original slot. Replay at the marker,
+                    // retaining the same array, epoch, and exact-history requirements.
+                    if instruction.opcode == NOT_TAKEN
+                        && instruction.exception_policy().exclusion()
+                            == super::ExceptionExclusion::None
+                        && instruction.exception_policy().owner()
+                            != NormalizedExceptionOwner::Dynamic
+                        && !owners.contains_key(&instruction_index)
+                        && owner_history_exact
+                        && pop_slot_epoch_known
+                        && tail.insertions == 0
+                        && tail.late_removals == 0
+                        && tail.post_compaction_fusions == 0
+                        && let Some((_, _, region)) =
+                            captured_handler_owner_slots
+                                .iter()
+                                .find(|(array, slot, _)| {
+                                    *array == original_array_start && *slot == instruction_index
+                                })
+                    {
+                        owners.insert(
+                            instruction_index,
+                            ExceptionOwnerDecision {
+                                has_owner: true,
+                                source_region: Some(*region),
+                                definitive: true,
+                                override_existing: true,
+                            },
+                        );
+                    }
                     // This separate origin proof starts with one retained normal POP_BLOCK.
                     // Known protected folds leave an owned stale tail. Carry that
                     // certificate across the marker's exception-range endpoints, using
@@ -4224,11 +4299,12 @@ impl LayoutAssembler {
                         );
                     }
                     // Reinsert certified late SETUP records into this original array.
+                    // Earlier folds and fusions precede this compaction, so their removed
+                    // slot counts do not affect its surviving records or SETUP positions.
                     // The appended marker reuses its pre-compaction physical slot, which
                     // can be an erased NULL SETUP or an earlier manager-entry instruction.
                     if instruction.opcode == NOT_TAKEN
                         && late_setup_history_known
-                        && owner_history_exact
                         && late_setup_positions.len() == tail.late_removals
                         && instruction.exception_policy().exclusion()
                             == super::ExceptionExclusion::None
@@ -4426,6 +4502,58 @@ impl LayoutAssembler {
                                 .and_then(|removed_before| load_index.checked_add(removed_before));
                             if removed_pop > 0 && original_pop_slot == Some(instruction_index + 1) {
                                 pending_normal_none_owner = Some((instruction_index + 1, None));
+                                continue;
+                            }
+                            // With both original POPs erased, earlier folds can put the
+                            // appended marker before either NULL cell. The captured pair
+                            // fixes their positions; only a uniformly protected original
+                            // prefix can donate the old instruction's owner.
+                            if paired
+                                && pop_slot_epoch_known
+                                && original_pop_slot
+                                    .and_then(|last_pop| last_pop.checked_sub(1))
+                                    .is_some_and(|first_pop| instruction_index + 1 < first_pop)
+                                && let Some(region) = self.uniform_exception_owner(
+                                    original_array_start,
+                                    load_index,
+                                    &label_positions,
+                                )
+                                && !self.exception_regions[region].is_scope_fallback
+                                && !self.exception_regions[region].preserve_lasti
+                                && indexed_instructions[original_array_start..load_index]
+                                    .iter()
+                                    .enumerate()
+                                    .all(|(offset, previous)| {
+                                        let index = original_array_start + offset;
+                                        previous.exception_policy().exclusion()
+                                            == super::ExceptionExclusion::None
+                                            && previous.exception_policy().owner()
+                                                == NormalizedExceptionOwner::Unchanged
+                                            && !owners.contains_key(&index)
+                                            && (previous
+                                                .local_policy
+                                                .hidden_exception_owner_slots()
+                                                == 0
+                                                || original_uniform_folds.contains(&index)
+                                                || self
+                                                    .exception_owner_provenance
+                                                    .uniform_fold_owner_slots
+                                                    .iter()
+                                                    .any(|(location, opcode, slots)| {
+                                                        previous.location == *location
+                                                            && previous.opcode == *opcode
+                                                            && previous
+                                                                .local_policy
+                                                                .hidden_exception_owner_slots()
+                                                                == *slots
+                                                            && previous
+                                                                .pre_fold_extra_instructions()
+                                                                == (*slots).min(4) as u8
+                                                    }))
+                                    })
+                            {
+                                pending_normal_none_owner =
+                                    Some((instruction_index + 1, Some(region)));
                                 continue;
                             }
                             if paired
@@ -5089,6 +5217,7 @@ impl LayoutAssembler {
                         retained_pop_prefix = None;
                         original_array_start = instruction_index;
                         captured_null_slots.clear();
+                        captured_handler_owner_slots.clear();
                         tail = ExceptionOwnerTail::default();
                         has_uninterrupted_fusion = false;
                         late_setup_positions.clear();
@@ -6772,6 +6901,107 @@ mod tests {
                 rustc_hash::FxHashSet::default()
             };
             assert_eq!(markers, expected, "{boundary}");
+        }
+    }
+
+    #[test]
+    fn normal_finally_constant_remapping_preserves_only_exact_surviving_arrays() {
+        use crate::assembler::{Assembler, ExceptionPolicy, Item, LayoutAssembler, SourceLocation};
+        use crate::target::opcodes::{
+            CALL, JUMP_FORWARD, LOAD_CONST, LOAD_FAST, NOP, NOT_TAKEN, POP_JUMP_IF_FALSE, POP_TOP,
+            PUSH_NULL, RERAISE, TO_BOOL,
+        };
+
+        for change in ["surviving constant", "removed constant", "changed location"] {
+            let mut assembler = Assembler::default();
+            let entry = assembler.label();
+            let setup_start = assembler.label();
+            let setup_end = assembler.label();
+            let setup = assembler.label();
+            let exit = assembler.label();
+            assembler.emit(LOAD_CONST, 1);
+            assembler.emit(POP_TOP, 0);
+            assembler.emit_forward_with_depth(JUMP_FORWARD, entry, 0, ExceptionPolicy::default());
+            assembler.emit(RERAISE, 0);
+            assembler.record_exception_owner_block_boundary(entry);
+            assembler.mark(entry);
+            let pop_ordinal = assembler.instruction_count();
+            assembler.emit_with_depth(NOP, 0, 0, ExceptionPolicy::EXCLUDE_ALWAYS);
+            assembler.mark_last_as_converted_pop_block();
+            assembler.set_location(SourceLocation::new(9, 9, 4, 12));
+            assembler.emit(LOAD_FAST, 1);
+            assembler.emit(PUSH_NULL, 0);
+            let load_item = assembler.item_count();
+            assembler.emit(LOAD_CONST, 2);
+            assembler.emit(CALL, 1);
+            assembler.emit(POP_TOP, 0);
+            assembler.mark(setup_start);
+            assembler.set_location(SourceLocation::new(10, 12, 4, 8));
+            assembler.emit(NOP, 0);
+            assembler.mark(setup_end);
+            assembler.record_setup_nop_boundaries(setup_start, setup_end);
+            assembler.mark(setup);
+            assembler.record_exception_setup(setup, true);
+            assembler.set_location(SourceLocation::new(11, 11, 7, 11));
+            assembler.emit(LOAD_FAST, 0);
+            assembler.emit(TO_BOOL, 0);
+            assembler.emit_forward_with_depth(
+                POP_JUMP_IF_FALSE,
+                exit,
+                0,
+                ExceptionPolicy::default(),
+            );
+            let marker_ordinal = assembler.instruction_count();
+            assembler.emit_with_depth(NOT_TAKEN, 0, 0, ExceptionPolicy::NoneAbsent);
+            assembler.record_original_normal_finally_array(pop_ordinal);
+            assert_eq!(
+                assembler
+                    .exception_owner_provenance
+                    .original_normal_finally_arrays
+                    .len(),
+                1
+            );
+
+            if change == "changed location" {
+                let Item::Instruction(load) = &mut assembler.linear_items_mut()[load_item] else {
+                    unreachable!();
+                };
+                load.location = SourceLocation::new(8, 8, 4, 12);
+            }
+            assembler.optimize_constant_pops();
+            assert!(
+                matches!(assembler.linear_items()[0], Item::Instruction(instruction) if instruction.opcode == NOP)
+            );
+            assert!(
+                matches!(assembler.linear_items()[load_item], Item::Instruction(instruction) if instruction.opcode == LOAD_CONST)
+            );
+            let retained = change != "removed constant";
+            assembler.remap_constant_indices(LOAD_CONST, &[Some(0), None, retained.then_some(1)]);
+            assert_eq!(
+                assembler
+                    .exception_owner_provenance
+                    .original_normal_finally_arrays
+                    .len(),
+                usize::from(retained),
+                "{change}"
+            );
+            let layout = LayoutAssembler {
+                items: assembler.linear_items().to_vec(),
+                exception_regions: assembler.exception_regions,
+                exception_owner_provenance: assembler.exception_owner_provenance,
+                preserved_block_boundaries: assembler.preserved_block_boundaries,
+                removed_max_depth: None,
+                next_label: assembler.next_label,
+                has_next_location: false,
+            };
+            let markers =
+                layout.original_normal_finally_null_markers(&[entry, exit].into_iter().collect());
+            let expected = if change == "surviving constant" {
+                [marker_ordinal].into_iter().collect()
+            } else {
+                rustc_hash::FxHashSet::default()
+            };
+            assert_eq!(markers, expected, "{change}");
         }
     }
 
