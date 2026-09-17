@@ -1077,6 +1077,89 @@ fn propagate_normal_try_pop_continuations(
     }
 }
 
+/// Replays only the recorded SWAP-to-NOP conversion and complete store exchange.
+fn static_swap_tail_location(
+    source: &[Item],
+    [swap, first, last]: [Instruction; 3],
+) -> Option<SourceLocation> {
+    let mut removed_swap = swap;
+    removed_swap.opcode = NOP;
+    removed_swap.set_operand(Operand::Value(0));
+    (source
+        == [
+            Item::Instruction(removed_swap),
+            Item::Instruction(last),
+            Item::Instruction(first),
+        ])
+    .then_some(last.location)
+}
+
+/// Replays the original store donor only across the exact static-SWAP permutation.
+fn comprehension_assignment_exit_location(
+    source: &[Item],
+    target: &[Item],
+    origins: &FxHashMap<Label, (Vec<Label>, [Instruction; 3])>,
+) -> Option<SourceLocation> {
+    let [Item::Label(exit), Item::Instruction(jump)] = target else {
+        return None;
+    };
+    if jump.opcode != JUMP_FORWARD || jump.location.line >= 0 {
+        return None;
+    }
+    let (entries, instructions) = origins.get(exit)?;
+    if source.len() != entries.len() + 3 {
+        return None;
+    }
+    let (labels, tail) = source.split_at(entries.len());
+    if !labels
+        .iter()
+        .copied()
+        .eq(entries.iter().copied().map(Item::Label))
+    {
+        return None;
+    }
+    static_swap_tail_location(tail, *instructions)
+}
+
+/// Resolves only an original match cleanup whose complete fallthrough array still matches.
+fn match_join_store_exit_location(
+    source: &[Item],
+    target: &[Item],
+    origins: &FxHashMap<Label, Vec<Item>>,
+) -> Option<SourceLocation> {
+    let entry_len = target
+        .iter()
+        .take_while(|item| matches!(item, Item::Label(_)))
+        .count();
+    let [Item::Instruction(pop), Item::Instruction(jump)] = &target[entry_len..] else {
+        return None;
+    };
+    if pop.opcode != POP_EXCEPT
+        || pop.location.line >= 0
+        || jump.opcode != JUMP_FORWARD
+        || jump.location.line >= 0
+    {
+        return None;
+    }
+    let original = target[..entry_len].iter().find_map(|item| match item {
+        Item::Label(label) => origins.get(label),
+        Item::Instruction(_) => None,
+    })?;
+    let [
+        prefix @ ..,
+        Item::Instruction(swap),
+        Item::Instruction(first),
+        Item::Instruction(last),
+    ] = original.as_slice()
+    else {
+        return None;
+    };
+    if source.len() != original.len() || source[..prefix.len()] != *prefix {
+        return None;
+    }
+    static_swap_tail_location(&source[prefix.len()..], [*swap, *first, *last])
+}
+
 fn propagate_exit_block_locations(
     graph: &mut BlockGraph,
     order: &[BasicBlockId],
@@ -1084,6 +1167,7 @@ fn propagate_exit_block_locations(
     exception_regions: &[ExceptionRegion],
     original_boundaries: &FxHashSet<Label>,
     original_location_absence: &FxHashSet<Label>,
+    comprehension_assignment_exits: &FxHashMap<Label, (Vec<Label>, [Instruction; 3])>,
 ) {
     for target in order.iter().copied() {
         if analysis.exception_handler_blocks[target.index()] {
@@ -1169,6 +1253,13 @@ fn propagate_exit_block_locations(
             analysis.jump_predecessors[target.index()]
         };
         let Some(location) = predecessor.and_then(|source| {
+            if let Some(location) = comprehension_assignment_exit_location(
+                graph[source].items(),
+                graph[target].items(),
+                comprehension_assignment_exits,
+            ) {
+                return Some(location);
+            }
             let last = graph[source].last_instruction()?;
             // A saved return crosses the artificial SWAP before an unnamed handler's
             // two-instruction exit. Propagate the same original block's finalizer line
@@ -2223,6 +2314,7 @@ impl OptimizationPipeline {
                 &self.exception_regions,
                 &self.exception_owner_provenance.block_boundaries,
                 original_location_absence,
+                &self.comprehension_assignment_exits,
             );
             let heads = shared_pop_block_heads
                 .iter()
@@ -4338,6 +4430,25 @@ impl OptimizationPipeline {
                 })
             };
             let Some(location) = predecessor.and_then(|source| {
+                if remaining_predecessors[target.index()] == 1
+                    && predecessors[target.index()] > 1
+                    && positions[source.index()] + 1 == target_position
+                    && block_has_fallthrough(graph[source].items())
+                    && let Some(location) = match_join_store_exit_location(
+                        graph[source].items(),
+                        graph[target].items(),
+                        &self.match_join_store_origins,
+                    )
+                {
+                    return Some(location);
+                }
+                if let Some(location) = comprehension_assignment_exit_location(
+                    graph[source].items(),
+                    graph[target].items(),
+                    &self.comprehension_assignment_exits,
+                ) {
+                    return Some(location);
+                }
                 if let Some(&start) = copied_split_eval_starts.get(&target)
                     && remaining_predecessors[target.index()] == 1
                     && positions[source.index()] + 1 == target_position

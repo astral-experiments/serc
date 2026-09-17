@@ -1416,6 +1416,8 @@ pub(crate) struct Assembler {
     pub(super) exception_regions: Vec<ExceptionRegion>,
     /// Original tail location retained when lowering emits an already-reordered restore.
     pub(super) original_fallthrough_location: Option<(EmittedInstruction, SourceLocation)>,
+    /// Source-authored match end awaiting its first emitted instruction.
+    pub(super) original_match_join: Option<Label>,
     pub(super) exception_owner_provenance: super::exception_owners::ExceptionOwnerProvenance,
     pub(super) preserved_block_boundaries: FxHashSet<Label>,
     pub(super) borrow_unreachable_blocks: FxHashSet<Label>,
@@ -1437,6 +1439,10 @@ pub(crate) struct Assembler {
     pub(super) borrow_block_aliases: FxHashSet<Label>,
     /// Original ordinary jump blocks that can thread conditional predecessors after exit copying.
     pub(super) conditional_threading_targets: FxHashMap<Label, SourceLocation>,
+    /// Exact pre-swap comprehension assignment arrays and their shared match exits.
+    pub(super) comprehension_assignment_exits: FxHashMap<Label, (Vec<Label>, [Instruction; 3])>,
+    /// Original match fallthrough arrays ending in an ordinary two-store exchange.
+    pub(super) match_join_store_origins: FxHashMap<Label, Vec<Item>>,
     /// Labels preceding an authored NOP omitted during statement lowering.
     pub(super) original_nop_targets: FxHashSet<Label>,
     /// Normal handler cleanup originally emitted without source locations.
@@ -1531,6 +1537,10 @@ pub(super) struct OptimizationPipeline {
     pub(super) borrow_block_aliases: FxHashSet<Label>,
     /// Original ordinary jump blocks that can thread conditional predecessors after exit copying.
     pub(super) conditional_threading_targets: FxHashMap<Label, SourceLocation>,
+    /// Exact pre-swap comprehension assignment arrays and their shared match exits.
+    pub(super) comprehension_assignment_exits: FxHashMap<Label, (Vec<Label>, [Instruction; 3])>,
+    /// Original match fallthrough arrays ending in an ordinary two-store exchange.
+    pub(super) match_join_store_origins: FxHashMap<Label, Vec<Item>>,
     /// Labels preceding an authored NOP omitted during statement lowering.
     pub(super) original_nop_targets: FxHashSet<Label>,
     /// Normal handler cleanup originally emitted without source locations.
@@ -1626,6 +1636,7 @@ impl Default for Assembler {
             location: SourceLocation::NONE,
             exception_regions: Vec::new(),
             original_fallthrough_location: None,
+            original_match_join: None,
             exception_owner_provenance: super::exception_owners::ExceptionOwnerProvenance::default(
             ),
             preserved_block_boundaries: FxHashSet::default(),
@@ -1640,6 +1651,8 @@ impl Default for Assembler {
             borrow_finally_entries: FxHashMap::default(),
             borrow_block_aliases: FxHashSet::default(),
             conditional_threading_targets: FxHashMap::default(),
+            comprehension_assignment_exits: FxHashMap::default(),
+            match_join_store_origins: FxHashMap::default(),
             original_nop_targets: FxHashSet::default(),
             original_unlocated_cleanup_targets: FxHashSet::default(),
             original_unlocated_discard_targets: FxHashSet::default(),

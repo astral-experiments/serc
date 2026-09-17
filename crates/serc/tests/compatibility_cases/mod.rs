@@ -567,3 +567,9 @@ mod nested_or_break_position;
 mod terminal_try_while_exit_locations;
 
 mod nested_else_return_location;
+
+mod match_handler_cleanup_join;
+
+mod match_comprehension_exit_positions;
+
+mod match_handler_tuple_fallthrough_donor;

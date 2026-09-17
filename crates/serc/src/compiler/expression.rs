@@ -881,7 +881,7 @@ impl Compiler<'_> {
             }
         }
 
-        self.assembler.mark(end);
+        self.assembler.mark_original_match_join(end);
         self.set_depth(base_depth);
         if terminal && failure_reaches_end {
             self.assembler.set_location(SourceLocation::NONE);
@@ -919,6 +919,10 @@ impl Compiler<'_> {
                 self.compile_match_case_tail_suite(&statement.body, false_exit)?;
             }
             self.set_branch_end_location(&statement.body, body_start);
+            if !loop_tail && !final_case {
+                self.assembler
+                    .record_comprehension_assignment_exit(false_exit);
+            }
             if loop_tail {
                 let original_unlocated_head = self.assembler.at_jump_target();
                 let success_exit = self.emit_jump_forward_instruction(JUMP_FORWARD, match_end)?;

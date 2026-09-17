@@ -389,6 +389,7 @@ impl Assembler {
         if matches!(item, Item::Instruction(_)) {
             self.instruction_count += 1;
             self.original_fallthrough_location = None;
+            self.original_match_join = None;
         }
         items.push(item);
     }
@@ -838,7 +839,9 @@ impl Assembler {
             })
     }
 
-    /// Whether an empty original join follows a terminator and has an unconditional edge.
+    /// Whether an empty original join has an unconditional edge and no authored location.
+    ///
+    /// A source-authored match end can also have a wildcard fallthrough predecessor.
     ///
     /// Range and fusion labels do not establish a CPython instruction-array boundary.
     /// Hidden authored NOPs and handler entries also prevent treating the join as unlocated.
@@ -857,7 +860,12 @@ impl Assembler {
         else {
             return false;
         };
-        if !(ends_scope(previous.opcode) || is_unconditional_jump(previous.opcode))
+        let match_join = self
+            .original_match_join
+            .filter(|label| labels.contains(label));
+        if !(ends_scope(previous.opcode)
+            || is_unconditional_jump(previous.opcode)
+            || match_join.is_some())
             || labels.iter().any(|label| {
                 self.original_nop_targets.contains(label)
                     || self.borrow_block_aliases.contains(label)
@@ -887,8 +895,9 @@ impl Assembler {
                 if is_unconditional_jump(instruction.opcode)
                     && matches!(instruction.operand(), Operand::Forward(label)
                         if labels.contains(&label)
-                            && self.exception_owner_provenance.source_boundaries.contains(&label)
-                            && self.exception_owner_provenance.block_boundaries.contains(&label)))
+                            && (match_join == Some(label)
+                                || (self.exception_owner_provenance.source_boundaries.contains(&label)
+                                    && self.exception_owner_provenance.block_boundaries.contains(&label)))))
         })
     }
 
@@ -1617,6 +1626,38 @@ impl Assembler {
                     && instruction.no_location_policy.borrow_fallthrough()
                         == BorrowFallthrough::Reachable
             })
+    }
+
+    /// Captures the original assignment donor before its comprehension restore is exchanged.
+    pub(crate) fn record_comprehension_assignment_exit(&mut self, exit: Label) {
+        if !self.current_original_block_is_single_comprehension_assignment() {
+            return;
+        }
+        let items = self.linear_items();
+        let [
+            ..,
+            Item::Label(_),
+            Item::Instruction(swap),
+            Item::Instruction(restore),
+            Item::Instruction(store),
+        ] = items
+        else {
+            unreachable!("certified comprehension assignment array");
+        };
+        let instructions = [*swap, *restore, *store];
+        // The cold cleanup's end can share the normal entry's original offset.
+        // Retain that entire emitted label prefix, including its exact order.
+        let mut entries = items[..items.len() - 3]
+            .iter()
+            .rev()
+            .map_while(|item| match item {
+                Item::Label(label) => Some(*label),
+                Item::Instruction(_) => None,
+            })
+            .collect::<Vec<_>>();
+        entries.reverse();
+        self.comprehension_assignment_exits
+            .insert(exit, (entries, instructions));
     }
 
     /// Records the real entry and cleanup owner of a later typed-handler dispatch.
@@ -2441,6 +2482,48 @@ impl Assembler {
 
     pub(crate) fn mark(&mut self, label: Label) {
         self.push_linear_item(Item::Label(label));
+    }
+
+    /// Records the source-authored match end until its first instruction is emitted.
+    pub(crate) fn mark_original_match_join(&mut self, label: Label) {
+        let items = self.linear_items();
+        let origin = match items {
+            [
+                ..,
+                Item::Instruction(swap),
+                Item::Instruction(first),
+                Item::Instruction(last),
+            ] if swap.opcode == SWAP
+                && swap.operand() == Operand::Value(2)
+                && first.opcode == STORE_FAST
+                && last.opcode == STORE_FAST
+                && !first.local_policy.may_store_null()
+                && !last.local_policy.may_store_null()
+                && matches!((first.operand(), last.operand()),
+                        (Operand::Value(first), Operand::Value(last)) if first != last)
+                && first.location.line >= 0
+                && first.location.line == last.location.line =>
+            {
+                // Keep the entire original array, including every adjacent entry alias.
+                // Static SWAP removal can exchange the last two stores before the
+                // unlocated match cleanup receives its remaining fallthrough donor.
+                items
+                    .iter()
+                    .rposition(|item| matches!(item, Item::Label(_)))
+                    .map(|mut start| {
+                        while start > 0 && matches!(items[start - 1], Item::Label(_)) {
+                            start -= 1;
+                        }
+                        items[start..].to_vec()
+                    })
+            }
+            _ => None,
+        };
+        self.mark(label);
+        self.original_match_join = Some(label);
+        if let Some(origin) = origin {
+            self.match_join_store_origins.insert(label, origin);
+        }
     }
 
     /// Retains an adjacent constant/Pass pair without inventing an original block entry.
