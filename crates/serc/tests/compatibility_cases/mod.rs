@@ -654,3 +654,4 @@ mod comprehension_method_ifexp;
 mod except_star_finally_source_boundary;
 
 mod protected_loop_surviving_break;
+mod synthetic_range_entry_copy_budget;

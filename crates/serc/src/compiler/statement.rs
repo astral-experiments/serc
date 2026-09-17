@@ -17574,7 +17574,11 @@ impl Compiler<'_> {
         let compound_fallthrough_handlers_reach_finally = !statement.is_star
             && statement.handlers.iter().all(|handler| {
                 handler.as_except_handler().is_some_and(|handler| {
-                    handler.type_.is_some() && !suite_contains_abrupt_control_flow(&handler.body)
+                    handler.type_.is_some()
+                        && !suite_contains_abrupt_control_flow(&handler.body)
+                        // A folded false assertion has no normal handler exit.
+                        && !matches!(handler.body.last(), Some(Stmt::Assert(assertion))
+                            if early_condition_truthiness(&assertion.test) == Some(false))
                 })
             })
             && (!suite_contains_loop_break(&statement.body) || linear_tail_after_guarded_break)
@@ -23803,7 +23807,12 @@ fn suite_contains_partial_terminal_handler_if(body: &[Stmt]) -> bool {
                                         .is_some_and(|clause| clause.test.is_some()),
                             ),
                     )
-                    .any(|clause| suite_terminates(&clause.body)))
+                    .any(|clause| suite_terminates(&clause.body))
+                || (index + 1 == body.len()
+                    && statement.elif_else_clauses.last().is_some_and(|clause| {
+                        clause.test.is_none()
+                            && suite_contains_partial_terminal_handler_if(&clause.body)
+                    })))
     })
 }
 
@@ -23947,6 +23956,26 @@ fn suite_contains_orphan_cold_cleanup(body: &[Stmt]) -> bool {
     }
 
     if matches!(body.last(), Some(Stmt::With(_))) {
+        return true;
+    }
+    // A non-final runtime arm's terminal manager leaves its separate normal
+    // exit behind when cold handler blocks move past the warm continuation.
+    if let Some(Stmt::If(branch)) = body.last()
+        && early_condition_truthiness(&branch.test).is_none()
+        && !branch.elif_else_clauses.is_empty()
+        && branch.elif_else_clauses.iter().all(|clause| {
+            clause
+                .test
+                .as_ref()
+                .is_none_or(|test| early_condition_truthiness(test).is_none())
+        })
+        && (matches!(branch.body.last(), Some(Stmt::With(_)))
+            || branch
+                .elif_else_clauses
+                .iter()
+                .take(branch.elif_else_clauses.len() - 1)
+                .any(|clause| matches!(clause.body.last(), Some(Stmt::With(_)))))
+    {
         return true;
     }
     // An unlocated shared loop backedge can be copied onto its incoming exits.

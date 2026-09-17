@@ -299,6 +299,19 @@ fn restore_normal_try_pop_holes(
     }
 }
 
+/// Identifies a range reentry that adds no original SETUP or POP record.
+fn is_metadata_range_entry(
+    label: Label,
+    exception_regions: &[ExceptionRegion],
+    original_setups: &[(Label, Option<SourceLocation>)],
+) -> bool {
+    exception_regions.iter().any(|region| region.start == label)
+        && exception_regions
+            .iter()
+            .all(|region| region.end != label && region.target != label)
+        && original_setups.iter().all(|(setup, _)| *setup != label)
+}
+
 struct ExitBlockAnalysis {
     positions: Vec<usize>,
     predecessors: Vec<usize>,
@@ -318,6 +331,7 @@ fn exit_block_analysis(
     retired_exception_handler_targets: &FxHashSet<Label>,
     original_nop_targets: &FxHashSet<Label>,
     return_region_reentries: &FxHashSet<Label>,
+    original_setups: &[(Label, Option<SourceLocation>)],
 ) -> ExitBlockAnalysis {
     let vector_len = order
         .iter()
@@ -455,11 +469,13 @@ fn exit_block_analysis(
         let Some(target_last) = graph[target_exit].last_instruction() else {
             continue;
         };
+        let mut at_target_entry = true;
         let target_pre_fusion_size = target_blocks
             .iter()
             .flat_map(|block| graph[*block].items())
             .map(|item| match item {
                 Item::Instruction(instruction) => {
+                    at_target_entry = false;
                     let fused_push_null = instruction.opcode == LOAD_GLOBAL
                         && matches!(instruction.operand(), Operand::Value(argument) if argument & 1 != 0);
                     1 + usize::from(fused_push_null)
@@ -468,7 +484,13 @@ fn exit_block_analysis(
                 Item::Label(label) => usize::from(
                     target_chain_end > target_position
                         && exception_split_labels.contains(label)
-                        && !return_region_reentries.contains(label),
+                        && !return_region_reentries.contains(label)
+                        && !(at_target_entry
+                            && is_metadata_range_entry(
+                                *label,
+                                exception_regions,
+                                original_setups,
+                            )),
                 ),
             })
             .sum::<usize>();
@@ -2371,6 +2393,7 @@ impl OptimizationPipeline {
             &self.retired_exception_handler_targets,
             &self.original_nop_targets,
             &self.exception_owner_provenance.return_region_reentries,
+            &self.exception_owner_provenance.setups,
         );
         let shared_pop_block_heads = order
             .iter()
@@ -2765,11 +2788,13 @@ impl OptimizationPipeline {
             }
             let target_blocks = &order[target_position..=target_chain_end];
             let target_exit = *target_blocks.last().expect("target chain is nonempty");
+            let mut at_target_entry = true;
             let target_pre_fusion_size = target_blocks
                 .iter()
                 .flat_map(|block| graph[*block].items())
                 .map(|item| match item {
                     Item::Instruction(instruction) => {
+                        at_target_entry = false;
                         let fused_push_null = instruction.opcode == LOAD_GLOBAL
                             && matches!(instruction.operand(), Operand::Value(argument) if argument & 1 != 0);
                         1 + usize::from(fused_push_null)
@@ -2781,7 +2806,13 @@ impl OptimizationPipeline {
                             && !self
                                 .exception_owner_provenance
                                 .return_region_reentries
-                                .contains(label),
+                                .contains(label)
+                            && !(at_target_entry
+                                && is_metadata_range_entry(
+                                    *label,
+                                    &self.exception_regions,
+                                    &self.exception_owner_provenance.setups,
+                                )),
                     ),
                 })
                 .sum::<usize>();

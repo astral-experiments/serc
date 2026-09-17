@@ -12819,6 +12819,209 @@ def filled(action, self, mask, result):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_folded_value_borrow_boundaries() {
+        for (filename, source) in [
+            (
+                "folded_value_else_none_or_attribute.py",
+                r"def choose(flag, primary, fallback):
+    value = primary if flag else None or fallback.value
+    consume(value)
+",
+            ),
+            (
+                "folded_value_else_none_or_chain.py",
+                r"def choose(flag, primary, fallback):
+    value = primary if flag else None or fallback.value or default()
+    consume(value)
+",
+            ),
+            (
+                "folded_value_after_if_expression_join.py",
+                r"def choose(flag, enabled, tail):
+    value = build(select() if flag else other(), enabled=False or enabled)
+    consume(tail, value)
+",
+            ),
+            (
+                "folded_value_no_constant_control.py",
+                r"def choose(flag, primary, fallback):
+    value = primary if flag else fallback.value
+    consume(value)
+",
+            ),
+            (
+                "folded_value_nonempty_prefix_control.py",
+                r"def choose(flag, primary, prefix, fallback):
+    value = primary if flag else combine(prefix, None or fallback.value)
+    consume(value)
+",
+            ),
+        ] {
+            assert_matches_cpython_marshal(source, filename);
+        }
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_false_assert_handler_finalizers() {
+        for (filename, source) in [
+            (
+                "false_assert_handler_async.py",
+                r"async def run(resource, value):
+    result = None
+    try:
+        result = await resource.work(value)
+    except Error as error:
+        message = str(error)
+        report(message)
+        assert False
+    finally:
+        await resource.close()
+    return convert(result)
+",
+            ),
+            (
+                "false_assert_handler_sync_control.py",
+                r"def run(resource, value):
+    result = None
+    try:
+        result = resource.work(value)
+    except Error as error:
+        message = str(error)
+        report(message)
+        assert False
+    finally:
+        resource.close()
+    return convert(result)
+",
+            ),
+            (
+                "raise_handler_async_control.py",
+                r"async def run(resource, value):
+    result = None
+    try:
+        result = await resource.work(value)
+    except Error as error:
+        message = str(error)
+        report(message)
+        raise Error
+    finally:
+        await resource.close()
+    return convert(result)
+",
+            ),
+            (
+                "runtime_assert_handler_async_control.py",
+                r"async def run(resource, value):
+    result = None
+    try:
+        result = await resource.work(value)
+    except Error as error:
+        message = str(error)
+        report(message)
+        assert value
+    finally:
+        await resource.close()
+    return convert(result)
+",
+            ),
+        ] {
+            assert_matches_cpython_marshal(source, filename);
+        }
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_nested_terminal_handler_else() {
+        for (filename, source) in [
+            (
+                "nested_terminal_else_target.py",
+                r"def run(factory, first, second, value, consume):
+    try:
+        value = factory()
+    except Error:
+        if first:
+            value = {}
+        else:
+            if second:
+                value = {}
+            else:
+                raise
+    consume(value)
+    return value
+",
+            ),
+            (
+                "nested_terminal_else_suffix_control.py",
+                r"def run(factory, first, second, value, consume):
+    try:
+        value = factory()
+    except Error:
+        if first:
+            value = {}
+        else:
+            if second:
+                value = {}
+            else:
+                raise
+            consume(second)
+    consume(value)
+    return value
+",
+            ),
+        ] {
+            assert_matches_cpython_marshal(source, filename);
+        }
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_nested_handler_manager_arms() {
+        for (filename, source) in [
+            (
+                "nested_manager_arm_target.py",
+                r"def run(manager, other, flag, value, work):
+    try:
+        work(value)
+    except Error:
+        if flag:
+            with manager:
+                with other:
+                    work(value)
+        else:
+            work(value)
+    try:
+        work(value)
+    except Error:
+        pass
+    work(value)
+    return value
+",
+            ),
+            (
+                "nested_manager_arm_suffix_control.py",
+                r"def run(manager, other, flag, value, work):
+    try:
+        work(value)
+    except Error:
+        if flag:
+            with manager:
+                with other:
+                    work(value)
+            work(value)
+        else:
+            work(value)
+    try:
+        work(value)
+    except Error:
+        pass
+    work(value)
+    return value
+",
+            ),
+        ] {
+            assert_matches_cpython_marshal(source, filename);
+        }
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_copied_finally_prefix_owners() {
         let source = include_str!("fixtures/copied_finally_prefix_owners.py");
         assert_matches_cpython_marshal(source, "copied_finally_prefix_owners.py");
