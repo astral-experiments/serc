@@ -289,3 +289,95 @@ fn matches_cpython_folded_predecessors_at_normal_try_cleanup() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_terminal_else_try_backedge_locations() {
+    for (filename, source) in [
+        (
+            "async_terminal_else_try_backedge_target.py",
+            r"async def f(items, choose, load):
+    for item in items:
+        response = None
+        try:
+            mode = await choose(item)
+            if mode == 1:
+                return await load(item)
+            elif mode == 2:
+                return await load(item)
+            else:
+                response = await load(item)
+                if item not in response.failed:
+                    return response
+        except Exception as exc:
+            record(exc)
+    finish()
+    return None
+",
+        ),
+        (
+            "sync_terminal_else_try_backedge_target.py",
+            r"def f(items, choose, load):
+    for item in items:
+        response = None
+        try:
+            mode = choose(item)
+            if mode == 1:
+                return load(item)
+            elif mode == 2:
+                return load(item)
+            else:
+                response = load(item)
+                if item not in response.failed:
+                    return response
+        except Exception as exc:
+            record(exc)
+    finish()
+    return None
+",
+        ),
+        (
+            "async_terminal_else_try_linear_arm_control.py",
+            r"async def f(items, choose, load):
+    for item in items:
+        response = None
+        try:
+            mode = await choose(item)
+            if mode == 1:
+                response = await load(item)
+            elif mode == 2:
+                return await load(item)
+            else:
+                response = await load(item)
+                if item not in response.failed:
+                    return response
+        except Exception as exc:
+            record(exc)
+    finish()
+    return None
+",
+        ),
+        (
+            "async_terminal_else_try_nonterminal_control.py",
+            r"async def f(items, choose, load):
+    for item in items:
+        response = None
+        try:
+            mode = await choose(item)
+            if mode == 1:
+                return await load(item)
+            elif mode == 2:
+                return await load(item)
+            else:
+                response = await load(item)
+                if item not in response.failed:
+                    record(response)
+        except Exception as exc:
+            record(exc)
+    finish()
+    return None
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

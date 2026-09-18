@@ -15072,6 +15072,15 @@ impl Compiler<'_> {
             } else if let Some(location) = direct_exit_location {
                 self.assembler
                     .set_location(self.source_location(location.test.range()));
+            } else if !statement.is_star
+                && statement.orelse.is_empty()
+                && statement.finalbody.is_empty()
+                && !unlocated_conditional_exit
+                && let Some(range) = terminal_else_try_exit_range(normal_exit_suite)
+            {
+                // Earlier arms leave the try. The final else's sole false edge
+                // supplies the normal exit location, including a copied backedge.
+                self.assembler.set_location(self.source_location(range));
             } else if let Some(range) = chained_assertion_exit_location {
                 self.assembler.set_location(self.source_location(range));
             } else if unlocated_conditional_exit {
@@ -15421,6 +15430,20 @@ impl Compiler<'_> {
                     && !original_condition_has_unique_jump_target(&tail.test, false)
                     && tail.elif_else_clauses.is_empty()
                     && (matches!(tail.body.last(), Some(Stmt::With(_)))
+                        || matches!(tail.body.last(), Some(Stmt::While(loop_statement))
+                            if early_condition_truthiness(&loop_statement.test) == Some(true)
+                                && loop_statement.orelse.is_empty()
+                                && matches!(loop_statement.body.last(), Some(Stmt::If(branch))
+                                    if condition_has_only_runtime_tests(&branch.test)
+                                        && branch.elif_else_clauses.is_empty()
+                                        && matches!(branch.body.last(), Some(Stmt::Break(_)))))
+                        || matches!(tail.body.last(), Some(Stmt::For(loop_statement))
+                            if !loop_statement.is_async
+                                && loop_statement.orelse.is_empty()
+                                && matches!(loop_statement.body.last(), Some(Stmt::If(branch))
+                                    if condition_has_only_runtime_tests(&branch.test)
+                                        && branch.elif_else_clauses.is_empty()
+                                        && matches!(branch.body.last(), Some(Stmt::Break(_)))))
                         || matches!(tail.body.last(), Some(Stmt::Try(nested))
                             if (nested.orelse.is_empty()
                                     || (!nested.is_star
@@ -15442,6 +15465,11 @@ impl Compiler<'_> {
                                             })
                                         })
                                             && (suite_has_linear_borrow_fallthrough(&nested.body)
+                                                || matches!(nested.body.as_slice(), [Stmt::Assert(assertion), rest @ ..]
+                                                    if assertion.msg.is_none()
+                                                        && assertion_has_only_runtime_tests(&assertion.test)
+                                                        && !expression_suspends_current_scope(&assertion.test)
+                                                        && suite_has_linear_borrow_fallthrough(rest))
                                                 || suite_retained_try_exit_leaves_empty_join(&nested.body)))
                                             || (suite_has_linear_borrow_fallthrough(&nested.body)
                                                 && matches!(nested.handlers.as_slice(), [handler]
@@ -15459,7 +15487,12 @@ impl Compiler<'_> {
                 // A linear nested else has the same empty shared join when its single
                 // recovery has only one normal path. Its work stays before the original
                 // outer POP_BLOCK; it cannot populate that unlocated false-edge array.
+                // An assertion followed by linear work still completes before that
+                // join; its raising arm cannot populate the pass-only recovery's exit.
                 // Keep the separate pass-only rule for retained conditional return exits.
+                // A terminal guarded break also leaves an empty loop/try join. Its
+                // false edges do not independently enter the loop's live continuation:
+                // the erased outer POP_BLOCK remains between those original arrays.
                 // A sole false edge retains a located NOP and its original borrow route.
                 self.assembler.prevent_borrow_fallthrough_reachability(end);
             }
@@ -23944,6 +23977,41 @@ fn direct_try_body_exit_location(body: &[Stmt]) -> Option<DirectTryBodyExitLocat
         .flatten()
 }
 
+/// Finds a normal try-exit donor behind terminating earlier conditional arms.
+fn terminal_else_try_exit_range(body: &[Stmt]) -> Option<TextRange> {
+    let Stmt::If(branch) = body.last()? else {
+        return None;
+    };
+    let (last, earlier) = branch.elif_else_clauses.split_last()?;
+    if last.test.is_some()
+        || !condition_has_only_runtime_tests(&branch.test)
+        || !suite_terminates_before_constant_folding(&branch.body)
+        || !earlier.iter().all(|clause| {
+            clause
+                .test
+                .as_ref()
+                .is_some_and(condition_has_only_runtime_tests)
+                && suite_terminates_before_constant_folding(&clause.body)
+        })
+    {
+        return None;
+    }
+    let (Stmt::If(tail), prefix) = last.body.split_last()? else {
+        return None;
+    };
+    if !tail.elif_else_clauses.is_empty()
+        || !condition_has_only_runtime_tests(&tail.test)
+        || !suite_terminates_before_constant_folding(&tail.body)
+        || (!prefix.is_empty() && !suite_has_linear_borrow_fallthrough(prefix))
+        || !original_condition_has_unique_jump_target(&tail.test, false)
+    {
+        return None;
+    }
+    // This only selects a location. The direct-exit helper also controls retained
+    // jumps; the terminating-arm shape does not change that copying policy.
+    unique_condition_jump_target(&tail.test, false).map(Ranged::range)
+}
+
 // Early small-block inlining copies the normal try exit onto the explicit
 // assignment arms. If the final nested else terminates, only the intervening
 // condition's false edge still reaches the original exit and donates its location.
@@ -24842,7 +24910,8 @@ fn terminal_condition_contains_owner_wrapper(expression: &Expr) -> bool {
 // A final complete handler if with a terminating branch can leave its shared cleanup block
 // empty after small-exit copies. A non-final terminating arm also leaves the unreachable
 // jump emitted after it empty, even when more handler statements follow. Cold-block
-// movement retains these orphans in the warm path.
+// movement retains these orphans in the warm path. A nested complete conditional
+// can leave the same orphan in either arm of the final complete handler if.
 fn suite_contains_partial_terminal_handler_if(body: &[Stmt]) -> bool {
     body.iter().enumerate().any(|(index, statement)| {
         let Stmt::If(statement) = statement else {
@@ -24874,7 +24943,8 @@ fn suite_contains_partial_terminal_handler_if(body: &[Stmt]) -> bool {
                 || (index + 1 == body.len()
                     && statement.elif_else_clauses.last().is_some_and(|clause| {
                         clause.test.is_none()
-                            && suite_contains_partial_terminal_handler_if(&clause.body)
+                            && (suite_contains_partial_terminal_handler_if(&statement.body)
+                                || suite_contains_partial_terminal_handler_if(&clause.body))
                     })))
     })
 }

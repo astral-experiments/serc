@@ -109,7 +109,7 @@ fn matches_cpython_marshal_for_original_jump_keyword_cleanup_witness() {
 }
 
 #[test]
-fn matches_cpython_marshal_for_original_jump_primitive_cleanup_witness() {
+fn matches_cpython_marshal_for_original_jump_noncall_cleanup_witness() {
     for (filename, source) in [
         (
             "normal_finally_nested_try_primitive_witness.py",
@@ -155,6 +155,74 @@ fn matches_cpython_marshal_for_original_jump_primitive_cleanup_witness() {
         raise
     finally:
         cleanup(source)
+        cleanup(root)
+"#,
+        ),
+        (
+            "normal_finally_global_attribute_store_witness.py",
+            r#"def f(flag, owned, source, root, work):
+    try:
+        if flag:
+            with work(source) as value:
+                root = work(value)
+        else:
+            try:
+                root = work(source)
+            except TypeError:
+                root = work()
+    except TypeError as error:
+        if owned is None:
+            raise RuntimeError("failed") from error
+        raise
+    finally:
+        namespace.value = source
+    return root.value
+"#,
+        ),
+        (
+            "normal_finally_nested_attribute_condition_witness.py",
+            r#"def f(flag, owned, source, root, work, cleanup, state):
+    try:
+        try:
+            if flag:
+                work(source, directory=root)
+            else:
+                work(root, directory=source)
+        except OSError as error:
+            raise RuntimeError("failed") from error
+    except (RuntimeError, OSError):
+        if owned:
+            try:
+                work(source)
+            except OSError:
+                pass
+        raise
+    finally:
+        if state.options.remove:
+            cleanup(source)
+        cleanup(root)
+"#,
+        ),
+        (
+            "normal_finally_inlined_comprehension_witness.py",
+            r#"def f(flag, owned, source, root, work, cleanup, values):
+    try:
+        try:
+            if flag:
+                work(source, directory=root)
+            else:
+                work(root, directory=source)
+        except OSError as error:
+            raise RuntimeError("failed") from error
+    except (RuntimeError, OSError):
+        if owned:
+            try:
+                work(source)
+            except OSError:
+                pass
+        raise
+    finally:
+        write_json(source, {"items": [item.value for item in values]})
         cleanup(root)
 "#,
         ),

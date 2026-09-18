@@ -1866,6 +1866,7 @@ impl OptimizationPipeline {
             return;
         }
         let order = self.graph.order().to_vec();
+        let mut shared_match_donors = Vec::new();
         let splits = self
             .conditional_threading_targets
             .iter()
@@ -1892,6 +1893,96 @@ impl OptimizationPipeline {
                     return None;
                 }
                 let last = self.graph[previous].last_instruction()?;
+                // A nonterminating case arm and its false edge share one original
+                // jump. Splitting it before small-exit copying duplicates the return.
+                // Keep that array only for an untouched authored match join whose
+                // final call falls through to an intact local or constant return.
+                if jump.opcode == JUMP_FORWARD
+                    && jump.location == SourceLocation::NONE
+                    && last.opcode == POP_TOP
+                    && last.location.line >= 0
+                    && self.graph[block]
+                        .items()
+                        .iter()
+                        .filter(|item| matches!(item, Item::Instruction(_)))
+                        .count()
+                        == 1
+                    && self.graph[target]
+                        .items()
+                        .iter()
+                        .filter(|item| matches!(item, Item::Instruction(_)))
+                        .count()
+                        == 1
+                    && first.opcode == JUMP_FORWARD
+                    && first.jump_policy.is_original_match_success()
+                    && first.location.line >= 0
+                    && [jump, first].iter().all(|instruction| {
+                        instruction.pre_fold_extra_instructions() == 0
+                            && instruction.local_policy.hidden_exception_owner_slots() == 0
+                            && !instruction.no_location_policy.preserves_location()
+                            && instruction.exception_policy()
+                                == super::super::ExceptionPolicy::default()
+                    })
+                    && let Operand::Forward(return_label) = first.operand()
+                    && let Some(return_block) = self.graph.label_block(return_label)
+                    && (is_original_constant_return(&self.graph, return_label)
+                        || super::normal_try_copies::original_local_return(
+                            self.graph[return_block].items(),
+                        ))
+                    && let Some(entry) = self.graph[target].items().iter().find_map(|item| {
+                        match item {
+                            Item::Label(entry)
+                                if self.exception_owner_provenance.original_match_join_boundaries.contains(entry)
+                                    && !self.borrow_block_aliases.contains(entry) => Some(*entry),
+                            _ => None,
+                        }
+                    })
+                    && let Some(target_position) = order.iter().position(|block| *block == target)
+                    && let Some(donor_block) = target_position.checked_sub(1).map(|index| order[index])
+                    && super::super::block_has_fallthrough(self.graph[donor_block].items())
+                    && let Some(donor) = self.graph[donor_block].last_instruction()
+                    && donor.opcode == POP_TOP
+                    && donor.location == first.location
+                    // An unrelated comprehension cleanup does not split this local
+                    // return. Keep every participating array outside protected ranges,
+                    // their boundary blocks, and handler entries. Shared constant-return
+                    // donation still requires the existing exception-free unit.
+                    && (self.exception_regions.is_empty()
+                        || (super::normal_try_copies::original_local_return(
+                            self.graph[return_block].items(),
+                        ) && self.exception_regions.iter().all(|region| {
+                            let Some(start) = self.graph.label_block(region.start)
+                                .and_then(|block| order.iter().position(|item| *item == block))
+                            else {
+                                return false;
+                            };
+                            let Some(end) = self.graph.label_block(region.end)
+                                .and_then(|block| order.iter().position(|item| *item == block))
+                            else {
+                                return false;
+                            };
+                            let Some(handler) = self.graph.label_block(region.target) else {
+                                return false;
+                            };
+                            start <= end
+                                && [block, previous, target, donor_block, return_block]
+                                    .iter()
+                                    .all(|candidate| {
+                                        *candidate != handler
+                                            && !order[start..=end].contains(candidate)
+                                    })
+                        })))
+                {
+                    // The existing early passes clear only these two jump tags on an
+                    // untouched forward head. Replay every other field literally.
+                    let mut expected = *first;
+                    expected.no_location_policy.clear_artificial_eval_break();
+                    if expected.jump_policy.defers_redundant_removal() {
+                        expected.jump_policy.resolve_deferred_removal();
+                    }
+                    shared_match_donors.push((entry, (expected, *donor)));
+                    return None;
+                }
                 Some((
                     *label,
                     block,
@@ -1903,6 +1994,9 @@ impl OptimizationPipeline {
                 ))
             })
             .collect::<Vec<_>>();
+        self.exception_owner_provenance
+            .shared_match_return_donors
+            .extend(shared_match_donors);
         for (label, block, previous, operand, condition_location, body_location, depth) in splits {
             self.graph.append_to_block(
                 previous,

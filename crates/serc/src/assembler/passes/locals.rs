@@ -27,8 +27,8 @@ use crate::assembler::ir::{ThreadedBorrowEntries, ThreadedBorrowSnapshot};
 use crate::target::{
     is_conditional_jump, is_unconditional_jump,
     opcodes::{
-        CALL, CALL_KW, END_FOR, GET_AWAITABLE, GET_ITER, POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE,
-        TO_BOOL,
+        CALL, CALL_KW, END_FOR, GET_AWAITABLE, GET_ITER, LOAD_GLOBAL, POP_JUMP_IF_FALSE,
+        POP_JUMP_IF_NONE, STORE_ATTR, TO_BOOL,
     },
 };
 
@@ -2803,20 +2803,23 @@ impl OptimizationPipeline {
                                 .filter(|pair| pair[0].opcode == CALL && pair[1].opcode == POP_TOP)
                                 .nth(1)
                                 .is_some();
-                        // A local condition ends this original cleanup array before any
-                        // call. Its first load cannot fold or fuse with the following
-                        // conversion/jump, so it can witness a surviving original jump entry.
+                        // A local or attribute condition ends this original cleanup array
+                        // before any call. Its first load cannot fold or fuse with the
+                        // attribute/conversion/jump, so it witnesses the original entry.
                         // Match the complete primitive head; interior NOPs and extra prefixes
                         // must not borrow a witness from a different original array.
                         let primitive_condition = match instructions.as_slice() {
-                            [_, load, to_bool, jump] => {
-                                load.opcode == LOAD_FAST
-                                    && matches!(load.operand(), Operand::Value(_))
-                                    && to_bool.opcode == TO_BOOL
-                                    && to_bool.operand() == Operand::Value(0)
-                                    && jump.opcode == POP_JUMP_IF_FALSE
-                                    && matches!(jump.operand(), Operand::Forward(_))
-                            }
+                            [_, load, attributes @ .., to_bool, jump] => load.opcode == LOAD_FAST
+                                && matches!(load.operand(), Operand::Value(_))
+                                && attributes.iter().all(|attribute| {
+                                    attribute.opcode == LOAD_ATTR
+                                        && matches!(attribute.operand(), Operand::Value(argument)
+                                                if argument & 1 == 0)
+                                })
+                                && to_bool.opcode == TO_BOOL
+                                && to_bool.operand() == Operand::Value(0)
+                                && jump.opcode == POP_JUMP_IF_FALSE
+                                && matches!(jump.operand(), Operand::Forward(_)),
                             [_, load, jump] => {
                                 load.opcode == LOAD_FAST
                                     && matches!(load.operand(), Operand::Value(_))
@@ -2853,6 +2856,49 @@ impl OptimizationPipeline {
                                     && instruction.no_location_policy.borrow_fallthrough()
                                         == BorrowFallthrough::Reachable
                             });
+                        // Restoring a global receiver's attribute has no CALL. The
+                        // store survives folding and local fusion, even when its trailing
+                        // ordinary jump is removed. Match the complete original array.
+                        let attribute_assignment = match instructions.as_slice() {
+                            [_, value, receiver, store, jump] => {
+                                value.opcode == LOAD_FAST
+                                    && matches!(value.operand(), Operand::Value(_))
+                                    && receiver.opcode == LOAD_GLOBAL
+                                    && matches!(receiver.operand(), Operand::Value(argument)
+                                    if argument & 1 == 0)
+                                    && store.opcode == STORE_ATTR
+                                    && matches!(store.operand(), Operand::Value(_))
+                                    && is_unconditional_jump(jump.opcode)
+                                    && matches!(jump.operand(), Operand::Forward(_))
+                            }
+                            _ => false,
+                        };
+                        // An inlined comprehension splits the call-argument array after
+                        // saving its local. GET_ITER consumes the original local before
+                        // that boundary and survives both folding and local fusion.
+                        let comprehension_iteration = match instructions.as_slice() {
+                            [_, prefix @ .., load, get_iter, clear, swap] => {
+                                !prefix.is_empty()
+                                    && load.opcode == LOAD_FAST
+                                    && matches!(load.operand(), Operand::Value(_))
+                                    && get_iter.opcode == GET_ITER
+                                    && get_iter.operand() == Operand::Value(0)
+                                    && clear.opcode == LOAD_FAST_AND_CLEAR
+                                    && matches!(clear.operand(), Operand::Value(_))
+                                    && swap.opcode == SWAP
+                                    && swap.operand() == Operand::Value(2)
+                            }
+                            _ => false,
+                        };
+                        let unsplit_reachable_array = items[range.clone()]
+                            .iter()
+                            .skip_while(|item| matches!(item, Item::Label(_)))
+                            .all(|item| matches!(item, Item::Instruction(_)))
+                            && instructions.iter().all(|instruction| {
+                                !instruction.jump_policy.borrow_empty_block()
+                                    && instruction.no_location_policy.borrow_fallthrough()
+                                        == BorrowFallthrough::Reachable
+                            });
                         // Preserve any existing CALL witness before considering the
                         // other entry witnesses in the same original block.
                         let candidates = instructions
@@ -2876,7 +2922,12 @@ impl OptimizationPipeline {
                                         || (instruction.opcode == GET_AWAITABLE
                                             && instruction.operand() == Operand::Value(0))
                                         || (primitive_iteration && instruction.opcode == GET_ITER)
-                                        || (primitive_condition && index == 1));
+                                        || (primitive_condition && index == 1)
+                                        || (unsplit_reachable_array
+                                            && ((attribute_assignment
+                                                && instruction.opcode == STORE_ATTR)
+                                                || (comprehension_iteration
+                                                    && instruction.opcode == GET_ITER))));
                             if (instruction.opcode != CALL && !alternate_finally_witness)
                                 || instruction.location.line < 0
                             {
@@ -3655,8 +3706,8 @@ impl OptimizationPipeline {
                     // Unlike the fallthrough and conditional paths, a surviving ordinary
                     // jump can enter the original nonempty normal-finally block directly.
                     // Only aliases captured before label merging identify that entry.
-                    // Keyword calls and primitive conditions are already captured from
-                    // the same original array; require their exact surviving witness too.
+                    // Calls, conditions, attribute stores and iterator setup are captured
+                    // from the same original array; require their exact surviving witness.
                     let finally_entry = is_unconditional_jump(last.opcode)
                         // A zero-distance surrogate can represent an empty native
                         // block, so it cannot certify an independent entry.
@@ -3706,7 +3757,7 @@ impl OptimizationPipeline {
                                                     }
                                                     matches!(
                                                         call.opcode,
-                                                        CALL | CALL_KW | GET_ITER | LOAD_FAST
+                                                        CALL | CALL_KW | GET_ITER | LOAD_FAST | STORE_ATTR
                                                     ) && instruction.opcode == call.opcode
                                                         && instruction.operand()
                                                             == Operand::Value(call.argument)

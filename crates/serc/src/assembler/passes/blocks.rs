@@ -3321,7 +3321,8 @@ impl OptimizationPipeline {
             let preserve_single_fallthrough_match_nop = !planned_copy
                 && inline_unprotected_return
                 && target_chain_end == target_position
-                && super::control_flow::is_original_constant_return(graph, target_label)
+                && (super::control_flow::is_original_constant_return(graph, target_label)
+                    || super::normal_try_copies::original_local_return(graph[target].items()))
                 && source_location.line >= 0
                 && remaining_predecessors[source.index()] == 1
                 && graph[source].items().iter().any(|item| {
@@ -3359,7 +3360,44 @@ impl OptimizationPipeline {
                             .last_instruction()
                             .is_some_and(|instruction| instruction.location == source_location)
                 });
+            // A shared match end can still be copied into an earlier pass arm.
+            // Keep its original jump slot unlocated through every copy round; only
+            // its exact original successor seam receives the final call's location.
+            let deferred_match_donor = (!planned_copy
+                && inline_unprotected_return
+                && target_chain_end == target_position
+                && super::control_flow::is_original_constant_return(graph, target_label)
+                && self.exception_regions.is_empty()
+                && graph[source]
+                    .items()
+                    .iter()
+                    .filter(|item| matches!(item, Item::Instruction(_)))
+                    .count()
+                    == 1)
+                .then(|| {
+                    graph[source].items().iter().find_map(|item| {
+                        let Item::Label(entry) = item else {
+                            return None;
+                        };
+                        let (expected, donor) = self
+                            .exception_owner_provenance
+                            .shared_match_return_donors
+                            .get(entry)?;
+                        let previous = *order.get(source_position.checked_sub(1)?)?;
+                        (graph.label_block(*entry) == Some(source)
+                            && !self.borrow_block_aliases.contains(entry)
+                            && !drop_blocks[previous.index()]
+                            && !inline_copies.contains_key(&previous)
+                            && !target_copies.contains_key(&previous)
+                            && block_has_fallthrough(graph[previous].items())
+                            && graph[previous].last_instruction() == Some(donor)
+                            && graph[source].last_instruction() == Some(expected))
+                        .then_some(donor.location)
+                    })
+                })
+                .flatten();
             let preserve_inlined_jump_nop = planned_copy
+                || deferred_match_donor.is_some()
                 || (inline_small_exit
                     && (preserve_unlocated_join_nop
                         || preserve_threaded_join_nop
@@ -3663,6 +3701,27 @@ impl OptimizationPipeline {
                     // identifies this original marker after the schedule finishes.
                     original_join_marker_donors.push((source, copied_label, marker, location));
                 }
+                graph.insert_item(
+                    ItemPosition::new(source, position),
+                    Item::Instruction(marker),
+                );
+            } else if let Some(location) = deferred_match_donor {
+                let position = graph[source]
+                    .items()
+                    .iter()
+                    .rposition(|item| matches!(item, Item::Instruction(_)))
+                    .expect("original match jump");
+                let original = *graph[source]
+                    .last_instruction()
+                    .expect("original match jump");
+                let mut marker = Instruction::synthetic(
+                    NOP,
+                    Operand::Value(0),
+                    SourceLocation::NONE,
+                    original.depth_after(),
+                );
+                marker.set_exception_policy(original.exception_policy());
+                original_join_marker_donors.push((source, copied_label, marker, location));
                 graph.insert_item(
                     ItemPosition::new(source, position),
                     Item::Instruction(marker),

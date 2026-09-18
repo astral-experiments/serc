@@ -62,6 +62,8 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) original_primitive_condition_boundaries: Vec<Instruction>,
     // Source-authored match ends establish original arrays independently of case exits.
     pub(super) original_match_join_boundaries: FxHashSet<Label>,
+    // Exact post-threading head and original fallthrough donor of a shared case return.
+    pub(super) shared_match_return_donors: FxHashMap<Label, (Instruction, Instruction)>,
     // Authored normal exits and their immediate, fully emitted restore records.
     pub(super) original_comprehension_normal_exits: Vec<(Label, Instruction)>,
     pub(super) original_comprehension_normal_restores: FxHashMap<Label, Vec<Instruction>>,
@@ -1926,27 +1928,17 @@ impl LayoutAssembler {
                 {
                     continue;
                 }
-                for (expected, current) in expected.iter_mut().zip(&current) {
-                    if let (Item::Instruction(expected), Item::Instruction(current)) =
-                        (expected, current)
-                        && expected.opcode == LOAD_FAST
-                        && current.opcode == LOAD_FAST_BORROW
-                    {
-                        // Borrowing follows marker normalization and changes
-                        // only this opcode, not the original instruction cell.
-                        expected.opcode = LOAD_FAST_BORROW;
-                    }
-                }
             }
-            if retained_setup_nop.is_some() {
-                for (expected, current) in expected.iter_mut().zip(&current) {
-                    if let (Item::Instruction(expected), Item::Instruction(current)) =
-                        (expected, current)
-                        && expected.opcode == LOAD_FAST
-                        && current.opcode == LOAD_FAST_BORROW
-                    {
-                        expected.opcode = LOAD_FAST_BORROW;
-                    }
+            // Borrowing follows marker normalization and changes only the opcode,
+            // including in an ordinary finalizer array. Keep the operand, location,
+            // policies, depth, labels, and every other original record exact.
+            for (expected, current) in expected.iter_mut().zip(&current) {
+                if let (Item::Instruction(expected), Item::Instruction(current)) =
+                    (expected, current)
+                    && expected.opcode == LOAD_FAST
+                    && current.opcode == LOAD_FAST_BORROW
+                {
+                    expected.opcode = LOAD_FAST_BORROW;
                 }
             }
             if current != expected

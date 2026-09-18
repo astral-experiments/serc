@@ -44,3 +44,45 @@ async def stream(source, should_stop):
 "#;
     common::assert_matches_cpython_marshal(source, "async_generator_finally_owner.py");
 }
+
+#[test]
+fn async_generator_finally_borrowing_preserves_original_null_owner() {
+    for (filename, source) in [
+        (
+            "async_generator_nested_manager_finally_borrowed_local_owner.py",
+            r"async def f(manager, permit, state):
+    with manager:
+        completed = False
+        try:
+            try:
+                async with permit:
+                    if not completed:
+                        state.pending -= 1
+                        completed = True
+                    yield state
+            finally:
+                state.complete()
+                record(state)
+        finally:
+            if not completed:
+                state.pending -= 1
+                completed = True
+",
+        ),
+        (
+            "async_generator_manager_finally_borrowed_local_owner.py",
+            r"async def f(manager, state):
+    with manager:
+        completed = False
+        try:
+            yield state
+        finally:
+            if not completed:
+                state.pending -= 1
+                completed = True
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
