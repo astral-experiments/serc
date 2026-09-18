@@ -23,6 +23,8 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) ordinary_await_cleanups: Vec<super::ExceptionRegion>,
     // Authored SEND, completion entry, and END_SEND before any cleanup or copying.
     pub(super) ordinary_await_ends: Vec<OrdinaryAwaitEnd>,
+    // Empty runtime-while anchor, shared exit, and exact terminal authored break.
+    pub(super) empty_while_break_anchors: Vec<(Label, Label, Instruction)>,
     // Authored return NOP, immediately following finally POP, and original try target.
     pub(super) early_return_nop_pairs: Vec<(Instruction, Instruction, Label)>,
     // Authored return NOP, iterator disposal, finally POP, and original try target.

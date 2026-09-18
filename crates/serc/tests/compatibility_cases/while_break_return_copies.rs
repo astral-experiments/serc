@@ -156,3 +156,76 @@ fn matches_cpython_terminal_while_chained_breaks_after_work() {
         }
     }
 }
+
+#[test]
+fn original_loop_exit_bridges_preserve_local_and_cell_return_copies() {
+    for (filename, source) in [
+        (
+            "original_loop_bridge_coroutine_local_return_target.py",
+            r"async def collect(mode, pending, fetch, stop):
+    result = []
+    if mode:
+        while pending():
+            value = await fetch()
+            result.append(value)
+            if stop(value):
+                break
+    else:
+        result.append(await fetch())
+    return result
+",
+        ),
+        (
+            "original_loop_bridge_cell_return_target.py",
+            r"def collect(mode, take):
+    count = 0
+    def below_limit():
+        return count < 4
+    if mode:
+        while below_limit():
+            value = take()
+            count += 1
+            if value is None:
+                break
+    else:
+        count = 1
+    return count
+",
+        ),
+        (
+            "original_loop_bridge_local_return_target.py",
+            r"def collect(mode, pending, take, stop):
+    result = []
+    if mode:
+        while pending():
+            value = take()
+            result.append(value)
+            if stop(value):
+                break
+    else:
+        result.append(None)
+    return result
+",
+        ),
+        (
+            "original_loop_bridge_cleanup_region_control.py",
+            r"def collect(mode, pending, take, stop, release):
+    result = []
+    if mode:
+        try:
+            while pending():
+                value = take()
+                result.append(value)
+                if stop(value):
+                    break
+        finally:
+            release()
+    else:
+        result.append(None)
+    return result
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

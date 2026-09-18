@@ -2094,6 +2094,22 @@ impl OptimizationPipeline {
                 label
             };
             let current = graph.block_at(position);
+            let empty_while_anchor = self
+                .exception_owner_provenance
+                .empty_while_break_anchors
+                .iter()
+                .any(|&(anchor, end, original)| {
+                    if !graph[next]
+                        .items()
+                        .starts_with(&[Item::Label(anchor), Item::Label(end)])
+                    {
+                        return false;
+                    }
+                    let mut marker = original;
+                    marker.opcode = NOP;
+                    marker.set_operand(Operand::Value(0));
+                    graph[current].last_instruction() == Some(&marker)
+                });
             let (location, exception_exclusion) = graph[current].last_instruction().map_or(
                 (SourceLocation::NONE, ExceptionExclusion::None),
                 |instruction| {
@@ -2116,6 +2132,13 @@ impl OptimizationPipeline {
                 None,
             );
             bridge.exclude_from_exception_table(exception_exclusion);
+            if empty_while_anchor {
+                // CPython's empty original anchor separates the authored break NOP
+                // from this new cold bridge. It cannot donate its line across that
+                // array, and must survive the later equal-next-line NOP removal.
+                bridge.location = SourceLocation::NONE;
+                bridge.no_location_policy.preserve_location();
+            }
             for origin in &mut self.exception_owner_provenance.async_with_setups {
                 if origin.bridge.is_some()
                     || graph[current].items() != origin.cleanup.as_slice()

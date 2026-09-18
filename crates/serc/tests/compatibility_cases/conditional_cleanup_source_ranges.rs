@@ -153,3 +153,83 @@ fn preserves_recursive_while_exit_locations() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn guarded_nested_cleanup_retains_false_exit_line_events() {
+    for (filename, source) in [
+        (
+            "guarded_nested_finally_false_exit_nop_target.py",
+            r"def run(resource, ready, work, emit):
+    try:
+        work()
+    finally:
+        if resource is not None:
+            try:
+                if ready:
+                    work()
+            finally:
+                resource.cleanup()
+    emit(resource)
+",
+        ),
+        (
+            "unguarded_nested_finally_false_exit_nop_control.py",
+            r"def run(resource, ready, work, emit):
+    try:
+        work()
+    finally:
+        try:
+            if ready:
+                work()
+        finally:
+            resource.cleanup()
+    emit(resource)
+",
+        ),
+        (
+            "guarded_recovery_cell_return_false_exit_nop_target.py",
+            r#"def run(resource, mode, emit, value):
+    def capture():
+        return value
+    try:
+        if mode:
+            emit(mode)
+        elif mode is None:
+            emit(None)
+        else:
+            emit(resource)
+            if resource is not None:
+                try:
+                    resource.unlink()
+                except FileNotFoundError:
+                    pass
+    except Exception:
+        emit("error")
+        raise
+    return value
+"#,
+        ),
+        (
+            "guarded_linear_cell_return_false_exit_nop_control.py",
+            r#"def run(resource, mode, emit, value):
+    def capture():
+        return value
+    try:
+        if mode:
+            emit(mode)
+        elif mode is None:
+            emit(None)
+        else:
+            emit(resource)
+            if resource is not None:
+                resource.unlink()
+    except Exception:
+        emit("error")
+        raise
+    return value
+"#,
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

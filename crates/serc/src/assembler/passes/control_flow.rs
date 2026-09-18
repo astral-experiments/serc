@@ -1288,6 +1288,116 @@ impl OptimizationPipeline {
                 Item::Instruction(_) => None,
             }));
         }
+        // A cleanup-free break first copies its original loop-exit bridge, then
+        // the local return. Keep that break's requested NOP through our earlier
+        // threading only when all three original arrays still match this path.
+        let original_break_return_bridges = instruction_positions
+            .iter()
+            .enumerate()
+            .filter_map(|(source_index, &(block, offset))| {
+                let source_items = graph[block].items();
+                let Item::Instruction(source) = source_items[offset] else {
+                    return None;
+                };
+                let Operand::Forward(entry) = source.operand() else {
+                    return None;
+                };
+                if source.opcode != JUMP_FORWARD
+                    || !source.fusion_policy.is_authored_break()
+                    || source.location.line < 0
+                    || source.jump_policy.retained_nop()
+                        != super::super::ir::RetainedJumpNop::DirectTarget
+                    || !source.jump_policy.inline_small_exit()
+                    || source.jump_policy.allows_threading_target()
+                    || source.depth_after() != Some(0)
+                    // The producer's authored break NOP is the sole omitted slot.
+                    || source.pre_fold_extra_instructions() != 1
+                    || offset + 1 != source_items.len()
+                    || !source_items[..offset].iter().all(|item| matches!(item, Item::Label(_)))
+                {
+                    return None;
+                }
+                let (Item::Instruction(bridge), labels) =
+                    graph[graph.label_block(entry)?].items().split_last()?
+                else {
+                    return None;
+                };
+                let Operand::Forward(target) = bridge.operand() else {
+                    return None;
+                };
+                let clean_label = |item: &Item| matches!(item, Item::Label(label)
+                    if self.exception_owner_provenance.block_boundaries.contains(label)
+                        && !self.original_nop_targets.contains(label)
+                        && !self.borrow_block_aliases.contains(label)
+                        && !self.exception_owner_provenance.omitted_nop_counts.contains_key(label)
+                        && !self.exception_owner_provenance.omitted_nop_locations.contains_key(label));
+                if bridge.opcode != JUMP_FORWARD
+                    || bridge.fusion_policy.is_authored_break()
+                    || bridge.fusion_policy.is_converted_pop_block()
+                    || !bridge.jump_policy.allows_threading_target()
+                    || bridge.jump_policy.is_interruptible()
+                    || bridge.depth_after() != Some(0)
+                    || labels.len() < 2
+                    || !labels.iter().all(clean_label)
+                    || !labels.iter().any(|item| matches!(item, Item::Label(label)
+                        if self.exception_owner_provenance.source_boundaries.contains(label)))
+                    || !((bridge.location == SourceLocation::NONE
+                        && bridge.no_location_policy.preserves_location())
+                        || (bridge.location.line >= 0
+                            && !bridge.no_location_policy.preserves_location()
+                            && bridge.jump_policy.retained_nop()
+                                == super::super::ir::RetainedJumpNop::DirectTarget))
+                {
+                    return None;
+                }
+                let target_items = graph[graph.label_block(target)?].items();
+                let first = target_items
+                    .iter()
+                    .position(|item| matches!(item, Item::Instruction(_)))?;
+                let [Item::Instruction(load), Item::Instruction(return_)] = &target_items[first..]
+                else {
+                    return None;
+                };
+                // Only the immediate original return entry is certified. A later
+                // outer-conditional join in this label run is a separate boundary.
+                if !matches!(target_items[..first].last(), Some(Item::Label(label)) if *label == target)
+                    || !self.exception_owner_provenance.source_boundaries.contains(&target)
+                    || !target_items[..first].iter().all(clean_label)
+                    || !matches!(load.opcode, crate::target::opcodes::LOAD_FAST | crate::target::opcodes::LOAD_DEREF)
+                    || load.depth_after() != Some(1)
+                    || return_.opcode != RETURN_VALUE
+                    || return_.depth_after() != Some(0)
+                    || return_.location.line < 0
+                    || load.location.line != return_.location.line
+                    || source.location.line == return_.location.line
+                    || !matches!(load.operand(), Operand::Value(_))
+                    || return_.operand() != Operand::Value(0)
+                    || [bridge, load, return_]
+                        .iter()
+                        .any(|instruction| instruction.pre_fold_extra_instructions() != 0)
+                    || [&source, bridge, load, return_].iter().any(|instruction| {
+                        instruction.local_policy.hidden_exception_owner_slots() != 0
+                            || instruction.exception_policy()
+                                != super::super::ExceptionPolicy::default()
+                    })
+                {
+                    return None;
+                }
+                let join_index = label_offsets[&entry];
+                let return_index = label_offsets[&target];
+                if !(source_index < join_index && join_index < return_index)
+                    || self.exception_regions.iter().zip(&region_ranges).any(|(region, range)| {
+                        let covered = [source_index, join_index, return_index, return_index + 1]
+                            .map(|index| range.contains(&index));
+                        covered.iter().any(|covered| *covered)
+                            && (!region.is_scope_fallback || !covered.iter().all(|covered| *covered))
+                    })
+                {
+                    return None;
+                }
+                Some((source_index, (source, target)))
+            })
+            .collect::<FxHashMap<_, _>>();
         let authored_finally_break_targets = Self::take_authored_finally_break_threading_targets(
             &self.graph,
             &mut self.borrow_authored_finally_break_origins,
@@ -1451,7 +1561,12 @@ impl OptimizationPipeline {
                     || (unlocated_return_join_heads.contains(&original_target)
                         && region_ranges
                             .iter()
-                            .all(|range| !range.contains(&source_index))))
+                            .all(|range| !range.contains(&source_index)))
+                    || original_break_return_bridges
+                        .get(&source_index)
+                        .is_some_and(|(original, end)| {
+                            *original == original_jump && *end == target
+                        }))
                 && matches!(operand, Operand::Forward(_))
                 && !instruction.jump_policy.is_interruptible()
             {

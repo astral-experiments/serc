@@ -169,3 +169,71 @@ fn async_generator_folded_following_empty_finally_control() {
         "async_generator_folded_following_empty_finally_control.py",
     );
 }
+
+#[test]
+fn protected_iterator_breaks_keep_cleanup_in_try_region() {
+    for (filename, source) in [
+        (
+            "async_iterator_break_try_else_target.py",
+            r"async def run(items, ready, recover):
+    try:
+        async for item in items:
+            if ready(item):
+                break
+            yield item
+    except ValueError as error:
+        await recover(error)
+    else:
+        await recover(None)
+    yield None
+",
+        ),
+        (
+            "iterator_break_following_work_control.py",
+            r"async def run(items, ready, action, recover):
+    try:
+        await action()
+        for item in items:
+            if ready(item):
+                break
+        return action()
+    except ValueError:
+        return recover()
+",
+        ),
+        (
+            "match_iterator_break_following_work_target.py",
+            r"async def run(mode, items, ready, action, recover):
+    try:
+        match mode:
+            case 0:
+                await action()
+                for item in items:
+                    if ready(item):
+                        break
+            case _:
+                await action()
+        return action()
+    except ValueError:
+        return recover()
+",
+        ),
+        (
+            "sync_iterator_break_try_else_control.py",
+            r"async def run(items, ready, recover):
+    try:
+        for item in items:
+            if ready(item):
+                break
+            yield item
+    except ValueError as error:
+        await recover(error)
+    else:
+        await recover(None)
+    yield None
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

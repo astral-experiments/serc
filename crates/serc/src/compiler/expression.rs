@@ -437,12 +437,37 @@ impl Compiler<'_> {
         self.compile_match_inner(statement, false)
     }
 
+    /// Carries a match successor only to its direct case-tail iterator break.
+    fn compile_match_case_suite(
+        &mut self,
+        body: &[Stmt],
+        match_has_following: bool,
+    ) -> Result<(), CompileError> {
+        let iterator_continuation = if self.context.target_specific_rules_enabled()
+            && match_has_following
+            && let Some(Stmt::For(iterator)) = body.last()
+            && !iterator.is_async
+            && iterator.orelse.is_empty()
+        {
+            Some(iterator.range)
+        } else {
+            None
+        };
+        self.with_control_override(
+            |control| &mut control.loops.match_case_iterator_continuation,
+            iterator_continuation,
+            |compiler| compiler.compile_suite(body),
+        )
+    }
+
     pub(super) fn compile_match_inner(
         &mut self,
         statement: &ruff_python_ast::StmtMatch,
         terminal: bool,
     ) -> Result<(), CompileError> {
         let base_depth = self.control.stack.depth;
+        let match_has_following =
+            !terminal && self.control.statements.current_statement_has_following;
         if matches!(statement.subject.as_ref(), Expr::Tuple(_))
             && let Some(constant) = fold_constant(&statement.subject)
         {
@@ -655,7 +680,9 @@ impl Compiler<'_> {
                     self.with_control_override(
                         |control| &mut control.loops.non_final_match_tail,
                         non_final_match_tail,
-                        |compiler| compiler.compile_suite(&case.body),
+                        |compiler| {
+                            compiler.compile_match_case_suite(&case.body, match_has_following)
+                        },
                     )?;
                     false
                 };
@@ -945,7 +972,7 @@ impl Compiler<'_> {
                     })?;
                     emitted_fallthrough
                 } else {
-                    self.compile_suite(&case.body)?;
+                    self.compile_match_case_suite(&case.body, match_has_following)?;
                     false
                 };
             if let Some(success_offset) = or_default_success_exit

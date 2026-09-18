@@ -556,6 +556,8 @@ pub(super) struct LoopState {
     synthesized_loop_tail_predecessor: Option<TextRange>,
     // This statement is followed by a loop tail compiled separately from its prefix.
     split_loop_tail_prefix_end: Option<TextRange>,
+    // This exact case-tail iterator reaches a sibling after the enclosing match.
+    pub(super) match_case_iterator_continuation: Option<TextRange>,
     exclude_loop_tail_not_taken_from_control_flow_regions: bool,
     // The first non-terminal assertion in the innermost iterator-loop body.
     first_iterator_loop_assertion: Option<TextRange>,
@@ -4339,9 +4341,9 @@ impl Compiler<'_> {
                         && context.exception_region_depth > 0
                         && context.finally_end_depth == 0
                         && !context.break_target_keeps_exception_owner
-                        // A direct synchronous iterator break enters this try's else
-                        // suite. Its authored jump retains the still-active try owner.
-                        && !(context.iterator_cleanup == IteratorCleanup::Sync
+                        // A direct iterator break enters this try's else suite. Its
+                        // authored jump retains the still-active try owner.
+                        && !(context.iterator_cleanup != IteratorCleanup::None
                             && self.control.exceptions.direct_try_body_has_else
                             && self.control.withs.active_with_exits.is_empty()
                             && self.control.finally.active_loop_finally_contexts.is_empty()
@@ -5178,25 +5180,30 @@ impl Compiler<'_> {
                 // A result returned from a loop that was already protected by this try keeps the
                 // iterator cleanup protected. For a literal, start the exclusion before
                 // loading the returned constant; other returned values are already on the stack.
-                let delay_literal_iterator_exception_unwind_start = !preserve_tos
-                    && (self.control.in_exception_protected_iterator_loop()
-                        || (self.context.target_specific_rules_enabled()
-                            && self
-                                .control
-                                .loops
-                                .contexts
-                                .iter()
-                                .rfind(|context| context.iterator_cleanup != IteratorCleanup::None)
-                                .is_some_and(|context| {
-                                    // A while contributes no stack cleanup. Keep the nearest
-                                    // enclosing iterator protected until it is discarded.
-                                    context.exception_region_depth
-                                        == self
-                                            .control
-                                            .exceptions
-                                            .active_exception_region_exclusions
-                                            .len()
-                                })));
+                let protected_return_iterator = self.control.in_exception_protected_iterator_loop()
+                    || (self.context.target_specific_rules_enabled()
+                        && (!preserve_tos
+                            || self.unit.flags
+                                & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                                == CO_COROUTINE)
+                        && self
+                            .control
+                            .loops
+                            .contexts
+                            .iter()
+                            .rfind(|context| context.iterator_cleanup != IteratorCleanup::None)
+                            .is_some_and(|context| {
+                                // A while contributes no stack cleanup. Keep the nearest
+                                // enclosing iterator protected until it is discarded.
+                                context.exception_region_depth
+                                    == self
+                                        .control
+                                        .exceptions
+                                        .active_exception_region_exclusions
+                                        .len()
+                            }));
+                let delay_literal_iterator_exception_unwind_start =
+                    !preserve_tos && protected_return_iterator;
                 let delay_iterator_exception_unwind_start = overriding_unwind_start.is_none()
                     && !self
                         .control
@@ -5213,7 +5220,7 @@ impl Compiler<'_> {
                     && (delay_literal_iterator_exception_unwind_start
                         || ((matches!(statement.value.as_deref(), Some(Expr::Call(_)))
                             || (self.context.target_specific_rules_enabled() && preserve_tos))
-                            && self.control.in_exception_protected_iterator_loop()));
+                            && protected_return_iterator));
                 let delay_exception_unwind_start = delay_iterator_exception_unwind_start
                     || (overriding_unwind_start.is_none()
                         && !self
@@ -10210,6 +10217,12 @@ impl Compiler<'_> {
                             .preserve_redundant_jump_nop_after_threading(branch_exit);
                     } else if pass_only_body {
                         self.assembler.preserve_authored_pass_jump_nop(branch_exit);
+                        if final_chained_comparison_jump(test).is_some() {
+                            // CPython still sees the authored Pass NOP when it visits the
+                            // comparison's earlier success jump. Its later NOP compaction
+                            // must not expose this branch exit to early jump threading.
+                            self.assembler.prevent_jump_threading_target(branch_exit);
+                        }
                     } else if retain_assertion_exit {
                         // The assertion-success label starts an original empty array.
                         // Keep that identity when its branch jump threads through another
@@ -10772,6 +10785,27 @@ impl Compiler<'_> {
         for exclusions in &mut self.control.exceptions.active_exception_region_exclusions {
             exclusions.push((start, end));
         }
+    }
+
+    /// Limits cleanup-guard donation to an empty original exit outside outer cleanup.
+    fn can_locate_guarded_cleanup_exit(&self) -> bool {
+        self.context.target_specific_rules_enabled()
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && self.control.loops.contexts.is_empty()
+            && self.control.withs.active_with_exits.is_empty()
+            && self.control.exceptions.active_exception_handlers.is_empty()
+            && self.control.exceptions.active_exception_group_handlers == 0
+            && !self.has_active_control_flow_region()
+            && self.control.finally.active_finally_try_bodies == 0
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
+            && self.assembler.current_original_block_location().is_none()
+            && self
+                .assembler
+                .current_original_block_pre_fusion_instruction_count()
+                == 0
     }
 
     fn has_active_control_flow_region(&self) -> bool {
@@ -14005,6 +14039,10 @@ impl Compiler<'_> {
             }
         }
         self.compile_suite(&statement.orelse)?;
+        if statement.orelse.is_empty() && self.context.target_specific_rules_enabled() {
+            self.assembler
+                .record_empty_while_break_anchor(else_label, end);
+        }
         self.assembler.mark(end);
         self.set_depth(base_depth);
         if statement.orelse.is_empty() {
@@ -14049,9 +14087,10 @@ impl Compiler<'_> {
             IteratorCleanup::Sync,
             self.loop_break_policy(statement.range),
         );
-        // Splitting an enclosing loop's terminal condition must not make this
-        // iterator's break appear to leave the enclosing ordinary try body.
-        if self.control.loops.split_loop_tail_prefix_end == Some(statement.range)
+        // A split loop-tail condition or a following match sibling keeps this
+        // exact iterator's break inside the enclosing ordinary try body.
+        if (self.control.loops.split_loop_tail_prefix_end == Some(statement.range)
+            || self.control.loops.match_case_iterator_continuation == Some(statement.range))
             && context.exception_region_depth > 0
             && context.finally_end_depth == 0
             && self.control.exceptions.active_exception_handlers.is_empty()
@@ -16401,7 +16440,27 @@ impl Compiler<'_> {
                     && direct_try_body_exit_location(&statement.body).is_none();
             let direct_exit_location = (!unlocated_conditional_exit)
                 .then(|| direct_try_body_exit_location(normal_exit_suite))
-                .flatten();
+                .flatten()
+                .or_else(|| {
+                    // Earlier arms copy the following name return before line resolution.
+                    // The final cleanup guard alone supplies this original empty exit.
+                    (!unlocated_conditional_exit
+                        && !statement.is_star
+                        && statement.orelse.is_empty()
+                        && statement.finalbody.is_empty()
+                        && self
+                            .control
+                            .statements
+                            .current_statement_followed_by_name_return
+                        && handlers_terminate
+                        && self.can_locate_guarded_cleanup_exit())
+                    .then(|| guarded_cleanup_false_exit_test(normal_exit_suite))
+                    .flatten()
+                    .map(|test| DirectTryBodyExitLocation {
+                        test,
+                        chained_comparison_cleanup: false,
+                    })
+                });
             let chained_assertion_exit_location = (!statement.orelse.is_empty())
                 .then(|| match normal_exit_suite.last()? {
                     Stmt::Assert(assertion)
@@ -22407,6 +22466,17 @@ impl Compiler<'_> {
                         Stmt::If(statement) => nested_if_exit_location(statement, true),
                         _ => None,
                     });
+            if !statement.is_star
+                && statement.handlers.is_empty()
+                && statement.orelse.is_empty()
+                && matches!(conditional_exit, Some(NestedIfExitLocation::Unlocated))
+                && self.can_locate_guarded_cleanup_exit()
+                && let Some(test) = guarded_cleanup_false_exit_test(&statement.finalbody)
+            {
+                // Nested cleanup jumps past the original normal-finally exit. Its
+                // guard's sole false predecessor retains this jump's line event.
+                conditional_exit = Some(NestedIfExitLocation::Located(test));
+            }
             // A nested finally jumps past this guard's empty normal continuation.
             // Its sole false edge supplies the NOP's line, while the surrounding
             // manager still owns that original jump before its own POP_BLOCK.
@@ -25990,6 +26060,49 @@ fn direct_try_body_exit_location(body: &[Stmt]) -> Option<DirectTryBodyExitLocat
             })
         })
         .flatten()
+}
+
+/// Finds a sole guard-false donor after an ordinary cleanup's unconditional exits.
+fn guarded_cleanup_false_exit_test(body: &[Stmt]) -> Option<&Expr> {
+    let Stmt::If(branch) = body.last()? else {
+        return None;
+    };
+    if !condition_has_only_runtime_tests(&branch.test) {
+        return None;
+    }
+    if let Some((last, earlier)) = branch.elif_else_clauses.split_last() {
+        if last.test.is_some()
+            || !earlier.iter().all(|clause| {
+                clause
+                    .test
+                    .as_ref()
+                    .is_some_and(condition_has_only_runtime_tests)
+            })
+        {
+            return None;
+        }
+        // Complete earlier arms have separate unconditional exits; only the
+        // final else can supply the original join's physical fallthrough.
+        return guarded_cleanup_false_exit_test(&last.body);
+    }
+    if !matches!(branch.test.as_ref(), Expr::Compare(comparison)
+        if matches!(comparison.left.as_ref(), Expr::Name(_))
+            && comparison.ops.as_ref() == [CmpOp::IsNot]
+            && matches!(comparison.comparators.as_ref(), [Expr::NoneLiteral(_)]))
+    {
+        return None;
+    }
+    let [Stmt::Try(cleanup)] = branch.body.as_slice() else {
+        return None;
+    };
+    if cleanup.is_star || !cleanup.orelse.is_empty() {
+        return None;
+    }
+    let unconditional_cleanup_exit = try_has_linear_shared_handler_cleanup(cleanup)
+        || (cleanup.handlers.is_empty()
+            && suite_has_linear_borrow_fallthrough(&cleanup.finalbody)
+            && !suite_terminates(&cleanup.body));
+    unconditional_cleanup_exit.then_some(branch.test.as_ref())
 }
 
 /// Finds a normal try-exit donor behind terminating earlier conditional arms.

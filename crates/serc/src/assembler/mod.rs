@@ -1128,6 +1128,40 @@ impl Assembler {
         self.folded_loop_exit_anchors.insert(target);
     }
 
+    /// Captures an empty while anchor after its terminal cleanup-free break.
+    pub(crate) fn record_empty_while_break_anchor(&mut self, anchor: Label, end: Label) {
+        let mut has_anchor = false;
+        let original = self
+            .linear_items()
+            .iter()
+            .rev()
+            .find_map(|item| match item {
+                Item::Label(label) => {
+                    has_anchor |= *label == anchor;
+                    None
+                }
+                Item::Instruction(instruction) => Some(*instruction),
+            });
+        let Some(original) = original else {
+            return;
+        };
+        if !has_anchor
+            || original.opcode != JUMP_FORWARD
+            || original.operand() != Operand::Forward(end)
+            || original.location.line < 0
+            || !original.fusion_policy.is_authored_break()
+            || original.jump_policy.retained_nop() != ir::RetainedJumpNop::DirectTarget
+            // Jump emission compacts the authored break NOP into this one slot.
+            || original.pre_fold_extra_instructions() != 1
+            || original.local_policy.hidden_exception_owner_slots() != 0
+        {
+            return;
+        }
+        self.exception_owner_provenance
+            .empty_while_break_anchors
+            .push((anchor, end, original));
+    }
+
     /// Records a discarded linear loop else suite's original normal exit.
     pub(crate) fn record_folded_loop_else_predecessor(&mut self, target: Label) {
         self.folded_away_loop_else_targets.insert(target);

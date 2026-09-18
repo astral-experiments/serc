@@ -124,3 +124,85 @@ fn matches_cpython_omitted_pass_with_small_exit_and_existing_markers() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn chained_comparison_pass_arms_keep_original_jump_boundaries() {
+    for (filename, source) in [
+        (
+            "async_nested_chained_pass_assignment.py",
+            r"async def run(fetch, low, high, output):
+    items = await fetch()
+    previous = None
+    for value in items:
+        if value is not None:
+            if low <= value < high:
+                pass
+            else:
+                previous = value
+        output.append(previous)
+    return output
+",
+        ),
+        (
+            "async_nested_chained_pass_call_assignment.py",
+            r"async def run(fetch, low, high, reject, output):
+    items = await fetch()
+    previous = None
+    for value in items:
+        if value is not None:
+            if low <= value < high:
+                pass
+            else:
+                reject(value)
+                previous = value
+        output.append(previous)
+    return output
+",
+        ),
+        (
+            "sync_boolean_chained_pass_elif_pass.py",
+            r"def run(skip_empty, skip_busy, completed, failed, busy, report):
+    if skip_empty and completed == failed == 0:
+        pass
+    elif skip_busy and not busy:
+        pass
+    else:
+        report()
+    return completed, failed
+",
+        ),
+        (
+            "chained_pass_small_return_control.py",
+            r"def run(a, b, c, fallback):
+    if a < b < c:
+        pass
+    else:
+        fallback()
+    return None
+",
+        ),
+        (
+            "negated_chained_pass_control.py",
+            r"def run(a, b, c, fallback, output):
+    if not a < b < c:
+        pass
+    else:
+        fallback()
+    output.append(a)
+    return output
+",
+        ),
+        (
+            "same_line_chained_pass_control.py",
+            r"def run(a, b, c, fallback, output):
+    if a < b < c: pass
+    else:
+        fallback()
+    output.append(a)
+    return output
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

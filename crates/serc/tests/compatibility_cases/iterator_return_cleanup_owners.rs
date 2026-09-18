@@ -331,3 +331,61 @@ fn none_returns_unwind_inner_managers_before_pending_finally_iterators() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn computed_returns_through_inner_while_keep_iterator_cleanup_owned() {
+    for (filename, source) in [
+        (
+            "protected_iterator_awaited_return_control.py",
+            r"async def run(items, ready, produce):
+    try:
+        for item in items:
+            if ready(item):
+                return await produce(item)
+    except Exception as error:
+        raise
+",
+        ),
+        (
+            "protected_iterator_computed_return_control.py",
+            r"async def run(items, ready, choose, produce):
+    try:
+        for item in items:
+            result = await produce(item)
+            if ready(item):
+                if choose(item):
+                    return produce(item)
+                return result
+    except Exception as error:
+        raise
+",
+        ),
+        (
+            "protected_iterator_while_awaited_return_target.py",
+            r"async def run(items, ready, produce):
+    try:
+        for item in items:
+            while ready(item):
+                return await produce(item)
+    except Exception as error:
+        raise
+",
+        ),
+        (
+            "protected_iterator_while_computed_return_target.py",
+            r"async def run(items, ready, choose, produce):
+    try:
+        for item in items:
+            result = await produce(item)
+            while ready(item):
+                if choose(item):
+                    return produce(item)
+                return result
+    except Exception as error:
+        raise
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
