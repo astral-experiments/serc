@@ -628,6 +628,15 @@ impl Compiler<'_> {
                         compiler.compile_suite_inner(&case.body, true)
                     })?;
                     emitted_fallthrough
+                } else if !terminal
+                    && index + 1 < matched_cases
+                    && case.guard.is_none()
+                    && matches!(&case.pattern, Pattern::MatchValue(_))
+                    && let [Stmt::Try(tail)] = case.body.as_slice()
+                    && self.compile_match_case_tail_try(tail, end)?
+                {
+                    // Handler fallthrough still needs the case's original success exit.
+                    false
                 } else {
                     // A non-default case appends its own success jump after a nested match.
                     // Its retained original slot prevents that match's final value failure
@@ -926,7 +935,7 @@ impl Compiler<'_> {
         Ok(())
     }
 
-    fn compile_match_case_tail_if(
+    pub(super) fn compile_match_case_tail_if(
         &mut self,
         statement: &ruff_python_ast::StmtIf,
         match_end: Label,

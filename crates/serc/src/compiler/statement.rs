@@ -284,6 +284,10 @@ struct TryCompileOptions {
     // Only the owning finally producer can certify this original else-exit NOP.
     retained_else_break_exit: bool,
     loop_tail: Option<(Label, bool)>,
+    // Only normal success enters else; handler exits keep their ordinary cleanup path.
+    else_loop_tail: Option<Label>,
+    // A selected value-pattern case owns the else exits before its common success jump.
+    else_match_tail: Option<Label>,
 }
 
 impl TryCompileOptions {
@@ -293,6 +297,8 @@ impl TryCompileOptions {
         exclude_terminal_body_not_taken: false,
         retained_else_break_exit: false,
         loop_tail: None,
+        else_loop_tail: None,
+        else_match_tail: None,
     };
     const TERMINAL: Self = Self {
         terminal: true,
@@ -308,6 +314,8 @@ impl TryCompileOptions {
         exclude_terminal_body_not_taken: false,
         retained_else_break_exit: false,
         loop_tail: None,
+        else_loop_tail: None,
+        else_match_tail: None,
     };
 
     const fn loop_tail(restart: Label, split_short_circuit: bool) -> Self {
@@ -6605,6 +6613,82 @@ impl Compiler<'_> {
                                 && loop_context.finally_end_depth == 0
                                 && loop_context.exception_region_depth
                                     == self.control.exceptions.active_exception_region_exclusions.len());
+                    // A coroutine's inner async iterator has already emitted its
+                    // POP_TOP (and SWAP for a value return). The surrounding ordinary
+                    // try still contributes a NULL POP before the copied finalizer.
+                    // An outer while contributes no iterator cell to that prefix.
+                    let copied_return_unwinds_inner_async_iterator = self
+                        .context
+                        .target_specific_rules_enabled()
+                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                            == CO_COROUTINE
+                        && !return_is_overridden
+                        && context_index == 0
+                        && finally_context.loop_depth <= 1
+                        && next_loop == finally_context.loop_depth + 1
+                        && next_loop == self.control.loops.contexts.len()
+                        && finally_context.with_depth == 0
+                        && next_with == 0
+                        && self.control.withs.active_with_exits.is_empty()
+                        && self.control.finally.active_copied_finally_bodies == 0
+                        && self
+                            .control
+                            .finally
+                            .preserved_return_value_contexts
+                            .is_empty()
+                        && self.control.loops.contexts[..finally_context.loop_depth]
+                            .iter()
+                            .all(|outer| {
+                                outer.iterator_cleanup == IteratorCleanup::None
+                                    && outer.with_depth == 0
+                                    && outer.finally_end_depth == 0
+                                    && outer.exception_region_depth
+                                        == finally_context.exception_region_depth
+                            })
+                        && self.control.loops.contexts.last().is_some_and(|iterator| {
+                            iterator.iterator_cleanup == IteratorCleanup::Async
+                                && iterator.with_depth == 0
+                                && iterator.finally_end_depth == 0
+                                && iterator.exception_region_depth
+                                    == self
+                                        .control
+                                        .exceptions
+                                        .active_exception_region_exclusions
+                                        .len()
+                        })
+                        && matches!(finally_context.body.first(), Some(Stmt::If(guard))
+                            if guard.elif_else_clauses.is_empty()
+                                && matches!(guard.test.as_ref(), Expr::Compare(comparison)
+                                    if matches!(comparison.left.as_ref(), Expr::Name(_))
+                                        && matches!(comparison.ops.as_ref(), [CmpOp::Is | CmpOp::IsNot])
+                                        && matches!(comparison.comparators.as_ref(), [Expr::NoneLiteral(_)])));
+                    // A value return through a while needs no iterator stack cleanup.
+                    // Ordinary tries entered inside that while still contribute their
+                    // own NULL POP_BLOCK records before the finalizer POP.
+                    let copied_return_unwinds_value_while_tries =
+                        self.context.target_specific_rules_enabled()
+                            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                                == CO_COROUTINE
+                            && preserve_tos
+                            && !return_is_overridden
+                            && context_index == 0
+                            && finally_context.loop_depth == 0
+                            && finally_context.with_depth == 0
+                            && next_loop == 1
+                            && next_with == 0
+                            && self.control.withs.active_with_exits.is_empty()
+                            && self.control.finally.active_copied_finally_bodies == 0
+                            && self
+                                .control
+                                .finally
+                                .preserved_return_value_contexts
+                                .is_empty()
+                            && matches!(self.control.loops.contexts.as_slice(), [loop_context]
+                            if loop_context.iterator_cleanup == IteratorCleanup::None
+                                && loop_context.with_depth == 0
+                                && loop_context.finally_end_depth == 0
+                                && loop_context.exception_region_depth
+                                    == finally_context.exception_region_depth + 1);
                     let mut copied_return_none_pop_pair = None;
                     if return_finally_contexts.len() == 1
                         && handler_count == 0
@@ -6628,6 +6712,10 @@ impl Compiler<'_> {
                         && (self.control.loops.contexts.is_empty()
                             || (copied_return_keeps_outer_iterator && ordinary_try_count == 1)
                             || (copied_return_unwinds_while_only && ordinary_try_count == 1)
+                            || (copied_return_unwinds_value_while_tries
+                                && (1..=2).contains(&ordinary_try_count))
+                            || (copied_return_unwinds_inner_async_iterator
+                                && ordinary_try_count == 1)
                             || (self.context.target_specific_rules_enabled()
                                 && self.unit.flags & CO_ASYNC_GENERATOR != 0
                                 && !preserve_tos
@@ -6660,8 +6748,9 @@ impl Compiler<'_> {
                         // POP_BLOCK remains a distinct NULL record after NOP compaction.
                         // An async iterator entered inside this ordinary try has already
                         // emitted its POP_TOP above. The try still contributes its own
-                        // original NULL POP before the finally POP. Keep the direct-return
-                        // prefix certificate restricted to returns without iterator cleanup.
+                        // original NULL POP before the finally POP. A value return through
+                        // the certified coroutine iterator retains the same adjacent pair;
+                        // its completed SWAP/POP_TOP precedes both captured NULL cells.
                         if (ordinary_try_count == 1
                             || (ordinary_try_count == 2
                                 && self.context.target_specific_rules_enabled()
@@ -6677,7 +6766,8 @@ impl Compiler<'_> {
                                     .is_empty()))
                             && (self.control.loops.contexts.is_empty()
                                 || copied_return_keeps_outer_iterator
-                                || copied_return_unwinds_while_only)
+                                || copied_return_unwinds_while_only
+                                || (copied_return_unwinds_inner_async_iterator && preserve_tos))
                         {
                             copied_return_none_pop_pair =
                                 Some((self.assembler.item_count(), ordinary_try_count == 2));
@@ -9805,6 +9895,24 @@ impl Compiler<'_> {
                 self.compile_loop_tail_prefix(leading)?;
                 self.compile_loop_tail_assert(statement, restart, mode.non_final_branch)?;
                 Ok(LoopBackedge::Emitted)
+            }
+            Some((Stmt::Try(statement), leading))
+                if try_else_requires_loop_tail_inlining(statement)
+                    && !try_requires_loop_tail_inlining(statement)
+                    && self.control.in_loop_tail_without_nested_cleanup() =>
+            {
+                // Normal success enters else after leaving this try's protected body.
+                // Its conditional exits can copy the backedge without handler cleanup.
+                self.compile_loop_tail_prefix(leading)?;
+                self.compile_try_inner(
+                    statement,
+                    TryCompileOptions {
+                        else_loop_tail: Some(restart),
+                        ..TryCompileOptions::STANDARD
+                    },
+                )?;
+                // Handlers still fall through to the enclosing loop's original exit.
+                Ok(LoopBackedge::Required)
             }
             Some((Stmt::Try(statement), leading))
                 if try_requires_loop_tail_inlining(statement)
@@ -13777,6 +13885,31 @@ impl Compiler<'_> {
         )
     }
 
+    /// Routes only a cleanup-free match case's normal else exits to its success join.
+    pub(super) fn compile_match_case_tail_try(
+        &mut self,
+        statement: &ruff_python_ast::StmtTry,
+        match_end: Label,
+    ) -> Result<bool, CompileError> {
+        if !self.control.falls_through_to_loop_backedge()
+            || !self.control.in_loop_tail_without_nested_cleanup()
+            || !try_else_requires_loop_tail_inlining(statement)
+            || try_requires_loop_tail_inlining(statement)
+            || !matches!(statement.orelse.last(), Some(Stmt::If(tail))
+                if tail.elif_else_clauses.is_empty() && !suite_terminates(&tail.body))
+        {
+            return Ok(false);
+        }
+        self.compile_try_inner(
+            statement,
+            TryCompileOptions {
+                else_match_tail: Some(match_end),
+                ..TryCompileOptions::STANDARD
+            },
+        )?;
+        Ok(true)
+    }
+
     fn compile_try_inner(
         &mut self,
         statement: &ruff_python_ast::StmtTry,
@@ -13799,6 +13932,8 @@ impl Compiler<'_> {
             exclude_terminal_body_not_taken,
             retained_else_break_exit,
             loop_tail,
+            else_loop_tail,
+            else_match_tail,
         } = options;
         if statement.is_star {
             return self.compile_try_star_except(statement, terminal, emit_statement_nop);
@@ -14819,7 +14954,26 @@ impl Compiler<'_> {
                     |control| &mut control.exceptions.preserve_coroutine_try_else_condition,
                     preserve_coroutine_try_else_condition,
                     |compiler| {
-                        if terminal
+                        if let Some(restart) = else_loop_tail {
+                            // Copy the original exit onto each normal else predecessor.
+                            // Non-final ordering keeps the taken body before the false edge;
+                            // this try's exclusion collector has already been removed.
+                            compiler.compile_non_final_branch_loop_tail_suite(
+                                &statement.orelse,
+                                restart,
+                                false,
+                            )?;
+                            Ok(())
+                        } else if let Some(match_end) = else_match_tail {
+                            let Some((Stmt::If(tail), leading)) = statement.orelse.split_last()
+                            else {
+                                unreachable!("selected match-case else has a conditional tail");
+                            };
+                            // Preserve the else prefix's authored following statement, then
+                            // reuse the case helper's separate taken and false success exits.
+                            compiler.compile_loop_tail_prefix(leading)?;
+                            compiler.compile_match_case_tail_if(tail, match_end, true, false)
+                        } else if terminal
                             && statement
                                 .orelse
                                 .last()
@@ -24429,6 +24583,20 @@ fn match_has_multiple_normal_case_exits(statement: &ruff_python_ast::StmtMatch) 
             == 2
 }
 
+/// Selects live normal else exits that share the enclosing loop's original backedge.
+fn try_else_requires_loop_tail_inlining(statement: &ruff_python_ast::StmtTry) -> bool {
+    !statement.is_star
+        && statement.finalbody.is_empty()
+        && suite_has_normal_fallthrough(&statement.body)
+        && matches!(statement.orelse.last(), Some(Stmt::If(tail))
+            if condition_has_only_runtime_tests(&tail.test)
+                && tail
+                    .elif_else_clauses
+                    .iter()
+                    .all(|clause| clause.test.is_none())
+                && if_has_multiple_normal_exit_targets(tail))
+}
+
 fn try_requires_loop_tail_inlining(statement: &ruff_python_ast::StmtTry) -> bool {
     // A terminating branch can still have several normal exits from its condition.
     // CPython copies the loop backedge onto each short-circuit fallthrough.
@@ -27260,6 +27428,33 @@ fn suite_ends_in_terminal_conditional_break(body: &[Stmt]) -> bool {
             && boolean_arguments == 1
     }
 
+    // These earlier arms return to the async header or raise. Neither route
+    // enters the final elif's iterator discard and removed break edge.
+    fn earlier_arm_keeps_terminal_break(body: &[Stmt]) -> bool {
+        suite_has_linear_borrow_fallthrough(body)
+            || suite_has_linear_raise_exit(body)
+            || body.split_last().is_some_and(|(last, leading)| {
+                matches!(last, Stmt::Raise(raise)
+                    if raise.exc.as_deref().is_none_or(|value| !expression_suspends_current_scope(value))
+                        && raise.cause.as_deref().is_none_or(|value| !expression_suspends_current_scope(value)))
+                    && (leading.is_empty() || suite_has_linear_borrow_fallthrough(leading))
+            })
+            || matches!(body, [Stmt::Try(recovery), rest @ ..]
+                if !recovery.is_star
+                    && recovery.orelse.is_empty()
+                    && recovery.finalbody.is_empty()
+                    && matches!(recovery.body.as_slice(), [Stmt::Assign(_)])
+                    && suite_has_linear_borrow_fallthrough(&recovery.body)
+                    && matches!(recovery.handlers.as_slice(), [handler]
+                        if handler.as_except_handler().is_some_and(|handler| {
+                            handler.type_.is_some()
+                                && handler.name.is_none()
+                                && matches!(handler.body.as_slice(), [Stmt::Continue(_)])
+                        }))
+                    && !suite_contains_yield(body)
+                    && suite_has_plain_recovery_fallthrough(rest, false))
+    }
+
     // Completed conditions and for exhaustion can precede the final break
     // without adding an entry beyond its iterator discard. A conditional
     // continue returns to the async header; it does not reach the loop exit.
@@ -27302,6 +27497,11 @@ fn suite_ends_in_terminal_conditional_break(body: &[Stmt]) -> bool {
                             }))
                 }
                 Stmt::Continue(_) => conditional && index + 1 == body.len(),
+                Stmt::Raise(_) => {
+                    conditional
+                        && index + 1 == body.len()
+                        && suite_has_linear_raise_exit(std::slice::from_ref(statement))
+                }
                 _ => suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement)),
             })
     }
@@ -27333,18 +27533,16 @@ fn suite_ends_in_terminal_conditional_break(body: &[Stmt]) -> bool {
                         .is_some_and(condition_reaches_async_break_entry)
                 });
             if !returning_arms_before_else_break
-                && ((!suite_has_linear_borrow_fallthrough(&tail.body)
-                    && !suite_has_linear_raise_exit(&tail.body))
+                && (!earlier_arm_keeps_terminal_break(&tail.body)
                     || tail.elif_else_clauses.iter().any(|clause| {
                         clause
                             .test
                             .as_ref()
                             .is_none_or(|test| !condition_reaches_async_break_entry(test))
                     })
-                    || earlier.iter().any(|clause| {
-                        !suite_has_linear_borrow_fallthrough(&clause.body)
-                            && !suite_has_linear_raise_exit(&clause.body)
-                    }))
+                    || earlier
+                        .iter()
+                        .any(|clause| !earlier_arm_keeps_terminal_break(&clause.body)))
             {
                 return false;
             }

@@ -390,3 +390,101 @@ fn matches_cpython_borrows_after_nested_first_arm_handler_exit() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_borrows_after_protected_async_elif_breaks() {
+    for (source, filename) in [
+        (
+            r"async def collect(stream, decode, handle, close, report):
+    try:
+        async for message in stream:
+            if message.kind == 1:
+                try:
+                    payload = decode(message.data)
+                except ValueError:
+                    continue
+                await handle(payload)
+            elif message.kind == 2:
+                break
+    finally:
+        report(stream)
+        await close(stream)
+    report(stream)
+    return stream
+",
+            "async_terminal_elif_retry_arm_target.py",
+        ),
+        (
+            r"async def collect(stream, decode, handle, close, report):
+    try:
+        async for message in stream:
+            if message.kind == 1:
+                payload = decode(message.data)
+                await handle(payload)
+            elif message.kind == 2:
+                break
+    finally:
+        report(stream)
+        await close(stream)
+    report(stream)
+    return stream
+",
+            "async_terminal_elif_linear_arm_control.py",
+        ),
+        (
+            r#"async def collect(stream, manager, close, report):
+    result = None
+    values = []
+    try:
+        async with manager:
+            async for message in stream:
+                if message.kind == 0:
+                    result = message.value
+                elif message.kind == 1:
+                    values.append(message.value)
+                elif message.kind == 2:
+                    raise ValueError(message.code or message.name)
+                elif message.kind == 3:
+                    result = message.value
+                    if message.failed:
+                        raise ValueError(result)
+                    break
+    finally:
+        await close(stream)
+    if result is None:
+        raise ValueError("no result")
+    report(stream, result, values)
+    return result, values
+"#,
+            "async_terminal_elif_raising_prefix_target.py",
+        ),
+        (
+            r#"async def collect(stream, manager, close, report):
+    result = None
+    values = []
+    try:
+        async with manager:
+            async for message in stream:
+                if message.kind == 0:
+                    result = message.value
+                elif message.kind == 1:
+                    values.append(message.value)
+                elif message.kind == 2:
+                    raise ValueError(message.name)
+                elif message.kind == 3:
+                    result = message.value
+                    report(result)
+                    break
+    finally:
+        await close(stream)
+    if result is None:
+        raise ValueError("no result")
+    report(stream, result, values)
+    return result, values
+"#,
+            "async_terminal_elif_linear_prefix_control.py",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

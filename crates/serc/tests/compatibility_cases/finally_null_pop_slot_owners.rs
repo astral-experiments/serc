@@ -173,3 +173,84 @@ fn matches_cpython_nested_finally_markers_after_collection_folding() {
         assert_matches_cpython_marshal(&source, "nested_finally_collection_fold.py");
     }
 }
+
+#[test]
+fn async_iterator_returns_preserve_ordinary_try_null_pop_slots() {
+    for (filename, source) in [
+        (
+            "coroutine_async_iterator_bare_return_finally_none_owner.py",
+            r"async def f(source, open_result, stop, close, idle):
+    while True:
+        result = None
+        try:
+            result = await open_result()
+            async for item in source:
+                if stop(item):
+                    return
+        except Exception as error:
+            record(error)
+        finally:
+            if result is not None:
+                close(result)
+        await idle()
+",
+        ),
+        (
+            "coroutine_async_iterator_handlerless_finally_control.py",
+            r"async def f(source, make_result):
+    status = None
+    try:
+        async for item in source:
+            if item:
+                status = 1
+                return make_result(item=item)
+        return make_result(item=None)
+    finally:
+        if status is None:
+            status = 2
+        record(status)
+",
+        ),
+    ] {
+        assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn async_iterator_value_returns_capture_finally_null_pop_slots() {
+    let source = r"async def f(source, prepare, stop, process, cleanup):
+    reload = False
+    status = None
+    try:
+        if await prepare():
+            status = Result.SKIPPED
+            return Finish(retry=True, reload=reload)
+        accepted = True
+        async for item in source:
+            process(item)
+            if stop(item):
+                status = (
+                    Result.SUCCESS
+                    if accepted
+                    else Result.ERROR
+                )
+                return Finish(
+                    retry=False, reload=reload
+                )
+            if item.failed:
+                accepted = False
+        return Finish(retry=True, reload=reload)
+    except Exception:
+        status = Result.ERROR
+        raise
+    finally:
+        if status is None:
+            status = Result.MISSING
+        record(status.value)
+        cleanup(status)
+";
+    assert_matches_cpython_marshal(
+        source,
+        "coroutine_async_iterator_branched_call_return_finally_none_owner.py",
+    );
+}

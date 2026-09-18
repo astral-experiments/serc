@@ -190,3 +190,104 @@ fn final_else_copied_backedges_leave_nested_tries() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_normal_try_else_loop_tail_backedges() {
+    for (source, filename) in [
+        (
+            r#"def collect(widgets, decode):
+    first = set()
+    second = set()
+    for widget in widgets:
+        if widget.bindings is not None:
+            for binding in widget.bindings.values():
+                first.add(binding.identifier)
+                if binding.version is not None:
+                    second.add(binding.version)
+        elif widget.kind == "form":
+            try:
+                value = decode(widget.output)
+            except Exception:
+                pass
+            else:
+                if value.identifier is not None:
+                    first.add(value.identifier)
+                if value.version is not None:
+                    second.add(value.version)
+    return first, second
+"#,
+            "try_else_outer_elif_two_conditions_target.py",
+        ),
+        (
+            r"async def check(cases, fetch, decode):
+    failures = []
+    for case in cases:
+        path = case.path
+        if isinstance(path, str) and path.strip():
+            ok, output = await fetch(path)
+            if not ok:
+                failures.append(output)
+            else:
+                try:
+                    parsed = decode(output)
+                except ValueError as exc:
+                    failures.append(str(exc))
+                else:
+                    if not isinstance(parsed, list):
+                        failures.append(type(parsed).__name__)
+    return failures
+",
+            "try_else_async_nested_named_recovery_target.py",
+        ),
+        (
+            r#"async def drain(source, timeout):
+    while True:
+        reservation = await source.reserve()
+        if not isinstance(reservation, str):
+            await source.pause()
+            continue
+        if source.enabled:
+            try:
+                async with timeout():
+                    result = await source.ack(reservation)
+            except Exception:
+                source.failures += 1
+                source.report_failure()
+            else:
+                if isinstance(result, dict) and result.get("acked") is True:
+                    source.acked += 1
+"#,
+            "try_else_async_manager_short_circuit_target.py",
+        ),
+        (
+            r"def with_finally(items, output):
+    for item in items:
+        try:
+            value = item.read()
+        except ValueError:
+            pass
+        else:
+            if value:
+                output.append(value)
+        finally:
+            item.close()
+    return output
+
+
+def folded_tail(items, output):
+    for item in items:
+        try:
+            value = item.read()
+        except ValueError:
+            pass
+        else:
+            if False:
+                output.append(value)
+    return output
+",
+            "try_else_backedge_boundaries_control.py",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

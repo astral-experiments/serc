@@ -41,3 +41,33 @@ fn matches_cpython_nested_match_case_loop_tail_conditions() {
         }
     }
 }
+
+#[test]
+fn matches_cpython_match_value_case_try_else_loop_tail() {
+    common::assert_matches_cpython_marshal(
+        r#"def convert(rows, page, decode):
+    for fields in rows:
+        for field, payload in fields:
+            match field:
+                case "name":
+                    page.name = payload
+                case "counters":
+                    try:
+                        counters = decode(payload)
+                    except Exception:
+                        pass
+                    else:
+                        if value := counters.get("created"):
+                            page.created = value
+                            page.modified = value
+                        if value := counters.get("modified"):
+                            page.modified = value
+                case "date":
+                    page.date = payload
+                case _:
+                    page.other = payload
+    return page
+"#,
+        "match_value_case_try_else_conditional_tail_target.py",
+    );
+}

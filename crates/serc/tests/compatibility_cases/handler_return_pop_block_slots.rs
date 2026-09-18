@@ -237,3 +237,45 @@ fn matches_cpython_two_named_handler_raise_cleanup_before_finally_control() {
 ";
     assert_matches_cpython_marshal(source, "two_named_handler_raise_finally_control.py");
 }
+
+#[test]
+fn matches_cpython_value_return_through_while_and_two_tries() {
+    for (filename, source) in [
+        (
+            "value_while_two_try_truth_finally.py",
+            r"async def f(ready, value, resource):
+    try:
+        while ready:
+            try:
+                try:
+                    return make_result(value=convert(value), success=True)
+                except ValueError:
+                    raise
+            except Exception:
+                raise
+    finally:
+        if resource:
+            cleanup(resource)
+",
+        ),
+        (
+            "value_if_two_try_truth_finally_control.py",
+            r"async def f(ready, value, resource):
+    try:
+        if ready:
+            try:
+                try:
+                    return make_result(value=convert(value), success=True)
+                except ValueError:
+                    raise
+            except Exception:
+                raise
+    finally:
+        if resource:
+            cleanup(resource)
+",
+        ),
+    ] {
+        assert_matches_cpython_marshal(source, filename);
+    }
+}
