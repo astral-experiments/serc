@@ -3315,10 +3315,55 @@ impl OptimizationPipeline {
                         && !instruction.no_location_policy.preserves_location()
                         && instruction.exception_policy() == ExceptionPolicy::default()
                 });
+            // Match-success jumps are originally unlocated. A located replacement
+            // may be retained only after their sole surviving fallthrough has supplied
+            // the donor; copying it into another predecessor would carry the wrong line.
+            let preserve_single_fallthrough_match_nop = !planned_copy
+                && inline_unprotected_return
+                && target_chain_end == target_position
+                && super::control_flow::is_original_constant_return(graph, target_label)
+                && source_location.line >= 0
+                && remaining_predecessors[source.index()] == 1
+                && graph[source].items().iter().any(|item| {
+                    matches!(item, Item::Label(label)
+                        if self.exception_owner_provenance.original_match_join_boundaries.contains(label)
+                            && !self.borrow_block_aliases.contains(label)
+                            && graph.label_block(*label) == Some(source))
+                })
+                && graph[source]
+                    .items()
+                    .iter()
+                    .filter(|item| matches!(item, Item::Instruction(_)))
+                    .count()
+                    == 1
+                && graph[source].last_instruction().is_some_and(|instruction| {
+                    instruction.opcode == JUMP_FORWARD
+                        && instruction.jump_policy.is_original_match_success()
+                        && instruction.pre_fold_extra_instructions() == 0
+                        && !instruction.no_location_policy.preserves_location()
+                        && instruction.exception_policy() == ExceptionPolicy::default()
+                })
+                && jump_sources[source.index()].iter().all(|predecessor| {
+                    drop_blocks[predecessor.index()]
+                        || block_jump_target(graph[*predecessor].items())
+                            .and_then(|label| graph.label_block(label))
+                            != Some(source)
+                })
+                && source_position.checked_sub(1).is_some_and(|position| {
+                    let previous = order[position];
+                    !drop_blocks[previous.index()]
+                        && !inline_copies.contains_key(&previous)
+                        && !target_copies.contains_key(&previous)
+                        && block_has_fallthrough(graph[previous].items())
+                        && graph[previous]
+                            .last_instruction()
+                            .is_some_and(|instruction| instruction.location == source_location)
+                });
             let preserve_inlined_jump_nop = planned_copy
                 || (inline_small_exit
                     && (preserve_unlocated_join_nop
                         || preserve_threaded_join_nop
+                        || preserve_single_fallthrough_match_nop
                         || (source_location.line >= 0
                             && graph[source].last_instruction().is_some_and(|instruction| {
                                 instruction

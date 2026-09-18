@@ -36,6 +36,8 @@ mod conditional_handler_cleanup_compatibility;
 mod conditional_handler_cleanup_order;
 mod conditional_handler_none_admission;
 mod conditional_jump_join_locations;
+mod conditional_nested_recovery_else_borrow;
+mod conditional_recovery_suffix_long_continuation;
 mod conditional_value_boolean_continuation;
 mod constant_assertion_exit_slots;
 mod constant_condition_admission;
@@ -139,6 +141,7 @@ mod inner_try_handler_return_owner;
 mod integer_true_division;
 mod iterator_boolean_condition_owner_compatibility;
 mod iterator_join_locations;
+mod iterator_pass_return_borrow;
 mod iterator_return_cleanup_owners;
 mod iterator_setup_owner_slots;
 mod iterator_try_assignment_branch_compatibility;
@@ -566,6 +569,7 @@ mod calculated_handler_return_two_managers;
 mod mixed_handler_finally_borrow;
 mod normal_finally_handler_fallthrough;
 
+mod nested_match_constant_return_nop;
 mod nested_match_donated_location;
 
 mod calculated_handler_return_retained_async_manager;

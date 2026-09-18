@@ -2142,6 +2142,64 @@ impl OptimizationPipeline {
                 }
             }
         }
+        // A compound try's normal jump crosses its own finally boundary. Bind
+        // its source-authored wildcard donor before considering that boundary;
+        // no ordinary try-copy plan is inferred from this separate certificate.
+        let mut compound_fallthrough_exits = Vec::new();
+        if finalize_borrow_empty_blocks
+            && !self
+                .exception_owner_provenance
+                .compound_try_fallthrough_donors
+                .is_empty()
+        {
+            let mut pending_labels = Vec::new();
+            let mut preceding = [None, None];
+            for &block in self.graph.order() {
+                for (offset, item) in self.graph[block].items().iter().enumerate() {
+                    match item {
+                        Item::Label(label) => pending_labels.push(*label),
+                        Item::Instruction(instruction) => {
+                            for entry in pending_labels.drain(..) {
+                                if instruction.opcode == JUMP_FORWARD
+                                    && let Operand::Forward(target) = instruction.operand()
+                                    && let [Some(call), Some(pop)] = preceding
+                                    && self
+                                        .exception_owner_provenance
+                                        .compound_try_fallthrough_donors
+                                        .get(&entry)
+                                        == Some(&(call, pop))
+                                    && self
+                                        .exception_owner_provenance
+                                        .compound_try_owner_exits
+                                        .contains(&(entry, target))
+                                    && self
+                                        .graph
+                                        .iter_items()
+                                        .filter(|item| **item == Item::Label(entry))
+                                        .count()
+                                        == 1
+                                    && self
+                                        .graph
+                                        .iter_items()
+                                        .filter(|item| **item == Item::Label(target))
+                                        .count()
+                                        == 1
+                                    && instruction.location == pop.location
+                                    && instruction.depth_after() == pop.depth_after()
+                                {
+                                    compound_fallthrough_exits.push((
+                                        ItemPosition::new(block, offset),
+                                        target,
+                                        pop,
+                                    ));
+                                }
+                            }
+                            preceding = [preceding[1], Some(*instruction)];
+                        }
+                    }
+                }
+            }
+        }
         // Count only labels certified to enter the same original instruction array.
         // Two separate arrays must not become shared merely because later passes merge them.
         let mut shared_entries = FxHashMap::<Label, usize>::default();
@@ -2465,6 +2523,27 @@ impl OptimizationPipeline {
                                     })
                             },
                         );
+                    // The original compound exit starts a new array after the
+                    // final wildcard call. Its CALL/POP pair and entry/target labels
+                    // must still be exact; crossing its finally boundary is expected.
+                    let preserves_compound_fallthrough_nop = !absorbed_normal_try_exit
+                        && !instruction.fusion_policy.is_authored_break()
+                        && instruction.pre_fold_extra_instructions() == 0
+                        && instruction.local_policy.hidden_exception_owner_slots() == 0
+                        && previous == previous_at_block_entry
+                        && instruction.location.line >= 0
+                        && next_line
+                            .is_some_and(|line| line >= 0 && line != instruction.location.line)
+                        && compound_fallthrough_exits.iter().any(
+                            |(original, original_target, pop)| {
+                                *original == position
+                                    && *original_target == target
+                                    && instruction.location == pop.location
+                                    && previous.is_some_and(|previous| {
+                                        graph.item(previous) == &Item::Instruction(*pop)
+                                    })
+                            },
+                        );
                     // A copied finalizer's conditional join remains a separate original
                     // array after its condition threads past the authored break. CPython
                     // resets the preceding line there, so its located jump becomes a NOP
@@ -2536,6 +2615,7 @@ impl OptimizationPipeline {
                                     && !self.original_nop_targets.contains(label))
                         });
                     if !preserves_original_fallthrough_nop
+                        && !preserves_compound_fallthrough_nop
                         && !preserves_copied_finally_break_nop
                         && (!instruction.jump_policy.always_retains_nop()
                             || absorbed_normal_try_exit)

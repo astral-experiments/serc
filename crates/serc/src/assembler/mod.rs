@@ -2647,6 +2647,9 @@ impl Assembler {
             self.record_exception_owner_block_boundary(label);
         }
         self.mark(label);
+        self.exception_owner_provenance
+            .original_match_join_boundaries
+            .insert(label);
         self.original_match_join = Some(label);
         if let Some(origin) = origin {
             self.match_join_store_origins.insert(label, origin);
@@ -3964,10 +3967,49 @@ impl Assembler {
     }
 
     /// Records an inner try/except `POP_BLOCK` exit for owner transfer and redundant-jump removal.
-    pub(crate) fn record_compound_try_owner_exit(&mut self, entry: Label, target: Label) {
+    pub(crate) fn record_compound_try_owner_exit(
+        &mut self,
+        entry: Label,
+        target: Label,
+        wildcard_call_location: Option<SourceLocation>,
+    ) {
         self.exception_owner_provenance
             .compound_try_owner_exits
             .push((entry, target));
+        let Some(location) = wildcard_call_location else {
+            return;
+        };
+        let mut instructions = self
+            .linear_items()
+            .iter()
+            .rev()
+            .filter_map(|item| match item {
+                Item::Instruction(instruction) => Some(*instruction),
+                Item::Label(_) => None,
+            });
+        let (Some(jump), Some(pop), Some(call)) = (
+            instructions.next(),
+            instructions.next(),
+            instructions.next(),
+        ) else {
+            return;
+        };
+        if jump.opcode == JUMP_FORWARD
+            && jump.operand() == Operand::Forward(target)
+            && jump.location == location
+            && pop.opcode == POP_TOP
+            && matches!(
+                call.opcode,
+                crate::target::opcodes::CALL | crate::target::opcodes::CALL_KW
+            )
+            && pop.location == location
+            && call.location == location
+            && jump.depth_after() == pop.depth_after()
+        {
+            self.exception_owner_provenance
+                .compound_try_fallthrough_donors
+                .insert(entry, (call, pop));
+        }
     }
 
     /// Records the live original else array without crossing a preserved empty boundary.

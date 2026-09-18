@@ -566,7 +566,7 @@ impl OptimizationPipeline {
         self.validate_structure(AssemblerStage::RemoveRedundantForwardJumpsLate)?;
         self.normalize_backward_conditionals()?;
         fusion_owners.retain_pipeline(&self);
-        let retained_finally_entries = self.retained_finally_entries(&retained_finally_origins);
+        let mut retained_finally_entries = self.retained_finally_entries(&retained_finally_origins);
         let features = self.graph.features();
         let mut items = self.graph.into_items();
         if !omitted_borrow_markers.is_empty() {
@@ -598,12 +598,18 @@ impl OptimizationPipeline {
             }
             items = marked;
         }
-        Self::retain_setup_finally_origins(
+        let mut setup_finally_entries: Vec<_> = Self::retain_setup_finally_origins(
             &items,
             &setup_finally_origins,
             &mut self.borrow_finally_entries,
             &mut self.borrow_block_aliases,
-        );
+        )
+        .into_iter()
+        .collect();
+        setup_finally_entries.sort_unstable_by_key(|(source, _)| source.0);
+        for (source, target) in setup_finally_entries {
+            retained_finally_entries.entry(source).or_insert(target);
+        }
         if features.has_fast_load() {
             // These entries split only borrowed-reference analysis. They do not
             // change earlier CFG copying, NOP removal or exception ownership.

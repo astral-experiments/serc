@@ -60,6 +60,8 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) copied_manager_return_compactions: Vec<CopiedManagerReturnCompaction>,
     pub(super) uncompacted_conditional_arrays: Vec<UncompactedConditionalArray>,
     pub(super) original_primitive_condition_boundaries: Vec<Instruction>,
+    // Source-authored match ends establish original arrays independently of case exits.
+    pub(super) original_match_join_boundaries: FxHashSet<Label>,
     // Authored normal exits and their immediate, fully emitted restore records.
     pub(super) original_comprehension_normal_exits: Vec<(Label, Instruction)>,
     pub(super) original_comprehension_normal_restores: FxHashMap<Label, Vec<Instruction>>,
@@ -76,6 +78,8 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) normal_try_exits: Vec<(Label, Label)>,
     // Exact final wildcard call/discard or class-pattern failure pops at a normal try exit.
     pub(super) normal_try_fallthrough_donors: FxHashMap<Label, (Instruction, Instruction)>,
+    // Exact final wildcard CALL/POP before a compound try's original normal exit.
+    pub(super) compound_try_fallthrough_donors: FxHashMap<Label, (Instruction, Instruction)>,
     // Original adjacent arrays containing the two final class-pattern failure pops.
     pub(super) normal_try_class_pattern_donor_labels: FxHashMap<Label, (Label, Label)>,
     // First records of the original manager cleanup arrays, before line resolution.
@@ -701,6 +705,9 @@ impl ExceptionOwnerProvenance {
                 if instruction.fusion_policy.is_authored_break()
                 && matches!(instruction.operand(), Operand::Forward(label) | Operand::Backward(label)
                     if leading_labels.contains(&label)))
+        }) || self.original_match_join_boundaries.iter().any(|entry| {
+            leading_labels.contains(entry)
+                && all.iter().filter(|item| **item == Item::Label(*entry)).count() == 1
         });
         if source_head {
             // Graph jump targets alone include copied exits. Require the compiler's

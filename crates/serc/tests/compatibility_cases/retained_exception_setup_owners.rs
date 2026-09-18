@@ -191,3 +191,111 @@ fn matches_cpython_marshal_for_try_entry_no_assignment_control() {
 "#;
     common::assert_matches_cpython_marshal(source, "try_entry_no_assignment_control.py");
 }
+
+#[test]
+fn matches_cpython_marshal_for_match_join_try_entry_with_cells() {
+    let source = r"async def f(source, kind, key, skip):
+    container = await source.container(key)
+    match kind:
+        case 0:
+            mode = None
+            tag = None
+        case 1:
+            tag = source.tag(key)
+            mode = source.Mode.CHECK if tag is not None else source.Mode.MISSING
+        case _:
+            raise ValueError(kind)
+    updated = False
+    limits = source.timeouts(container)
+    operation = source.Operation.WRITE
+    excluded = source.exclude(operation.name, container.name)
+    try:
+        transaction: object
+        if skip:
+            transaction = source.empty()
+        else:
+            transaction = source.start(container.name, key=str(key))
+        async with transaction as token:
+            with source.report(container, operation) as tracker, source.track(tracker):
+                def response(value):
+                    nonlocal updated
+                    updated = value
+                result = await source.retry(
+                    lambda: source.commit(container, excluded), response
+                )
+        return result, updated
+    except LookupError:
+        return None
+";
+    common::assert_matches_cpython_marshal(source, "try_entry_captured_cells_managers_target.py");
+}
+
+#[test]
+fn matches_cpython_marshal_for_match_join_try_entry_without_annotation() {
+    let source = r"async def f(source, kind, key, skip):
+    container = await source.container(key)
+    match kind:
+        case 0:
+            mode = None
+            tag = None
+        case 1:
+            tag = source.tag(key)
+            mode = source.Mode.CHECK if tag is not None else source.Mode.MISSING
+        case _:
+            raise ValueError(kind)
+    updated = False
+    limits = source.timeouts(container)
+    operation = source.Operation.WRITE
+    excluded = source.exclude(operation.name, container.name)
+    try:
+        if skip:
+            transaction = source.empty()
+        else:
+            transaction = source.start(container.name, key=str(key))
+        async with transaction as token:
+            with source.report(container, operation) as tracker, source.track(tracker):
+                return await source.commit(token, key, tracker, excluded, limits, mode, tag, updated)
+    except LookupError:
+        return None
+";
+    common::assert_matches_cpython_marshal(source, "try_entry_no_annotation_control.py");
+}
+
+#[test]
+fn matches_cpython_marshal_for_wildcard_call_compound_try_exit_nop() {
+    let source = r#"async def f(value):
+    result = None
+    try:
+        match value:
+            case Item():
+                result = await value.load()
+            case _:
+                reject(value)
+    except Exception:
+        result = "failure"
+        raise
+    finally:
+        if result is not None:
+            record(result)
+"#;
+    common::assert_matches_cpython_marshal(source, "wildcard_call_compound_try_nop_target.py");
+}
+
+#[test]
+fn matches_cpython_marshal_for_wildcard_call_ordinary_try_exit_control() {
+    let source = r#"async def f(value):
+    result = None
+    try:
+        match value:
+            case Item():
+                result = await value.load()
+            case _:
+                reject(value)
+    except Exception:
+        result = "failure"
+        raise
+    if result is not None:
+        record(result)
+"#;
+    common::assert_matches_cpython_marshal(source, "wildcard_call_ordinary_try_nop_control.py");
+}

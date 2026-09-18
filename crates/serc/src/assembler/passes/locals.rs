@@ -53,6 +53,8 @@ pub(super) struct RetainedFinallyOrigin {
     source_prefix: Vec<Instruction>,
     // A recorded try-range end can split the physical graph without ending this array.
     source_exit_alias: Option<Label>,
+    // A conditional may enter the retained jump after an earlier empty original array.
+    conditional_entry: Option<(Label, Instruction)>,
     // The setup-only source certificate also requires this original populated join.
     setup_join: Option<(Label, Instruction)>,
     target_labels: Vec<Label>,
@@ -71,6 +73,8 @@ pub(super) struct SetupFinallyOrigin {
     aliases: [Label; 2],
     previous_entries: Vec<(Label, Option<BorrowCleanupCall>)>,
     previous_alias: bool,
+    // The emitter's normal try exit and its complete populated source array.
+    normal_source: Option<(Label, Vec<Item>)>,
 }
 
 impl OptimizationPipeline {
@@ -145,6 +149,39 @@ impl OptimizationPipeline {
                         if !instruction.jump_policy.borrow_empty_block()
                             && instruction.no_location_policy.borrow_fallthrough() == BorrowFallthrough::Reachable)
                 });
+            // A context-manager call and its enter call keep this nested setup's
+            // original array nonempty. Authenticate the complete synchronous entry
+            // sequence and its recorded protected boundary before extending the span.
+            let manager_call_prefix = matches!(body.get(body.len().saturating_sub(7)..),
+                Some([
+                    Item::Instruction(context_call),
+                    Item::Instruction(copy),
+                    Item::Instruction(exit),
+                    Item::Instruction(swap_two),
+                    Item::Instruction(swap_three),
+                    Item::Instruction(enter),
+                    Item::Instruction(call),
+                ])
+                    if context_call.opcode == CALL
+                        && matches!(context_call.operand(), Operand::Value(_))
+                        && copy.opcode == COPY && copy.operand() == Operand::Value(1)
+                        && exit.opcode == LOAD_SPECIAL && exit.operand() == Operand::Value(1)
+                        && swap_two.opcode == SWAP && swap_two.operand() == Operand::Value(2)
+                        && swap_three.opcode == SWAP && swap_three.operand() == Operand::Value(3)
+                        && enter.opcode == LOAD_SPECIAL && enter.operand() == Operand::Value(0)
+                        && call.opcode == CALL && call.operand() == Operand::Value(0)
+                        && context_call.location.line >= 0
+                        && [copy, exit, swap_two, swap_three, enter, call]
+                            .iter().all(|instruction| instruction.location == context_call.location))
+                && matches!(blocks.get(block_index + 3),
+                    Some([Item::Label(manager), ..])
+                        if provenance.synchronous_with_setups.contains(manager))
+                && body[2..].iter().all(|item| {
+                    matches!(item, Item::Instruction(instruction)
+                        if matches!(instruction.operand(), Operand::Value(_))
+                            && !instruction.jump_policy.borrow_empty_block()
+                            && instruction.no_location_policy.borrow_fallthrough() == BorrowFallthrough::Reachable)
+                });
             if self.borrow_finally_entries.get(entry) != Some(&None)
                 || self.borrow_loop_exit_blocks.contains_key(entry)
                 || !self.borrow_jump_entry_labels.contains(entry)
@@ -199,7 +236,8 @@ impl OptimizationPipeline {
                                                     && !region.is_scope_fallback
                                                     && !region.preserve_lasti
                                             }).count() == 1))
-                    || conditional_call_prefix)
+                    || conditional_call_prefix
+                    || manager_call_prefix)
                 || [pop, nop, first].iter().any(|instruction| {
                     instruction.jump_policy.borrow_empty_block()
                         || instruction.no_location_policy.borrow_fallthrough() != BorrowFallthrough::Reachable
@@ -217,6 +255,100 @@ impl OptimizationPipeline {
             let mut final_prefix = head[..2].to_vec();
             final_prefix.extend_from_slice(setup);
             final_prefix.extend_from_slice(body);
+            let normal_source = if manager_call_prefix {
+                (|| {
+                    // Cold handlers still separate the normal source from its target
+                    // here. Follow the emitter's exact edge before requiring adjacency
+                    // after relocation and redundant-jump removal.
+                    let mut exits = provenance
+                        .compound_try_owner_exits
+                        .iter()
+                        .filter(|&&(_, target)| target == *original);
+                    let &(source_exit, _) = exits.next()?;
+                    if exits.next().is_some() {
+                        return None;
+                    }
+                    let source_exit_index = blocks.iter().position(|block| {
+                        matches!(block.first(), Some(Item::Label(label)) if *label == source_exit)
+                    })?;
+                    let source_blocks =
+                        blocks.get(source_exit_index.checked_sub(1)?..=source_exit_index)?;
+                    let [source, exit] = source_blocks else {
+                        return None;
+                    };
+                    let [Item::Label(exit), Item::Instruction(jump)] = *exit else {
+                        return None;
+                    };
+                    if jump.opcode != crate::target::opcodes::JUMP_FORWARD
+                        || jump.operand() != Operand::Forward(*original)
+                        || jump.fusion_policy.is_authored_break()
+                        || jump.jump_policy.borrow_empty_block()
+                        || jump.jump_policy.retained_nop()
+                            != crate::assembler::ir::RetainedJumpNop::None
+                        || jump.no_location_policy.borrow_fallthrough()
+                            != BorrowFallthrough::Reachable
+                        || self.borrow_finally_jump_sources.get(exit) != Some(&true)
+                        || provenance
+                            .compound_try_owner_exits
+                            .iter()
+                            .filter(|&&(start, target)| start == *exit && target == *original)
+                            .count()
+                            != 1
+                        || targets.contains(exit)
+                        || provenance.block_boundaries.contains(exit)
+                        || self.preserved_block_boundaries.contains(exit)
+                        || self.borrow_unreachable_blocks.contains(exit)
+                    {
+                        return None;
+                    }
+                    let labels = source
+                        .iter()
+                        .take_while(|item| matches!(item, Item::Label(_)))
+                        .count();
+                    if labels == 0 {
+                        return None;
+                    }
+                    let mut prefix = source[..labels].to_vec();
+                    for item in &source[labels..] {
+                        let Item::Instruction(instruction) = item else {
+                            return None;
+                        };
+                        // These emitter slots disappear before borrowing; a real NOP
+                        // or any independent control-flow marker still rejects replay.
+                        if instruction.opcode == NOP
+                            && instruction.fusion_policy.is_converted_pop_block()
+                            && instruction.exception_policy()
+                                == crate::assembler::ExceptionPolicy::EXCLUDE_ALWAYS
+                            && instruction.jump_policy.retained_nop()
+                                == crate::assembler::ir::RetainedJumpNop::None
+                            && !instruction.jump_policy.preserves_explicit_nop()
+                            && !instruction.jump_policy.borrow_empty_block()
+                            && !instruction.no_location_policy.preserves_location()
+                            && instruction.no_location_policy.borrow_fallthrough()
+                                == BorrowFallthrough::Reachable
+                        {
+                            continue;
+                        }
+                        if matches!(instruction.opcode, NOP | NOT_TAKEN)
+                            || !matches!(instruction.operand(), Operand::Value(_))
+                            || ends_scope(instruction.opcode)
+                            || instruction.jump_policy.borrow_empty_block()
+                            || instruction.no_location_policy.borrow_fallthrough()
+                                != BorrowFallthrough::Reachable
+                        {
+                            return None;
+                        }
+                        prefix.push(*item);
+                    }
+                    if prefix.len() == labels {
+                        return None;
+                    }
+                    prefix.push(Item::Label(*exit));
+                    Some((*exit, prefix))
+                })()
+            } else {
+                None
+            };
             origins.push(SetupFinallyOrigin {
                 entry: *entry,
                 aliases,
@@ -233,6 +365,7 @@ impl OptimizationPipeline {
                 setup_offset: 3,
                 setup_can_disappear: nop.location.line == first.location.line,
                 previous_alias: self.borrow_block_aliases.contains(entry),
+                normal_source,
             });
         }
         for origin in &origins {
@@ -247,17 +380,21 @@ impl OptimizationPipeline {
         origins: &[SetupFinallyOrigin],
         entries: &mut FxHashMap<Label, Option<BorrowCleanupCall>>,
         aliases: &mut FxHashSet<Label>,
-    ) {
+    ) -> FxHashMap<Label, Label> {
+        let mut normal_entries = FxHashMap::default();
         for origin in origins {
-            let matches = |prefix: &[Item]| {
+            let matches = |prefix: &[Item], checked_source_len: usize| {
                 items.windows(prefix.len()).any(|actual| {
-                    actual
-                        .iter()
-                        .zip(prefix)
-                        .all(|(actual, expected)| match (actual, expected) {
+                    actual.iter().zip(prefix).enumerate().all(
+                        |(offset, (actual, expected))| match (actual, expected) {
                             (Item::Label(actual), Item::Label(expected)) => actual == expected,
                             (Item::Instruction(actual), Item::Instruction(expected)) => {
-                                actual.opcode == expected.opcode
+                                // Definite-assignment analysis may add a check to this
+                                // same source slot. Target replay stays opcode-literal.
+                                (actual.opcode == expected.opcode
+                                    || (offset < checked_source_len
+                                        && expected.opcode == LOAD_FAST
+                                        && actual.opcode == LOAD_FAST_CHECK))
                                     && actual.operand() == expected.operand()
                                     && actual.location == expected.location
                                     && !actual.jump_policy.borrow_empty_block()
@@ -265,7 +402,8 @@ impl OptimizationPipeline {
                                         == BorrowFallthrough::Reachable
                             }
                             _ => false,
-                        })
+                        },
+                    )
                 })
             };
             let mut erased = origin.final_prefix.clone();
@@ -274,8 +412,21 @@ impl OptimizationPipeline {
             // explicit jump can enter the same-line body after its setup disappears;
             // the existing unreachable marker still forbids ordinary fallthrough.
             let retained = entries.get(&origin.entry).is_some_and(Option::is_some)
-                && (matches(&origin.final_prefix)
-                    || (origin.setup_can_disappear && matches(&erased)));
+                && (matches(&origin.final_prefix, 0)
+                    || (origin.setup_can_disappear && matches(&erased, 0)));
+            if retained && let Some((source, prefix)) = &origin.normal_source {
+                let target = if matches(&origin.final_prefix, 0) {
+                    &origin.final_prefix
+                } else {
+                    &erased
+                };
+                let original_edge = prefix.iter().chain(target).copied().collect::<Vec<_>>();
+                // Only the original jump may disappear between these unchanged
+                // populated arrays. Copies, moved sources and extra labels revoke it.
+                if matches(&original_edge, prefix.len()) {
+                    normal_entries.insert(*source, origin.aliases[0]);
+                }
+            }
             if !retained {
                 for label in origin.aliases {
                     entries.remove(&label);
@@ -286,6 +437,7 @@ impl OptimizationPipeline {
                 }
             }
         }
+        normal_entries
     }
 
     /// Certifies a populated ordinary-try body before its synthetic range-end split.
@@ -573,14 +725,56 @@ impl OptimizationPipeline {
                 } else {
                     None
                 };
-                // Consecutive exception aliases may share one original array. A second
-                // original boundary or an uncertified preserved boundary is not an alias.
-                for (labels, preserved_source, setup_source) in [
-                    (&source_labels, preserved_else_source, setup_source),
-                    (&target_labels, None, None),
+                // A live condition can target the retained jump after an empty
+                // manager-end array. Keep that incoming edge separate: ordinary
+                // fallthrough through the earlier boundary is still disconnected.
+                let conditional_entry = if source_prefix.is_empty()
+                    && source_exit_alias.is_none()
+                    && setup_source.is_none()
+                    && !jump.fusion_policy.is_authored_break()
+                    && source_labels.iter().filter(|label| {
+                        self.exception_owner_provenance.block_boundaries.contains(*label)
+                    }).count() > 1
+                {
+                    let entry = source_labels.iter().rev().copied().find(|label| {
+                        self.exception_owner_provenance.block_boundaries.contains(label)
+                    })?;
+                    let mut incoming = self.graph.iter().filter_map(|(_, block)| {
+                        let items = block.items();
+                        let Item::Instruction(condition) = items.last()? else {
+                            return None;
+                        };
+                        if !is_conditional_jump(condition.opcode)
+                            || condition.operand() != Operand::Forward(entry)
+                            || condition.location != jump.location
+                            || condition.jump_policy.borrow_empty_block()
+                            || condition.no_location_policy.borrow_fallthrough()
+                                != BorrowFallthrough::Reachable
+                        {
+                            return None;
+                        }
+                        let source = items.iter().rev().find_map(|item| match item {
+                            Item::Label(label) => Some(*label),
+                            Item::Instruction(_) => None,
+                        })?;
+                        Some((source, *condition))
+                    });
+                    let entry = incoming.next()?;
+                    if incoming.next().is_some() {
+                        return None;
+                    }
+                    Some(entry)
+                } else {
+                    None
+                };
+                // Consecutive exception aliases may share one original array. Only
+                // the captured conditional can bypass earlier empty source arrays.
+                for (labels, preserved_source, setup_source, conditional_source) in [
+                    (&source_labels, preserved_else_source, setup_source, conditional_entry.is_some()),
+                    (&target_labels, None, None, false),
                 ] {
                     let expected_boundaries = usize::from(setup_source.is_none());
-                    if labels
+                    if (!conditional_source && labels
                         .iter()
                         .filter(|label| {
                             self.exception_owner_provenance
@@ -588,7 +782,7 @@ impl OptimizationPipeline {
                                 .contains(*label)
                         })
                         .count()
-                        != expected_boundaries
+                        != expected_boundaries)
                         || labels.iter().any(|label| {
                             self.preserved_block_boundaries.contains(label)
                                 && Some(*label) != preserved_source
@@ -645,6 +839,7 @@ impl OptimizationPipeline {
                     source_labels,
                     source_prefix,
                     source_exit_alias,
+                    conditional_entry,
                     setup_join,
                     target_labels,
                     target,
@@ -689,6 +884,28 @@ impl OptimizationPipeline {
             })
             .collect::<FxHashMap<_, _>>();
         for origin in origins {
+            if let Some((source, expected)) = origin.conditional_entry {
+                let Some(block) = self.graph.label_block(source) else {
+                    continue;
+                };
+                let source_items = self.graph[block].items();
+                let Some(Item::Instruction(actual)) = source_items.last() else {
+                    continue;
+                };
+                if actual.opcode != expected.opcode
+                    || actual.operand() != expected.operand()
+                    || actual.location != expected.location
+                    || actual.jump_policy.borrow_empty_block()
+                    || actual.no_location_policy.borrow_fallthrough()
+                        != BorrowFallthrough::Reachable
+                    || source_items.iter().rev().find_map(|item| match item {
+                        Item::Label(label) => Some(*label),
+                        Item::Instruction(_) => None,
+                    }) != Some(source)
+                {
+                    continue;
+                }
+            }
             if origin
                 .setup_join
                 .is_some_and(|(join, first)| !self.original_borrow_join_survives(join, first))
@@ -823,7 +1040,12 @@ impl OptimizationPipeline {
                     .last()
                     .expect("one original source label")
             });
-            entries.insert(source, origin.target);
+            entries.insert(
+                origin
+                    .conditional_entry
+                    .map_or(source, |(source, _)| source),
+                origin.target,
+            );
         }
         entries
     }
@@ -2583,7 +2805,7 @@ impl OptimizationPipeline {
                                 .is_some();
                         // A local condition ends this original cleanup array before any
                         // call. Its first load cannot fold or fuse with the following
-                        // conversion/jump, so it can witness a surviving authored-break entry.
+                        // conversion/jump, so it can witness a surviving original jump entry.
                         // Match the complete primitive head; interior NOPs and extra prefixes
                         // must not borrow a witness from a different original array.
                         let primitive_condition = match instructions.as_slice() {
@@ -2644,9 +2866,9 @@ impl OptimizationPipeline {
                                     .filter(|(_, instruction)| instruction.opcode != CALL),
                             );
                         for (index, instruction) in candidates {
-                            // A captured iterator prefix is also nonempty for an ordinary
-                            // original jump. Other alternate witnesses remain restricted to
-                            // the captured authored-break route during traversal.
+                            // Captured calls, iterator prefixes and primitive conditions
+                            // remain nonempty for an ordinary original jump. Suspension
+                            // witnesses retain the authored-break route during traversal.
                             let alternate_finally_witness =
                                 self.borrow_finally_entries.contains_key(&label)
                                     && !scope_exit
@@ -3252,7 +3474,16 @@ impl OptimizationPipeline {
                                         Item::Label(_) => None,
                                     })
                                     .is_some_and(|instruction| {
-                                        !matches!(instruction.opcode, NOP | NOT_TAKEN)
+                                        (!matches!(instruction.opcode, NOP | NOT_TAKEN)
+                                            || (instruction.opcode == NOP
+                                                && items[blocks[block + 1].clone()].iter().any(
+                                                    |item| {
+                                                        matches!(item, Item::Label(label)
+                                                        if borrow_block_aliases.contains(label)
+                                                            && borrow_finally_entries.get(label)
+                                                                .is_some_and(Option::is_some))
+                                                    },
+                                                )))
                                             && !instruction.jump_policy.borrow_empty_block()
                                     })
                         });
@@ -3315,6 +3546,48 @@ impl OptimizationPipeline {
                                 offsets[blocks[block].end] != offsets[blocks[target].start]
                             }))
                 {
+                    // Replay the captured conditional through its sole retained NOP.
+                    // This admission belongs to the live conditional, never to another
+                    // route entering an earlier empty label in the same physical range.
+                    if is_conditional_jump(last.opcode)
+                        && let Some(finally) = items[blocks[block].clone()]
+                            .iter()
+                            .rev()
+                            .find_map(|item| match item {
+                                Item::Label(label) => Some(label),
+                                Item::Instruction(_) => None,
+                            })
+                            .and_then(|source| retained_finally_entries.get(source))
+                        && let Some(finally_block) = label_blocks
+                            .get(usize::try_from(finally.0).unwrap())
+                            .copied()
+                        && finally_block == target + 1
+                        && finally_block < blocks.len()
+                        && {
+                            let mut instructions = items[blocks[target].clone()].iter().filter_map(
+                                |item| match item {
+                                    Item::Instruction(instruction) => Some(instruction),
+                                    Item::Label(_) => None,
+                                },
+                            );
+                            instructions.next().is_some_and(|nop| {
+                                nop.opcode == NOP
+                                    && nop.location == last.location
+                                    && nop.jump_policy.retained_nop()
+                                        == crate::assembler::ir::RetainedJumpNop::DirectTarget
+                                    && !nop.jump_policy.borrow_empty_block()
+                                    && nop.no_location_policy.borrow_fallthrough()
+                                        == BorrowFallthrough::Reachable
+                            }) && instructions.next().is_none()
+                        }
+                        && items[blocks[finally_block].clone()].iter().all(|item| {
+                            !matches!(item, Item::Label(label)
+                                if borrow_unreachable_labels.contains(label)
+                                    && !borrow_finally_entries.contains_key(label))
+                        })
+                    {
+                        pending.push((finally_block, true));
+                    }
                     let for_cleanup_entry = for_iter_enters_original_cleanup(
                         last,
                         label,
@@ -3382,6 +3655,8 @@ impl OptimizationPipeline {
                     // Unlike the fallthrough and conditional paths, a surviving ordinary
                     // jump can enter the original nonempty normal-finally block directly.
                     // Only aliases captured before label merging identify that entry.
+                    // Keyword calls and primitive conditions are already captured from
+                    // the same original array; require their exact surviving witness too.
                     let finally_entry = is_unconditional_jump(last.opcode)
                         // A zero-distance surrogate can represent an empty native
                         // block, so it cannot certify an independent entry.
@@ -3406,9 +3681,33 @@ impl OptimizationPipeline {
                                                     false
                                                 }
                                                 Item::Instruction(instruction) => {
-                                                    at_target
-                                                        && matches!(call.opcode, CALL | GET_ITER)
-                                                        && instruction.opcode == call.opcode
+                                                    if !at_target {
+                                                        return false;
+                                                    }
+                                                    if call.opcode == LOAD_FAST {
+                                                        // The captured primitive condition
+                                                        // witnesses its first live record,
+                                                        // never a later equal local load.
+                                                        if instruction.opcode == NOP
+                                                            && instruction
+                                                                .fusion_policy
+                                                                .is_converted_pop_block()
+                                                            && !instruction
+                                                                .jump_policy
+                                                                .borrow_empty_block()
+                                                            && instruction
+                                                                .no_location_policy
+                                                                .borrow_fallthrough()
+                                                                == BorrowFallthrough::Reachable
+                                                        {
+                                                            return false;
+                                                        }
+                                                        at_target = false;
+                                                    }
+                                                    matches!(
+                                                        call.opcode,
+                                                        CALL | CALL_KW | GET_ITER | LOAD_FAST
+                                                    ) && instruction.opcode == call.opcode
                                                         && instruction.operand()
                                                             == Operand::Value(call.argument)
                                                         && instruction.location == call.location

@@ -108,3 +108,71 @@ fn matches_cpython_named_handler_finally_false_join_location_single_edge_control
         "named_handler_finally_false_join_location_single_edge_control.py",
     );
 }
+
+#[test]
+fn coroutine_named_recovery_raising_guard_keeps_cleanup_unlocated() {
+    for (filename, source) in [
+        (
+            "async_named_recovery_raising_guard_cleanup.py",
+            r"async def handle(ready, attempt, recover, finish, close):
+    try:
+        try:
+            result = await attempt()
+        except Exception as error:
+            result = error
+            if ready:
+                marker = result
+                try:
+                    status = await recover(marker)
+                except Exception as recovery_error:
+                    raise RuntimeError('recovery failed') from recovery_error
+                if status != 0:
+                    raise RuntimeError('bad status')
+        finish(result)
+    finally:
+        await close()
+",
+        ),
+        (
+            "async_named_linear_raising_guard_cleanup_control.py",
+            r"async def handle(ready, attempt, recover, finish, close):
+    try:
+        try:
+            result = await attempt()
+        except Exception as error:
+            result = error
+            if ready:
+                marker = result
+                status = await recover(marker)
+                if status != 0:
+                    raise RuntimeError('bad status')
+        finish(result)
+    finally:
+        await close()
+",
+        ),
+        (
+            "async_named_recovery_return_guard_cleanup_control.py",
+            r"async def handle(ready, attempt, recover, finish, close):
+    try:
+        try:
+            result = await attempt()
+        except Exception as error:
+            result = error
+            if ready:
+                marker = result
+                try:
+                    status = await recover(marker)
+                except Exception as recovery_error:
+                    return recovery_error
+                if status != 0:
+                    raise RuntimeError('bad status')
+        finish(result)
+    finally:
+        await close()
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

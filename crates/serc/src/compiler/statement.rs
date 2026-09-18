@@ -15306,7 +15306,12 @@ impl Compiler<'_> {
             {
                 // The enclosing finally does not remove this inner try/except POP_BLOCK.
                 // Its owner origin is independent of ordinary-try copy-plan eligibility.
-                self.assembler.record_compound_try_owner_exit(try_end, end);
+                let wildcard_call_location = (!statement.is_star)
+                    .then(|| normal_try_wildcard_call_exit(&statement.body))
+                    .flatten()
+                    .map(|range| self.source_location(range));
+                self.assembler
+                    .record_compound_try_owner_exit(try_end, end, wildcard_call_location);
             }
             if retained_finally_normal_source
                 && statement.handlers.iter().any(|handler| {
@@ -15417,7 +15422,16 @@ impl Compiler<'_> {
                     && tail.elif_else_clauses.is_empty()
                     && (matches!(tail.body.last(), Some(Stmt::With(_)))
                         || matches!(tail.body.last(), Some(Stmt::Try(nested))
-                            if nested.orelse.is_empty()
+                            if (nested.orelse.is_empty()
+                                    || (!nested.is_star
+                                        && suite_has_linear_borrow_fallthrough(&nested.body)
+                                        && suite_has_linear_borrow_fallthrough(&nested.orelse)
+                                        && matches!(nested.handlers.as_slice(), [handler]
+                                            if handler.as_except_handler().is_some_and(|handler| {
+                                                handler.type_.is_some()
+                                                    && !suite_contains_yield(&handler.body)
+                                                    && suite_has_plain_recovery_fallthrough(&handler.body, false)
+                                            }))))
                                 && nested.finalbody.is_empty()
                                 && (suite_ends_in_empty_try_exit_block(&nested.body, false)
                                     || (!nested.is_star
@@ -15442,6 +15456,9 @@ impl Compiler<'_> {
                 // A linear nested body also leaves this join empty when its recovery has
                 // one normal cleanup edge. That recovery remains cold, including named
                 // exception cleanup, and cannot populate the normal exit's original array.
+                // A linear nested else has the same empty shared join when its single
+                // recovery has only one normal path. Its work stays before the original
+                // outer POP_BLOCK; it cannot populate that unlocated false-edge array.
                 // Keep the separate pass-only rule for retained conditional return exits.
                 // A sole false edge retains a located NOP and its original borrow route.
                 self.assembler.prevent_borrow_fallthrough_reachability(end);
@@ -15839,6 +15856,44 @@ impl Compiler<'_> {
                 // original empty join stops borrowing, unless a retained NOP keeps it live.
                 self.assembler
                     .mark_borrow_empty_block_if_unretained(normal_exit);
+            }
+            if handlers_terminate
+                && statement.orelse.is_empty()
+                && statement.finalbody.is_empty()
+                && body_ends_in_nop
+                && self
+                    .control
+                    .statements
+                    .current_statement_followed_by_name_return
+                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                && self.control.loops.contexts.is_empty()
+                && self.control.withs.active_with_exits.is_empty()
+                && self.control.exceptions.active_exception_handlers.is_empty()
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .is_empty()
+                && self.control.finally.active_normal_finally_bodies == 0
+                && self.control.finally.active_finally_try_bodies == 0
+                && let Some(Stmt::If(branch)) = statement.body.last()
+                && early_condition_truthiness(&branch.test).is_none()
+                && original_condition_has_unique_jump_target(&branch.test, false)
+                && let [otherwise] = branch.elif_else_clauses.as_slice()
+                && otherwise.test.is_none()
+                && let [Stmt::Pass(pass)] = otherwise.body.as_slice()
+                && self.assembler.last_instruction_location()
+                    == Some(self.source_location(pass.range))
+                && let Some(Stmt::For(iterator)) = branch.body.last()
+                && !iterator.is_async
+                && iterator.orelse.is_empty()
+                && !suite_contains_loop_break(&iterator.body)
+            {
+                // The iterator cleanup receives its own return copy before the normal
+                // try exit. The pass arm retains the original range-end identity after
+                // its empty conditional join; that array must stay outside borrowing.
+                // Mark this source label, not the shared return target or copied labels.
+                self.assembler.prevent_borrow_reachability(try_end);
             }
             if terminal_handler_exit
                 && !statement.finalbody.is_empty()
@@ -16818,6 +16873,50 @@ impl Compiler<'_> {
                         == Some(self.control.loops.contexts.len()))
                     && (self.control.finally.active_finally_try_bodies > 0
                         || !self.control.withs.active_with_exits.is_empty()));
+            // The outer guard and the final raising guard both fall through to
+            // the named cleanup. A nested recovery that raises or directly returns
+            // its exception name adds no normal donor. Its successful await rejoins
+            // before that final guard; a return's copied finalizer exits separately.
+            let handler_has_terminating_recovery_join = handler.name.is_some()
+                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                    == CO_COROUTINE
+                && self.control.withs.active_with_exits.is_empty()
+                && self.control.loops.contexts.is_empty()
+                && self.control.finally.active_normal_finally_bodies == 0
+                && self.control.finally.active_finally_end_blocks == 0
+                && self.control.finally.active_copied_finally_bodies == 0
+                && matches!(handler.body.last(), Some(Stmt::If(tail))
+                if tail.elif_else_clauses.is_empty()
+                    && condition_has_linear_runtime_leaves(&tail.test)
+                    && !expression_suspends_current_scope(&tail.test)
+                    && tail.body.split_last().is_some_and(|(last, leading)| {
+                        matches!(last, Stmt::If(guard)
+                            if guard.elif_else_clauses.is_empty()
+                                && condition_has_linear_runtime_leaves(&guard.test)
+                                && !expression_suspends_current_scope(&guard.test)
+                                && matches!(guard.body.as_slice(), [Stmt::Raise(_)]))
+                            && leading.split_last().is_some_and(|(recovery, prefix)| {
+                                (prefix.is_empty() || suite_has_linear_borrow_fallthrough(prefix))
+                                    && matches!(recovery, Stmt::Try(recovery)
+                                        if !recovery.is_star
+                                            && recovery.orelse.is_empty()
+                                            && recovery.finalbody.is_empty()
+                                            && suite_has_linear_borrow_fallthrough(&recovery.body)
+                                            && !recovery.handlers.is_empty()
+                                            && recovery.handlers.iter().all(|handler| {
+                                                handler.as_except_handler().is_some_and(|handler| {
+                                                    handler.type_.is_some()
+                                                        && (matches!(handler.body.as_slice(), [Stmt::Raise(_)])
+                                                            && suite_has_linear_raise_exit(&handler.body)
+                                                            || matches!(handler.body.as_slice(), [Stmt::Return(return_)]
+                                                                if matches!(return_.value.as_deref(), Some(Expr::Name(value))
+                                                                    if handler.name.as_ref().is_some_and(|name| {
+                                                                        value.id.as_str() == name.as_str()
+                                                                    }))))
+                                                })
+                                            }))
+                            })
+                    }));
             // A normal continuation can outlive the currently lowered suite. It still
             // shares this cleanup's condition and body exits. A surrounding cleanup beyond
             // a loop backedge is different: each copied backedge keeps its predecessor span.
@@ -16852,6 +16951,7 @@ impl Compiler<'_> {
                         && tail.body.iter().all(|statement| match statement {
                             Stmt::If(_) => !tail.body.iter().any(|statement| matches!(statement, Stmt::Assert(_)))
                                 && (handler_cleanup_has_runtime_if_join(tail)
+                                    || handler_has_terminating_recovery_join
                                     // A final call follows every normal prefix branch and supplies
                                     // a concrete predecessor for the outer shared cleanup.
                                     || (condition_has_only_runtime_tests(&tail.test)
@@ -18876,6 +18976,9 @@ impl Compiler<'_> {
                     && loop_statement.orelse.is_empty()
                     && suite_contains_borrow_reachable_conditional_loop_break(&loop_statement.body)
                     && (suite_has_linear_live_conditional_break(&loop_statement.body)
+                        || (runtime_coroutine_break_context
+                            && condition_has_linear_runtime_leaves(&loop_statement.test)
+                            && suite_has_generator_prefix_live_break(&loop_statement.body))
                         || (matches!(self.unit.scope, Scope::Function { .. })
                             && self.control.loops.contexts.is_empty()
                             && self.control.withs.active_with_exits.is_empty()
@@ -25135,6 +25238,25 @@ fn suite_contains_conditional_nested_recovery(body: &[Stmt]) -> bool {
                 && !statement.handlers.is_empty())
     }
 
+    // A terminating nested recovery leaves an empty original cleanup array even
+    // when its normal arm continues with assignments. Those later instructions
+    // do not repopulate the cold cleanup after the handler blocks move away.
+    let contains_terminal_recovery = |body: &[Stmt]| {
+        body.iter().any(|statement| {
+            matches!(statement, Stmt::Try(recovery)
+                if !recovery.is_star
+                    && recovery.orelse.is_empty()
+                    && recovery.finalbody.is_empty()
+                    && suite_has_linear_borrow_fallthrough(&recovery.body)
+                    && recovery.handlers.iter().all(|handler| {
+                        handler.as_except_handler().is_some_and(|handler| handler.type_.is_some())
+                    })
+                    && recovery.handlers.iter().any(|handler| {
+                        handler.as_except_handler().is_some_and(|handler| suite_terminates(&handler.body))
+                    }))
+        })
+    };
+
     body.iter().any(|statement| {
         let Stmt::If(conditional) = statement else {
             return false;
@@ -25150,7 +25272,15 @@ fn suite_contains_conditional_nested_recovery(body: &[Stmt]) -> bool {
         {
             return false;
         }
-        (!conditional.elif_else_clauses.is_empty() && ends_in_recovery(&conditional.body))
+        std::iter::once(conditional.body.as_slice())
+            .chain(
+                conditional
+                    .elif_else_clauses
+                    .iter()
+                    .map(|clause| clause.body.as_slice()),
+            )
+            .any(contains_terminal_recovery)
+            || (!conditional.elif_else_clauses.is_empty() && ends_in_recovery(&conditional.body))
             || conditional
                 .elif_else_clauses
                 .iter()
@@ -26917,6 +27047,33 @@ fn suite_has_linear_live_conditional_break(body: &[Stmt]) -> bool {
         }
     }
     false
+}
+
+/// Certifies a lazy generator creation before an otherwise linear early break.
+fn suite_has_generator_prefix_live_break(body: &[Stmt]) -> bool {
+    let Some((index, Stmt::Assign(assignment))) = body.iter().enumerate().find(|(_, statement)| {
+        !suite_has_linear_borrow_fallthrough(std::slice::from_ref(*statement))
+    }) else {
+        return false;
+    };
+    // Only the first iterable runs in this scope. Generator filters and the
+    // element expression belong to the nested code object, so they do not split
+    // this assignment's original array. Keep eager comprehensions excluded.
+    matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+        && matches!(assignment.value.as_ref(), Expr::Call(call)
+            if matches!(call.func.as_ref(), Expr::Name(_))
+                && call.arguments.keywords.is_empty()
+                && matches!(call.arguments.args.as_ref(), [Expr::Generator(generator), Expr::NoneLiteral(_)]
+                    if matches!(generator.elt.as_ref(), Expr::Name(_))
+                        && matches!(generator.generators.as_slice(), [comprehension]
+                            if !comprehension.is_async
+                                && comprehension.ifs.iter().all(|condition| {
+                                    !expression_suspends_current_scope(condition)
+                                })
+                                && matches!(&comprehension.target, Expr::Name(_))
+                                && !expression_contains_inline_branch(&comprehension.iter)
+                                && !expression_suspends_current_scope(&comprehension.iter))))
+        && suite_has_linear_live_conditional_break(&body[index + 1..])
 }
 
 // This certificate is used only for a terminal loop in a finally-protected suite.
