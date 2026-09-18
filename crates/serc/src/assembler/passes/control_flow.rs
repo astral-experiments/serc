@@ -1200,6 +1200,94 @@ impl OptimizationPipeline {
                 .then_some(*entry)
             })
             .collect::<FxHashSet<_>>();
+        // CPython copies an original unlocated join onto a break before copying
+        // its small return. Threading through that join must keep the break's
+        // own replaced-jump NOP, even though the return has a different location.
+        let mut unlocated_return_join_heads = FxHashSet::default();
+        for (_, block) in graph.iter() {
+            let Some((Item::Instruction(jump), labels)) = block.items().split_last() else {
+                continue;
+            };
+            let Operand::Forward(target) = jump.operand() else {
+                continue;
+            };
+            if jump.opcode != JUMP_FORWARD
+                || jump.location != SourceLocation::NONE
+                || !jump.no_location_policy.preserves_location()
+                || jump.pre_fold_extra_instructions() != 0
+                || jump.local_policy.hidden_exception_owner_slots() != 0
+                || jump.exception_policy() != super::super::ExceptionPolicy::default()
+                || jump.fusion_policy.is_authored_break()
+                || labels.is_empty()
+                || labels.iter().any(|item| {
+                    !matches!(item, Item::Label(label)
+                    if !self.original_nop_targets.contains(label)
+                        && !self.borrow_block_aliases.contains(label))
+                })
+                || !labels.iter().any(|item| {
+                    matches!(item, Item::Label(label)
+                    if self.exception_owner_provenance.source_boundaries.contains(label)
+                        && self.exception_owner_provenance.block_boundaries.contains(label))
+                })
+            {
+                continue;
+            }
+            let Some(target_block) = graph.label_block(target) else {
+                continue;
+            };
+            let Some(return_) = graph[target_block].last_instruction() else {
+                continue;
+            };
+            let mut target_width = 0;
+            if return_.opcode != RETURN_VALUE
+                || return_.location.line < 0
+                || !graph[target_block].items().iter().all(|item| match item {
+                    Item::Label(_) => target_width == 0,
+                    Item::Instruction(instruction) => {
+                        // LOAD_GLOBAL's fused PUSH_NULL still occupies an original slot.
+                        target_width += 1 + usize::from(
+                            instruction.opcode == LOAD_GLOBAL
+                                && matches!(instruction.operand(), Operand::Value(argument)
+                                if argument & 1 != 0),
+                        );
+                        target_width <= 4
+                            && matches!(instruction.operand(), Operand::Value(_))
+                            && instruction.location.line == return_.location.line
+                            && instruction.pre_fold_extra_instructions() == 0
+                            && instruction.local_policy.hidden_exception_owner_slots() == 0
+                            && instruction.exception_policy()
+                                == super::super::ExceptionPolicy::default()
+                    }
+                })
+            {
+                continue;
+            }
+            let Item::Label(entry) = labels[0] else {
+                unreachable!("validated original join labels");
+            };
+            let join_index = label_offsets[&entry];
+            let return_start = label_offsets[&target];
+            let return_end = return_start
+                + graph[target_block]
+                    .items()
+                    .iter()
+                    .filter(|item| matches!(item, Item::Instruction(_)))
+                    .count();
+            // An earlier inlined comprehension may have its own recovery region.
+            // Only coverage of this original join or the copied return matters.
+            if region_ranges.iter().any(|range| {
+                range.contains(&join_index)
+                    || (range.start < range.end
+                        && range.start < return_end
+                        && return_start < range.end)
+            }) {
+                continue;
+            }
+            unlocated_return_join_heads.extend(labels.iter().filter_map(|item| match item {
+                Item::Label(label) => Some(*label),
+                Item::Instruction(_) => None,
+            }));
+        }
         let authored_finally_break_targets = Self::take_authored_finally_break_threading_targets(
             &self.graph,
             &mut self.borrow_authored_finally_break_origins,
@@ -1358,12 +1446,17 @@ impl OptimizationPipeline {
             }
             if authored_break_copy_nop
                 && threaded_jump_count == 1
-                && (crosses_normal_try_exit || folded_loop_return_heads.contains(&original_target))
+                && (crosses_normal_try_exit
+                    || folded_loop_return_heads.contains(&original_target)
+                    || (unlocated_return_join_heads.contains(&original_target)
+                        && region_ranges
+                            .iter()
+                            .all(|range| !range.contains(&source_index))))
                 && matches!(operand, Operand::Forward(_))
                 && !instruction.jump_policy.is_interruptible()
             {
                 // A break's direct copy request survives the original POP_BLOCK/JUMP
-                // exit. The small-exit copier still decides whether the target fits,
+                // or unlocated return join. The copier still decides whether the target fits,
                 // and gives the copied NOP this break's own location and exit owner.
                 instruction.jump_policy.retain_nop_for_direct_target();
             }

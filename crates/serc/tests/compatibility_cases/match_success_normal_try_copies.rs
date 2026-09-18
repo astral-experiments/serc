@@ -242,3 +242,121 @@ fn matches_cpython_async_for_match_success_continuation_control() {
         "async_for_match_success_continuation_control.py",
     );
 }
+#[test]
+fn matches_cpython_outer_if_match_return_join_target() {
+    let source = r"def f(items, mode, active, ready, report):
+    if active:
+        match mode:
+            case Mode.FIRST:
+                report(items)
+                if ready:
+                    return [items[0]]
+            case Mode.SEARCH:
+                found = None
+                for item in items:
+                    if item.ready:
+                        found = item
+                        break
+                if found is not None:
+                    return [found]
+                else:
+                    report(items)
+            case Mode.ALL:
+                report(items)
+                pass
+            case _:
+                raise ValueError(mode)
+    return items
+";
+    common::assert_matches_cpython_marshal(source, "outer_if_match_return_join_target.py");
+}
+
+#[test]
+fn matches_cpython_direct_match_return_join_control() {
+    let source = r"def f(items, mode, active, ready, report):
+    match mode:
+        case Mode.FIRST:
+            report(items)
+            if ready:
+                return [items[0]]
+        case Mode.SEARCH:
+            found = None
+            for item in items:
+                if item.ready:
+                    found = item
+                    break
+            if found is not None:
+                return [found]
+            else:
+                report(items)
+        case Mode.ALL:
+            report(items)
+            pass
+        case _:
+            raise ValueError(mode)
+    return items
+";
+    common::assert_matches_cpython_marshal(source, "direct_match_return_join_control.py");
+}
+
+#[test]
+fn matches_cpython_outer_if_match_literal_return_control() {
+    let source = r"def f(items, mode, active, ready, report):
+    if active:
+        match mode:
+            case Mode.FIRST:
+                report(items)
+                if ready:
+                    return [items[0]]
+            case Mode.SEARCH:
+                found = None
+                for item in items:
+                    if item.ready:
+                        found = item
+                        break
+                if found is not None:
+                    return [found]
+                else:
+                    report(items)
+            case Mode.ALL:
+                report(items)
+                pass
+            case _:
+                raise ValueError(mode)
+    return None
+";
+    common::assert_matches_cpython_marshal(source, "outer_if_match_literal_return_control.py");
+}
+
+#[test]
+fn matches_cpython_outer_if_match_elif_name_return_control() {
+    let source = r"def f(mode, active, first, second, work, items):
+    if active:
+        match mode:
+            case Mode.FIRST:
+                work(items)
+            case Mode.LAST:
+                if first:
+                    work(items)
+                elif second:
+                    work(items)
+    return items
+";
+    common::assert_matches_cpython_marshal(source, "outer_if_match_elif_name_return_control.py");
+}
+
+#[test]
+fn matches_cpython_direct_match_elif_name_return_control() {
+    let source = r"def f(mode, active, first, second, work, items):
+    match mode:
+        case Mode.FIRST:
+            work(items)
+        case Mode.LAST:
+            if first:
+                work(items)
+            elif second:
+                work(items)
+    return items
+";
+    common::assert_matches_cpython_marshal(source, "direct_match_elif_name_return_control.py");
+}

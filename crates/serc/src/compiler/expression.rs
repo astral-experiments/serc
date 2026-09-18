@@ -4724,10 +4724,25 @@ impl Compiler<'_> {
     fn emit_multiline_none_filter_nops(
         &mut self,
         comparison: &ruff_python_ast::ExprCompare,
+        element_location: SourceLocation,
     ) -> Result<(), CompileError> {
         let left_location = self.source_location(comparison.left.range());
         let none_location = self.source_location(comparison.comparators[0].range());
         if left_location.line == none_location.line {
+            let comparison_location = self.source_location(comparison.range);
+            if element_location.line != comparison_location.line
+                && self.assembler.at_empty_borrow_block()
+                && self
+                    .assembler
+                    .current_block_last_instruction_location()
+                    .is_none()
+                && self.assembler.current_block_starts_at_source_boundary()
+            {
+                // None specialization leaves a comparison-line NOP at an empty original
+                // join. The following filter jump carries the distinct element line.
+                self.assembler.set_location(comparison_location);
+                self.emit(NOP, 0, 0)?;
+            }
             return Ok(());
         }
 
@@ -4837,7 +4852,10 @@ impl Compiler<'_> {
         {
             self.compile_expression(&comparison.left)?;
             self.add_constant(Constant::None)?;
-            self.emit_multiline_none_filter_nops(comparison)?;
+            self.emit_multiline_none_filter_nops(
+                comparison,
+                self.source_location(element.range()),
+            )?;
             let exclusion_start = self.assembler.label();
             self.assembler.mark(exclusion_start);
             self.assembler
@@ -5050,7 +5068,7 @@ impl Compiler<'_> {
         {
             self.compile_expression(&comparison.left)?;
             self.add_constant(Constant::None)?;
-            self.emit_multiline_none_filter_nops(comparison)?;
+            self.emit_multiline_none_filter_nops(comparison, element_location)?;
             let exclusion_start = self.assembler.label();
             self.assembler.mark(exclusion_start);
             self.assembler.set_location(element_location);
@@ -5483,7 +5501,7 @@ impl Compiler<'_> {
         {
             self.compile_expression(&comparison.left)?;
             self.add_constant(Constant::None)?;
-            self.emit_multiline_none_filter_nops(comparison)?;
+            self.emit_multiline_none_filter_nops(comparison, element_location)?;
             let exclusion_start = self.assembler.label();
             self.assembler.mark(exclusion_start);
             self.assembler.set_location(element_location);

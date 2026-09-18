@@ -103,3 +103,62 @@ def yielding_loop_control(values, suffix):
 "#;
     common::assert_matches_cpython_marshal(source, "multiline_comprehension_filter_owners.py");
 }
+
+#[test]
+fn matches_cpython_marshal_for_multiline_short_circuit_none_filter_target() {
+    let source = r"async def f(load):
+    rows = await load()
+    return sorted({
+        (row.primary or str(row.fallback))
+        for row in rows
+        if (row.primary or row.fallback) is not None
+    })
+";
+    common::assert_matches_cpython_marshal(source, "multiline_short_circuit_none_filter_target.py");
+}
+
+#[test]
+fn matches_cpython_marshal_for_same_line_short_circuit_none_filter_control() {
+    let source = r"async def f(load):
+    rows = await load()
+    return sorted({(row.primary or str(row.fallback)) for row in rows if (row.primary or row.fallback) is not None})
+";
+    common::assert_matches_cpython_marshal(
+        source,
+        "same_line_short_circuit_none_filter_control.py",
+    );
+}
+
+#[test]
+fn matches_cpython_marshal_for_multiline_nested_short_circuit_none_filter_target() {
+    let source = r"def f(rows, missing):
+    if missing:
+        return [
+            row
+            for row in rows
+            if (row.primary or (row.group.key if row.group else None)) is None
+        ]
+    return [
+        row
+        for row in rows
+        if (row.primary or (row.group.key if row.group else None)) is not None
+    ]
+";
+    common::assert_matches_cpython_marshal(
+        source,
+        "multiline_nested_short_circuit_none_filter_target.py",
+    );
+}
+
+#[test]
+fn matches_cpython_marshal_for_same_line_nested_short_circuit_none_filter_control() {
+    let source = r"def f(rows, missing):
+    if missing:
+        return [row for row in rows if (row.primary or (row.group.key if row.group else None)) is None]
+    return [row for row in rows if (row.primary or (row.group.key if row.group else None)) is not None]
+";
+    common::assert_matches_cpython_marshal(
+        source,
+        "same_line_nested_short_circuit_none_filter_control.py",
+    );
+}

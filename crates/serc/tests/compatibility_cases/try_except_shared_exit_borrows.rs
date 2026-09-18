@@ -1167,3 +1167,101 @@ fn matches_cpython_borrows_after_recovery_value_matches() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_borrows_after_iterator_reduction_and_recovery() {
+    for (source, filename) in [
+        (
+            r#"async def collect(stream, check, report):
+    values = []
+    try:
+        async for item in stream:
+            if item < 0:
+                raise ValueError(item)
+            elif item:
+                values.append(item)
+                matched = any(value > 0 and check(value) for value in values)
+                if matched:
+                    break
+        report(values)
+        report(len(values))
+        return values
+    except ValueError:
+        report("recovered")
+    return []
+"#,
+            "async_reduction_assignment_terminal_break_target.py",
+        ),
+        (
+            r#"async def collect(stream, check, report):
+    values = []
+    try:
+        async for item in stream:
+            if item < 0:
+                raise ValueError(item)
+            elif item:
+                values.append(item)
+                matched = check(values)
+                if matched:
+                    break
+        report(values)
+        report(len(values))
+        return values
+    except ValueError:
+        report("recovered")
+    return []
+"#,
+            "async_linear_assignment_terminal_break_control.py",
+        ),
+        (
+            r#"def collect(source, accept, report):
+    found = False
+    values = []
+    try:
+        if source.items is not None:
+            for item in source.items:
+                content = getattr(item, "content", None)
+                if accept(content):
+                    found = True
+                    try:
+                        key = getattr(content, "key", None)
+                        value = getattr(content, "value", None)
+                        if isinstance(key, str) and isinstance(value, str) and value:
+                            values.append((key, value))
+                    except Exception:
+                        pass
+                    break
+    except Exception:
+        found = False
+    report(found, values)
+    if found and values:
+        return values
+    return []
+"#,
+            "guarded_iterator_pass_recovery_break_target.py",
+        ),
+        (
+            r#"def collect(source, accept, report):
+    found = False
+    values = []
+    try:
+        if source.items is not None:
+            for item in source.items:
+                content = getattr(item, "content", None)
+                if accept(content):
+                    found = True
+                    report(content)
+                    break
+    except Exception:
+        found = False
+    report(found, values)
+    if found and values:
+        return values
+    return []
+"#,
+            "guarded_iterator_linear_break_control.py",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

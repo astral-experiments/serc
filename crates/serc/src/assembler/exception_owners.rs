@@ -54,9 +54,11 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) retained_normal_pop_blocks: FxHashMap<Label, RetainedNormalPopBlock>,
     pub(super) original_normal_finally_arrays: Vec<OriginalNormalFinallyArray>,
     pub(super) normal_finally_none_prefixes: Vec<(Instruction, Instruction, Instruction)>,
+    pub(super) normal_finally_truth_prefixes: Vec<[Instruction; 4]>,
     pub(super) copied_return_none_prefixes: Vec<CopiedReturnNonePrefix>,
     pub(super) copied_return_pop_prefixes: Vec<CopiedReturnPopPrefix>,
     pub(super) copied_return_truth_prefixes: Vec<CopiedReturnTruthPrefix>,
+    pub(super) copied_return_call_prefixes: Vec<CopiedReturnCallPrefix>,
     pub(super) copied_handler_return_none_prefixes: Vec<(Label, [Instruction; 6])>,
     pub(super) copied_manager_return_none_prefixes: Vec<CopiedManagerReturnNonePrefix>,
     pub(super) retained_manager_return_none_prefixes: Vec<RetainedManagerReturnNonePrefix>,
@@ -194,6 +196,16 @@ pub(super) struct CopiedReturnNonePrefix {
 pub(super) struct CopiedReturnPopPrefix {
     pub(super) entry: Label,
     pub(super) records: [Instruction; 3],
+}
+
+/// A constant return's original source entry and global-attribute truth call.
+#[derive(Debug)]
+pub(super) struct CopiedReturnCallPrefix {
+    pub(super) entry: Label,
+    pub(super) return_nop: Instruction,
+    pub(super) pops: [Instruction; 2],
+    pub(super) prefix: [Instruction; 5],
+    pub(super) condition: Instruction,
 }
 
 /// A constant return's original POP pair and complete local truthiness test.
@@ -4580,6 +4592,38 @@ impl LayoutAssembler {
                     {
                         owners.insert(instruction_index, decision);
                     }
+                    // A retained return POP can hide two earlier NULL POP records.
+                    // Its captured call prefix proves that sufficiently early compaction
+                    // reuses the preceding try's array, without restoring the POP epoch.
+                    if instruction.opcode == NOT_TAKEN
+                        && instruction.exception_policy()
+                            == super::ExceptionPolicy::NoneDynamicCondition
+                        && owner_history_exact
+                        && tail.insertions == 0
+                        && tail.late_removals == 0
+                        && tail.post_compaction_fusions == 0
+                        && owners
+                            .get(&instruction_index)
+                            .is_none_or(|owner| !owner.definitive)
+                        && let Some(region) = self.copied_return_call_parent_owner(
+                            instruction_index,
+                            original_array_start,
+                            tail,
+                            &indexed_instructions,
+                            &label_positions,
+                            &jump_targets,
+                        )
+                    {
+                        owners.insert(
+                            instruction_index,
+                            ExceptionOwnerDecision {
+                                has_owner: true,
+                                source_region: Some(region),
+                                definitive: true,
+                                override_existing: true,
+                            },
+                        );
+                    }
                     // Resolve the exact normal-finally None prefix before a marker's
                     // range-end label can erase the preceding try's array certificate.
                     let original_none_marker =
@@ -4620,12 +4664,61 @@ impl LayoutAssembler {
                         } else {
                             None
                         };
+                    // A truth condition has the same authored normal POP, but its
+                    // separate TO_BOOL leaves the marker one record later. Resolve
+                    // its exact captured prefix before the marker's exclusion label.
+                    let original_truth_marker = if matches!(
+                        instruction.opcode,
+                        crate::target::opcodes::POP_JUMP_IF_FALSE
+                            | crate::target::opcodes::POP_JUMP_IF_TRUE
+                    ) && owner_history_exact
+                        && retained_epoch_known
+                        && pop_slot_epoch_known
+                        && tail.insertions == 0
+                        && tail.late_removals == 0
+                        && tail.post_compaction_fusions == 0
+                        && instruction_index >= 2
+                        && ended_owned_prefix.is_some_and(|(start, end, _, _)| {
+                            start >= original_array_start && end == instruction_index - 2
+                        })
+                        && ended_pop_slot.is_some_and(|(start, _, width)| {
+                            start == instruction_index - 2 && width == 1
+                        })
+                        && self
+                            .exception_owner_provenance
+                            .normal_finally_truth_prefixes
+                            .iter()
+                            .filter(|[_, original_load, original_to_bool, original_condition]| {
+                                let load = *indexed_instructions[instruction_index - 2];
+                                let mut expected_load = *original_load;
+                                expected_load
+                                    .local_policy
+                                    .add_hidden_exception_owner_slots(1);
+                                if load.opcode == crate::target::opcodes::LOAD_FAST_BORROW {
+                                    expected_load.opcode = load.opcode;
+                                }
+                                load == expected_load
+                                    && *indexed_instructions[instruction_index - 1]
+                                        == *original_to_bool
+                                    && instruction == original_condition
+                            })
+                            .count()
+                            == 1
+                    {
+                        indexed_instructions
+                            .get(instruction_index + 1)
+                            .filter(|marker| marker.opcode == NOT_TAKEN)
+                            .map(|marker| (instruction_index + 1, **marker))
+                    } else {
+                        None
+                    };
                     // A normal cleanup can share its original array with the preceding try.
                     // If compaction skips the entire cleanup suffix, the marker reuses a slot
                     // in that earlier protected prefix, rather than its current condition.
                     if let Some((marker_index, marker)) = (instruction.opcode == NOT_TAKEN)
                         .then_some((instruction_index, *instruction))
                         .or(original_none_marker)
+                        .or(original_truth_marker)
                         && marker.exception_policy().exclusion() == super::ExceptionExclusion::None
                         && matches!(
                             marker.exception_policy().owner(),
@@ -7108,6 +7201,97 @@ impl LayoutAssembler {
             && !owner.preserve_lasti
             && owner.target == handler
             && self.exception_regions[current].is_scope_fallback)
+            .then_some(region)
+    }
+
+    /// Resolves only a captured return call whose appended cell precedes its whole cleanup.
+    fn copied_return_call_parent_owner(
+        &self,
+        marker: usize,
+        array: usize,
+        tail: ExceptionOwnerTail,
+        instructions: &[&Instruction],
+        positions: &FxHashMap<Label, usize>,
+        jump_targets: &FxHashSet<Label>,
+    ) -> Option<usize> {
+        let pop = marker.checked_sub(7)?;
+        if pop <= array {
+            return None;
+        }
+        let provenance = &self.exception_owner_provenance;
+        let mut matches = provenance
+            .copied_return_call_prefixes
+            .iter()
+            .filter(|origin| {
+                let mut expected_pop = origin.pops[1];
+                expected_pop
+                    .local_policy
+                    .add_hidden_exception_owner_slots(2);
+                positions.get(&origin.entry) == Some(&array)
+                    && provenance.source_boundaries.contains(&origin.entry)
+                    && provenance.block_boundaries.contains(&origin.entry)
+                    && !provenance
+                        .retired_normal_try_copy_labels
+                        .contains(&origin.entry)
+                    && !provenance.normal_try_copy_blocks.contains(&origin.entry)
+                    && !provenance
+                        .normal_try_copy_internal_labels
+                        .contains(&origin.entry)
+                    && self
+                        .items
+                        .iter()
+                        .filter(|item| **item == Item::Label(origin.entry))
+                        .count()
+                        == 1
+                    && *instructions[pop] == expected_pop
+                    && instructions
+                        .iter()
+                        .filter(|record| ***record == expected_pop)
+                        .count()
+                        == 1
+                    && origin.return_nop.location == expected_pop.location
+                    && origin.return_nop.depth_after() == expected_pop.depth_after()
+                    && instructions[pop + 1..marker - 1]
+                        .iter()
+                        .copied()
+                        .copied()
+                        .eq(origin.prefix)
+                    && *instructions[marker - 1] == origin.condition
+                    && matches!(origin.condition.operand(), Operand::Forward(_))
+                    && jump_targets.iter().all(|label| {
+                        positions
+                            .get(label)
+                            .is_none_or(|index| *index <= array || *index > marker)
+                    })
+                    && provenance.block_boundaries.iter().all(|label| {
+                        positions
+                            .get(label)
+                            .is_none_or(|index| *index <= array || *index > marker)
+                    })
+            });
+        matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        // Seven live records from the surviving POP through the condition plus
+        // the two captured erased records precede this newly appended marker.
+        // A smaller removal count reaches one of those cleanup cells instead.
+        let suffix_width = marker - pop + 2;
+        let prefix_width = pop - array;
+        if tail.early_removals <= suffix_width
+            || tail.early_removals > suffix_width + prefix_width
+            || instructions[array..pop].iter().any(|record| {
+                record.exception_policy() != super::ExceptionPolicy::NoneUnchanged
+                    || record.opcode == NOP
+                    || record.no_location_policy.borrow_fallthrough()
+                        == super::BorrowFallthrough::Barrier
+            })
+        {
+            return None;
+        }
+        let region = self.uniform_exception_owner(array, pop, positions)?;
+        (!self.exception_regions[region].is_scope_fallback
+            && !self.exception_regions[region].preserve_lasti)
             .then_some(region)
     }
 

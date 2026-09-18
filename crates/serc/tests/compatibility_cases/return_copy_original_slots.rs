@@ -166,3 +166,98 @@ fn matches_cpython_name_return_borrowing_at_original_copy_limit() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn preserves_break_locations_through_unlocated_return_joins() {
+    for (filename, source) in [
+        (
+            "conditional_while_break_tuple_return_nop_target.py",
+            r"def f(mode, groups):
+    preview = []
+    used = [0 for group in groups]
+    if mode:
+        last = len(groups) - 1
+        while len(preview) < 3 and last >= 0:
+            group = groups[last]
+            index = used[last]
+            if index < len(group):
+                preview.append(group[index])
+                used[last] += 1
+            else:
+                break
+    else:
+        while len(preview) < 3:
+            added = False
+            for index, group in enumerate(groups):
+                if group:
+                    preview.append(group[0])
+                    added = True
+                    if len(preview) >= 3:
+                        break
+            if not added:
+                break
+    return preview, used
+",
+        ),
+        (
+            "conditional_while_break_name_return_control.py",
+            r"def f(mode, groups):
+    preview = []
+    used = [0 for group in groups]
+    if mode:
+        last = len(groups) - 1
+        while len(preview) < 3 and last >= 0:
+            group = groups[last]
+            index = used[last]
+            if index < len(group):
+                preview.append(group[index])
+                used[last] += 1
+            else:
+                break
+    else:
+        while len(preview) < 3:
+            added = False
+            for index, group in enumerate(groups):
+                if group:
+                    preview.append(group[0])
+                    added = True
+                    if len(preview) >= 3:
+                        break
+            if not added:
+                break
+    return preview
+",
+        ),
+        (
+            "conditional_while_break_larger_tuple_return_control.py",
+            r"def f(mode, groups):
+    preview = []
+    used = [0 for group in groups]
+    if mode:
+        last = len(groups) - 1
+        while len(preview) < 3 and last >= 0:
+            group = groups[last]
+            index = used[last]
+            if index < len(group):
+                preview.append(group[index])
+                used[last] += 1
+            else:
+                break
+    else:
+        while len(preview) < 3:
+            added = False
+            for index, group in enumerate(groups):
+                if group:
+                    preview.append(group[0])
+                    added = True
+                    if len(preview) >= 3:
+                        break
+            if not added:
+                break
+    return preview, used, mode
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

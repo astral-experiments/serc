@@ -4307,6 +4307,9 @@ impl OptimizationPipeline {
                     self.exception_owner_provenance
                         .copied_return_pop_prefixes
                         .retain(|origin| graph.label_block(origin.entry) != Some(predecessor));
+                    self.exception_owner_provenance
+                        .copied_return_call_prefixes
+                        .retain(|origin| graph.label_block(origin.entry) != Some(predecessor));
                     graph.remove_item_at(predecessor, jump_position);
                     inline_copies
                         .entry(predecessor)
@@ -4349,6 +4352,9 @@ impl OptimizationPipeline {
                     // Replacing the original jump can append equal records from another array.
                     self.exception_owner_provenance
                         .copied_return_pop_prefixes
+                        .retain(|origin| graph.label_block(origin.entry) != Some(source));
+                    self.exception_owner_provenance
+                        .copied_return_call_prefixes
                         .retain(|origin| graph.label_block(origin.entry) != Some(source));
                     graph.remove_item_at(source, position);
                 }
@@ -5209,6 +5215,9 @@ impl OptimizationPipeline {
                             .retire_async_with_setup(*label);
                         self.exception_owner_provenance
                             .copied_return_pop_prefixes
+                            .retain(|origin| origin.entry != *label);
+                        self.exception_owner_provenance
+                            .copied_return_call_prefixes
                             .retain(|origin| origin.entry != *label);
                         // Labels retained without their array cannot certify a later seam.
                         self.exception_owner_provenance

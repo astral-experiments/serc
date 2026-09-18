@@ -5020,6 +5020,48 @@ impl Assembler {
         ) else {
             return;
         };
+        // Truthiness keeps TO_BOOL, so preserve all four original records rather
+        // than treating its appended marker as a None-test slot.
+        let truth_condition = (condition.opcode == crate::target::opcodes::TO_BOOL)
+            .then(|| instructions.next())
+            .flatten();
+        if let Some(truth_condition) = truth_condition
+            && pop.opcode == NOP
+            && pop.operand() == Operand::Value(0)
+            && pop.location == SourceLocation::NONE
+            && pop.fusion_policy.is_converted_pop_block()
+            && pop.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
+            && matches!(load.opcode, LOAD_FAST | crate::target::opcodes::LOAD_DEREF)
+            && matches!(load.operand(), Operand::Value(_))
+            && condition.operand() == Operand::Value(0)
+            && matches!(
+                truth_condition.opcode,
+                crate::target::opcodes::POP_JUMP_IF_FALSE
+                    | crate::target::opcodes::POP_JUMP_IF_TRUE
+            )
+            && matches!(truth_condition.operand(), Operand::Forward(_))
+            && truth_condition.location.line >= 0
+            && [load, condition, truth_condition].iter().all(|record| {
+                record.location == truth_condition.location
+                    && record.exception_policy() == ExceptionPolicy::NoneUnchanged
+            })
+            && [pop, load, condition, truth_condition]
+                .iter()
+                .all(|record| {
+                    record.local_policy.hidden_exception_owner_slots() == 0
+                        && record.pre_fold_extra_instructions() == 0
+                        && record.no_location_policy.borrow_fallthrough()
+                            == BorrowFallthrough::Reachable
+                })
+            && pop.depth_after().is_some()
+            && load.depth_after() == pop.depth_after().map(|depth| depth + 1)
+            && condition.depth_after() == load.depth_after()
+            && truth_condition.depth_after() == pop.depth_after()
+        {
+            self.exception_owner_provenance
+                .normal_finally_truth_prefixes
+                .push([pop, load, condition, truth_condition]);
+        }
         if pop.opcode == NOP
             && pop.fusion_policy.is_converted_pop_block()
             && pop.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
@@ -5268,12 +5310,131 @@ impl Assembler {
             .push(exception_owners::CopiedReturnPopPrefix { entry, records });
     }
 
+    /// Captures a constant return's POP pair and direct global-attribute truth call.
+    fn record_copied_return_call_prefix(&mut self, return_item: usize, first_pop_item: usize) {
+        use crate::target::opcodes::{CALL, PUSH_NULL};
+
+        let items = self.linear_items();
+        let Some(
+            [
+                Item::Instruction(first_pop),
+                Item::Instruction(final_pop),
+                Item::Instruction(global),
+                Item::Instruction(attribute),
+                Item::Instruction(null),
+                Item::Instruction(call),
+                Item::Instruction(to_bool),
+                Item::Instruction(condition),
+                ..,
+            ],
+        ) = items.get(first_pop_item..)
+        else {
+            return;
+        };
+        let pops = [*first_pop, *final_pop];
+        let prefix = [*global, *attribute, *null, *call, *to_bool];
+        let condition = *condition;
+        if pops.iter().any(|pop| {
+            pop.opcode != NOP
+                || pop.operand() != Operand::Value(0)
+                || !pop.fusion_policy.is_converted_pop_block()
+                || pop.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
+        }) || global.opcode != LOAD_GLOBAL
+            || !matches!(global.operand(), Operand::Value(argument) if argument & 1 == 0)
+            || attribute.opcode != LOAD_ATTR
+            || !matches!(attribute.operand(), Operand::Value(argument) if argument & 1 == 0)
+            || null.opcode != PUSH_NULL
+            || null.operand() != Operand::Value(0)
+            || call.opcode != CALL
+            || call.operand() != Operand::Value(0)
+            || to_bool.opcode != TO_BOOL
+            || to_bool.operand() != Operand::Value(0)
+            || !matches!(condition.opcode, POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE)
+            || !matches!(condition.operand(), Operand::Forward(_))
+            || condition.location.line < 0
+            || prefix
+                .iter()
+                .chain(std::iter::once(&condition))
+                .any(|record| {
+                    record.exception_policy() != ExceptionPolicy::NoneUnchanged
+                        || record.location.line != condition.location.line
+                        || record.location.end_line != condition.location.end_line
+                        || record.location.column != condition.location.column
+                        || record.location.end_column > condition.location.end_column
+                })
+            || pops
+                .iter()
+                .chain(prefix.iter())
+                .chain(std::iter::once(&condition))
+                .any(|record| {
+                    record.local_policy.hidden_exception_owner_slots() != 0
+                        || record.pre_fold_extra_instructions() != 0
+                        || record.no_location_policy.borrow_fallthrough()
+                            != BorrowFallthrough::Reachable
+                        || record.jump_policy.borrow_empty_block()
+                })
+        {
+            return;
+        }
+        let Some([Item::Instruction(authored), labels @ ..]) =
+            items.get(return_item..first_pop_item)
+        else {
+            return;
+        };
+        if authored.opcode != NOP
+            || authored.operand() != Operand::Value(0)
+            || authored.location.line < 0
+            || authored.exception_policy() != ExceptionPolicy::NoneUnchanged
+            || authored.fusion_policy.is_converted_pop_block()
+            || authored.local_policy.hidden_exception_owner_slots() != 0
+            || authored.pre_fold_extra_instructions() != 0
+            || !labels.iter().all(|item| matches!(item, Item::Label(_)))
+            || pops.iter().any(|pop| {
+                pop.location != authored.location || pop.depth_after() != authored.depth_after()
+            })
+        {
+            return;
+        }
+        let Some(entry) = items[..return_item]
+            .iter()
+            .rev()
+            .find_map(|item| match item {
+                Item::Label(label)
+                    if self
+                        .exception_owner_provenance
+                        .source_boundaries
+                        .contains(label)
+                        && self
+                            .exception_owner_provenance
+                            .block_boundaries
+                            .contains(label) =>
+                {
+                    Some(*label)
+                }
+                _ => None,
+            })
+        else {
+            return;
+        };
+        let origin = exception_owners::CopiedReturnCallPrefix {
+            entry,
+            return_nop: *authored,
+            pops,
+            prefix,
+            condition,
+        };
+        self.exception_owner_provenance
+            .copied_return_call_prefixes
+            .push(origin);
+    }
+
     /// Captures the original return POP pair and its direct local truth test.
     pub(crate) fn record_copied_return_truth_prefix(
         &mut self,
         return_item: usize,
         first_pop_item: usize,
     ) {
+        self.record_copied_return_call_prefix(return_item, first_pop_item);
         let Some(
             [
                 Item::Instruction(first_pop),

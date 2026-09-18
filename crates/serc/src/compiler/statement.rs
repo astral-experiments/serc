@@ -1499,11 +1499,20 @@ impl Compiler<'_> {
             && self.control.finally.active_finally_try_bodies == 0
     }
 
-    /// A name return, its optional line NOP, and the replaced jump fit four original slots.
+    /// A name or inherited small return, its line NOP, and the replaced jump fit four slots.
     pub(super) fn following_name_return_fits_match_copy_budget(&self) -> bool {
-        self.control
+        // A suite-tail match reaches the same return through an enclosing conditional.
+        // Intervening siblings and the cleanup contexts below cannot use that continuation.
+        let follows_small_return = self
+            .control
             .statements
             .current_statement_followed_by_name_return
+            || (!self.control.statements.current_statement_has_following
+                && self
+                    .control
+                    .statements
+                    .inherited_statement_followed_by_small_return);
+        follows_small_return
             && self.control.loops.contexts.is_empty()
             && self.control.withs.active_with_exits.is_empty()
             && self.control.withs.active_with_region_exclusions.is_empty()
@@ -16017,6 +16026,34 @@ impl Compiler<'_> {
                 self.assembler.prevent_borrow_fallthrough_reachability(end);
             }
             if borrow_exit_has_source_successor
+                && shared_conditional_exit
+                && matches!(self.unit.scope, Scope::Function { .. })
+                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                && !self
+                    .control
+                    .statements
+                    .current_statement_followed_by_return_or_raise
+                && self.control.loops.contexts.is_empty()
+                && self.control.withs.active_with_exits.is_empty()
+                && self.control.exceptions.active_exception_handlers.is_empty()
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .is_empty()
+                && self.control.finally.active_finally_try_bodies == 0
+                && self.control.finally.active_normal_finally_bodies == 0
+                && self.control.finally.active_copied_finally_bodies == 0
+                && self.control.finally.active_finally_end_blocks == 0
+                && guarded_iterator_recovery_leaves_empty_try_exit(statement)
+            {
+                // The inner recovery disconnects the authored break. Its original
+                // predecessor still leaves the shared outer POP_BLOCK unlocated,
+                // even with one guard-false edge. Iterator exhaustion remains live
+                // before that empty exit; independent jumps retain their own entry.
+                self.assembler.prevent_borrow_fallthrough_reachability(end);
+            }
+            if borrow_exit_has_source_successor
                 && statement.handlers.iter().any(|handler| {
                     handler.as_except_handler().is_some_and(|handler| {
                         matches!(handler.body.last(), Some(Stmt::Try(recovery))
@@ -26769,6 +26806,77 @@ fn suite_ends_in_empty_try_exit_block(body: &[Stmt], loop_tail: bool) -> bool {
     }
 }
 
+// A guarded iterator's break can remain behind an empty pass-only recovery.
+// That cold predecessor joins the guard-false and iterator-exhaustion paths at
+// an unlocated outer try exit, without making its continuation borrow-reachable.
+fn guarded_iterator_recovery_leaves_empty_try_exit(statement: &ruff_python_ast::StmtTry) -> bool {
+    if statement.is_star
+        || !statement.orelse.is_empty()
+        || !statement.finalbody.is_empty()
+        || !matches!(statement.handlers.as_slice(), [handler]
+        if handler.as_except_handler().is_some_and(|handler| {
+            handler.type_.is_some()
+                && handler.name.is_none()
+                && matches!(handler.body.as_slice(), [Stmt::Assign(assignment)]
+                    if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                        && is_literal_constant(&assignment.value))
+        }))
+    {
+        return false;
+    }
+    let [Stmt::If(guard)] = statement.body.as_slice() else {
+        return false;
+    };
+    if !guard.elif_else_clauses.is_empty()
+        || !matches!(guard.test.as_ref(), Expr::Compare(comparison)
+            if comparison.ops[..] == [CmpOp::IsNot]
+                && matches!(&comparison.comparators[..], [Expr::NoneLiteral(_)])
+                && !expression_contains_inline_branch(&comparison.left))
+    {
+        return false;
+    }
+    let [Stmt::For(iterator)] = guard.body.as_slice() else {
+        return false;
+    };
+    let Some((Stmt::If(branch), leading)) = iterator.body.split_last() else {
+        return false;
+    };
+    if iterator.is_async
+        || !iterator.orelse.is_empty()
+        || !matches!(iterator.target.as_ref(), Expr::Name(_))
+        || expression_contains_inline_branch(&iterator.iter)
+        || !(leading.is_empty() || suite_has_linear_borrow_fallthrough(leading))
+        || !branch.elif_else_clauses.is_empty()
+        || !condition_has_linear_runtime_leaves(&branch.test)
+    {
+        return false;
+    }
+    let Some((Stmt::Break(_), prefix)) = branch.body.split_last() else {
+        return false;
+    };
+    let Some((Stmt::Try(recovery), leading)) = prefix.split_last() else {
+        return false;
+    };
+    !recovery.is_star
+        && recovery.orelse.is_empty()
+        && recovery.finalbody.is_empty()
+        && (leading.is_empty() || suite_has_linear_borrow_fallthrough(leading))
+        && matches!(recovery.handlers.as_slice(), [handler]
+        if handler.as_except_handler().is_some_and(|handler| {
+            handler.type_.is_some()
+                && handler.name.is_none()
+                && matches!(handler.body.as_slice(), [Stmt::Pass(_)])
+        }))
+        && recovery.body.split_last().is_some_and(|(last, leading)| {
+            matches!(last, Stmt::If(guard)
+                if guard.elif_else_clauses.is_empty()
+                    && condition_has_linear_runtime_leaves(&guard.test)
+                    && condition_jump_target_count(&guard.test, false) > 1
+                    && suite_has_linear_borrow_fallthrough(&guard.body))
+                && (leading.is_empty() || suite_has_linear_borrow_fallthrough(leading))
+        })
+}
+
 // CPython threads these nested compound-statement exits through a following empty `if` join.
 // That gives borrowed-load traversal another route to the suite after the enclosing `try`.
 fn statement_threads_through_empty_join(statement: &Stmt) -> bool {
@@ -28514,6 +28622,23 @@ fn suite_ends_in_terminal_conditional_break(body: &[Stmt]) -> bool {
                 Stmt::Expr(expression)
                     if call_has_completed_boolean_argument(&expression.value) =>
                 {
+                    true
+                }
+                Stmt::Assign(assignment)
+                    if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                        && matches!(assignment.value.as_ref(), Expr::Call(call)
+                            if matches!(optimized_generator_callable(call), Some("all" | "any"))
+                                && matches!(call.arguments.args.as_ref(), [Expr::Generator(generator)]
+                                    if condition_reaches_async_break_entry(&generator.elt)
+                                        && !expression_suspends_current_scope(&generator.elt)
+                                        && matches!(generator.generators.as_slice(), [iterator]
+                                            if iterator.ifs.is_empty()
+                                                && matches!(iterator.target, Expr::Name(_))
+                                                && matches!(iterator.iter, Expr::Name(_))))) =>
+                {
+                    // Optimized and fallback reduction paths join before STORE_FAST.
+                    // Their completed branches cannot enter beyond the later break's
+                    // iterator discard, just like a completed linear assignment.
                     true
                 }
                 Stmt::If(guard) => {
