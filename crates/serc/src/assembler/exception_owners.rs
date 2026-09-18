@@ -726,9 +726,10 @@ impl ExceptionOwnerProvenance {
         source_head: bool,
     ) -> bool {
         use crate::target::opcodes::{
-            BINARY_OP, BUILD_MAP, BUILD_STRING, CALL, CALL_KW, CONTAINS_OP, FORMAT_SIMPLE,
-            IMPORT_FROM, IMPORT_NAME, LOAD_ATTR, LOAD_CONST, LOAD_DEREF, LOAD_FAST, LOAD_GLOBAL,
-            LOAD_NAME, LOAD_SMALL_INT, POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE, PUSH_NULL, STORE_DEREF,
+            BINARY_OP, BUILD_LIST, BUILD_MAP, BUILD_STRING, BUILD_TUPLE, CALL, CALL_KW,
+            CONTAINS_OP, FORMAT_SIMPLE, IMPORT_FROM, IMPORT_NAME, LOAD_ATTR, LOAD_CONST,
+            LOAD_DEREF, LOAD_FAST, LOAD_GLOBAL, LOAD_NAME, LOAD_SMALL_INT, MAKE_FUNCTION,
+            POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE, PUSH_NULL, SET_FUNCTION_ATTRIBUTE, STORE_DEREF,
             STORE_FAST, STORE_NAME, TO_BOOL,
         };
 
@@ -866,6 +867,31 @@ impl ExceptionOwnerProvenance {
         {
             return false;
         }
+        // A one-cell closure tuple is built from LOAD_CLOSURE, not constants.
+        // Its complete function-construction sequence cannot fold or unpack;
+        // retain all six original records and their exact source identity.
+        let closure_members = instructions
+            .windows(6)
+            .enumerate()
+            .filter_map(|(start, parts)| {
+                let [cell, tuple, code, function, closure, store] = parts else {
+                    unreachable!()
+                };
+                (cell.opcode == LOAD_FAST
+                    && cell.local_policy.is_post_analysis_closure_load()
+                    && tuple.opcode == BUILD_TUPLE
+                    && tuple.operand() == Operand::Value(1)
+                    && code.opcode == LOAD_CONST
+                    && function.opcode == MAKE_FUNCTION
+                    && function.operand() == Operand::Value(0)
+                    && closure.opcode == SET_FUNCTION_ATTRIBUTE
+                    && closure.operand() == Operand::Value(8)
+                    && store.opcode == STORE_FAST
+                    && parts.iter().all(|part| part.location == cell.location))
+                .then_some(start + 1..start + 5)
+            })
+            .flatten()
+            .collect::<FxHashSet<_>>();
         let original_folds =
             self.original_uniform_fold_positions(&instructions.iter().collect::<Vec<_>>());
         let mut setup_count = 0;
@@ -952,16 +978,34 @@ impl ExceptionOwnerProvenance {
                     setup_count += 1;
                 }
                 LOAD_FAST => {
-                    // Only same-line local loads can compact into a superinstruction.
-                    if instructions.get(index + 1).is_some_and(|next| {
-                        next.opcode == LOAD_FAST && next.location.line == instruction.location.line
-                    }) {
+                    // CP's superinstruction operands each occupy four bits.
+                    // Larger local indices retain separate original records.
+                    if matches!(instruction.operand(), Operand::Value(0..=15))
+                        && instructions.get(index + 1).is_some_and(|next| {
+                            next.opcode == LOAD_FAST
+                                && next.location.line == instruction.location.line
+                                && matches!(next.operand(), Operand::Value(0..=15))
+                        })
+                    {
                         return false;
                     }
                 }
                 LOAD_DEREF | STORE_DEREF => {
                     // Cell accesses keep their own records throughout this array;
                     // local-load/store superinstructions cannot compact them.
+                }
+                BUILD_TUPLE | MAKE_FUNCTION | SET_FUNCTION_ATTRIBUTE
+                    if closure_members.contains(&index) => {}
+                BUILD_LIST => {
+                    // An empty list stored as a local is neither a constant
+                    // sequence fold nor an iterable/containment conversion.
+                    if instruction.operand() != Operand::Value(0)
+                        || instructions
+                            .get(index + 1)
+                            .is_none_or(|next| next.opcode != STORE_FAST)
+                    {
+                        return false;
+                    }
                 }
                 BUILD_MAP => {
                     // The certified restore is followed by CALL, whose runtime
@@ -982,19 +1026,23 @@ impl ExceptionOwnerProvenance {
                     // pseudo instructions during CP superinstruction insertion.
                     // Ordinary adjacent stores/loads can fuse on the same line.
                     if !(1..=comprehension_restore_count).contains(&index)
+                        && matches!(instruction.operand(), Operand::Value(0..=15))
                         && instructions.get(index + 1).is_some_and(|next| {
                             matches!(next.opcode, LOAD_FAST | STORE_FAST)
                                 && next.location.line == instruction.location.line
+                                && matches!(next.operand(), Operand::Value(0..=15))
                         })
                     {
                         return false;
                     }
                 }
                 LOAD_GLOBAL => {
-                    // The low bit represents a separately emitted PUSH_NULL
-                    // that CP folds into this record before marker insertion.
-                    if !matches!(instruction.operand(), Operand::Value(value) if value & 1 == 0) {
-                        return false;
+                    // CP removes the separately emitted PUSH_NULL before
+                    // marker insertion. Keep its original cell in the SETUP
+                    // coordinates; a folded prefix is accepted only when the
+                    // append lands on an authenticated NULL SETUP cell below.
+                    if matches!(instruction.operand(), Operand::Value(value) if value & 1 != 0) {
+                        folded_slots += 1;
                     }
                 }
                 PUSH_NULL => {
@@ -1076,12 +1124,33 @@ impl ExceptionOwnerProvenance {
                     }
                 }
                 BUILD_STRING => {
-                    // This is the direct small-string producer, ending in a runtime
-                    // interpolation. Large joined-string lowering is not covered.
+                    // A trailing literal after one runtime interpolation also
+                    // retains all records. Require the complete three-piece
+                    // producer, not an arbitrary constant suffix.
+                    let trailing_literal = instruction.operand() == Operand::Value(3)
+                        && index.checked_sub(4).is_some_and(|start| {
+                            let [prefix, value, format, suffix] = &instructions[start..index]
+                            else {
+                                return false;
+                            };
+                            prefix.opcode == LOAD_CONST
+                                && matches!(
+                                    value.opcode,
+                                    LOAD_FAST | LOAD_NAME | LOAD_ATTR | CALL | CALL_KW
+                                )
+                                && format.opcode == FORMAT_SIMPLE
+                                && format.operand() == Operand::Value(0)
+                                && suffix.opcode == LOAD_CONST
+                                && [prefix, value, format, suffix]
+                                    .iter()
+                                    .all(|part| part.location.line == instruction.location.line)
+                        });
+                    // Large joined-string lowering remains outside this proof.
                     if !matches!(instruction.operand(), Operand::Value(2..=30))
-                        || instructions
-                            .get(index.wrapping_sub(1))
-                            .is_none_or(|previous| previous.opcode != FORMAT_SIMPLE)
+                        || (!trailing_literal
+                            && instructions
+                                .get(index.wrapping_sub(1))
+                                .is_none_or(|previous| previous.opcode != FORMAT_SIMPLE))
                     {
                         return false;
                     }
@@ -1116,8 +1185,8 @@ impl ExceptionOwnerProvenance {
         // restore followed by CALL already establishes the original array head,
         // including a condition reached without crossing a new SETUP.
         (setup_count > 0 || comprehension_restore_count > 0)
-            // With no folds, the append is fresh. A certified membership fold may
-            // instead leave the original retained SETUP in that exact array cell.
+            // With no folds, the append is fresh. Certified membership/global
+            // folds may instead leave the retained SETUP in that exact array cell.
             && (folded_slots == 0 || null_setup_cells.contains(&(instructions.len() - 1)))
             && self
                 .setups

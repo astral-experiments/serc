@@ -347,3 +347,81 @@ line
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn preserves_folded_false_footer_before_shared_return_copy() {
+    for (filename, source) in [
+        (
+            "conditional_iterator_dead_tail_return_target.py",
+            r"async def emit_rows(flag, manager, fetch, emit):
+    async with manager:
+        rows = await fetch()
+    if flag:
+        for name, value in rows:
+            if value:
+                emit(name, value)
+    else:
+        for name, value in rows:
+            emit(name, value)
+    if False:
+        import debugger
+        debugger.enable()
+",
+        ),
+        (
+            "conditional_iterator_direct_footer_control.py",
+            r"async def emit_rows(flag, manager, fetch, emit):
+    async with manager:
+        rows = await fetch()
+    if flag:
+        for name, value in rows:
+            if value:
+                emit(name, value)
+    else:
+        for name, value in rows:
+            emit(name, value)
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn counts_retained_setup_once_for_protected_local_return_copy() {
+    for (filename, source) in [
+        (
+            "conditional_arms_protected_local_return_target.py",
+            r"def convert_key(key, text_type, special_type, report):
+    name: str | None
+    if isinstance(key, text_type) and key.char is not None:
+        name = key.char.upper()
+    elif isinstance(key, special_type):
+        name = key.name
+    else:
+        report(key)
+        return None
+    try:
+        return name
+    except KeyError:
+        return None
+",
+        ),
+        (
+            "conditional_arms_direct_local_return_control.py",
+            r"def convert_key(key, text_type, special_type, report):
+    name: str | None
+    if isinstance(key, text_type) and key.char is not None:
+        name = key.char.upper()
+    elif isinstance(key, special_type):
+        name = key.name
+    else:
+        report(key)
+        return None
+    return name
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

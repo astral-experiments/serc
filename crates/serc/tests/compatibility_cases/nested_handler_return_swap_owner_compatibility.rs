@@ -124,3 +124,92 @@ fn unnamed_tuple_return_preserves_two_named_handler_cleanup() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn named_handler_return_retires_try_before_async_manager_iterator_cleanup() {
+    for (filename, source) in [
+        (
+            "named_handler_iterator_async_manager_dict_return.py",
+            r#"async def f(manager, values, request, decode, pause):
+    async with manager:
+        for value in values:
+            try:
+                payload = await request(value)
+                try:
+                    result = decode(payload)
+                    return {"result": result}
+                except ValueError as error:
+                    if value:
+                        return {"error": str(error)}
+                    continue
+            except Exception as error:
+                if value:
+                    return {"error": str(error)}
+                await pause()
+    return {}
+"#,
+        ),
+        (
+            "named_handler_iterator_async_manager_multiline_return.py",
+            r#"async def f(manager, values, request, decode, pause):
+    async with manager:
+        for value in values:
+            try:
+                payload = await request(value)
+                try:
+                    result = decode(payload)
+                    return {"result": result}
+                except ValueError as error:
+                    if value:
+                        return {
+                            "value": value,
+                            "error": f"decode failed: {error}",
+                        }
+                    continue
+            except Exception as error:
+                if value:
+                    return {"error": str(error)}
+                await pause()
+    return {}
+"#,
+        ),
+        (
+            "named_handler_iterator_no_outer_try_control.py",
+            r#"async def f(manager, values, request, decode, pause):
+    async with manager:
+        for value in values:
+            payload = await request(value)
+            try:
+                result = decode(payload)
+                return {"result": result}
+            except ValueError as error:
+                if value:
+                    return {"error": str(error)}
+                continue
+    return {}
+"#,
+        ),
+        (
+            "named_handler_iterator_no_manager_control.py",
+            r#"async def f(manager, values, request, decode, pause):
+    for value in values:
+        try:
+            payload = await request(value)
+            try:
+                result = decode(payload)
+                return {"result": result}
+            except ValueError as error:
+                if value:
+                    return {"error": str(error)}
+                continue
+        except Exception as error:
+            if value:
+                return {"error": str(error)}
+            await pause()
+    return {}
+"#,
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

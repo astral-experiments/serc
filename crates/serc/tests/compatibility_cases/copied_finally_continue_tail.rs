@@ -209,3 +209,79 @@ fn continued_finally_pop_records_preserve_ordinary_for_marker_owners() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_guarded_linear_cleanup_before_continue() {
+    for (source, filename) in [
+        (
+            r"async def f(items, client):
+    for item in items:
+        try:
+            if item:
+                continue
+            return item
+        finally:
+            if client is not None:
+                try:
+                    await client.close()
+                except Exception as error:
+                    report(error)
+",
+            "copied_continue_none_guard_try_cleanup_target.py",
+        ),
+        (
+            r"async def f(items, token, client):
+    for item in items:
+        try:
+            if item:
+                continue
+            work(item)
+        except Exception as error:
+            report(error)
+        finally:
+            cleanup_client = client
+            if token is not None and cleanup_client is not None:
+                try:
+                    await cleanup_client.close(token)
+                    mark_done()
+                except Exception as error:
+                    report(error)
+",
+            "copied_continue_and_none_guard_try_cleanup_target.py",
+        ),
+        (
+            r"async def f(items, preserve, attempts, last_error):
+    for attempt in items:
+        try:
+            await work(attempt)
+        except Exception:
+            if retry(attempt):
+                continue
+            raise
+        finally:
+            if not preserve and (attempt >= attempts or last_error is None):
+                started = clock()
+                try:
+                    await cleanup()
+                finally:
+                    record(started)
+",
+            "copied_continue_compound_guard_try_finally_target.py",
+        ),
+        (
+            r"async def f(items, client):
+    for item in items:
+        try:
+            if item:
+                continue
+            return item
+        finally:
+            if client is not None:
+                await client.close()
+",
+            "copied_continue_none_guard_linear_cleanup_control.py",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

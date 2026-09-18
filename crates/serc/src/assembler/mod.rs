@@ -6871,9 +6871,21 @@ impl Assembler {
             && jump.operand() == Operand::Forward(end)
             && jump.location == SourceLocation::NONE
         {
+            let pop_index = items.len() - 2;
+            let missing_pop_block = pop.pre_fold_extra_instructions() == 0
+                && pop.local_policy.hidden_exception_owner_slots() == 0;
             self.exception_owner_provenance
                 .original_handler_cleanup_join_exits
                 .insert(end);
+            if missing_pop_block {
+                // This original unnamed-handler cleanup starts with POP_BLOCK before
+                // POP_EXCEPT. Keep that removed slot when a small return replaces the
+                // following jump, so the enlarged cleanup is not copied as a four-slot exit.
+                let Item::Instruction(pop) = &mut self.linear_items_mut()[pop_index] else {
+                    unreachable!("captured handler cleanup POP_EXCEPT");
+                };
+                pop.add_pre_fold_extra_instructions(1);
+            }
         }
     }
 

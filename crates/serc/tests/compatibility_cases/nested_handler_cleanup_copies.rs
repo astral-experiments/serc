@@ -131,3 +131,64 @@ fn preserves_named_handler_return_owner_before_older_iterators() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_shared_unnamed_handler_local_return_copies() {
+    for (filename, source) in [
+        (
+            "handler_manager_simple_recovery_control.py",
+            r"def read_cached(kind, open_resource, load, build, save):
+    try:
+        if kind == 'text':
+            with open_resource('r') as handle:
+                result = load(handle)
+        elif kind == 'bytes':
+            with open_resource('rb') as handle:
+                result = load(handle)
+        else:
+            raise ValueError('unknown format')
+    except FileNotFoundError:
+        result = build()
+        save(result)
+    return result
+",
+        ),
+        (
+            "nested_handler_loop_shared_local_return_target.py",
+            r"def collect_entries(data):
+    entries = []
+    try:
+        for key in data['sources'].keys():
+            item = data['sources'][key]
+            entries.append({'value': item['value'], 'kind': item['kind']})
+    except Exception:
+        try:
+            for item in data['sources']:
+                entries.append({'value': item['value'], 'kind': item['kind']})
+        except Exception:
+            try:
+                for key in data.keys():
+                    item = data[key]
+                    entries.append({'value': item['value'], 'kind': item['kind']})
+            except Exception:
+                pass
+    return entries
+",
+        ),
+        (
+            "nested_handler_simple_recovery_control.py",
+            r"def collect_entries(data):
+    entries = []
+    try:
+        for key in data['sources'].keys():
+            item = data['sources'][key]
+            entries.append({'value': item['value'], 'kind': item['kind']})
+    except Exception:
+        pass
+    return entries
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

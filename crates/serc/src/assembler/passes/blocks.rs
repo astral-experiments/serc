@@ -6,6 +6,7 @@ use super::super::{
     block_has_fallthrough, block_jump_target, cleanup_block_creation_order, ends_scope,
 };
 use crate::assembler::block_graph::{BasicBlockId, BlockGraph, ItemPosition};
+use crate::assembler::exception_owners::ExceptionOwnerProvenance;
 use crate::target::opcodes::{
     BUILD_TUPLE, CALL, CALL_KW, DELETE_FAST, END_ASYNC_FOR, END_SEND, FOR_ITER, LOAD_CONST,
     LOAD_FAST, LOAD_GLOBAL, NOP, NOT_TAKEN, POP_EXCEPT, POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE,
@@ -357,6 +358,68 @@ fn is_metadata_range_entry(
         && original_setups.iter().all(|(setup, _)| *setup != label)
 }
 
+/// Finds original SETUP records already represented by a retained NOP in this target chain.
+fn represented_setup_nops(
+    graph: &BlockGraph,
+    blocks: &[BasicBlockId],
+    provenance: &ExceptionOwnerProvenance,
+) -> FxHashSet<Label> {
+    if provenance.setup_nop_ranges.is_empty()
+        || !blocks.iter().any(|block| {
+            graph[*block].items().iter().any(
+                |item| matches!(item, Item::Instruction(instruction) if instruction.opcode == NOP),
+            )
+        })
+    {
+        return FxHashSet::default();
+    }
+    let mut positions = FxHashMap::default();
+    let mut instructions = Vec::new();
+    for item in blocks.iter().flat_map(|block| graph[*block].items()) {
+        match item {
+            Item::Label(label) => {
+                positions.insert(*label, instructions.len());
+            }
+            Item::Instruction(instruction) => instructions.push(*instruction),
+        }
+    }
+    provenance
+        .setups
+        .iter()
+        .filter_map(|&(setup, location)| {
+            let location = location?;
+            let &index = positions.get(&setup)?;
+            let nop_index = index.checked_sub(1)?;
+            let nop = instructions.get(nop_index)?;
+            let mut expected =
+                Instruction::new(NOP, Operand::Value(0), location, Some(nop.depth_after()?));
+            expected.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS);
+            if location.line < 0
+                || !provenance.ordinary_try_setups.contains_key(&setup)
+                || *nop != expected
+                || provenance
+                    .setups
+                    .iter()
+                    .filter(|(label, _)| positions.get(label) == Some(&index))
+                    .count()
+                    != 1
+                || provenance
+                    .setup_nop_ranges
+                    .iter()
+                    .filter(|(start, end)| {
+                        positions.get(start) == Some(&nop_index)
+                            && positions.get(end) == Some(&index)
+                    })
+                    .count()
+                    != 1
+            {
+                return None;
+            }
+            Some(setup)
+        })
+        .collect()
+}
+
 struct ExitBlockAnalysis {
     positions: Vec<usize>,
     predecessors: Vec<usize>,
@@ -375,8 +438,7 @@ fn exit_block_analysis(
     exception_regions: &[ExceptionRegion],
     retired_exception_handler_targets: &FxHashSet<Label>,
     original_nop_targets: &FxHashSet<Label>,
-    return_region_reentries: &FxHashSet<Label>,
-    original_setups: &[(Label, Option<SourceLocation>)],
+    provenance: &ExceptionOwnerProvenance,
 ) -> ExitBlockAnalysis {
     let vector_len = order
         .iter()
@@ -515,6 +577,7 @@ fn exit_block_analysis(
         let Some(target_last) = graph[target_exit].last_instruction() else {
             continue;
         };
+        let represented_setups = represented_setup_nops(graph, target_blocks, provenance);
         let mut at_target_entry = true;
         let target_pre_fusion_size = target_blocks
             .iter()
@@ -530,12 +593,13 @@ fn exit_block_analysis(
                 Item::Label(label) => usize::from(
                     target_chain_end > target_position
                         && exception_split_labels.contains(label)
-                        && !return_region_reentries.contains(label)
+                        && !provenance.return_region_reentries.contains(label)
+                        && !represented_setups.contains(label)
                         && !(at_target_entry
                             && is_metadata_range_entry(
                                 *label,
                                 exception_regions,
-                                original_setups,
+                                &provenance.setups,
                             )),
                 ),
             })
@@ -2604,8 +2668,7 @@ impl OptimizationPipeline {
             &self.exception_regions,
             &self.retired_exception_handler_targets,
             &self.original_nop_targets,
-            &self.exception_owner_provenance.return_region_reentries,
-            &self.exception_owner_provenance.setups,
+            &self.exception_owner_provenance,
         );
         let shared_pop_block_heads = order
             .iter()
@@ -3189,6 +3252,8 @@ impl OptimizationPipeline {
             }
             let target_blocks = &order[target_position..=target_chain_end];
             let target_exit = *target_blocks.last().expect("target chain is nonempty");
+            let represented_setups =
+                represented_setup_nops(graph, target_blocks, &self.exception_owner_provenance);
             let mut at_target_entry = true;
             let target_pre_fusion_size = target_blocks
                 .iter()
@@ -3208,6 +3273,7 @@ impl OptimizationPipeline {
                                 .exception_owner_provenance
                                 .return_region_reentries
                                 .contains(label)
+                            && !represented_setups.contains(label)
                             && !(at_target_entry
                                 && is_metadata_range_entry(
                                     *label,

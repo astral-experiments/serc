@@ -1675,3 +1675,226 @@ fn matches_cpython_borrows_at_folded_loop_late_entries() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_borrows_in_loop_recovery_finally() {
+    for (source, filename) in [
+        (
+            r"def run(get, stop, process, recover, report, done, publish, close):
+    try:
+        while True:
+            item = get()
+            result = None
+            try:
+                if item is stop:
+                    break
+                key, value = item
+                result = process(key, value)
+            except Exception as error:
+                report(error)
+                if isinstance(item, tuple) and len(item) == 2 and isinstance(item[0], int):
+                    result = recover(item[0])
+            finally:
+                done()
+            if result is not None:
+                publish(result)
+    finally:
+        close()
+",
+            "outer_finally_guarded_break_recovery_target.py",
+        ),
+        (
+            r"def run(get, stop, process, recover, report, done, publish, close):
+    while True:
+        item = get()
+        result = None
+        try:
+            if item is stop:
+                break
+            key, value = item
+            result = process(key, value)
+        except Exception as error:
+            report(error)
+            if isinstance(item, tuple) and len(item) == 2 and isinstance(item[0], int):
+                result = recover(item[0])
+        finally:
+            done()
+        if result is not None:
+            publish(result)
+",
+            "plain_guarded_break_recovery_control.py",
+        ),
+        (
+            r#"def collect(groups, job, process, report, update):
+    records = []
+    for group in groups:
+        try:
+            selected = process(group)
+            for key, value in selected:
+                if key in records:
+                    report(value)
+                else:
+                    records.append(key)
+                records.append(value)
+        except ValueError as error:
+            if error.args[0] == "fatal":
+                raise
+            report(error)
+        finally:
+            if job is not None:
+                update(job, count=len({entry for entry in records}), values=list(records))
+    return records
+"#,
+            "iterator_exhaustion_guarded_set_cleanup_target.py",
+        ),
+        (
+            r#"def collect(groups, job, process, report, update):
+    records = []
+    for group in groups:
+        try:
+            selected = process(group)
+            for key, value in selected:
+                if key in records:
+                    report(value)
+                else:
+                    records.append(key)
+                records.append(value)
+        except ValueError as error:
+            if error.args[0] == "fatal":
+                raise
+            report(error)
+        finally:
+            if job is not None:
+                update(job, count=len(records), values=list(records))
+    return records
+"#,
+            "iterator_exhaustion_guarded_linear_cleanup_control.py",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn matches_cpython_borrows_at_structured_finally_entries() {
+    for (source, filename) in [
+        (
+            r#"async def fetch(mode, state, first, second, report, manager):
+    chosen = state
+    result = []
+    try:
+        if mode == 0:
+            with manager():
+                result = await first()
+        elif mode == 1:
+            result = await second()
+            chosen = state.updated()
+        else:
+            raise ValueError(mode)
+    except LookupError as error:
+        report(error)
+        raise
+    except Exception as error:
+        report(error)
+        raise
+    finally:
+        kind = "none"
+        if state.agent is not None:
+            if state.is_web():
+                kind = "web"
+            elif state.is_app():
+                kind = "app"
+        tags = [chosen.source, kind, "ready" if result else "empty"]
+        report(tags)
+    return result, chosen
+"#,
+            "async_manager_await_store_raising_else_target.py",
+        ),
+        (
+            r#"async def fetch(mode, state, first, second, report, manager):
+    chosen = state
+    result = []
+    try:
+        if mode == 0:
+            with manager():
+                result = await first()
+        elif mode == 1:
+            result = await second()
+            chosen = state.updated()
+        else:
+            result = []
+    except LookupError as error:
+        report(error)
+        raise
+    except Exception as error:
+        report(error)
+        raise
+    finally:
+        kind = "none"
+        if state.agent is not None:
+            if state.is_web():
+                kind = "web"
+            elif state.is_app():
+                kind = "app"
+        tags = [chosen.source, kind, "ready" if result else "empty"]
+        report(tags)
+    return result, chosen
+"#,
+            "async_manager_await_store_fallthrough_else_control.py",
+        ),
+        (
+            r"import sys
+
+
+def repair(state, key, pending, prepared, signaled, work, release, report):
+    try:
+        if not pending and not prepared and not signaled:
+            with state.lock:
+                report(key)
+            return True
+        work()
+        return False
+    finally:
+        primary = sys.exc_info()[1]
+        try:
+            release()
+        except Exception:
+            if primary is None:
+                raise
+            report(primary)
+        finally:
+            with state.lock:
+                if state.key == key:
+                    state.key = None
+",
+            "copied_return_guarded_recovery_manager_finally_target.py",
+        ),
+        (
+            r"import sys
+
+
+def repair(state, key, pending, prepared, signaled, work, release, report):
+    try:
+        if not pending and not prepared and not signaled:
+            with state.lock:
+                report(key)
+            return True
+        work()
+        return False
+    finally:
+        primary = sys.exc_info()[1]
+        try:
+            release()
+        except Exception:
+            report(primary)
+        finally:
+            with state.lock:
+                if state.key == key:
+                    state.key = None
+",
+            "copied_return_linear_recovery_manager_finally_control.py",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

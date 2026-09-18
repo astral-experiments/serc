@@ -399,3 +399,92 @@ fn iterator_handler_continue_preserves_nested_finalizer_setup_slot() {
         assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn retained_nested_try_arrays_preserve_truth_marker_slots() {
+    for (filename, source) in [
+        (
+            "nested_try_ifexp_local_truth_owner.py",
+            r#"def f(resources, run, parse):
+    outputs = []
+    for resource in resources:
+        try:
+            async def listing():
+                return await resource.list()
+            text = run(listing())
+            files = []
+            try:
+                files = parse(text.strip().split("\n")[-1]) if text else []
+            except Exception:
+                files = [line for line in text.split("\n") if line]
+        except Exception:
+            files = []
+        outputs.extend(files)
+    return outputs
+"#,
+        ),
+        (
+            "nested_try_ifexp_linear_control.py",
+            r#"def f(resources, run, parse):
+    outputs = []
+    for resource in resources:
+        try:
+            async def listing():
+                return await resource.list()
+            text = run(listing())
+            files = []
+            try:
+                files = parse(text.strip().split("\n")[-1])
+            except Exception:
+                files = [line for line in text.split("\n") if line]
+        except Exception:
+            files = []
+        outputs.extend(files)
+    return outputs
+"#,
+        ),
+        (
+            "nested_try_finally_local_and_owner.py",
+            r#"def f(stages, flag, duration, clock, work, release):
+    for index, stage in enumerate(stages):
+        started = clock()
+        phase = f"stage {index}: preparing"
+        nodes: list[str] = []
+        try:
+            try:
+                if flag and duration:
+                    phase = "draining"
+                    nodes = work(stage, duration)
+                work(stage)
+            finally:
+                if flag and duration:
+                    release(nodes)
+        except Exception as error:
+            raise Error(phase, error) from error
+        report(clock() - started)
+"#,
+        ),
+        (
+            "nested_try_finally_local_and_linear_control.py",
+            r#"def f(stages, flag, duration, clock, work, release):
+    for index, stage in enumerate(stages):
+        started = clock()
+        phase = f"stage {index}: preparing"
+        nodes: list[str] = []
+        try:
+            try:
+                phase = "draining"
+                nodes = work(stage, duration)
+                work(stage)
+            finally:
+                if flag and duration:
+                    release(nodes)
+        except Exception as error:
+            raise Error(phase, error) from error
+        report(clock() - started)
+"#,
+        ),
+    ] {
+        assert_matches_cpython_marshal(source, filename);
+    }
+}
