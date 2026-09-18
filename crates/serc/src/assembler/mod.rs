@@ -543,6 +543,18 @@ impl Assembler {
             .unwrap_or(false)
     }
 
+    /// Whether an adjacent record already supplies a trailing NOP's line in its array.
+    pub(crate) fn last_nop_repeats_previous_line(&self) -> bool {
+        matches!(self.linear_items(),
+            [.., Item::Instruction(previous), Item::Instruction(nop)]
+                if nop.opcode == NOP
+                    && nop.location.line >= 0
+                    && previous.location.line == nop.location.line
+                    && previous.opcode != NOT_TAKEN
+                    && matches!(previous.operand(), Operand::Value(_))
+                    && !ends_scope(previous.opcode))
+    }
+
     fn last_instruction_mut(&mut self) -> Option<&mut Instruction> {
         let index = self
             .linear_items()
@@ -2558,6 +2570,17 @@ impl Assembler {
         self.push_linear_item(Item::Label(label));
     }
 
+    /// Whether the next instruction starts at the recorded source-authored match end.
+    pub(crate) fn at_original_match_join(&self) -> bool {
+        self.original_match_join.is_some_and(|join| {
+            self.linear_items()
+                .iter()
+                .rev()
+                .take_while(|item| matches!(item, Item::Label(_)))
+                .any(|item| matches!(item, Item::Label(label) if *label == join))
+        })
+    }
+
     /// Records the source-authored match end until its first instruction is emitted.
     pub(crate) fn mark_original_match_join(&mut self, label: Label) {
         let items = self.linear_items();
@@ -2593,6 +2616,17 @@ impl Assembler {
             }
             _ => None,
         };
+        // CPython's case-success jumps also establish this array when every
+        // successful body terminates and lowering omits those unreachable edges.
+        // Live success edges already represent the join and keep their own policies.
+        let has_success_edge = items.iter().any(|item| {
+            matches!(item, Item::Instruction(instruction)
+                if is_unconditional_jump(instruction.opcode)
+                    && instruction.operand() == Operand::Forward(label))
+        });
+        if !has_success_edge {
+            self.record_exception_owner_block_boundary(label);
+        }
         self.mark(label);
         self.original_match_join = Some(label);
         if let Some(origin) = origin {
@@ -3594,9 +3628,19 @@ impl Assembler {
     }
 
     /// Defers Boolean-marker ownership until all CFG removals and late insertions are known.
-    pub(crate) fn defer_last_boolean_exception_owner(&mut self) {
+    pub(crate) fn defer_last_boolean_exception_owner(&mut self, entry: Label) {
         self.required_last_instruction_mut("deferring Boolean exception ownership")
             .set_exception_policy(ExceptionPolicy::NoneDynamic);
+        if let Some(start) = self
+            .linear_items()
+            .iter()
+            .rposition(|item| *item == Item::Label(entry))
+        {
+            let prefix = self.linear_items()[start..].to_vec();
+            self.exception_owner_provenance
+                .original_value_jump_prefixes
+                .push((entry, prefix));
+        }
     }
 
     /// Marks the fallthrough created by backward conditional normalization as a fresh block.
@@ -4032,10 +4076,19 @@ impl Assembler {
     }
 
     /// Certifies an original case-success edge without introducing a block boundary.
-    pub(crate) fn record_original_match_success(&mut self, emitted: EmittedJump) {
+    pub(crate) fn record_original_match_success(
+        &mut self,
+        emitted: EmittedJump,
+        original_match_join: bool,
+    ) {
         let instruction = self.emitted_jump_mut(emitted, "recording an original match success");
         debug_assert_eq!(instruction.opcode, JUMP_FORWARD);
         instruction.jump_policy.mark_original_match_success();
+        if original_match_join {
+            // Only the immediately preceding match end supplies this certificate.
+            // Other case-tail joins retain their existing exit-copy policies.
+            self.record_original_empty_join(emitted);
+        }
     }
 
     pub(crate) fn preserve_inlined_jump_nop(&mut self, emitted: EmittedJump) {
@@ -4704,28 +4757,42 @@ impl Assembler {
             .push((entry, records));
     }
 
-    /// Records two adjacent emitted return-unwind POPs and their direct local None test.
+    /// Records adjacent emitted return-unwind POPs and their direct local None test.
     pub(crate) fn record_copied_return_none_prefix(
         &mut self,
         return_item: usize,
         first_pop_item: usize,
+        allow_additional_pop: bool,
     ) {
-        let Some(
-            [
-                Item::Instruction(first_pop),
-                Item::Instruction(final_pop),
-                Item::Instruction(load),
-                Item::Instruction(condition),
-                ..,
-            ],
-        ) = self.linear_items().get(first_pop_item..)
-        else {
-            return;
-        };
-        let pops = [*first_pop, *final_pop];
-        let load = *load;
-        let condition = *condition;
-        if pops.iter().any(|pop| {
+        let (pops, additional_pop, load, condition) =
+            match self.linear_items().get(first_pop_item..) {
+                Some(
+                    [
+                        Item::Instruction(first_pop),
+                        Item::Instruction(middle_pop),
+                        Item::Instruction(final_pop),
+                        Item::Instruction(load),
+                        Item::Instruction(condition),
+                        ..,
+                    ],
+                ) if allow_additional_pop && final_pop.opcode == NOP => (
+                    [*first_pop, *final_pop],
+                    Some(*middle_pop),
+                    *load,
+                    *condition,
+                ),
+                Some(
+                    [
+                        Item::Instruction(first_pop),
+                        Item::Instruction(final_pop),
+                        Item::Instruction(load),
+                        Item::Instruction(condition),
+                        ..,
+                    ],
+                ) => ([*first_pop, *final_pop], None, *load, *condition),
+                _ => return,
+            };
+        if pops.iter().chain(additional_pop.iter()).any(|pop| {
             pop.opcode != NOP
                 || pop.operand() != Operand::Value(0)
                 || !pop.fusion_policy.is_converted_pop_block()
@@ -4757,11 +4824,30 @@ impl Assembler {
             }
             _ => None,
         };
+        if additional_pop.is_some() {
+            let Some(authored) = return_nop else {
+                return;
+            };
+            // Three removed cells require the complete authored-NOP/POP/POP/POP
+            // chain. They are not an arbitrary transferred hidden-slot count.
+            if authored.location.line < 0
+                || pops.iter().chain(additional_pop.iter()).any(|pop| {
+                    pop.location != authored.location
+                        || pop.depth_after() != authored.depth_after()
+                        || pop.jump_policy.borrow_empty_block()
+                        || pop.no_location_policy.borrow_fallthrough()
+                            != BorrowFallthrough::Reachable
+                })
+            {
+                return;
+            }
+        }
         self.exception_owner_provenance
             .copied_return_none_prefixes
             .push(exception_owners::CopiedReturnNonePrefix {
                 return_nop,
                 pops,
+                additional_pop,
                 load,
                 condition,
             });
@@ -5969,6 +6055,60 @@ impl Assembler {
             return;
         };
         self.record_copied_handler_cleanup(start, end, break_item, true);
+    }
+
+    /// Captures a continued local None test with an emitted fallthrough suffix.
+    pub(crate) fn record_copied_continue_none_handler_cleanup(&mut self, continue_item: usize) {
+        let items = self.linear_items();
+        let records = items
+            .iter()
+            .enumerate()
+            .skip(continue_item)
+            .filter_map(|(index, item)| match item {
+                Item::Instruction(instruction) => Some((index, *instruction)),
+                Item::Label(_) => None,
+            })
+            .take(8)
+            .collect::<Vec<_>>();
+        if records.len() != 8 || records[0].0 != continue_item {
+            return;
+        }
+        let condition = records[6].1;
+        if !matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE) {
+            return;
+        }
+        let Operand::Forward(target) = condition.operand() else {
+            return;
+        };
+        let mut targets = items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| (*item == Item::Label(target)).then_some(index));
+        let Some(target_index) = targets.next() else {
+            return;
+        };
+        if targets.next().is_some() || target_index <= records[7].0 {
+            return;
+        }
+        let Some(suffix) = items[target_index + 1..]
+            .iter()
+            .find_map(|item| match item {
+                Item::Instruction(instruction) => Some(instruction),
+                Item::Label(_) => None,
+            })
+        else {
+            return;
+        };
+        // This recorder runs before the pending continue jump is emitted. A terminal
+        // join has no stable suffix yet and may acquire a fresh backward marker.
+        if matches!(suffix.opcode, NOP | NOT_TAKEN)
+            || is_conditional_jump(suffix.opcode)
+            || is_unconditional_jump(suffix.opcode)
+            || ends_scope(suffix.opcode)
+        {
+            return;
+        }
+        self.record_copied_break_handler_cleanup(continue_item);
     }
 
     /// Captures a direct named-handler continue and its first copied call condition.

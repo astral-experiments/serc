@@ -1030,7 +1030,7 @@ pub(super) fn statement_execution_range(statement: &Stmt) -> ruff_text_size::Tex
     }
 }
 
-fn first_expression_instruction_range(expression: &Expr) -> ruff_text_size::TextRange {
+pub(super) fn first_expression_instruction_range(expression: &Expr) -> ruff_text_size::TextRange {
     if matches!(
         expression,
         Expr::BinOp(_) | Expr::Name(_) | Expr::UnaryOp(_) | Expr::Tuple(_)

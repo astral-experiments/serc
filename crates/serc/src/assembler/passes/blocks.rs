@@ -2167,8 +2167,8 @@ impl OptimizationPipeline {
     ///
     /// CPython resolves lines before folding constant condition edges. Walk the original
     /// folded paths from a surviving, reachable source marker while their instructions
-    /// still exist, stopping where they rejoin live code. A folded target alone does not
-    /// prove reachability: lowering can also emit constant loops after terminal try arms.
+    /// still exist, crossing only original unlocated jump bridges at live joins. A folded
+    /// target alone does not prove reachability: lowering can emit loops after terminal arms.
     /// Only a located target that cannot be copied before line resolution certifies
     /// that the converted `POP_BLOCK` had no sole predecessor from which to inherit a line.
     pub(in crate::assembler) fn preserve_folded_pop_block_locations(&mut self) {
@@ -2212,7 +2212,51 @@ impl OptimizationPipeline {
                 continue;
             }
             if reachable[block.index()] {
-                joins.push(block);
+                // CPython copies an unlocated jump-only join onto each incoming
+                // path before resolving lines. Carry the folded predecessor through
+                // that original bridge so the cleanup head remains shared.
+                let items = self.graph[block].items();
+                let mut instructions = items.iter().filter_map(|item| match item {
+                    Item::Instruction(instruction) => Some(instruction),
+                    Item::Label(_) => None,
+                });
+                if let Some(jump) = instructions.next()
+                    && instructions.next().is_none()
+                    && jump.opcode == JUMP_FORWARD
+                    && jump.location == SourceLocation::NONE
+                    && jump.pre_fold_extra_instructions() == 0
+                    && jump.local_policy.hidden_exception_owner_slots() == 0
+                    && jump.jump_policy.allows_threading_target()
+                    && !jump.jump_policy.retains_nop_for(jump.operand())
+                    && !jump.jump_policy.preserves_nop_after_threading()
+                    && !jump.jump_policy.is_interruptible()
+                    && !jump.no_location_policy.preserves_location()
+                    && items.iter().any(|item| {
+                        matches!(item, Item::Label(label)
+                            if self.exception_owner_provenance.block_boundaries.contains(label))
+                    })
+                    && items.iter().all(|item| match item {
+                        Item::Label(label) => {
+                            !self.original_nop_targets.contains(label)
+                                && !self
+                                    .exception_owner_provenance
+                                    .omitted_nop_counts
+                                    .contains_key(label)
+                                && !self
+                                    .exception_owner_provenance
+                                    .omitted_nop_locations
+                                    .contains_key(label)
+                        }
+                        Item::Instruction(_) => true,
+                    })
+                    && let Operand::Forward(target) = jump.operand()
+                    && let Some(target) = self.graph.label_block(target)
+                    && positions[&block] < positions[&target]
+                {
+                    pending.push(target);
+                } else {
+                    joins.push(block);
+                }
                 continue;
             }
             if block_has_fallthrough(self.graph[block].items())

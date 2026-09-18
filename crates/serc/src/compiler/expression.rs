@@ -49,8 +49,8 @@ use super::scope::{
     generator_cellvars, generator_required_names, inlined_comprehension_cell_names_in_expression,
 };
 use super::source::{
-    debug_text_range, statement_execution_range, strip_expression_comments,
-    synthetic_condition_exit_range,
+    debug_text_range, first_expression_instruction_range, statement_execution_range,
+    strip_expression_comments, synthetic_condition_exit_range,
 };
 use super::statement::{
     final_chained_comparison_jump, is_wildcard_pattern, suite_has_linear_borrow_fallthrough,
@@ -568,6 +568,19 @@ impl Compiler<'_> {
                     }
                 } else {
                     self.ensure_match_fail_pop(&mut context, 0);
+                    if copied_subject
+                        && is_wildcard_pattern(&case.pattern)
+                        && self.source_location(case.pattern.range()).line
+                            != self
+                                .source_location(first_expression_instruction_range(guard))
+                                .line
+                    {
+                        // CPython replaces the wildcard's COPY/POP_TOP pair with NOPs.
+                        // Its pattern line survives when the guard begins on a later line.
+                        self.assembler
+                            .set_location(self.source_location(case.pattern.range()));
+                        self.emit(NOP, 0, 0)?;
+                    }
                     self.compile_jump_if(guard, false, context.fail_pop[0])?;
                 }
             }
@@ -684,8 +697,13 @@ impl Compiler<'_> {
                         self.assembler.add_last_inlined_jump_slot();
                     } else {
                         let original_unlocated_head = self.assembler.at_jump_target();
+                        let authored_pass_exit = self.assembler.last_instruction_is_nop()
+                            && !self.assembler.last_nop_repeats_previous_line()
+                            && matches!(case.body.last(), Some(Stmt::Pass(_)));
+                        let original_match_join = self.assembler.at_original_match_join();
                         let success_exit = self.emit_jump_forward_instruction(JUMP_FORWARD, end)?;
-                        self.assembler.record_original_match_success(success_exit);
+                        self.assembler
+                            .record_original_match_success(success_exit, original_match_join);
                         if original_unlocated_head {
                             self.assembler.mark_as_artificial_eval_break(success_exit);
                             if let Some(Stmt::If(tail)) = case.body.last()
@@ -738,6 +756,10 @@ impl Compiler<'_> {
                             });
                         if irrefutable_true_guard {
                             self.assembler.preserve_inlined_jump_nop(success_exit);
+                        } else if authored_pass_exit && case.body.len() > 1 {
+                            // The case-success jump absorbed an authored trailing Pass NOP.
+                            // Copying or retargeting its exit must keep that line event.
+                            self.assembler.preserve_authored_pass_jump_nop(success_exit);
                         } else if self.assembler.instruction_count() == body_start + 1
                             && !previous_instruction_covers_branch
                             && !matches!(self.unit.scope, Scope::Class { .. })
@@ -7147,7 +7169,8 @@ impl Compiler<'_> {
                 },
             )?;
 
-            self.assembler.defer_last_boolean_exception_owner();
+            self.assembler
+                .defer_last_boolean_exception_owner(exclusion_start);
 
             if let Some(marker_start) = marker_start {
                 let marker_end = self.assembler.label();

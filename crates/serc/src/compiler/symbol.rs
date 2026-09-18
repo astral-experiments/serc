@@ -1838,7 +1838,13 @@ impl Compiler<'_> {
         opcode: Opcode,
         label: Label,
     ) -> Result<EmittedJump, CompileError> {
-        self.emit_jump_forward_instruction_inner(opcode, label, ExceptionPolicy::default(), true)
+        self.emit_jump_forward_instruction_inner(
+            opcode,
+            label,
+            ExceptionPolicy::default(),
+            true,
+            true,
+        )
     }
 
     pub(super) fn emit_jump_forward_instruction_with_exception_policy(
@@ -1847,19 +1853,30 @@ impl Compiler<'_> {
         label: Label,
         exception_policy: ExceptionPolicy,
     ) -> Result<EmittedJump, CompileError> {
-        self.emit_jump_forward_instruction_inner(opcode, label, exception_policy, false)
+        self.emit_jump_forward_instruction_inner(opcode, label, exception_policy, false, true)
     }
 
-    /// Shares validated jump emission and NOP compaction between both location policies.
+    /// Keeps the preceding original record for location propagation and NOP removal.
+    pub(super) fn emit_jump_forward_instruction_preserving_nop(
+        &mut self,
+        opcode: Opcode,
+        label: Label,
+        exception_policy: ExceptionPolicy,
+    ) -> Result<EmittedJump, CompileError> {
+        self.emit_jump_forward_instruction_inner(opcode, label, exception_policy, false, false)
+    }
+
+    /// Shares validated jump emission and optional NOP compaction between location policies.
     fn emit_jump_forward_instruction_inner(
         &mut self,
         opcode: Opcode,
         label: Label,
         exception_policy: ExceptionPolicy,
         preserve_location: bool,
+        compact_trailing_nop: bool,
     ) -> Result<EmittedJump, CompileError> {
         self.control.clear_direct_comprehension_assignment_results();
-        let removed_nop = is_unconditional_jump(opcode)
+        let removed_nop = (compact_trailing_nop && is_unconditional_jump(opcode))
             .then(|| self.take_trailing_nop_location())
             .flatten();
         if !preserve_location && let Some((location, _)) = removed_nop {
