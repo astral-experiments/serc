@@ -6379,35 +6379,78 @@ impl Compiler<'_> {
                     // These managers were all entered after the remaining loops. Their
                     // exit callables must be removed before the surrounding iterators.
                     // Keep the separate handler and copied-finally unwind paths unchanged.
-                    let unwind_inner_managers_first = self.context.target_specific_rules_enabled()
-                        && preserve_tos
-                        && handler_count == 0
-                        && !nested_call_finally_return
-                        && self.control.finally.active_finally_end_blocks == 0
-                        && self.control.finally.active_normal_finally_bodies == 0
-                        && self.control.finally.active_copied_finally_bodies == 0
-                        && self
-                            .control
-                            .finally
-                            .preserved_return_value_contexts
-                            .is_empty()
-                        && next_with > finally_context.with_depth
-                        && finally_context.loop_depth < next_loop
-                        && self.control.loops.contexts[finally_context.loop_depth..next_loop]
-                            .iter()
-                            .any(|context| context.iterator_cleanup != IteratorCleanup::None)
+                    let can_unwind_inner_managers_first =
+                        self.context.target_specific_rules_enabled()
+                            && preserve_tos
+                            && handler_count == 0
+                            && !nested_call_finally_return
+                            && self.control.finally.active_finally_end_blocks == 0
+                            && self.control.finally.active_normal_finally_bodies == 0
+                            && self.control.finally.active_copied_finally_bodies == 0
+                            && self
+                                .control
+                                .finally
+                                .preserved_return_value_contexts
+                                .is_empty()
+                            && next_with > finally_context.with_depth
+                            && finally_context.loop_depth < next_loop
+                            && self.control.loops.contexts[finally_context.loop_depth..next_loop]
+                                .iter()
+                                .any(|context| context.iterator_cleanup != IteratorCleanup::None);
+                    let unwind_inner_managers_first = can_unwind_inner_managers_first
                         && self.control.withs.active_with_exits
                             [finally_context.with_depth..next_with]
                             .iter()
                             .all(|manager| !manager.is_async && manager.loop_depth == next_loop);
+                    // A coroutine can enter managers on both sides of one retry iterator.
+                    // Its stored manager depth separates the inner exit callables from
+                    // managers that must remain on the stack until that iterator is popped.
+                    let inner_async_manager_start = if can_unwind_inner_managers_first
+                        && !return_is_overridden
+                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                            == CO_COROUTINE
+                        && finally_context.handler_depth == 0
+                        && next_loop == finally_context.loop_depth + 1
+                    {
+                        let iterator = self.control.loops.contexts[finally_context.loop_depth];
+                        (iterator.iterator_cleanup == IteratorCleanup::Sync
+                            && iterator.finally_end_depth == 0
+                            && iterator.exception_region_depth
+                                == finally_context.exception_region_depth + 1
+                            && iterator.with_depth >= finally_context.with_depth
+                            && iterator.with_depth < next_with
+                            && self.control.withs.active_with_exits
+                                [finally_context.with_depth..iterator.with_depth]
+                                .iter()
+                                .all(|manager| {
+                                    manager.is_async
+                                        && manager.loop_depth == finally_context.loop_depth
+                                        && manager.exception_region_depth
+                                            == iterator.exception_region_depth
+                                        && manager.normal_finally_depth == 0
+                                })
+                            && self.control.withs.active_with_exits[iterator.with_depth..next_with]
+                                .iter()
+                                .all(|manager| {
+                                    manager.is_async
+                                        && manager.loop_depth == next_loop
+                                        && manager.exception_region_depth
+                                            >= iterator.exception_region_depth
+                                        && manager.normal_finally_depth == 0
+                                }))
+                        .then_some(iterator.with_depth)
+                    } else {
+                        None
+                    };
+                    let early_manager_start = if unwind_inner_managers_first {
+                        Some(finally_context.with_depth)
+                    } else {
+                        inner_async_manager_start
+                    };
                     let mut starts = Vec::new();
-                    let remaining_with = if unwind_inner_managers_first {
-                        starts = self.emit_with_unwind(
-                            finally_context.with_depth,
-                            next_with,
-                            preserve_tos,
-                        )?;
-                        finally_context.with_depth
+                    let remaining_with = if let Some(from_depth) = early_manager_start {
+                        starts = self.emit_with_unwind(from_depth, next_with, preserve_tos)?;
+                        from_depth
                     } else {
                         next_with
                     };
@@ -6419,7 +6462,8 @@ impl Compiler<'_> {
                     // still pending here, before any inner ordinary try began. A bare
                     // return has the same unwind boundary as an explicit `return None`.
                     let retained_manager_surrounds_iterators = (nested_call_finally_return
-                        || statement.value.is_none())
+                        || statement.value.is_none()
+                        || inner_async_manager_start.is_some())
                         && remaining_with > finally_context.with_depth
                         && finally_context.loop_depth < next_loop
                         && self.control.loops.contexts[finally_context.loop_depth..next_loop]
@@ -6960,6 +7004,51 @@ impl Compiler<'_> {
                     } else {
                         None
                     };
+                    // An unnamed handler restores its exception state before one or
+                    // two enclosing sync managers and the sole outer finally unwind.
+                    let copied_unnamed_handler_manager_pop = (self.context.target_specific_rules_enabled()
+                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                        && !preserve_tos
+                        && !return_is_overridden
+                        && context_index == 0
+                        && return_finally_contexts.len() == 1
+                        && handler_count == 1
+                        && next_handler == 0
+                        && next_loop == 0
+                        && next_with == 0
+                        && finally_context.handler_depth == 0
+                        && finally_context.with_depth == 0
+                        && finally_context.loop_depth == 0
+                        && finally_context.try_body_depth == 0
+                        && finally_context.exception_region_depth == 0
+                        && self.control.exceptions.active_try_marker_slots.is_empty()
+                        && self.control.exceptions.active_exception_region_exclusions.len() == 2
+                        && matches!(
+                            self.control.exceptions.active_exception_handlers.as_slice(),
+                            [handler]
+                                if handler.name.is_none()
+                                    && handler.with_depth == self.control.withs.active_with_exits.len()
+                                    && handler.loop_depth == 0
+                                    && handler.finally_end_depth == 0
+                                    && handler.try_body_depth == 0
+                                    && handler.exception_region_depth == 1
+                        )
+                        && (1..=2).contains(&self.control.withs.active_with_exits.len())
+                        && self.control.withs.active_with_exits.iter().all(|manager| {
+                            !manager.is_async
+                                && manager.loop_depth == 0
+                                && manager.normal_finally_depth == 0
+                                && manager.exception_region_depth == 1
+                        })
+                        && with_unwind_starts.iter().map(|unwind| unwind.index)
+                            .eq((0..self.control.withs.active_with_exits.len()).rev())
+                        && self.control.loops.contexts.is_empty()
+                        && self.control.finally.active_finally_try_bodies == 1
+                        && self.control.finally.active_finally_end_blocks == 0
+                        && self.control.finally.active_normal_finally_bodies == 0
+                        && self.control.finally.active_copied_finally_bodies == 0
+                        && self.control.finally.preserved_return_value_contexts.is_empty())
+                        .then(|| (self.assembler.item_count(), self.control.withs.active_with_exits.len()));
                     let copied_manager_return_pop = (self.context.target_specific_rules_enabled()
                         && matches!(
                             self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR),
@@ -7321,6 +7410,19 @@ impl Compiler<'_> {
                                 pop_item,
                                 named_handler,
                                 missing_null_pops,
+                                0,
+                            );
+                    }
+                    if result.is_ok()
+                        && let Some((pop_item, managers)) = copied_unnamed_handler_manager_pop
+                    {
+                        self.assembler
+                            .record_copied_constant_manager_return_compaction(
+                                copied_handler_return_item,
+                                pop_item,
+                                false,
+                                managers - 1,
+                                managers,
                             );
                     }
                     if result.is_ok()
@@ -19924,8 +20026,20 @@ impl Compiler<'_> {
                                 })
                             })))
             });
+        let managed_while_recovery_exit = statement.handlers.is_empty()
+            && !normal_finally_is_borrow_reachable
+            && statement.orelse.is_empty()
+            && self.unit.flags & (CO_COROUTINE | CO_GENERATOR | CO_ASYNC_GENERATOR) == CO_COROUTINE
+            && self.control.loops.contexts.is_empty()
+            && !self.control.in_exception_handler()
+            && self.control.finally.active_finally_try_bodies == 0
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+            && managed_while_reraise_leaves_empty_borrow_exit(&statement.body);
         if (!statement.handlers.is_empty() && !normal_finally_is_borrow_reachable)
             || nested_handler_exit
+            || managed_while_recovery_exit
         {
             // An abrupt or bare handler leaves an empty CPython CFG block before the normal
             // finally body. Breaks and trailing structured try-body exits can leave the same
@@ -24924,6 +25038,52 @@ pub(super) fn suite_has_linear_borrow_fallthrough(body: &[Stmt]) -> bool {
         has_runtime_work |= has_work;
     }
     has_runtime_work
+}
+
+// A terminal while's false edge crosses an emptied ordinary-try exit before
+// manager teardown. Reraising handlers provide no separate normal entry to the
+// enclosing finally, even though the manager's exit calls are nonempty.
+fn managed_while_reraise_leaves_empty_borrow_exit(body: &[Stmt]) -> bool {
+    let Some(Stmt::With(manager)) = body.last() else {
+        return false;
+    };
+    if manager.is_async
+        || manager.items.iter().any(|item| {
+            expression_contains_inline_branch(&item.context_expr)
+                || expression_suspends_current_scope(&item.context_expr)
+        })
+    {
+        return false;
+    }
+    let Some(Stmt::Try(recovery)) = manager.body.last() else {
+        return false;
+    };
+    if recovery.is_star
+        || !recovery.orelse.is_empty()
+        || !recovery.finalbody.is_empty()
+        || recovery.handlers.is_empty()
+    {
+        return false;
+    }
+    let Some(Stmt::While(tail)) = recovery.body.last() else {
+        return false;
+    };
+    if !matches!(tail.test.as_ref(), Expr::Name(_))
+        || !tail.orelse.is_empty()
+        || suite_contains_loop_break(&tail.body)
+        || suite_contains_return(&tail.body)
+    {
+        return false;
+    }
+    recovery.handlers.iter().all(|handler| {
+        let Some(handler) = handler.as_except_handler() else {
+            return false;
+        };
+        handler.type_.is_some()
+            && handler.name.is_none()
+            && matches!(handler.body.last(), Some(Stmt::Raise(raise))
+                if raise.exc.is_none() && raise.cause.is_none())
+    })
 }
 
 // A guarded bare reraise keeps the nested recovery cold. Its normal work can

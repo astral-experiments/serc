@@ -6,9 +6,10 @@ use super::{
     Instruction, Item, Label, LayoutAssembler, NormalizedExceptionOwner, Operand, SourceLocation,
 };
 use crate::target::opcodes::{
-    COMPARE_OP, COPY_FREE_VARS, FOR_ITER, LOAD_FAST_BORROW_LOAD_FAST_BORROW, LOAD_FAST_LOAD_FAST,
-    LOAD_GLOBAL, MAKE_CELL, NOP, NOT_TAKEN, POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE, POP_TOP,
-    RETURN_GENERATOR, SEND, STORE_FAST_LOAD_FAST, STORE_FAST_STORE_FAST,
+    COMPARE_OP, COPY_FREE_VARS, FOR_ITER, LOAD_CONST, LOAD_FAST_BORROW_LOAD_FAST_BORROW,
+    LOAD_FAST_LOAD_FAST, LOAD_GLOBAL, MAKE_CELL, NOP, NOT_TAKEN, POP_JUMP_IF_NONE,
+    POP_JUMP_IF_NOT_NONE, POP_TOP, RETURN_GENERATOR, SEND, STORE_FAST_LOAD_FAST,
+    STORE_FAST_STORE_FAST,
 };
 use crate::target::{is_conditional_jump, is_scope_exit};
 
@@ -244,6 +245,7 @@ pub(super) struct CopiedManagerReturnCompaction {
 #[derive(Debug)]
 pub(super) struct ConstantManagerReturnPrefix {
     pub(super) authored_nop: Instruction,
+    pub(super) handler_pop: Option<Instruction>,
     pub(super) instructions: Vec<Instruction>,
     pub(super) missing_null_pops: usize,
 }
@@ -6567,7 +6569,9 @@ impl LayoutAssembler {
                             .all(|(offset, (actual, expected))| {
                                 let mut expected = *expected;
                                 if offset == 0 {
-                                    expected.local_policy.add_hidden_exception_owner_slots(1);
+                                    expected.local_policy.add_hidden_exception_owner_slots(
+                                        1 + u16::from(prefix.handler_pop.is_some()),
+                                    );
                                 }
                                 **actual == expected
                             })
@@ -6581,16 +6585,40 @@ impl LayoutAssembler {
         if origins.next().is_some() {
             return None;
         }
-        // The prefix must contain only the known LOAD_GLOBAL and local-pair folds.
-        // In particular, no unrelated erased POP can shift the manager's old cells.
+        // The prefix may contain certified literal folds, LOAD_GLOBAL folds, and
+        // local-pair folds. No unrelated erased POP may shift the manager's old cells.
         let mut prefix_tail = ExceptionOwnerTail::default();
         for (offset, instruction) in instructions[array_start..start].iter().enumerate() {
-            let authored_return_slots = usize::from(
-                origin.constant_return_prefix.is_some() && array_start + offset == prefix_start,
-            );
+            let authored_return_slots =
+                origin.constant_return_prefix.as_ref().map_or(0, |prefix| {
+                    if array_start + offset == prefix_start {
+                        1 + usize::from(prefix.handler_pop.is_some())
+                    } else {
+                        0
+                    }
+                });
+            // A small literal tuple removes only records with its survivor's
+            // owner. Its exact unsaturated frontend certificate accounts for those
+            // cells before the captured manager cleanup, independently of POPs.
+            let literal_slots = if instruction.opcode == LOAD_CONST
+                && authored_return_slots == 0
+                && self
+                    .exception_owner_provenance
+                    .uniform_fold_owner_slots
+                    .iter()
+                    .any(|(location, opcode, slots)| {
+                        instruction.location == *location
+                            && instruction.opcode == *opcode
+                            && instruction.local_policy.hidden_exception_owner_slots() == *slots
+                            && u16::from(instruction.pre_fold_extra_instructions()) == *slots
+                    }) {
+                usize::from(instruction.local_policy.hidden_exception_owner_slots())
+            } else {
+                0
+            };
             if usize::from(instruction.local_policy.hidden_exception_owner_slots())
-                != authored_return_slots
-                || instruction.pre_fold_extra_instructions() != 0
+                != authored_return_slots + literal_slots
+                || usize::from(instruction.pre_fold_extra_instructions()) != literal_slots
                 || instruction.exception_policy() != super::ExceptionPolicy::NoneUnchanged
                 || instruction.opcode == NOP
                 || instruction.no_location_policy.borrow_fallthrough()

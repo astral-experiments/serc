@@ -95,3 +95,32 @@ fn preserves_real_boundaries_after_comprehension_restoration() {
         assert_restore_owner(statement, prelude_calls, join, condition);
     }
 }
+
+#[test]
+fn matches_cpython_comprehension_restore_fusion_after_tuple_assignment() {
+    for (filename, source) in [
+        (
+            "tuple_assignment_nested_dict_restore_fusion.py",
+            r"def f(items, copy):
+    first, second, matrix = copy(items), copy(items), {key: {inner: 0 for inner in items} for key in items}
+    return first, second, matrix
+",
+        ),
+        (
+            "tuple_assignment_pair_target_restore_fusion.py",
+            r"def f(exits, turn, enters):
+    exits, turn, enters = [e for _, e in exits], turn[1], [e for _, e in enters]
+    return exits, turn, enters
+",
+        ),
+        (
+            "single_assignment_pair_restore_control.py",
+            r"def f(items):
+    result = [value for _, value in items]
+    return result
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

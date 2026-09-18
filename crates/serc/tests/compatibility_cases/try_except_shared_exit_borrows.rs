@@ -648,3 +648,107 @@ fn matches_cpython_borrows_after_conditional_finalizer_call_suffixes() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_borrows_after_managed_while_reraise_finally() {
+    for (source, filename) in [
+        (
+            r"async def collect(outer, manager, resource, pending, wait, report):
+    async with outer:
+        try:
+            with manager:
+                try:
+                    while pending:
+                        completed = await wait(pending)
+                        for task in completed:
+                            report(task)
+                except Exception:
+                    for task in pending:
+                        task.cancel()
+                    await wait(pending)
+                    raise
+        finally:
+            if resource is not None:
+                resource.close()
+    report(resource)
+",
+            "managed_while_reraise_conditional_finally_target.py",
+        ),
+        (
+            r"async def collect(outer, manager, resource, pending, wait, report):
+    async with outer:
+        try:
+            with manager:
+                try:
+                    while pending:
+                        completed = await wait(pending)
+                        for task in completed:
+                            report(task)
+                except Exception:
+                    for task in pending:
+                        task.cancel()
+                    await wait(pending)
+                    report(pending)
+        finally:
+            if resource is not None:
+                resource.close()
+    report(resource)
+",
+            "managed_while_recover_conditional_finally_control.py",
+        ),
+        (
+            r"async def collect(manager, resource, pending, wait, report, value):
+    def retain_resource():
+        return resource
+
+    try:
+        source = pending
+        with manager:
+            try:
+                for task in source:
+                    await wait(task)
+                while pending:
+                    await wait(pending)
+            except Exception:
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    await wait(pending)
+                raise
+    finally:
+        await resource.close()
+    report(value)
+    return value
+",
+            "managed_while_reraise_awaited_finally_target.py",
+        ),
+        (
+            r"async def collect(manager, resource, pending, wait, report, value):
+    def retain_resource():
+        return resource
+
+    try:
+        source = pending
+        with manager:
+            try:
+                for task in source:
+                    await wait(task)
+                while pending:
+                    await wait(pending)
+            except Exception:
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    await wait(pending)
+                report(pending)
+    finally:
+        await resource.close()
+    report(value)
+    return value
+",
+            "managed_while_recover_awaited_finally_control.py",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

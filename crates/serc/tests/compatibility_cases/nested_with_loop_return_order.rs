@@ -102,3 +102,46 @@ fn matches_cpython_with_return_iterator_exception_owners() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn exits_async_managers_before_retry_iterator_in_finally_return() {
+    for (filename, source) in [
+        (
+            "async_manager_inside_retry_return_finally.py",
+            r"async def f(items, manager, value, cleanup):
+    try:
+        for item in items:
+            async with manager:
+                return value
+    finally:
+        cleanup()
+",
+        ),
+        (
+            "async_managers_around_retry_return_finally.py",
+            r"async def f(items, outer, inner, value, cleanup):
+    try:
+        async with outer:
+            for item in items:
+                async with inner:
+                    return value
+    finally:
+        cleanup()
+",
+        ),
+        (
+            "async_nested_managers_retry_await_return_finally.py",
+            r"async def f(items, outer, inner, work, cleanup):
+    try:
+        for item in items:
+            async with outer:
+                async with inner:
+                    return await work()
+    finally:
+        cleanup()
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

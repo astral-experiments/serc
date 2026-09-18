@@ -200,8 +200,24 @@ fn capture_cleanup_rotation(items: &[Item]) -> Option<CaptureCleanupRotation<'_>
     // Close the emitted snapshot before predicting it. A later line cannot fuse with
     // the rotated final store. A sole capture's guard load is separated by pops;
     // with two captures, a large penultimate local cannot fuse with its guard load.
-    let Some(Item::Instruction(following)) = items.get(consumed) else {
-        return None;
+    let following = match items.get(consumed) {
+        Some(Item::Instruction(instruction)) => instruction,
+        Some(Item::Label(_)) => {
+            // A following try can place labels before its located NOP. The complete
+            // rotation stays before those labels, and the next-line NOP still closes
+            // its fusion boundary. Do not look through any intervening instruction.
+            let Some(Item::Instruction(nop)) = items[consumed..]
+                .iter()
+                .find(|item| !matches!(item, Item::Label(_)))
+            else {
+                return None;
+            };
+            if nop.opcode != NOP || nop.operand() != Operand::Value(0) {
+                return None;
+            }
+            nop
+        }
+        None => return None,
     };
     let same_line_capture_guard = matches!(
         stores.as_slice(),
@@ -3837,6 +3853,10 @@ impl Assembler {
         instruction
             .local_policy
             .mark_maybe_null_comprehension_restore();
+        // Native lowers STORE_FAST_MAYBE_NULL after local-pair fusion. Keep both
+        // boundaries attached to the restore when static swaps move it.
+        instruction.fusion_policy.prevent_with_previous();
+        instruction.fusion_policy.prevent_with_next();
     }
 
     pub(crate) fn mark_load_fast_as_post_analysis_closure(&mut self, emitted: EmittedInstruction) {
@@ -5484,10 +5504,17 @@ impl Assembler {
         pop_item: usize,
         named_handler: bool,
         missing_null_pops: usize,
+        unnamed_handler_managers: usize,
     ) {
         use crate::target::opcodes::{CALL, DELETE_FAST, LOAD_CONST, STORE_FAST};
 
-        if (named_handler && missing_null_pops != 2) || (!named_handler && missing_null_pops > 1) {
+        if (named_handler && missing_null_pops != 2)
+            || (!named_handler && missing_null_pops > 1)
+            || (unnamed_handler_managers != 0
+                && (named_handler
+                    || !(1..=2).contains(&unnamed_handler_managers)
+                    || missing_null_pops + 1 != unnamed_handler_managers))
+        {
             return;
         }
         let items = self.linear_items();
@@ -5501,26 +5528,47 @@ impl Assembler {
                 Item::Label(_) => None,
             })
             .collect::<Vec<_>>();
-        let prelude_len = if named_handler { 4 } else { 1 };
-        if records.len() != 1 + prelude_len + 5
+        let unnamed_handler = unnamed_handler_managers != 0;
+        let prelude_start = 1 + usize::from(unnamed_handler);
+        let prelude_len = if unnamed_handler {
+            1 + 5 * (unnamed_handler_managers - 1)
+        } else if named_handler {
+            4
+        } else {
+            1
+        };
+        if records.len() != prelude_start + prelude_len + 5
             || items.get(return_item) != Some(&Item::Instruction(records[0]))
         {
             return;
         }
         let authored = records[0];
-        let prelude = &records[1..=prelude_len];
-        let cleanup = &records[1 + prelude_len..];
+        let handler_pop = unnamed_handler.then_some(records[1]);
+        let prelude = &records[prelude_start..prelude_start + prelude_len];
+        let cleanup = &records[prelude_start + prelude_len..];
         if authored.opcode != NOP
             || authored.operand() != Operand::Value(0)
             || authored.fusion_policy.is_converted_pop_block()
             || authored.location.line < 0
-            || prelude
-                .iter()
-                .any(|instruction| instruction.location != authored.location)
-            || records.iter().any(|instruction| {
+            || prelude[0].location != authored.location
+            || (!unnamed_handler
+                && prelude
+                    .iter()
+                    .any(|instruction| instruction.location != authored.location))
+            || handler_pop.is_some_and(|pop| {
+                pop.opcode != NOP
+                    || pop.operand() != Operand::Value(0)
+                    || !pop.fusion_policy.is_converted_pop_block()
+                    || pop.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
+                    || pop.location != authored.location
+                    || pop.depth_after().is_none()
+                    || pop.depth_after() != authored.depth_after()
+            })
+            || records.iter().enumerate().any(|(index, instruction)| {
                 instruction.local_policy.hidden_exception_owner_slots() != 0
                     || instruction.pre_fold_extra_instructions() != 0
-                    || instruction.exception_policy() != ExceptionPolicy::NoneUnchanged
+                    || (!(unnamed_handler && index == 1)
+                        && instruction.exception_policy() != ExceptionPolicy::NoneUnchanged)
                     || !matches!(instruction.operand(), Operand::Value(_))
             })
             || (named_handler
@@ -5531,7 +5579,23 @@ impl Assembler {
                     DELETE_FAST,
                 ]) || prelude[2].operand() != prelude[3].operand()
                     || prelude[1].operand() != cleanup[0].operand()))
-            || (!named_handler && prelude[0].opcode != POP_TOP)
+            || (!named_handler && !unnamed_handler && prelude[0].opcode != POP_TOP)
+            || (unnamed_handler
+                && (prelude[0].opcode != POP_EXCEPT
+                    || prelude[0].operand() != Operand::Value(0)
+                    || records[3..].as_chunks::<5>().0.iter().any(|manager| {
+                        manager
+                            .iter()
+                            .map(|instruction| instruction.opcode)
+                            .ne([LOAD_CONST, LOAD_CONST, LOAD_CONST, CALL, POP_TOP])
+                            || manager[0].operand() != manager[1].operand()
+                            || manager[1].operand() != manager[2].operand()
+                            || manager[3].operand() != Operand::Value(3)
+                            || manager[4].operand() != Operand::Value(0)
+                            || manager
+                                .iter()
+                                .any(|record| record.location != manager[0].location)
+                    })))
             || cleanup
                 .iter()
                 .map(|instruction| instruction.opcode)
@@ -5567,11 +5631,12 @@ impl Assembler {
             self.exception_owner_provenance
                 .copied_manager_return_compactions
                 .push(exception_owners::CopiedManagerReturnCompaction {
-                    ordinary_try_pops: usize::from(!named_handler),
+                    ordinary_try_pops: usize::from(!named_handler && !unnamed_handler),
                     cleanup: cleanup.to_vec(),
                     earlier_cleanup: None,
                     constant_return_prefix: Some(exception_owners::ConstantManagerReturnPrefix {
                         authored_nop: authored,
+                        handler_pop,
                         instructions: prelude.to_vec(),
                         // Captured frontend nesting certifies the POPs before cleanup.
                         // The manager POP is counted separately in replay.

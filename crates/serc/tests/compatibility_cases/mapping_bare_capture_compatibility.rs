@@ -411,3 +411,38 @@ fn matches_cpython_complete_capture_cleanup_rotations() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_mapping_capture_before_try_boundaries() {
+    for (filename, source) in [
+        (
+            "mapping_capture_before_try_target.py",
+            r#"def f(subject, convert):
+    match subject:
+        case {"outer": {"inner": captured}}:
+            try:
+                result = convert(captured)
+            except ValueError:
+                result = captured
+            return result
+    return None
+"#,
+        ),
+        (
+            "mapping_capture_before_call_control.py",
+            r#"def f(subject, convert):
+    match subject:
+        case {"outer": {"inner": captured}}:
+            convert(captured)
+            try:
+                result = convert(captured)
+            except ValueError:
+                result = captured
+            return result
+    return None
+"#,
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

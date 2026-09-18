@@ -318,3 +318,75 @@ fn while_return_finally_none_owners_match_cpython() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn unnamed_handler_manager_return_owners_match_cpython() {
+    for (filename, source) in [
+        (
+            "manager_unnamed_handler_bare_return.py",
+            r"def f(manager, item):
+    try:
+        with manager:
+            try:
+                work()
+            except ValueError:
+                report(item)
+                return
+    finally:
+        if item is not None:
+            item.close()
+",
+        ),
+        (
+            "manager_pair_unnamed_handler_constant_return.py",
+            r"def f(outer, inner, item):
+    try:
+        with outer:
+            with inner:
+                try:
+                    work()
+                except ValueError:
+                    report(item)
+                    return 0
+    finally:
+        if item is not None:
+            item.close()
+",
+        ),
+        (
+            "manager_named_handler_bare_return_control.py",
+            r"def f(manager, item):
+    try:
+        with manager:
+            try:
+                work()
+            except ValueError as error:
+                report(error)
+                return
+    finally:
+        if item is not None:
+            item.close()
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn conditional_tuple_manager_return_owner_matches_cpython() {
+    let source = r"def f(manager, item, flag):
+    try:
+        with manager:
+            if flag is None:
+                return 'missing', 'details'
+            work()
+        return 'ok', None
+    except Exception as error:
+        return 'error', str(error)
+    finally:
+        if item is not None and item.ready():
+            item.close()
+";
+    common::assert_matches_cpython_marshal(source, "manager_conditional_tuple_none_return.py");
+}
