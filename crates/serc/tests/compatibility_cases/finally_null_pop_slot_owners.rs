@@ -488,3 +488,127 @@ fn retained_nested_try_arrays_preserve_truth_marker_slots() {
         assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_guarded_finally_iterator_return_and_continue_origins() {
+    for (filename, source) in [
+        (
+            "guarded_cleanup_iterator_return_location_target.py",
+            r"async def f(items, first, second):
+    try:
+        for item in items:
+            try:
+                return item
+            finally:
+                if first is not None:
+                    try:
+                        await first.close()
+                    except Exception as error:
+                        report(error)
+                if second is not None:
+                    try:
+                        await second.close()
+                    except Exception as error:
+                        report(error)
+    except Exception:
+        raise
+",
+        ),
+        (
+            "guarded_cleanup_iterator_return_continue_target.py",
+            r"async def f(items, first, second):
+    try:
+        for item in items:
+            try:
+                if item:
+                    return item
+                continue
+            finally:
+                if first is not None:
+                    try:
+                        await first.close()
+                    except Exception as error:
+                        report(error)
+                if second is not None:
+                    try:
+                        await second.close()
+                    except Exception as error:
+                        report(error)
+    except Exception:
+        raise
+",
+        ),
+        (
+            "guarded_cleanup_iterator_return_plain_tail_control.py",
+            r"async def f(items, first, second):
+    try:
+        for item in items:
+            try:
+                return item
+            finally:
+                cleanup(item)
+    except Exception:
+        raise
+",
+        ),
+        (
+            "continued_finally_none_pop_0_calls.py",
+            r"async def f(items, resource, recover):
+    try:
+        for item in items:
+            try:
+                if item:
+                    continue
+            finally:
+                if resource is not None:
+                    try:
+                        await resource.close()
+                    except Exception:
+                        recover()
+    except Exception:
+        recover()
+",
+        ),
+        (
+            "continued_finally_none_pop_1_calls.py",
+            r"async def f(items, resource, recover):
+    try:
+        for item in items:
+            try:
+                if item:
+                    work()
+                    continue
+            finally:
+                if resource is not None:
+                    try:
+                        await resource.close()
+                    except Exception:
+                        recover()
+    except Exception:
+        recover()
+",
+        ),
+        (
+            "continued_finally_none_pop_2_calls.py",
+            r"async def f(items, resource, recover):
+    try:
+        for item in items:
+            try:
+                if item:
+                    work()
+                    work()
+                    continue
+            finally:
+                if resource is not None:
+                    try:
+                        await resource.close()
+                    except Exception:
+                        recover()
+    except Exception:
+        recover()
+",
+        ),
+    ] {
+        assert_matches_cpython_marshal(source, filename);
+    }
+}

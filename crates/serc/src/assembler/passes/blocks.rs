@@ -364,7 +364,8 @@ fn represented_setup_nops(
     blocks: &[BasicBlockId],
     provenance: &ExceptionOwnerProvenance,
 ) -> FxHashSet<Label> {
-    if provenance.setup_nop_ranges.is_empty()
+    if blocks.len() <= 1
+        || provenance.setup_nop_ranges.is_empty()
         || !blocks.iter().any(|block| {
             graph[*block].items().iter().any(
                 |item| matches!(item, Item::Instruction(instruction) if instruction.opcode == NOP),

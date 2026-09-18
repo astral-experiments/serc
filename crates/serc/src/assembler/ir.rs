@@ -312,6 +312,11 @@ impl NoLocationPolicy {
             .insert(NoLocationBlockPolicy::ALLOW_INLINING);
     }
 
+    pub(super) fn prevent_block_inlining(&mut self) {
+        self.block_policy
+            .remove(NoLocationBlockPolicy::ALLOW_INLINING);
+    }
+
     pub(super) fn make_first_copy_interruptible(&mut self) {
         debug_assert!(self.allows_block_inlining());
         self.block_policy

@@ -1898,3 +1898,124 @@ def repair(state, key, pending, prepared, signaled, work, release, report):
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_borrows_at_folded_loop_continuations() {
+    for (source, filename) in [
+        (
+            r#"async def run(state, work, stop, advance, report, limit):
+    complete = False
+    iteration = 0
+    try:
+        while True:
+            if state.stop:
+                break
+            if await stop():
+                complete = True
+                break
+            if limit > 0 and iteration >= limit:
+                break
+            await work()
+            iteration += 1
+            if await stop():
+                complete = True
+                break
+            if limit > 0 and iteration >= limit:
+                break
+            if iteration >= limit:
+                advance(iteration)
+    except Exception as error:
+        await report(error)
+        raise
+    else:
+        if not complete:
+            complete = await stop()
+        status = "done" if complete else "stopped"
+        await report(status)
+"#,
+            "async_awaited_break_try_else_target.py",
+        ),
+        (
+            r#"async def run(state, work, stop, advance, report, limit):
+    complete = False
+    iteration = 0
+    try:
+        while True:
+            if state.stop:
+                break
+            if await stop():
+                complete = True
+                break
+            if limit > 0 and iteration >= limit:
+                break
+            await work()
+            iteration += 1
+            if await stop():
+                complete = True
+                break
+            if limit > 0 and iteration >= limit:
+                break
+            if iteration >= limit:
+                advance(iteration)
+        advance(iteration)
+    except Exception as error:
+        await report(error)
+        raise
+    else:
+        if not complete:
+            complete = await stop()
+        status = "done" if complete else "stopped"
+        await report(status)
+"#,
+            "async_awaited_break_populated_try_else_control.py",
+        ),
+        (
+            r#"async def run(manager, work, ready, retry, done, report):
+    async with manager():
+        try:
+            while True:
+                value = await work()
+                if not retry(value):
+                    break
+                while True:
+                    error = None
+                    try:
+                        state = await ready()
+                    except Exception as caught:
+                        error = caught
+                    if error is None:
+                        report(state)
+                        break
+                    await work()
+            events = value.get("events")
+            if events is not None:
+                report(events)
+            return value
+        finally:
+            done()
+"#,
+            "async_managed_nested_recovery_loop_suffix_target.py",
+        ),
+        (
+            r#"async def run(manager, work, ready, retry, done, report):
+    async with manager():
+        try:
+            while True:
+                value = await work()
+                if not retry(value):
+                    break
+                state = await ready()
+                report(state)
+            events = value.get("events")
+            if events is not None:
+                report(events)
+            return value
+        finally:
+            done()
+"#,
+            "async_managed_linear_recovery_loop_suffix_control.py",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

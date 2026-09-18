@@ -45,8 +45,8 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) original_value_jump_prefixes: Vec<(Label, Vec<Item>)>,
     // Region re-entry after a return emits no original instruction or unwind slot.
     pub(super) return_region_reentries: FxHashSet<Label>,
-    // Exact copied-finally CALL/POP and its artificial iterator-disposal/return array.
-    pub(super) copied_finally_iterator_returns: Vec<Vec<Item>>,
+    // Proven CALL/POP or unique conditional-join donor and its exact disposal array.
+    pub(super) copied_finally_iterator_returns: Vec<(SourceLocation, Vec<Item>)>,
     pub(super) fusion_boundaries: FxHashSet<Label>,
     pub(super) setup_nop_boundaries: FxHashSet<Label>,
     pub(super) setup_nop_ranges: Vec<(Label, Label)>,

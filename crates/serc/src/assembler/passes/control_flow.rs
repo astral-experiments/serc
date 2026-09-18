@@ -3038,7 +3038,7 @@ impl OptimizationPipeline {
                 }
             }
         }
-        for origin in origins {
+        for (donor, origin) in origins {
             let Some((anchor, label)) =
                 origin
                     .iter()
@@ -3059,9 +3059,11 @@ impl OptimizationPipeline {
             let Some(current) = items.get(start..start + origin.len()) else {
                 continue;
             };
-            let Item::Instruction(donor) = origin[0] else {
+            if !matches!(current.first(), Some((_, Item::Instruction(instruction)))
+                if instruction.location == donor)
+            {
                 continue;
-            };
+            }
             if !current.iter().zip(&origin).all(|((_, current), original)| {
                 match (*current, *original) {
                     (Item::Label(actual), Item::Label(expected)) => {
@@ -3070,9 +3072,7 @@ impl OptimizationPipeline {
                     (Item::Instruction(mut actual), Item::Instruction(expected)) => {
                         // The existing within-array pass may already have located the
                         // iterator's SWAP/POP. No other record or metadata may change.
-                        if expected.location == SourceLocation::NONE
-                            && actual.location == donor.location
-                        {
+                        if expected.location == SourceLocation::NONE && actual.location == donor {
                             actual.location = SourceLocation::NONE;
                         }
                         actual == expected
@@ -3086,7 +3086,7 @@ impl OptimizationPipeline {
             self.graph
                 .instruction_mut(*position)
                 .expect("captured original return")
-                .location = donor.location;
+                .location = donor;
         }
     }
 

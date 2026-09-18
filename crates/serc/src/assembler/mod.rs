@@ -3214,6 +3214,76 @@ impl Assembler {
         {
             return;
         }
+        self.record_copied_finally_iterator_return_tail(start, 2, iterators, call.location);
+    }
+
+    /// Captures a guard's unique false join before artificial iterator disposal.
+    pub(crate) fn record_copied_finally_iterator_join_return(
+        &mut self,
+        cleanup_end: usize,
+        iterators: usize,
+    ) {
+        let Some(join_index) = cleanup_end.checked_sub(1) else {
+            return;
+        };
+        let items = self.linear_items();
+        let Some(Item::Label(join)) = items.get(join_index) else {
+            return;
+        };
+        if !self
+            .exception_owner_provenance
+            .source_boundaries
+            .contains(join)
+            || !self
+                .exception_owner_provenance
+                .block_boundaries
+                .contains(join)
+        {
+            return;
+        }
+        let mut incoming = items.iter().filter_map(|item| match item {
+            Item::Instruction(instruction)
+                if matches!(instruction.operand(), Operand::Forward(target) | Operand::Backward(target) if target == *join) => Some(instruction),
+            _ => None,
+        });
+        let Some(condition) = incoming.next() else {
+            return;
+        };
+        if incoming.next().is_some()
+            || !matches!(
+                condition.opcode,
+                POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE | POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE
+            )
+            || condition.operand() != Operand::Forward(*join)
+            || condition.location.line < 0
+        {
+            return;
+        }
+        self.record_copied_finally_iterator_return_tail(
+            cleanup_end,
+            0,
+            iterators,
+            condition.location,
+        );
+    }
+
+    /// Keeps a complete disposal array for later replay across metadata-only labels.
+    fn record_copied_finally_iterator_return_tail(
+        &mut self,
+        start: usize,
+        prefix: usize,
+        iterators: usize,
+        donor: SourceLocation,
+    ) {
+        let Some(items) = self.linear_items().get(start..) else {
+            return;
+        };
+        let Some(tail) = items.get(prefix..) else {
+            return;
+        };
+        if iterators == 0 || !tail.iter().any(|item| matches!(item, Item::Label(_))) {
+            return;
+        }
         let mut offset = 0;
         for item in tail {
             let Item::Instruction(instruction) = item else {
@@ -3245,7 +3315,7 @@ impl Assembler {
         let origin = items.to_vec();
         self.exception_owner_provenance
             .copied_finally_iterator_returns
-            .push(origin);
+            .push((donor, origin));
     }
 
     /// Records the first erased ordinary-try POP before a return's remaining unwind.
@@ -6858,12 +6928,16 @@ impl Assembler {
     }
 
     /// Records an ordinary handler exit copied from an original empty join.
-    pub(crate) fn record_original_handler_cleanup_join_exit(&mut self, end: Label) {
+    pub(crate) fn record_original_handler_cleanup_join_exit(
+        &mut self,
+        end: Label,
+        manager_try_cleanup: bool,
+    ) -> bool {
         let items = self.linear_items();
         let Some([Item::Instruction(pop), Item::Instruction(jump)]) =
             items.get(items.len().saturating_sub(2)..)
         else {
-            return;
+            return false;
         };
         if pop.opcode == POP_EXCEPT
             && pop.location == SourceLocation::NONE
@@ -6874,6 +6948,47 @@ impl Assembler {
             let pop_index = items.len() - 2;
             let missing_pop_block = pop.pre_fold_extra_instructions() == 0
                 && pop.local_policy.hidden_exception_owner_slots() == 0;
+            let normal_exit = (manager_try_cleanup && missing_pop_block)
+                .then(|| {
+                    let aliases = items[..pop_index]
+                        .iter()
+                        .rev()
+                        .map_while(|item| match item {
+                            Item::Label(label) => Some(*label),
+                            Item::Instruction(_) => None,
+                        })
+                        .collect::<Vec<_>>();
+                    let mut exits = self
+                        .exception_owner_provenance
+                        .normal_try_exits
+                        .iter()
+                        .filter(|(_, target)| aliases.contains(target));
+                    let &(entry, target) = exits.next()?;
+                    if exits.next().is_some() {
+                        return None;
+                    }
+                    let mut entries = items
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, item)| (*item == Item::Label(entry)).then_some(index));
+                    let entry_index = entries.next()?;
+                    if entries.next().is_some() || entry_index >= pop_index {
+                        return None;
+                    }
+                    let (index, exit) = items[entry_index + 1..pop_index]
+                        .iter()
+                        .enumerate()
+                        .find_map(|(index, item)| match item {
+                            Item::Instruction(exit) => Some((entry_index + 1 + index, exit)),
+                            Item::Label(_) => None,
+                        })?;
+                    (exit.opcode == JUMP_FORWARD
+                        && exit.operand() == Operand::Forward(target)
+                        && exit.pre_fold_extra_instructions() == 0
+                        && exit.local_policy.hidden_exception_owner_slots() == 0)
+                        .then_some(index)
+                })
+                .flatten();
             self.exception_owner_provenance
                 .original_handler_cleanup_join_exits
                 .insert(end);
@@ -6886,7 +7001,18 @@ impl Assembler {
                 };
                 pop.add_pre_fold_extra_instructions(1);
             }
+            if normal_exit.is_some() {
+                // Keep this cleanup at its original join until its return is appended.
+                // Its POP_BLOCK and replaced jump then make it larger than a small exit.
+                // The earlier normal-try jump remains transparent to ordinary threading.
+                let Item::Instruction(jump) = &mut self.linear_items_mut()[pop_index + 1] else {
+                    unreachable!("captured handler cleanup jump");
+                };
+                jump.no_location_policy.prevent_block_inlining();
+                return true;
+            }
         }
+        false
     }
 
     /// Finds the sole original match donor for a manager's normal `POP_BLOCK`.
@@ -8143,6 +8269,27 @@ impl Assembler {
                     Some((std::array::from_fn(|index| records[index + 5].1), marker));
             }
         }
+    }
+
+    /// Checks that the pending cleanup still ends with its captured authored NOP/POP.
+    pub(crate) fn ends_with_recorded_finally_nop_pair(&self, target: Label) -> bool {
+        let mut instructions = self
+            .linear_items()
+            .iter()
+            .rev()
+            .filter_map(|item| match item {
+                Item::Instruction(instruction) => Some(instruction),
+                Item::Label(_) => None,
+            });
+        let (Some(pop), Some(authored)) = (instructions.next(), instructions.next()) else {
+            return false;
+        };
+        self.exception_owner_provenance
+            .early_return_nop_pairs
+            .iter()
+            .any(|(original_authored, original_pop, handler)| {
+                authored == original_authored && pop == original_pop && target == *handler
+            })
     }
 
     /// Records an authored return NOP and its direct finally unwind records.

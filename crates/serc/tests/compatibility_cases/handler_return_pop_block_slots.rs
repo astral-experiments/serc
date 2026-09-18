@@ -668,3 +668,142 @@ fn matches_cpython_named_handler_value_boolean_finally_cleanup_slots() {
         assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_named_return_finalizers_with_enclosing_try_owners() {
+    for (filename, source) in [
+        (
+            "nested_finalizer_outer_handler_computed_return.py",
+            r#"def build_request(worker, manager, active, missing, timeout):
+    async def run():
+        try:
+            token = None
+            if active:
+                token = worker.context.set("request")
+            try:
+                if missing:
+                    return response(status=401, data={"error": "missing"})
+                try:
+                    with manager():
+                        await worker.validate()
+                except LookupError as error:
+                    return response(status=error.status, data={"error": str(error)})
+                with manager():
+                    if timeout is None:
+                        result = await worker.fetch()
+                    else:
+                        result = await worker.wait(timeout=float(timeout))
+            finally:
+                if token is not None:
+                    worker.session.remove()
+                    worker.replica().remove()
+                    worker.context.reset(token)
+        except TimeoutError as error:
+            raise RuntimeError() from error
+        except Exception as error:
+            return response(status=500, data={"error": str(error)})
+        return response(status=200, data=result)
+    return run
+"#,
+        ),
+        (
+            "nested_finalizer_outer_handler_retry_return.py",
+            r"async def poll(worker, retry):
+    try:
+        await worker.ready.wait()
+        while True:
+            finish = await worker.reserve()
+            if finish is None:
+                return
+            try:
+                if worker.abandoned:
+                    await worker.cancel(finish=finish)
+                    finish = None
+                    return
+                result = await worker.retrieve(finish=finish)
+                if result.pending:
+                    continue
+                worker.commit(result, finish)
+                finish = None
+                return
+            except CancelledError:
+                raise
+            except Exception as error:
+                if retry(error):
+                    continue
+                await worker.cancel(error=error, finish=finish)
+                finish = None
+                return
+            finally:
+                if finish is not None:
+                    finish.release()
+    except CancelledError:
+        await worker.cancel()
+        raise
+",
+        ),
+        (
+            "nested_finalizer_no_outer_handler_computed_control.py",
+            r#"def build_request(worker, manager, active, missing, timeout):
+    async def run():
+        token = None
+        if active:
+            token = worker.context.set("request")
+        try:
+            if missing:
+                return response(status=401, data={"error": "missing"})
+            try:
+                with manager():
+                    await worker.validate()
+            except LookupError as error:
+                return response(status=error.status, data={"error": str(error)})
+            with manager():
+                if timeout is None:
+                    result = await worker.fetch()
+                else:
+                    result = await worker.wait(timeout=float(timeout))
+        finally:
+            if token is not None:
+                worker.session.remove()
+                worker.replica().remove()
+                worker.context.reset(token)
+        return response(status=200, data=result)
+    return run
+"#,
+        ),
+        (
+            "nested_finalizer_no_outer_handler_retry_control.py",
+            r"async def poll(worker, retry):
+    await worker.ready.wait()
+    while True:
+        finish = await worker.reserve()
+        if finish is None:
+            return
+        try:
+            if worker.abandoned:
+                await worker.cancel(finish=finish)
+                finish = None
+                return
+            result = await worker.retrieve(finish=finish)
+            if result.pending:
+                continue
+            worker.commit(result, finish)
+            finish = None
+            return
+        except CancelledError:
+            raise
+        except Exception as error:
+            if retry(error):
+                continue
+            await worker.cancel(error=error, finish=finish)
+            finish = None
+            return
+        finally:
+            if finish is not None:
+                finish.release()
+",
+        ),
+    ] {
+        assert_matches_cpython_marshal(source, filename);
+    }
+}

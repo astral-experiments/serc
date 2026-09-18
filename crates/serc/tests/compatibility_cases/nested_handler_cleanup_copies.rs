@@ -192,3 +192,66 @@ fn matches_cpython_shared_unnamed_handler_local_return_copies() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_nested_manager_terminating_handler_return_copies() {
+    for (filename, source) in [
+        (
+            "nested_fallback_manager_tuple_return_target.py",
+            r"def read_size(open_resource, open_image, read_bytes, report):
+    try:
+        with open_resource() as resource:
+            with open_image(resource) as image:
+                image.load()
+                size = (int(image.width), int(image.height))
+    except Exception:
+        try:
+            data = read_bytes()
+            with open_image(data) as image:
+                image.load()
+                size = (int(image.width), int(image.height))
+        except Exception as error:
+            report(error)
+            return None
+    return size
+",
+        ),
+        (
+            "nested_fallback_direct_tuple_return_control.py",
+            r"def read_size(open_resource, open_image, read_bytes, report):
+    try:
+        with open_resource() as resource:
+            with open_image(resource) as image:
+                image.load()
+                size = (int(image.width), int(image.height))
+    except Exception:
+        try:
+            data = read_bytes()
+            image = open_image(data)
+            image.load()
+            size = (int(image.width), int(image.height))
+        except Exception as error:
+            report(error)
+            return None
+    return size
+",
+        ),
+        (
+            "nested_fallback_direct_shared_return_control.py",
+            r"def read_fallback(open_resource, read, report):
+    try:
+        with open_resource('primary') as handle:
+            result = read(handle)
+    except ValueError:
+        try:
+            result = read(open_resource('fallback'))
+        except ValueError:
+            report()
+            result = []
+    return result
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
