@@ -176,3 +176,78 @@ fn named_handler_loop_exits_copy_original_name_cleanup() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn nested_named_handler_arms_share_the_original_cleanup() {
+    for (filename, source) in [
+        (
+            "named_nested_assignment_cleanup_target.py",
+            r"async def run(operation, ready, choose, record):
+    result = None
+    try:
+        result = operation()
+    except ValueError as error:
+        record(error)
+        token = operation()
+        if token and ready(token):
+            fallback = operation()
+            if choose(fallback):
+                result = error.value
+            else:
+                result = fallback
+    await record(result)
+    return result
+",
+        ),
+        (
+            "named_linear_assignment_cleanup_control.py",
+            r"async def run(operation, ready, choose, record):
+    result = None
+    try:
+        result = operation()
+    except ValueError as error:
+        record(error)
+        token = operation()
+        if token and ready(token):
+            fallback = operation()
+            result = fallback
+    await record(result)
+    return result
+",
+        ),
+        (
+            "named_nested_call_cleanup_target.py",
+            r"async def run(operation, manager, ready, choose, enabled, record):
+    try:
+        with manager:
+            result = await operation()
+    except ValueError as error:
+        result = error
+        if ready():
+            if choose(error):
+                if enabled():
+                    record(error)
+            else:
+                record(error, result)
+    await record(result)
+    return result
+",
+        ),
+        (
+            "named_linear_call_cleanup_control.py",
+            r"async def run(operation, manager, ready, choose, enabled, record):
+    try:
+        with manager:
+            result = await operation()
+    except ValueError as error:
+        result = error
+        if ready():
+            record(error, result)
+    await record(result)
+    return result
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

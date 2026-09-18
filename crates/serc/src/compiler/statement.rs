@@ -10230,14 +10230,17 @@ impl Compiler<'_> {
                         self.assembler
                             .preserve_empty_join_inlined_jump_nop(branch_exit);
                     } else if matches!(body.last(), Some(Stmt::For(statement))
-                            if suite_contains_loop_break(&statement.body))
+                            if (statement.is_async && statement.orelse.is_empty())
+                                || suite_contains_loop_break(&statement.body))
                         || matches!(body.last(), Some(Stmt::While(statement))
                             if statement.orelse.is_empty()
                                 || suite_contains_loop_break(&statement.body))
                     {
-                        // A loop with a break has a distinct, initially empty end block. A
-                        // while loop also has an empty condition-failure block. Its inlined
-                        // branch jump therefore has no preceding line event to replace it.
+                        // A loop with a break has a distinct, initially empty end block.
+                        // END_ASYNC_FOR likewise starts a new normal-exhaustion array;
+                        // an else suite would supply its own preceding line instead.
+                        // A while loop also has an empty condition-failure block. Its
+                        // inlined branch jump has no preceding line event to replace it.
                         self.assembler.preserve_direct_inlined_jump_nop(branch_exit);
                     } else if branch_index == 0
                         && matches!(self.unit.scope, Scope::Function { .. })
@@ -18266,14 +18269,19 @@ impl Compiler<'_> {
                                             || suite_has_normal_fallthrough(&clause.body))
                                 }))
                 )
-                // An elif also gives earlier runtime arms an original success jump,
-                // even when its own final body falls through without an else.
+                // An elif or a nested runtime conditional gives an earlier normal
+                // arm an original success jump into the shared name cleanup.
                 || (handler.name.is_some()
                     && self.control.finally.active_normal_finally_bodies == 0
                     && self.control.finally.active_finally_end_blocks == 0
                     && suite_has_normal_fallthrough(&handler.body)
                     && matches!(handler.body.last(), Some(Stmt::If(tail))
-                        if tail.elif_else_clauses.last().is_some_and(|clause| clause.test.is_some())
+                        if (tail.elif_else_clauses.last().is_some_and(|clause| clause.test.is_some())
+                            || (self.context.target_specific_rules_enabled()
+                                && tail.elif_else_clauses.is_empty()
+                                && !terminal
+                                && loop_tail.is_none()
+                                && self.control.finally.active_copied_finally_bodies == 0))
                             && handler_cleanup_has_runtime_jump_exit(tail)
                             && handler_cleanup_has_stable_fallthrough_location(tail)
                             && (!cleanup_has_small_return_successor
@@ -22658,8 +22666,9 @@ impl Compiler<'_> {
             // suffix retains the enclosing manager owner; it is not the manager POP_BLOCK.
             let located_structured_finally_jump = capture_manager_pop
                 && preserve_exit_nop
-                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
-                    == CO_COROUTINE
+                // The empty original join precedes the manager POP in ordinary and
+                // generator scopes too; resumability does not change its owner.
+                && self.unit.flags & CO_ASYNC_GENERATOR == 0
                 && self.control.loops.contexts.is_empty()
                 && self.control.exceptions.active_exception_handlers.is_empty()
                 && self.control.finally.active_normal_finally_bodies == 0

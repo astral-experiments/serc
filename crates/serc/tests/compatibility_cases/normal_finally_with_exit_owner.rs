@@ -219,3 +219,71 @@ fn preserves_normal_finally_attribute_owners_inside_async_managers() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn guarded_recovery_finally_keeps_enclosing_manager_owners() {
+    for (filename, source) in [
+        (
+            "manager_guarded_recovery_normal_finally.py",
+            r"def target(manager, process):
+    with manager:
+        try:
+            work()
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=3)
+                except Timeout:
+                    process.kill()
+                    process.wait()
+",
+        ),
+        (
+            "generator_manager_guarded_recovery_finally.py",
+            r"def target(manager, process):
+    with manager:
+        try:
+            yield process
+            if process.poll() is not None:
+                raise Failure()
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=3)
+                except Timeout:
+                    process.kill()
+                    process.wait()
+",
+        ),
+        (
+            "manager_guarded_linear_normal_finally_control.py",
+            r"def target(manager, process):
+    with manager:
+        try:
+            work()
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=3)
+",
+        ),
+        (
+            "generator_manager_guarded_linear_finally_control.py",
+            r"def target(manager, process):
+    with manager:
+        try:
+            yield process
+            if process.poll() is not None:
+                raise Failure()
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=3)
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

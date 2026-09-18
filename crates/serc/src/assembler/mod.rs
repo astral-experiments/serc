@@ -4765,8 +4765,9 @@ impl Assembler {
 
     /// Records an original empty join and whether a later copied return retains its jump slot.
     pub(crate) fn preserve_empty_join_inlined_jump_nop(&mut self, emitted: EmittedJump) {
-        self.preserve_direct_inlined_jump_nop(emitted);
-        self.record_original_empty_join(emitted);
+        if self.record_original_empty_join(emitted) {
+            self.preserve_direct_inlined_jump_nop(emitted);
+        }
     }
 
     /// Retains a folded branch's exit when it starts in a nested if's original empty join.
@@ -4788,8 +4789,8 @@ impl Assembler {
         }
     }
 
-    /// Records original empty-join identity independently of its jump-retention policy.
-    fn record_original_empty_join(&mut self, emitted: EmittedJump) {
+    /// Records original empty-join identity and whether a direct copy keeps its line slot.
+    fn record_original_empty_join(&mut self, emitted: EmittedJump) -> bool {
         let index = usize::try_from(emitted.instruction().item_index)
             .expect("emitted instruction index should fit in usize");
         let items = &self.linear_items()[..index];
@@ -4849,6 +4850,36 @@ impl Assembler {
         let original_empty_join = original_block
             && (conditional_predecessors == 0
                 || (conditional_predecessors == 1 && !has_fallthrough));
+        // A live conditional edge and a fallthrough edge share this original
+        // array. Its emission line came from the preceding body, so it cannot
+        // give a copied jump a separate NOP at that same location. Keep authored
+        // and omitted Pass slots, as well as every existing empty-join route.
+        let shared_fallthrough_line = original_block
+            && !original_match_success
+            && conditional_predecessors == 1
+            && has_fallthrough
+            && labels.iter().all(|label| {
+                !self
+                    .exception_owner_provenance
+                    .omitted_nop_counts
+                    .contains_key(label)
+                    && !self
+                        .exception_owner_provenance
+                        .omitted_nop_locations
+                        .contains_key(label)
+            })
+            && matches!(&self.linear_items()[index], Item::Instruction(jump)
+            if jump.location.line >= 0
+                && items.iter().rev().find_map(|item| match item {
+                    Item::Instruction(instruction) => Some(instruction),
+                    Item::Label(_) => None,
+                }).is_some_and(|previous| {
+                    previous.opcode != NOP
+                        && previous.location == jump.location
+                        && previous.pre_fold_extra_instructions() == 0
+                        && !previous.fusion_policy.is_converted_pop_block()
+                        && !previous.fusion_policy.is_authored_break()
+                }));
         if original_empty_join {
             self.emitted_jump_mut(emitted, "retaining an original empty join")
                 .jump_policy
@@ -4861,6 +4892,7 @@ impl Assembler {
                 .jump_policy
                 .mark_original_shared_empty_join();
         }
+        !shared_fallthrough_line
     }
 
     /// Records a CPython ordinary jump block before small exits can replace its jump.
@@ -5339,6 +5371,51 @@ impl Assembler {
         ) else {
             return;
         };
+        // A zero-argument method test retains two more records than a local test.
+        // Capture them before either the normal POP or its range labels disappear.
+        if condition.opcode == crate::target::opcodes::LOAD_ATTR {
+            if let (Some(call), Some(comparison)) = (instructions.next(), instructions.next()) {
+                let prefix = [pop, load, condition, call, comparison];
+                if pop.opcode == NOP
+                    && pop.operand() == Operand::Value(0)
+                    && pop.location == SourceLocation::NONE
+                    && pop.fusion_policy.is_converted_pop_block()
+                    && pop.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
+                    && load.opcode == LOAD_FAST
+                    && matches!(load.operand(), Operand::Value(_))
+                    && matches!(condition.operand(), Operand::Value(argument) if argument & 1 != 0)
+                    && call.opcode == crate::target::opcodes::CALL
+                    && call.operand() == Operand::Value(0)
+                    && matches!(comparison.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+                    && matches!(comparison.operand(), Operand::Forward(_))
+                    && comparison.location.line >= 0
+                    && prefix[1..].iter().all(|record| {
+                        record.location.line == comparison.location.line
+                            && record.location.end_line == comparison.location.end_line
+                            && record.location.column == comparison.location.column
+                            && record.location.end_column <= comparison.location.end_column
+                            && record.exception_policy() == ExceptionPolicy::default()
+                    })
+                    && prefix.iter().enumerate().all(|(index, record)| {
+                        record.pre_fold_extra_instructions() == 0
+                            && record.local_policy.hidden_exception_owner_slots()
+                                == if index == 4 { 3 } else { 0 }
+                            && record.no_location_policy.borrow_fallthrough()
+                                == BorrowFallthrough::Reachable
+                    })
+                    && pop.depth_after().is_some()
+                    && load.depth_after() == pop.depth_after().map(|depth| depth + 1)
+                    && condition.depth_after() == pop.depth_after().map(|depth| depth + 2)
+                    && call.depth_after() == load.depth_after()
+                    && comparison.depth_after() == pop.depth_after()
+                {
+                    self.exception_owner_provenance
+                        .normal_finally_method_none_prefixes
+                        .push(prefix);
+                }
+            }
+            return;
+        }
         // Truthiness keeps TO_BOOL, so preserve all four original records rather
         // than treating its appended marker as a None-test slot.
         let truth_condition = (condition.opcode == crate::target::opcodes::TO_BOOL)

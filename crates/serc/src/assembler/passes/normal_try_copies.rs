@@ -173,6 +173,28 @@ impl OptimizationPipeline {
                         }
                 })
         };
+        // The producer records a shared nested-if join before jump threading.
+        // Reuse this exact one-slot certificate for both discovery and closure.
+        let is_shared_join = |block| {
+            graph[block].last_instruction().is_some_and(|jump| {
+                jump.location == SourceLocation::NONE
+                    && jump.no_location_policy.preserves_location()
+                    && !jump.no_location_policy.is_artificial_eval_break()
+                    && !jump.jump_policy.is_interruptible()
+                    && jump.local_policy.hidden_exception_owner_slots() == 0
+                    && jump.exception_policy() == super::super::ExceptionPolicy::default()
+                    && graph[block].items().iter().any(|item| {
+                        matches!(item, Item::Label(label)
+                            if self.nested_if_unlocated_join_blocks.contains(label))
+                    })
+                    && graph[block]
+                        .items()
+                        .iter()
+                        .filter(|item| matches!(item, Item::Instruction(_)))
+                        .count()
+                        == 1
+            })
+        };
         let mut returns = FxHashMap::default();
         for &block in order {
             if !intact(block) {
@@ -182,7 +204,9 @@ impl OptimizationPipeline {
                 returns.insert(block, located);
             }
         }
-        // Limit this plan to tuple tails reached by a certified original join;
+        // Limit this plan to tuple tails reached by a certified original join,
+        // directly or through one certified shared nested-if array. The full
+        // predecessor closure below still verifies every original copy slot;
         // unrelated tuple exits in the same compilation unit keep their own path.
         returns.retain(|block, _| {
             graph.iter_items().any(|item| {
@@ -190,7 +214,16 @@ impl OptimizationPipeline {
                 if instruction.opcode == JUMP_FORWARD
                     && instruction.jump_policy.is_original_empty_join()
                     && matches!(instruction.operand(), Operand::Forward(label)
-                        if graph.label_block(label) == Some(*block)))
+                        if graph.label_block(label).is_some_and(|target| {
+                            target == *block
+                                || (intact(target)
+                                    && is_shared_join(target)
+                                    && graph[target].last_instruction().is_some_and(|bridge| {
+                                        bridge.opcode == JUMP_FORWARD
+                                            && matches!(bridge.operand(), Operand::Forward(end)
+                                                if graph.label_block(end) == Some(*block))
+                                    }))
+                        })))
             })
         });
         if returns.is_empty() {
@@ -225,22 +258,7 @@ impl OptimizationPipeline {
                 // to the same closed graph. Its conditional predecessors keep the
                 // original jump unlocated, but private copies inherit their own lines.
                 // Require the producer's exact head, not an arbitrary unlocated jump.
-                let shared_join = jump.location == SourceLocation::NONE
-                    && jump.no_location_policy.preserves_location()
-                    && !jump.no_location_policy.is_artificial_eval_break()
-                    && !jump.jump_policy.is_interruptible()
-                    && jump.local_policy.hidden_exception_owner_slots() == 0
-                    && jump.exception_policy() == super::super::ExceptionPolicy::default()
-                    && graph[block].items().iter().any(|item| {
-                        matches!(item, Item::Label(label)
-                            if self.nested_if_unlocated_join_blocks.contains(label))
-                    })
-                    && graph[block]
-                        .items()
-                        .iter()
-                        .filter(|item| matches!(item, Item::Instruction(_)))
-                        .count()
-                        == 1;
+                let shared_join = is_shared_join(block);
                 if !intact(block)
                     || jump.opcode != JUMP_FORWARD
                     || !matches!(jump.operand(), Operand::Forward(_))

@@ -164,3 +164,59 @@ fn async_for_nonterminal_join_no_raising_else_control() {
 "#;
     common::assert_matches_cpython_marshal(source, "async_for_nonterminal_join_no_raising_else.py");
 }
+
+#[test]
+fn async_for_branch_exits_preserve_copied_return_nops() {
+    for (filename, source) in [
+        (
+            "async_for_if_arm_literal_return_nop_target.py",
+            r"async def target(items, enabled):
+    if enabled:
+        async for item in items:
+            consume(item)
+    else:
+        consume(None)
+    return None
+",
+        ),
+        (
+            "async_for_if_arm_local_return_nop_target.py",
+            r"async def target(items, enabled, value):
+    if enabled:
+        value = None
+        async for item in items:
+            value = transform(item)
+    else:
+        value = transform(None)
+    return value
+",
+        ),
+        (
+            "sync_for_if_arm_local_return_nop_control.py",
+            r"async def target(items, enabled, value):
+    if enabled:
+        value = None
+        for item in items:
+            value = transform(item)
+    else:
+        value = transform(None)
+    return value
+",
+        ),
+        (
+            "async_for_else_if_arm_return_nop_control.py",
+            r"async def target(items, enabled, value):
+    if enabled:
+        async for item in items:
+            value = transform(item)
+        else:
+            finish()
+    else:
+        value = transform(None)
+    return value
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

@@ -1358,11 +1358,7 @@ impl OptimizationPipeline {
                 else {
                     return None;
                 };
-                // Only the immediate original return entry is certified. A later
-                // outer-conditional join in this label run is a separate boundary.
-                if !matches!(target_items[..first].last(), Some(Item::Label(label)) if *label == target)
-                    || !self.exception_owner_provenance.source_boundaries.contains(&target)
-                    || !target_items[..first].iter().all(clean_label)
+                if !target_items[..first].iter().all(clean_label)
                     || !matches!(load.opcode, crate::target::opcodes::LOAD_FAST | crate::target::opcodes::LOAD_DEREF)
                     || load.depth_after() != Some(1)
                     || return_.opcode != RETURN_VALUE

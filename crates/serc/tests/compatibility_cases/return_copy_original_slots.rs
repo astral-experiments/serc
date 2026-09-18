@@ -425,3 +425,99 @@ fn counts_retained_setup_once_for_protected_local_return_copy() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn shared_conditional_joins_preserve_original_return_copy_slots() {
+    for (filename, source) in [
+        (
+            "original_tuple_return_through_shared_if_join_target.py",
+            r"def target(flag, kind, choice, items, value, end):
+    if flag:
+        if kind == 1:
+            if choice:
+                value = items[0]
+            else:
+                items[0] = value
+        elif kind == 2:
+            if choice:
+                value = items[1]
+            else:
+                items[1] = value
+    else:
+        value = convert(value)
+        if choice:
+            value = convert(value)
+    return value, end
+",
+        ),
+        (
+            "original_tuple_return_direct_if_join_control.py",
+            r"def target(flag, choice, items, value, end):
+    if flag:
+        if choice:
+            value = items[0]
+        else:
+            items[0] = value
+    else:
+        value = convert(value)
+    return value, end
+",
+        ),
+        (
+            "shared_conditional_fallthrough_attribute_return_target.py",
+            r"def target(self, ready, selected, enabled):
+    if ready:
+        if selected:
+            value = build()
+            if enabled:
+                self.value = value
+        else:
+            try:
+                self.value = build()
+            except Exception:
+                recover()
+    return self.value
+",
+        ),
+        (
+            "shared_conditional_iterator_fallthrough_return_target.py",
+            r"def target(self, ready, selected, values):
+    if ready:
+        if selected:
+            self.value = build()
+            if self.value is None:
+                for value in values:
+                    consume(value)
+        else:
+            self.value = build()
+    return self.value
+",
+        ),
+        (
+            "shared_conditional_authored_pass_return_control.py",
+            r"def target(self, ready, selected, enabled):
+    if ready:
+        if selected:
+            if enabled:
+                pass
+        else:
+            self.value = build()
+    return self.value
+",
+        ),
+        (
+            "shared_conditional_terminating_guard_return_control.py",
+            r"def target(self, ready, selected, enabled):
+    if ready:
+        if selected:
+            if enabled:
+                return self.value
+        else:
+            self.value = build()
+    return self.value
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
