@@ -4487,8 +4487,9 @@ impl Compiler<'_> {
                                     .len()
                         })
                     && self.control.exceptions.active_exception_handlers.is_empty()
-                    && self.control.finally.active_loop_finally_contexts.is_empty()
-                    && self.control.finally.active_finally_try_bodies == 0
+                    && ((self.control.finally.active_loop_finally_contexts.is_empty()
+                        && self.control.finally.active_finally_try_bodies == 0)
+                        || self.loop_finalizers_follow_innermost_manager_exit())
                     && self.control.finally.active_finally_end_blocks == 0
                     && self.control.finally.active_normal_finally_bodies == 0
                     && self.control.finally.active_copied_finally_bodies == 0
@@ -4831,11 +4832,12 @@ impl Compiler<'_> {
                                         .len()
                             })
                         && self.control.exceptions.active_exception_handlers.is_empty()
-                        && self
+                        && (self
                             .control
                             .finally
                             .active_return_finally_contexts
                             .is_empty()
+                            || self.loop_finalizers_follow_innermost_manager_exit())
                         && self.control.finally.active_finally_end_blocks == 0
                         && self.control.finally.active_normal_finally_bodies == 0
                     {
@@ -4930,29 +4932,36 @@ impl Compiler<'_> {
                         && self.control.finally.active_normal_finally_bodies == 0
                         && self.control.finally.active_copied_finally_bodies == 0
                         && let Some(context) = self.control.withs.active_with_exits.last()
-                        && context.exception_region_depth.checked_add(1)
-                            == Some(
-                                self.control
-                                    .exceptions
-                                    .active_exception_region_exclusions
-                                    .len(),
-                            )
+                        && context.exception_region_depth
+                            < self
+                                .control
+                                .exceptions
+                                .active_exception_region_exclusions
+                                .len()
                         && context.loop_depth == self.control.loops.contexts.len()
                     {
-                        // One ordinary try exits before this manager changes the return
+                        // Each ordinary try exits before this manager changes the return
                         // location. Its POP_BLOCK is an unowned slot even when the computed
                         // return value stays on the stack for the manager's SWAPs.
+                        let ordinary_try_count = self
+                            .control
+                            .exceptions
+                            .active_exception_region_exclusions
+                            .len()
+                            - context.exception_region_depth;
                         // An incoming jump makes this the first record in an original join
                         // block. CPython cannot compare its line with the fallthrough block.
                         let starts_join_block = self.assembler.at_jump_target();
                         self.assembler.set_location(location);
-                        self.emit_with_exception_policy(
-                            NOP,
-                            0,
-                            0,
-                            ExceptionPolicy::EXCLUDE_ALWAYS,
-                        )?;
-                        self.assembler.mark_last_as_converted_pop_block();
+                        for _ in 0..ordinary_try_count {
+                            self.emit_with_exception_policy(
+                                NOP,
+                                0,
+                                0,
+                                ExceptionPolicy::EXCLUDE_ALWAYS,
+                            )?;
+                            self.assembler.mark_last_as_converted_pop_block();
+                        }
                         if starts_join_block {
                             self.assembler.preserve_last_nop();
                         }
@@ -6570,6 +6579,32 @@ impl Compiler<'_> {
                                         == self.control.exceptions.active_exception_region_exclusions.len()
                                     && manager.loop_depth == 0
                                     && manager.normal_finally_depth == 0);
+                    // A while-only exit carries no iterator cleanup between the
+                    // ordinary try POP and the finalizer POP. Keep their exact adjacent
+                    // records for the existing authored-return slot certificate.
+                    let copied_return_unwinds_while_only = self
+                        .context
+                        .target_specific_rules_enabled()
+                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                            == CO_COROUTINE
+                        && !preserve_tos
+                        && !return_is_overridden
+                        && context_index == 0
+                        && finally_context.loop_depth == 0
+                        && next_loop == 1
+                        && self.control.withs.active_with_exits.is_empty()
+                        && self.control.finally.active_copied_finally_bodies == 0
+                        && self
+                            .control
+                            .finally
+                            .preserved_return_value_contexts
+                            .is_empty()
+                        && matches!(self.control.loops.contexts.as_slice(), [loop_context]
+                            if loop_context.iterator_cleanup == IteratorCleanup::None
+                                && loop_context.with_depth == 0
+                                && loop_context.finally_end_depth == 0
+                                && loop_context.exception_region_depth
+                                    == self.control.exceptions.active_exception_region_exclusions.len());
                     let mut copied_return_none_pop_pair = None;
                     if return_finally_contexts.len() == 1
                         && handler_count == 0
@@ -6592,6 +6627,7 @@ impl Compiler<'_> {
                             || copied_return_unwinds_inner_async_manager)
                         && (self.control.loops.contexts.is_empty()
                             || (copied_return_keeps_outer_iterator && ordinary_try_count == 1)
+                            || (copied_return_unwinds_while_only && ordinary_try_count == 1)
                             || (self.context.target_specific_rules_enabled()
                                 && self.unit.flags & CO_ASYNC_GENERATOR != 0
                                 && !preserve_tos
@@ -6640,7 +6676,8 @@ impl Compiler<'_> {
                                     .preserved_return_value_contexts
                                     .is_empty()))
                             && (self.control.loops.contexts.is_empty()
-                                || copied_return_keeps_outer_iterator)
+                                || copied_return_keeps_outer_iterator
+                                || copied_return_unwinds_while_only)
                         {
                             copied_return_none_pop_pair =
                                 Some((self.assembler.item_count(), ordinary_try_count == 2));
@@ -6703,7 +6740,6 @@ impl Compiler<'_> {
                         && next_with == 0
                         && let [manager] = self.control.withs.active_with_exits.as_slice()
                         && !manager.is_async
-                        && manager.loop_depth == 0
                         && manager.normal_finally_depth == 0
                         && with_unwind_starts.iter().map(|unwind| unwind.index).eq([0])
                     {
@@ -6714,6 +6750,7 @@ impl Compiler<'_> {
                             ([], [iterator])
                                 if handler_count == 0
                                     && next_loop == 1
+                                    && manager.loop_depth == 0
                                     && retained_manager_surrounds_iterators
                                     && iterator.iterator_cleanup == IteratorCleanup::Sync
                                     && iterator.with_depth == 1
@@ -6732,11 +6769,42 @@ impl Compiler<'_> {
                             {
                                 // The inner ordinary POP precedes the iterator; the
                                 // outer ordinary POP follows the manager's exit call.
-                                Some((self.assembler.item_count(), false))
+                                Some((self.assembler.item_count(), false, 1))
+                            }
+                            ([], [outer_loop, iterator])
+                                if handler_count == 0
+                                    && next_loop == 2
+                                    && retained_manager_surrounds_iterators
+                                    && manager.loop_depth == 1
+                                    && outer_loop.iterator_cleanup == IteratorCleanup::None
+                                    && outer_loop.with_depth == 0
+                                    && outer_loop.finally_end_depth == 0
+                                    && outer_loop.exception_region_depth
+                                        == manager.exception_region_depth
+                                    && iterator.iterator_cleanup == IteratorCleanup::Sync
+                                    && iterator.with_depth == 1
+                                    && iterator.finally_end_depth == 0
+                                    && iterator.exception_region_depth
+                                        == manager.exception_region_depth
+                                    && manager.exception_region_depth == 2
+                                    && self.control.exceptions.active_try_marker_slots.len()
+                                        == 1
+                                    && self
+                                        .control
+                                        .exceptions
+                                        .active_exception_region_exclusions
+                                        .len()
+                                        == 2 =>
+                            {
+                                // The surrounding while contributes no stack record. This
+                                // iterator has no inner ordinary try to pop before cleanup;
+                                // the one outer ordinary POP follows the manager exit.
+                                Some((self.assembler.item_count(), false, 0))
                             }
                             ([handler], [])
                                 if handler_count == 1
                                     && next_loop == 0
+                                    && manager.loop_depth == 0
                                     && handler.name.is_some()
                                     && handler.exception_region_depth
                                         == manager.exception_region_depth
@@ -6759,7 +6827,7 @@ impl Compiler<'_> {
                             {
                                 // Both named-handler POPs precede POP_EXCEPT; no
                                 // ordinary try is left between manager and finally.
-                                Some((self.assembler.item_count(), true))
+                                Some((self.assembler.item_count(), true, 2))
                             }
                             _ => None,
                         }
@@ -7105,13 +7173,15 @@ impl Compiler<'_> {
                         }
                     }
                     if result.is_ok()
-                        && let Some((pop_item, named_handler)) = copied_constant_manager_pop
+                        && let Some((pop_item, named_handler, missing_null_pops)) =
+                            copied_constant_manager_pop
                     {
                         self.assembler
                             .record_copied_constant_manager_return_compaction(
                                 copied_handler_return_item,
                                 pop_item,
                                 named_handler,
+                                missing_null_pops,
                             );
                     }
                     if result.is_ok()
@@ -9954,6 +10024,39 @@ impl Compiler<'_> {
         )
     }
 
+    /// Certifies outer-finalizer ordering for exits from nested loops and managers.
+    ///
+    /// Ordinary tries inside that manager still emit their `POP_BLOCK` at the authored
+    /// exit location. An outer finalizer does not precede or replace those records.
+    fn loop_finalizers_follow_innermost_manager_exit(&self) -> bool {
+        let Some(manager) = self.control.withs.active_with_exits.last() else {
+            return false;
+        };
+        let finally = &self.control.finally;
+        !finally.active_loop_finally_contexts.is_empty()
+            && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+            && finally.active_finally_try_bodies == finally.active_loop_finally_contexts.len()
+            && finally.active_return_finally_contexts.len()
+                == finally.active_loop_finally_contexts.len()
+            && finally.active_finally_end_blocks == 0
+            && finally.active_normal_finally_bodies == 0
+            && finally.active_copied_finally_bodies == 0
+            && finally.active_overriding_finally_returns == 0
+            && finally.active_pass_finally_locations.is_empty()
+            && finally.preserved_return_value_contexts.is_empty()
+            && finally.copied_return_finally_preserved_values == 0
+            && finally.active_loop_finally_contexts.iter().all(|context| {
+                context.with_depth < self.control.withs.active_with_exits.len()
+                    && context.loop_depth < self.control.loops.contexts.len()
+                    && context.exception_region_depth < manager.exception_region_depth
+            })
+            // An inner while adds no cleanup records before the manager. Iterator
+            // exits have a separate POP_TOP sequence and keep their existing path.
+            && self.control.loops.contexts[manager.loop_depth..]
+                .iter()
+                .all(|context| context.iterator_cleanup == IteratorCleanup::None)
+    }
+
     /// Counts the original `POP_BLOCK` records before a direct continued finalizer.
     fn continued_finally_pop_blocks(
         &self,
@@ -12255,6 +12358,48 @@ impl Compiler<'_> {
                     && self.control.finally.active_copied_finally_bodies == 0
                     && self.control.finally.active_normal_finally_bodies == 0
                     && self.control.finally.active_finally_end_blocks == 0
+                {
+                    self.assembler.allow_borrow_surviving_break_entry(end);
+                }
+                // A conditional arm can finish at this loop while its generator body
+                // still has a source successor before nested finally cleanup. The exact
+                // same-region range excludes a continuation across another cleanup.
+                if self.context.target_specific_rules_enabled()
+                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                        == CO_GENERATOR
+                    && !self.control.statements.current_statement_has_following
+                    && self.control.statements.same_region_continuation == Some(statement.range)
+                    && self.control.loops.contexts.is_empty()
+                    && self.control.withs.active_with_exits.is_empty()
+                    && self.control.withs.active_with_region_exclusions.is_empty()
+                    && self.control.exceptions.active_exception_handlers.is_empty()
+                    && self.control.exceptions.active_exception_group_handlers == 0
+                    && self.control.finally.active_normal_finally_bodies == 0
+                    && self.control.finally.active_finally_end_blocks == 0
+                    && self.control.finally.active_copied_finally_bodies == 0
+                    && self
+                        .control
+                        .finally
+                        .innermost_finally_exception_exclusion_depth
+                        == Some(
+                            self.control
+                                .exceptions
+                                .active_exception_region_exclusions
+                                .len(),
+                        )
+                    && matches!(self.control.finally.active_return_finally_contexts.as_slice(), [context]
+                        if context.loop_depth == 0
+                            && context.with_depth == 0
+                            && context.handler_depth == 0
+                            && context.exception_region_depth + 1
+                                == self.control.exceptions.active_exception_region_exclusions.len()
+                            && matches!(context.body.as_slice(), [Stmt::Try(cleanup)]
+                                if !cleanup.is_star
+                                    && cleanup.handlers.is_empty()
+                                    && cleanup.orelse.is_empty()
+                                    && !suite_contains_abrupt_control_flow(&cleanup.body)
+                                    && !suite_contains_yield(&cleanup.body)
+                                    && suite_has_linear_borrow_fallthrough(&cleanup.finalbody)))
                 {
                     self.assembler.allow_borrow_surviving_break_entry(end);
                 }

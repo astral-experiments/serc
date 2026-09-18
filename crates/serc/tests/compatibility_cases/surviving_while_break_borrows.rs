@@ -153,3 +153,55 @@ fn protected_while_name_return_preserves_small_exit_borrowing() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn generator_conditional_break_reaches_nested_finally_borrows() {
+    let source = r"def generator(flag, fd, acquire, release, close, timed_out, wait):
+    def mark():
+        remember(fd)
+
+    acquired = False
+    try:
+        if flag:
+            while True:
+                try:
+                    acquire(fd)
+                    mark()
+                    acquired = True
+                    break
+                except BlockingIOError:
+                    if timed_out():
+                        report(fd)
+                        acquire(fd)
+                        mark()
+                        acquired = True
+                        break
+                    wait()
+        else:
+            while True:
+                try:
+                    acquire(fd)
+                    mark()
+                    acquired = True
+                    break
+                except OSError:
+                    if timed_out():
+                        report(fd)
+                        acquire(fd)
+                        mark()
+                        acquired = True
+                        break
+                    wait()
+        yield
+    finally:
+        try:
+            if acquired:
+                if flag:
+                    release(fd)
+                else:
+                    release(fd)
+        finally:
+            close(fd)
+";
+    common::assert_matches_cpython_marshal(source, "normal_nested_finally_generator_borrow.py");
+}

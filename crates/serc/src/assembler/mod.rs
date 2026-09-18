@@ -5326,9 +5326,13 @@ impl Assembler {
         return_item: usize,
         pop_item: usize,
         named_handler: bool,
+        missing_null_pops: usize,
     ) {
         use crate::target::opcodes::{CALL, DELETE_FAST, LOAD_CONST, STORE_FAST};
 
+        if (named_handler && missing_null_pops != 2) || (!named_handler && missing_null_pops > 1) {
+            return;
+        }
         let items = self.linear_items();
         let Some(before) = items.get(return_item..pop_item) else {
             return;
@@ -5395,7 +5399,7 @@ impl Assembler {
             && pop.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
             && pop.local_policy.hidden_exception_owner_slots() == 0
             && pop.pre_fold_extra_instructions() == 0
-            && load.opcode == LOAD_FAST
+            && matches!(load.opcode, LOAD_FAST | crate::target::opcodes::LOAD_DEREF)
             && load.local_policy.hidden_exception_owner_slots() == 0
             && load.pre_fold_extra_instructions() == 0
             && matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
@@ -5412,9 +5416,9 @@ impl Assembler {
                     constant_return_prefix: Some(exception_owners::ConstantManagerReturnPrefix {
                         authored_nop: authored,
                         instructions: prelude.to_vec(),
-                        // A named handler omits two POPs; the iterator's inner ordinary
-                        // try omits one. The manager POP is counted separately in replay.
-                        missing_null_pops: if named_handler { 2 } else { 1 },
+                        // Captured frontend nesting certifies the POPs before cleanup.
+                        // The manager POP is counted separately in replay.
+                        missing_null_pops,
                     }),
                     pop,
                     load,

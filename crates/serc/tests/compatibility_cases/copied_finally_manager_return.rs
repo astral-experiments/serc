@@ -146,3 +146,175 @@ fn copied_finally_retained_manager_return_owners_match_cpython() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn while_return_finally_none_owners_match_cpython() {
+    for (filename, source) in [
+        (
+            "manager_iterator_cell_finally_target.py",
+            r#"async def f(source, manager, sink, spare):
+    resource = None
+    try:
+        resource = source.open()
+        yield "ready"
+        while True:
+            try:
+                async def receive():
+                    return await resource.__anext__()
+                pending = source.start(receive())
+                async with manager:
+                    item = await pending
+            except TimeoutError:
+                sink.timeout()
+                yield "timeout"
+                if pending is not None:
+                    await source.cancel(pending)
+                return
+            except StopAsyncIteration:
+                break
+            except Exception as error:
+                sink.error(error)
+                break
+            with sink.context():
+                for value in await source.unpack(item):
+                    sink.record(value)
+                    yield value
+                    if value.done:
+                        return
+    except StopAsyncIteration:
+        pass
+    finally:
+        if resource is not None:
+            await resource.aclose()
+        if spare is not None:
+            await source.cancel(spare)
+        sink.finish()
+"#,
+        ),
+        (
+            "while_global_call_finally_target.py",
+            r#"async def f(source, sink, manager, cancel_task):
+    sink.attached = True
+    cursor = 0
+    try:
+        try:
+            events, terminal, latest = await source.snapshot(cursor)
+        except LookupError:
+            sink.gap()
+            await sink.send({"type": "error", "code": "gap"})
+            return
+        await sink.send({"type": "ready", "cursor": cursor})
+        while True:
+            for event in events:
+                await sink.send(event.value)
+                cursor = event.cursor
+            if terminal and cursor >= latest:
+                record(sink, "completed")
+                return
+            try:
+                async with manager:
+                    await source.wait(cursor)
+            except TimeoutError:
+                await sink.heartbeat()
+            try:
+                events, terminal, latest = await source.snapshot(cursor)
+            except LookupError:
+                sink.gap()
+                await sink.send({"type": "error", "code": "gap"})
+                return
+    except ConnectionError:
+        sink.disconnected()
+        raise
+    finally:
+        if cancel_task is not None:
+            cancel_task.cancel()
+            await source.join(cancel_task, return_exceptions=True)
+        sink.attached = False
+"#,
+        ),
+        (
+            "while_method_call_finally_control.py",
+            r#"async def f(source, sink, manager, cancel_task):
+    sink.attached = True
+    cursor = 0
+    try:
+        try:
+            events, terminal, latest = await source.snapshot(cursor)
+        except LookupError:
+            sink.gap()
+            await sink.send({"type": "error", "code": "gap"})
+            return
+        await sink.send({"type": "ready", "cursor": cursor})
+        while True:
+            for event in events:
+                await sink.send(event.value)
+                cursor = event.cursor
+            if terminal and cursor >= latest:
+                sink.complete()
+                return
+            try:
+                async with manager:
+                    await source.wait(cursor)
+            except TimeoutError:
+                await sink.heartbeat()
+            try:
+                events, terminal, latest = await source.snapshot(cursor)
+            except LookupError:
+                sink.gap()
+                await sink.send({"type": "error", "code": "gap"})
+                return
+    except ConnectionError:
+        sink.disconnected()
+        raise
+    finally:
+        if cancel_task is not None:
+            cancel_task.cancel()
+            await source.join(cancel_task, return_exceptions=True)
+        sink.attached = False
+"#,
+        ),
+        (
+            "while_global_call_break_control.py",
+            r#"async def f(source, sink, manager, cancel_task):
+    sink.attached = True
+    cursor = 0
+    try:
+        try:
+            events, terminal, latest = await source.snapshot(cursor)
+        except LookupError:
+            sink.gap()
+            await sink.send({"type": "error", "code": "gap"})
+            return
+        await sink.send({"type": "ready", "cursor": cursor})
+        while True:
+            for event in events:
+                await sink.send(event.value)
+                cursor = event.cursor
+            if terminal and cursor >= latest:
+                record(sink, "completed")
+                break
+            try:
+                async with manager:
+                    await source.wait(cursor)
+            except TimeoutError:
+                await sink.heartbeat()
+            try:
+                events, terminal, latest = await source.snapshot(cursor)
+            except LookupError:
+                sink.gap()
+                await sink.send({"type": "error", "code": "gap"})
+                return
+    except ConnectionError:
+        sink.disconnected()
+        raise
+    finally:
+        if cancel_task is not None:
+            cancel_task.cancel()
+            await source.join(cancel_task, return_exceptions=True)
+        sink.attached = False
+"#,
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
