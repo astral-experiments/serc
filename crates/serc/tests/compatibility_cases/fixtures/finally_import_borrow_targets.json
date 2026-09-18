@@ -1,0 +1,6 @@
+{
+  "finally_from_import_target.py": "def sample(manager, state, saved):\n    try:\n        with manager:\n            pass\n    finally:\n        state.value = saved\n    from importlib import util\n    return util\n",
+  "finally_folded_while_continuation.py": "def sample(manager, state, saved):\n    try:\n        with manager:\n            pass\n    finally:\n        state.value = saved\n    while False:\n        state.touch(saved)\n    from importlib import util\n    return util\n",
+  "finally_second_try_import_target.py": "def sample(manager, state, saved):\n    try:\n        with manager:\n            pass\n    finally:\n        state.value = saved\n    state.touch()\n    try:\n        from importlib import util\n        result = util\n    finally:\n        state.done()\n    return result\n",
+  "finally_enclosing_manager_control.py": "def sample(outer, manager, state, saved):\n    with outer:\n        try:\n            with manager:\n                pass\n        finally:\n            state.value = saved\n        from importlib import util\n    return util\n"
+}

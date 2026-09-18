@@ -251,3 +251,72 @@ fn folds_sequence_capture_rotations_after_unpack() {
 "#;
     common::assert_matches_cpython_marshal(source, "mapping_sequence_capture_rotation.py");
 }
+
+#[test]
+fn folds_same_line_capture_rotations_before_guards_and_bodies() {
+    for (source, filename) in [
+        (
+            r"def f(subject):
+    match subject:
+        case (captured, _, _):
+            return captured
+    return None
+",
+            "sequence_capture_two_discards.py",
+        ),
+        (
+            r"def f(manager, subject, consume):
+    with manager:
+        match subject:
+            case (captured, _, _):
+                if captured is None:
+                    consume(captured)
+            case _:
+                consume(None)
+",
+            "protected_sequence_capture_marker.py",
+        ),
+        (
+            r#"def f(subject):
+    match subject:
+        case ("red" | "blue") as captured, _, _:
+            return captured
+    return None
+"#,
+            "or_capture_two_discards.py",
+        ),
+        (
+            r"def f(subject):
+    match subject:
+        case list() as captured, _, _ if captured:
+            return captured
+    return None
+",
+            "class_capture_two_discards_guard.py",
+        ),
+        (
+            r#"def f(subject, convert):
+    match subject:
+        case {"value": captured}:
+            try:
+                return convert(captured)
+            except ValueError:
+                return None
+    return None
+"#,
+            "mapping_capture_try_body.py",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn matches_cpython_nested_mapping_capture_guard_cleanup() {
+    let cases: std::collections::BTreeMap<String, String> =
+        serde_json::from_str(include_str!("fixtures/nested_mapping_capture_guards.json"))
+            .expect("public nested capture cases are filename-to-source strings");
+    for (filename, source) in cases {
+        common::assert_matches_cpython_marshal(&source, &filename);
+    }
+}

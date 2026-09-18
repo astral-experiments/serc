@@ -1,0 +1,4 @@
+{
+  "finally_plain_import_control.py": "def sample(manager, state, saved):\n    try:\n        with manager:\n            pass\n    finally:\n        state.value = saved\n    import importlib\n    return importlib\n",
+  "finally_small_return_control.py": "def sample(manager, state, saved):\n    try:\n        with manager:\n            pass\n    finally:\n        state.value = saved\n    return state\n"
+}

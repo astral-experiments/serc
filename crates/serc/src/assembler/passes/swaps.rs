@@ -1,8 +1,8 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::super::{
-    Instruction, Item, NOP, Operand, POP_TOP, STORE_FAST, SWAP, UNPACK_SEQUENCE, ends_scope,
-    single_capture_cleanup_vacancies, unpacked_capture_cleanup,
+    Instruction, Item, NOP, NOT_TAKEN, Operand, POP_TOP, STORE_FAST, SWAP, UNPACK_SEQUENCE,
+    ends_scope, single_capture_cleanup_vacancies, unpacked_capture_cleanup,
 };
 use crate::assembler::OptimizationPipeline;
 use crate::assembler::block_graph::{BlockGraph, ItemPosition};
@@ -88,10 +88,21 @@ impl OptimizationPipeline {
         let blocks = graph.partition_positions(&block_labels, |instruction| {
             !matches!(instruction.operand(), Operand::Value(_)) || ends_scope(instruction.opcode)
         });
-        // Admit unpacked cleanups from their complete original partition before any swap
-        // run is rewritten. A newly simplified suffix cannot certify an emitted owner slot.
-        let mut unpacked_capture_swaps = FxHashSet::default();
+        // Admit cleanups from their complete original partition before any swap run is
+        // rewritten. A newly simplified suffix cannot certify an emitted owner slot.
+        let mut capture_cleanup_swaps = FxHashSet::default();
         for block in &blocks {
+            for rotation in block.windows(6) {
+                if !matches!(graph.item(rotation[0]), Item::Instruction(prefix)
+                    if matches!(prefix.opcode, UNPACK_SEQUENCE | POP_TOP))
+                {
+                    continue;
+                }
+                let items = std::array::from_fn::<_, 6, _>(|index| *graph.item(rotation[index]));
+                if single_capture_cleanup_vacancies(&items).is_some() {
+                    capture_cleanup_swaps.extend([rotation[1], rotation[2]]);
+                }
+            }
             if !block.iter().any(|position| {
                 matches!(graph.item(*position), Item::Instruction(instruction)
                     if instruction.opcode == UNPACK_SEQUENCE
@@ -105,7 +116,7 @@ impl OptimizationPipeline {
                 .collect::<Vec<_>>();
             for index in 0..items.len() {
                 if let Some(rotation) = unpacked_capture_cleanup(&items[index..]) {
-                    unpacked_capture_swaps.extend(
+                    capture_cleanup_swaps.extend(
                         block[index + 1..index + 1 + rotation.swap_count]
                             .iter()
                             .copied(),
@@ -210,7 +221,7 @@ impl OptimizationPipeline {
                 position = run_end;
             }
         }
-        (blocks, unpacked_capture_swaps)
+        (blocks, capture_cleanup_swaps)
     }
 
     /// Applies stack swaps statically by reordering local stores and pops.
@@ -259,7 +270,7 @@ impl OptimizationPipeline {
             None
         }
 
-        let (blocks, unpacked_capture_swaps) = blocks;
+        let (blocks, capture_cleanup_swaps) = blocks;
         let join_origins =
             std::mem::take(&mut self.exception_owner_provenance.normal_try_copy_join_origins);
         let retired_labels = &self
@@ -339,7 +350,7 @@ impl OptimizationPipeline {
                 let last_store = stored_local(&last_instruction);
                 if first_store.is_none()
                     && last_store.is_none()
-                    && !unpacked_capture_swaps.contains(&positions[index])
+                    && !capture_cleanup_swaps.contains(&positions[index])
                 {
                     // A complete conditional-fallthrough capture rotation proves both pop
                     // records are identical and its compacted-slot count is known at emission.
@@ -350,7 +361,8 @@ impl OptimizationPipeline {
                             std::array::from_fn::<_, 6, _>(|index| *graph.item(positions[index]))
                         });
                     if !rotation.as_ref().is_some_and(|rotation| {
-                        single_capture_cleanup_vacancies(rotation).is_some()
+                        matches!(rotation[0], Item::Instruction(marker) if marker.opcode == NOT_TAKEN)
+                            && single_capture_cleanup_vacancies(rotation).is_some()
                     }) {
                         continue;
                     }

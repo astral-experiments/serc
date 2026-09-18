@@ -7716,7 +7716,7 @@ impl Compiler<'_> {
                 // block even after the jump is folded away. Its reference must be
                 // consumed within that block to qualify as borrowed.
                 self.assembler
-                    .record_folded_condition_borrow_boundary(selected);
+                    .record_borrow_analysis_block_boundary(selected);
             }
             if truthiness {
                 let body_start = self.assembler.instruction_count();
@@ -12040,7 +12040,7 @@ impl Compiler<'_> {
             self.assembler.record_exception_owner_block_boundary(body);
             // Borrowed-reference producers are indexed within that original array,
             // including CPython's shadowed index for IMPORT_FROM and similar opcodes.
-            self.assembler.record_folded_condition_borrow_boundary(body);
+            self.assembler.record_borrow_analysis_block_boundary(body);
             self.assembler.mark(body);
             let context = self.loop_context(
                 start,
@@ -19922,6 +19922,17 @@ impl Compiler<'_> {
                     .set_location(self.source_location(condition_fallthrough_range(test)));
             } else if matches!(conditional_exit, Some(NestedIfExitLocation::Unlocated)) {
                 self.assembler.set_location(SourceLocation::NONE);
+            } else if let Some(Stmt::While(loop_statement)) = statement.finalbody.last()
+                && loop_statement.orelse.is_empty()
+                && early_condition_truthiness(&loop_statement.test).is_none()
+                && condition_jump_target_count(&loop_statement.test, false) == 1
+                && !suite_contains_loop_break(&loop_statement.body)
+            {
+                // The sole false edge supplies the loop exit's original location. The
+                // physical backedge belongs to the body and cannot donate this location.
+                self.assembler.set_location(
+                    self.source_location(while_condition_exit_range(&loop_statement.test)),
+                );
             } else if matches!(statement.finalbody.last(), Some(Stmt::Assert(assertion))
                 if assertion_has_only_runtime_tests(&assertion.test))
                 && let Some(range) = suite_assert_success_fallthrough_range(&statement.finalbody)
@@ -20006,10 +20017,83 @@ impl Compiler<'_> {
                                 && !expression_suspends_current_scope(test)
                         }) && suite_has_linear_borrow_fallthrough(&clause.body)
                     }));
+            // Nested cleanup bypasses this guard's located join. Its empty original-array
+            // suffix retains the enclosing manager owner; it is not the manager POP_BLOCK.
+            let located_structured_finally_jump = capture_manager_pop
+                && preserve_exit_nop
+                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                    == CO_COROUTINE
+                && self.control.loops.contexts.is_empty()
+                && self.control.exceptions.active_exception_handlers.is_empty()
+                && self.control.finally.active_normal_finally_bodies == 0
+                && self.control.finally.active_copied_finally_bodies == 0
+                && self.control.finally.active_finally_end_blocks == 0
+                && !drop_expression_if_exit_nop
+                && !drop_shared_manager_exit_nop
+                && !statement.is_star
+                && statement.orelse.is_empty()
+                && self
+                    .control
+                    .withs
+                    .active_with_exits
+                    .last()
+                    .is_some_and(|manager| {
+                        !manager.is_async
+                            && manager.loop_depth == self.control.loops.contexts.len()
+                            && manager.exception_region_depth
+                                == self
+                                    .control
+                                    .exceptions
+                                    .active_exception_region_exclusions
+                                    .len()
+                    })
+                && matches!(conditional_exit, Some(NestedIfExitLocation::Located(_)))
+                && self.assembler.current_original_block_location().is_none()
+                && self
+                    .assembler
+                    .current_original_block_pre_fusion_instruction_count()
+                    == 0
+                && statement
+                    .finalbody
+                    .split_last()
+                    .is_some_and(|(last, leading)| {
+                        let Stmt::If(tail) = last else {
+                            return false;
+                        };
+                        (leading.is_empty() || suite_has_linear_borrow_fallthrough(leading))
+                            && tail.elif_else_clauses.is_empty()
+                            && condition_has_linear_runtime_leaves(&tail.test)
+                            && condition_jump_target_count(&tail.test, false) == 1
+                            && !expression_suspends_current_scope(&tail.test)
+                            && !suite_contains_abrupt_control_flow(&tail.body)
+                            && tail.body.split_last().is_some_and(|(cleanup, leading)| {
+                                (leading.is_empty() || suite_has_linear_borrow_fallthrough(leading))
+                                    && match cleanup {
+                                        Stmt::Try(recovery) => {
+                                            !recovery.is_star
+                                                && recovery.orelse.is_empty()
+                                                && recovery.finalbody.is_empty()
+                                                && !recovery.handlers.is_empty()
+                                        }
+                                        Stmt::With(manager) => {
+                                            !manager.is_async
+                                                && manager.items.len() == 1
+                                                && !expression_contains_inline_branch(
+                                                    &manager.items[0].context_expr,
+                                                )
+                                                && !expression_suspends_current_scope(
+                                                    &manager.items[0].context_expr,
+                                                )
+                                        }
+                                        _ => false,
+                                    }
+                            })
+                    });
             let exit_exclusion_start = (preserve_exit_nop
                 && !shared_manager_exit
                 && !separate_manager_pop
-                && !original_conditional_finally_jump)
+                && !original_conditional_finally_jump
+                && !located_structured_finally_jump)
                 .then(|| {
                     let start = self.assembler.label();
                     self.assembler.mark(start);
@@ -20392,8 +20476,10 @@ impl Compiler<'_> {
         self.emit(POP_EXCEPT, 0, -1)?;
         self.emit_reraise(ReraiseStackState::HandlerCleanup)?;
         // The finally end label starts a fresh original instruction array, even when its
-        // normal-exit jump is removed before forward-branch normalization.
+        // normal-exit jump is removed before forward-branch normalization. Borrow analysis
+        // must still reset its reference state and producer indices at that original entry.
         self.assembler.record_exception_owner_block_boundary(end);
+        self.assembler.record_borrow_analysis_block_boundary(end);
         self.assembler.mark(end);
         self.set_depth(base_depth);
         if capture_manager_pop {

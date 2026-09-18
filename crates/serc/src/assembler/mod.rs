@@ -51,11 +51,11 @@ pub(crate) struct NameReturnBorrowExit {
     original: Instruction,
 }
 
-/// Certifies one local-capture cleanup rotation at a conditional fallthrough.
+/// Certifies one complete local-capture cleanup rotation.
 ///
-/// The marker identifies an original block entry. Static swapping turns both swaps into
-/// NOPs and moves the store ahead of the two identical pops. CPython removes the first NOP;
-/// it also removes the second when the capture and pattern begin on the same line.
+/// A conditional marker identifies an original block entry with identical pop locations.
+/// After an unpack or pop, all five operations must instead share a line: both replacement
+/// NOPs disappear, and the moved store cannot fuse with either the prefix or trailing pops.
 fn single_capture_cleanup_vacancies(items: &[Item]) -> Option<usize> {
     let [
         Item::Instruction(marker),
@@ -68,7 +68,11 @@ fn single_capture_cleanup_vacancies(items: &[Item]) -> Option<usize> {
     else {
         return None;
     };
-    if marker.opcode != NOT_TAKEN
+    let same_line_cleanup = matches!(marker.opcode, UNPACK_SEQUENCE | POP_TOP)
+        && [inner, first_pop, last_pop, store]
+            .iter()
+            .all(|instruction| instruction.location.line == outer.location.line);
+    if (marker.opcode != NOT_TAKEN && !same_line_cleanup)
         || outer.opcode != SWAP
         || outer.operand() != Operand::Value(3)
         || inner.opcode != SWAP
@@ -83,8 +87,8 @@ fn single_capture_cleanup_vacancies(items: &[Item]) -> Option<usize> {
         || outer.location.line < 0
         || outer.location != inner.location
         || first_pop.location.line < 0
-        || first_pop.location != last_pop.location
-        || first_pop.location != store.location
+        || (!same_line_cleanup
+            && (first_pop.location != last_pop.location || first_pop.location != store.location))
     {
         return None;
     }
@@ -170,11 +174,22 @@ fn unpacked_capture_cleanup(items: &[Item]) -> Option<UnpackedCaptureCleanup<'_>
         return None;
     }
     // Close the emitted snapshot before predicting it. A later line cannot fuse with
-    // the rotated final store; same-line continuations need a separate fusion proof.
+    // the rotated final store. Admit a same-line guard only with an original fused-pair
+    // witness; the rotated capture is then separated from its guard load by the pops.
     let Some(Item::Instruction(following)) = items.get(depth * 2) else {
         return None;
     };
-    if following.location.line < 0 || following.location.line == first_consumer.location.line {
+    let same_line_capture_guard = matches!(
+        stores.as_slice(),
+        [local]
+            if *local < 16
+                && following.opcode == LOAD_FAST
+                && following.operand() == Operand::Value(*local)
+                && !following.fusion_policy.prevents_with_previous()
+    );
+    if following.location.line < 0
+        || (following.location.line == first_consumer.location.line && !same_line_capture_guard)
+    {
         return None;
     }
     // Preserve unknown provenance instead of predicting a different compaction schedule.
@@ -6600,8 +6615,8 @@ impl Assembler {
             .insert(entry, restores);
     }
 
-    /// Retains a folded condition's selected entry for borrowed-reference analysis.
-    pub(crate) fn record_folded_condition_borrow_boundary(&mut self, label: Label) {
+    /// Retains an original instruction-array boundary for borrowed-reference analysis.
+    pub(crate) fn record_borrow_analysis_block_boundary(&mut self, label: Label) {
         self.exception_owner_provenance
             .borrow_only_block_boundaries
             .insert(label);

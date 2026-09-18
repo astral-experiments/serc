@@ -14242,3 +14242,134 @@ fn matches_cpython_threaded_async_loop_exit_borrow_boundaries() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_located_conditional_finally_cleanup_owners() {
+    for (source, filename) in [
+        (
+            r"async def test(cm, proc):
+    with cm:
+        try:
+            await work()
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.communicate(timeout=5)
+                except TimeoutError:
+                    proc.kill()
+                    proc.communicate(timeout=5)
+",
+            "01_async_outer_with_guarded_try.py",
+        ),
+        (
+            r"async def test(cm, timeout, client):
+    with cm:
+        try:
+            await work()
+        except Exception as exc:
+            recover(exc)
+        finally:
+            if client is not None:
+                try:
+                    async with timeout:
+                        await client.cleanup()
+                except Exception as exc:
+                    recover(exc)
+",
+            "05_async_guarded_cleanup_async_with_try.py",
+        ),
+        (
+            r"async def test(cm, suppressor, task):
+    with cm:
+        try:
+            await work()
+        except Exception:
+            recover()
+            raise
+        finally:
+            if task is not None:
+                task.cancel()
+                with suppressor:
+                    await task
+    done()
+",
+            "06_async_guarded_with_await_cleanup.py",
+        ),
+        (
+            r"async def test(cm, second, lock, enabled):
+    with cm, second:
+        try:
+            await work()
+        except Exception as exc:
+            recover(exc)
+        finally:
+            flush()
+            if enabled:
+                with lock:
+                    collect()
+",
+            "07_async_two_outer_with_cleanup.py",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn matches_cpython_located_conditional_finally_owner_boundaries() {
+    for (source, filename) in [
+        (
+            r"async def test(proc):
+    try:
+        await work()
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.communicate(timeout=5)
+            except TimeoutError:
+                proc.kill()
+                proc.communicate(timeout=5)
+",
+            "03_async_without_outer_with_control.py",
+        ),
+        (
+            r"async def test(cm, enabled):
+    with cm:
+        try:
+            await work()
+        finally:
+            if enabled:
+                cleanup()
+",
+            "08_async_linear_conditional_cleanup_control.py",
+        ),
+        (
+            r"async def test(cm, lock, enabled):
+    async with cm:
+        try:
+            await work()
+        finally:
+            if enabled:
+                with lock:
+                    collect()
+",
+            "09_async_outer_async_with_control.py",
+        ),
+        (
+            r"def test(cm, lock, enabled):
+    with cm:
+        try:
+            yield work()
+        finally:
+            if enabled:
+                with lock:
+                    collect()
+",
+            "14_generator_guarded_cleanup_control.py",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

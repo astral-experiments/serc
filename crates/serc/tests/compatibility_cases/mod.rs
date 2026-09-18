@@ -100,6 +100,7 @@ mod finally_assignment_assert_owner_compatibility;
 mod finally_end_owner_boundary;
 mod finally_entry_borrows;
 mod finally_exit_borrows;
+mod finally_import_borrow_boundaries;
 mod finally_null_pop_slot_owners;
 mod folded_collection_owner_slots;
 mod folded_constant_construction_order;

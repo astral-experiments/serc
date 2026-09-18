@@ -1,0 +1,5 @@
+{
+  "finally_named_call_exit.py": "def sample(client, work, value):\n    try:\n        work()\n    finally:\n        while batch := client.take():\n            work(batch)\n    first = value.first\n    second = value.second\n    value.finish(first, second)\n    return first, second\n",
+  "finally_plain_call_exit.py": "def sample(client, work, value):\n    try:\n        work()\n    finally:\n        while client.ready():\n            work()\n    first = value.first\n    second = value.second\n    value.finish(first, second)\n    return first, second\n",
+  "finally_named_call_else_control.py": "def sample(client, work, value):\n    try:\n        work()\n    finally:\n        while batch := client.take():\n            work(batch)\n        else:\n            client.finished()\n    first = value.first\n    second = value.second\n    value.finish(first, second)\n    return first, second\n"
+}
