@@ -390,3 +390,90 @@ fn conditional_tuple_manager_return_owner_matches_cpython() {
 ";
     common::assert_matches_cpython_marshal(source, "manager_conditional_tuple_none_return.py");
 }
+
+#[test]
+fn outer_try_manager_return_primitive_owners_match_cpython() {
+    for (filename, source) in [
+        (
+            "manager_bare_return_truth_finally.py",
+            r"def f(manager, value, flag):
+    try:
+        with manager:
+            try:
+                work()
+            except ValueError:
+                report(value)
+                flag = True
+                return
+            if value:
+                report(value)
+                flag = True
+                return
+    except Exception as error:
+        report(error)
+        flag = True
+    finally:
+        if not flag:
+            finish()
+",
+        ),
+        (
+            "manager_bare_return_none_finally_control.py",
+            r"def f(manager, value, flag):
+    try:
+        with manager:
+            try:
+                work()
+            except ValueError:
+                report(value)
+                flag = True
+                return
+            if value:
+                report(value)
+                flag = True
+                return
+    except Exception as error:
+        report(error)
+        flag = True
+    finally:
+        if value is not None:
+            finish()
+",
+        ),
+        (
+            "manager_normal_truth_three_globals.py",
+            r"def f(manager, flag):
+    try:
+        with manager:
+            first()
+            second()
+            third()
+            flag = True
+            return
+    except Exception:
+        pass
+    finally:
+        if not flag:
+            finish()
+",
+        ),
+        (
+            "manager_normal_truth_two_globals_control.py",
+            r"def f(manager, flag):
+    try:
+        with manager:
+            first()
+            second()
+            flag = True
+            return
+    except Exception:
+        pass
+    finally:
+        if not flag:
+            finish()
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

@@ -147,3 +147,49 @@ fn matches_cpython_marshal_for_final_elif_or_chains() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_marshal_for_final_elif_and_chains() {
+    for (filename, source) in [
+        (
+            "final_elif_and_chain_loop_control.py",
+            r#"def count(items, counts):
+    for value in items:
+        if value is None:
+            counts["missing"] += 1
+        elif value != 5 and 0 <= value < 10:
+            counts["range"] += 1
+    return counts
+"#,
+        ),
+        (
+            "final_elif_and_calls_chain_loop_target.py",
+            r"def restore(items):
+    for parent, key, value in items:
+        if mapping(parent):
+            parent[key] = value
+        elif (
+            sequence(parent)
+            and integer(key)
+            and 0 <= key < len(parent)
+        ):
+            parent[key] = value
+",
+        ),
+        (
+            "final_elif_and_equal_chain_loop_target.py",
+            r"def collect(items, left, middle, right, output):
+    for value in items:
+        if value == '(':
+            left += 1
+        elif value == ')':
+            left -= 1
+        elif value == ',' and left == middle == right == 0:
+            output.append(value)
+    return output
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

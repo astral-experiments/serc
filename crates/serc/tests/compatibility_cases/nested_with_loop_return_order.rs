@@ -145,3 +145,57 @@ fn exits_async_managers_before_retry_iterator_in_finally_return() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn exits_async_managers_before_retry_iterator_with_handlers() {
+    for (filename, source) in [
+        (
+            "async_manager_retry_except_finally_call_return.py",
+            r"async def f(items, manager, make, cleanup):
+    try:
+        for item in items:
+            async with manager:
+                return make(item)
+    except ValueError:
+        raise
+    finally:
+        cleanup()
+",
+        ),
+        (
+            "async_managers_retry_except_loop_finally_await_return.py",
+            r"async def f(items, outer, inner, work, parts, cleanup):
+    try:
+        async with outer:
+            for item in items:
+                async with inner:
+                    return await work(item)
+    except ValueError:
+        raise
+    finally:
+        for part in parts:
+            await cleanup(part)
+",
+        ),
+        (
+            "async_three_managers_retry_outer_except_finally_call_return.py",
+            r"async def f(items, outer, middle, inner, make, cleanup):
+    try:
+        async with outer:
+            for item in items:
+                try:
+                    async with middle:
+                        async with inner:
+                            return make(item)
+                except ValueError:
+                    continue
+    except RuntimeError:
+        raise
+    finally:
+        cleanup()
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

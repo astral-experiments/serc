@@ -1645,6 +1645,7 @@ impl Compiler<'_> {
                 self.store_name(name.as_str())?;
             } else if pattern.rest.is_none()
                 && pattern.keys.len() == 1
+                && context.stores.is_empty()
                 && index + 1 == pattern.patterns.len()
                 && let Pattern::MatchAs(capture) = subpattern
                 && let Some(name) = &capture.name
@@ -1658,8 +1659,9 @@ impl Compiler<'_> {
                 self.emit(COPY, 1, 1)?;
                 self.compile_stack_pattern(inner, context)?;
                 context.on_top -= 1;
-                // The last mapping value cannot fail after its inner pattern succeeds. CPython's
-                // static-swap pass moves this capture ahead of the mapping cleanup pops.
+                // With no pending captures, static swaps move this store ahead of the
+                // mapping cleanup. Otherwise keep the original rotation and deferred stores:
+                // their line boundaries can prevent the static-swap pass from moving it.
                 self.assembler
                     .set_location(self.source_location(pattern.range));
                 self.store_name(name.as_str())?;

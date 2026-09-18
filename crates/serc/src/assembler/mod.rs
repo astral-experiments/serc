@@ -5490,6 +5490,7 @@ impl Assembler {
                     cleanup,
                     earlier_cleanup,
                     constant_return_prefix: None,
+                    to_bool: None,
                     pop,
                     load,
                     condition,
@@ -5636,17 +5637,184 @@ impl Assembler {
                     earlier_cleanup: None,
                     constant_return_prefix: Some(exception_owners::ConstantManagerReturnPrefix {
                         authored_nop: authored,
+                        retained_authored: false,
                         handler_pop,
                         instructions: prelude.to_vec(),
                         // Captured frontend nesting certifies the POPs before cleanup.
                         // The manager POP is counted separately in replay.
                         missing_null_pops,
                     }),
+                    to_bool: None,
                     pop,
                     load,
                     condition,
                 });
         }
+    }
+
+    /// Captures a constant manager return through an outer try into a primitive test.
+    pub(crate) fn record_copied_try_manager_return_compaction(
+        &mut self,
+        return_item: usize,
+        pop_item: usize,
+        unnamed_handler: bool,
+    ) {
+        use crate::target::opcodes::CALL;
+
+        let items = self.linear_items();
+        let Some(before) = items.get(return_item..pop_item) else {
+            return;
+        };
+        let records = before
+            .iter()
+            .filter_map(|item| match item {
+                Item::Instruction(instruction) => Some(*instruction),
+                Item::Label(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let cleanup_start = if unnamed_handler { 3 } else { 1 };
+        if records.len() != cleanup_start + 5
+            || items.get(return_item) != Some(&Item::Instruction(records[0]))
+        {
+            return;
+        }
+        let authored = records[0];
+        let cleanup = &records[cleanup_start..];
+        let handler_pop = unnamed_handler.then_some(records[1]);
+        if authored.opcode != NOP
+            || authored.operand() != Operand::Value(0)
+            || authored.fusion_policy.is_converted_pop_block()
+            || authored.location.line < 0
+            || authored.depth_after().is_none()
+            || cleanup
+                .iter()
+                .map(|record| record.opcode)
+                .ne([LOAD_CONST, LOAD_CONST, LOAD_CONST, CALL, POP_TOP])
+            || cleanup[0].operand() != cleanup[1].operand()
+            || cleanup[1].operand() != cleanup[2].operand()
+            || cleanup[3].operand() != Operand::Value(3)
+            || cleanup[4].operand() != Operand::Value(0)
+            || cleanup
+                .iter()
+                .any(|record| record.location != cleanup[0].location)
+            || cleanup[4].depth_after() != Some(0)
+            || authored.depth_after() != Some(if unnamed_handler { 3 } else { 2 })
+            || (unnamed_handler
+                && (records[1].opcode != NOP
+                    || records[1].operand() != Operand::Value(0)
+                    || !records[1].fusion_policy.is_converted_pop_block()
+                    || records[1].location != authored.location
+                    || records[1].depth_after() != authored.depth_after()
+                    || records[2].opcode != POP_EXCEPT
+                    || records[2].operand() != Operand::Value(0)
+                    || records[2].location != authored.location
+                    || records[2].depth_after() != Some(2)))
+            || records.iter().enumerate().any(|(index, record)| {
+                record.local_policy.hidden_exception_owner_slots() != 0
+                    || record.pre_fold_extra_instructions() != 0
+                    || !matches!(record.operand(), Operand::Value(_))
+                    || record.exception_policy()
+                        != if unnamed_handler && index == 1 {
+                            ExceptionPolicy::EXCLUDE_ALWAYS
+                        } else {
+                            ExceptionPolicy::NoneUnchanged
+                        }
+            })
+        {
+            return;
+        }
+        let suffix = items[pop_item..]
+            .iter()
+            .filter_map(|item| match item {
+                Item::Instruction(instruction) => Some(*instruction),
+                Item::Label(_) => None,
+            })
+            .take(5)
+            .collect::<Vec<_>>();
+        let (pop, load, to_bool, condition, marker) = match suffix.as_slice() {
+            [pop, load, to_bool, condition, marker] if to_bool.opcode == TO_BOOL => {
+                (pop, load, Some(to_bool), condition, marker)
+            }
+            // The same unnamed-handler cleanup precedes a local None comparison.
+            // Its three fused condition records are already modeled by None replay;
+            // retain the existing generic POP-epoch requirement for this shape.
+            [pop, load, condition, marker, ..]
+                if unnamed_handler
+                    && matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE) =>
+            {
+                (pop, load, None, condition, marker)
+            }
+            _ => return,
+        };
+        if pop.opcode != NOP
+            || pop.operand() != Operand::Value(0)
+            || !pop.fusion_policy.is_converted_pop_block()
+            || pop.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
+            || pop.location.line >= 0
+            || pop.depth_after() != Some(0)
+            || load.opcode != LOAD_FAST
+            || !matches!(load.operand(), Operand::Value(_))
+            || to_bool.is_some_and(|record| record.operand() != Operand::Value(0))
+            || (to_bool.is_some()
+                && !matches!(condition.opcode, POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE))
+            || !matches!(condition.operand(), Operand::Forward(_))
+            || marker.opcode != NOT_TAKEN
+            || marker.operand() != Operand::Value(0)
+            || marker.exception_policy()
+                != if to_bool.is_some() {
+                    ExceptionPolicy::NoneDynamicCondition
+                } else {
+                    ExceptionPolicy::NonePresent
+                }
+            || condition.location.line < 0
+            || marker.location != condition.location
+            || (if let Some(to_bool) = to_bool {
+                load.location != condition.location || to_bool.location != condition.location
+            } else {
+                load.location.line != condition.location.line
+                    || load.location.end_line != condition.location.end_line
+                    || load.location.column != condition.location.column
+                    || load.location.end_column > condition.location.end_column
+            })
+            || [load, condition]
+                .into_iter()
+                .chain(to_bool)
+                .any(|record| record.exception_policy() != ExceptionPolicy::NoneUnchanged)
+            || [pop, load, marker]
+                .into_iter()
+                .chain(to_bool)
+                .any(|record| {
+                    record.local_policy.hidden_exception_owner_slots() != 0
+                        || record.pre_fold_extra_instructions() != 0
+                })
+            || condition.local_policy.hidden_exception_owner_slots()
+                != if to_bool.is_some() { 0 } else { 3 }
+            || condition.pre_fold_extra_instructions() != 0
+        {
+            return;
+        }
+        self.exception_owner_provenance
+            .copied_manager_return_compactions
+            .push(exception_owners::CopiedManagerReturnCompaction {
+                ordinary_try_pops: 1,
+                cleanup: cleanup.to_vec(),
+                earlier_cleanup: None,
+                constant_return_prefix: Some(exception_owners::ConstantManagerReturnPrefix {
+                    authored_nop: authored,
+                    retained_authored: !unnamed_handler,
+                    handler_pop,
+                    instructions: vec![if unnamed_handler {
+                        records[2]
+                    } else {
+                        authored
+                    }],
+                    missing_null_pops: 0,
+                }),
+                to_bool: to_bool.copied(),
+                pop: *pop,
+                load: *load,
+                condition: *condition,
+            });
     }
 
     /// Captures the unchanged first array of an ordinary normal-finally entry.
@@ -6482,7 +6650,7 @@ impl Assembler {
         return_item: usize,
         named: bool,
     ) {
-        self.record_copied_handler_cleanup_inner(start, end, return_item, named, None);
+        self.record_copied_handler_cleanup_inner(start, end, return_item, named, None, false);
     }
 
     /// Captures an unnamed handler unwind and its immediately copied local assignment.
@@ -6493,7 +6661,24 @@ impl Assembler {
         end: Label,
         return_item: usize,
     ) {
-        self.record_copied_handler_cleanup_inner(start, end, return_item, false, Some(handler_end));
+        self.record_copied_handler_cleanup_inner(
+            start,
+            end,
+            return_item,
+            false,
+            Some(handler_end),
+            false,
+        );
+    }
+
+    /// Captures an inner iterator disposal before an enclosing named-handler cleanup.
+    pub(crate) fn record_copied_iterator_handler_cleanup(
+        &mut self,
+        start: Label,
+        end: Label,
+        return_item: usize,
+    ) {
+        self.record_copied_handler_cleanup_inner(start, end, return_item, true, None, true);
     }
 
     fn record_copied_handler_cleanup_inner(
@@ -6503,6 +6688,7 @@ impl Assembler {
         return_item: usize,
         named: bool,
         assignment_pop_boundary: Option<Label>,
+        inner_iterator: bool,
     ) {
         let copied_assignment = assignment_pop_boundary.is_some();
         let items = self.linear_items();
@@ -6529,30 +6715,63 @@ impl Assembler {
                 Item::Label(_) => None,
             })
             .collect::<Vec<_>>();
-        let (missing_null_pops, removed_prefix_slots) = match (named, prefix.as_slice()) {
-            (true, [_]) => (2, 1),
-            (true, [_, first, second])
-                if return_nop.exception_policy() == ExceptionPolicy::NoneUnchanged
-                    && return_nop.local_policy.hidden_exception_owner_slots() == 0
-                    && return_nop.pre_fold_extra_instructions() == 0
-                    && [first, second].into_iter().all(|pop| {
-                        pop.opcode == NOP
-                            && pop.operand() == Operand::Value(0)
-                            && pop.fusion_policy.is_converted_pop_block()
-                            && pop.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
-                            && pop.local_policy.hidden_exception_owner_slots() == 0
-                            && pop.pre_fold_extra_instructions() == 0
-                            && pop.location == return_nop.location
-                    }) =>
+        let return_iterator = if inner_iterator {
+            let [authored, iterator] = prefix.as_slice() else {
+                return;
+            };
+            if !named
+                || copied_assignment
+                || authored.fusion_policy.is_converted_pop_block()
+                || authored.location.line < 0
+                || iterator.opcode != POP_TOP
+                || iterator.operand() != Operand::Value(0)
+                || iterator.location != authored.location
+                || authored
+                    .depth_after()
+                    .and_then(|depth| depth.checked_sub(1))
+                    != iterator.depth_after()
+                || [authored, iterator].into_iter().any(|record| {
+                    record.exception_policy() != ExceptionPolicy::NoneUnchanged
+                        || record.local_policy.hidden_exception_owner_slots() != 0
+                        || record.pre_fold_extra_instructions() != 0
+                })
             {
-                (0, 3)
+                return;
             }
-            (false, [_, pop])
-                if pop.opcode == NOP && pop.fusion_policy.is_converted_pop_block() =>
-            {
-                (0, 2)
+            Some(**iterator)
+        } else {
+            None
+        };
+        let (missing_null_pops, removed_prefix_slots) = if return_iterator.is_some() {
+            // The inner ordinary try retires before iterator disposal; the two
+            // named-handler POPs follow it, before the four protected clear records.
+            (3, 0)
+        } else {
+            match (named, prefix.as_slice()) {
+                (true, [_]) => (2, 1),
+                (true, [_, first, second])
+                    if return_nop.exception_policy() == ExceptionPolicy::NoneUnchanged
+                        && return_nop.local_policy.hidden_exception_owner_slots() == 0
+                        && return_nop.pre_fold_extra_instructions() == 0
+                        && [first, second].into_iter().all(|pop| {
+                            pop.opcode == NOP
+                                && pop.operand() == Operand::Value(0)
+                                && pop.fusion_policy.is_converted_pop_block()
+                                && pop.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
+                                && pop.local_policy.hidden_exception_owner_slots() == 0
+                                && pop.pre_fold_extra_instructions() == 0
+                                && pop.location == return_nop.location
+                        }) =>
+                {
+                    (0, 3)
+                }
+                (false, [_, pop])
+                    if pop.opcode == NOP && pop.fusion_policy.is_converted_pop_block() =>
+                {
+                    (0, 2)
+                }
+                _ => return,
             }
-            _ => return,
         };
         let mut instructions = items[start_at..end_at]
             .iter()
@@ -6625,6 +6844,7 @@ impl Assembler {
                 start,
                 end,
                 return_nop,
+                return_iterator,
                 instructions,
                 missing_null_pops,
                 removed_prefix_slots,

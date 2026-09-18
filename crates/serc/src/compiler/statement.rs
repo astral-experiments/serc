@@ -5934,6 +5934,52 @@ impl Compiler<'_> {
                         if exception_unwind_start.is_none() {
                             with_unwind_before_exception_start = with_unwind_starts.len();
                         }
+                        // A constant return from an ordinary try inside a handler's
+                        // iterator discards that iterator before clearing the handler name.
+                        // Keep that exact prefix separate from the direct-handler captures.
+                        let copied_inner_iterator_handler =
+                            self.context.target_specific_rules_enabled()
+                                && !preserve_tos
+                                && !return_is_overridden
+                                && handler_count == 1
+                                && handler_index == 0
+                                && name.is_some()
+                                && next_finally == 1
+                                && return_finally_contexts.len() == 1
+                                && next_with == 0
+                                && with_depth == 0
+                                && loop_depth == 0
+                                && next_loop == 1
+                                && try_body_depth == 0
+                                && region_depth == 1
+                                && self.control.exceptions.active_try_marker_slots.len() == 1
+                                && self
+                                    .control
+                                    .exceptions
+                                    .active_exception_region_exclusions
+                                    .len()
+                                    == 3
+                                && self.control.exceptions.active_exception_group_handlers == 0
+                                && self.control.withs.active_with_exits.is_empty()
+                                && self.control.finally.active_finally_end_blocks == 0
+                                && self.control.finally.active_normal_finally_bodies == 0
+                                && self.control.finally.active_copied_finally_bodies == 0
+                                && self
+                                    .control
+                                    .finally
+                                    .preserved_return_value_contexts
+                                    .is_empty()
+                                && matches!(return_finally_contexts.as_slice(), [finally]
+                                if finally.handler_depth == 0
+                                    && finally.with_depth == 0
+                                    && finally.loop_depth == 0
+                                    && finally.try_body_depth == 0
+                                    && finally.exception_region_depth == 0)
+                                && matches!(self.control.loops.contexts.as_slice(), [iterator]
+                                if iterator.iterator_cleanup == IteratorCleanup::Sync
+                                    && iterator.with_depth == 0
+                                    && iterator.finally_end_depth == 0
+                                    && iterator.exception_region_depth == 2);
                         self.emit_return_loop_iterator_cleanup(
                             loop_depth,
                             next_loop,
@@ -6233,6 +6279,13 @@ impl Compiler<'_> {
                             } else {
                                 let end = self.assembler.label();
                                 self.assembler.mark(end);
+                                if copied_inner_iterator_handler {
+                                    self.assembler.record_copied_iterator_handler_cleanup(
+                                        start,
+                                        end,
+                                        copied_handler_return_item,
+                                    );
+                                }
                                 if self.context.target_specific_rules_enabled()
                                     && !preserve_tos
                                     && handler_count == 1
@@ -6415,8 +6468,13 @@ impl Compiler<'_> {
                         let iterator = self.control.loops.contexts[finally_context.loop_depth];
                         (iterator.iterator_cleanup == IteratorCleanup::Sync
                             && iterator.finally_end_depth == 0
-                            && iterator.exception_region_depth
-                                == finally_context.exception_region_depth + 1
+                            // A try with handlers adds its ordinary collector inside
+                            // the finally collector before this iterator is created.
+                            && matches!(
+                                iterator.exception_region_depth
+                                    .checked_sub(finally_context.exception_region_depth),
+                                Some(1 | 2)
+                            )
                             && iterator.with_depth >= finally_context.with_depth
                             && iterator.with_depth < next_with
                             && self.control.withs.active_with_exits
@@ -7004,6 +7062,49 @@ impl Compiler<'_> {
                     } else {
                         None
                     };
+                    // A bare return through a sync manager can leave an ordinary try
+                    // between the manager and finally. Capture the exact cleanup before
+                    // its primitive test, including an optional unnamed-handler unwind.
+                    let copied_try_manager_pop = (self.context.target_specific_rules_enabled()
+                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                        && !preserve_tos
+                        && !return_is_overridden
+                        && context_index == 0
+                        && return_finally_contexts.len() == 1
+                        && next_handler == 0
+                        && next_loop == 0
+                        && next_with == 0
+                        && finally_context.handler_depth == 0
+                        && finally_context.with_depth == 0
+                        && finally_context.loop_depth == 0
+                        && finally_context.try_body_depth == 0
+                        && finally_context.exception_region_depth == 0
+                        && self.control.exceptions.active_try_marker_slots.len() == 1
+                        && self.control.exceptions.active_exception_group_handlers == 0
+                        && self.control.exceptions.active_exception_region_exclusions.len()
+                            == 2 + handler_count
+                        && (handler_count == 0
+                            || (handler_count == 1
+                                && matches!(self.control.exceptions.active_exception_handlers.as_slice(),
+                                    [handler] if handler.name.is_none()
+                                        && handler.with_depth == 1
+                                        && handler.loop_depth == 0
+                                        && handler.finally_end_depth == 0
+                                        && handler.try_body_depth == 1
+                                        && handler.exception_region_depth == 2)))
+                        && matches!(self.control.withs.active_with_exits.as_slice(), [manager]
+                            if !manager.is_async
+                                && manager.loop_depth == 0
+                                && manager.normal_finally_depth == 0
+                                && manager.exception_region_depth == 2)
+                        && with_unwind_starts.iter().map(|unwind| unwind.index).eq([0])
+                        && self.control.loops.contexts.is_empty()
+                        && self.control.finally.active_finally_try_bodies == 1
+                        && self.control.finally.active_finally_end_blocks == 0
+                        && self.control.finally.active_normal_finally_bodies == 0
+                        && self.control.finally.active_copied_finally_bodies == 0
+                        && self.control.finally.preserved_return_value_contexts.is_empty())
+                        .then(|| (self.assembler.item_count(), handler_count == 1));
                     // An unnamed handler restores its exception state before one or
                     // two enclosing sync managers and the sole outer finally unwind.
                     let copied_unnamed_handler_manager_pop = (self.context.target_specific_rules_enabled()
@@ -7412,6 +7513,15 @@ impl Compiler<'_> {
                                 missing_null_pops,
                                 0,
                             );
+                    }
+                    if result.is_ok()
+                        && let Some((pop_item, unnamed_handler)) = copied_try_manager_pop
+                    {
+                        self.assembler.record_copied_try_manager_return_compaction(
+                            copied_handler_return_item,
+                            pop_item,
+                            unnamed_handler,
+                        );
                     }
                     if result.is_ok()
                         && let Some((pop_item, managers)) = copied_unnamed_handler_manager_pop
@@ -11631,14 +11741,14 @@ impl Compiler<'_> {
                     return Ok(LoopBackedge::Emitted);
                 }
                 let body_label = self.assembler.label();
-                let split_final_or_chain = !non_final_branch
+                let split_final_boolean_chain = !non_final_branch
                     && !self.has_active_control_flow_region()
-                    && matches!(test, Expr::BoolOp(boolean) if boolean.op == BoolOp::Or)
+                    && matches!(test, Expr::BoolOp(_))
                     && condition_has_only_runtime_tests(test)
                     && final_chained_comparison_jump(test).is_some();
                 // A direct final chain keeps separate success and cleanup arrays, as
-                // does the final operand of a live OR condition. Other compound and
-                // non-final branch layouts retain their existing routes.
+                // does the final operand of a live Boolean condition. Leading AND
+                // operands also keep their separate false-edge backedges.
                 if !non_final_branch
                     && self.control.generators.generator_region_start.is_none()
                     && let Expr::Compare(comparison) = test
@@ -11651,7 +11761,7 @@ impl Compiler<'_> {
                         false,
                         matches!(body, [Stmt::Return(_)]),
                     )?;
-                } else if split_final_or_chain
+                } else if split_final_boolean_chain
                     || (split_short_circuit && !expression_contains_chained_comparison(test))
                 {
                     self.compile_loop_tail_condition(test, true, body_label, restart)?;
@@ -20026,6 +20136,24 @@ impl Compiler<'_> {
                                 })
                             })))
             });
+        let nested_named_recovery_exit = statement.handlers.is_empty()
+            && !normal_finally_is_borrow_reachable
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && statement.orelse.is_empty()
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && self.control.loops.contexts.is_empty()
+            && self.control.withs.active_with_exits.is_empty()
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            && !self.control.in_exception_handler()
+            && self.control.finally.active_finally_try_bodies == 0
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+            && nested_named_recovery_leaves_empty_borrow_entry(statement);
         let managed_while_recovery_exit = statement.handlers.is_empty()
             && !normal_finally_is_borrow_reachable
             && statement.orelse.is_empty()
@@ -20039,6 +20167,7 @@ impl Compiler<'_> {
             && managed_while_reraise_leaves_empty_borrow_exit(&statement.body);
         if (!statement.handlers.is_empty() && !normal_finally_is_borrow_reachable)
             || nested_handler_exit
+            || nested_named_recovery_exit
             || managed_while_recovery_exit
         {
             // An abrupt or bare handler leaves an empty CPython CFG block before the normal
@@ -25083,6 +25212,95 @@ fn managed_while_reraise_leaves_empty_borrow_exit(body: &[Stmt]) -> bool {
             && handler.name.is_none()
             && matches!(handler.body.last(), Some(Stmt::Raise(raise))
                 if raise.exc.is_none() && raise.cause.is_none())
+    })
+}
+
+// These named recovery shapes leave the nested try's original normal exit empty.
+// Earlier returns use separately copied finalizers and do not reopen that entry.
+fn nested_named_recovery_leaves_empty_borrow_entry(statement: &ruff_python_ast::StmtTry) -> bool {
+    let Some(Stmt::Try(recovery)) = statement.body.last() else {
+        return false;
+    };
+    if recovery.is_star
+        || !recovery.orelse.is_empty()
+        || !recovery.finalbody.is_empty()
+        || recovery.handlers.is_empty()
+        || !recovery.handlers.iter().all(|handler| {
+            handler
+                .as_except_handler()
+                .is_some_and(|handler| handler.type_.is_some() && handler.name.is_some())
+        })
+    {
+        return false;
+    }
+    if suite_has_linear_borrow_fallthrough(&statement.finalbody)
+        && matches!(recovery.body.as_slice(), [Stmt::While(tail)]
+            if tail.orelse.is_empty()
+                && condition_has_only_runtime_tests(&tail.test)
+                && condition_jump_target_count(&tail.test, false) > 1
+                && !suite_contains_loop_break(&tail.body)
+                && !suite_contains_return(&tail.body))
+        && recovery.handlers.iter().all(|handler| {
+            handler
+                .as_except_handler()
+                .is_some_and(|handler| suite_has_linear_borrow_fallthrough(&handler.body))
+        })
+    {
+        return true;
+    }
+    let [Stmt::If(cleanup)] = statement.finalbody.as_slice() else {
+        return false;
+    };
+    if !matches!(cleanup.test.as_ref(), Expr::Name(_))
+        || !cleanup.elif_else_clauses.is_empty()
+        || !suite_has_linear_borrow_fallthrough(&cleanup.body)
+        || !recovery
+            .body
+            .iter()
+            .all(|part| matches!(part, Stmt::Expr(_) | Stmt::Assign(_)))
+        || suite_contains_yield(&recovery.body)
+    {
+        return false;
+    }
+    recovery.handlers.iter().all(|handler| {
+        let Some(handler) = handler.as_except_handler() else {
+            return false;
+        };
+        let Some((Stmt::Try(restoration), leading)) = handler.body.split_last() else {
+            return false;
+        };
+        if restoration.is_star
+            || !restoration.handlers.is_empty()
+            || !restoration.orelse.is_empty()
+            || !suite_has_linear_borrow_fallthrough(&restoration.finalbody)
+            || !leading.iter().any(|part| matches!(part, Stmt::If(_)))
+            || !leading.iter().all(|part| match part {
+                Stmt::Expr(_) | Stmt::Assign(_) => true,
+                Stmt::If(guard) => {
+                    guard.elif_else_clauses.is_empty()
+                        && condition_has_only_runtime_tests(&guard.test)
+                        && matches!(guard.body.as_slice(), [Stmt::Raise(raise)]
+                            if raise.exc.is_none() && raise.cause.is_none())
+                }
+                _ => false,
+            })
+            || suite_contains_yield(leading)
+        {
+            return false;
+        }
+        let Some((Stmt::Try(retry), prefix)) = restoration.body.split_last() else {
+            return false;
+        };
+        !retry.is_star
+            && retry.handlers.is_empty()
+            && retry.orelse.is_empty()
+            && suite_has_linear_borrow_fallthrough(prefix)
+            && retry
+                .body
+                .iter()
+                .all(|part| matches!(part, Stmt::Expr(_) | Stmt::Assign(_)))
+            && !suite_contains_yield(&retry.body)
+            && suite_has_linear_borrow_fallthrough(&retry.finalbody)
     })
 }
 

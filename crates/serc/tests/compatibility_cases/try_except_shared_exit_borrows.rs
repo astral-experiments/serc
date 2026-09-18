@@ -752,3 +752,87 @@ fn matches_cpython_borrows_after_managed_while_reraise_finally() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_borrows_after_nested_named_recovery_finally() {
+    for (source, filename) in [
+        (
+            r"def publish(resource, work, acquire, restore, report, enabled):
+    try:
+        report(resource)
+        try:
+            work(resource, mode=enabled or resource)
+            completed = True
+            report(completed)
+        except Exception as error:
+            code = report(error)
+            if code != 0 and not enabled:
+                raise
+            report(error)
+            saved = restore(resource)
+            if saved:
+                raise
+            try:
+                restore(resource)
+                resource = None
+                retry = acquire()
+                try:
+                    work(retry)
+                    completed = True
+                    report(completed)
+                finally:
+                    retry.close()
+            finally:
+                restore(saved)
+    finally:
+        if resource:
+            resource.close()
+",
+            "nested_named_guarded_restoration_finally_target.py",
+        ),
+        (
+            r"def run(worker, initial, load, report):
+    try:
+        if worker.offline:
+            with load() as items:
+                for item in items:
+                    report(item)
+            return
+        for item in initial:
+            report(item)
+        try:
+            while not worker.stop() and not worker.closed():
+                for item in worker.items():
+                    report(item)
+        except Exception as error:
+            report(error)
+    finally:
+        worker.stopped.set()
+",
+            "nested_named_multiedge_while_finally_target.py",
+        ),
+        (
+            r"def run(worker, initial, load, report):
+    try:
+        if worker.offline:
+            with load() as items:
+                for item in items:
+                    report(item)
+            return
+        for item in initial:
+            report(item)
+        try:
+            while not worker.stop():
+                for item in worker.items():
+                    report(item)
+        except Exception as error:
+            report(error)
+    finally:
+        worker.stopped.set()
+",
+            "nested_named_singleedge_while_finally_control.py",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
