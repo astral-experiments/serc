@@ -7802,6 +7802,15 @@ impl Compiler<'_> {
         } else {
             self.compile_jump_if(&conditional.orelse, jump_on, else_target)?;
         }
+        if body_target == else_target
+            && jump_constant_truthiness(&conditional.orelse) == Some(jump_on)
+        {
+            self.assembler.prevent_folded_arm_exit_inlining(
+                otherwise,
+                else_target,
+                self.source_location(conditional.orelse.range()),
+            );
+        }
         self.assembler.preserve_block_boundary_if_new(end);
         self.assembler.mark(end);
         Ok(())

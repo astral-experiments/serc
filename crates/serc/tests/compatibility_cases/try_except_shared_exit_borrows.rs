@@ -1462,3 +1462,216 @@ fn matches_cpython_borrows_after_async_guarded_recovery_else() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_borrows_after_consecutive_break_cleanup() {
+    for (source, filename) in [
+        (
+            r"async def receive(state, channel, epoch, report, stop, consume, close):
+    try:
+        while state.enabled and state.channel is channel and not channel.closed:
+            item = await channel.receive()
+            if item.kind in {1, 2, 3}:
+                report(item)
+                stop()
+                break
+            if item.kind is None:
+                error = channel.error()
+                report(error if error is not None else None)
+                stop()
+                break
+            if item.kind == 4:
+                await consume(item)
+                continue
+            report(item)
+    except LookupError:
+        raise
+    except Exception as error:
+        report(error)
+        stop()
+    finally:
+        if state.channel is channel:
+            await close(channel, epoch if state.enabled else None)
+",
+            "runtime_while_consecutive_break_finally_target.py",
+        ),
+        (
+            r"async def receive(state, channel, epoch, report, stop, consume, close):
+    try:
+        while state.enabled and state.channel is channel and not channel.closed:
+            item = await channel.receive()
+            if item.kind in {1, 2, 3}:
+                report(item)
+                stop()
+                break
+            report(item)
+            if item.kind is None:
+                error = channel.error()
+                report(error if error is not None else None)
+                stop()
+                break
+            if item.kind == 4:
+                await consume(item)
+                continue
+            report(item)
+    except LookupError:
+        raise
+    except Exception as error:
+        report(error)
+        stop()
+    finally:
+        if state.channel is channel:
+            await close(channel, epoch if state.enabled else None)
+",
+            "runtime_while_linear_break_successor_control.py",
+        ),
+        (
+            r"def drain(manager, read, expired, idle, ready, report, close):
+    with manager() as stream:
+        try:
+            while True:
+                value = read()
+                if expired(value):
+                    report(value)
+                    break
+                if idle(value):
+                    report(value)
+                    break
+                report(value)
+                if ready(value):
+                    while True:
+                        tail = read()
+                        if not tail:
+                            break
+                        report(tail)
+                    return value
+        finally:
+            try:
+                close(stream)
+            except Exception:
+                pass
+    return None
+",
+            "managed_consecutive_break_recovery_finally_target.py",
+        ),
+        (
+            r"def drain(manager, read, expired, idle, ready, report, close):
+    stream = manager()
+    try:
+        while True:
+            value = read()
+            if expired(value):
+                report(value)
+                break
+            if idle(value):
+                report(value)
+                break
+            report(value)
+            if ready(value):
+                while True:
+                    tail = read()
+                    if not tail:
+                        break
+                    report(tail)
+                return value
+    finally:
+        try:
+            close(stream)
+        except Exception:
+            pass
+    return None
+",
+            "unmanaged_consecutive_break_recovery_finally_control.py",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn matches_cpython_borrows_at_folded_loop_late_entries() {
+    for (source, filename) in [
+        (
+            r#"async def receive(reader, report, close):
+    try:
+        buffer = bytearray()
+        while True:
+            chunk = await reader.read(64)
+            if not chunk:
+                break
+            buffer.extend(chunk)
+            while True:
+                split = buffer.find(b"\n")
+                if split < 0:
+                    break
+                line = bytes(buffer[:split])
+                del buffer[:split + 1]
+                report(line)
+        if buffer:
+            report(bytes(buffer))
+    except Exception as error:
+        report(error)
+    finally:
+        await close()
+"#,
+            "async_nested_drain_loop_suffix_target.py",
+        ),
+        (
+            r"async def receive(reader, report, close):
+    try:
+        buffer = bytearray()
+        while True:
+            chunk = await reader.read(64)
+            if not chunk:
+                break
+            buffer.extend(chunk)
+            report(buffer)
+        if buffer:
+            report(bytes(buffer))
+    except Exception as error:
+        report(error)
+    finally:
+        await close()
+",
+            "async_linear_drain_loop_suffix_control.py",
+        ),
+        (
+            r#"def drain(manager, stop, tick, report):
+    with manager() as resource:
+        try:
+            while True:
+                delay = tick()
+                if stop.wait(delay):
+                    break
+                health = tick()
+                report(health)
+                if health.ready:
+                    report(health.value)
+        finally:
+            report.info("closing", extra={"address": resource.address})
+    report(None)
+"#,
+            "managed_keyword_call_finally_break_target.py",
+        ),
+        (
+            r#"def drain(manager, stop, tick, report):
+    resource = manager()
+    try:
+        while True:
+            delay = tick()
+            if stop.wait(delay):
+                break
+            health = tick()
+            report(health)
+            if health.ready:
+                report(health.value)
+    finally:
+        report.info("closing", extra={"address": resource.address})
+    report(None)
+"#,
+            "unmanaged_keyword_call_finally_break_control.py",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

@@ -209,7 +209,7 @@ impl Assembler {
 
     pub(in crate::assembler) fn into_optimization_pipeline(mut self) -> OptimizationPipeline {
         self.resolve_folded_condition_borrow_entries();
-        let (graph, initial_reachable) = match self.code {
+        let (mut graph, initial_reachable) = match self.code {
             UnoptimizedCode::Linear(items) => (
                 BlockGraph::from_items(items, &rustc_hash::FxHashSet::default()),
                 None,
@@ -222,6 +222,77 @@ impl Assembler {
                 (graph, Some(reachable))
             }
         };
+        for (entry, original) in self.folded_arm_exit_origins {
+            let Operand::Forward(target) = original.operand() else {
+                continue;
+            };
+            let (Some(source), Some(target)) =
+                (graph.label_block(entry), graph.label_block(target))
+            else {
+                continue;
+            };
+            if !graph[source]
+                .items()
+                .iter()
+                .filter_map(|item| match item {
+                    Item::Instruction(instruction) => Some(*instruction),
+                    Item::Label(_) => None,
+                })
+                .eq(std::iter::once(original))
+            {
+                continue;
+            }
+            let mut instructions = graph[target].items().iter().filter_map(|item| match item {
+                Item::Instruction(instruction) => Some(instruction),
+                Item::Label(_) => None,
+            });
+            let (Some(first), Some(second)) = (instructions.next(), instructions.next()) else {
+                continue;
+            };
+            let (marker, load, ret) = if first.opcode == NOP {
+                let Some(ret) = instructions.next() else {
+                    continue;
+                };
+                (Some(first), second, ret)
+            } else {
+                (None, first, second)
+            };
+            if instructions.next().is_some()
+                // A literal return emits this plain marker at the expression's
+                // original location before loading its constant. It is not an
+                // arbitrary NOP or a location donated to an implicit return.
+                || marker.is_some_and(|marker| {
+                    load.opcode != crate::target::opcodes::LOAD_CONST
+                        || load.location != ret.location
+                        || load.depth_after() != Some(1)
+                        || ret.depth_after() != Some(0)
+                        || *marker
+                            != Instruction::new(NOP, Operand::Value(0), load.location, Some(0))
+                })
+                || !matches!(
+                    load.opcode,
+                    crate::target::opcodes::LOAD_FAST | crate::target::opcodes::LOAD_CONST
+                )
+                || ret.opcode != crate::target::opcodes::RETURN_VALUE
+                || load.location.line < 0
+                || ret.location.line < 0
+                || [load, ret].iter().any(|instruction| {
+                    instruction.pre_fold_extra_instructions() != 0
+                        || instruction.local_policy.hidden_exception_owner_slots() != 0
+                })
+            {
+                continue;
+            }
+            // CPython's earlier small-exit pass still sees the arm's original
+            // conditional jump. An implicit unlocated return instead takes the
+            // separate exit-duplication path and must retain its existing policy.
+            graph
+                .instructions_mut(source)
+                .next()
+                .expect("exact original folded arm")
+                .jump_policy
+                .prevent_small_exit_inlining();
+        }
         if !self.exception_regions.is_empty()
             || !self
                 .exception_owner_provenance
@@ -464,6 +535,20 @@ impl OptimizationPipeline {
             {
                 if records[5] == *before {
                     records[5] = *after;
+                }
+            }
+            for origin in &mut self
+                .exception_owner_provenance
+                .continued_handler_try_prefixes
+            {
+                for item in &mut origin.items {
+                    if let Item::Instruction(condition) = item
+                        && condition == before
+                    {
+                        // This pair comes from the actual surviving conditional's
+                        // target duplication, with every other field unchanged.
+                        *condition = *after;
+                    }
                 }
             }
             for origin in &mut self.exception_owner_provenance.copied_return_truth_prefixes {

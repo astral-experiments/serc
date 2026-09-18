@@ -254,3 +254,148 @@ fn async_iterator_value_returns_capture_finally_null_pop_slots() {
         "coroutine_async_iterator_branched_call_return_finally_none_owner.py",
     );
 }
+
+#[test]
+fn coroutine_return_cleanup_preserves_original_finally_none_slots() {
+    for (filename, source) in [
+        (
+            "coroutine_iterator_handler_return_none_finalizer.py",
+            r#"async def f(manager, handle, attempts):
+    try:
+        for attempt in range(attempts):
+            try:
+                await work()
+            except Exception:
+                if should_stop(attempt):
+                    record("abandoned", attempt, handle)
+                    return
+                if await cancelled():
+                    return
+                continue
+            record("success", attempt, handle)
+            return
+    finally:
+        if handle is not None:
+            async with manager():
+                await release(handle)
+"#,
+        ),
+        (
+            "coroutine_iterator_handler_linear_finalizer_control.py",
+            r#"async def f(manager, handle, attempts):
+    try:
+        for attempt in range(attempts):
+            try:
+                await work()
+            except Exception:
+                if should_stop(attempt):
+                    record("abandoned", attempt, handle)
+                    return
+                if await cancelled():
+                    return
+                continue
+            record("success", attempt, handle)
+            return
+    finally:
+        async with manager():
+            await release(handle)
+"#,
+        ),
+        (
+            "coroutine_manager_handler_return_none_finalizer.py",
+            r"from contextlib import suppress
+
+async def f(manager, handle, flag):
+    try:
+        await work()
+        with manager():
+            if flag:
+                return
+            record(handle)
+    except Exception as error:
+        with manager():
+            if flag:
+                record(error)
+                return
+            report(error)
+    finally:
+        if handle is not None:
+            handle.cancel()
+            with suppress(Exception):
+                await handle
+",
+        ),
+        (
+            "coroutine_manager_handler_linear_finalizer_control.py",
+            r"from contextlib import suppress
+
+async def f(manager, handle, flag):
+    try:
+        await work()
+        with manager():
+            if flag:
+                return
+            record(handle)
+    except Exception as error:
+        with manager():
+            if flag:
+                record(error)
+                return
+            report(error)
+    finally:
+        handle.cancel()
+        with suppress(Exception):
+            await handle
+",
+        ),
+    ] {
+        assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn iterator_handler_continue_preserves_nested_finalizer_setup_slot() {
+    for (filename, source) in [
+        (
+            "iterator_value_return_nested_try_finalizer.py",
+            r"def f(values, make):
+    for value in values:
+        resource = None
+        try:
+            resource = make(value)
+            resource.prepare()
+            resource.bind(value)
+            return value
+        except OSError:
+            continue
+        finally:
+            try:
+                if resource is not None:
+                    resource.close()
+            except Exception:
+                pass
+    return None
+",
+        ),
+        (
+            "iterator_value_return_plain_finalizer_control.py",
+            r"def f(values, make):
+    for value in values:
+        resource = None
+        try:
+            resource = make(value)
+            resource.prepare()
+            resource.bind(value)
+            return value
+        except OSError:
+            continue
+        finally:
+            if resource is not None:
+                resource.close()
+    return None
+",
+        ),
+    ] {
+        assert_matches_cpython_marshal(source, filename);
+    }
+}

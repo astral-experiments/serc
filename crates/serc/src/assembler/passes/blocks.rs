@@ -227,6 +227,51 @@ fn block_is_bare_raise(items: &[Item], original_nop_targets: &FxHashSet<Label>) 
     }) && instructions.next().is_none()
 }
 
+/// Certifies a local raise without copied return/finally unwind records.
+///
+/// One original converted `POP_BLOCK` may precede the two-record raise. Authored
+/// or folded-away NOPs do not certify that original array's size.
+fn block_is_local_raise(items: &[Item], original_nop_targets: &FxHashSet<Label>) -> bool {
+    if items
+        .iter()
+        .any(|item| matches!(item, Item::Label(label) if original_nop_targets.contains(label)))
+    {
+        return false;
+    }
+    let mut instructions = items.iter().filter_map(|item| match item {
+        Item::Instruction(instruction) => Some(instruction),
+        Item::Label(_) => None,
+    });
+    let Some(mut first) = instructions.next() else {
+        return false;
+    };
+    if first.opcode == NOP {
+        if first.operand() != Operand::Value(0)
+            || first.location != SourceLocation::NONE
+            || !first.fusion_policy.is_converted_pop_block()
+            || first.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
+            || first.pre_fold_extra_instructions() != 0
+            || first.local_policy.hidden_exception_owner_slots() != 0
+        {
+            return false;
+        }
+        let Some(local) = instructions.next() else {
+            return false;
+        };
+        first = local;
+    }
+    first.opcode == LOAD_FAST
+        && first.pre_fold_extra_instructions() == 0
+        && first.local_policy.hidden_exception_owner_slots() == 0
+        && instructions.next().is_some_and(|raise| {
+            raise.opcode == RAISE_VARARGS
+                && raise.operand() == Operand::Value(1)
+                && raise.pre_fold_extra_instructions() == 0
+                && raise.local_policy.hidden_exception_owner_slots() == 0
+        })
+        && instructions.next().is_none()
+}
+
 // Every restored POP_BLOCK is outside ordinary handlers but inside the scope fallback.
 // Reapply its exact one-slot hole after all source and copied regions have been formed.
 fn restore_normal_try_pop_holes(
@@ -413,6 +458,7 @@ fn exit_block_analysis(
                 });
         let small_exit_source = !source_has_fallthrough
             && (block_is_bare_raise(graph[target].items(), original_nop_targets)
+                || block_is_local_raise(graph[target].items(), original_nop_targets)
                 || graph[source]
                     .last_instruction()
                     .is_some_and(|instruction| instruction.jump_policy.inline_small_exit()));
@@ -515,7 +561,8 @@ fn exit_block_analysis(
         let inline_small_exit = !source_has_fallthrough
             && target_is_small_exit
             && ((target_chain_end == target_position
-                && block_is_bare_raise(graph[target].items(), original_nop_targets))
+                && (block_is_bare_raise(graph[target].items(), original_nop_targets)
+                    || block_is_local_raise(graph[target].items(), original_nop_targets)))
                 || graph[source]
                     .last_instruction()
                     .is_some_and(|instruction| instruction.jump_policy.inline_small_exit()))
@@ -3203,7 +3250,8 @@ impl OptimizationPipeline {
                             || matches!(opcode, RAISE_VARARGS | RETURN_VALUE))
                 });
             let source_allows_small_exit_inlining = (target_chain_end == target_position
-                && block_is_bare_raise(graph[target].items(), &self.original_nop_targets))
+                && (block_is_bare_raise(graph[target].items(), &self.original_nop_targets)
+                    || block_is_local_raise(graph[target].items(), &self.original_nop_targets)))
                 || graph[source]
                     .last_instruction()
                     .is_some_and(|instruction| instruction.jump_policy.inline_small_exit());
