@@ -220,3 +220,74 @@ fn async_for_branch_exits_preserve_copied_return_nops() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn async_for_finally_bare_returns_keep_join_nops() {
+    for (filename, source) in [
+        (
+            "async_generator_finally_async_for_bare_return_target.py",
+            r"async def target(enabled, items):
+    if enabled:
+        try:
+            try:
+                async for item in items:
+                    pass
+            except Exception:
+                pass
+            yield make_value()
+        finally:
+            cleanup = items
+            async for item in cleanup:
+                pass
+        return
+    async for item in items:
+        yield item
+",
+        ),
+        (
+            "coroutine_finally_async_for_bare_return_target.py",
+            r"async def target(enabled, items):
+    if enabled:
+        try:
+            await work()
+        finally:
+            cleanup = items
+            async for item in cleanup:
+                consume(item)
+        return
+    await finish()
+",
+        ),
+        (
+            "async_generator_finally_async_for_following_call_control.py",
+            r"async def target(enabled, items):
+    if enabled:
+        try:
+            yield make_value()
+        finally:
+            async for item in items:
+                consume(item)
+            finish()
+        return
+    yield None
+",
+        ),
+        (
+            "async_generator_finally_async_for_else_return_control.py",
+            r"async def target(enabled, items):
+    if enabled:
+        try:
+            yield make_value()
+        finally:
+            async for item in items:
+                consume(item)
+            else:
+                finish()
+        return
+    yield None
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

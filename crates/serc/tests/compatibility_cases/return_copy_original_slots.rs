@@ -521,3 +521,79 @@ fn shared_conditional_joins_preserve_original_return_copy_slots() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn iterator_breaks_copy_two_literal_tuple_returns() {
+    for (filename, source) in [
+        (
+            "iterator_break_two_literal_tuple_return_target.py",
+            r#"def select(items):
+    for item in items:
+        if item == "stop":
+            break
+        if item == "skip":
+            continue
+        if item:
+            return item, "found"
+    return None, "missing"
+"#,
+        ),
+        (
+            "iterator_break_three_literal_tuple_return_control.py",
+            r#"def select(items):
+    for item in items:
+        if item == "stop":
+            break
+        if item == "skip":
+            continue
+        if item:
+            return item, "found"
+    return None, "missing", False
+"#,
+        ),
+        (
+            "iterator_break_four_literal_tuple_return_control.py",
+            r#"def select(items):
+    for item in items:
+        if item == "stop":
+            break
+        if item == "skip":
+            continue
+        if item:
+            return item, "found"
+    return None, "missing", False, 0
+"#,
+        ),
+        (
+            "iterator_break_nonconstant_tuple_return_control.py",
+            r#"def select(items, fallback):
+    for item in items:
+        if item == "stop":
+            break
+        if item == "skip":
+            continue
+        if item:
+            return item, "found"
+    return fallback, "missing"
+"#,
+        ),
+        (
+            "iterator_break_finally_literal_tuple_return_control.py",
+            r#"def select(items, release):
+    for item in items:
+        try:
+            if item == "stop":
+                break
+            if item == "skip":
+                continue
+            if item:
+                return item, "found"
+        finally:
+            release()
+    return None, "missing"
+"#,
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

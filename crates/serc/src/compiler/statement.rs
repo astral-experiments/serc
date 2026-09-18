@@ -659,8 +659,8 @@ pub(super) struct StatementState {
     // Whether that successor is a direct literal return. CPython can copy this small exit onto
     // the normal edge of a preceding try/else before retaining the edge as a source NOP.
     current_statement_followed_by_literal_return: bool,
-    // Whether that successor is a direct folded tuple return. CPython keeps loop breaks targeting
-    // this constant exit instead of copying the tuple-return block onto each break edge.
+    // Whether the following folded tuple return still needs its iterator-break jump.
+    // Two literal elements fit the original four-slot exit-copy budget.
     current_statement_followed_by_tuple_return: bool,
     // Two direct name loads, BUILD_TUPLE, and RETURN_VALUE fill CPython's four-slot
     // copy budget before superinstruction fusion. A copied jump NOP exceeds it.
@@ -2077,7 +2077,9 @@ impl Compiler<'_> {
                     Some(Stmt::Return(statement))
                         if matches!(
                             statement.value.as_deref(),
-                            Some(value @ Expr::Tuple(_)) if fold_constant(value).is_some()
+                            Some(value @ Expr::Tuple(tuple)) if fold_constant(value).is_some()
+                                && !(tuple.elts.len() == 2
+                                    && tuple.elts.iter().all(is_literal_constant))
                         )
                 );
                 let match_successor_fills_small_exit_copy_budget = matches!(
@@ -22941,6 +22943,17 @@ impl Compiler<'_> {
                     self.assembler
                         .mark_retained_nop_borrow_fallthrough_if_unblocked(normal_exit);
                 }
+            } else if !preserve_exit_nop
+                && finalizer_tail_count == 0
+                && matches!(statement.finalbody.last(), Some(Stmt::For(tail))
+                    if tail.is_async
+                        && tail.orelse.is_empty()
+                        && !suite_contains_loop_break(&tail.body))
+            {
+                // END_ASYNC_FOR ends the preceding original array. Its empty
+                // exhaustion join retains a separate line event when the normal
+                // finally jump is replaced by a directly copied return.
+                self.assembler.preserve_direct_inlined_jump_nop(normal_exit);
             } else if preserve_exit_nop && !separate_manager_pop {
                 self.assembler
                     .preserve_redundant_jump_nop_after_threading(normal_exit);

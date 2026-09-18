@@ -620,7 +620,7 @@ impl ExceptionOwnerProvenance {
         prefix: &'a [Item],
         all: &[Item],
     ) -> Option<(Label, &'a [Item], usize)> {
-        use crate::target::opcodes::{CALL, LOAD_ATTR, LOAD_FAST, STORE_FAST, SWAP};
+        use crate::target::opcodes::{CALL, LOAD_ATTR, LOAD_FAST, STORE_FAST, STORE_NAME, SWAP};
 
         let leading = prefix
             .iter()
@@ -690,12 +690,13 @@ impl ExceptionOwnerProvenance {
                 .collect::<Vec<_>>();
             // All authored restores are STORE_FAST_MAYBE_NULL in CPython,
             // including cells. They remain distinct through superinstruction
-            // insertion. CALL, LOAD_ATTR, and LOAD_FAST prevent static elimination of
-            // SWAP(n + 1), because only n swappable restores precede the next operation.
+            // insertion. CALL, LOAD_ATTR, LOAD_FAST, and STORE_NAME prevent static
+            // elimination of SWAP(n + 1): CPython only swaps local stores and POP_TOP,
+            // so only n swappable restores precede the next operation.
             if instructions.starts_with(original)
-                && instructions
-                    .get(original.len())
-                    .is_some_and(|next| matches!(next.opcode, CALL | LOAD_ATTR | LOAD_FAST))
+                && instructions.get(original.len()).is_some_and(|next| {
+                    matches!(next.opcode, CALL | LOAD_ATTR | LOAD_FAST | STORE_NAME)
+                })
             {
                 return Some((*entry, &prefix[start..], restores.len()));
             }
@@ -721,6 +722,85 @@ impl ExceptionOwnerProvenance {
         Some((entry, &prefix[begin..]))
     }
 
+    /// Proves the unchanged success array after an empty class pattern.
+    fn empty_class_success_prefix(prefix: &[Item], all: &[Item]) -> bool {
+        use crate::target::opcodes::{COPY, MATCH_CLASS, POP_JUMP_IF_NONE, UNPACK_SEQUENCE};
+
+        let [
+            Item::Instruction(unpack),
+            Item::Instruction(discard),
+            Item::Instruction(next),
+            ..,
+        ] = prefix
+        else {
+            return false;
+        };
+        let (Some(unpack_depth), Some(discard_depth)) =
+            (unpack.depth_after(), discard.depth_after())
+        else {
+            return false;
+        };
+        if unpack.opcode != UNPACK_SEQUENCE
+            || unpack.operand() != Operand::Value(0)
+            || discard.opcode != POP_TOP
+            || discard.operand() != Operand::Value(0)
+            || !discard.fusion_policy.location_from_next()
+            || discard.location != next.location
+            || unpack_depth.checked_sub(1) != Some(discard_depth)
+        {
+            return false;
+        }
+        let mut starts = all
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| (*item == Item::Instruction(*unpack)).then_some(index));
+        let Some(start) = starts.next() else {
+            return false;
+        };
+        if starts.next().is_some() {
+            return false;
+        }
+        let Some(start) = start.checked_sub(4) else {
+            return false;
+        };
+        let [
+            Item::Instruction(class),
+            Item::Instruction(copy),
+            Item::Instruction(failure),
+            Item::Instruction(marker),
+        ] = &all[start..start + 4]
+        else {
+            return false;
+        };
+        let (Some(class_depth), Some(copy_depth), Some(failure_depth), Some(marker_depth)) = (
+            class.depth_after(),
+            copy.depth_after(),
+            failure.depth_after(),
+            marker.depth_after(),
+        ) else {
+            return false;
+        };
+        // The two hidden COPY cells are the None comparison in the preceding
+        // array. The authored failure conditional starts a fresh success array;
+        // UNPACK(0) and the subject discard both survive in that new array.
+        class.opcode == MATCH_CLASS
+            && class.operand() == Operand::Value(0)
+            && copy.opcode == COPY
+            && copy.operand() == Operand::Value(1)
+            && copy.local_policy.hidden_exception_owner_slots() == 2
+            && copy.pre_fold_extra_instructions() == 0
+            && failure.opcode == POP_JUMP_IF_NONE
+            && matches!(failure.operand(), Operand::Forward(_))
+            && marker.opcode == NOT_TAKEN
+            && [class, copy, failure, marker]
+                .iter()
+                .all(|record| record.location == unpack.location)
+            && class_depth.checked_add(1) == Some(copy_depth)
+            && failure_depth == class_depth
+            && marker_depth == failure_depth
+            && failure_depth.checked_sub(1) == Some(unpack_depth)
+    }
+
     fn uncompacted_prefix(
         &self,
         prefix: &[Item],
@@ -736,6 +816,7 @@ impl ExceptionOwnerProvenance {
             STORE_FAST, STORE_NAME, TO_BOOL,
         };
 
+        let empty_class_success = Self::empty_class_success_prefix(prefix, all);
         let leading_labels = prefix
             .iter()
             .map_while(|item| {
@@ -770,10 +851,39 @@ impl ExceptionOwnerProvenance {
             let Some(entry) = boundaries.next() else {
                 return false;
             };
-            if boundaries.next().is_some() || !self.source_boundaries.contains(entry) {
+            if !self.source_boundaries.contains(entry) {
                 return false;
             }
-        } else if !has_original_target && comprehension_restore_count == 0 {
+            if boundaries.next().is_some() {
+                // Nested primitive branches can end at adjacent source labels.
+                // They share one instruction-array head only when each alias is
+                // the target of its own still-literal authored conditional.
+                if leading_labels
+                    .iter()
+                    .filter(|label| self.block_boundaries.contains(*label))
+                    .any(|label| {
+                        !self.source_boundaries.contains(label)
+                            || all
+                                .iter()
+                                .filter(|item| **item == Item::Label(*label))
+                                .count()
+                                != 1
+                            || !self.original_primitive_condition_boundaries.iter().any(
+                                |condition| {
+                                    condition.operand() == Operand::Forward(*label)
+                                        && all
+                                            .iter()
+                                            .filter(|item| **item == Item::Instruction(*condition))
+                                            .count()
+                                            == 1
+                                },
+                            )
+                    })
+                {
+                    return false;
+                }
+            }
+        } else if !has_original_target && comprehension_restore_count == 0 && !empty_class_success {
             return false;
         }
         let positions = all
@@ -1158,6 +1268,8 @@ impl ExceptionOwnerProvenance {
                         return false;
                     }
                 }
+                crate::target::opcodes::UNPACK_SEQUENCE if empty_class_success && index == 0 => {}
+                POP_TOP if empty_class_success && index == 1 => {}
                 IMPORT_FROM | POP_TOP if from_import_members.contains(&index) => {}
                 POP_TOP => {
                     // Discarding a call result retains both original records at an
@@ -1315,8 +1427,20 @@ impl LayoutAssembler {
             .exception_owner_provenance
             .uncompacted_conditional_arrays
         {
-            let Some(Item::Label(entry)) = origin.prefix.first() else {
+            let Some(first) = origin.prefix.first() else {
                 continue;
+            };
+            let entry = match first {
+                Item::Label(entry) => Some(*entry),
+                Item::Instruction(unpack)
+                    if unpack.opcode == crate::target::opcodes::UNPACK_SEQUENCE
+                        && unpack.operand() == Operand::Value(0)
+                        && origin.source_entry.is_none()
+                        && origin.comprehension_entry.is_none() =>
+                {
+                    None
+                }
+                Item::Instruction(_) => continue,
             };
             if let Some(source_entry) = origin.source_entry
                 && (!self
@@ -1331,7 +1455,7 @@ impl LayoutAssembler {
                 continue;
             }
             if let Some(original_entry) = origin.comprehension_entry
-                && (original_entry != *entry
+                && (entry != Some(original_entry)
                     || self
                         .exception_owner_provenance
                         .retired_comprehension_normal_entries
@@ -1357,7 +1481,7 @@ impl LayoutAssembler {
                 .items
                 .iter()
                 .enumerate()
-                .filter_map(|(index, item)| (*item == Item::Label(*entry)).then_some(index))
+                .filter_map(|(index, item)| (item == first).then_some(index))
                 .collect::<Vec<_>>();
             let [start] = starts.as_slice() else { continue };
             let original_labels = origin
@@ -1373,7 +1497,7 @@ impl LayoutAssembler {
                 .collect::<FxHashSet<_>>();
             let mut cursor = *start;
             let mut valid = true;
-            for expected in &origin.prefix {
+            for (original_index, expected) in origin.prefix.iter().enumerate() {
                 while let Some(Item::Label(label)) = self.items.get(cursor)
                     && !original_labels.contains(label)
                 {
@@ -1412,6 +1536,15 @@ impl LayoutAssembler {
                         let mut expected = *expected;
                         if expected.opcode == LOAD_FAST && current.opcode == LOAD_FAST_BORROW {
                             expected.opcode = LOAD_FAST_BORROW;
+                        }
+                        if entry.is_none()
+                            && original_index == 1
+                            && expected.opcode == POP_TOP
+                            && expected.fusion_policy.location_from_next()
+                        {
+                            // The captured next record has this exact location.
+                            // resolve_next_locations only clears this proven bit.
+                            expected.fusion_policy.clear_location_from_next();
                         }
                         expected == *current
                     }
