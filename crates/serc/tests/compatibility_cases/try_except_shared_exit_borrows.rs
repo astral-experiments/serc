@@ -836,3 +836,99 @@ fn matches_cpython_borrows_after_nested_named_recovery_finally() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_borrows_after_named_cleanup_store_suffix() {
+    for (source, filename) in [
+        (
+            r#"def build(worker, report, kind):
+    source = "direct"
+    try:
+        result = worker.build(kind)
+    except Exception as error:
+        report(error)
+        source = "fallback"
+        try:
+            spec = worker.retry(kind)
+        except Exception as inner:
+            report(inner)
+            saved = worker.method
+            try:
+                worker.method = lambda value: -1
+                spec = worker.retry(kind)
+            finally:
+                worker.method = saved
+        result = {"spec": spec, "source": source, "tokens": list(worker.tokens())}
+    return result, source, kind
+"#,
+            "named_nested_restoration_store_suffix_target.py",
+        ),
+        (
+            r"def lease(resource, acquire, manager, report):
+    payload = resource.payload
+    try:
+        handle = acquire(resource)
+    except OSError as error:
+        existing = resource.read()
+        if existing.active:
+            if existing.owner:
+                try:
+                    yield existing
+                finally:
+                    try:
+                        current = resource.read()
+                        if current.active and current.owner:
+                            if existing.restore:
+                                report(existing)
+                            else:
+                                with manager():
+                                    resource.remove()
+                    finally:
+                        report(resource)
+                return
+            reason = existing.reason
+            raise RuntimeError(reason) from error
+        with manager():
+            resource.remove()
+        handle = acquire(resource)
+    with resource.open(handle) as output:
+        output.write(payload)
+    report(resource)
+    try:
+        yield handle
+    finally:
+        try:
+            current = resource.read()
+            if current.active and current.owner:
+                with manager():
+                    resource.remove()
+        finally:
+            report(resource)
+",
+            "named_manager_store_suffix_target.py",
+        ),
+        (
+            r#"def build(worker, report, kind):
+    source = "direct"
+    try:
+        result = worker.build(kind)
+    except Exception as error:
+        report(error)
+        source = "fallback"
+        try:
+            spec = worker.retry(kind)
+        except Exception as inner:
+            report(inner)
+            saved = worker.method
+            worker.method = lambda value: -1
+            spec = worker.retry(kind)
+            worker.method = saved
+        result = {"spec": spec, "source": source, "tokens": list(worker.tokens())}
+    return result, source, kind
+"#,
+            "named_nested_linear_store_suffix_control.py",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

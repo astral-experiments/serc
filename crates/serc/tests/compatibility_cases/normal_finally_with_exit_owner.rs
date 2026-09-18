@@ -133,3 +133,89 @@ fn preserves_outer_manager_owner_after_sequential_finally_guards() {
         common::assert_matches_cpython_marshal(&source, "sequential_finally_manager_joins.py");
     }
 }
+
+#[test]
+fn preserves_normal_finally_attribute_owners_inside_async_managers() {
+    for (filename, source) in [
+        (
+            "async_manager_finally_method_after_async_for.py",
+            r"async def f(manager, task, consume):
+    async with manager as stream:
+        try:
+            async for item in stream:
+                if not item:
+                    break
+                await consume(item)
+        finally:
+            if not task.done():
+                task.cancel()
+                await task
+",
+        ),
+        (
+            "async_manager_finally_method_linear_control.py",
+            r"async def f(manager, task, consume):
+    async with manager as stream:
+        try:
+            await consume(stream)
+        finally:
+            if not task.done():
+                task.cancel()
+                await task
+",
+        ),
+        (
+            "async_manager_finally_attribute_after_conditional_await.py",
+            r"async def f(self, session, run, hook, cleanup):
+    try:
+        async with session:
+            error = None
+            try:
+                result = await run()
+                if hook is not None:
+                    await hook()
+            except BaseException as caught:
+                error = caught
+                raise
+            finally:
+                if self.enabled:
+                    try:
+                        await session.stop()
+                    except Exception:
+                        if error is None:
+                            raise
+                        self.record(error)
+    finally:
+        await cleanup(session)
+    return result
+",
+        ),
+        (
+            "async_manager_finally_attribute_linear_control.py",
+            r"async def f(self, session, run, hook, cleanup):
+    try:
+        async with session:
+            error = None
+            try:
+                result = await run()
+                await hook()
+            except BaseException as caught:
+                error = caught
+                raise
+            finally:
+                if self.enabled:
+                    try:
+                        await session.stop()
+                    except Exception:
+                        if error is None:
+                            raise
+                        self.record(error)
+    finally:
+        await cleanup(session)
+    return result
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

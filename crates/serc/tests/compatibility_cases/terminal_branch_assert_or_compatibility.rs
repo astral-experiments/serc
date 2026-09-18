@@ -220,3 +220,52 @@ def terminal_false_selector(enabled, value):
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn inherited_assertion_success_return_joins() {
+    for (filename, source) in [
+        (
+            "nested_assert_ladder_return_join_nop_target.py",
+            r"def f(value, enabled, kind, size):
+    if enabled:
+        if kind == 1:
+            assert len(value) == size
+        elif kind == 2:
+            assert len(value) == 2
+        else:
+            raise ValueError()
+    return value
+",
+        ),
+        (
+            "nested_assert_ladder_intervening_call_control.py",
+            r"def f(value, enabled, kind, size):
+    if enabled:
+        if kind == 1:
+            assert len(value) == size
+        elif kind == 2:
+            assert len(value) == 2
+        else:
+            raise ValueError()
+        observe(value)
+    return value
+",
+        ),
+        (
+            "nested_assert_ladder_manager_cleanup_control.py",
+            r"def f(value, enabled, kind, size, manager):
+    with manager:
+        if enabled:
+            if kind == 1:
+                assert len(value) == size
+            elif kind == 2:
+                assert len(value) == 2
+            else:
+                raise ValueError()
+    return value
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

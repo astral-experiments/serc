@@ -710,10 +710,35 @@ impl Compiler<'_> {
                         let authored_pass_exit = self.assembler.last_instruction_is_nop()
                             && !self.assembler.last_nop_repeats_previous_line()
                             && matches!(case.body.last(), Some(Stmt::Pass(_)));
-                        let original_match_join = self.assembler.at_original_match_join();
+                        let fallthrough_if_join = !original_unlocated_head
+                            && self.following_name_return_fits_match_copy_budget()
+                            && case.body.last().is_some_and(|statement| {
+                                let Stmt::If(tail) = statement else {
+                                    return false;
+                                };
+                                let Some((otherwise, branches)) =
+                                    tail.elif_else_clauses.split_last()
+                                else {
+                                    return false;
+                                };
+                                early_condition_truthiness(&tail.test).is_none()
+                                    && suite_terminates(&tail.body)
+                                    && otherwise.test.is_none()
+                                    && !suite_terminates(&otherwise.body)
+                                    && branches.iter().all(|clause| {
+                                        clause.test.as_ref().is_some_and(|test| {
+                                            early_condition_truthiness(test).is_none()
+                                        }) && suite_terminates(&clause.body)
+                                    })
+                            });
+                        // A complete if with terminating tested arms still has an original
+                        // empty join when only its else suite falls through. It needs no
+                        // incoming jump to retain the slot replaced by a small return.
+                        let original_empty_join =
+                            self.assembler.at_original_match_join() || fallthrough_if_join;
                         let success_exit = self.emit_jump_forward_instruction(JUMP_FORWARD, end)?;
                         self.assembler
-                            .record_original_match_success(success_exit, original_match_join);
+                            .record_original_match_success(success_exit, original_empty_join);
                         if original_unlocated_head {
                             self.assembler.mark_as_artificial_eval_break(success_exit);
                             if let Some(Stmt::If(tail)) = case.body.last()

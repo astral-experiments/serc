@@ -9663,14 +9663,20 @@ impl Compiler<'_> {
                     }
                     // CPython retains the first assertion branch's source jump when it copies a
                     // nonterminal join onto that edge. A directly following return or raise
-                    // copies the function-exit block onto later clauses too. Without a copied
-                    // function exit, terminating `else` blocks take a different CFG path and
-                    // drop the jump instead.
+                    // copies the function-exit block onto later clauses too. A final nested
+                    // conditional inherits the same small return through unprotected joins.
+                    // Without a copied function exit, terminating `else` blocks drop the jump.
                     let retain_assertion_exit = ((branch_index == 0 && !has_terminating_else)
                         || self
                             .control
                             .statements
-                            .current_statement_followed_by_return_or_raise)
+                            .current_statement_followed_by_return_or_raise
+                        || (!self.control.statements.current_statement_has_following
+                            && self
+                                .control
+                                .statements
+                                .inherited_statement_followed_by_small_return
+                            && !self.has_active_control_flow_region()))
                         && matches!(body.last(), Some(Stmt::Assert(_)));
                     if nested_if_ends_in_break
                         && has_terminating_else
@@ -15951,6 +15957,40 @@ impl Compiler<'_> {
                         || suite_contains_partial_terminal_handler_if(&handler.body)
                 })
             });
+            let named_handler_cleanup_suffix = borrow_exit_has_source_successor
+                && matches!(self.unit.scope, Scope::Function { .. })
+                && !statement.is_star
+                && statement.orelse.is_empty()
+                && statement.finalbody.is_empty()
+                && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                && suite_has_linear_borrow_fallthrough(&statement.body)
+                && !suite_contains_yield(&statement.body)
+                && !self
+                    .control
+                    .statements
+                    .current_statement_followed_by_name_return
+                && !self
+                    .control
+                    .statements
+                    .current_statement_followed_by_literal_return
+                && self.control.loops.contexts.is_empty()
+                && self.control.withs.active_with_exits.is_empty()
+                && self.control.exceptions.active_exception_handlers.is_empty()
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .is_empty()
+                && self.control.finally.active_finally_try_bodies == 0
+                && self.control.finally.active_normal_finally_bodies == 0
+                && self.control.finally.active_copied_finally_bodies == 0
+                && self.control.finally.active_finally_end_blocks == 0
+                && matches!(statement.handlers.as_slice(), [handler]
+                if handler.as_except_handler().is_some_and(|handler| {
+                    handler.type_.is_some()
+                        && handler.name.is_some()
+                        && named_handler_cleanup_precedes_assignment(&handler.body)
+                }));
             let following_name_return_has_noncopyable_cleanup = self
                 .control
                 .finally
@@ -16003,6 +16043,7 @@ impl Compiler<'_> {
                     && self.control.withs.active_with_exits.is_empty()
                     && !following_name_return_has_noncopyable_cleanup))
                 || handler_has_orphan_cold_cleanup
+                || named_handler_cleanup_suffix
                 || has_bare_handler
                 || (!statement.is_star
                     && self.context.target_specific_rules_enabled()
@@ -24043,8 +24084,11 @@ fn with_body_match_exit_location(body: &[Stmt]) -> Option<TextRange> {
         || fallback.guard.is_some()
         || !(is_wildcard_pattern(&fallback.pattern) || bare_capture_call)
         || !preceding.iter().all(|case| {
-            matches!(case.body.last(), Some(Stmt::Return(_) | Stmt::Raise(_)))
-                && suite_terminates(&case.body)
+            (matches!(case.body.last(), Some(Stmt::Return(_) | Stmt::Raise(_)))
+                && suite_terminates(&case.body))
+                || (matches!(case.body.last(), Some(Stmt::Try(statement))
+                    if statement.orelse.is_empty() && statement.finalbody.is_empty())
+                    && with_body_ends_in_terminal_try(&case.body))
         })
         || !suite_has_linear_borrow_fallthrough(&fallback.body)
     {
@@ -24056,8 +24100,8 @@ fn with_body_match_exit_location(body: &[Stmt]) -> Option<TextRange> {
     if !matches!(expression.value.as_ref(), Expr::Call(_)) {
         return None;
     }
-    // The other cases exit directly. The irrefutable case's normal edge alone
-    // locates the original match join containing the manager's converted POP_BLOCK.
+    // The other cases leave through their own cleanup, including terminal try bodies
+    // and handlers. Only the irrefutable case locates the manager's normal POP_BLOCK.
     Some(expression.value.range())
 }
 
@@ -25994,6 +26038,73 @@ fn suite_contains_orphan_cold_cleanup(body: &[Stmt]) -> bool {
     let mut detector = Detector::default();
     detector.visit_body(body);
     detector.found
+}
+
+// A copied cleanup before a handler's final store can leave an empty original
+// array in the warm exit path. The store stays in the relocated cold suffix;
+// it does not populate that original array or admit the normal continuation.
+fn named_handler_cleanup_precedes_assignment(body: &[Stmt]) -> bool {
+    let Some((Stmt::Assign(assignment), prefix)) = body.split_last() else {
+        return false;
+    };
+    if !assignment
+        .targets
+        .iter()
+        .all(|target| matches!(target, Expr::Name(_)))
+        || expression_contains_inline_branch(&assignment.value)
+        || expression_suspends_current_scope(&assignment.value)
+    {
+        return false;
+    }
+    let Some((cleanup, leading)) = prefix.split_last() else {
+        return false;
+    };
+    let linear =
+        |body: &[Stmt]| suite_has_linear_borrow_fallthrough(body) && !suite_contains_yield(body);
+    match cleanup {
+        Stmt::Try(recovery) => {
+            !recovery.is_star
+                && recovery.orelse.is_empty()
+                && recovery.finalbody.is_empty()
+                && linear(&recovery.body)
+                && (leading.is_empty() || linear(leading))
+                && matches!(recovery.handlers.as_slice(), [handler]
+                if handler.as_except_handler().is_some_and(|handler| {
+                    handler.type_.is_some()
+                        && handler.name.is_some()
+                        && handler.body.split_last().is_some_and(|(last, prefix)| {
+                            (prefix.is_empty() || linear(prefix))
+                                && matches!(last, Stmt::Try(restoration)
+                                    if !restoration.is_star
+                                        && restoration.handlers.is_empty()
+                                        && restoration.orelse.is_empty()
+                                        && linear(&restoration.body)
+                                        && linear(&restoration.finalbody))
+                        })
+                }))
+        }
+        Stmt::With(manager) => {
+            let terminal_guard = |statement: &Stmt| {
+                matches!(statement, Stmt::If(guard)
+                    if guard.elif_else_clauses.is_empty()
+                        && condition_has_linear_runtime_leaves(&guard.test)
+                        && !expression_suspends_current_scope(&guard.test)
+                        && suite_terminates(&guard.body))
+            };
+            !manager.is_async
+                && manager.items.len() == 1
+                && manager.items.iter().all(|item| {
+                    !expression_contains_inline_branch(&item.context_expr)
+                        && !expression_suspends_current_scope(&item.context_expr)
+                })
+                && linear(&manager.body)
+                && leading.iter().any(terminal_guard)
+                && leading.iter().all(|statement| {
+                    terminal_guard(statement) || linear(std::slice::from_ref(statement))
+                })
+        }
+        _ => false,
+    }
 }
 
 // A direct tail nested handler leaves the containing suite's normal-exit join empty.

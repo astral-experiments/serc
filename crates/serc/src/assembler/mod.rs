@@ -2343,6 +2343,101 @@ impl Assembler {
                 }
             }
         }
+        // The first attribute test can follow a single converted POP_BLOCK. Its
+        // range labels do not start an array; deleting that cell leaves the
+        // appended marker in a protected condition slot. Defer the final owner
+        // to the normal replay, including its retained-NULL-array proof.
+        let single_pop_truth = match instructions.as_slice() {
+            [pop, load, attribute, convert, condition]
+                if truth
+                    && attribute.opcode == LOAD_ATTR
+                    && matches!(attribute.operand(), Operand::Value(argument) if argument & 1 == 0) =>
+            {
+                Some((*pop, *load, *convert, *condition, None))
+            }
+            [pop, load, method, call, convert, condition]
+                if truth
+                    && method.opcode == LOAD_ATTR
+                    && matches!(method.operand(), Operand::Value(argument) if argument & 1 != 0)
+                    && call.opcode == CALL
+                    && call.operand() == Operand::Value(0)
+                    && call.location == condition.location =>
+            {
+                Some((*pop, *load, *convert, *condition, Some(*method)))
+            }
+            _ => None,
+        };
+        if let Some((pop, load, convert, condition, method)) = single_pop_truth
+            && pop.opcode == NOP
+            && pop.operand() == Operand::Value(0)
+            && pop.location == SourceLocation::NONE
+            && pop.fusion_policy.is_converted_pop_block()
+            && pop.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
+            && load.opcode == LOAD_FAST
+            && matches!(load.operand(), Operand::Value(_))
+            && convert.opcode == TO_BOOL
+            && convert.operand() == Operand::Value(0)
+            && convert.location == condition.location
+            && condition.location.line >= 0
+            && matches!(condition.operand(), Operand::Forward(_))
+            && instructions[1..].iter().all(|record| {
+                record.location.line == condition.location.line
+                    && record.location.end_line == condition.location.end_line
+                    && record.location.column == condition.location.column
+                    && record.location.end_column <= condition.location.end_column
+                    && record.exception_policy() == ExceptionPolicy::default()
+                    && !record.fusion_policy.is_converted_pop_block()
+            })
+            && instructions.iter().all(|record| {
+                record.pre_fold_extra_instructions() == 0
+                    && record.local_policy.hidden_exception_owner_slots() == 0
+                    && record.no_location_policy.borrow_fallthrough()
+                        == BorrowFallthrough::Reachable
+            })
+            && instructions[..instructions.len() - 1]
+                .iter()
+                .all(|record| matches!(record.operand(), Operand::Value(_)))
+            && pop.depth_after().is_some()
+            && condition.depth_after() == pop.depth_after()
+            && load.depth_after() == pop.depth_after().map(|depth| depth + 1)
+            && convert.depth_after() == load.depth_after()
+            && method.is_none_or(|method| {
+                method.depth_after() == pop.depth_after().map(|depth| depth + 2)
+            })
+            && provenance
+                .original_primitive_condition_boundaries
+                .iter()
+                .filter(|original| **original == condition)
+                .count()
+                == 1
+            && prefix[prefix
+                .iter()
+                .rposition(|item| matches!(item, Item::Label(_)))
+                .map_or(0, |index| index + 1)..]
+                .iter()
+                .copied()
+                .eq(instructions[1..].iter().copied().map(Item::Instruction))
+            && matches!(items[..begin].iter().rev().find(|item| matches!(item, Item::Instruction(_))),
+                Some(Item::Instruction(previous))
+                    if ends_scope(previous.opcode)
+                        || (previous.opcode == crate::target::opcodes::END_ASYNC_FOR
+                            && matches!(previous.operand(), Operand::Backward(_))))
+        {
+            let incoming = items.iter().filter_map(|item| match item {
+                Item::Instruction(jump)
+                    if matches!(jump.operand(), Operand::Forward(target) | Operand::Backward(target)
+                        if labels.contains(&target)) => Some(*jump),
+                _ => None,
+            }).collect::<Vec<_>>();
+            if !incoming.is_empty()
+                && incoming.iter().all(|jump| {
+                    is_unconditional_jump(jump.opcode)
+                        && matches!(jump.operand(), Operand::Forward(target) if leading_labels.contains(&target))
+                })
+            {
+                return Some(true);
+            }
+        }
         let (plain, pop, owns_slot) = match instructions.as_slice() {
             [plain, pop, receiver, method, call, discard, load, condition]
                 if !truth
@@ -4275,14 +4370,14 @@ impl Assembler {
     pub(crate) fn record_original_match_success(
         &mut self,
         emitted: EmittedJump,
-        original_match_join: bool,
+        original_empty_join: bool,
     ) {
         let instruction = self.emitted_jump_mut(emitted, "recording an original match success");
         debug_assert_eq!(instruction.opcode, JUMP_FORWARD);
         instruction.jump_policy.mark_original_match_success();
-        if original_match_join {
-            // Only the immediately preceding match end supplies this certificate.
-            // Other case-tail joins retain their existing exit-copy policies.
+        if original_empty_join {
+            // Validate the compiler's join certificate against the original boundary
+            // and its emitted predecessors before allowing retained return-copy slots.
             self.record_original_empty_join(emitted);
         }
     }
