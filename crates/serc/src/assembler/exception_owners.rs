@@ -5503,17 +5503,36 @@ impl LayoutAssembler {
                                         previous.opcode,
                                         POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE
                                     ) && previous.local_policy.hidden_exception_owner_slots() == 3;
-                                // A constant-return unnamed handler can donate POP_EXCEPT
-                                // through its copied primitive truth test. Authenticate the
-                                // single finalizer POP and every live suffix record.
-                                let truth_test = missing == 0
+                                // Both handler forms retain an authenticated cleanup prefix.
+                                // A named handler also contributes two omitted NULL POPs;
+                                // its name cleanup remains four distinct live records.
+                                let handler_truth_prefix = (missing == 0
                                     && end - start == 1
                                     && indexed_instructions[start].opcode
                                         == crate::target::opcodes::POP_EXCEPT
                                     && indexed_instructions[start]
                                         .local_policy
                                         .hidden_exception_owner_slots()
-                                        == 2
+                                        == 2)
+                                    || (missing == 2
+                                        && end - start == 4
+                                        && end_removed == 1
+                                        && indexed_instructions[start].opcode
+                                            == crate::target::opcodes::POP_EXCEPT
+                                        && indexed_instructions[start]
+                                            .local_policy
+                                            .hidden_exception_owner_slots()
+                                            == 1
+                                        && indexed_instructions[start + 1].opcode == crate::target::opcodes::LOAD_CONST
+                                        && indexed_instructions[start + 2].opcode
+                                            == crate::target::opcodes::STORE_FAST
+                                        && indexed_instructions[start + 3].opcode
+                                            == crate::target::opcodes::DELETE_FAST
+                                        && indexed_instructions[start + 2].operand()
+                                            == indexed_instructions[start + 3].operand());
+                                // Authenticate the single finalizer POP and every live
+                                // suffix record after the captured handler cleanup.
+                                let truth_test = handler_truth_prefix
                                     && instruction_index - end == 3
                                     && matches!(
                                         indexed_instructions[end].opcode,
@@ -5547,8 +5566,31 @@ impl LayoutAssembler {
                                                     == super::ExceptionPolicy::NoneUnchanged
                                         },
                                     )
-                                    && ended_pop_slot
+                                    && (ended_pop_slot
                                         .is_some_and(|(pop, _, width)| pop == end && width == 1)
+                                        // The named cleanup's exact end label also records
+                                        // this POP when the generic owned-prefix epoch ends
+                                        // at POP_EXCEPT. Do not revive that broader epoch.
+                                        || (missing == 2
+                                            && end - start == 4
+                                            && end_removed == 1
+                                            && self.exception_owner_provenance
+                                                .copied_handler_cleanups.iter()
+                                                .filter(|origin| {
+                                                    origin.missing_null_pops == 2
+                                                        && origin.removed_prefix_slots == 1
+                                                        && origin.instructions.len() == 4
+                                                        && origin.assignment_pop.is_none()
+                                                        && origin.continued_call.is_none()
+                                                        && origin.continued_attribute_none.is_none()
+                                                        && label_positions.get(&origin.start) == Some(&start)
+                                                        && label_positions.get(&origin.end) == Some(&end)
+                                                        && self.exception_owner_provenance
+                                                            .removed_pop_block_boundaries.contains(&origin.end)
+                                                        && self.exception_owner_provenance
+                                                            .removed_pop_block_widths.get(&origin.end)
+                                                            .copied().unwrap_or(1) == 1
+                                                }).count() == 1))
                                     && self
                                         .exception_owner_provenance
                                         .original_primitive_condition_boundaries
@@ -5597,7 +5639,19 @@ impl LayoutAssembler {
                         // cleanup, not its preceding POP_EXCEPT. Its one transferred record
                         // must be the only hidden slot on the immediately following load.
                         if removed == suffix
-                            && instruction_index - end == 2
+                            && (instruction_index - end == 2
+                                || (missing == 2
+                                    && end - start == 4
+                                    && instruction_index - end == 3
+                                    && continued_call.is_none()
+                                    && continued_attribute_none.is_none()
+                                    && previous.is_some_and(|condition| {
+                                        matches!(
+                                            condition.opcode,
+                                            crate::target::opcodes::POP_JUMP_IF_FALSE
+                                                | crate::target::opcodes::POP_JUMP_IF_TRUE
+                                        )
+                                    })))
                             && matches!(
                                 indexed_instructions[end].opcode,
                                 crate::target::opcodes::LOAD_FAST
@@ -5608,13 +5662,21 @@ impl LayoutAssembler {
                                 .local_policy
                                 .hidden_exception_owner_slots()
                                 == 1
-                            && self
-                                .exception_owner_provenance
-                                .source_none_conditions
-                                .iter()
-                                .filter(|origin| Some(origin.instruction) == previous)
-                                .count()
-                                == 1
+                            && (if instruction_index - end == 2 {
+                                self.exception_owner_provenance
+                                    .source_none_conditions
+                                    .iter()
+                                    .filter(|origin| Some(origin.instruction) == previous)
+                                    .count()
+                                    == 1
+                            } else {
+                                self.exception_owner_provenance
+                                    .original_primitive_condition_boundaries
+                                    .iter()
+                                    .filter(|condition| Some(**condition) == previous)
+                                    .count()
+                                    == 1
+                            })
                             && self
                                 .exception_owner_provenance
                                 .removed_pop_block_boundaries

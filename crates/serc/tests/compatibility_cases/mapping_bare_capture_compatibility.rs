@@ -331,3 +331,83 @@ fn matches_cpython_high_local_mapping_capture_guards() {
         common::assert_matches_cpython_marshal(&source, &filename);
     }
 }
+
+#[test]
+fn matches_cpython_complete_capture_cleanup_rotations() {
+    for (filename, source) in [
+        (
+            "nested_star_capture_cleanup_target.py",
+            r#"def f(value):
+    match value:
+        case {"outer": {"inner": [*items]}}:
+            return items
+    return None
+"#,
+        ),
+        (
+            "nested_star_or_capture_cleanup_target.py",
+            r#"def f(value):
+    match value:
+        case {"outer": {"inner": [*items]}} | {"inner": [*items]}:
+            return items
+    return None
+"#,
+        ),
+        (
+            "class_wildcard_capture_cleanup_target.py",
+            r"def f(value):
+    match value:
+        case Event(at=_, message=message, exception=_, request_id=_, raw=_):
+            return message
+    return None
+",
+        ),
+        (
+            "multiline_mapping_three_capture_cleanup_target.py",
+            r#"def f(value):
+    match value:
+        case {
+            "first": first,
+            "second": second,
+            "flag": False,
+            "last": last,
+        } if isinstance(first, str):
+            return first, second, last
+    return None
+"#,
+        ),
+        (
+            "protected_nested_star_capture_owner_target.py",
+            r#"def f(value, finish):
+    try:
+        match value:
+            case {"outer": {"inner": [*items]}}:
+                if items is None:
+                    return None
+                return items
+        return None
+    finally:
+        finish()
+"#,
+        ),
+        (
+            "protected_multiline_capture_owner_target.py",
+            r#"def f(value, finish):
+    try:
+        match value:
+            case {
+                "first": first,
+                "second": second,
+                "flag": False,
+                "last": last,
+            } if first is not None:
+                return first, second, last
+        return None
+    finally:
+        finish()
+"#,
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

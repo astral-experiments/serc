@@ -2820,6 +2820,90 @@ impl OptimizationPipeline {
             .normal_try_copy_steps
             .is_empty()
             && !original_pop_ranges.is_empty();
+        // A nested condition can share its original case-success array with the
+        // body (or another condition). Copying the certified normal-try cleanup
+        // replaces that array's jump before conditional predecessors are visited.
+        // Retain the original shared-array classification across that exact copy.
+        let shared_match_cleanup_heads = order
+            .iter()
+            .copied()
+            .filter_map(|source| {
+                if !generic_original_arrays || predecessors[source.index()] <= 1 {
+                    return None;
+                }
+                let source_items = graph[source].items();
+                let (Item::Instruction(jump), head) = source_items.split_last()? else {
+                    return None;
+                };
+                if head.is_empty()
+                    || !head.iter().all(|item| matches!(item, Item::Label(_)))
+                    || jump.opcode != JUMP_FORWARD
+                    || jump.pre_fold_extra_instructions() != 0
+                    || jump.local_policy.hidden_exception_owner_slots() != 0
+                    || jump.no_location_policy.preserves_location()
+                    || jump.exception_policy() != ExceptionPolicy::default()
+                {
+                    return None;
+                }
+                let Operand::Forward(label) = jump.operand() else {
+                    return None;
+                };
+                if !self
+                    .exception_owner_provenance
+                    .original_match_join_boundaries
+                    .contains(&label)
+                {
+                    return None;
+                }
+                let target = graph.label_block(label)?;
+                let target_items = graph[target].items();
+                let [
+                    labels @ ..,
+                    Item::Label(start),
+                    Item::Instruction(pop),
+                    Item::Label(end),
+                    Item::Instruction(exit),
+                ] = target_items
+                else {
+                    return None;
+                };
+                if !labels.iter().all(|item| matches!(item, Item::Label(_)))
+                    || !labels.contains(&Item::Label(label))
+                    || !original_pop_ranges.contains(&(*start, *end))
+                    || [start, end].into_iter().any(|label| {
+                        self.exception_owner_provenance
+                            .retired_normal_try_copy_labels
+                            .contains(label)
+                            || self
+                                .exception_owner_provenance
+                                .normal_try_copy_inline_labels
+                                .contains(label)
+                    })
+                    || pop.opcode != NOP
+                    || pop.operand() != Operand::Value(0)
+                    || !pop.fusion_policy.is_converted_pop_block()
+                    || exit.opcode != JUMP_FORWARD
+                    || !matches!(exit.operand(), Operand::Forward(_))
+                    || !exit.only_allows_unconditional_inlining()
+                    || !exit.no_location_policy.allows_block_inlining()
+                    || exit.jump_policy.allows_threading_target()
+                    || jump.depth_after() != pop.depth_after()
+                    || pop.depth_after() != exit.depth_after()
+                    || [pop, exit].iter().any(|instruction| {
+                        instruction.location != SourceLocation::NONE
+                            || instruction.pre_fold_extra_instructions() != 0
+                            || instruction.local_policy.hidden_exception_owner_slots() != 0
+                    })
+                {
+                    return None;
+                }
+                Some((
+                    source,
+                    (target, source_items.to_vec(), target_items.to_vec()),
+                ))
+            })
+            .collect::<FxHashMap<_, _>>();
+        let mut shared_match_cleanup_copies = FxHashMap::<BasicBlockId, Vec<Item>>::default();
         let mut drop_blocks = vec![false; positions.len()];
         let mut remaining_predecessors = predecessors.clone();
         let mut jump_sources = vec![Vec::<BasicBlockId>::new(); positions.len()];
@@ -2922,6 +3006,18 @@ impl OptimizationPipeline {
             let source_position = positions[source.index()];
             let target_position = positions[target.index()];
             let source_has_fallthrough = block_has_fallthrough(graph[source].items());
+            let preserves_shared_match_exit = shared_match_cleanup_heads.get(&source).is_some_and(
+                |(original_target, source_items, target_items)| {
+                    *original_target == target
+                        && graph[source].items() == source_items
+                        && graph[target].items() == target_items
+                },
+            );
+            let copy_shared_match_exit = source_has_fallthrough
+                && remaining_predecessors[target.index()] > 1
+                && shared_match_cleanup_copies
+                    .get(&target)
+                    .is_some_and(|items| graph[target].items() == items);
             let mut target_chain_end = target_position;
             while target_chain_end + 1 < order.len()
                 && block_has_fallthrough(graph[order[target_chain_end]].items())
@@ -3058,6 +3154,7 @@ impl OptimizationPipeline {
                 continue;
             }
             if source_has_fallthrough
+                && !copy_shared_match_exit
                 && !target_has_copied_jump_eval_check
                 && graph[target_exit]
                     .last_instruction()
@@ -3848,6 +3945,7 @@ impl OptimizationPipeline {
                         .copy_inherits_shared_predecessor();
                     (target_has_no_location
                         || target_has_artificial_eval_break
+                        || copy_shared_match_exit
                         || (inline_small_exit && instruction.location.line < 0)
                         || copy_conditional_split_return)
                         && (!inline_no_location_block
@@ -3937,6 +4035,16 @@ impl OptimizationPipeline {
                             }
                         }
                         Item::Label(_) => {}
+                    }
+                }
+            }
+            if copy_shared_match_exit {
+                // This exact array contains only the former case jump's NOP and
+                // its certified POP_BLOCK/JUMP copy. Its earlier donor belongs to
+                // another predecessor; every copied slot inherits this condition.
+                for item in &mut copied {
+                    if let Item::Instruction(instruction) = item {
+                        instruction.location = source_location;
                     }
                 }
             }
@@ -4368,6 +4476,13 @@ impl OptimizationPipeline {
                 let copied_jump_target =
                     block_jump_target(&copied).and_then(|label| graph.label_block(label));
                 graph.append_to_block(source, copied);
+                if preserves_shared_match_exit && generic_original_copy {
+                    // Recheck the complete expanded array for each conditional copy;
+                    // another inlining, retarget or label edit retires this admission.
+                    shared_match_cleanup_copies.insert(source, graph[source].items().to_vec());
+                    exit_without_unique_predecessor[source.index()] =
+                        remaining_predecessors[source.index()] > 1;
+                }
                 // Deferred copies receive this classification before conditional duplication.
                 // Keep it when a reraising exit is appended during the fixed-point scan.
                 if inline_unprotected_return
@@ -4755,6 +4870,44 @@ impl OptimizationPipeline {
                 )
             {
                 continue;
+            }
+            if remaining_predecessors[target.index()] == 1
+                && shared_match_cleanup_copies
+                    .get(&target)
+                    .is_some_and(|items| {
+                        graph[target].items() == items
+                            && items.iter().all(|item| {
+                                !matches!(item,
+                            Item::Instruction(instruction)
+                                if instruction.no_location_policy.preserves_location())
+                            })
+                    })
+            {
+                let mut live_sources =
+                    jump_sources[target.index()]
+                        .iter()
+                        .copied()
+                        .filter(|source| {
+                            !drop_blocks[source.index()]
+                                && block_jump_target(graph[*source].items())
+                                    .and_then(|label| graph.label_block(label))
+                                    == Some(target)
+                        });
+                if let Some(source) = live_sources.next()
+                    && live_sources.next().is_none()
+                    && let Some(instruction) = graph[source].last_instruction()
+                    && is_conditional_jump(instruction.opcode)
+                    && instruction.location.line >= 0
+                {
+                    // Other conditions received copies. The exact surviving original
+                    // array now belongs to this sole condition, including its inlined
+                    // POP_BLOCK and jump whose previous donor came from another edge.
+                    let location = instruction.location;
+                    for instruction in graph.instructions_mut(target) {
+                        instruction.location = location;
+                    }
+                    continue;
+                }
             }
             if remaining_predecessors[target.index()] == 1
                 && let Some(Item::Instruction(first)) = graph[target]

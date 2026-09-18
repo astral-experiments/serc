@@ -61,3 +61,93 @@ class TaskSuggestionsTurnCompleterRuntime:
 "#;
     assert_matches_cpython_marshal(source, "finally_truth_after_async_manager.py");
 }
+
+#[test]
+fn matches_cpython_copied_handler_cell_truth_finally_owner() {
+    for (filename, source) in [
+        (
+            "coroutine_named_handler_cell_truth_finally_owner.py",
+            r"async def f(manager, work, reply, release):
+    with manager:
+        owned = True
+        def read_owned():
+            return owned
+        try:
+            try:
+                await work()
+            except ValueError as error:
+                await reply(error)
+                return
+        finally:
+            if owned:
+                release()
+",
+        ),
+        (
+            "coroutine_unnamed_handler_cell_truth_finally_control.py",
+            r"async def f(manager, work, reply, release):
+    with manager:
+        owned = True
+        def read_owned():
+            return owned
+        try:
+            try:
+                await work()
+            except ValueError:
+                await reply(None)
+                return
+        finally:
+            if owned:
+                release()
+",
+        ),
+    ] {
+        assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn matches_cpython_terminal_while_normal_finally_truth_owner() {
+    for (filename, source) in [
+        (
+            "coroutine_terminal_while_normal_finally_truth_owner.py",
+            r"async def f(manager, chunks, pending, work, cleanup):
+    try:
+        with manager:
+            for chunk in chunks:
+                try:
+                    if not pending:
+                        continue
+                    while pending:
+                        await work()
+                        pending = False
+                finally:
+                    if chunk:
+                        await cleanup(chunk)
+    finally:
+        cleanup(None)
+",
+        ),
+        (
+            "coroutine_terminal_while_break_normal_finally_truth_control.py",
+            r"async def f(manager, chunks, pending, work, cleanup):
+    try:
+        with manager:
+            for chunk in chunks:
+                try:
+                    if not pending:
+                        continue
+                    while pending:
+                        await work()
+                        break
+                finally:
+                    if chunk:
+                        await cleanup(chunk)
+    finally:
+        cleanup(None)
+",
+        ),
+    ] {
+        assert_matches_cpython_marshal(source, filename);
+    }
+}

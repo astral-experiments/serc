@@ -466,6 +466,7 @@ impl Compiler<'_> {
         let matched_cases = statement.cases.len() - usize::from(has_default);
         let mut failure_reaches_end = false;
         let mut specialized_none_seen = false;
+        let mut or_default_success_exit = None;
 
         for (index, case) in statement.cases[..matched_cases].iter().enumerate() {
             let copied_subject = index + 1 != matched_cases;
@@ -820,6 +821,28 @@ impl Compiler<'_> {
                                 );
                             }
                         }
+                        if self.context.target_specific_rules_enabled()
+                            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                                == 0
+                            && has_default
+                            && index + 1 == matched_cases
+                            && case.guard.is_none()
+                            && matches!(case.pattern, Pattern::MatchOr(_))
+                            && context.fail_pop.len() == 1
+                            && !context.empty_failure_jumps.is_empty()
+                        {
+                            or_default_success_exit = Some(self.assembler.instruction_count() - 1);
+                        }
+                        if self.context.target_specific_rules_enabled()
+                            && matches!(case.body.last(), Some(Stmt::For(tail))
+                                if !tail.is_async && tail.orelse.is_empty())
+                        {
+                            // The loop's end is a separate original array after iterator
+                            // cleanup. Removing its sole case-success jump leaves that
+                            // array empty, so borrowing cannot visit the match continuation.
+                            self.assembler
+                                .mark_borrow_empty_block_if_unretained(success_exit);
+                        }
                     }
                 }
             } else {
@@ -869,6 +892,7 @@ impl Compiler<'_> {
 
         if has_default {
             let case = statement.cases.last().unwrap();
+            let default_start = self.assembler.instruction_count();
             self.assembler
                 .set_location(self.source_location(case.pattern.range()));
             self.emit(NOP, 0, 0)?;
@@ -899,6 +923,25 @@ impl Compiler<'_> {
                     self.compile_suite(&case.body)?;
                     false
                 };
+            if let Some(success_offset) = or_default_success_exit
+                && case.guard.is_none()
+                && matches!(case.body.as_slice(), [Stmt::Return(return_)]
+                    if return_.value.as_deref().is_none_or(|value| matches!(value, Expr::NoneLiteral(_))))
+                && self
+                    .assembler
+                    .pre_fusion_instruction_count_since(default_start)
+                    <= 4
+                && self
+                    .assembler
+                    .instruction_opcode_at(self.assembler.instruction_count() - 1)
+                    == Some(RETURN_VALUE)
+            {
+                // The OR's zero-pop failure jump copies this small fallback before
+                // the successful body. Its original array then becomes empty and
+                // stops borrowing when the case-success jump is removed across it.
+                self.assembler
+                    .mark_borrow_empty_block_if_unretained_at(success_offset);
+            }
             if !terminal
                 && self.assembler.instruction_count() == body_start
                 && let [Stmt::Pass(pass)] = case.body.as_slice()
@@ -7387,16 +7430,19 @@ impl Compiler<'_> {
                 .conditions
                 .exclude_condition_not_taken_from_exception
             && !self.control.withs.force_terminal_with_marker_ownerless
-            && self
-                .assembler
-                .current_normal_finally_call_none_has_owned_slot()
+            && let Some(owns_slot) = self.assembler.current_normal_finally_condition_slot_owner()
         {
             // The loop exit's excluded NOP does not split the original array.
+            // Its exact prefix distinguishes a reused call slot from a fresh truth marker.
             return self.emit_with_exception_policy(
                 NOT_TAKEN,
                 0,
                 0,
-                policy.ordinary.defer_condition_owner(),
+                if owns_slot {
+                    policy.ordinary.defer_condition_owner()
+                } else {
+                    ExceptionPolicy::NoneAbsent
+                },
             );
         }
         if (self.control.conditions.allow_compacted_condition_owner

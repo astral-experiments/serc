@@ -81,3 +81,64 @@ fn matches_cpython_match_without_try_control() {
 ";
     common::assert_matches_cpython_marshal(source, "match_without_try_control.py");
 }
+
+#[test]
+fn matches_cpython_final_value_match_conditional_success() {
+    let source = r"async def f(value, work, finish):
+    await work(value)
+    try:
+        match value:
+            case Kind.FIRST:
+                if value.enabled:
+                    left, right = work(value)
+                else:
+                    left, right = work(value)
+            case Kind.LAST:
+                left, right = work(value)
+    except ValueError as error:
+        raise RuntimeError(value) from error
+    return finish(left, right, value)
+";
+    common::assert_matches_cpython_marshal(source, "final_value_match_conditional_success.py");
+}
+
+#[test]
+fn matches_cpython_final_value_match_nested_conditional_success() {
+    let source = r"async def f(value, work, finish):
+    await work(value)
+    try:
+        match value:
+            case Kind.FIRST:
+                if value.enabled:
+                    left, right = work(value)
+                else:
+                    if value.ready:
+                        left, right = work(value)
+            case Kind.LAST:
+                left, right = work(value)
+    except ValueError as error:
+        raise RuntimeError(value) from error
+    return finish(left, right, value)
+";
+    common::assert_matches_cpython_marshal(
+        source,
+        "final_value_match_nested_conditional_success.py",
+    );
+}
+
+#[test]
+fn matches_cpython_final_value_match_try_exit() {
+    let source = r"async def f(value, work, finish):
+    await work(value)
+    try:
+        match value:
+            case Kind.FIRST:
+                left, right = work(value)
+            case Kind.LAST:
+                left, right = work(value)
+    except ValueError as error:
+        raise RuntimeError(value) from error
+    return finish(left, right, value)
+";
+    common::assert_matches_cpython_marshal(source, "final_value_match_try_exit.py");
+}

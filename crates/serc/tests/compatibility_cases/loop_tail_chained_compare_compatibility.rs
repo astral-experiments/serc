@@ -99,3 +99,51 @@ finish(out)
         "module_final_elif_chained_compare.py",
     );
 }
+
+#[test]
+fn matches_cpython_marshal_for_final_elif_or_chains() {
+    for (filename, source) in [
+        (
+            "final_elif_or_two_chains_loop_target.py",
+            r#"def count(items, counts):
+    for value in items:
+        if value is None:
+            counts["missing"] += 1
+        elif 0 <= value < 10 or 20 <= value < 30:
+            counts["range"] += 1
+    return counts
+"#,
+        ),
+        (
+            "final_elif_or_attribute_chain_loop_target.py",
+            r"def collect(items, bounds, output):
+    count = 0
+    for value in items:
+        if value == bounds.stop:
+            count += 1
+        elif count == 0:
+            if value == bounds.special or bounds.low <= value <= bounds.high:
+                output.append(value)
+            elif value < bounds.limit:
+                output.append(value)
+        elif value == bounds.special or bounds.low <= value <= bounds.high:
+            output.append(value)
+    return count, output
+",
+        ),
+        (
+            "final_elif_or_negated_chain_loop_target.py",
+            r"def validate(items, upper, warnings):
+    for field, value in items:
+        if value is None:
+            if field not in warnings:
+                warnings.append(field)
+        elif not finite(value) or not 0.0 <= value <= upper:
+            warnings.append(field)
+    return warnings
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

@@ -871,13 +871,41 @@ impl OptimizationPipeline {
                 if !labels.contains(&label) {
                     continue;
                 }
+                // A case ending in a conditional emits its success edge in the
+                // original empty join. Its retained NOP is a later threading
+                // decision, not an unknown predecessor of this POP_BLOCK array.
+                // The match-success bit is retired on retargeting; replay only
+                // that unchanged edge and its exact authored match-end label.
+                let original_match_success_head = instruction.opcode == JUMP_FORWARD
+                    && instruction.jump_policy.is_original_match_success()
+                    && instruction.jump_policy.preserves_nop_after_threading()
+                    && instruction.jump_policy.defers_redundant_removal()
+                    && instruction.no_location_policy.is_artificial_eval_break()
+                    && !instruction.no_location_policy.preserves_location()
+                    && instruction.pre_fold_extra_instructions() == 0
+                    && instruction.local_policy.hidden_exception_owner_slots() == 0
+                    && self
+                        .exception_owner_provenance
+                        .original_match_join_boundaries
+                        .contains(&label)
+                    && self.graph[source_block].items().split_last().is_some_and(
+                        |(last, head)| {
+                            matches!(last, Item::Instruction(last) if last == instruction)
+                                && head.iter().all(|item| matches!(item, Item::Label(_)))
+                                && head.iter().any(|item| matches!(item, Item::Label(label)
+                                    if self.exception_owner_provenance.block_boundaries.contains(label)
+                                        && !self.borrow_block_aliases.contains(label)))
+                        },
+                    );
                 if !matches!(instruction.operand(), Operand::Forward(_))
-                    || instruction.jump_policy.preserves_nop_after_threading()
+                    || (instruction.jump_policy.preserves_nop_after_threading()
+                        && !original_match_success_head)
                     || instruction.jump_policy.borrow_empty_block()
                     || instruction.jump_policy.always_retains_nop()
                     // An original unlocated eval-breaker head still needs separate
                     // predecessor copies. A preceding real instruction supplies its own line.
                     || (instruction.no_location_policy.is_artificial_eval_break()
+                        && !original_match_success_head
                         && self.graph[source_block].items().split_last().is_some_and(|(_, head)| {
                             !head.iter().any(|item| matches!(item,
                                 Item::Instruction(instruction)

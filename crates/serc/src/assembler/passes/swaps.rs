@@ -1,8 +1,8 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::super::{
-    Instruction, Item, NOP, NOT_TAKEN, Operand, POP_TOP, STORE_FAST, SWAP, UNPACK_SEQUENCE,
-    ends_scope, single_capture_cleanup_vacancies, unpacked_capture_cleanup,
+    Instruction, Item, NOP, NOT_TAKEN, Operand, POP_TOP, STORE_FAST, SWAP, UNPACK_EX,
+    UNPACK_SEQUENCE, capture_cleanup_rotation, ends_scope, single_capture_cleanup_vacancies,
 };
 use crate::assembler::OptimizationPipeline;
 use crate::assembler::block_graph::{BlockGraph, ItemPosition};
@@ -105,8 +105,9 @@ impl OptimizationPipeline {
             }
             if !block.iter().any(|position| {
                 matches!(graph.item(*position), Item::Instruction(instruction)
-                    if instruction.opcode == UNPACK_SEQUENCE
+                    if (instruction.opcode == UNPACK_SEQUENCE
                         && matches!(instruction.operand(), Operand::Value(0 | 1)))
+                        || matches!(instruction.opcode, UNPACK_EX | POP_TOP | NOT_TAKEN))
             }) {
                 continue;
             }
@@ -115,7 +116,7 @@ impl OptimizationPipeline {
                 .map(|position| *graph.item(*position))
                 .collect::<Vec<_>>();
             for index in 0..items.len() {
-                if let Some(rotation) = unpacked_capture_cleanup(&items[index..]) {
+                if let Some(rotation) = capture_cleanup_rotation(&items[index..]) {
                     capture_cleanup_swaps.extend(
                         block[index + 1..index + 1 + rotation.swap_count]
                             .iter()

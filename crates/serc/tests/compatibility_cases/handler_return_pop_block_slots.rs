@@ -514,3 +514,45 @@ fn matches_cpython_async_iterator_return_finally_truth_slots() {
         assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_value_return_in_outer_loop_finally() {
+    for (filename, source) in [
+        (
+            "value_return_outer_while_try_finally_none.py",
+            r"async def f(items, ready, value, resource):
+    while ready:
+        try:
+            if value:
+                raise ValueError
+            result = make_result(value=value)
+            ready = not value
+            return result
+        except Exception:
+            raise
+        finally:
+            if resource is not None:
+                await cleanup(resource)
+",
+        ),
+        (
+            "value_return_outer_for_try_finally_none_control.py",
+            r"async def f(items, ready, value, resource):
+    for item in items:
+        try:
+            if value:
+                raise ValueError
+            result = make_result(value=value)
+            ready = not value
+            return result
+        except Exception:
+            raise
+        finally:
+            if resource is not None:
+                await cleanup(resource)
+",
+        ),
+    ] {
+        assert_matches_cpython_marshal(source, filename);
+    }
+}

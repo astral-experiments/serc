@@ -544,3 +544,107 @@ fn matches_cpython_borrows_after_guarded_recovery_finally_joins() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_borrows_after_conditional_finalizer_call_suffixes() {
+    for (source, filename) in [
+        (
+            r#"def finish(work, worker, resource, connect, endpoint, report):
+    value = None
+    try:
+        value = work(endpoint)
+    finally:
+        if worker.is_alive():
+            try:
+                with connect(endpoint, timeout=1):
+                    pass
+            except OSError:
+                pass
+        worker.join(timeout=5)
+        resource.close()
+    if worker.is_alive():
+        raise RuntimeError("worker active")
+    if value is None:
+        raise RuntimeError("missing result")
+    report(value, endpoint)
+    return value
+"#,
+            "finally_guarded_manager_call_suffix_target.py",
+        ),
+        (
+            r#"def finish(work, worker, resource, connect, endpoint, report):
+    value = None
+    try:
+        value = work(endpoint)
+    finally:
+        worker.join(timeout=5)
+        resource.close()
+    if worker.is_alive():
+        raise RuntimeError("worker active")
+    if value is None:
+        raise RuntimeError("missing result")
+    report(value, endpoint)
+    return value
+"#,
+            "finally_guarded_manager_call_suffix_linear_control.py",
+        ),
+        (
+            r#"def finish(work, worker, pending, token, report, full_error):
+    problem = None
+    try:
+        with work() as jobs:
+            for job in jobs:
+                try:
+                    job.run()
+                except BaseException as error:
+                    problem = error
+                    job.stop()
+                    break
+            if problem is not None:
+                for job in jobs:
+                    job.cancel()
+    finally:
+        if worker.is_alive():
+            while True:
+                try:
+                    pending.put(token, timeout=0.5)
+                    break
+                except full_error:
+                    if not worker.is_alive():
+                        break
+        worker.join()
+    if problem is not None:
+        raise RuntimeError("work failed") from problem
+    report(token)
+    return token
+"#,
+            "finally_conditional_retry_call_suffix_target.py",
+        ),
+        (
+            r#"def finish(work, worker, pending, token, report, full_error):
+    problem = None
+    try:
+        with work() as jobs:
+            for job in jobs:
+                try:
+                    job.run()
+                except BaseException as error:
+                    problem = error
+                    job.stop()
+                    break
+            if problem is not None:
+                for job in jobs:
+                    job.cancel()
+    finally:
+        worker.join()
+    if problem is not None:
+        raise RuntimeError("work failed") from problem
+    report(token)
+    return token
+"#,
+            "finally_conditional_retry_call_suffix_linear_control.py",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

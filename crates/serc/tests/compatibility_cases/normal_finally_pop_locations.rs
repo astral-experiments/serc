@@ -328,3 +328,28 @@ fn preserves_conditional_finally_tail_boundaries() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn preserves_absent_location_after_generator_else_loop_break() {
+    let source = r"def f(value, work, ready, cleanup):
+    def finish():
+        cleanup(value)
+    try:
+        work()
+        yield value
+    except BaseException:
+        work()
+        raise
+    else:
+        work()
+        while True:
+            work()
+            if ready():
+                work()
+                break
+            work()
+    finally:
+        finish()
+";
+    common::assert_matches_cpython_marshal(source, "generator_else_while_break_local_finally.py");
+}
