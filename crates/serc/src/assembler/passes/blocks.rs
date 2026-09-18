@@ -1156,6 +1156,47 @@ fn comprehension_assignment_exit_location(
     static_swap_tail_location(tail, *instructions)
 }
 
+/// Predicts the surviving donor of a reversed store pair at the end of an array.
+fn fused_store_tail_location(source: &[Item]) -> Option<SourceLocation> {
+    let [.., Item::Instruction(first), Item::Instruction(second)] = source else {
+        return None;
+    };
+    if first.opcode != STORE_FAST || second.opcode != STORE_FAST {
+        return None;
+    }
+    let fused = super::locals::fuse_pair(first, second)?;
+    if fused.location.line < 0 || fused.location.column <= second.location.column {
+        return None;
+    }
+    let start = source
+        .iter()
+        .rposition(|item| !matches!(item, Item::Instruction(instruction) if instruction.opcode == STORE_FAST))
+        .map_or(0, |offset| offset + 1);
+    let stores = &source[start..];
+    if stores
+        .iter()
+        .any(|item| matches!(item, Item::Instruction(instruction) if instruction.location.line < 0))
+    {
+        return None;
+    }
+    // No preceding non-store can fuse with this run. Its resolved locations also
+    // cannot change through the fuser's forward-location donation. Walk the same
+    // non-overlapping pairs: an odd run can leave the final store unfused.
+    let tail = stores.len() - 2;
+    let mut offset = 0;
+    while offset < tail {
+        offset += match (&stores[offset], &stores[offset + 1]) {
+            (Item::Instruction(first), Item::Instruction(second))
+                if super::locals::fuse_pair(first, second).is_some() =>
+            {
+                2
+            }
+            _ => 1,
+        };
+    }
+    (offset == tail).then_some(fused.location)
+}
+
 /// Carries a named-handler cleanup's line across its exception-end split.
 fn named_handler_cleanup_exit_location(source: &[Item], target: &[Item]) -> Option<SourceLocation> {
     let source_entry_len = source
@@ -4724,6 +4765,17 @@ impl OptimizationPipeline {
                             }
                             _ => None,
                         });
+                }
+                if remaining_predecessors[target.index()] == 1
+                    && predecessors[target.index()] > 1
+                    && !planned_blocks.contains(&target)
+                    && positions[source.index()] + 1 == target_position
+                    && block_has_fallthrough(graph[source].items())
+                    && let Some(location) = fused_store_tail_location(graph[source].items())
+                {
+                    // Native resolves the surviving original exit after local fusion.
+                    // A reversed store pair contributes its surviving first location.
+                    return Some(location);
                 }
                 graph[source]
                     .last_instruction()

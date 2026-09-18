@@ -12258,6 +12258,49 @@ impl Compiler<'_> {
                 {
                     self.assembler.allow_borrow_surviving_break_entry(end);
                 }
+                // A guarded finalizer inside one outer async manager has a populated
+                // normal entry. Keep the loop barrier, but let surviving authored breaks
+                // reach that entry; empty finalizers and removed breaks stay disconnected.
+                if self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR) != 0
+                    && !self.control.statements.current_statement_has_following
+                    && self.control.loops.contexts.is_empty()
+                    && self.control.exceptions.active_exception_handlers.is_empty()
+                    && self.control.exceptions.active_exception_group_handlers == 0
+                    && self.control.finally.active_normal_finally_bodies == 0
+                    && self.control.finally.active_finally_end_blocks == 0
+                    && self.control.finally.active_copied_finally_bodies == 0
+                    && self.control.withs.active_with_region_exclusions.len() == 1
+                    && self.control.finally.innermost_finally_exception_exclusion_depth
+                        == Some(self.control.exceptions.active_exception_region_exclusions.len())
+                    && matches!(self.control.withs.active_with_exits.as_slice(), [manager]
+                        if manager.is_async
+                            && manager.loop_depth == 0
+                            && manager.exception_region_depth + 1
+                                == self.control.exceptions.active_exception_region_exclusions.len())
+                    && self.control.finally.active_return_finally_contexts.last().is_some_and(|context| {
+                        context.loop_depth == 0
+                            && context.with_depth == 1
+                            && context.handler_depth == 0
+                            && context.exception_region_depth + 1
+                                == self.control.exceptions.active_exception_region_exclusions.len()
+                            && !suite_contains_yield(&context.body)
+                            && context.body.split_first().is_some_and(|(entry, tail)| {
+                                matches!(entry, Stmt::If(cleanup)
+                                    if condition_has_linear_runtime_leaves(&cleanup.test)
+                                        && !expression_suspends_current_scope(&cleanup.test)
+                                        && cleanup.elif_else_clauses.is_empty()
+                                        && (suite_has_linear_borrow_fallthrough(&cleanup.body)
+                                            || matches!(cleanup.body.as_slice(), [Stmt::If(nested)]
+                                                if condition_has_linear_runtime_leaves(&nested.test)
+                                                    && !expression_suspends_current_scope(&nested.test)
+                                                    && nested.elif_else_clauses.is_empty()
+                                                    && suite_has_linear_borrow_fallthrough(&nested.body)))
+                                        && (tail.is_empty() || suite_has_linear_borrow_fallthrough(tail)))
+                            })
+                    })
+                {
+                    self.assembler.allow_borrow_surviving_break_entry(end);
+                }
                 // Manager exit calls retain a nonempty original target for any
                 // break jump that survives, even when the terminal break is removed.
                 // A finally body can erase another continuation after this cleanup;
@@ -16117,6 +16160,58 @@ impl Compiler<'_> {
                         .active_pass_finally_locations
                         .is_empty()
                     && self.control.finally.active_overriding_finally_returns == 0;
+                // An unnamed return nested directly inside two named handlers exposes
+                // the nearer handler's name cleanup. Saved depths exclude another scope
+                // between these collectors; only the innermost POP_EXCEPT needs ownership.
+                let returns_through_two_named_handlers = self
+                    .context
+                    .target_specific_rules_enabled()
+                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                    && handler_name.is_none()
+                    && matches!(handler.body.as_slice(), [Stmt::Return(statement)]
+                            if matches!(statement.value.as_deref(), Some(Expr::Tuple(_))))
+                    && self.control.exceptions.active_exception_group_handlers == 0
+                    && self.control.exceptions.active_try_marker_slots.is_empty()
+                    && self.control.withs.active_with_exits.is_empty()
+                    && self.control.loops.contexts.is_empty()
+                    && self
+                        .control
+                        .finally
+                        .active_return_finally_contexts
+                        .is_empty()
+                    && self.control.finally.active_loop_finally_contexts.is_empty()
+                    && self
+                        .control
+                        .finally
+                        .active_pass_finally_locations
+                        .is_empty()
+                    && self
+                        .control
+                        .finally
+                        .preserved_return_value_contexts
+                        .is_empty()
+                    && self.control.finally.copied_return_finally_preserved_values == 0
+                    && self.control.finally.active_finally_try_bodies == 0
+                    && self.control.finally.active_normal_finally_bodies == 0
+                    && self.control.finally.active_copied_finally_bodies == 0
+                    && self.control.finally.active_finally_end_blocks == 0
+                    && self.control.finally.active_overriding_finally_returns == 0
+                    && matches!(
+                        self.control.exceptions.active_exception_handlers.as_slice(),
+                        [outer, middle]
+                            if outer.name.is_some()
+                                && middle.name.is_some()
+                                && outer.try_body_depth == 0
+                                && middle.try_body_depth == 0
+                                && outer.exception_region_depth == 0
+                                && middle.exception_region_depth == 1
+                                && outer.with_depth == 0
+                                && middle.with_depth == 0
+                                && outer.loop_depth == 0
+                                && middle.loop_depth == 0
+                                && outer.finally_end_depth == 0
+                                && middle.finally_end_depth == 0
+                    );
                 let context = ExceptionHandlerContext {
                     name: handler_name,
                     first: handler_index == 0,
@@ -16135,6 +16230,7 @@ impl Compiler<'_> {
                     ownerless_optimized_boolean_generator_test:
                         handler_ownerless_optimized_boolean_generator_test(&handler.body),
                     protect_outer_return_pop: nested_handler_tail_if_with_terminal_handlers
+                        || returns_through_two_named_handlers
                         || (handler_name.is_none() && direct_outer_handler)
                         || (handler_name.is_none()
                             && (suite_terminates(&statement.body)

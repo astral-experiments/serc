@@ -4014,6 +4014,42 @@ impl LayoutAssembler {
                             );
                         }
                     }
+                    // A retained SETUP may follow an owned source record and one erased
+                    // outer POP. An exact append slot can still belong to that earlier
+                    // handler, even though it falls before the new protected suffix.
+                    if instruction.opcode == NOT_TAKEN
+                        && instruction.exception_policy() == super::ExceptionPolicy::NonePresent
+                        && owner_history_exact
+                        && tail.insertions == 0
+                        && tail.late_removals == 0
+                        && tail.post_compaction_fusions == 0
+                        && let Some((start, setup_tail, setup)) = protected_suffix
+                        && setup_tail.insertions == 0
+                        && setup_tail.late_removals == 0
+                        && setup_tail.post_compaction_fusions == 0
+                        && tail.early_removals.checked_sub(setup_tail.early_removals) == Some(3)
+                        && let Some(region) = self.retained_setup_predecessor_owner(
+                            instruction_index,
+                            original_array_start,
+                            start,
+                            setup,
+                            setup_tail.early_removals,
+                            &indexed_instructions,
+                            &label_positions,
+                            &jump_targets,
+                            &owners,
+                        )
+                    {
+                        owners.insert(
+                            instruction_index,
+                            ExceptionOwnerDecision {
+                                has_owner: true,
+                                source_region: Some(region),
+                                definitive: true,
+                                override_existing: true,
+                            },
+                        );
+                    }
                     // A retained SETUP can follow removals owned by an outer handler. Only
                     // certify a reused inner owner when the last compaction lands entirely
                     // within a known, uniformly owned suffix; other outcomes remain unknown.
@@ -5914,6 +5950,157 @@ impl LayoutAssembler {
             }
         });
         exact && seen_send && seen_bridge == origin.bridge.is_some()
+    }
+
+    /// Recovers the owned record immediately before an authenticated POP/SETUP pair.
+    fn retained_setup_predecessor_owner(
+        &self,
+        marker: usize,
+        array_start: usize,
+        setup_start: usize,
+        setup: Label,
+        setup_removed: usize,
+        instructions: &[&Instruction],
+        positions: &FxHashMap<Label, usize>,
+        jump_targets: &FxHashSet<Label>,
+        owners: &FxHashMap<usize, ExceptionOwnerDecision>,
+    ) -> Option<usize> {
+        use crate::target::opcodes::{LOAD_DEREF, LOAD_FAST, LOAD_FAST_BORROW};
+
+        let nop_index = setup_start.checked_sub(1)?;
+        let donor_index = nop_index.checked_sub(1)?;
+        // The sole transferred POP precedes the retained SETUP. Neither it nor
+        // the three folded None-comparison records can donate this old slot.
+        if array_start > donor_index
+            || setup_start.checked_add(2) != Some(marker)
+            || donor_index.checked_add(setup_removed.checked_sub(1)?) != Some(marker)
+        {
+            return None;
+        }
+        let donor = *instructions.get(donor_index)?;
+        let nop = *instructions.get(nop_index)?;
+        let load = *instructions.get(setup_start)?;
+        let condition = *instructions.get(marker.checked_sub(1)?)?;
+        if !matches!(donor.opcode, LOAD_FAST | LOAD_FAST_BORROW | POP_TOP)
+            || donor.exception_policy() != super::ExceptionPolicy::NoneUnchanged
+            || owners.contains_key(&donor_index)
+            || donor.local_policy.hidden_exception_owner_slots() != 0
+            || nop.opcode != NOP
+            || nop.operand() != Operand::Value(0)
+            || nop.fusion_policy.is_converted_pop_block()
+            || nop.exception_policy() != super::ExceptionPolicy::EXCLUDE_ALWAYS
+            || nop.local_policy.hidden_exception_owner_slots() != 1
+            || !matches!(load.opcode, LOAD_FAST | LOAD_FAST_BORROW | LOAD_DEREF)
+            || load.exception_policy() != super::ExceptionPolicy::NoneUnchanged
+            || load.local_policy.hidden_exception_owner_slots() != 0
+            || !matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+            || !matches!(condition.operand(), Operand::Forward(_))
+            || condition.exception_policy() != super::ExceptionPolicy::NoneUnchanged
+            || condition.local_policy.hidden_exception_owner_slots() != 3
+            || [donor, nop, load, condition].iter().any(|instruction| {
+                instruction.pre_fold_extra_instructions() != 0
+                    || instruction.only_allows_unconditional_inlining()
+                    || instruction.no_location_policy.borrow_fallthrough()
+                        == super::BorrowFallthrough::Barrier
+                    || instruction.location.line < 0
+            })
+        {
+            return None;
+        }
+        let provenance = &self.exception_owner_provenance;
+        let in_head = |label: &Label| {
+            positions
+                .get(label)
+                .is_some_and(|position| donor_index < *position && *position <= marker)
+        };
+        if provenance
+            .source_boundaries
+            .iter()
+            .chain(&provenance.block_boundaries)
+            .chain(&provenance.fusion_boundaries)
+            .chain(&self.preserved_block_boundaries)
+            .chain(jump_targets)
+            .chain(&provenance.normal_try_copy_blocks)
+            .chain(&provenance.retired_normal_try_copy_labels)
+            .chain(&provenance.normal_try_copy_inline_labels)
+            .chain(&provenance.normal_try_copy_jump_nop_successors)
+            .chain(&provenance.normal_try_copy_internal_labels)
+            .chain(provenance.omitted_nop_counts.keys())
+            .chain(provenance.omitted_nop_locations.keys())
+            .any(in_head)
+            || provenance
+                .normal_try_copy_steps
+                .iter()
+                .any(|(start, end, _)| in_head(start) || in_head(end))
+            || provenance
+                .normal_try_copy_pop_ranges
+                .iter()
+                .any(|(start, end)| in_head(start) || in_head(end))
+            || self
+                .exception_regions
+                .iter()
+                .any(|region| in_head(&region.target))
+        {
+            return None;
+        }
+        let mut ranges = provenance.setup_nop_ranges.iter().filter(|(start, end)| {
+            positions.get(start) == Some(&nop_index) && positions.get(end) == Some(&setup_start)
+        });
+        let &(range_start, range_end) = ranges.next()?;
+        if ranges.next().is_some()
+            || provenance
+                .setup_nop_boundaries
+                .iter()
+                .any(|label| in_head(label) && *label != range_start && *label != range_end)
+        {
+            return None;
+        }
+        let mut pops = provenance
+            .removed_pop_block_boundaries
+            .iter()
+            .filter(|label| in_head(label));
+        let pop = pops.next()?;
+        if pops.next().is_some()
+            || positions.get(pop) != Some(&nop_index)
+            || provenance
+                .removed_pop_block_widths
+                .get(pop)
+                .copied()
+                .unwrap_or(1)
+                != 1
+        {
+            return None;
+        }
+        let mut setups = provenance.setups.iter().filter(|(label, _)| in_head(label));
+        let &(label, location) = setups.next()?;
+        if setups.next().is_some()
+            || label != setup
+            || positions.get(&label) != Some(&setup_start)
+            || location != Some(nop.location)
+        {
+            return None;
+        }
+        if [range_start, range_end, *pop, setup].iter().any(|label| {
+            self.items
+                .iter()
+                .filter(|item| **item == Item::Label(*label))
+                .count()
+                != 1
+        }) {
+            return None;
+        }
+        let handler = provenance.ordinary_try_setups.get(&setup)?;
+        let inner = self.uniform_exception_owner(setup_start, marker + 1, positions)?;
+        if self.exception_regions[inner].is_scope_fallback
+            || self.exception_regions[inner].target != *handler
+            || self.exception_regions[inner].preserve_lasti
+        {
+            return None;
+        }
+        let outer = self.uniform_exception_owner(donor_index, donor_index + 1, positions)?;
+        let owner = self.exception_regions[outer];
+        (!owner.is_scope_fallback && !owner.preserve_lasti && owner.target != *handler)
+            .then_some(outer)
     }
 
     /// Replays only the original NULL POPs of an intact retained-manager return array.

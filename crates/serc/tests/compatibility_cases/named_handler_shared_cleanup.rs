@@ -61,3 +61,64 @@ fn handler_cleanup_keeps_a_separately_lowered_loop_successor() {
         }
     }
 }
+
+#[test]
+fn named_handler_original_cleanup_uses_surviving_store_location() {
+    for (filename, source) in [
+        (
+            "named_handler_reversed_store_pair.py",
+            r"async def sample(flag, work, report):
+    try:
+        await work()
+    except ValueError as error:
+        if flag:
+            report(error)
+            left, right = None, None
+        else:
+            report(error)
+            left, right = None, None
+    except Exception:
+        left, right = None, None
+    return left, right
+",
+        ),
+        (
+            "named_handler_forward_store_pair_control.py",
+            r"async def sample(flag, work, report):
+    try:
+        await work()
+    except ValueError as error:
+        if flag:
+            report(error)
+            left = right = None
+        else:
+            report(error)
+            left = right = None
+    except Exception:
+        left = right = None
+    return left, right
+",
+        ),
+        (
+            "named_handler_multiline_store_pair_control.py",
+            r"async def sample(flag, work, report):
+    try:
+        await work()
+    except ValueError as error:
+        if flag:
+            report(error)
+            (left,
+             right) = None, None
+        else:
+            report(error)
+            (left,
+             right) = None, None
+    except Exception:
+        left, right = None, None
+    return left, right
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
