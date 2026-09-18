@@ -1889,18 +1889,26 @@ impl OptimizationPipeline {
                 }
                 let position = order.iter().position(|candidate| *candidate == block)?;
                 let previous = *order.get(position.checked_sub(1)?)?;
-                if !super::super::block_has_fallthrough(self.graph[previous].items()) {
-                    return None;
-                }
+                let previous_falls_through =
+                    super::super::block_has_fallthrough(self.graph[previous].items());
                 let last = self.graph[previous].last_instruction()?;
+                let terminating_case_exit = !previous_falls_through
+                    && ends_scope(last.opcode)
+                    && jump.location.line >= 0
+                    && jump.jump_policy.is_original_empty_join();
                 // A nonterminating case arm and its false edge share one original
                 // jump. Splitting it before small-exit copying duplicates the return.
                 // Keep that array only for an untouched authored match join whose
                 // final call falls through to an intact local or constant return.
+                // A terminating arm leaves a certified false-edge array instead.
+                // Both routes can reach a shared match end copied into a Pass arm;
+                // its wildcard-call donor must wait until every copy is finished.
                 if jump.opcode == JUMP_FORWARD
-                    && jump.location == SourceLocation::NONE
-                    && last.opcode == POP_TOP
-                    && last.location.line >= 0
+                    && ((previous_falls_through
+                        && jump.location == SourceLocation::NONE
+                        && last.opcode == POP_TOP
+                        && last.location.line >= 0)
+                        || terminating_case_exit)
                     && self.graph[block]
                         .items()
                         .iter()
@@ -1914,7 +1922,9 @@ impl OptimizationPipeline {
                         .count()
                         == 1
                     && first.opcode == JUMP_FORWARD
-                    && first.jump_policy.is_original_match_success()
+                    && (first.jump_policy.is_original_match_success()
+                        || (terminating_case_exit
+                            && first.jump_policy.retains_nop_for(first.operand())))
                     && first.location.line >= 0
                     && [jump, first].iter().all(|instruction| {
                         instruction.pre_fold_extra_instructions() == 0
@@ -1926,9 +1936,10 @@ impl OptimizationPipeline {
                     && let Operand::Forward(return_label) = first.operand()
                     && let Some(return_block) = self.graph.label_block(return_label)
                     && (is_original_constant_return(&self.graph, return_label)
-                        || super::normal_try_copies::original_local_return(
-                            self.graph[return_block].items(),
-                        ))
+                        || (!terminating_case_exit
+                            && super::normal_try_copies::original_local_return(
+                                self.graph[return_block].items(),
+                            )))
                     && let Some(entry) = self.graph[target].items().iter().find_map(|item| {
                         match item {
                             Item::Label(entry)
@@ -1981,6 +1992,9 @@ impl OptimizationPipeline {
                         expected.jump_policy.resolve_deferred_removal();
                     }
                     shared_match_donors.push((entry, (expected, *donor)));
+                    return None;
+                }
+                if !previous_falls_through {
                     return None;
                 }
                 Some((

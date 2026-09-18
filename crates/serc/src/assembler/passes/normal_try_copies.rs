@@ -872,14 +872,12 @@ impl OptimizationPipeline {
                     continue;
                 }
                 // A case ending in a conditional emits its success edge in the
-                // original empty join. Its retained NOP is a later threading
-                // decision, not an unknown predecessor of this POP_BLOCK array.
-                // The match-success bit is retired on retargeting; replay only
-                // that unchanged edge and its exact authored match-end label.
+                // original empty join, whether or not later threading retains its NOP.
+                // That retention policy does not change the original predecessor of
+                // this POP_BLOCK array. The match-success bit retires on retargeting;
+                // replay only the unchanged edge and its authored match-end label.
                 let original_match_success_head = instruction.opcode == JUMP_FORWARD
                     && instruction.jump_policy.is_original_match_success()
-                    && instruction.jump_policy.preserves_nop_after_threading()
-                    && instruction.jump_policy.defers_redundant_removal()
                     && instruction.no_location_policy.is_artificial_eval_break()
                     && !instruction.no_location_policy.preserves_location()
                     && instruction.pre_fold_extra_instructions() == 0

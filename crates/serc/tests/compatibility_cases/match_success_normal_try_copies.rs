@@ -142,3 +142,59 @@ fn matches_cpython_final_value_match_try_exit() {
 ";
     common::assert_matches_cpython_marshal(source, "final_value_match_try_exit.py");
 }
+#[test]
+fn matches_cpython_wildcard_elif_await_try_exit_target() {
+    let source = r#"async def f(value, mode, work, report, reject):
+    result = 0
+    try:
+        match value:
+            case First():
+                result = 1
+            case Second():
+                details = await work(value)
+                if mode == "present" and details is not None:
+                    result = 1
+                elif mode == "absent" and details is None:
+                    result = 2
+            case Last():
+                result = await work(value)
+            case _:
+                reject(value)
+    except Exception as error:
+        report(error)
+    bias = "up" if result > 1 else ("down" if result < 1 else None)
+    return result, bias
+"#;
+    common::assert_matches_cpython_marshal(source, "wildcard_elif_await_try_exit_target.py");
+}
+
+#[test]
+fn matches_cpython_wildcard_complete_else_await_try_exit_control() {
+    let source = r#"async def f(value, mode, work, report, reject):
+    result = 0
+    try:
+        match value:
+            case First():
+                result = 1
+            case Second():
+                details = await work(value)
+                if mode == "present" and details is not None:
+                    result = 1
+                elif mode == "absent" and details is None:
+                    result = 2
+                else:
+                    result = 0
+            case Last():
+                result = await work(value)
+            case _:
+                reject(value)
+    except Exception as error:
+        report(error)
+    bias = "up" if result > 1 else ("down" if result < 1 else None)
+    return result, bias
+"#;
+    common::assert_matches_cpython_marshal(
+        source,
+        "wildcard_complete_else_await_try_exit_control.py",
+    );
+}

@@ -1078,10 +1078,11 @@ impl Compiler<'_> {
                     .preserve_redundant_jump_nop_after_threading(success_exit);
             }
             if unique_false_edge.is_some() {
-                // Only the false edge reaches this initially empty block. Its condition
-                // location remains as a NOP when a small exit replaces the case jump.
+                // Only the false edge reaches this original empty block. Preserve its
+                // condition slot even when a containing match retargets the case exit
+                // before a small return replaces the jump.
                 self.assembler
-                    .preserve_direct_inlined_jump_nop(success_exit);
+                    .preserve_empty_join_inlined_jump_nop(success_exit);
             } else {
                 self.assembler.mark_jump_as_interruptible(success_exit);
                 self.assembler

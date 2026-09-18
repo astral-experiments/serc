@@ -4464,10 +4464,26 @@ impl Assembler {
         // Unconditional incoming edges can copy the exit before line propagation.
         // A conditional edge remains: it can donate a line only when it is the
         // sole predecessor, as after a guard whose true arm terminates.
+        let original_match_success = matches!(
+            &self.linear_items()[index],
+            Item::Instruction(instruction) if instruction.jump_policy.is_original_match_success()
+        );
         let original_block = labels.iter().any(|label| {
-            self.exception_owner_provenance
+            // Live case-success edges already establish a match end without adding
+            // a source-boundary entry. A lone terminating guard's false edge has
+            // its original array recorded by conditional-threading provenance.
+            (self
+                .exception_owner_provenance
                 .source_boundaries
                 .contains(label)
+                || (original_match_success
+                    && self
+                        .exception_owner_provenance
+                        .original_match_join_boundaries
+                        .contains(label))
+                || (conditional_predecessors == 1
+                    && !has_fallthrough
+                    && self.conditional_threading_targets.contains_key(label)))
                 && !self.borrow_block_aliases.contains(label)
         });
         let original_empty_join = original_block

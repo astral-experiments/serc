@@ -82,3 +82,61 @@ fn matches_cpython_marshal_for_match_tail_if_fallthrough_return_join() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_marshal_for_nested_match_terminating_guard_return_joins() {
+    for (filename, source) in [
+        (
+            "nested_match_case_return_join_nop_target.py",
+            r"def f(subject, inner, flag):
+    match subject:
+        case Outer():
+            match inner:
+                case Inner():
+                    if flag:
+                        return False
+                case None:
+                    pass
+                case _:
+                    observe(inner)
+        case _:
+            raise ValueError()
+    return True
+",
+        ),
+        (
+            "nested_match_conditional_call_exit.py",
+            r"def f(value, work):
+    match value:
+        case Outer(item=item):
+            match item:
+                case Inner():
+                    if work(item):
+                        return False
+                case None:
+                    pass
+                case _:
+                    work(item)
+        case _:
+            raise ValueError(value)
+    return True
+",
+        ),
+        (
+            "direct_match_case_return_join_control.py",
+            r"def f(subject, flag):
+    match subject:
+        case Inner():
+            if flag:
+                return False
+        case None:
+            pass
+        case _:
+            observe(subject)
+    return True
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

@@ -14563,6 +14563,22 @@ impl Compiler<'_> {
                                                 _ => false,
                                             }
                                     }))));
+        let nested_else_call_entry = borrow_exit_has_source_successor
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && self.control.loops.contexts.is_empty()
+            && self.control.withs.active_with_exits.is_empty()
+            && self.control.exceptions.active_exception_handlers.is_empty()
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            && self.control.finally.active_finally_try_bodies == 0
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
+            && nested_try_else_has_populated_call_entry(statement);
         // CPython can leave an empty physical block after a final with or nested try. Borrowed-
         // load traversal stops there, so a following suite cannot reach this try join through
         // that normal-exit edge.
@@ -14572,7 +14588,8 @@ impl Compiler<'_> {
             || (borrow_exit_has_successor
                 && matches!(normal_exit_suite.last(), Some(Stmt::Try(_)))
                 && suite_ends_in_empty_try_exit_block(normal_exit_suite, loop_tail.is_some())
-                && !nested_conditional_store_entry)
+                && !nested_conditional_store_entry
+                && !nested_else_call_entry)
         {
             self.assembler.prevent_borrow_reachability(end);
         }
@@ -15940,9 +15957,36 @@ impl Compiler<'_> {
                 // removal. The apparent fallthrough is not a borrowed-load entry.
                 self.assembler.prevent_borrow_fallthrough_reachability(end);
             }
+            let populated_guarded_handler_suffix = handler_contains_nested_handler_cold_join
+                && !statement.is_star
+                && statement.orelse.is_empty()
+                && statement.finalbody.is_empty()
+                && matches!(self.unit.scope, Scope::Function { .. })
+                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                && suite_has_linear_borrow_fallthrough(&statement.body)
+                && self.control.loops.contexts.is_empty()
+                && matches!(self.control.withs.active_with_exits.as_slice(), [manager]
+                    if !manager.is_async)
+                && self.control.exceptions.active_exception_handlers.is_empty()
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .is_empty()
+                && self.control.finally.active_finally_try_bodies == 0
+                && self.control.finally.active_normal_finally_bodies == 0
+                && self.control.finally.active_copied_finally_bodies == 0
+                && self.control.finally.active_finally_end_blocks == 0
+                && matches!(statement.handlers.as_slice(), [handler]
+                if handler.as_except_handler().is_some_and(|handler| {
+                    handler.type_.is_some()
+                        && handler.name.is_some()
+                        && guarded_recovery_has_populated_handler_suffix(&handler.body)
+                }));
             if (normal_exit_starts_in_empty_block
                 && borrow_exit_has_source_successor
-                && !nonempty_finally_normal_source)
+                && !nonempty_finally_normal_source
+                && !populated_guarded_handler_suffix)
                 || matches!(normal_exit_suite.last(), Some(Stmt::Assert(assertion))
                     if assertion_has_only_runtime_tests(&assertion.test)
                         && condition_jump_target_count(&assertion.test, true) > 1)
@@ -26105,6 +26149,94 @@ fn named_handler_cleanup_precedes_assignment(body: &[Stmt]) -> bool {
         }
         _ => false,
     }
+}
+
+// A no-else None guard and its normally completing recovery meet before a
+// populated handler suffix. Neither path leaves an orphan normal-exit array.
+fn guarded_recovery_has_populated_handler_suffix(body: &[Stmt]) -> bool {
+    body.iter().enumerate().any(|(index, statement)| {
+        let Stmt::If(guard) = statement else {
+            return false;
+        };
+        let suffix = &body[index + 1..];
+        guard.elif_else_clauses.is_empty()
+            && matches!(guard.test.as_ref(), Expr::Compare(comparison)
+                if matches!(comparison.left.as_ref(), Expr::Name(_))
+                    && comparison.ops[..] == [CmpOp::IsNot]
+                    && matches!(&comparison.comparators[..], [Expr::NoneLiteral(_)]))
+            && (index == 0 || suite_has_linear_borrow_fallthrough(&body[..index]))
+            && matches!(guard.body.as_slice(), [Stmt::Try(recovery)]
+            if !recovery.is_star
+                && recovery.orelse.is_empty()
+                && recovery.finalbody.is_empty()
+                && suite_has_linear_borrow_fallthrough(&recovery.body)
+                && matches!(recovery.handlers.as_slice(), [handler]
+                    if handler.as_except_handler().is_some_and(|handler| {
+                        handler.type_.is_some()
+                            && handler.name.is_none()
+                            && suite_has_linear_borrow_fallthrough(&handler.body)
+                    })))
+            && suffix
+                .last()
+                .is_some_and(|last| suite_has_linear_borrow_fallthrough(std::slice::from_ref(last)))
+            && suffix.iter().all(|statement| {
+                suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement))
+                    || matches!(statement, Stmt::If(guard)
+                        if guard.elif_else_clauses.is_empty()
+                            && condition_has_linear_runtime_leaves(&guard.test)
+                            && suite_has_linear_raise_exit(&guard.body)
+                            && matches!(guard.body.last(), Some(Stmt::Raise(raise))
+                                if raise.exc.is_none() && raise.cause.is_none()))
+            })
+    })
+}
+
+// The first arm of a nested try-else conditional keeps its populated jump to
+// the outer continuation. Empty normal joins still block other fallthroughs.
+fn nested_try_else_has_populated_call_entry(statement: &ruff_python_ast::StmtTry) -> bool {
+    let linear_recovery = |statement: &ruff_python_ast::StmtTry| {
+        !statement.is_star
+            && statement.finalbody.is_empty()
+            && suite_has_linear_borrow_fallthrough(&statement.body)
+            && !statement.handlers.is_empty()
+            && statement.handlers.iter().all(|handler| {
+                handler.as_except_handler().is_some_and(|handler| {
+                    handler.type_.is_some()
+                        && handler.name.is_some()
+                        && suite_has_linear_borrow_fallthrough(&handler.body)
+                })
+            })
+    };
+    if !linear_recovery(statement) {
+        return false;
+    }
+    let Some(Stmt::Try(nested)) = statement.orelse.last() else {
+        return false;
+    };
+    if !linear_recovery(nested) {
+        return false;
+    }
+    let [Stmt::If(branch)] = nested.orelse.as_slice() else {
+        return false;
+    };
+    let [otherwise] = branch.elif_else_clauses.as_slice() else {
+        return false;
+    };
+    if !condition_has_linear_runtime_leaves(&branch.test)
+        || otherwise.test.is_some()
+        || !matches!(branch.body.as_slice(), [Stmt::Expr(expression)]
+            if matches!(expression.value.as_ref(), Expr::Call(_))
+                && !expression_contains_inline_branch(&expression.value))
+        || suite_contains_abrupt_control_flow(&otherwise.body)
+    {
+        return false;
+    }
+    matches!(otherwise.body.last(), Some(Stmt::Try(recovery))
+        if linear_recovery(recovery)
+            && matches!(recovery.orelse.as_slice(), [Stmt::If(tail)]
+                if tail.elif_else_clauses.is_empty()
+                    && condition_has_linear_runtime_leaves(&tail.test)
+                    && suite_has_linear_borrow_fallthrough(&tail.body)))
 }
 
 // A direct tail nested handler leaves the containing suite's normal-exit join empty.

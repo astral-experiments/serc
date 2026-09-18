@@ -932,3 +932,108 @@ fn matches_cpython_borrows_after_named_cleanup_store_suffix() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_borrows_through_live_recovery_entries() {
+    for (source, filename) in [
+        (
+            r#"def run(recorder, worker, sample, index, record_raw):
+    with recorder.open():
+        if record_raw:
+            try:
+                recorder.record(sample)
+            except Exception as error:
+                if worker.ignore:
+                    recorder.report(error)
+                else:
+                    raise
+        seed = worker.seed(index)
+        try:
+            result = worker.run(sample, seed)
+        except Exception as error:
+            partial = getattr(error, "partial", None)
+            if partial is not None:
+                try:
+                    recorder.record(partial)
+                except Exception:
+                    recorder.report(sample)
+            recorder.report(error)
+            if not worker.accepts(error):
+                recorder.report(sample)
+                raise
+            result = None
+            recorder.report(error)
+        recorder.completed(index)
+        return index, result
+"#,
+            "managed_guarded_linear_recovery_suffix_target.py",
+        ),
+        (
+            r#"def validate(load, parse, attest, changed, valid, fields):
+    errors = []
+    try:
+        data = load()
+    except OSError as error:
+        errors.append(str(error))
+    else:
+        if changed(data):
+            errors.append("changed")
+        try:
+            value = parse(data)
+        except ValueError as error:
+            errors.append(str(error))
+        else:
+            if not valid(value):
+                errors.append("invalid")
+            else:
+                for field in fields:
+                    if changed(field):
+                        errors.append(field)
+                try:
+                    result = attest(value)
+                except RuntimeError as error:
+                    errors.append(str(error))
+                else:
+                    if changed(result):
+                        errors.append("attested")
+    if errors:
+        raise RuntimeError("; ".join(errors))
+"#,
+            "nested_try_else_populated_call_entry_target.py",
+        ),
+        (
+            r#"def run(recorder, worker, sample, index, record_raw):
+    with recorder.open():
+        if record_raw:
+            try:
+                recorder.record(sample)
+            except Exception as error:
+                if worker.ignore:
+                    recorder.report(error)
+                else:
+                    raise
+        seed = worker.seed(index)
+        try:
+            result = worker.run(sample, seed)
+        except Exception as error:
+            partial = getattr(error, "partial", None)
+            if partial is not None:
+                try:
+                    recorder.record(partial)
+                except Exception:
+                    raise
+            recorder.report(error)
+            if not worker.accepts(error):
+                recorder.report(sample)
+                raise
+            result = None
+            recorder.report(error)
+        recorder.completed(index)
+        return index, result
+"#,
+            "managed_guarded_raising_recovery_suffix_control.py",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
