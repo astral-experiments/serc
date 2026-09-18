@@ -300,3 +300,95 @@ fn matches_cpython_shared_conditional_finally_manager_exit() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_retry_manager_suppression_owner() {
+    for (filename, source) in [
+        (
+            "retry_conditional_manager_fallback.py",
+            r"def read_source(source, retries):
+    for attempt in range(retries + 1):
+        try:
+            if is_remote(source):
+                with open_remote(source) as handle:
+                    return handle.read()
+            return read_local(source)
+        except Exception as error:
+            if attempt >= retries:
+                raise
+            pause(attempt)
+    raise RuntimeError()
+",
+        ),
+        (
+            "retry_conditional_manager_branch_fallback.py",
+            r"def read_source(source, retries):
+    last_error = None
+    for attempt in range(retries + 1):
+        try:
+            if is_remote(source):
+                request = prepare(source)
+                with open_remote(request) as handle:
+                    return handle.read()
+            if is_file(source):
+                return read_file(source)
+            return read_local(source)
+        except Exception as error:
+            last_error = error
+            if attempt >= retries:
+                break
+            pause(attempt)
+    raise last_error
+",
+        ),
+        (
+            "retry_direct_manager_loop_control.py",
+            r"def read_source(source, retries):
+    for attempt in range(retries + 1):
+        try:
+            with open_remote(source) as handle:
+                return handle.read()
+        except Exception as error:
+            if attempt >= retries:
+                raise
+            pause(attempt)
+    raise RuntimeError()
+",
+        ),
+        (
+            "retry_conditional_manager_break_control.py",
+            r"def read_source(source, retries):
+    for attempt in range(retries + 1):
+        try:
+            if is_remote(source):
+                with open_remote(source) as handle:
+                    return handle.read()
+                break
+            return read_local(source)
+        except Exception as error:
+            if attempt >= retries:
+                raise
+            pause(attempt)
+    raise RuntimeError()
+",
+        ),
+        (
+            "retry_conditional_manager_fallthrough_control.py",
+            r"def read_source(source, retries):
+    for attempt in range(retries + 1):
+        try:
+            if is_remote(source):
+                with open_remote(source) as handle:
+                    consume(handle.read())
+            return read_local(source)
+        except Exception as error:
+            if attempt >= retries:
+                raise
+            pause(attempt)
+    raise RuntimeError()
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

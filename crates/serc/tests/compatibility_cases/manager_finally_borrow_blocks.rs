@@ -178,3 +178,65 @@ fn matches_cpython_async_manager_guarded_finally_break_borrows() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_sync_conditional_nested_finally_nop_owners() {
+    for (filename, source) in [
+        (
+            "nested_finally_guard_call.py",
+            r"def f(manager, enabled, work, close):
+    with manager:
+        try:
+            work()
+        finally:
+            if enabled:
+                try:
+                    work()
+                finally:
+                    close()
+",
+        ),
+        (
+            "nested_finally_guard_loop.py",
+            r"def f(manager, resource, values, work):
+    with manager:
+        try:
+            work()
+        finally:
+            if resource is not None:
+                try:
+                    for value in values:
+                        work(value)
+                finally:
+                    resource.close()
+",
+        ),
+        (
+            "ordinary_handler_guard_control.py",
+            r"def f(manager, enabled, work, close):
+    with manager:
+        try:
+            work()
+        finally:
+            if enabled:
+                try:
+                    work()
+                except ValueError:
+                    close()
+",
+        ),
+        (
+            "linear_guard_control.py",
+            r"def f(manager, enabled, work, close):
+    with manager:
+        try:
+            work()
+        finally:
+            if enabled:
+                close()
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

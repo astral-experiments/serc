@@ -20124,7 +20124,7 @@ impl Compiler<'_> {
             // until small-exit inlining finishes. Count that original slot on this copy.
             self.assembler.add_last_inlined_jump_slot();
         } else if !terminal {
-            let conditional_exit =
+            let mut conditional_exit =
                 statement
                     .finalbody
                     .last()
@@ -20132,6 +20132,83 @@ impl Compiler<'_> {
                         Stmt::If(statement) => nested_if_exit_location(statement, true),
                         _ => None,
                     });
+            // A nested finally jumps past this guard's empty normal continuation.
+            // Its sole false edge supplies the NOP's line, while the surrounding
+            // manager still owns that original jump before its own POP_BLOCK.
+            let located_nested_finally_guard = capture_manager_pop
+                && preserve_exit_nop
+                && !shared_manager_exit
+                && !drop_expression_if_exit_nop
+                && !drop_shared_manager_exit_nop
+                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                && self.control.loops.contexts.is_empty()
+                && self.control.exceptions.active_exception_handlers.is_empty()
+                && self.control.exceptions.active_exception_group_handlers == 0
+                && self.control.finally.active_normal_finally_bodies == 0
+                && self.control.finally.active_copied_finally_bodies == 0
+                && self.control.finally.active_finally_end_blocks == 0
+                && !statement.is_star
+                && statement.handlers.is_empty()
+                && statement.orelse.is_empty()
+                && matches!(conditional_exit, Some(NestedIfExitLocation::Unlocated))
+                && self.assembler.current_original_block_location().is_none()
+                && self
+                    .assembler
+                    .current_original_block_pre_fusion_instruction_count()
+                    == 0
+                && self
+                    .control
+                    .withs
+                    .active_with_exits
+                    .last()
+                    .is_some_and(|manager| {
+                        !manager.is_async
+                            && manager.loop_depth == self.control.loops.contexts.len()
+                            && manager.exception_region_depth
+                                == self
+                                    .control
+                                    .exceptions
+                                    .active_exception_region_exclusions
+                                    .len()
+                    })
+                && matches!(statement.finalbody.as_slice(), [Stmt::If(tail)]
+                if tail.elif_else_clauses.is_empty()
+                    && condition_has_linear_runtime_leaves(&tail.test)
+                    && condition_jump_target_count(&tail.test, false) == 1
+                    && !expression_suspends_current_scope(&tail.test)
+                    && tail.body.split_last().is_some_and(|(cleanup, leading)| {
+                        let Stmt::Try(cleanup) = cleanup else {
+                            return false;
+                        };
+                        leading.iter().all(|statement| matches!(statement, Stmt::Assign(assignment)
+                            if assignment.targets.iter().all(|target| matches!(target, Expr::Name(_)))
+                                && !expression_suspends_current_scope(&assignment.value)))
+                            && !cleanup.is_star
+                            && cleanup.handlers.is_empty()
+                            && cleanup.orelse.is_empty()
+                            && matches!(cleanup.finalbody.as_slice(), [Stmt::Expr(expression)]
+                                if matches!(expression.value.as_ref(), Expr::Call(_))
+                                    && !expression_contains_inline_branch(&expression.value)
+                                    && !expression_suspends_current_scope(&expression.value))
+                            && match cleanup.body.as_slice() {
+                                [Stmt::Expr(expression)] => {
+                                    matches!(expression.value.as_ref(), Expr::Call(_))
+                                        && !expression_suspends_current_scope(&expression.value)
+                                }
+                                [Stmt::For(loop_statement)] => {
+                                    !loop_statement.is_async
+                                        && loop_statement.orelse.is_empty()
+                                        && !expression_contains_inline_branch(&loop_statement.iter)
+                                        && !expression_contains_inline_branch(&loop_statement.target)
+                                        && suite_has_linear_borrow_fallthrough(&loop_statement.body)
+                                }
+                                _ => false,
+                            }
+                    }));
+            if located_nested_finally_guard && let Some(Stmt::If(tail)) = statement.finalbody.last()
+            {
+                conditional_exit = Some(NestedIfExitLocation::Located(&tail.test));
+            }
             if let Some(NestedIfExitLocation::Located(test)) = conditional_exit {
                 self.assembler
                     .set_location(self.source_location(condition_fallthrough_range(test)));
@@ -20308,7 +20385,8 @@ impl Compiler<'_> {
                 && !shared_manager_exit
                 && !separate_manager_pop
                 && !original_conditional_finally_jump
-                && !located_structured_finally_jump)
+                && !located_structured_finally_jump
+                && !located_nested_finally_guard)
                 .then(|| {
                     let start = self.assembler.label();
                     self.assembler.mark(start);
@@ -20883,6 +20961,9 @@ impl Compiler<'_> {
                 .direct_final_sync_with_protected_handler_try_body
                 == Some(statement.range)
             || (self.context.target_specific_rules_enabled()
+                // A sibling reached through a conditional arm remains inside the
+                // same try. Suppression must retain that continuation's owner.
+                && self.control.statements.same_region_continuation != Some(statement.range)
                 // A following break begins its own try unwind. The manager's
                 // suppression jump reaches that unwind while still inside the try.
                 && !self.control.statements.current_statement_followed_by_break
