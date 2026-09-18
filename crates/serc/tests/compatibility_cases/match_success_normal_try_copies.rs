@@ -198,3 +198,47 @@ fn matches_cpython_wildcard_complete_else_await_try_exit_control() {
         "wildcard_complete_else_await_try_exit_control.py",
     );
 }
+
+#[test]
+fn matches_cpython_async_for_match_success_try_finally_target() {
+    let source = r"async def f(command, first, last, ready, close, record, kwargs):
+    await ready()
+    try:
+        match command:
+            case Kind.FIRST:
+                async for item in first(**kwargs):
+                    yield item
+            case Kind.LAST:
+                async for item in last(**kwargs):
+                    yield item
+            case _:
+                raise RuntimeError(command)
+    finally:
+        await close()
+";
+    common::assert_matches_cpython_marshal(source, "async_for_match_success_try_finally_target.py");
+}
+
+#[test]
+fn matches_cpython_async_for_match_success_continuation_control() {
+    let source = r"async def f(command, first, last, ready, close, record, kwargs):
+    await ready()
+    try:
+        match command:
+            case Kind.FIRST:
+                async for item in first(**kwargs):
+                    yield item
+            case Kind.LAST:
+                async for item in last(**kwargs):
+                    yield item
+                record(command)
+            case _:
+                raise RuntimeError(command)
+    finally:
+        await close()
+";
+    common::assert_matches_cpython_marshal(
+        source,
+        "async_for_match_success_continuation_control.py",
+    );
+}

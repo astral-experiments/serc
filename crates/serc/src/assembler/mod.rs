@@ -3992,6 +3992,47 @@ impl Assembler {
         self.record_original_empty_join(emitted);
     }
 
+    /// Defers a normal exit whose preceding call already supplies its line event.
+    pub(crate) fn defer_redundant_same_line_call_exit(&mut self, emitted: EmittedJump) -> bool {
+        let index = usize::try_from(emitted.instruction().item_index)
+            .expect("emitted instruction index should fit in usize");
+        let jump = *self.emitted_jump_mut(emitted, "inspecting a redundant call exit");
+        if jump.opcode != JUMP_FORWARD || jump.location.line < 0 {
+            return false;
+        }
+        let mut preceding = self.linear_items()[..index].iter().rev();
+        for opcode in [POP_TOP, crate::target::opcodes::CALL] {
+            loop {
+                match preceding.next() {
+                    Some(Item::Label(label)) if !self.borrow_block_aliases.contains(label) => {}
+                    Some(Item::Instruction(instruction))
+                        if instruction.opcode == opcode
+                            && instruction.location == jump.location
+                            && instruction.pre_fold_extra_instructions() == 0
+                            && instruction.local_policy.hidden_exception_owner_slots() == 0
+                            && !instruction.no_location_policy.preserves_location()
+                            && !instruction.jump_policy.borrow_empty_block() =>
+                    {
+                        break;
+                    }
+                    _ => return false,
+                }
+            }
+        }
+        // Preserve the same provenance as the ordinary retained-exit route. An
+        // original empty array still needs its own slot despite an adjacent call.
+        self.record_original_empty_join(emitted);
+        if self
+            .emitted_jump_mut(emitted, "checking an original call-exit join")
+            .jump_policy
+            .is_original_empty_join()
+        {
+            return false;
+        }
+        self.defer_jump_removal(emitted);
+        true
+    }
+
     /// Retains the empty final-pattern block before copying an unprotected literal return.
     /// The caller must exclude loops and cleanup suites and require directly returning cases.
     pub(crate) fn preserve_final_match_failure_return_join(&mut self, emitted: EmittedJump) {

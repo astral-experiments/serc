@@ -2439,6 +2439,13 @@ impl OptimizationPipeline {
 
                     let mut target_is_next = false;
                     let mut crosses_exception_boundary = false;
+                    let mut crosses_only_original_match_end = finalize_borrow_empty_blocks
+                        && instruction.jump_policy.is_original_match_success()
+                        && self
+                            .exception_owner_provenance
+                            .original_match_join_boundaries
+                            .contains(&target)
+                        && !self.borrow_block_aliases.contains(&target);
                     let mut original_cleanup_boundaries = 0;
                     let mut crosses_only_original_cleanup = true;
                     let mut crosses_removed_line_event = false;
@@ -2460,6 +2467,26 @@ impl OptimizationPipeline {
                                     target_is_next |= *label == target;
                                     crosses_exception_boundary |=
                                         exception_boundaries.contains(label);
+                                    if crosses_only_original_match_end
+                                        && exception_boundaries.contains(label)
+                                    {
+                                        let mut ending = self
+                                            .exception_regions
+                                            .iter()
+                                            .filter(|region| region.end == *label);
+                                        let original = ending.next();
+                                        crosses_only_original_match_end = *label == target
+                                            && ending.next().is_none()
+                                            && original.is_some_and(|region| {
+                                                !region.is_scope_fallback
+                                                    && !region.preserve_lasti
+                                                    && Some(region.depth)
+                                                        == instruction.depth_after()
+                                            })
+                                            && self.exception_regions.iter().all(|region| {
+                                                region.start != *label && region.target != *label
+                                            });
+                                    }
                                     if finalize_borrow_empty_blocks
                                         && instruction.fusion_policy.is_authored_break()
                                         && exception_boundaries.contains(label)
@@ -2690,8 +2717,11 @@ impl OptimizationPipeline {
                     // Async exhaustion starts an original empty continuation array after
                     // END_ASYNC_FOR. Cold ordering can make its branch jump redundant, but
                     // CPython resets the preceding line at that certified array boundary.
+                    // An unchanged match-success jump can also close its original try body
+                    // at the authored match end. Its replacement NOP remains before that
+                    // sole region end; setup, handler, and unrelated boundaries still reject.
                     let original_async_for_join = finalize_borrow_empty_blocks
-                        && !crosses_exception_boundary
+                        && (!crosses_exception_boundary || crosses_only_original_match_end)
                         && !absorbed_normal_try_exit
                         && !instruction.fusion_policy.is_authored_break()
                         && !instruction.fusion_policy.is_converted_pop_block()

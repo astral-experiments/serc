@@ -1037,3 +1037,133 @@ fn matches_cpython_borrows_through_live_recovery_entries() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_borrows_after_recovery_value_matches() {
+    for (source, filename) in [
+        (
+            r#"def edit(value, read, parse, choose, report):
+    while True:
+        text = read(value)
+        if text is None:
+            return
+        try:
+            result = parse(text)
+        except ValueError as error:
+            report(error)
+            action = choose()
+            match action:
+                case "again":
+                    continue
+                case "reset":
+                    value = text
+                    continue
+                case "stop":
+                    report(error)
+                    return
+                case _:
+                    raise ValueError(action) from None
+        formatted = str(result)
+        report(formatted, value)
+        if choose():
+            return formatted
+"#,
+            "named_terminal_value_match_recovery_target.py",
+        ),
+        (
+            r#"def edit(value, read, parse, choose, report):
+    while True:
+        text = read(value)
+        if text is None:
+            return
+        try:
+            result = parse(text)
+        except ValueError as error:
+            report(error)
+            action = choose()
+            if action == "again":
+                continue
+            elif action == "reset":
+                value = text
+                continue
+            elif action == "stop":
+                report(error)
+                return
+            else:
+                raise ValueError(action) from None
+        formatted = str(result)
+        report(formatted, value)
+        if choose():
+            return formatted
+"#,
+            "named_terminal_if_recovery_control.py",
+        ),
+        (
+            r#"def collect(messages, decode, report):
+    seen = []
+    for message in messages:
+        first = False
+        second = False
+        try:
+            values = decode(message)
+            for key, items in values.items():
+                size = len(items) if isinstance(items, list) else 1
+                report(key, size)
+                if key.startswith("alpha"):
+                    first = True
+                elif key.startswith("beta"):
+                    second = True
+                elif key == "other":
+                    first = True
+        except Exception:
+            for line in message.splitlines():
+                key, *values = line.split("|")
+                if values:
+                    report(key, len(values))
+                match key:
+                    case "slow":
+                        first = True
+                    case "fast":
+                        second = True
+        report(message, first, second)
+        seen.append((first, second))
+    return seen
+"#,
+            "iterator_value_match_recovery_target.py",
+        ),
+        (
+            r#"def collect(messages, decode, report):
+    seen = []
+    for message in messages:
+        first = False
+        second = False
+        try:
+            values = decode(message)
+            for key, items in values.items():
+                size = len(items) if isinstance(items, list) else 1
+                report(key, size)
+                if key.startswith("alpha"):
+                    first = True
+                elif key.startswith("beta"):
+                    second = True
+                elif key == "other":
+                    first = True
+        except Exception:
+            for line in message.splitlines():
+                key, *values = line.split("|")
+                if values:
+                    report(key, len(values))
+                if key == "slow":
+                    first = True
+                if key == "fast":
+                    second = True
+        report(message, first, second)
+        seen.append((first, second))
+    return seen
+"#,
+            "iterator_independent_if_recovery_control.py",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
