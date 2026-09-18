@@ -13253,6 +13253,54 @@ def filled(action, self, mask, result):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_async_iterator_manager_tail_break_owners() {
+        for (name, source) in [
+            (
+                "manager_tail_break_target.py",
+                include_str!("fixtures/borrow_finally_reachability/manager_tail_break_target.py"),
+            ),
+            (
+                "conditional_manager_break_control.py",
+                include_str!(
+                    "fixtures/borrow_finally_reachability/conditional_manager_break_control.py"
+                ),
+            ),
+            (
+                "manager_following_work_control.py",
+                include_str!(
+                    "fixtures/borrow_finally_reachability/manager_following_work_control.py"
+                ),
+            ),
+            (
+                "manager_small_return_control.py",
+                include_str!(
+                    "fixtures/borrow_finally_reachability/manager_small_return_control.py"
+                ),
+            ),
+        ] {
+            assert_matches_cpython_marshal(source, name);
+        }
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_generator_manager_recovery_owners() {
+        for (name, source) in [
+            (
+                "yield_manager_recovery_target.py",
+                include_str!(
+                    "fixtures/borrow_finally_reachability/yield_manager_recovery_target.py"
+                ),
+            ),
+            (
+                "yield_no_handler_control.py",
+                include_str!("fixtures/borrow_finally_reachability/yield_no_handler_control.py"),
+            ),
+        ] {
+            assert_matches_cpython_marshal(source, name);
+        }
+    }
+
+    #[test]
     fn executes_control_flow() {
         let source = r#"
 x = 3

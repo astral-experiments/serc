@@ -4311,9 +4311,12 @@ impl Assembler {
         {
             return;
         }
-        let Some((Item::Instruction(_), head)) = self.linear_items().split_last() else {
+        let Some((Item::Instruction(last), head)) = self.linear_items().split_last() else {
             return;
         };
+        if *last != jump {
+            return;
+        }
         let labels = head
             .iter()
             .rev()
@@ -4327,7 +4330,10 @@ impl Assembler {
         };
         let mut matching = unwind.iter().filter_map(|item| match item {
             Item::Instruction(instruction)
-                if instruction.opcode == POP_JUMP_IF_FALSE && instruction.location == condition =>
+                if matches!(
+                    instruction.opcode,
+                    POP_JUMP_IF_FALSE | POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE
+                ) && instruction.location == condition =>
             {
                 match instruction.operand() {
                     Operand::Forward(label) if labels.contains(&label) => Some(label),
@@ -4339,7 +4345,13 @@ impl Assembler {
         let Some(label) = matching.next() else {
             return;
         };
-        if matching.next().is_some() {
+        if matching.next().is_some()
+            || head
+                .iter()
+                .filter(|item| **item == Item::Label(label))
+                .count()
+                != 1
+        {
             return;
         }
         self.conditional_threading_targets
@@ -5115,9 +5127,7 @@ impl Assembler {
         {
             return;
         }
-        let cleanup = records[records.len() - 7..]
-            .try_into()
-            .expect("seven cleanup records");
+        let cleanup = records[records.len() - 7..].to_vec();
         let earlier_cleanup = (manager_count == 2).then(|| {
             records[..7]
                 .try_into()
@@ -5151,6 +5161,110 @@ impl Assembler {
                     ordinary_try_pops,
                     cleanup,
                     earlier_cleanup,
+                    constant_return_prefix: None,
+                    pop,
+                    load,
+                    condition,
+                });
+        }
+    }
+
+    /// Captures a constant return's exact cleanup before a synchronous manager exit.
+    pub(crate) fn record_copied_constant_manager_return_compaction(
+        &mut self,
+        return_item: usize,
+        pop_item: usize,
+        named_handler: bool,
+    ) {
+        use crate::target::opcodes::{CALL, DELETE_FAST, LOAD_CONST, STORE_FAST};
+
+        let items = self.linear_items();
+        let Some(before) = items.get(return_item..pop_item) else {
+            return;
+        };
+        let records = before
+            .iter()
+            .filter_map(|item| match item {
+                Item::Instruction(instruction) => Some(*instruction),
+                Item::Label(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let prelude_len = if named_handler { 4 } else { 1 };
+        if records.len() != 1 + prelude_len + 5
+            || items.get(return_item) != Some(&Item::Instruction(records[0]))
+        {
+            return;
+        }
+        let authored = records[0];
+        let prelude = &records[1..=prelude_len];
+        let cleanup = &records[1 + prelude_len..];
+        if authored.opcode != NOP
+            || authored.operand() != Operand::Value(0)
+            || authored.fusion_policy.is_converted_pop_block()
+            || authored.location.line < 0
+            || prelude
+                .iter()
+                .any(|instruction| instruction.location != authored.location)
+            || records.iter().any(|instruction| {
+                instruction.local_policy.hidden_exception_owner_slots() != 0
+                    || instruction.pre_fold_extra_instructions() != 0
+                    || instruction.exception_policy() != ExceptionPolicy::NoneUnchanged
+                    || !matches!(instruction.operand(), Operand::Value(_))
+            })
+            || (named_handler
+                && (prelude.iter().map(|instruction| instruction.opcode).ne([
+                    POP_EXCEPT,
+                    LOAD_CONST,
+                    STORE_FAST,
+                    DELETE_FAST,
+                ]) || prelude[2].operand() != prelude[3].operand()
+                    || prelude[1].operand() != cleanup[0].operand()))
+            || (!named_handler && prelude[0].opcode != POP_TOP)
+            || cleanup
+                .iter()
+                .map(|instruction| instruction.opcode)
+                .ne([LOAD_CONST, LOAD_CONST, LOAD_CONST, CALL, POP_TOP])
+            || cleanup[0].operand() != cleanup[1].operand()
+            || cleanup[1].operand() != cleanup[2].operand()
+            || cleanup[3].operand() != Operand::Value(3)
+        {
+            return;
+        }
+        let mut suffix = items[pop_item..].iter().filter_map(|item| match item {
+            Item::Instruction(instruction) => Some(*instruction),
+            Item::Label(_) => None,
+        });
+        let (Some(pop), Some(load), Some(condition)) =
+            (suffix.next(), suffix.next(), suffix.next())
+        else {
+            return;
+        };
+        if pop.opcode == NOP
+            && pop.fusion_policy.is_converted_pop_block()
+            && pop.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
+            && pop.local_policy.hidden_exception_owner_slots() == 0
+            && pop.pre_fold_extra_instructions() == 0
+            && load.opcode == LOAD_FAST
+            && load.local_policy.hidden_exception_owner_slots() == 0
+            && load.pre_fold_extra_instructions() == 0
+            && matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+            && matches!(condition.operand(), Operand::Forward(_))
+            && condition.local_policy.hidden_exception_owner_slots() == 3
+            && condition.pre_fold_extra_instructions() == 0
+        {
+            self.exception_owner_provenance
+                .copied_manager_return_compactions
+                .push(exception_owners::CopiedManagerReturnCompaction {
+                    ordinary_try_pops: usize::from(!named_handler),
+                    cleanup: cleanup.to_vec(),
+                    earlier_cleanup: None,
+                    constant_return_prefix: Some(exception_owners::ConstantManagerReturnPrefix {
+                        authored_nop: authored,
+                        instructions: prelude.to_vec(),
+                        // A named handler omits two POPs; the iterator's inner ordinary
+                        // try omits one. The manager POP is counted separately in replay.
+                        missing_null_pops: if named_handler { 2 } else { 1 },
+                    }),
                     pop,
                     load,
                     condition,
@@ -5466,6 +5580,125 @@ impl Assembler {
                 .original_handler_cleanup_join_exits
                 .insert(end);
         }
+    }
+
+    /// Finds the sole original match donor for a manager's normal `POP_BLOCK`.
+    pub(crate) fn original_manager_match_join(
+        &self,
+        protected_end: Label,
+    ) -> Option<(Label, SourceLocation)> {
+        let entry = self.original_match_join?;
+        let items = self.linear_items();
+        let aliases = items
+            .iter()
+            .rev()
+            .map_while(|item| match item {
+                Item::Label(label) => Some(*label),
+                Item::Instruction(_) => None,
+            })
+            .collect::<Vec<_>>();
+        if !aliases.contains(&entry)
+            || !aliases.contains(&protected_end)
+            || self.join_labels_have_authored_location(&aliases)
+        {
+            return None;
+        }
+        let start = items.len() - aliases.len();
+        let Item::Instruction(previous) = items.get(start.checked_sub(1)?)? else {
+            return None;
+        };
+        let intact = |instruction: &Instruction| {
+            instruction.pre_fold_extra_instructions() == 0
+                && instruction.local_policy.hidden_exception_owner_slots() == 0
+                && instruction.exception_policy() == ExceptionPolicy::default()
+                && !instruction.fusion_policy.is_authored_break()
+                && !instruction.fusion_policy.is_converted_pop_block()
+                && !instruction.jump_policy.borrow_empty_block()
+                && !instruction.jump_policy.always_retains_nop()
+                && !instruction.no_location_policy.preserves_location()
+                && instruction.depth_after().is_some()
+        };
+        let incoming = |targets: &[Label]| {
+            items.iter().filter_map(move |item| match item {
+                Item::Instruction(instruction)
+                    if matches!(instruction.operand(), Operand::Forward(label) | Operand::Backward(label)
+                        if targets.contains(&label)) => Some(instruction),
+                _ => None,
+            }).collect::<Vec<_>>()
+        };
+        let mut entries = incoming(&aliases).into_iter();
+        if let Some(jump) = entries.next() {
+            // A terminating fallback leaves only this original successful case.
+            // Its located body is the sole donor for the separate manager array.
+            return (entries.next().is_none()
+                && ends_scope(previous.opcode)
+                && jump.opcode == JUMP_FORWARD
+                && jump.operand() == Operand::Forward(entry)
+                && jump.jump_policy.is_original_match_success()
+                && jump.location.line >= 0
+                && !jump.no_location_policy.is_artificial_eval_break()
+                && intact(jump))
+            .then_some((entry, jump.location));
+        }
+        // With all successful cases terminated, CPython's dead case-success
+        // edges still establish the end after the final class failure pops.
+        let [
+            head @ ..,
+            Item::Label(first_label),
+            Item::Instruction(first),
+            Item::Label(last_label),
+            Item::Instruction(last),
+        ] = &items[..start]
+        else {
+            return None;
+        };
+        let provenance = &self.exception_owner_provenance;
+        if !provenance.block_boundaries.contains(&entry)
+            || !provenance.source_boundaries.contains(&entry)
+            || first.opcode != POP_TOP
+            || last.opcode != POP_TOP
+            || first.operand() != Operand::Value(0)
+            || last.operand() != Operand::Value(0)
+            || first.location.line < 0
+            || first.location != last.location
+            || !intact(first)
+            || !intact(last)
+            || first.depth_after().and_then(|depth| depth.checked_sub(1)) != last.depth_after()
+            || !incoming(&[*last_label]).is_empty()
+        {
+            return None;
+        }
+        let first_aliases = head
+            .iter()
+            .rev()
+            .map_while(|item| match item {
+                Item::Label(label) => Some(*label),
+                Item::Instruction(_) => None,
+            })
+            .chain(std::iter::once(*first_label))
+            .collect::<Vec<_>>();
+        if self.join_labels_have_authored_location(&first_aliases)
+            || self.join_labels_have_authored_location(&[*last_label])
+            || !head.iter().rev().find_map(|item| match item {
+                Item::Instruction(instruction) => Some(ends_scope(instruction.opcode)),
+                Item::Label(_) => None,
+            })?
+        {
+            return None;
+        }
+        let mut failures = incoming(&first_aliases).into_iter();
+        let condition = failures.next()?;
+        (failures.next().is_none()
+            && condition.opcode == POP_JUMP_IF_NONE
+            && matches!(condition.operand(), Operand::Forward(_))
+            && condition.location.line == first.location.line
+            && condition.location.column == first.location.column
+            && intact(condition)
+            && condition
+                .depth_after()
+                .and_then(|depth| depth.checked_sub(1))
+                == first.depth_after())
+        .then_some((entry, last.location))
     }
 
     /// Finds the original manager exit following a completed cold handler cleanup.

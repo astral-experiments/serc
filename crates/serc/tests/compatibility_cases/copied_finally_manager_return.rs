@@ -54,3 +54,48 @@ fn matches_cpython_shared_iterator_return_value_cleanup_prefix_locations() {
         common::assert_matches_cpython_marshal(source, "shared_iterator_cleanup_prefix.py");
     }
 }
+
+#[test]
+fn constant_manager_return_cleanup_owners_match_cpython() {
+    for (filename, source) in [
+        (
+            "constant_iterator_manager_conditional_return.py",
+            r"async def example(manager, items, value):
+    try:
+        with manager:
+            for item in items:
+                try:
+                    if should_return(item):
+                        tick()
+                        return
+                except ValueError:
+                    pass
+    except RuntimeError:
+        raise
+    finally:
+        if value is not None:
+            finish(value)
+        after()
+",
+        ),
+        (
+            "constant_named_handler_manager_await_yield_keyword.py",
+            r"async def example(manager, value):
+    try:
+        with manager:
+            try:
+                work()
+            except ValueError as error:
+                await cancel()
+                yield Event(text='failure')
+                return
+    finally:
+        if value is not None and not value.done():
+            finish(value)
+        after()
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

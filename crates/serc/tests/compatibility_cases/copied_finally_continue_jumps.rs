@@ -79,3 +79,84 @@ fn matches_cpython_continue_stays_inside_its_finally_context() {
         }
     }
 }
+
+#[test]
+fn copied_finally_none_continue_heads_match_cpython() {
+    for (filename, source) in [
+        (
+            "while_is_not_none.py",
+            r"async def consume(items, active, resource, work, close, notify, done):
+    while active:
+        try:
+            await work(resource)
+        except Exception as exc:
+            notify(exc)
+            continue
+        finally:
+            if resource is not None:
+                try:
+                    await close(resource)
+                except Exception as error:
+                    notify(error)
+    return resource
+",
+        ),
+        (
+            "while_is_none.py",
+            r"async def consume(items, active, resource, work, close, notify, done):
+    while active:
+        try:
+            await work(resource)
+        except Exception as exc:
+            notify(exc)
+            continue
+        finally:
+            if resource is None:
+                try:
+                    await close(resource)
+                except Exception as error:
+                    notify(error)
+    return resource
+",
+        ),
+        (
+            "for_name.py",
+            r"async def consume(items, active, resource, work, close, notify, done):
+    for unused in items:
+        try:
+            await work(resource)
+        except Exception as exc:
+            notify(exc)
+            continue
+        finally:
+            if resource:
+                try:
+                    await close(resource)
+                except Exception as error:
+                    notify(error)
+    return resource
+",
+        ),
+        (
+            "while_is_not_none_suffix_control.py",
+            r"async def consume(items, active, resource, work, close, notify, done):
+    while active:
+        try:
+            await work(resource)
+        except Exception as exc:
+            notify(exc)
+            continue
+        finally:
+            if resource is not None:
+                try:
+                    await close(resource)
+                except Exception as error:
+                    notify(error)
+            done(resource)
+    return resource
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

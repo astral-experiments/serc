@@ -210,11 +210,20 @@ pub(super) struct CopiedManagerReturnNonePrefix {
 #[derive(Debug)]
 pub(super) struct CopiedManagerReturnCompaction {
     pub(super) ordinary_try_pops: usize,
-    pub(super) cleanup: [Instruction; 7],
+    pub(super) cleanup: Vec<Instruction>,
     pub(super) earlier_cleanup: Option<[Instruction; 7]>,
+    pub(super) constant_return_prefix: Option<ConstantManagerReturnPrefix>,
     pub(super) pop: Instruction,
     pub(super) load: Instruction,
     pub(super) condition: Instruction,
+}
+
+/// Exact non-preserving return cleanup before its manager's omitted POP.
+#[derive(Debug)]
+pub(super) struct ConstantManagerReturnPrefix {
+    pub(super) authored_nop: Instruction,
+    pub(super) instructions: Vec<Instruction>,
+    pub(super) missing_null_pops: usize,
 }
 
 /// Original constant-return cleanup, including NULL records omitted under a manager.
@@ -5828,27 +5837,33 @@ impl LayoutAssembler {
 
         let condition_index = marker.checked_sub(1)?;
         let load_index = marker.checked_sub(2)?;
-        let start = load_index.checked_sub(7)?;
-        if array_start > start
-            || jump_targets
-                .iter()
-                .chain(&self.exception_owner_provenance.source_boundaries)
-                .chain(&self.exception_owner_provenance.block_boundaries)
-                .any(|label| {
-                    positions
-                        .get(label)
-                        .is_some_and(|position| start < *position && *position <= marker)
-                })
-        {
-            return None;
-        }
         let condition = *instructions.get(condition_index)?;
         let load = *instructions.get(load_index)?;
         let mut origins = self
             .exception_owner_provenance
             .copied_manager_return_compactions
             .iter()
-            .filter(|origin| {
+            .filter_map(|origin| {
+                let start = load_index.checked_sub(origin.cleanup.len())?;
+                let prefix_start = start.checked_sub(
+                    origin
+                        .constant_return_prefix
+                        .as_ref()
+                        .map_or(0, |prefix| prefix.instructions.len()),
+                )?;
+                if array_start > prefix_start
+                    || jump_targets
+                        .iter()
+                        .chain(&self.exception_owner_provenance.source_boundaries)
+                        .chain(&self.exception_owner_provenance.block_boundaries)
+                        .any(|label| {
+                            positions.get(label).is_some_and(|position| {
+                                prefix_start < *position && *position <= marker
+                            })
+                        })
+                {
+                    return None;
+                }
                 let mut expected_load = origin.load;
                 expected_load
                     .local_policy
@@ -5856,16 +5871,16 @@ impl LayoutAssembler {
                 if load.opcode == LOAD_FAST_BORROW {
                     expected_load.opcode = LOAD_FAST_BORROW;
                 }
-                *condition == origin.condition
-                    && *load == expected_load
-                    && origin.pop.opcode == NOP
-                    && origin.pop.fusion_policy.is_converted_pop_block()
-                    && origin.pop.exception_policy() == super::ExceptionPolicy::EXCLUDE_ALWAYS
-                    && instructions[start..load_index]
+                if *condition != origin.condition
+                    || *load != expected_load
+                    || origin.pop.opcode != NOP
+                    || !origin.pop.fusion_policy.is_converted_pop_block()
+                    || origin.pop.exception_policy() != super::ExceptionPolicy::EXCLUDE_ALWAYS
+                    || !instructions[start..load_index]
                         .iter()
-                        .zip(origin.cleanup)
-                        .all(|(actual, expected)| **actual == expected)
-                    && origin.earlier_cleanup.is_none_or(|cleanup| {
+                        .zip(&origin.cleanup)
+                        .all(|(actual, expected)| **actual == *expected)
+                    || !origin.earlier_cleanup.is_none_or(|cleanup| {
                         start.checked_sub(cleanup.len()).is_some_and(|earlier| {
                             array_start <= earlier
                                 && instructions[earlier..start]
@@ -5883,16 +5898,46 @@ impl LayoutAssembler {
                                     })
                         })
                     })
+                {
+                    return None;
+                }
+                if let Some(prefix) = &origin.constant_return_prefix {
+                    if tail.post_compaction_fusions != 0
+                        || prefix.authored_nop.opcode != NOP
+                        || prefix
+                            .instructions
+                            .first()
+                            .is_none_or(|first| first.location != prefix.authored_nop.location)
+                        || !instructions[prefix_start..start]
+                            .iter()
+                            .zip(&prefix.instructions)
+                            .enumerate()
+                            .all(|(offset, (actual, expected))| {
+                                let mut expected = *expected;
+                                if offset == 0 {
+                                    expected.local_policy.add_hidden_exception_owner_slots(1);
+                                }
+                                **actual == expected
+                            })
+                    {
+                        return None;
+                    }
+                }
+                Some((origin, start, prefix_start))
             });
-        let origin = origins.next()?;
+        let (origin, start, prefix_start) = origins.next()?;
         if origins.next().is_some() {
             return None;
         }
         // The prefix must contain only the known LOAD_GLOBAL and local-pair folds.
         // In particular, no unrelated erased POP can shift the manager's old cells.
         let mut prefix_tail = ExceptionOwnerTail::default();
-        for instruction in &instructions[array_start..start] {
-            if instruction.local_policy.hidden_exception_owner_slots() != 0
+        for (offset, instruction) in instructions[array_start..start].iter().enumerate() {
+            let authored_return_slots = usize::from(
+                origin.constant_return_prefix.is_some() && array_start + offset == prefix_start,
+            );
+            if usize::from(instruction.local_policy.hidden_exception_owner_slots())
+                != authored_return_slots
                 || instruction.pre_fold_extra_instructions() != 0
                 || instruction.exception_policy() != super::ExceptionPolicy::NoneUnchanged
                 || instruction.opcode == NOP
@@ -5923,19 +5968,30 @@ impl LayoutAssembler {
             }
             true
         } else {
-            // The manager's omitted POP is immediately before these seven records;
-            // the optional ordinary-try POP and captured finally POP follow them.
+            // The manager's omitted POP immediately precedes its cleanup records.
+            // Constant returns can omit earlier handler/try POPs before the prelude;
+            // the optional outer ordinary-try POP and captured finally POP follow it.
             // These original POP records are NULL before compaction removes them.
             let original_start = start
                 .checked_add(prefix_tail.early_removals)?
                 // A preceding captured manager contributes its own omitted POP.
                 .checked_add(usize::from(origin.earlier_cleanup.is_some()))?
+                .checked_add(
+                    origin
+                        .constant_return_prefix
+                        .as_ref()
+                        .map_or(0, |prefix| prefix.missing_null_pops),
+                )?
                 .checked_add(1)?;
-            match marker.checked_sub(original_start)? {
-                0..=6 => true,
-                7 => false,
-                8 if origin.ordinary_try_pops == 1 => false,
-                _ => return None,
+            let source = marker.checked_sub(original_start)?;
+            if source < origin.cleanup.len() {
+                true
+            } else if source == origin.cleanup.len()
+                || (source == origin.cleanup.len() + 1 && origin.ordinary_try_pops == 1)
+            {
+                false
+            } else {
+                return None;
             }
         };
         let region = self.uniform_exception_owner(start, load_index, positions)?;

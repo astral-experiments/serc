@@ -332,3 +332,80 @@ fn preserves_value_match_join_guard_and_continuation_boundaries() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn preserves_manager_pops_at_original_match_joins() {
+    for (filename, source) in [
+        (
+            "class_as_with_returns.py",
+            r"def f(subject, manager, First, Second, make):
+    with manager:
+        match subject:
+            case First() as first:
+                return make(first)
+            case Second() as second:
+                return make(second)
+",
+        ),
+        (
+            "sequence_with_raise_default.py",
+            r"def f(subject, manager, result, make):
+    with manager:
+        match subject:
+            case [record]:
+                result.value = make(record)
+                result.cursor = record.cursor
+            case _:
+                raise ValueError(subject)
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn keeps_match_manager_donor_boundaries() {
+    for (filename, source) in [
+        (
+            "class_as_with_guard_control.py",
+            r"def f(subject, manager, First, Second, make):
+    with manager:
+        match subject:
+            case First() as first:
+                return make(first)
+            case Second() as second if second.ready:
+                return make(second)
+",
+        ),
+        (
+            "sequence_with_two_successes_control.py",
+            r"def f(subject, manager, result, make):
+    with manager:
+        match subject:
+            case [record]:
+                result.value = make(record)
+                result.cursor = record.cursor
+            case [left, right]:
+                result.value = left
+                result.cursor = right
+            case _:
+                raise ValueError(subject)
+",
+        ),
+        (
+            "sequence_with_nonterminal_fallback_control.py",
+            r"def f(subject, manager, result, make):
+    with manager:
+        match subject:
+            case [record]:
+                result.value = make(record)
+                result.cursor = record.cursor
+            case _:
+                make(subject)
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
