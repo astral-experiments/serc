@@ -285,3 +285,85 @@ fn matches_cpython_guarded_linear_cleanup_before_continue() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn sync_continue_copies_preserve_nested_pass_cleanup() {
+    for (filename, source) in [
+        (
+            "sync_iterator_nested_cleanup_continue_target.py",
+            r"def fetch_retry(attempts, open_resource, fetch, exists, remove, retry):
+    for attempt in attempts:
+        path = None
+        try:
+            with open_resource() as resource:
+                path = resource.name
+            return fetch(path), None
+        except Exception:
+            if retry(attempt):
+                continue
+            return None, None
+        finally:
+            if path and exists(path):
+                try:
+                    remove(path)
+                except Exception:
+                    pass
+",
+        ),
+        (
+            "sync_iterator_linear_cleanup_continue_control.py",
+            r"def fetch_retry(attempts, open_resource, fetch, exists, remove, retry):
+    for attempt in attempts:
+        path = None
+        try:
+            with open_resource() as resource:
+                path = resource.name
+            return fetch(path), None
+        except Exception:
+            if retry(attempt):
+                continue
+            return None, None
+        finally:
+            if path and exists(path):
+                remove(path)
+",
+        ),
+        (
+            "sync_while_nested_cleanup_continue_target.py",
+            r"def copy_retry(run, report, remove, atomic):
+    while True:
+        try:
+            run()
+        except TimeoutError as error:
+            report(error)
+            continue
+        else:
+            break
+        finally:
+            if atomic:
+                try:
+                    remove()
+                except FileNotFoundError:
+                    pass
+",
+        ),
+        (
+            "sync_while_linear_cleanup_continue_control.py",
+            r"def copy_retry(run, report, remove, atomic):
+    while True:
+        try:
+            run()
+        except TimeoutError as error:
+            report(error)
+            continue
+        else:
+            break
+        finally:
+            if atomic:
+                remove()
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

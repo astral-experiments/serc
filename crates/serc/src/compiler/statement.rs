@@ -6630,12 +6630,46 @@ impl Compiler<'_> {
                         .finally
                         .active_return_finally_contexts
                         .truncate(context_index);
+                    // A bare or None return has no saved value above the exit callable.
+                    // These original scope depths still require inner managers to finish
+                    // before the iterators surrounding them, then the enclosing finally.
+                    let none_return_unwinds_inner_managers = !preserve_tos
+                        && !return_is_overridden
+                        && matches!(
+                            statement.value.as_deref(),
+                            None | Some(Expr::NoneLiteral(_))
+                        )
+                        && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+                        && context_index == 0
+                        && return_finally_contexts.len() == 1
+                        && finally_context.handler_depth == 0
+                        && self.control.exceptions.active_exception_group_handlers == 0
+                        && next_with > finally_context.with_depth
+                        && finally_context.loop_depth < next_loop
+                        && self.control.withs.active_with_exits
+                            [finally_context.with_depth..next_with]
+                            .iter()
+                            .all(|manager| {
+                                manager.loop_depth == next_loop
+                                    && manager.normal_finally_depth == 0
+                                    && self.control.loops.contexts
+                                        [finally_context.loop_depth..next_loop]
+                                        .iter()
+                                        .all(|iterator| {
+                                            iterator.with_depth == finally_context.with_depth
+                                                && iterator.finally_end_depth == 0
+                                                && iterator.exception_region_depth
+                                                    > finally_context.exception_region_depth
+                                                && iterator.exception_region_depth
+                                                    <= manager.exception_region_depth
+                                        })
+                            });
                     // These managers were all entered after the remaining loops. Their
                     // exit callables must be removed before the surrounding iterators.
                     // Keep the separate handler and copied-finally unwind paths unchanged.
                     let can_unwind_inner_managers_first =
                         self.context.target_specific_rules_enabled()
-                            && preserve_tos
+                            && (preserve_tos || none_return_unwinds_inner_managers)
                             && handler_count == 0
                             && !nested_call_finally_return
                             && self.control.finally.active_finally_end_blocks == 0
@@ -6655,7 +6689,10 @@ impl Compiler<'_> {
                         && self.control.withs.active_with_exits
                             [finally_context.with_depth..next_with]
                             .iter()
-                            .all(|manager| !manager.is_async && manager.loop_depth == next_loop);
+                            .all(|manager| {
+                                (!manager.is_async || none_return_unwinds_inner_managers)
+                                    && manager.loop_depth == next_loop
+                            });
                     // A coroutine can enter managers on both sides of one retry iterator.
                     // Its stored manager depth separates the inner exit callables from
                     // managers that must remain on the stack until that iterator is popped.
@@ -6709,6 +6746,20 @@ impl Compiler<'_> {
                     let mut starts = Vec::new();
                     let remaining_with = if let Some(from_depth) = early_manager_start {
                         starts = self.emit_with_unwind(from_depth, next_with, preserve_tos)?;
+                        if none_return_unwinds_inner_managers
+                            && let Some(region_starts) = &mut handler_region_unwind_starts
+                        {
+                            // Inner tries have already ended when this manager exits.
+                            // Record that boundary before the later iterator cleanup
+                            // can fill the same still-empty region-start slots.
+                            for unwind in &starts {
+                                let depth = self.control.withs.active_with_exits[unwind.index]
+                                    .exception_region_depth;
+                                for region_start in &mut region_starts[depth..] {
+                                    region_start.get_or_insert(unwind.start);
+                                }
+                            }
+                        }
                         from_depth
                     } else {
                         next_with
@@ -6737,6 +6788,60 @@ impl Compiler<'_> {
                                         == self.control.withs.active_with_exits[remaining_with - 1]
                                             .exception_region_depth
                             });
+                    // This shared inner-cleanup join has no unique line donor. The
+                    // iterator discard precedes the outer try's located SETUP, so it
+                    // must remain artificial when later cleanup blocks are compacted.
+                    let preserve_shared_iterator_location =
+                        self.context.target_specific_rules_enabled()
+                            && !preserve_tos
+                            && !return_is_overridden
+                            && matches!(
+                                statement.value.as_deref(),
+                                None | Some(Expr::NoneLiteral(_))
+                            )
+                            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                                == 0
+                            && handler_count == 0
+                            && context_index == 0
+                            && return_finally_contexts.len() == 2
+                            && self.control.withs.active_with_exits.is_empty()
+                            && self.control.exceptions.active_try_marker_slots.is_empty()
+                            && self.control.exceptions.active_exception_group_handlers == 0
+                            && self.control.finally.active_finally_end_blocks == 0
+                            && self.control.finally.active_normal_finally_bodies == 0
+                            && self.control.finally.active_copied_finally_bodies == 0
+                            && self
+                                .control
+                                .finally
+                                .preserved_return_value_contexts
+                                .is_empty()
+                            && next_loop == finally_context.loop_depth + 1
+                            && self
+                                .control
+                                .loops
+                                .contexts
+                                .get(finally_context.loop_depth)
+                                .is_some_and(|iterator| {
+                                    iterator.iterator_cleanup == IteratorCleanup::Sync
+                                        && iterator.with_depth == 0
+                                        && iterator.finally_end_depth == 0
+                                        && iterator.exception_region_depth
+                                            == finally_context.exception_region_depth + 1
+                                })
+                            && return_finally_contexts.get(1).is_some_and(|inner| {
+                                inner.handler_depth == 0
+                                    && inner.with_depth == 0
+                                    && inner.loop_depth == next_loop
+                                    && inner.exception_region_depth
+                                        == finally_context.exception_region_depth + 1
+                                    && copied_finally_has_guarded_pass_cleanup(&inner.body)
+                            })
+                            && matches!(finally_context.body.as_slice(), [Stmt::Try(cleanup)]
+                            if !cleanup.is_star
+                                && cleanup.finalbody.is_empty()
+                                && !cleanup.handlers.is_empty())
+                            && self.assembler.location() == SourceLocation::NONE
+                            && self.assembler.at_original_unconditional_join();
                     let iterator_cleanup_start = self.assembler.label();
                     self.assembler.mark(iterator_cleanup_start);
                     self.emit_return_loop_iterator_cleanup(
@@ -6762,6 +6867,11 @@ impl Compiler<'_> {
                             None
                         },
                     )?;
+                    if preserve_shared_iterator_location {
+                        // The proven range contains one sync iterator and no saved value:
+                        // emit_return_loop_iterator_cleanup emitted exactly this POP_TOP.
+                        self.assembler.preserve_last_no_location();
+                    }
                     let iterator_cleanup_end = self.assembler.label();
                     self.assembler.mark(iterator_cleanup_end);
                     if preserve_tos
@@ -11229,7 +11339,20 @@ impl Compiler<'_> {
                                         && self.copied_finally_starts_local_none_cleanup(
                                             &context.body,
                                         ),
-                                )))
+                                ))
+                            || (self.context.target_specific_rules_enabled()
+                                && self.unit.flags
+                                    & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                                    == 0
+                                && self.control.loops.contexts.last().is_some_and(
+                                    |loop_context| {
+                                        matches!(
+                                            loop_context.iterator_cleanup,
+                                            IteratorCleanup::None | IteratorCleanup::Sync
+                                        )
+                                    },
+                                )
+                                && copied_finally_has_guarded_pass_cleanup(&context.body)))
                         && matches!(context.body.last(), Some(Stmt::If(tail))
                             if tail.elif_else_clauses.is_empty()
                                 && !suite_contains_loop_break(&tail.body))
@@ -28118,6 +28241,41 @@ fn assertion_has_only_runtime_tests(expression: &Expr) -> bool {
                 && fold_constant(expression).is_none()
         }
     }
+}
+
+/// Certifies a guarded cleanup call whose only recovery arm falls through after `pass`.
+///
+/// The false edge leaves before the nested try begins, while its call and handler keep
+/// ordinary try lowering. The caller still proves that no cleanup remains before the
+/// pending continue; folded tests and additional cleanup blocks keep their old path.
+fn copied_finally_has_guarded_pass_cleanup(body: &[Stmt]) -> bool {
+    let [Stmt::If(guard)] = body else {
+        return false;
+    };
+    let [Stmt::Try(cleanup)] = guard.body.as_slice() else {
+        return false;
+    };
+    let [handler] = cleanup.handlers.as_slice() else {
+        return false;
+    };
+    let Some(handler) = handler.as_except_handler() else {
+        return false;
+    };
+    guard.elif_else_clauses.is_empty()
+        && condition_has_linear_runtime_leaves(&guard.test)
+        && !expression_suspends_current_scope(&guard.test)
+        && !cleanup.is_star
+        && cleanup.orelse.is_empty()
+        && cleanup.finalbody.is_empty()
+        && matches!(cleanup.body.as_slice(), [Stmt::Expr(expression)]
+            if matches!(expression.value.as_ref(), Expr::Call(_))
+                && !expression_contains_inline_branch(&expression.value)
+                && !expression_suspends_current_scope(&expression.value))
+        && handler.name.is_none()
+        && handler.type_.as_deref().is_some_and(|test| {
+            !expression_contains_inline_branch(test) && !expression_suspends_current_scope(test)
+        })
+        && matches!(handler.body.as_slice(), [Stmt::Pass(_)])
 }
 
 /// A terminal runtime guard can bypass a closed, linear cleanup and reach the loop.

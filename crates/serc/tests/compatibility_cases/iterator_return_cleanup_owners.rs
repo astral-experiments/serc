@@ -250,3 +250,84 @@ fn suppressed_manager_return_keeps_try_owner_before_following_break() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn none_returns_unwind_inner_managers_before_pending_finally_iterators() {
+    for (filename, source) in [
+        (
+            "manager_inside_sync_iterator_bare_return_finally.py",
+            r"async def run(items, manager, ready, cleanup):
+    try:
+        for item in items:
+            async with manager:
+                if ready(item):
+                    return
+    finally:
+        cleanup()
+",
+        ),
+        (
+            "manager_inside_async_iterator_bare_return_finally.py",
+            r"async def run(items, manager, ready, cleanup):
+    try:
+        async for item in items:
+            async with manager:
+                if ready(item):
+                    return
+    finally:
+        cleanup()
+",
+        ),
+        (
+            "manager_inside_sync_iterator_none_return_finally.py",
+            r"def run(items, manager, ready, cleanup):
+    try:
+        for item in items:
+            with manager:
+                if ready(item):
+                    return None
+    finally:
+        cleanup()
+",
+        ),
+        (
+            "manager_inside_async_iterator_nested_try_none_return_finally.py",
+            r"async def run(items, manager, ready, work, recover, cleanup):
+    try:
+        async for item in items:
+            with manager:
+                if ready(item):
+                    try:
+                        await work(item)
+                        return
+                    except ValueError as error:
+                        recover(error)
+                await work(item)
+                return
+    except Exception:
+        raise
+    finally:
+        cleanup()
+",
+        ),
+        (
+            "manager_inside_async_iterator_no_inner_try_none_return_control.py",
+            r"async def run(items, manager, ready, work, recover, cleanup):
+    try:
+        async for item in items:
+            with manager:
+                if ready(item):
+                    await work(item)
+                    return
+                await work(item)
+                return
+    except Exception:
+        raise
+    finally:
+        cleanup()
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
