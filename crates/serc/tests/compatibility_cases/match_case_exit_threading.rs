@@ -688,3 +688,14 @@ fn wildcard_match_try_exit_await_first_arm_control() {
         );
     common::assert_matches_cpython_marshal(&source, "wildcard_match_try_exit_await_first.py");
 }
+
+#[test]
+fn matches_cpython_bare_pass_match_success_threading() {
+    let cases: std::collections::BTreeMap<String, String> = serde_json::from_str(include_str!(
+        "fixtures/bare_pass_match_success_threading.json"
+    ))
+    .expect("public bare Pass match cases are filename-to-source strings");
+    for (filename, source) in cases {
+        common::assert_matches_cpython_marshal(&source, &filename);
+    }
+}

@@ -320,3 +320,14 @@ fn matches_cpython_nested_mapping_capture_guard_cleanup() {
         common::assert_matches_cpython_marshal(&source, &filename);
     }
 }
+
+#[test]
+fn matches_cpython_high_local_mapping_capture_guards() {
+    let cases: std::collections::BTreeMap<String, String> = serde_json::from_str(include_str!(
+        "fixtures/mapping_capture_high_local_guards.json"
+    ))
+    .expect("public high-local capture cases are filename-to-source strings");
+    for (filename, source) in cases {
+        common::assert_matches_cpython_marshal(&source, &filename);
+    }
+}

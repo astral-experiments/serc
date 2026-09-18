@@ -773,7 +773,19 @@ impl Compiler<'_> {
                                     && matches!(case.pattern, Pattern::MatchValue(_)))
                                     || !context.fail_pop.is_empty()))
                         {
-                            self.assembler.preserve_inlined_jump_nop(success_exit);
+                            if copied_subject
+                                && case.guard.is_none()
+                                && matches!(case.body.as_slice(), [Stmt::Pass(_)])
+                                && !context.fail_pop.is_empty()
+                                && !self.control.falls_through_to_loop_backedge()
+                            {
+                                // The subject POP keeps this success array nonempty. Thread
+                                // its exit before restoring the authored Pass line's NOP.
+                                self.assembler
+                                    .preserve_redundant_jump_nop_after_threading(success_exit);
+                            } else {
+                                self.assembler.preserve_inlined_jump_nop(success_exit);
+                            }
                             // CPython keeps this retained success-exit NOP on the physical
                             // fallthrough for irrefutable explicit-global captures. Refutable
                             // and local captures keep the ordinary borrowed-load barrier.

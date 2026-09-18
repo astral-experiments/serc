@@ -99,3 +99,50 @@ fn constant_manager_return_cleanup_owners_match_cpython() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn copied_finally_retained_manager_return_owners_match_cpython() {
+    for (filename, source) in [
+        (
+            "copied_finally_inner_and_outer_manager.py",
+            r"def exercise(outer, inner, value):
+    with outer:
+        try:
+            with inner():
+                if value is not None:
+                    work(value)
+                    return
+                work(None)
+            after()
+        except Exception as error:
+            if value is not None:
+                record(error)
+            raise
+        finally:
+            if value is not None:
+                finish(value)
+",
+        ),
+        (
+            "copied_finally_inner_manager_only.py",
+            r"def exercise(outer, inner, value):
+    try:
+        with inner():
+            if value is not None:
+                work(value)
+                return
+            work(None)
+        after()
+    except Exception as error:
+        if value is not None:
+            record(error)
+        raise
+    finally:
+        if value is not None:
+            finish(value)
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

@@ -25,7 +25,7 @@ use crate::assembler::OptimizationPipeline;
 use crate::assembler::block_graph::ItemMut;
 use crate::assembler::ir::{ThreadedBorrowEntries, ThreadedBorrowSnapshot};
 use crate::target::{
-    is_unconditional_jump,
+    is_conditional_jump, is_unconditional_jump,
     opcodes::{
         CALL, CALL_KW, END_FOR, GET_AWAITABLE, GET_ITER, POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE,
         TO_BOOL,
@@ -53,6 +53,8 @@ pub(super) struct RetainedFinallyOrigin {
     source_prefix: Vec<Instruction>,
     // A recorded try-range end can split the physical graph without ending this array.
     source_exit_alias: Option<Label>,
+    // The setup-only source certificate also requires this original populated join.
+    setup_join: Option<(Label, Instruction)>,
     target_labels: Vec<Label>,
     target: Label,
     jump_location: crate::assembler::SourceLocation,
@@ -286,6 +288,57 @@ impl OptimizationPipeline {
         }
     }
 
+    /// Certifies a populated ordinary-try body before its synthetic range-end split.
+    fn ordinary_try_borrow_source(&self, items: &[Item], end: Label) -> Option<Label> {
+        let labels = items
+            .iter()
+            .take_while(|item| matches!(item, Item::Label(_)))
+            .filter_map(|item| match item {
+                Item::Label(label) => Some(*label),
+                Item::Instruction(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let mut setups = labels.iter().filter_map(|label| {
+            self.exception_owner_provenance
+                .ordinary_try_setups
+                .get(label)
+                .map(|handler| (*label, *handler))
+        });
+        let (source, handler) = setups.next()?;
+        let mut regions = self.exception_regions.iter().filter(|region| {
+            region.start == source && region.end == end && region.target == handler
+        });
+        let region = regions.next()?;
+        if setups.next().is_some()
+            || regions.next().is_some()
+            || region.is_scope_fallback
+            || region.preserve_lasti
+            || labels.last() != Some(&source)
+            || self.exception_owner_provenance.setups.iter()
+                .filter(|(label, _)| *label == source).count() != 1
+            || labels.iter().any(|label| {
+                self.exception_owner_provenance.block_boundaries.contains(label)
+                    || self.exception_owner_provenance.source_boundaries.contains(label)
+                    || self.preserved_block_boundaries.contains(label)
+                    || self.borrow_unreachable_blocks.contains(label)
+                    || self.borrow_jump_entry_labels.contains(label)
+                    || self.borrow_finally_entries.contains_key(label)
+                    || self.exception_regions.iter().any(|region| region.target == *label)
+                    || self.graph.iter_items().filter(|item| **item == Item::Label(*label)).count() != 1
+                    || self.graph.iter_items().any(|item| {
+                        matches!(item, Item::Instruction(instruction)
+                            if matches!(instruction.operand(), Operand::Forward(target) | Operand::Backward(target)
+                                if target == *label))
+                    })
+            })
+        {
+            return None;
+        }
+        // The caller authenticates the normal exit and snapshots every live source
+        // instruction. A setup label alone never admits an empty source array.
+        Some(source)
+    }
+
     /// Records exact original arrays before jump copying can replace either endpoint.
     pub(super) fn capture_retained_finally_origins(&self) -> Vec<RetainedFinallyOrigin> {
         if self.borrow_finally_entries.is_empty() {
@@ -309,6 +362,45 @@ impl OptimizationPipeline {
                 {
                     return None;
                 }
+                let setup_source = if let [Item::Label(alias)] = leading
+                    && let Operand::Forward(target) = jump.operand()
+                    && self.exception_owner_provenance.compound_try_owner_exits
+                        .iter().filter(|origin| **origin == (*alias, target)).count() == 1
+                    && let Some(source_items) =
+                        block_index.checked_sub(1).and_then(|index| blocks.get(index)).copied()
+                {
+                    self.ordinary_try_borrow_source(source_items, *alias)
+                } else {
+                    None
+                };
+                // A located pass can transfer its line to the normal jump and
+                // survive as that jump's DirectTarget NOP. Its setup and range-end
+                // aliases then share one original source, with no live prefix.
+                let direct_setup_source = if jump.jump_policy.retained_nop()
+                    == crate::assembler::ir::RetainedJumpNop::DirectTarget
+                    && jump.location.line >= 0
+                    && leading.iter().all(|item| matches!(item, Item::Label(_)))
+                    && let Some(Item::Label(alias)) = leading.last()
+                    && let Operand::Forward(target) = jump.operand()
+                    && self.exception_owner_provenance.compound_try_owner_exits
+                        .iter().filter(|origin| **origin == (*alias, target)).count() == 1
+                    && !self.exception_owner_provenance.block_boundaries.contains(alias)
+                    && !self.exception_owner_provenance.source_boundaries.contains(alias)
+                    && !self.preserved_block_boundaries.contains(alias)
+                    && !self.borrow_unreachable_blocks.contains(alias)
+                    && !self.borrow_jump_entry_labels.contains(alias)
+                    && !self.borrow_finally_entries.contains_key(alias)
+                    && !self.exception_regions.iter().any(|region| region.target == *alias)
+                    && !self.graph.iter_items().any(|item| {
+                        matches!(item, Item::Instruction(instruction)
+                            if matches!(instruction.operand(), Operand::Forward(target) | Operand::Backward(target)
+                                if target == *alias))
+                    })
+                {
+                    self.ordinary_try_borrow_source(&leading[..leading.len() - 1], *alias)
+                } else {
+                    None
+                };
                 // A try-range end can split a populated original source array.
                 // Its leading exception aliases do not create another CPython block.
                 // Capture the complete span; the checks below require exactly one
@@ -331,17 +423,21 @@ impl OptimizationPipeline {
                     })
                     && let Some(source_items) =
                         block_index.checked_sub(1).and_then(|index| blocks.get(index)).copied()
-                    && source_items.iter().take_while(|item| matches!(item, Item::Label(_))).any(|item| {
-                        matches!(item, Item::Label(source)
-                            if self.exception_owner_provenance.source_boundaries.contains(source)
-                                && self.exception_owner_provenance.block_boundaries.contains(source))
-                    })
+                    && (setup_source.is_some()
+                        || source_items.iter().take_while(|item| matches!(item, Item::Label(_))).any(|item| {
+                            matches!(item, Item::Label(source)
+                                if self.exception_owner_provenance.source_boundaries.contains(source)
+                                    && self.exception_owner_provenance.block_boundaries.contains(source))
+                        }))
                     && source_items.iter().any(|item| matches!(item, Item::Instruction(_)))
                 {
                     Some(*alias)
                 } else {
                     None
                 };
+                let setup_source = setup_source
+                    .filter(|_| source_exit_alias.is_some())
+                    .or(direct_setup_source);
                 let leading = if source_exit_alias.is_some() {
                     blocks[block_index - 1]
                 } else {
@@ -381,7 +477,21 @@ impl OptimizationPipeline {
                     {
                         continue;
                     }
-                    if matches!(instruction.opcode, NOP | NOT_TAKEN)
+                    // A sole authored, located NOP can itself survive as the whole
+                    // ordinary-try body. Exact replay must keep that instruction;
+                    // removed POP_BLOCKs and label-only sources remain excluded.
+                    let retained_source_nop = setup_source.is_some()
+                        && source_exit_alias.is_some()
+                        && leading.len() == source_label_count + 1
+                        && instruction.opcode == NOP
+                        && instruction.operand() == Operand::Value(0)
+                        && instruction.location.line >= 0
+                        && !instruction.fusion_policy.is_converted_pop_block()
+                        && instruction.pre_fold_extra_instructions() == 0
+                        && instruction.local_policy.hidden_exception_owner_slots() == 0
+                        && instruction.jump_policy.retained_nop()
+                            == crate::assembler::ir::RetainedJumpNop::None;
+                    if (matches!(instruction.opcode, NOP | NOT_TAKEN) && !retained_source_nop)
                         || !matches!(instruction.operand(), Operand::Value(_))
                         || ends_scope(instruction.opcode)
                         || instruction.jump_policy.borrow_empty_block()
@@ -415,6 +525,25 @@ impl OptimizationPipeline {
                 };
                 let target_block = self.graph.label_block(target)?;
                 let target_items = self.graph[target_block].items();
+                let setup_join = if setup_source.is_some() {
+                    let mut originals = self.exception_owner_provenance
+                        .original_normal_finally_arrays.iter().filter(|origin| origin.entry == target);
+                    let original = originals.next()?;
+                    if originals.next().is_some() || !original.incoming.contains(jump) {
+                        return None;
+                    }
+                    let (join, first) = original.borrow_join?;
+                    if !target_items.iter().any(|item| {
+                        matches!(item, Item::Instruction(condition)
+                            if is_conditional_jump(condition.opcode)
+                                && condition.operand() == Operand::Forward(join))
+                    }) || !self.original_borrow_join_survives(join, first) {
+                        return None;
+                    }
+                    Some((join, first))
+                } else {
+                    None
+                };
                 let first_instruction = target_items
                     .iter()
                     .position(|item| matches!(item, Item::Instruction(_)))?;
@@ -446,10 +575,11 @@ impl OptimizationPipeline {
                 };
                 // Consecutive exception aliases may share one original array. A second
                 // original boundary or an uncertified preserved boundary is not an alias.
-                for (labels, preserved_source) in [
-                    (&source_labels, preserved_else_source),
-                    (&target_labels, None),
+                for (labels, preserved_source, setup_source) in [
+                    (&source_labels, preserved_else_source, setup_source),
+                    (&target_labels, None, None),
                 ] {
+                    let expected_boundaries = usize::from(setup_source.is_none());
                     if labels
                         .iter()
                         .filter(|label| {
@@ -458,7 +588,7 @@ impl OptimizationPipeline {
                                 .contains(*label)
                         })
                         .count()
-                        != 1
+                        != expected_boundaries
                         || labels.iter().any(|label| {
                             self.preserved_block_boundaries.contains(label)
                                 && Some(*label) != preserved_source
@@ -515,6 +645,7 @@ impl OptimizationPipeline {
                     source_labels,
                     source_prefix,
                     source_exit_alias,
+                    setup_join,
                     target_labels,
                     target,
                     jump_location: jump.location,
@@ -522,6 +653,21 @@ impl OptimizationPipeline {
                 })
             })
             .collect()
+    }
+
+    /// Requires the same populated conditional join captured before exit emission.
+    fn original_borrow_join_survives(&self, join: Label, first: Instruction) -> bool {
+        let Some(block) = self.graph.label_block(join) else {
+            return false;
+        };
+        self.graph[block]
+            .items()
+            .iter()
+            .find_map(|item| match item {
+                Item::Instruction(instruction) => Some(*instruction == first),
+                Item::Label(_) => None,
+            })
+            == Some(true)
     }
 
     /// Keeps only original normal edges whose source and target arrays survive.
@@ -543,6 +689,12 @@ impl OptimizationPipeline {
             })
             .collect::<FxHashMap<_, _>>();
         for origin in origins {
+            if origin
+                .setup_join
+                .is_some_and(|(join, first)| !self.original_borrow_join_survives(join, first))
+            {
+                continue;
+            }
             let Some(start) = origin
                 .source_labels
                 .first()
@@ -3109,8 +3261,13 @@ impl OptimizationPipeline {
                             == crate::assembler::ir::RetainedJumpNop::DirectTarget
                         && finally_jump_sources.get(block).copied().unwrap_or(false)
                         && jump_entry_blocks.get(block + 1).copied().unwrap_or(false)
+                        // Earlier physical instructions can precede the exact
+                        // original source labels after block merging. Replay has
+                        // authenticated the final source label and its sole NOP.
                         && items[blocks[block].clone()]
                             .iter()
+                            .rev()
+                            .take_while(|item| !matches!(item, Item::Label(_)))
                             .filter(|item| matches!(item, Item::Instruction(_)))
                             .count()
                             == 1
@@ -3118,7 +3275,25 @@ impl OptimizationPipeline {
                     // Removing a redundant ordinary jump preserves fallthrough when
                     // its original source still has its complete nonempty prefix.
                     // The same endpoint certificate rejects empty or merged targets.
-                    let erased_finally_entry = !matches!(last.opcode, NOP | NOT_TAKEN)
+                    // A sole surviving authored NOP is populated too, but only
+                    // the exact source/target replay above may admit this route.
+                    // DirectTarget jump surrogates retain their separate policy.
+                    let retained_source_nop = last.opcode == NOP
+                        && last.operand() == Operand::Value(0)
+                        && last.location.line >= 0
+                        && !last.fusion_policy.is_converted_pop_block()
+                        && last.pre_fold_extra_instructions() == 0
+                        && last.local_policy.hidden_exception_owner_slots() == 0
+                        && last.jump_policy.retained_nop()
+                            == crate::assembler::ir::RetainedJumpNop::None
+                        && items[blocks[block].clone()]
+                            .iter()
+                            .filter(|item| matches!(item, Item::Instruction(_)))
+                            .count()
+                            == 1
+                        && original_finally_entry;
+                    let erased_finally_entry = (!matches!(last.opcode, NOP | NOT_TAKEN)
+                        || retained_source_nop)
                         && finally_jump_sources.get(block).copied().unwrap_or(false)
                         && jump_entry_blocks.get(block + 1).copied().unwrap_or(false)
                         && original_finally_entry;

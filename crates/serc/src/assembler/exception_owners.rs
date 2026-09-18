@@ -56,6 +56,7 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) copied_return_truth_prefixes: Vec<CopiedReturnTruthPrefix>,
     pub(super) copied_handler_return_none_prefixes: Vec<(Label, [Instruction; 6])>,
     pub(super) copied_manager_return_none_prefixes: Vec<CopiedManagerReturnNonePrefix>,
+    pub(super) retained_manager_return_none_prefixes: Vec<RetainedManagerReturnNonePrefix>,
     pub(super) copied_manager_return_compactions: Vec<CopiedManagerReturnCompaction>,
     pub(super) uncompacted_conditional_arrays: Vec<UncompactedConditionalArray>,
     pub(super) original_primitive_condition_boundaries: Vec<Instruction>,
@@ -206,6 +207,19 @@ pub(super) struct CopiedManagerReturnNonePrefix {
     pub(super) condition: Instruction,
 }
 
+/// An unchanged conditional return array whose outer manager survives the copied finally.
+#[derive(Debug)]
+pub(super) struct RetainedManagerReturnNonePrefix {
+    pub(super) entry: Instruction,
+    pub(super) prefix: Vec<Instruction>,
+    pub(super) return_offset: usize,
+    pub(super) outer_handler: Label,
+    pub(super) pop: Instruction,
+    pub(super) load: Instruction,
+    pub(super) condition: Instruction,
+    pub(super) marker: Instruction,
+}
+
 /// Exact manager cleanup and first copied-finally test, before either compaction pass.
 #[derive(Debug)]
 pub(super) struct CopiedManagerReturnCompaction {
@@ -238,6 +252,8 @@ pub(super) struct CopiedHandlerCleanup {
     // Exact inner-finally POP removed immediately before the captured local assignment.
     pub(super) assignment_pop: Option<(Label, Instruction)>,
     pub(super) continued_call: Option<([Instruction; 6], Instruction)>,
+    // Direct named-handler continue: the original finalizer POP follows name cleanup.
+    pub(super) continued_attribute_none: Option<([Instruction; 3], Instruction)>,
 }
 
 /// A single-line source None comparison whose three removed records precede late SETUP cleanup.
@@ -273,6 +289,8 @@ pub(super) struct OriginalNormalFinallyArray {
     pub(super) prefix: Vec<Item>,
     pub(super) incoming: Vec<Instruction>,
     pub(super) retained_setup: Option<(Label, Label, Label)>,
+    // Captured before the normal-finally exit is emitted: this join already has code.
+    pub(super) borrow_join: Option<(Label, Instruction)>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2710,6 +2728,7 @@ impl LayoutAssembler {
                                 tail.early_removals,
                                 original.missing_null_pops,
                                 original.continued_call,
+                                original.continued_attribute_none,
                             ));
                         }
                     }
@@ -4253,6 +4272,36 @@ impl LayoutAssembler {
                             },
                         );
                     }
+                    // This source certificate identifies the retained authored return
+                    // NOP and every live prefix record. It proves only this NULL POP cell;
+                    // the generic POP epoch remains unknown after unrelated NOPs.
+                    if instruction.opcode == NOT_TAKEN
+                        && owner_history_exact
+                        && tail.insertions == 0
+                        && tail.late_removals == 0
+                        && tail.post_compaction_fusions == 0
+                        && owners
+                            .get(&instruction_index)
+                            .is_none_or(|owner| !owner.definitive)
+                        && self.retained_manager_return_none_owner(
+                            instruction_index,
+                            original_array_start,
+                            tail,
+                            &indexed_instructions,
+                            &label_positions,
+                            &jump_targets,
+                        )
+                    {
+                        owners.insert(
+                            instruction_index,
+                            ExceptionOwnerDecision {
+                                has_owner: false,
+                                source_region: None,
+                                definitive: true,
+                                override_existing: true,
+                            },
+                        );
+                    }
                     // The original manager POP precedes its cleanup. A later local-load
                     // fusion compacts the live array again, superseding those early slots.
                     if instruction.opcode == NOT_TAKEN
@@ -5278,12 +5327,34 @@ impl LayoutAssembler {
                         && owners
                             .get(&instruction_index)
                             .is_none_or(|decision| !decision.definitive)
-                        && let Some((array, start, end, end_removed, missing, continued_call)) =
-                            copied_handler_prefix
+                        && let Some((
+                            array,
+                            start,
+                            end,
+                            end_removed,
+                            missing,
+                            continued_call,
+                            continued_attribute_none,
+                        )) = copied_handler_prefix
                         && array == original_array_start
                         && end <= instruction_index
                         && tail.early_removals >= end_removed
-                        && (if let Some((prefix, marker)) = continued_call {
+                        && (if let Some((prefix, marker)) = continued_attribute_none {
+                            instruction_index - end == prefix.len()
+                                && *instruction == marker
+                                && indexed_instructions[end..instruction_index]
+                                    .iter()
+                                    .zip(prefix)
+                                    .all(|(actual, mut expected)| {
+                                        if expected.opcode == crate::target::opcodes::LOAD_FAST
+                                            && actual.opcode
+                                                == crate::target::opcodes::LOAD_FAST_BORROW
+                                        {
+                                            expected.opcode = actual.opcode;
+                                        }
+                                        **actual == expected
+                                    })
+                        } else if let Some((prefix, marker)) = continued_call {
                             instruction_index - end == prefix.len()
                                 && *instruction == marker
                                 && indexed_instructions[end..instruction_index]
@@ -5373,6 +5444,28 @@ impl LayoutAssembler {
                         && let Some(removed) = tail.early_removals.checked_add(missing)
                     {
                         let suffix = instruction_index - end + tail.early_removals - end_removed;
+                        // The authenticated direct continue originally emitted its NOP,
+                        // two handler POPs, the four name-cleanup records, then the
+                        // finalizer POP. The exact attribute None prefix appends into
+                        // that last NULL cell; it adds no earlier live or hidden record.
+                        if continued_attribute_none.is_some()
+                            && array == start
+                            && end - start == 4
+                            && end_removed == 1
+                            && missing == 2
+                            && tail.early_removals == end_removed + 3
+                            && instruction_index - array == 1 + missing + end - start
+                        {
+                            owners.insert(
+                                instruction_index,
+                                ExceptionOwnerDecision {
+                                    has_owner: false,
+                                    source_region: None,
+                                    definitive: true,
+                                    override_existing: true,
+                                },
+                            );
+                        }
                         // Equality selects the original NULL finally POP immediately after
                         // cleanup, not its preceding POP_EXCEPT. Its one transferred record
                         // must be the only hidden slot on the immediately following load.
@@ -5821,6 +5914,124 @@ impl LayoutAssembler {
             }
         });
         exact && seen_send && seen_bridge == origin.bridge.is_some()
+    }
+
+    /// Replays only the original NULL POPs of an intact retained-manager return array.
+    fn retained_manager_return_none_owner(
+        &self,
+        marker: usize,
+        array_start: usize,
+        tail: ExceptionOwnerTail,
+        instructions: &[&Instruction],
+        positions: &FxHashMap<Label, usize>,
+        jump_targets: &FxHashSet<Label>,
+    ) -> bool {
+        use crate::target::opcodes::{LOAD_FAST, LOAD_FAST_BORROW};
+
+        let Some(load_index) = marker.checked_sub(2) else {
+            return false;
+        };
+        let Some(entry_index) = array_start.checked_sub(1) else {
+            return false;
+        };
+        if array_start > load_index {
+            return false;
+        }
+        let mut matches = self
+            .exception_owner_provenance
+            .retained_manager_return_none_prefixes
+            .iter()
+            .filter(|origin| {
+                if *instructions[entry_index] != origin.entry
+                    || array_start.checked_add(origin.prefix.len()) != Some(load_index)
+                    || *instructions[marker - 1] != origin.condition
+                    || *instructions[marker] != origin.marker
+                    || origin.return_offset.checked_add(6) != Some(origin.prefix.len())
+                {
+                    return false;
+                }
+                if jump_targets
+                    .iter()
+                    .chain(&self.exception_owner_provenance.source_boundaries)
+                    .chain(&self.exception_owner_provenance.block_boundaries)
+                    .chain(&self.preserved_block_boundaries)
+                    .chain(self.exception_regions.iter().map(|region| &region.target))
+                    .any(|label| {
+                        positions
+                            .get(label)
+                            .is_some_and(|position| array_start < *position && *position <= marker)
+                    })
+                {
+                    return false;
+                }
+                let mut expected_load = origin.load;
+                expected_load
+                    .local_policy
+                    .add_hidden_exception_owner_slots(1);
+                if instructions[load_index].opcode == LOAD_FAST_BORROW {
+                    expected_load.opcode = LOAD_FAST_BORROW;
+                }
+                if *instructions[load_index] != expected_load {
+                    return false;
+                }
+                let mut prefix_tail = ExceptionOwnerTail::default();
+                for (offset, (actual, expected)) in instructions[array_start..load_index]
+                    .iter()
+                    .zip(&origin.prefix)
+                    .enumerate()
+                {
+                    let mut expected = *expected;
+                    if expected.opcode == LOAD_FAST && actual.opcode == LOAD_FAST_BORROW {
+                        expected.opcode = LOAD_FAST_BORROW;
+                    }
+                    if **actual != expected
+                        || actual.local_policy.hidden_exception_owner_slots() != 0
+                        || actual.pre_fold_extra_instructions() != 0
+                        || actual.exception_policy() != super::ExceptionPolicy::NoneUnchanged
+                        || (actual.opcode == NOP && offset != origin.return_offset)
+                        || actual.no_location_policy.borrow_fallthrough()
+                            == super::BorrowFallthrough::Barrier
+                        || actual.only_allows_unconditional_inlining()
+                        || !matches!(actual.operand(), Operand::Value(_))
+                        || is_scope_exit(actual.opcode)
+                        || matches!((actual.opcode, actual.operand()),
+                            (COMPARE_OP, Operand::Value(argument)) if argument & 16 != 0)
+                    {
+                        return false;
+                    }
+                    prefix_tail.instruction(**actual, None);
+                }
+                if prefix_tail.insertions != 0
+                    || prefix_tail.post_compaction_fusions != 0
+                    || prefix_tail.early_removals.checked_add(4) != Some(tail.early_removals)
+                {
+                    return false;
+                }
+                // The omitted inner-WITH POP precedes the five cleanup records.
+                // Its surrounding ordinary-try POP follows those records, immediately
+                // before the captured final POP. Both original cells are NULL.
+                let Some(ordinary_pop) = load_index
+                    .checked_add(prefix_tail.early_removals)
+                    .and_then(|index| index.checked_add(1))
+                else {
+                    return false;
+                };
+                if marker != ordinary_pop && ordinary_pop.checked_add(1) != Some(marker) {
+                    return false;
+                }
+                // Bind the existing real owner to the exact manager retained by the
+                // frontend; never clear an arbitrary protected or fallback region.
+                let Some(region) = self.uniform_exception_owner(load_index, marker + 1, positions)
+                else {
+                    return false;
+                };
+                let owner = self.exception_regions[region];
+                !owner.is_scope_fallback
+                    && owner.preserve_lasti
+                    && owner.target == origin.outer_handler
+                    && origin.pop.depth_after() == Some(owner.depth)
+            });
+        matches.next().is_some() && matches.next().is_none()
     }
 
     /// Projects the appended marker through the last compaction of a captured manager return.
@@ -7659,6 +7870,7 @@ mod tests {
                     block_boundaries: [entry].into_iter().collect(),
                     original_normal_finally_arrays: vec![OriginalNormalFinallyArray {
                         retained_setup: None,
+                        borrow_join: None,
                         entry,
                         prefix,
                         incoming: vec![plain(JUMP_FORWARD, Operand::Forward(entry))],
