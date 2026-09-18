@@ -8871,7 +8871,8 @@ impl Compiler<'_> {
                     let nested_if_ends_in_break = matches!(
                         body.last(),
                         Some(Stmt::If(statement))
-                            if matches!(statement.body.last(), Some(Stmt::Break(_)))
+                            if statement.elif_else_clauses.is_empty()
+                                && matches!(statement.body.last(), Some(Stmt::Break(_)))
                     );
                     let unlocated_while_exit = matches!(body.last(), Some(Stmt::While(statement))
                         if statement.orelse.is_empty()
@@ -8879,7 +8880,10 @@ impl Compiler<'_> {
                             && condition_jump_target_count(&statement.test, false) > 1);
                     let unlocated_assertion_exit = matches!(body.last(), Some(Stmt::Assert(statement))
                         if condition_jump_target_count(&statement.test, true) > 1);
-                    if nested_if_ends_in_break && has_terminating_else {
+                    if nested_if_ends_in_break
+                        && has_terminating_else
+                        && !matches!(nested_if_exit, Some(NestedIfExitLocation::Unlocated))
+                    {
                         let Some(Stmt::If(statement)) = body.last() else {
                             unreachable!();
                         };
@@ -8921,6 +8925,13 @@ impl Compiler<'_> {
                         // located NOP separate, as in the simple constant-true branch.
                         self.assembler.preserve_last_nop();
                     }
+                    // A terminal discarded call leaves a live original source even
+                    // when earlier work branches. Inspect it before emitting the exit.
+                    let body_ends_with_discarded_call = matches!(body.last(), Some(Stmt::Expr(expression))
+                            if matches!(expression.value.as_ref(), Expr::Call(_)))
+                        && self
+                            .assembler
+                            .current_original_block_ends_with_discarded_call();
                     let branch_exit = if direct_try_body_exit
                         && self.control.in_iterator_loop()
                         && self
@@ -8979,7 +8990,8 @@ impl Compiler<'_> {
                         && self.control.finally.active_copied_finally_bodies == 0
                         && matches!(statement.elif_else_clauses.as_slice(), [clause]
                             if clause.test.is_none())
-                        && suite_has_linear_borrow_fallthrough(body)
+                        && (suite_has_linear_borrow_fallthrough(body)
+                            || body_ends_with_discarded_call)
                         && matches!(test, Expr::BoolOp(boolean)
                         if boolean.op == BoolOp::Or
                             && boolean.values.split_last().is_some_and(|(last, leading)| {
@@ -9006,7 +9018,10 @@ impl Compiler<'_> {
                             .statements
                             .current_statement_followed_by_return_or_raise)
                         && matches!(body.last(), Some(Stmt::Assert(_)));
-                    if nested_if_ends_in_break && has_terminating_else {
+                    if nested_if_ends_in_break
+                        && has_terminating_else
+                        && !matches!(nested_if_exit, Some(NestedIfExitLocation::Unlocated))
+                    {
                         self.assembler.preserve_inlined_jump_nop(branch_exit);
                     } else if has_terminating_else
                         && matches!(nested_if_exit, Some(NestedIfExitLocation::Unlocated))
@@ -24045,6 +24060,97 @@ fn suite_contains_orphan_cold_cleanup(body: &[Stmt]) -> bool {
             _ => false,
         })
     {
+        return true;
+    }
+    // Continue unwinds the inner handler before its authored terminal jump.
+    // Its now-unreachable ordinary cleanup can remain between the warm exit
+    // and the relocated cold loop, even when live loop statements follow.
+    let linear_nonsuspending = |body: &[Stmt]| {
+        suite_has_linear_borrow_fallthrough(body)
+            && body.iter().all(|statement| match statement {
+                Stmt::Pass(_) => true,
+                Stmt::Expr(expression) => !expression_suspends_current_scope(&expression.value),
+                Stmt::Assign(assignment) => {
+                    !expression_suspends_current_scope(&assignment.value)
+                        && assignment
+                            .targets
+                            .iter()
+                            .all(|target| !expression_suspends_current_scope(target))
+                }
+                Stmt::AnnAssign(assignment) => {
+                    !expression_suspends_current_scope(&assignment.target)
+                        && assignment
+                            .value
+                            .as_ref()
+                            .is_some_and(|value| !expression_suspends_current_scope(value))
+                }
+                Stmt::AugAssign(assignment) => {
+                    !expression_suspends_current_scope(&assignment.target)
+                        && !expression_suspends_current_scope(&assignment.value)
+                }
+                _ => false,
+            })
+    };
+    let has_midbody_continue_recovery = |body: &[Stmt]| {
+        body.iter().enumerate().any(|(index, statement)| {
+            let Stmt::Try(recovery) = statement else {
+                return false;
+            };
+            let suffix = &body[index + 1..];
+            let live_suffix = linear_nonsuspending(suffix)
+                || matches!(suffix, [Stmt::For(tail)]
+                    if !tail.is_async
+                        && tail.orelse.is_empty()
+                        && !expression_contains_inline_branch(&tail.iter)
+                        && !expression_suspends_current_scope(&tail.iter)
+                        && !expression_contains_inline_branch(&tail.target)
+                        && !expression_suspends_current_scope(&tail.target)
+                        && linear_nonsuspending(&tail.body));
+            !recovery.is_star
+                && recovery.orelse.is_empty()
+                && recovery.finalbody.is_empty()
+                && live_suffix
+                && linear_nonsuspending(&recovery.body)
+                && body[..index].iter().all(|prefix| {
+                    linear_nonsuspending(std::slice::from_ref(prefix))
+                        || matches!(prefix, Stmt::If(guard)
+                            if guard.elif_else_clauses.is_empty()
+                                && condition_has_linear_runtime_leaves(&guard.test)
+                                && !expression_suspends_current_scope(&guard.test)
+                                && matches!(guard.body.as_slice(), [Stmt::Break(_)]))
+                })
+                && matches!(recovery.handlers.as_slice(), [handler]
+                if handler.as_except_handler().is_some_and(|handler| {
+                    handler.name.is_none()
+                        && handler.type_.as_ref().is_some_and(|type_| {
+                            !expression_contains_inline_branch(type_)
+                                && !expression_suspends_current_scope(type_)
+                        })
+                        && handler.body.split_last().is_some_and(|(last, prefix)| {
+                            matches!(last, Stmt::Continue(_))
+                                && (prefix.is_empty() || linear_nonsuspending(prefix))
+                        })
+                }))
+        })
+    };
+    if body.iter().any(|statement| match statement {
+        Stmt::For(statement) => {
+            !statement.is_async
+                && statement.orelse.is_empty()
+                && !expression_contains_inline_branch(&statement.iter)
+                && !expression_suspends_current_scope(&statement.iter)
+                && !expression_contains_inline_branch(&statement.target)
+                && !expression_suspends_current_scope(&statement.target)
+                && has_midbody_continue_recovery(&statement.body)
+        }
+        Stmt::While(statement) => {
+            matches!(statement.test.as_ref(), Expr::BooleanLiteral(value) if value.value)
+                && statement.orelse.is_empty()
+                && suite_contains_loop_break(&statement.body)
+                && has_midbody_continue_recovery(&statement.body)
+        }
+        _ => false,
+    }) {
         return true;
     }
     // Recovery exits can copy a loop's unlocated backedge even when more

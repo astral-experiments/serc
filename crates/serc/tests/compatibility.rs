@@ -13875,3 +13875,131 @@ fn matches_cpython_name_returns_after_terminal_handlers_with_awaited_finally() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_midbody_continue_recovery_borrow_exits() {
+    for (source, filename) in [
+        (
+            r#"def parse(source, decoder):
+    parsed_values = []
+    try:
+        parsed_values.append(decode(source))
+    except DecodeError:
+        index = 0
+        while True:
+            index = source.find("{", index)
+            if index == -1:
+                break
+            try:
+                parsed, end = decoder.read(source, index)
+            except DecodeError:
+                index += 1
+                continue
+            parsed_values.append(parsed)
+            index = end
+    for parsed in parsed_values:
+        result = convert(parsed)
+        if result is not None:
+            return result
+    return None
+"#,
+            "continue_recovery_while_target.py",
+        ),
+        (
+            r"def collect(options, value):
+    result = {}
+    try:
+        batches = initial(value)
+        for batch in batches:
+            merge(result, batch)
+    except Error:
+        for option in options:
+            try:
+                batches = retry(option, value)
+            except Error:
+                continue
+            for batch in batches:
+                merge(result, batch)
+    return [result[name] for name in sorted(result)]
+",
+            "continue_recovery_for_target.py",
+        ),
+        (
+            r"def collect(options, value):
+    result = {}
+    try:
+        batches = initial(value)
+        for batch in batches:
+            merge(result, batch)
+    except Error:
+        for option in options:
+            try:
+                batches = retry(option, value)
+            except Error:
+                batches = ()
+            for batch in batches:
+                merge(result, batch)
+    return [result[name] for name in sorted(result)]
+",
+            "continue_recovery_fallthrough_control.py",
+        ),
+        (
+            r"def collect(options, value):
+    result = {}
+    try:
+        batches = initial(value)
+        for batch in batches:
+            merge(result, batch)
+    except Error:
+        for option in options:
+            break
+            try:
+                batches = retry(option, value)
+            except Error:
+                continue
+            for batch in batches:
+                merge(result, batch)
+    return [result[name] for name in sorted(result)]
+",
+            "continue_recovery_dead_prefix_control.py",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn matches_cpython_folded_or_true_discarded_call_exits() {
+    for (source, filename) in [
+        (
+            r"def run(exists, write, read, cache, items, consume, force):
+    if not exists(cache) or True:
+        values = []
+        for item in items:
+            values.append(item)
+        write([(item,) for item in values], cache)
+    else:
+        values = [item for (item,) in read(cache)]
+    result = consume(values)
+    consume(cache, result, values)
+",
+            "folded_or_true_comprehension_call_tail.py",
+        ),
+        (
+            r"def run(exists, write, read, cache, items, consume, force):
+    if not exists(cache) or force:
+        values = []
+        for item in items:
+            values.append(item)
+        write([(item,) for item in values], cache)
+    else:
+        values = [item for (item,) in read(cache)]
+    result = consume(values)
+    consume(cache, result, values)
+",
+            "runtime_or_comprehension_call_tail_control.py",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

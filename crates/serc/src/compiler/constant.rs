@@ -444,15 +444,15 @@ impl Compiler<'_> {
         {
             // Numeric negation removes its adjacent, equally owned literal load.
             self.assembler.record_last_uniform_fold_owner_slots(1);
-        } else if let Expr::BinOp(binary) = expression
-            && is_literal_constant(&binary.left)
-            && is_literal_constant(&binary.right)
+        } else if matches!(expression, Expr::BinOp(_))
+            && is_literal_binary_tree(expression)
             && self.source_location(expression.range()).line
                 == self.source_location(expression.range()).end_line
         {
-            // A folded primitive binary operation removes its two adjacent literal loads.
-            // A single source line leaves neither load behind as a location NOP.
-            self.assembler.record_last_uniform_fold_owner_slots(2);
+            // Each folded binary operation removes two adjacent literal loads. A single
+            // source line keeps all nested operands in the same owner without line NOPs.
+            self.assembler
+                .record_last_uniform_fold_owner_slots(hidden_owner_slots);
         }
         Ok(())
     }
@@ -811,6 +811,16 @@ impl Compiler<'_> {
             .deferred_names
             .push((instruction, name.to_string()));
         Ok(())
+    }
+}
+
+/// Returns whether a binary-expression tree contains only primitive literal leaves.
+fn is_literal_binary_tree(expression: &Expr) -> bool {
+    match expression {
+        Expr::BinOp(binary) => {
+            is_literal_binary_tree(&binary.left) && is_literal_binary_tree(&binary.right)
+        }
+        _ => is_literal_constant(expression),
     }
 }
 

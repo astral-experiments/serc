@@ -468,7 +468,7 @@ impl ExceptionOwnerProvenance {
         prefix: &'a [Item],
         all: &[Item],
     ) -> Option<(Label, &'a [Item], usize)> {
-        use crate::target::opcodes::{CALL, LOAD_ATTR, STORE_FAST, SWAP};
+        use crate::target::opcodes::{CALL, LOAD_ATTR, LOAD_FAST, STORE_FAST, SWAP};
 
         let leading = prefix
             .iter()
@@ -538,12 +538,12 @@ impl ExceptionOwnerProvenance {
                 .collect::<Vec<_>>();
             // All authored restores are STORE_FAST_MAYBE_NULL in CPython,
             // including cells. They remain distinct through superinstruction
-            // insertion. CALL and LOAD_ATTR prevent static elimination of SWAP(n + 1),
-            // because only n swappable restores precede either operation.
+            // insertion. CALL, LOAD_ATTR, and LOAD_FAST prevent static elimination of
+            // SWAP(n + 1), because only n swappable restores precede the next operation.
             if instructions.starts_with(original)
                 && instructions
                     .get(original.len())
-                    .is_some_and(|next| matches!(next.opcode, CALL | LOAD_ATTR))
+                    .is_some_and(|next| matches!(next.opcode, CALL | LOAD_ATTR | LOAD_FAST))
             {
                 return Some((*entry, &prefix[start..], restores.len()));
             }
@@ -2313,6 +2313,14 @@ impl LayoutAssembler {
             .setups
             .iter()
             .any(|(_, location)| location.is_some());
+        let has_entry_prologue = self
+            .items
+            .iter()
+            .find_map(|item| match item {
+                Item::Instruction(instruction) => Some(instruction.opcode),
+                Item::Label(_) => None,
+            })
+            .is_some_and(|opcode| matches!(opcode, COPY_FREE_VARS | MAKE_CELL | RETURN_GENERATOR));
         if self
             .exception_owner_provenance
             .synchronous_with_setups
@@ -2329,10 +2337,12 @@ impl LayoutAssembler {
                         | NormalizedExceptionOwner::DynamicConditionStrict
                 ) || (has_retained_setup
                     && instruction.opcode == NOT_TAKEN
-                    && matches!(
+                    && (matches!(
                         instruction.exception_policy().owner(),
                         NormalizedExceptionOwner::Present | NormalizedExceptionOwner::Absent
-                    ))
+                    ) || (has_entry_prologue
+                        && instruction.exception_policy()
+                            == super::ExceptionPolicy::NoneUnchanged)))
             })
         {
             return FxHashMap::default();
@@ -3688,6 +3698,34 @@ impl LayoutAssembler {
                             },
                         );
                     }
+                    // Primitive match tests keep their unchanged marker policy. They
+                    // still append a fresh NULL record once entry-prologue insertion
+                    // consumes every exact early-compaction slot in the original array.
+                    if instruction.opcode == NOT_TAKEN
+                        && instruction.exception_policy() == super::ExceptionPolicy::NoneUnchanged
+                        && has_entry_prologue
+                        && instruction.local_policy.hidden_exception_owner_slots() == 0
+                        && instruction.pre_fold_extra_instructions() == 0
+                        && original_array_start == 0
+                        && owner_history_exact
+                        && tail.insertions > 0
+                        && tail.early_removals <= tail.insertions
+                        && tail.late_removals == 0
+                        && tail.post_compaction_fusions == 0
+                        && owners
+                            .get(&instruction_index)
+                            .is_none_or(|decision| !decision.definitive)
+                    {
+                        owners.insert(
+                            instruction_index,
+                            ExceptionOwnerDecision {
+                                has_owner: false,
+                                source_region: None,
+                                definitive: true,
+                                override_existing: false,
+                            },
+                        );
+                    }
                     // Local fusion leaves a newer stale suffix inside the original array.
                     // Entry prologue insertion consumes that suffix first; once all fusion
                     // slots are used, the marker reuses the older peephole-compaction tail.
@@ -4120,8 +4158,9 @@ impl LayoutAssembler {
                         && tail.late_removals == 0
                         && let Some((start, end, start_tail, end_tail)) = ended_owned_prefix
                         && (tail.insertions == 0
-                            || (tail.post_compaction_fusions <= tail.insertions
-                                && start_tail.insertions == tail.insertions))
+                            || (start_tail.insertions == tail.insertions
+                                && (tail.post_compaction_fusions <= tail.insertions
+                                    || original_array_start == 0)))
                     {
                         // Prologue insertion consumes the newer fusion suffix first. Once
                         // exhausted, the marker reuses the earlier compaction tail, as it
@@ -7480,10 +7519,11 @@ mod tests {
             Instruction, Item, Label, LayoutAssembler, Operand, SourceLocation,
         };
         use crate::target::opcodes::{
-            CALL, JUMP_FORWARD, LOAD_ATTR, NOT_TAKEN, POP_JUMP_IF_FALSE, STORE_FAST, SWAP, TO_BOOL,
+            CALL, JUMP_FORWARD, LOAD_ATTR, LOAD_FAST, NOT_TAKEN, POP_JUMP_IF_FALSE, STORE_FAST,
+            SWAP, TO_BOOL,
         };
 
-        for (opcode, case) in [CALL, LOAD_ATTR].into_iter().flat_map(|opcode| {
+        for (opcode, case) in [CALL, LOAD_ATTR, LOAD_FAST].into_iter().flat_map(|opcode| {
             ["original", "unsealed", "cloned", "retired"].map(|case| (opcode, case))
         }) {
             let entry = Label(0);

@@ -9,8 +9,8 @@ use crate::assembler::block_graph::{BasicBlockId, BlockGraph, ItemPosition};
 use crate::target::opcodes::{
     BUILD_TUPLE, CALL, CALL_KW, DELETE_FAST, END_ASYNC_FOR, END_SEND, FOR_ITER, LOAD_CONST,
     LOAD_FAST, LOAD_GLOBAL, NOP, NOT_TAKEN, POP_EXCEPT, POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE,
-    POP_JUMP_IF_NOT_NONE, POP_JUMP_IF_TRUE, POP_TOP, RAISE_VARARGS, RETURN_VALUE, STORE_ATTR,
-    STORE_FAST, SWAP,
+    POP_JUMP_IF_NOT_NONE, POP_JUMP_IF_TRUE, POP_TOP, RAISE_VARARGS, RERAISE, RETURN_VALUE,
+    STORE_ATTR, STORE_FAST, SWAP,
 };
 use crate::target::{is_conditional_jump, is_unconditional_jump};
 
@@ -2838,6 +2838,9 @@ impl OptimizationPipeline {
                 graph[source].last_instruction().is_some_and(|instruction| {
                     instruction.no_location_policy.copies_split_return_exit()
                 });
+            let source_unlocated_inlining = graph[source]
+                .last_instruction()
+                .is_some_and(|instruction| instruction.no_location_policy.allows_block_inlining());
             let target_is_small_exit = target_pre_fusion_size <= 4
                 && target_terminal_opcode.is_some_and(|opcode| {
                     ends_scope(opcode)
@@ -4101,11 +4104,19 @@ impl OptimizationPipeline {
                     .unwrap_or(copied.len());
                 copied.drain(..first_instruction);
                 graph.append_to_block(source, copied);
-            } else if inline_no_location_block || inline_unprotected_return || planned_copy {
+            } else if inline_no_location_block
+                || inline_unprotected_return
+                || (inline_small_exit && target_terminal_opcode == Some(RERAISE))
+                || planned_copy
+            {
                 let copied_jump_target =
                     block_jump_target(&copied).and_then(|label| graph.label_block(label));
                 graph.append_to_block(source, copied);
-                if inline_unprotected_return {
+                // Deferred copies receive this classification before conditional duplication.
+                // Keep it when a reraising exit is appended during the fixed-point scan.
+                if inline_unprotected_return
+                    || (inline_small_exit && target_terminal_opcode == Some(RERAISE))
+                {
                     let unlocated_scope_exit = graph[source].items().iter().all(|item| {
                         !matches!(item, Item::Instruction(instruction) if instruction.location.line >= 0)
                     }) && graph[source]
@@ -4115,6 +4126,22 @@ impl OptimizationPipeline {
                         });
                     exit_without_unique_predecessor[source.index()] |=
                         remaining_predecessors[source.index()] > 1 && unlocated_scope_exit;
+                    if unlocated_scope_exit
+                        && inline_small_exit
+                        && target_terminal_opcode == Some(RERAISE)
+                        && source_unlocated_inlining
+                    {
+                        // Preserve the array's inlining permission after replacing its jump.
+                        // The removed jump's unconditional-only restriction does not apply to
+                        // the new scope exit: shared unlocated exits also need conditional copies.
+                        // Keep any restriction already present on the copied target itself.
+                        graph
+                            .instructions_mut(source)
+                            .next_back()
+                            .unwrap()
+                            .no_location_policy
+                            .allow_block_inlining();
+                    }
                 }
                 if let Some(copied_jump_target) = copied_jump_target {
                     remaining_predecessors[copied_jump_target.index()] += 1;
@@ -4133,8 +4160,8 @@ impl OptimizationPipeline {
                 if !planned_copy {
                     sources.push(source);
                 }
-                // A completed return also makes earlier predecessors eligible for a small
-                // exit copy. Revisit them before beginning conditional exit duplication.
+                // A completed return or reraising cleanup also makes earlier predecessors
+                // eligible for a small exit copy. Revisit them before conditional duplication.
                 for predecessor in jump_sources[source.index()].iter().copied() {
                     if !planned_copy
                         && positions[predecessor.index()] < source_position
