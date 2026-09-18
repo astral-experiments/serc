@@ -205,3 +205,70 @@ fn generator_conditional_break_reaches_nested_finally_borrows() {
 ";
     common::assert_matches_cpython_marshal(source, "normal_nested_finally_generator_borrow.py");
 }
+
+#[test]
+fn coroutine_runtime_while_break_reaches_finally_borrows() {
+    for (filename, source) in [
+        (
+            "async_runtime_loop_early_break_linear_finally.py",
+            r"async def lookup(client, sink):
+    result = None
+    try:
+        cursor = None
+        while result is None:
+            result, next_cursor = await client.fetch(cursor)
+            if result is not None or next_cursor is None:
+                break
+            client.record(next_cursor)
+            cursor = next_cursor
+    except Exception as error:
+        client.failed(error)
+        raise
+    finally:
+        sink.record(client)
+    return result
+",
+        ),
+        (
+            "async_runtime_loop_two_breaks_guarded_finally.py",
+            r"async def summarize(state, client, sink):
+    try:
+        while state.pending or client.pending:
+            remaining = state.remaining()
+            if remaining <= 0:
+                state.finish()
+                break
+            batch = await client.fetch()
+            for item in batch:
+                if item.ready:
+                    state.record(item)
+            if state.finished:
+                break
+    except Exception:
+        client.cancel()
+        raise
+    finally:
+        if state.finished:
+            sink.record(state)
+    return state.result
+",
+        ),
+        (
+            "async_loop_no_break_finally_control.py",
+            r"async def lookup(client, sink):
+    result = None
+    try:
+        while client.pending:
+            result = await client.fetch()
+            client.record(result)
+    except Exception as error:
+        client.failed(error)
+    finally:
+        sink.record(client)
+    return result
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

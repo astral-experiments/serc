@@ -355,7 +355,7 @@ impl ExceptionOwnerTail {
     }
 }
 
-/// An original conditional array whose supported records cannot be compacted.
+/// An emitted conditional array whose unchanged records prove a NULL append cell.
 #[derive(Debug)]
 pub(super) struct UncompactedConditionalArray {
     prefix: Vec<Item>,
@@ -674,10 +674,10 @@ impl ExceptionOwnerProvenance {
         source_head: bool,
     ) -> bool {
         use crate::target::opcodes::{
-            BINARY_OP, BUILD_MAP, BUILD_STRING, CALL, CALL_KW, FORMAT_SIMPLE, IMPORT_FROM,
-            IMPORT_NAME, LOAD_ATTR, LOAD_CONST, LOAD_DEREF, LOAD_FAST, LOAD_GLOBAL, LOAD_NAME,
-            LOAD_SMALL_INT, POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE, PUSH_NULL, STORE_FAST, STORE_NAME,
-            TO_BOOL,
+            BINARY_OP, BUILD_MAP, BUILD_STRING, CALL, CALL_KW, CONTAINS_OP, FORMAT_SIMPLE,
+            IMPORT_FROM, IMPORT_NAME, LOAD_ATTR, LOAD_CONST, LOAD_DEREF, LOAD_FAST, LOAD_GLOBAL,
+            LOAD_NAME, LOAD_SMALL_INT, POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE, PUSH_NULL, STORE_DEREF,
+            STORE_FAST, STORE_NAME, TO_BOOL,
         };
 
         let leading_labels = prefix
@@ -811,16 +811,35 @@ impl ExceptionOwnerProvenance {
         {
             return false;
         }
+        let original_folds =
+            self.original_uniform_fold_positions(&instructions.iter().collect::<Vec<_>>());
         let mut setup_count = 0;
+        let mut folded_slots = 0usize;
+        let mut membership_folds = 0;
+        let mut null_setup_cells = FxHashSet::default();
         for (index, instruction) in instructions.iter().enumerate() {
-            if instruction.local_policy.hidden_exception_owner_slots() != 0
-                || instruction.pre_fold_extra_instructions() != 0
+            let membership_fold = instruction.opcode == LOAD_CONST
+                && original_folds.contains(&index)
+                && instructions
+                    .get(index + 1)
+                    .is_some_and(|next| next.opcode == CONTAINS_OP);
+            if ((instruction.local_policy.hidden_exception_owner_slots() != 0
+                || instruction.pre_fold_extra_instructions() != 0)
+                && !membership_fold)
                 || instruction.no_location_policy.borrow_fallthrough()
                     != super::BorrowFallthrough::Reachable
                 || instruction.jump_policy.borrow_empty_block()
                 || instruction.location.line < 0
             {
                 return false;
+            }
+            if membership_fold {
+                membership_folds += 1;
+                if membership_folds > 1 {
+                    return false;
+                }
+                folded_slots +=
+                    usize::from(instruction.local_policy.hidden_exception_owner_slots());
             }
             if index >= body.len() {
                 continue;
@@ -874,6 +893,7 @@ impl ExceptionOwnerProvenance {
                     {
                         return false;
                     }
+                    null_setup_cells.insert(index + folded_slots);
                     setup_count += 1;
                 }
                 LOAD_FAST => {
@@ -884,12 +904,9 @@ impl ExceptionOwnerProvenance {
                         return false;
                     }
                 }
-                LOAD_DEREF => {
-                    // A cell load feeding the terminal truth conversion keeps its
-                    // original record; local superinstructions do not fuse it.
-                    if index + 2 != body.len() {
-                        return false;
-                    }
+                LOAD_DEREF | STORE_DEREF => {
+                    // Cell accesses keep their own records throughout this array;
+                    // local-load/store superinstructions cannot compact them.
                 }
                 BUILD_MAP => {
                     // The certified restore is followed by CALL, whose runtime
@@ -1026,6 +1043,15 @@ impl ExceptionOwnerProvenance {
                         return false;
                     }
                 }
+                CONTAINS_OP => {
+                    if !matches!(instruction.operand(), Operand::Value(0 | 1))
+                        || !index
+                            .checked_sub(1)
+                            .is_some_and(|previous| original_folds.contains(&previous))
+                    {
+                        return false;
+                    }
+                }
                 LOAD_NAME | LOAD_ATTR | LOAD_CONST | STORE_NAME | CALL | IMPORT_NAME => {}
                 crate::target::opcodes::SWAP if comprehension_restore_count > 0 && index == 0 => {}
                 _ => return false,
@@ -1035,6 +1061,9 @@ impl ExceptionOwnerProvenance {
         // restore followed by CALL already establishes the original array head,
         // including a condition reached without crossing a new SETUP.
         (setup_count > 0 || comprehension_restore_count > 0)
+            // With no folds, the append is fresh. A certified membership fold may
+            // instead leave the original retained SETUP in that exact array cell.
+            && (folded_slots == 0 || null_setup_cells.contains(&(instructions.len() - 1)))
             && self
                 .setups
                 .iter()

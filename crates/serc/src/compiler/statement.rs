@@ -18846,9 +18846,33 @@ impl Compiler<'_> {
                     }
                     _ => false,
                 });
+        // A runtime coroutine loop retains the same early break into cleanup.
+        // Its false edge keeps the original loop-exit boundary; only the existing
+        // live-break certificate supplies the independent normal-finally route.
+        let runtime_coroutine_break_context = matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
+            && self.control.loops.contexts.is_empty()
+            && self.control.withs.active_with_exits.is_empty()
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            && !self.control.in_exception_handler()
+            && self.control.finally.active_copied_finally_bodies == 0
+            && !statement.handlers.is_empty()
+            && statement.handlers.iter().all(|handler| {
+                handler
+                    .as_except_handler()
+                    .is_some_and(|handler| handler.type_.is_some())
+            })
+            && !suite_contains_abrupt_control_flow(&statement.finalbody);
         let conditional_break_reaches_finally = conditional_break_cleanup_entry
             && matches!(statement.body.last(), Some(Stmt::While(loop_statement))
-                if early_condition_truthiness(&loop_statement.test) == Some(true)
+                if (early_condition_truthiness(&loop_statement.test) == Some(true)
+                    || (runtime_coroutine_break_context
+                        && condition_has_linear_runtime_leaves(&loop_statement.test)
+                        && !expression_suspends_current_scope(&loop_statement.test)))
                     && loop_statement.orelse.is_empty()
                     && suite_contains_borrow_reachable_conditional_loop_break(&loop_statement.body)
                     && (suite_has_linear_live_conditional_break(&loop_statement.body)
