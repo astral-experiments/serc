@@ -2917,6 +2917,9 @@ impl Compiler<'_> {
         let base_depth = self.control.stack.depth;
         let start = self.assembler.label();
         self.assembler.mark(start);
+        // This authored loop header has its own original array, just like a
+        // nonterminal while. Earlier local fusions cannot own its first marker.
+        self.assembler.record_exception_owner_block_boundary(start);
         let exits = condition
             .values
             .iter()
@@ -15222,6 +15225,28 @@ impl Compiler<'_> {
             && self.control.finally.active_copied_finally_bodies == 0
             && self.control.finally.active_finally_end_blocks == 0
             && nested_try_else_has_populated_call_entry(statement);
+        // A populated call arm can bypass the nested pass recovery's empty join.
+        // Keep that source barrier, but let its surviving jump enter the outer
+        // continuation while the other branch still stops at the empty array.
+        let nested_pass_call_entry = borrow_exit_has_source_successor
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && self.control.loops.contexts.is_empty()
+            && self.control.withs.active_with_exits.is_empty()
+            && self.control.withs.active_with_region_exclusions.is_empty()
+            && self.control.exceptions.active_exception_handlers.is_empty()
+            && self.control.exceptions.active_exception_group_handlers == 0
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .len()
+                == 1
+            && self.control.finally.active_finally_try_bodies == 0
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
+            && nested_pass_recovery_has_populated_call_arm(statement);
         // CPython can leave an empty physical block after a final with or nested try. Borrowed-
         // load traversal stops there, so a following suite cannot reach this try join through
         // that normal-exit edge.
@@ -15232,7 +15257,8 @@ impl Compiler<'_> {
                 && matches!(normal_exit_suite.last(), Some(Stmt::Try(_)))
                 && suite_ends_in_empty_try_exit_block(normal_exit_suite, loop_tail.is_some())
                 && !nested_conditional_store_entry
-                && !nested_else_call_entry)
+                && !nested_else_call_entry
+                && !nested_pass_call_entry)
         {
             self.assembler.prevent_borrow_reachability(end);
         }
@@ -16955,6 +16981,30 @@ impl Compiler<'_> {
                     self.assembler
                         .mark_retained_nop_borrow_fallthrough_if_unblocked(normal_exit);
                 }
+                // The one success edge of an asserted else retains this normal
+                // jump as a located NOP. A plain identity assertion in the named
+                // handler supplies no intervening cleanup array or terminal exit.
+                let coroutine_asserted_else_exit = borrow_exit_has_source_successor
+                    && !statement.is_star
+                    && statement.finalbody.is_empty()
+                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                        == CO_COROUTINE
+                    && try_body_suspended
+                    && self.control.loops.contexts.is_empty()
+                    && self.control.withs.active_with_exits.is_empty()
+                    && self.control.withs.active_with_region_exclusions.is_empty()
+                    && self.control.exceptions.active_exception_handlers.is_empty()
+                    && self.control.exceptions.active_exception_group_handlers == 0
+                    && self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .is_empty()
+                    && self.control.finally.active_finally_try_bodies == 0
+                    && self.control.finally.active_normal_finally_bodies == 0
+                    && self.control.finally.active_copied_finally_bodies == 0
+                    && self.control.finally.active_finally_end_blocks == 0
+                    && coroutine_try_has_asserted_identity_recovery(statement);
                 // Recovery handlers keep this located normal exit connected to the following
                 // suite. Cold cleanup or an unlocated join can leave an empty block in between.
                 if (pass_only_handlers
@@ -16981,7 +17031,8 @@ impl Compiler<'_> {
                         })))
                     && matches!(self.unit.scope, Scope::Function { .. })
                     && (suite_retained_try_exit_has_normal_fallthrough(&statement.orelse)
-                        || suite_retained_try_exit_has_terminal_protected_body(&statement.orelse))
+                        || suite_retained_try_exit_has_terminal_protected_body(&statement.orelse)
+                        || coroutine_asserted_else_exit)
                 {
                     if pass_only_handlers {
                         self.assembler
@@ -25467,6 +25518,33 @@ fn suite_ends_in_retained_try_exit_join(body: &[Stmt]) -> bool {
     }
     !statement.elif_else_clauses.is_empty() || terminating_if_fallthrough_test(statement).is_some()
 }
+// This assertion pair has one normal success edge and a plain named-handler
+// cleanup. It does not certify folded, short-circuit, or chained assertions.
+fn coroutine_try_has_asserted_identity_recovery(statement: &ruff_python_ast::StmtTry) -> bool {
+    matches!(statement.body.as_slice(), [Stmt::Expr(expression)]
+        if matches!(expression.value.as_ref(), Expr::Await(awaited)
+            if matches!(awaited.value.as_ref(), Expr::Call(_))
+                && !expression_contains_inline_branch(&awaited.value)
+                && !expression_suspends_current_scope(&awaited.value)))
+        && matches!(statement.orelse.as_slice(), [Stmt::Assert(assertion)]
+            if assertion.msg.is_none()
+                && matches!(assertion.test.as_ref(), Expr::Compare(comparison)
+                    if matches!(comparison.left.as_ref(), Expr::Name(_))
+                        && comparison.ops[..] == [CmpOp::Is]
+                        && matches!(&comparison.comparators[..], [Expr::NoneLiteral(_)])))
+        && matches!(statement.handlers.as_slice(), [handler]
+        if handler.as_except_handler().is_some_and(|handler| {
+            handler.type_.is_some()
+                && handler.name.is_some()
+                && matches!(handler.body.as_slice(), [Stmt::Assert(assertion)]
+                    if assertion.msg.is_none()
+                        && matches!(assertion.test.as_ref(), Expr::Compare(comparison)
+                            if matches!(comparison.left.as_ref(), Expr::Name(_))
+                                && comparison.ops[..] == [CmpOp::Is]
+                                && matches!(&comparison.comparators[..], [Expr::Name(_)])))
+        }))
+}
+
 // A retained exit cannot bypass the following empty block unless a surviving branch reaches
 // that continuation directly. Constant conditions contribute only their selected suite.
 fn suite_retained_try_exit_leaves_empty_join(body: &[Stmt]) -> bool {
@@ -27463,6 +27541,69 @@ fn nested_try_else_has_populated_call_entry(statement: &ruff_python_ast::StmtTry
                 if tail.elif_else_clauses.is_empty()
                     && condition_has_linear_runtime_leaves(&tail.test)
                     && suite_has_linear_borrow_fallthrough(&tail.body)))
+}
+
+// A nonempty call arm survives the terminal pass recovery and can jump around
+// its empty normal join. A separate bare-pass recovery in the outer handler is
+// followed by a call, so that handler does not terminate at another cleanup join.
+fn nested_pass_recovery_has_populated_call_arm(statement: &ruff_python_ast::StmtTry) -> bool {
+    let plain_call = |statement: &Stmt| {
+        matches!(statement, Stmt::Expr(expression)
+            if matches!(expression.value.as_ref(), Expr::Call(_))
+                && !expression_contains_inline_branch(&expression.value)
+                && !expression_suspends_current_scope(&expression.value))
+    };
+    if statement.is_star || !statement.orelse.is_empty() || !statement.finalbody.is_empty() {
+        return false;
+    }
+    let Some((Stmt::Try(nested), leading)) = statement.body.split_last() else {
+        return false;
+    };
+    if !suite_has_linear_borrow_fallthrough(leading)
+        || nested.is_star
+        || !nested.orelse.is_empty()
+        || !nested.finalbody.is_empty()
+        || !matches!(nested.handlers.as_slice(), [handler]
+        if handler.as_except_handler().is_some_and(|handler| {
+            handler.type_.is_some()
+                && handler.name.is_some()
+                && matches!(handler.body.as_slice(), [Stmt::Pass(_)])
+        }))
+    {
+        return false;
+    }
+    let Some((Stmt::If(branch), leading)) = nested.body.split_last() else {
+        return false;
+    };
+    if !suite_has_linear_borrow_fallthrough(leading)
+        || !condition_has_only_runtime_tests(&branch.test)
+        || expression_contains_inline_branch(&branch.test)
+        || !branch.body.iter().all(plain_call)
+        || branch.body.is_empty()
+        || !matches!(branch.elif_else_clauses.as_slice(), [otherwise]
+            if otherwise.test.is_none()
+                && matches!(otherwise.body.as_slice(), [Stmt::Pass(_)]))
+    {
+        return false;
+    }
+    matches!(statement.handlers.as_slice(), [handler]
+    if handler.as_except_handler().is_some_and(|handler| {
+        handler.type_.is_some()
+            && handler.name.is_some()
+            && matches!(handler.body.as_slice(), [leading @ .., Stmt::Try(recovery), tail]
+                if suite_has_linear_borrow_fallthrough(leading)
+                    && plain_call(tail)
+                    && !recovery.is_star
+                    && recovery.orelse.is_empty()
+                    && recovery.finalbody.is_empty()
+                    && matches!(recovery.body.as_slice(), [call] if plain_call(call))
+                    && matches!(recovery.handlers.as_slice(), [handler]
+                        if handler.as_except_handler().is_some_and(|handler| {
+                            handler.type_.is_none()
+                                && handler.name.is_none()
+                                && matches!(handler.body.as_slice(), [Stmt::Pass(_)])
+                        })))
+    }))
 }
 
 // A direct tail nested handler leaves the containing suite's normal-exit join empty.

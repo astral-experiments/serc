@@ -336,3 +336,28 @@ fn matches_cpython_identity_fold_after_retained_finally_pop() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn normal_finally_marker_range_end_preserves_null_pop_slot() {
+    // Nine global-call folds place the marker in the erased POP_BLOCK's NULL cell.
+    common::assert_matches_cpython_marshal(
+        r#"async def f(manager, task, release, pool, values):
+    with manager:
+        try:
+            await task.wait()
+            if task.failed():
+                raise ValueError("failed")
+            print(f"count={len(values)} ready={values.count('ready')}")
+            print(f"seen={len(values)} total={len(values)}")
+            print(f"remaining={len(values)} final={len(values)}")
+            print("complete")
+        finally:
+            release.set()
+            if not task.done():
+                task.cancel()
+                await wait(task, return_exceptions=True)
+            await pool.close()
+"#,
+        "normal_finally_nine_fold_pop_owner_target.py",
+    );
+}

@@ -2019,3 +2019,71 @@ fn matches_cpython_borrows_at_folded_loop_continuations() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_borrows_after_asserted_and_nested_pass_recovery() {
+    for (source, filename) in [
+        (
+            r"import asyncio
+
+async def run(client, expected, left, right):
+    try:
+        await client.work()
+    except Exception as caught:
+        assert caught is expected
+    else:
+        assert expected is None
+    await asyncio.gather(*list(client.pending))
+    return left, right
+",
+            "async_asserted_recovery_else_suffix_target.py",
+        ),
+        (
+            r"import asyncio
+
+async def run(client, expected, left, right):
+    try:
+        await client.work()
+    except Exception as caught:
+        assert caught is expected
+    else:
+        assert expected is None
+        client.check(expected)
+    await asyncio.gather(*list(client.pending))
+    return left, right
+",
+            "async_asserted_recovery_populated_else_control.py",
+        ),
+        (
+            r"def run(work, probe, report, make, value):
+    try:
+        work()
+        try:
+            report(value)
+            try:
+                state = probe()
+                if state:
+                    work()
+                else:
+                    pass
+            except Exception as inner:
+                pass
+        except Exception as outer:
+            report(outer)
+            try:
+                work()
+            except:
+                pass
+            report(value)
+        result = make(value)
+        report(result)
+        return result
+    except Exception:
+        return None
+",
+            "nested_named_pass_recovery_suffix_target.py",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

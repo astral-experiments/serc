@@ -464,3 +464,94 @@ fn matches_cpython_optimized_tuple_conditional_keyword_plain_control() {
         "plain_call_conditional_keyword_control.py",
     );
 }
+
+#[test]
+fn matches_cpython_shared_nested_if_tuple_copy_order() {
+    // Keep the four original return slots before local-load fusion, and retain
+    // intermediate join widths until CPython's ordered exit-copy rounds finish.
+    for (filename, source) in [
+        (
+            "nested_complete_and_partial_if_high_tuple_target.py",
+            r"def f(outer, seed, use_pid, fast, p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, left, right):
+    if outer:
+        if seed is None:
+            left = plain(left)
+        else:
+            if use_pid:
+                if fast:
+                    left = quick(left, seed, pid=use_pid)
+                else:
+                    left = slow(left, seed, pid=use_pid)
+            else:
+                left = slow(left, seed)
+    elif seed is None and ready(right):
+        left = alternate(right)
+        if use_pid:
+            left = finish(left)
+    else:
+        left = fallback(right)
+    return left, right
+",
+        ),
+        (
+            "nested_if_elif_low_local_tuple_return_target.py",
+            r#"def f(outer, choose, sort, model, left, right):
+    if outer:
+        if choose or model:
+            left = prepare(left)
+            if sort is not None:
+                left.apply(lambda value: restore(value, sort))
+            elif getattr(model, "output", None) is not None:
+                left.apply(lambda value: trim(value, model))
+        else:
+            left = empty()
+    else:
+        left = fallback(right)
+    return left, right
+"#,
+        ),
+        (
+            "nested_complete_and_partial_if_high_name_control.py",
+            r"def f(outer, seed, use_pid, fast, p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10, p11, left, right):
+    if outer:
+        if seed is None:
+            left = plain(left)
+        else:
+            if use_pid:
+                if fast:
+                    left = quick(left, seed, pid=use_pid)
+                else:
+                    left = slow(left, seed, pid=use_pid)
+            else:
+                left = slow(left, seed)
+    elif seed is None and ready(right):
+        left = alternate(right)
+        if use_pid:
+            left = finish(left)
+    else:
+        left = fallback(right)
+    return left
+",
+        ),
+        (
+            "nested_if_elif_low_local_following_call_control.py",
+            r#"def f(outer, choose, sort, model, left, right):
+    if outer:
+        if choose or model:
+            left = prepare(left)
+            if sort is not None:
+                left.apply(lambda value: restore(value, sort))
+            elif getattr(model, "output", None) is not None:
+                left.apply(lambda value: trim(value, model))
+        else:
+            left = empty()
+    else:
+        left = fallback(right)
+    observe(left)
+    return left, right
+"#,
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

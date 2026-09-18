@@ -3589,7 +3589,62 @@ impl LayoutAssembler {
                             .removed_pop_block_boundaries
                             .contains(label)
                     {
-                        pending_null_append = None;
+                        // A marker-only range end adds no original cell between
+                        // an authored primitive condition and its appended marker.
+                        // Carry only an already-proven erased POP slot across it.
+                        let original_pop_append = pending_null_append == Some(instruction_index)
+                            && owner_history_exact
+                            && pop_slot_epoch_known
+                            && region_ends.contains(label)
+                            && !boundaries.contains(label)
+                            && !jump_targets.contains(label)
+                            && !setups.contains_key(label)
+                            && !self
+                                .exception_owner_provenance
+                                .source_boundaries
+                                .contains(label)
+                            && !self
+                                .exception_owner_provenance
+                                .fusion_boundaries
+                                .contains(label)
+                            && !self
+                                .exception_owner_provenance
+                                .removed_pop_block_boundaries
+                                .contains(label)
+                            && !self
+                                .exception_owner_provenance
+                                .omitted_nop_counts
+                                .contains_key(label)
+                            && !self
+                                .exception_owner_provenance
+                                .omitted_nop_locations
+                                .contains_key(label)
+                            && previous.is_some_and(|condition: Instruction| {
+                                is_conditional_jump(condition.opcode)
+                                    && matches!(condition.operand(), Operand::Forward(_))
+                                    && self
+                                        .exception_owner_provenance
+                                        .original_primitive_condition_boundaries
+                                        .iter()
+                                        .filter(|origin| **origin == condition)
+                                        .count()
+                                        == 1
+                                    && indexed_instructions
+                                        .iter()
+                                        .filter(|record| ***record == condition)
+                                        .count()
+                                        == 1
+                                    && indexed_instructions.get(instruction_index).is_some_and(
+                                        |marker| {
+                                            marker.opcode == NOT_TAKEN
+                                                && marker.location == condition.location
+                                                && marker.depth_after() == condition.depth_after()
+                                        },
+                                    )
+                            });
+                        if !original_pop_append {
+                            pending_null_append = None;
+                        }
                         pending_fresh_null_append = None;
                         pending_normal_pop_null_append = None;
                     }

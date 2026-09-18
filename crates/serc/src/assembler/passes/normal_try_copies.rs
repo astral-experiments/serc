@@ -199,6 +199,7 @@ impl OptimizationPipeline {
         let mut selected = returns.keys().copied().collect::<FxHashSet<_>>();
         let mut sources = FxHashSet::default();
         let mut joins = FxHashSet::default();
+        let mut shared_joins = FxHashSet::default();
         // Close over every original unconditional predecessor, including direct
         // tuple entries and predecessors of ordinary source arrays. Omission of
         // even a source whose final copy fails could change a later target's size.
@@ -220,6 +221,26 @@ impl OptimizationPipeline {
                 if !selected.contains(&target) {
                     continue;
                 }
+                // A partial nested if can contribute another original empty array
+                // to the same closed graph. Its conditional predecessors keep the
+                // original jump unlocated, but private copies inherit their own lines.
+                // Require the producer's exact head, not an arbitrary unlocated jump.
+                let shared_join = jump.location == SourceLocation::NONE
+                    && jump.no_location_policy.preserves_location()
+                    && !jump.no_location_policy.is_artificial_eval_break()
+                    && !jump.jump_policy.is_interruptible()
+                    && jump.local_policy.hidden_exception_owner_slots() == 0
+                    && jump.exception_policy() == super::super::ExceptionPolicy::default()
+                    && graph[block].items().iter().any(|item| {
+                        matches!(item, Item::Label(label)
+                            if self.nested_if_unlocated_join_blocks.contains(label))
+                    })
+                    && graph[block]
+                        .items()
+                        .iter()
+                        .filter(|item| matches!(item, Item::Instruction(_)))
+                        .count()
+                        == 1;
                 if !intact(block)
                     || jump.opcode != JUMP_FORWARD
                     || !matches!(jump.operand(), Operand::Forward(_))
@@ -230,11 +251,13 @@ impl OptimizationPipeline {
                     || (jump.jump_policy.defers_redundant_removal()
                         && !(jump.jump_policy.is_original_empty_join()
                             && jump.jump_policy.preserves_nop_after_threading()))
-                    || jump.no_location_policy.preserves_location()
+                    || (jump.no_location_policy.preserves_location() && !shared_join)
                 {
                     return;
                 }
-                if jump.jump_policy.is_original_empty_join() {
+                if shared_join {
+                    shared_joins.insert(block);
+                } else if jump.jump_policy.is_original_empty_join() {
                     if graph[block]
                         .items()
                         .iter()
@@ -291,7 +314,7 @@ impl OptimizationPipeline {
                     unreachable!()
                 };
                 let target = graph.label_block(label).expect("closed original target");
-                let is_join = joins.contains(&block);
+                let is_join = joins.contains(&block) || shared_joins.contains(&block);
                 // An already unlocated ordinary array must have the same eligibility
                 // in the executor. Only certified empty joins gain that permission.
                 if !is_join
@@ -366,7 +389,7 @@ impl OptimizationPipeline {
         let ordered_joins = order
             .iter()
             .copied()
-            .filter(|block| joins.contains(block))
+            .filter(|block| joins.contains(block) || shared_joins.contains(block))
             .collect::<Vec<_>>();
         let fallthrough_stores = order
             .windows(2)
