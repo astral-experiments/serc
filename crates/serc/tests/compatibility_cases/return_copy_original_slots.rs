@@ -261,3 +261,89 @@ fn preserves_break_locations_through_unlocated_return_joins() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_constant_nop_return_footer_copies() {
+    for (filename, source) in [
+        (
+            "module_if_with_two_constant_footer_target.py",
+            r#"if enabled:
+    with manager():
+        work()
+"""first footer
+line
+"""
+"""last footer
+line
+"""
+"#,
+        ),
+        (
+            "module_if_bound_with_two_constant_footer_target.py",
+            r#"if enabled:
+    values = [item for item in source]
+    with manager() as resource:
+        result = resource.work(values)
+"""first footer
+line
+"""
+"""last footer
+line
+"""
+"#,
+        ),
+        (
+            "module_with_body_constant_footer_owner_control.py",
+            r#"if enabled:
+    with manager():
+        work()
+        """body tail
+        line
+        """
+"""first footer
+line
+"""
+"""last footer
+line
+"""
+"#,
+        ),
+        (
+            "module_if_with_three_constant_footer_budget_control.py",
+            r#"if enabled:
+    with manager():
+        work()
+"""first footer
+line
+"""
+"""second footer
+line
+"""
+"""last footer
+line
+"""
+"#,
+        ),
+        (
+            "module_if_with_large_constant_footer_control.py",
+            r#"if enabled:
+    with manager():
+        work()
+"""first footer
+line
+"""
+"""second footer
+line
+"""
+"""third footer
+line
+"""
+"""last footer
+line
+"""
+"#,
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

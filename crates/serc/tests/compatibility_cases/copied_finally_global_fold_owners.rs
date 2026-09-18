@@ -140,3 +140,87 @@ def f(records, directory, options, submitted, counters):
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn copied_return_local_truth_preserves_the_authored_return_owner() {
+    for (filename, source) in [
+        (
+            "coroutine_return_local_truth_parent_global_folds.py",
+            r"async def f(flag, ready):
+    try:
+        if ready:
+            report(first())
+            report(second())
+            report(third())
+            return
+        await work()
+    except Exception as error:
+        report(error)
+    finally:
+        if flag:
+            await cleanup()
+",
+        ),
+        (
+            "coroutine_return_local_truth_parent_short_control.py",
+            r"async def f(flag, ready):
+    try:
+        if ready:
+            report(first())
+            return
+        await work()
+    except Exception as error:
+        report(error)
+    finally:
+        if flag:
+            await cleanup()
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn matches_cpython_copied_return_attribute_truth_parent_owners() {
+    for (filename, source) in [
+        (
+            "coroutine_return_attribute_truth_parent_constant_folds.py",
+            r#"async def f(value, runner):
+    try:
+        if value:
+            print("!" * 80)
+            print(value, "skipping")
+            print("!" * 80)
+            return
+        await work()
+    except Exception as error:
+        print(error)
+    finally:
+        if runner.manager and runner.manager.session is not None:
+            await runner.manager.session.stop()
+        await runner.close()
+"#,
+        ),
+        (
+            "coroutine_return_attribute_truth_parent_literal_control.py",
+            r#"async def f(value, runner):
+    try:
+        if value:
+            print("skipping")
+            print(value, "skipping")
+            print("skipping")
+            return
+        await work()
+    except Exception as error:
+        print(error)
+    finally:
+        if runner.manager and runner.manager.session is not None:
+            await runner.manager.session.stop()
+        await runner.close()
+"#,
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

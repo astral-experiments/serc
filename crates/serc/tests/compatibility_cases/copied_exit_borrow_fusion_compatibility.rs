@@ -533,3 +533,64 @@ fn matches_cpython_local_fusion_at_keyword_return_seams_after_comprehensions() {
         "comprehension_conditional_keyword_tail.py",
     );
 }
+
+#[test]
+fn matches_cpython_marshal_for_protected_conditional_positional_return_fusion_target() {
+    let source = r"import service
+
+def f(text, *, direct, sensitive):
+    if not text:
+        raise ValueError('text is required')
+    options = 0 if sensitive else service.DEFAULT
+    try:
+        return service.compile(text if direct else service.escape(text), options)
+    except service.Error as error:
+        raise ValueError(f'invalid pattern: {error}') from error
+";
+    common::assert_matches_cpython_marshal(
+        source,
+        "protected_conditional_positional_return_fusion_target.py",
+    );
+}
+
+#[test]
+fn matches_cpython_marshal_for_unprotected_conditional_positional_return_fusion_control() {
+    let source = r"import service
+
+def f(text, *, direct, sensitive):
+    if not text:
+        raise ValueError('text is required')
+    options = 0 if sensitive else service.DEFAULT
+    return service.compile(text if direct else service.escape(text), options)
+";
+    common::assert_matches_cpython_marshal(
+        source,
+        "unprotected_conditional_positional_return_fusion_control.py",
+    );
+}
+
+#[test]
+fn matches_cpython_marshal_for_protected_conditional_tuple_return_fusion_target() {
+    let source = r"def f(view, path, extra):
+    try:
+        return view, path if exists(path) else None, extra
+    except Error as error:
+        record(error)
+        return None, None, None
+";
+    common::assert_matches_cpython_marshal(
+        source,
+        "protected_conditional_tuple_return_fusion_target.py",
+    );
+}
+
+#[test]
+fn matches_cpython_marshal_for_unprotected_conditional_tuple_return_fusion_control() {
+    let source = r"def f(view, path, extra):
+    return view, path if exists(path) else None, extra
+";
+    common::assert_matches_cpython_marshal(
+        source,
+        "unprotected_conditional_tuple_return_fusion_control.py",
+    );
+}

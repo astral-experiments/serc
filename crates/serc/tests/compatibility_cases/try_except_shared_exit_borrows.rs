@@ -1265,3 +1265,200 @@ fn matches_cpython_borrows_after_iterator_reduction_and_recovery() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_borrows_after_guarded_nested_recovery() {
+    for (source, filename) in [
+        (
+            r#"def recover(text, parse, retry, repair, needed, report):
+    try:
+        parsed = parse(text)
+        recovery = {"attempted": False}
+    except ValueError as error:
+        attempts = []
+        parsed = None
+        if needed(text):
+            try:
+                parsed, result = retry(text, error)
+                attempts.append(result)
+                recovery = {"attempts": attempts}
+            except Exception as retry_error:
+                attempts.append(str(retry_error))
+        if parsed is None:
+            try:
+                parsed, result = repair(text, error)
+                attempts.append(result)
+                recovery = {"attempts": attempts}
+            except Exception as repair_error:
+                attempts.append(str(repair_error))
+                parsed, result = retry(text, repair_error)
+                attempts.append(result)
+                recovery = {"attempts": attempts}
+    parsed["raw"] = text
+    report(parsed, recovery)
+    return parsed
+"#,
+            "named_two_guard_nested_recovery_target.py",
+        ),
+        (
+            r#"def recover(text, parse, retry, repair, needed, report):
+    try:
+        parsed = parse(text)
+        recovery = {"attempted": False}
+    except ValueError as error:
+        attempts = []
+        parsed = None
+        if needed(text):
+            try:
+                parsed, result = retry(text, error)
+                attempts.append(result)
+                recovery = {"attempts": attempts}
+            except Exception as retry_error:
+                recovery = None
+        if parsed is None:
+            try:
+                parsed, result = repair(text, error)
+                attempts.append(result)
+                recovery = {"attempts": attempts}
+            except Exception as repair_error:
+                recovery = None
+    parsed["raw"] = text
+    report(parsed, recovery)
+    return parsed
+"#,
+            "named_two_guard_store_recovery_control.py",
+        ),
+        (
+            r#"def recover(work, retry, report):
+    process = None
+    result = ""
+    try:
+        process = work()
+        result = process.read()
+        report(result)
+    except TimeoutError as error:
+        result = str(error)
+        if process is not None:
+            token = None
+            try:
+                token = process.identity()
+                report(token)
+            except LookupError:
+                report(process)
+            try:
+                result = process.read()
+                report(result)
+                result = process.result if process.result is not None else result
+            except TimeoutError as second_error:
+                report(second_error)
+                result = retry(process)
+                result = result if result is not None else ""
+    except OSError as error:
+        result = str(error)
+    report(result, process)
+    return result
+"#,
+            "named_none_guard_nested_recovery_target.py",
+        ),
+        (
+            r#"def recover(work, retry, report):
+    process = None
+    result = ""
+    try:
+        process = work()
+        result = process.read()
+        report(result)
+    except TimeoutError as error:
+        result = str(error)
+        if process is not None:
+            token = None
+            try:
+                token = process.identity()
+                report(token)
+            except LookupError:
+                token = None
+            try:
+                result = process.read()
+                report(result)
+                result = process.result if process.result is not None else result
+            except TimeoutError as second_error:
+                result = ""
+    except OSError as error:
+        result = str(error)
+    report(result, process)
+    return result
+"#,
+            "named_none_guard_store_recovery_control.py",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn matches_cpython_borrows_after_async_guarded_recovery_else() {
+    for (source, filename) in [
+        (
+            r#"async def probe(manager, read, restore, report, opened, changed, restored):
+    try:
+        async with manager():
+            opened = await read()
+            if opened:
+                changed = await restore()
+                if not changed:
+                    raise RuntimeError("change failed")
+            else:
+                restored = await read()
+                if not restored:
+                    raise RuntimeError("restore failed")
+    except Exception as error:
+        if changed and not restored:
+            try:
+                async with manager():
+                    restored = await restore()
+                report(restored)
+            except Exception as recovery_error:
+                report(recovery_error)
+        status = {"ok": False, "error": str(error), "restored": restored}
+    else:
+        status = {"ok": True, "restored": restored}
+    status["opened"] = opened
+    report(status)
+    return status
+"#,
+            "async_guarded_recovery_populated_else_target.py",
+        ),
+        (
+            r#"async def probe(manager, read, restore, report, opened, changed, restored):
+    try:
+        async with manager():
+            opened = await read()
+            if opened:
+                changed = await restore()
+                if not changed:
+                    raise RuntimeError("change failed")
+            else:
+                restored = await read()
+                if not restored:
+                    raise RuntimeError("restore failed")
+    except Exception as error:
+        if changed and not restored:
+            try:
+                async with manager():
+                    restored = await restore()
+                report(restored)
+            except Exception as recovery_error:
+                restored = False
+        status = {"ok": False, "error": str(error), "restored": restored}
+    else:
+        status = {"ok": True, "restored": restored}
+    status["opened"] = opened
+    report(status)
+    return status
+"#,
+            "async_guarded_store_recovery_populated_else_control.py",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

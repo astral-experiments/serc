@@ -5428,6 +5428,120 @@ impl Assembler {
             .push(origin);
     }
 
+    /// Captures a constant return's POP pair and direct local attribute truth test.
+    fn record_copied_return_attribute_truth_prefix(
+        &mut self,
+        return_item: usize,
+        first_pop_item: usize,
+    ) {
+        let items = self.linear_items();
+        let Some(
+            [
+                Item::Instruction(first_pop),
+                Item::Instruction(final_pop),
+                Item::Instruction(load),
+                Item::Instruction(attribute),
+                Item::Instruction(to_bool),
+                Item::Instruction(condition),
+                ..,
+            ],
+        ) = items.get(first_pop_item..)
+        else {
+            return;
+        };
+        let pops = [*first_pop, *final_pop];
+        let prefix = [*load, *attribute, *to_bool];
+        let condition = *condition;
+        if pops.iter().any(|pop| {
+            pop.opcode != NOP
+                || pop.operand() != Operand::Value(0)
+                || !pop.fusion_policy.is_converted_pop_block()
+                || pop.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
+        }) || load.opcode != LOAD_FAST
+            || !matches!(load.operand(), Operand::Value(_))
+            || attribute.opcode != LOAD_ATTR
+            || !matches!(attribute.operand(), Operand::Value(argument) if argument & 1 == 0)
+            || to_bool.opcode != TO_BOOL
+            || to_bool.operand() != Operand::Value(0)
+            || !matches!(condition.opcode, POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE)
+            || !matches!(condition.operand(), Operand::Forward(_))
+            || condition.location.line < 0
+            || prefix
+                .iter()
+                .chain(std::iter::once(&condition))
+                .any(|record| {
+                    record.exception_policy() != ExceptionPolicy::NoneUnchanged
+                        || record.location.line != condition.location.line
+                        || record.location.end_line != condition.location.end_line
+                        || record.location.column != condition.location.column
+                        || record.location.end_column > condition.location.end_column
+                })
+            || pops
+                .iter()
+                .chain(prefix.iter())
+                .chain(std::iter::once(&condition))
+                .any(|record| {
+                    record.local_policy.hidden_exception_owner_slots() != 0
+                        || record.pre_fold_extra_instructions() != 0
+                        || record.no_location_policy.borrow_fallthrough()
+                            != BorrowFallthrough::Reachable
+                        || record.jump_policy.borrow_empty_block()
+                })
+        {
+            return;
+        }
+        let Some([Item::Instruction(authored), labels @ ..]) =
+            items.get(return_item..first_pop_item)
+        else {
+            return;
+        };
+        if authored.opcode != NOP
+            || authored.operand() != Operand::Value(0)
+            || authored.location.line < 0
+            || authored.exception_policy() != ExceptionPolicy::NoneUnchanged
+            || authored.fusion_policy.is_converted_pop_block()
+            || authored.local_policy.hidden_exception_owner_slots() != 0
+            || authored.pre_fold_extra_instructions() != 0
+            || !labels.iter().all(|item| matches!(item, Item::Label(_)))
+            || pops.iter().any(|pop| {
+                pop.location != authored.location || pop.depth_after() != authored.depth_after()
+            })
+        {
+            return;
+        }
+        let Some(entry) = items[..return_item]
+            .iter()
+            .rev()
+            .find_map(|item| match item {
+                Item::Label(label)
+                    if self
+                        .exception_owner_provenance
+                        .source_boundaries
+                        .contains(label)
+                        && self
+                            .exception_owner_provenance
+                            .block_boundaries
+                            .contains(label) =>
+                {
+                    Some(*label)
+                }
+                _ => None,
+            })
+        else {
+            return;
+        };
+        let origin = exception_owners::CopiedReturnAttributeTruthPrefix {
+            entry,
+            return_nop: *authored,
+            pops,
+            prefix,
+            condition,
+        };
+        self.exception_owner_provenance
+            .copied_return_attribute_truth_prefixes
+            .push(origin);
+    }
+
     /// Captures the original return POP pair and its direct local truth test.
     pub(crate) fn record_copied_return_truth_prefix(
         &mut self,
@@ -5435,6 +5549,7 @@ impl Assembler {
         first_pop_item: usize,
     ) {
         self.record_copied_return_call_prefix(return_item, first_pop_item);
+        self.record_copied_return_attribute_truth_prefix(return_item, first_pop_item);
         let Some(
             [
                 Item::Instruction(first_pop),

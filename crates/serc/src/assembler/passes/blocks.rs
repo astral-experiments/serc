@@ -2075,10 +2075,16 @@ impl OptimizationPipeline {
                 matches!(item, Item::Instruction(instruction) if instruction.opcode == END_ASYNC_FOR)
             })
         }).collect::<Vec<_>>();
-        let nested_async_cleanup = async_iteration_exits.windows(2).any(|blocks| {
-            cleanup_block_creation_order(graph[*blocks[0]].items())
-                > cleanup_block_creation_order(graph[*blocks[1]].items())
-        });
+        // A reversed pair identifies its second exit as the outer cleanup. It does not
+        // authorize moving the inner comprehension's continuation before its handler.
+        let nested_async_cleanup_exits = async_iteration_exits
+            .windows(2)
+            .filter_map(|blocks| {
+                (cleanup_block_creation_order(graph[*blocks[0]].items())
+                    > cleanup_block_creation_order(graph[*blocks[1]].items()))
+                .then_some(*blocks[1])
+            })
+            .collect::<FxHashSet<_>>();
         // Inlined comprehensions emit their successful restore after the exceptional restore.
         // CPython puts a terminal restore before the handlers. Move a direct local restore or
         // the outer restore of nested async loops back to END_ASYNC_FOR's fallthrough.
@@ -2146,7 +2152,17 @@ impl OptimizationPipeline {
             let relocates_restore = if restores_locals {
                 restore_size <= 4
             } else {
-                nested_async_cleanup
+                // The outer exit must itself restore an inlined comprehension. An
+                // ordinary async-for's terminal finally suite stays after its handlers.
+                nested_async_cleanup_exits.contains(&order[position])
+                    && self
+                        .exception_owner_provenance
+                        .original_comprehension_normal_exits
+                        .iter()
+                        .any(|(entry, jump)| {
+                            graph.label_block(*entry) == Some(target)
+                                && graph[order[position + 1]].last_instruction() == Some(jump)
+                        })
             };
             (exits_scope == Some(true) && relocates_restore)
                 .then_some((position + 2, start, end))
@@ -2740,6 +2756,96 @@ impl OptimizationPipeline {
             .iter()
             .flat_map(|region| [region.start, region.end])
             .collect::<FxHashSet<_>>();
+        // A protected expression exit can be one original array split at POP_BLOCK.
+        // Snapshot its complete source, expression tail and return before any copy.
+        let original_protected_return_seams = order
+            .iter()
+            .filter_map(|&source| {
+                let source_items = graph[source].items();
+                let [
+                    Item::Label(_),
+                    Item::Instruction(first),
+                    Item::Instruction(jump),
+                ] = source_items
+                else {
+                    return None;
+                };
+                let Operand::Forward(entry) = jump.operand() else {
+                    return None;
+                };
+                let target = graph.label_block(entry)?;
+                let target_items = graph[target].items();
+                let [
+                    Item::Label(target_entry),
+                    Item::Instruction(second),
+                    Item::Instruction(consume),
+                ] = target_items
+                else {
+                    return None;
+                };
+                let return_block = *order.get(positions[target.index()] + 1)?;
+                let return_items = graph[return_block].items();
+                let [Item::Label(end), Item::Instruction(ret)] = return_items else {
+                    return None;
+                };
+                let mut owners = region_memberships
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, membership)| {
+                        membership.contains(&positions[source.index()])
+                            || membership.contains(&positions[target.index()])
+                    });
+                let (region_index, membership) = owners.next()?;
+                let region = self.exception_regions[region_index];
+                (owners.next().is_none()
+                    && !region.is_scope_fallback
+                    && region.depth == 0
+                    && !region.preserve_lasti
+                    && membership.contains(&positions[source.index()])
+                    && membership.contains(&positions[target.index()])
+                    && region.end == *end
+                    && !membership.contains(&positions[return_block.index()])
+                    && !exception_boundary_blocks[source.index()]
+                    && !exception_boundary_blocks[target.index()]
+                    && predecessors[target.index()] == 2
+                    && predecessors[return_block.index()] == 1
+                    && positions[source.index()] < positions[target.index()]
+                    && *target_entry == entry
+                    && exception_split_labels.contains(end)
+                    && jump.opcode == JUMP_FORWARD
+                    && jump.location.line < 0
+                    && first.opcode == LOAD_FAST
+                    && second.opcode == LOAD_FAST
+                    && matches!(consume.opcode, BUILD_TUPLE | CALL)
+                    && ret.opcode == RETURN_VALUE
+                    && first.location.line >= 0
+                    && super::locals::fuse_pair(first, second).is_some()
+                    && [first, jump, second, consume, ret]
+                        .iter()
+                        .all(|instruction| {
+                            instruction.pre_fold_extra_instructions() == 0
+                                && instruction.local_policy.hidden_exception_owner_slots() == 0
+                                && instruction.exception_policy() == ExceptionPolicy::default()
+                        })
+                    && [second, consume, ret]
+                        .iter()
+                        .all(|instruction| matches!(instruction.operand(), Operand::Value(_))))
+                .then(|| {
+                    (
+                        source,
+                        (
+                            target,
+                            return_block,
+                            region_index,
+                            source_items.to_vec(),
+                            target_items.to_vec(),
+                            return_items.to_vec(),
+                        ),
+                    )
+                })
+            })
+            .collect::<FxHashMap<_, _>>();
+
         // Keep locations already present on original return records distinct from
         // locations inherited by synthetic cleanup copies during this pass.
         let mut original_return_locations = FxHashMap::default();
@@ -3299,6 +3405,25 @@ impl OptimizationPipeline {
                         && *original_target == target
                         && graph[source].items() == source_items
                         && graph[target].items() == target_items
+                },
+            );
+            let protected_return_seam = original_protected_return_seams.get(&source).filter(
+                |(
+                    original_target,
+                    original_return,
+                    _,
+                    source_items,
+                    target_items,
+                    return_items,
+                )| {
+                    inline_small_exit
+                        && !planned_copy
+                        && target_pre_fusion_size == 4
+                        && target_blocks == [*original_target, *original_return]
+                        && *original_target == target
+                        && graph[source].items() == source_items
+                        && graph[target].items() == target_items
+                        && graph[*original_return].items() == return_items
                 },
             );
             let mut copied = target_blocks
@@ -4310,6 +4435,9 @@ impl OptimizationPipeline {
                     self.exception_owner_provenance
                         .copied_return_call_prefixes
                         .retain(|origin| graph.label_block(origin.entry) != Some(predecessor));
+                    self.exception_owner_provenance
+                        .copied_return_attribute_truth_prefixes
+                        .retain(|origin| graph.label_block(origin.entry) != Some(predecessor));
                     graph.remove_item_at(predecessor, jump_position);
                     inline_copies
                         .entry(predecessor)
@@ -4355,6 +4483,9 @@ impl OptimizationPipeline {
                         .retain(|origin| graph.label_block(origin.entry) != Some(source));
                     self.exception_owner_provenance
                         .copied_return_call_prefixes
+                        .retain(|origin| graph.label_block(origin.entry) != Some(source));
+                    self.exception_owner_provenance
+                        .copied_return_attribute_truth_prefixes
                         .retain(|origin| graph.label_block(origin.entry) != Some(source));
                     graph.remove_item_at(source, position);
                 }
@@ -4464,6 +4595,75 @@ impl OptimizationPipeline {
                                     Item::Label(_) => *item,
                                 }))
                 });
+            let inline_protected_return_pair = protected_return_seam.is_some_and(
+                |(_, original_return, region_index, source_items, target_items, return_items)| {
+                    let [
+                        Item::Label(entry),
+                        Item::Instruction(second),
+                        Item::Instruction(consume),
+                        Item::Label(end),
+                        Item::Instruction(ret),
+                        Item::Label(exclusion_end),
+                    ] = copied.as_slice()
+                    else {
+                        return false;
+                    };
+                    let [Item::Label(original_end), Item::Instruction(original_ret)] =
+                        return_items.as_slice()
+                    else {
+                        return false;
+                    };
+                    let [
+                        Item::Label(_),
+                        Item::Instruction(original_second),
+                        Item::Instruction(original_consume),
+                    ] = target_items.as_slice()
+                    else {
+                        return false;
+                    };
+                    let region = self.exception_regions[*region_index];
+                    let mut fragments = copied_exception_regions
+                        .iter()
+                        .filter(|fragment| fragment.start == *entry);
+                    let fragment_matches = fragments.next().is_some_and(|fragment| {
+                        fragment.end == *end
+                            && fragment.target == region.target
+                            && fragment.depth == region.depth
+                            && fragment.preserve_lasti == region.preserve_lasti
+                            && fragment.is_scope_fallback == region.is_scope_fallback
+                    }) && fragments.next().is_none();
+                    !preserve_inlined_jump_nop
+                        && *entry == copied_label
+                        && copied_labels.get(original_end) == Some(end)
+                        && *entry != *end
+                        && *entry != *exclusion_end
+                        && *end != *exclusion_end
+                        && graph[source].items() == &source_items[..source_items.len() - 1]
+                        && graph[target].items() == target_items
+                        && graph[*original_return].items() == return_items
+                        && *second == original_second.for_exit_copy()
+                        && *consume == original_consume.for_exit_copy()
+                        && *ret == original_ret.for_exit_copy()
+                        && protected_fragment_origins.contains(region_index)
+                        && fragment_matches
+                        && !copied_region_exclusions[*region_index].is_empty()
+                        && copied_region_exclusions[*region_index]
+                            .iter()
+                            .all(|range| *range == (*end, *exclusion_end))
+                        && !self.preserved_block_boundaries.contains(entry)
+                        && !self
+                            .exception_owner_provenance
+                            .block_boundaries
+                            .contains(entry)
+                },
+            );
+            if inline_protected_return_pair {
+                // Keep the fresh region entry, moving it over only the exact first load
+                // already owned by that same region. Its end/POP_BLOCK and return stay put.
+                // The normal copy scheduling and later fuser remain unchanged.
+                copied.remove(0);
+                graph.insert_label(source, 1, copied_label);
+            }
             if inline_borrowed_tuple_exit
                 || inline_unprotected_local_pair
                 || inline_keyword_return_pair
@@ -5218,6 +5418,9 @@ impl OptimizationPipeline {
                             .retain(|origin| origin.entry != *label);
                         self.exception_owner_provenance
                             .copied_return_call_prefixes
+                            .retain(|origin| origin.entry != *label);
+                        self.exception_owner_provenance
+                            .copied_return_attribute_truth_prefixes
                             .retain(|origin| origin.entry != *label);
                         // Labels retained without their array cannot certify a later seam.
                         self.exception_owner_provenance

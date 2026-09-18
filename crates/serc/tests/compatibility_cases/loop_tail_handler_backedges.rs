@@ -366,3 +366,83 @@ def folded_tail(items, output):
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_protected_return_false_backedges_after_recovery() {
+    for (source, filename) in [
+        (
+            r"def f(self):
+    while True:
+        try:
+            try:
+                item = self.queue.get()
+                if item is not None:
+                    self.buffer.append(item)
+            except Empty:
+                pass
+            if self.ready:
+                self.flush()
+            if self.closed and self.queue.empty():
+                return
+        except Exception as error:
+            report(error)
+            if self.closed:
+                return
+            else:
+                pause()
+",
+            "protected_terminal_and_return_backedges_target.py",
+        ),
+        (
+            r"def f(self):
+    while True:
+        try:
+            with self.lock:
+                count = len(self.buffer)
+            try:
+                item = self.queue.get()
+                if item is not None:
+                    with self.lock:
+                        self.buffer.append(item)
+            except Empty:
+                pass
+            if self.ready:
+                self.flush()
+            if self.closed and self.queue.empty():
+                return
+        except Exception as error:
+            report(error)
+            if self.closed:
+                return
+            else:
+                pause()
+",
+            "protected_terminal_and_return_manager_prefix_target.py",
+        ),
+        (
+            r"def f(self):
+    while True:
+        try:
+            try:
+                item = self.queue.get()
+                if item is not None:
+                    self.buffer.append(item)
+            except Empty:
+                pass
+            if self.ready:
+                self.flush()
+            if self.closed:
+                return
+        except Exception as error:
+            report(error)
+            if self.closed:
+                return
+            else:
+                pause()
+",
+            "protected_terminal_single_return_backedge_control.py",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

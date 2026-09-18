@@ -556,3 +556,115 @@ fn matches_cpython_value_return_in_outer_loop_finally() {
         assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_named_handler_value_boolean_finally_cleanup_slots() {
+    for (filename, source) in [
+        (
+            "named_handler_async_generator_boolean_call_finally.py",
+            r#"async def f(factory, suggestion, replacement):
+    try:
+        async with factory() as stream:
+            async for item in stream:
+                yield item
+    except LookupError as error:
+        if is_limit(error):
+            record(error)
+            yield Event(detail=Message(text="failed"))
+            return
+        raise
+    finally:
+        suggestion = suggestion or rebuild()
+"#,
+        ),
+        (
+            "named_handler_async_generator_boolean_local_finally.py",
+            r#"async def f(factory, suggestion, replacement):
+    try:
+        async with factory() as stream:
+            async for item in stream:
+                yield item
+    except LookupError as error:
+        if is_limit(error):
+            record(error)
+            yield Event(detail=Message(text="failed"))
+            return
+        raise
+    finally:
+        suggestion = replacement or suggestion
+"#,
+        ),
+        (
+            "named_handler_async_generator_explicit_call_guard_control.py",
+            r#"async def f(factory, suggestion, replacement):
+    try:
+        async with factory() as stream:
+            async for item in stream:
+                yield item
+    except LookupError as error:
+        if is_limit(error):
+            record(error)
+            yield Event(detail=Message(text="failed"))
+            return
+        raise
+    finally:
+        if not suggestion:
+            suggestion = rebuild()
+"#,
+        ),
+        (
+            "named_handler_async_generator_explicit_local_guard_control.py",
+            r#"async def f(factory, suggestion, replacement):
+    try:
+        async with factory() as stream:
+            async for item in stream:
+                yield item
+    except LookupError as error:
+        if is_limit(error):
+            record(error)
+            yield Event(detail=Message(text="failed"))
+            return
+        raise
+    finally:
+        if replacement:
+            suggestion = replacement
+"#,
+        ),
+        (
+            "named_handler_async_generator_fused_boolean_call_finally.py",
+            r#"async def f(factory, suggestion, replacement):
+    try:
+        async with factory() as stream:
+            async for item in stream:
+                yield item
+    except LookupError as error:
+        if is_limit(error):
+            record("error", error, replacement)
+            yield Event(detail=Message(text="failed"))
+            return
+        raise
+    finally:
+        suggestion = suggestion or rebuild()
+"#,
+        ),
+        (
+            "named_handler_async_generator_fused_boolean_local_finally.py",
+            r#"async def f(factory, suggestion, replacement):
+    try:
+        async with factory() as stream:
+            async for item in stream:
+                yield item
+    except LookupError as error:
+        if is_limit(error):
+            record("error", error, replacement)
+            yield Event(detail=Message(text="failed"))
+            return
+        raise
+    finally:
+        suggestion = replacement or suggestion
+"#,
+        ),
+    ] {
+        assert_matches_cpython_marshal(source, filename);
+    }
+}

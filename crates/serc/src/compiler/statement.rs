@@ -1919,11 +1919,6 @@ impl Compiler<'_> {
                         && matches!(body.get(index.wrapping_sub(1)), Some(Stmt::With(previous))
                             if !previous.is_async))
                 {
-                    let noop_start = self.assembler.label();
-                    self.assembler.mark(noop_start);
-                    self.emit(NOP, 0, 0)?;
-                    let noop_end = self.assembler.label();
-                    self.assembler.mark(noop_end);
                     // A trailing constant in a synchronous with body donates its location
                     // to the following POP_BLOCK. The retained NOP is that ownerless
                     // POP_BLOCK cell, rather than the authored constant's owned cell.
@@ -1937,6 +1932,11 @@ impl Compiler<'_> {
                                 && context.terminal_statement_range == Some(statement.range())
                         });
                     if constant_with_body {
+                        let noop_start = self.assembler.label();
+                        self.assembler.mark(noop_start);
+                        self.emit(NOP, 0, 0)?;
+                        let noop_end = self.assembler.label();
+                        self.assembler.mark(noop_end);
                         self.control
                             .generators
                             .generator_region_exclusions
@@ -1949,6 +1949,37 @@ impl Compiler<'_> {
                         {
                             exclusions.push((noop_start, noop_end));
                         }
+                    } else if (final_expression_becomes_return
+                        && index + 1 < body.len()
+                        && body[index + 1..].iter().all(|statement| {
+                            matches!(statement, Stmt::Expr(expression)
+                                if is_literal_constant(&expression.value))
+                        }))
+                        || matches!(&body[index + 1..], [Stmt::Return(returned)]
+                        if returned.value.as_deref().is_none_or(|value| {
+                            matches!(value, Expr::Name(_)) || is_literal_constant(value)
+                        }))
+                    {
+                        // Keep a literal-constant or simple-return footer in one block
+                        // so the existing exit-copy budget sees its complete suffix.
+                        self.emit(NOP, 0, 0)?;
+                        if final_expression_becomes_return
+                            && index + 2 == body.len()
+                            && matches!(body.last(), Some(Stmt::Expr(expression))
+                                if is_literal_constant(&expression.value))
+                        {
+                            // The final constant's NOP is omitted before our implicit return,
+                            // but CPython still counts it during the earlier exit-copy pass.
+                            self.assembler.add_last_original_block_slots(1);
+                        }
+                    } else {
+                        // Other constants retain boundaries used by following authored
+                        // passes and terminal manager/branch line propagation.
+                        let noop_start = self.assembler.label();
+                        self.assembler.mark(noop_start);
+                        self.emit(NOP, 0, 0)?;
+                        let noop_end = self.assembler.label();
+                        self.assembler.mark(noop_end);
                     }
                 }
             } else if plain_function_suite
@@ -9061,8 +9092,44 @@ impl Compiler<'_> {
                                         == self.control.exceptions.active_exception_region_exclusions.len()
                             }))))
                 .then(|| test.range());
+                // Terminal while lowering turns a cleanup-free break into the same
+                // short implicit return that the chained-comparison success edge copies.
+                let terminal_break_return = matches!(body, [Stmt::Break(_)])
+                    && (self.control.statements.current_statement_has_following
+                        || self.control.loops.split_loop_tail_prefix_end == Some(statement.range))
+                    && self.control.withs.active_with_exits.is_empty()
+                    && self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .is_empty()
+                    && self.control.exceptions.active_exception_handlers.is_empty()
+                    && self.control.exceptions.active_exception_group_handlers == 0
+                    && self.control.finally.active_finally_try_bodies == 0
+                    && self.control.finally.active_finally_end_blocks == 0
+                    && self.control.finally.active_normal_finally_bodies == 0
+                    && self.control.finally.active_copied_finally_bodies == 0
+                    && self.control.finally.active_loop_finally_contexts.is_empty()
+                    && self
+                        .control
+                        .finally
+                        .active_return_finally_contexts
+                        .is_empty()
+                    && self
+                        .control
+                        .finally
+                        .preserved_return_value_contexts
+                        .is_empty()
+                    && self.control.finally.copied_return_finally_preserved_values == 0
+                    && self.control.loops.contexts.last().is_some_and(|context| {
+                        context.break_policy.returns()
+                            && context.iterator_cleanup == IteratorCleanup::None
+                            && context.with_depth == 0
+                            && context.finally_end_depth == 0
+                            && context.exception_region_depth == 0
+                    });
                 let retained_chained_comparison_exit =
-                    matches!(body, [Stmt::Return(_) | Stmt::Raise(_)])
+                    (matches!(body, [Stmt::Return(_) | Stmt::Raise(_)]) || terminal_break_return)
                         .then(|| {
                             final_chained_comparison_jump(test).or_else(|| {
                                 (self.control.statements.current_statement_has_following
@@ -12273,10 +12340,25 @@ impl Compiler<'_> {
             } else {
                 statement.test.as_ref()
             };
+            // A direct return leaves only the condition's false edges entering this
+            // original normal-try exit. An earlier completed try cannot merge its
+            // cleanup array into that distinct conditional target.
+            let independent_return_fallthrough = statement.elif_else_clauses.is_empty()
+                && matches!(statement.body.as_slice(), [Stmt::Return(_)])
+                && condition_has_only_runtime_tests(&statement.test)
+                && self.control.exceptions.normal_try_loop_tail_owner
+                    == Some((
+                        restart,
+                        self.control
+                            .exceptions
+                            .active_exception_region_exclusions
+                            .len(),
+                    ));
             let copied_protected_fallthrough = if try_body_normal_exit
-                && !leading
+                && (!leading
                     .iter()
                     .any(|statement| matches!(statement, Stmt::Try(_)))
+                    || independent_return_fallthrough)
                 // Each elif starts its own original conditional array. A manager in
                 // the first arm cannot locate that later arm's shared false exit.
                 && (!statement.elif_else_clauses.is_empty()
@@ -16092,10 +16174,65 @@ impl Compiler<'_> {
                         && handler.name.is_some()
                         && guarded_recovery_has_populated_handler_suffix(&handler.body)
                 }));
+            let live_guarded_recovery_cleanup = handler_contains_nested_handler_cold_join
+                && !handler_contains_terminal_nested_try
+                && !handler_has_orphan_cold_cleanup
+                && !statement.is_star
+                && statement.orelse.is_empty()
+                && statement.finalbody.is_empty()
+                && matches!(self.unit.scope, Scope::Function { .. })
+                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                && suite_has_linear_borrow_fallthrough(&statement.body)
+                && self.control.loops.contexts.is_empty()
+                && self.control.withs.active_with_exits.is_empty()
+                && self.control.exceptions.active_exception_handlers.is_empty()
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .is_empty()
+                && self.control.finally.active_finally_try_bodies == 0
+                && self.control.finally.active_normal_finally_bodies == 0
+                && self.control.finally.active_copied_finally_bodies == 0
+                && self.control.finally.active_finally_end_blocks == 0
+                && handlers_have_live_guarded_recovery_cleanup(statement);
+            let populated_async_recovery_else = handler_contains_nested_handler_cold_join
+                && !handler_contains_terminal_nested_try
+                && !handler_has_orphan_cold_cleanup
+                && !statement.is_star
+                && statement.finalbody.is_empty()
+                && matches!(self.unit.scope, Scope::Function { .. })
+                && self.unit.flags & CO_COROUTINE != 0
+                && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+                && suite_has_linear_borrow_fallthrough(&statement.orelse)
+                && matches!(statement.body.as_slice(), [Stmt::With(manager)]
+                    if manager.is_async
+                        && manager.items.len() == 1
+                        && suite_has_normal_fallthrough(&manager.body))
+                && self.control.loops.contexts.is_empty()
+                && self.control.withs.active_with_exits.is_empty()
+                && self.control.exceptions.active_exception_handlers.is_empty()
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .is_empty()
+                && self.control.finally.active_finally_try_bodies == 0
+                && self.control.finally.active_normal_finally_bodies == 0
+                && self.control.finally.active_copied_finally_bodies == 0
+                && self.control.finally.active_finally_end_blocks == 0
+                && matches!(statement.handlers.as_slice(), [handler]
+                if handler.as_except_handler().is_some_and(|handler| {
+                    handler.type_.is_some()
+                        && handler.name.is_some()
+                        && async_recovery_has_populated_handler_suffix(&handler.body)
+                }));
             if (normal_exit_starts_in_empty_block
                 && borrow_exit_has_source_successor
                 && !nonempty_finally_normal_source
-                && !populated_guarded_handler_suffix)
+                && !populated_guarded_handler_suffix
+                && !live_guarded_recovery_cleanup
+                && !populated_async_recovery_else)
                 || matches!(normal_exit_suite.last(), Some(Stmt::Assert(assertion))
                     if assertion_has_only_runtime_tests(&assertion.test)
                         && condition_jump_target_count(&assertion.test, true) > 1)
@@ -26413,6 +26550,124 @@ fn guarded_recovery_has_populated_handler_suffix(body: &[Stmt]) -> bool {
                                 if raise.exc.is_none() && raise.cause.is_none()))
             })
     })
+}
+
+// A final no-else None guard keeps the named handler cleanup live through its
+// false edge. Normally completing nested recoveries cannot orphan that entry.
+fn handlers_have_live_guarded_recovery_cleanup(statement: &ruff_python_ast::StmtTry) -> bool {
+    fn completed_work(statement: &Stmt) -> bool {
+        suite_has_linear_borrow_fallthrough(std::slice::from_ref(statement))
+            || matches!(statement, Stmt::Assign(assignment)
+                if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                    && matches!(assignment.value.as_ref(), Expr::If(value)
+                        if is_specialized_none_condition(&value.test)
+                            && !expression_contains_inline_branch(&value.test)
+                            && !expression_contains_inline_branch(&value.body)
+                            && !expression_contains_inline_branch(&value.orelse)))
+    }
+
+    fn normal_recovery_suite(body: &[Stmt]) -> bool {
+        !body.is_empty()
+            && body.iter().all(|statement| {
+                if completed_work(statement) {
+                    return true;
+                }
+                match statement {
+                    Stmt::If(guard) => {
+                        guard.elif_else_clauses.is_empty()
+                            && condition_has_linear_runtime_leaves(&guard.test)
+                            && !expression_contains_inline_branch(&guard.test)
+                            && normal_recovery_suite(&guard.body)
+                    }
+                    Stmt::Try(recovery) => {
+                        !recovery.is_star
+                            && recovery.orelse.is_empty()
+                            && recovery.finalbody.is_empty()
+                            && !recovery.body.is_empty()
+                            && recovery.body.iter().all(completed_work)
+                            && !recovery.handlers.is_empty()
+                            && recovery.handlers.iter().all(|handler| {
+                                handler.as_except_handler().is_some_and(|handler| {
+                                    handler.type_.is_some() && normal_recovery_suite(&handler.body)
+                                })
+                            })
+                    }
+                    _ => false,
+                }
+            })
+    }
+
+    let mut has_guarded_recovery = false;
+    for handler in &statement.handlers {
+        let Some(handler) = handler.as_except_handler() else {
+            return false;
+        };
+        if handler.type_.is_none() || handler.name.is_none() {
+            return false;
+        }
+        if suite_has_linear_borrow_fallthrough(&handler.body) {
+            continue;
+        }
+        let Some(Stmt::If(guard)) = handler.body.last() else {
+            return false;
+        };
+        if !guard.elif_else_clauses.is_empty()
+            || !matches!(guard.test.as_ref(), Expr::Compare(comparison)
+                if matches!(comparison.left.as_ref(), Expr::Name(_))
+                    && is_specialized_none_condition(&guard.test))
+            || !matches!(guard.body.last(), Some(Stmt::Try(_)))
+            || !normal_recovery_suite(&handler.body)
+        {
+            return false;
+        }
+        has_guarded_recovery = true;
+    }
+    has_guarded_recovery
+}
+
+// A completed assignment after guarded async recovery keeps the named handler
+// cleanup populated. Its cold joins do not empty a separately populated else.
+fn async_recovery_has_populated_handler_suffix(body: &[Stmt]) -> bool {
+    let Some((suffix, leading)) = body.split_last() else {
+        return false;
+    };
+    if !matches!(suffix, Stmt::Assign(assignment)
+        if matches!(assignment.targets.as_slice(), [Expr::Name(_)]))
+        || !suite_has_linear_borrow_fallthrough(std::slice::from_ref(suffix))
+    {
+        return false;
+    }
+    let Some((Stmt::If(guard), prefix)) = leading.split_last() else {
+        return false;
+    };
+    if !guard.elif_else_clauses.is_empty()
+        || !condition_has_linear_runtime_leaves(&guard.test)
+        || !prefix.iter().all(|part| {
+            matches!(part, Stmt::Assign(assignment)
+                if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                    && !expression_suspends_current_scope(&assignment.value))
+        })
+    {
+        return false;
+    }
+    let Some((Stmt::Try(recovery), prefix)) = guard.body.split_last() else {
+        return false;
+    };
+    (prefix.is_empty() || suite_has_linear_borrow_fallthrough(prefix))
+        && !recovery.is_star
+        && recovery.orelse.is_empty()
+        && recovery.finalbody.is_empty()
+        && matches!(recovery.body.as_slice(), [Stmt::With(manager), suffix @ ..]
+            if manager.is_async
+                && manager.items.len() == 1
+                && suite_has_normal_fallthrough(&manager.body)
+                && suite_has_linear_borrow_fallthrough(suffix))
+        && matches!(recovery.handlers.as_slice(), [handler]
+        if handler.as_except_handler().is_some_and(|handler| {
+            handler.type_.is_some()
+                && handler.name.is_some()
+                && suite_has_linear_borrow_fallthrough(&handler.body)
+        }))
 }
 
 // The first arm of a nested try-else conditional keeps its populated jump to
