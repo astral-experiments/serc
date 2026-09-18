@@ -6582,6 +6582,32 @@ impl LayoutAssembler {
                                 // Both handler forms retain an authenticated cleanup prefix.
                                 // A named handler also contributes two omitted NULL POPs;
                                 // its name cleanup remains four distinct live records.
+                                // An inner iterator consumes the authored return NOP,
+                                // while its ordinary try and the named handler contribute
+                                // three omitted NULL POPs before the unchanged name cleanup.
+                                // The original capture already revalidated that iterator and
+                                // every cleanup record at this exact start/end pair.
+                                let iterator_handler_truth_prefix = missing == 3
+                                    && end - start == 4
+                                    && end_removed == 1
+                                    && self.exception_owner_provenance
+                                        .copied_handler_cleanups.iter()
+                                        .filter(|origin| {
+                                            origin.missing_null_pops == 3
+                                                && origin.removed_prefix_slots == 0
+                                                && origin.return_iterator.is_some()
+                                                && origin.instructions.len() == 4
+                                                && origin.assignment_pop.is_none()
+                                                && origin.continued_call.is_none()
+                                                && origin.continued_attribute_none.is_none()
+                                                && label_positions.get(&origin.start) == Some(&start)
+                                                && label_positions.get(&origin.end) == Some(&end)
+                                                && self.exception_owner_provenance
+                                                    .removed_pop_block_boundaries.contains(&origin.end)
+                                                && self.exception_owner_provenance
+                                                    .removed_pop_block_widths.get(&origin.end)
+                                                    .copied().unwrap_or(1) == 1
+                                        }).count() == 1;
                                 let handler_truth_prefix = (missing == 0
                                     && end - start == 1
                                     && indexed_instructions[start].opcode
@@ -6605,7 +6631,8 @@ impl LayoutAssembler {
                                         && indexed_instructions[start + 3].opcode
                                             == crate::target::opcodes::DELETE_FAST
                                         && indexed_instructions[start + 2].operand()
-                                            == indexed_instructions[start + 3].operand());
+                                            == indexed_instructions[start + 3].operand())
+                                    || iterator_handler_truth_prefix;
                                 // Authenticate the single finalizer POP and every live
                                 // suffix record after the captured handler cleanup.
                                 let truth_test = handler_truth_prefix
@@ -6666,7 +6693,8 @@ impl LayoutAssembler {
                                                         && self.exception_owner_provenance
                                                             .removed_pop_block_widths.get(&origin.end)
                                                             .copied().unwrap_or(1) == 1
-                                                }).count() == 1))
+                                                }).count() == 1)
+                                        || iterator_handler_truth_prefix)
                                     && self
                                         .exception_owner_provenance
                                         .original_primitive_condition_boundaries

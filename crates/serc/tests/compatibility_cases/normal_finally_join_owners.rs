@@ -361,3 +361,53 @@ fn normal_finally_marker_range_end_preserves_null_pop_slot() {
         "normal_finally_nine_fold_pop_owner_target.py",
     );
 }
+
+#[test]
+fn matches_cpython_named_retry_normal_truth_finalizer() {
+    for (filename, source) in [
+        (
+            "coroutine_named_retry_break_normal_truth_finalizer.py",
+            r"async def run(work, retry, items, report, finish):
+    error = None
+    try:
+        await work()
+    except ConnectionError as caught:
+        error = caught
+        if retry:
+            for item in items:
+                try:
+                    await work()
+                    error = None
+                    return
+                except ValueError as caught:
+                    error = caught
+                    await report(item)
+                except Exception as caught:
+                    error = caught
+                    break
+    except Exception as caught:
+        error = caught
+    finally:
+        if error:
+            await report(error)
+        finish()
+",
+        ),
+        (
+            "coroutine_named_recovery_normal_truth_finalizer_control.py",
+            r"async def run(work, report, finish):
+    error = None
+    try:
+        await work()
+    except Exception as caught:
+        error = caught
+    finally:
+        if error:
+            await report(error)
+        finish()
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

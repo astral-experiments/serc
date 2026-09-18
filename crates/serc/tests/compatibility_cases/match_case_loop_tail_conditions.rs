@@ -71,3 +71,92 @@ fn matches_cpython_match_value_case_try_else_loop_tail() {
         "match_value_case_try_else_conditional_tail_target.py",
     );
 }
+
+#[test]
+fn matches_cpython_match_loop_tail_original_backedges() {
+    for (filename, source) in [
+        (
+            "async_match_wildcard_tail_if_backedge_target.py",
+            r"async def run(events, emit, enabled):
+    async for event in events:
+        match event:
+            case Event(kind=Kind.START):
+                emit(event)
+            case _:
+                if enabled:
+                    emit(event)
+",
+        ),
+        (
+            "async_match_wildcard_tail_if_following_call_control.py",
+            r"async def run(events, emit, enabled):
+    async for event in events:
+        match event:
+            case Event(kind=Kind.START):
+                emit(event)
+            case _:
+                if enabled:
+                    emit(event)
+        emit(None)
+",
+        ),
+        (
+            "async_match_final_class_value_failure_backedge_target.py",
+            r"async def run(events, emit):
+    async for event in events:
+        match event:
+            case Event(kind=Kind.START):
+                emit(event)
+            case Event(kind=Kind.END):
+                emit(event)
+",
+        ),
+        (
+            "async_match_final_class_value_following_call_control.py",
+            r"async def run(events, emit):
+    async for event in events:
+        match event:
+            case Event(kind=Kind.START):
+                emit(event)
+            case Event(kind=Kind.END):
+                emit(event)
+        emit(None)
+",
+        ),
+        (
+            "nested_elif_match_wildcard_tail_if_backedge_target.py",
+            r"def run(events, emit, enabled, choose):
+    for event in events:
+        if event is None:
+            emit(None)
+        elif choose(event):
+            match event:
+                case Kind.START:
+                    emit(event)
+                case _:
+                    value = choose(event)
+                    if value:
+                        emit(event)
+",
+        ),
+        (
+            "nested_elif_match_wildcard_tail_if_successor_control.py",
+            r"def run(events, emit, enabled, choose):
+    for event in events:
+        if event is None:
+            emit(None)
+        elif choose(event):
+            match event:
+                case Kind.START:
+                    emit(event)
+                case _:
+                    value = choose(event)
+                    if value:
+                        emit(event)
+            emit(None)
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

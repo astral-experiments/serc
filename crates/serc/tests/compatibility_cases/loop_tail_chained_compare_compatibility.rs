@@ -193,3 +193,49 @@ fn matches_cpython_marshal_for_final_elif_and_chains() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_final_elif_chain_original_cleanup_donors() {
+    for (filename, source) in [
+        (
+            "sync_final_elif_negated_chain.py",
+            r"def run(items, upper, output):
+    for value in items:
+        if value is None:
+            output.append(value)
+        elif not 0 <= value <= upper:
+            output.append(value)
+    return output
+",
+        ),
+        (
+            "async_final_elif_negated_chain.py",
+            r"async def run(fetch, upper, output):
+    items = await fetch()
+    if items:
+        for value in items:
+            if value is None:
+                output.append(value)
+            elif not 0 <= value <= upper:
+                output.append(value)
+    return output
+",
+        ),
+        (
+            "async_try_final_elif_direct_chain.py",
+            r"async def run(fetch, previous, current, output):
+    try:
+        items = await fetch()
+        for limit in items:
+            if previous < limit <= current:
+                output.append(limit)
+            elif current < limit <= previous:
+                output.append(limit)
+    except Exception:
+        output.clear()
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

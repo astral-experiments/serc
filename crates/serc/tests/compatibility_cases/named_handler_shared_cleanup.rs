@@ -122,3 +122,57 @@ fn named_handler_original_cleanup_uses_surviving_store_location() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn named_handler_loop_exits_copy_original_name_cleanup() {
+    for (filename, source) in [
+        (
+            "named_handler_nested_retry_break_target.py",
+            r"def run(items, retries, work, report):
+    for item in items:
+        try:
+            work(item)
+        except LookupError as caught:
+            report(item)
+            for retry in retries:
+                try:
+                    work(item)
+                    break
+                except LookupError as caught:
+                    report(retry)
+                except Exception as caught:
+                    report(item)
+                    break
+            else:
+                report(item)
+        report(item)
+",
+        ),
+        (
+            "async_named_handler_multi_break_target.py",
+            r"async def run(items, work, report):
+    try:
+        await work(None)
+    except LookupError as caught:
+        report(None)
+        for item in items:
+            value = await work(item)
+            if value is None:
+                report(item)
+                break
+            if value:
+                break
+            try:
+                await work(value)
+                break
+            except ValueError:
+                report(value)
+        else:
+            await work(None)
+    report(None)
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

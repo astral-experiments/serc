@@ -5178,8 +5178,25 @@ impl Compiler<'_> {
                 // A result returned from a loop that was already protected by this try keeps the
                 // iterator cleanup protected. For a literal, start the exclusion before
                 // loading the returned constant; other returned values are already on the stack.
-                let delay_literal_iterator_exception_unwind_start =
-                    !preserve_tos && self.control.in_exception_protected_iterator_loop();
+                let delay_literal_iterator_exception_unwind_start = !preserve_tos
+                    && (self.control.in_exception_protected_iterator_loop()
+                        || (self.context.target_specific_rules_enabled()
+                            && self
+                                .control
+                                .loops
+                                .contexts
+                                .iter()
+                                .rfind(|context| context.iterator_cleanup != IteratorCleanup::None)
+                                .is_some_and(|context| {
+                                    // A while contributes no stack cleanup. Keep the nearest
+                                    // enclosing iterator protected until it is discarded.
+                                    context.exception_region_depth
+                                        == self
+                                            .control
+                                            .exceptions
+                                            .active_exception_region_exclusions
+                                            .len()
+                                })));
                 let delay_iterator_exception_unwind_start = overriding_unwind_start.is_none()
                     && !self
                         .control
@@ -11659,7 +11676,13 @@ impl Compiler<'_> {
             |control| &mut control.loops.loop_tail_while_condition,
             true,
             |compiler| {
-                compiler.compile_loop_tail_condition(&statement.test, true, body_label, restart)
+                compiler.compile_loop_tail_condition(
+                    &statement.test,
+                    true,
+                    body_label,
+                    restart,
+                    non_final_branch,
+                )
             },
         )?;
 
@@ -11781,7 +11804,7 @@ impl Compiler<'_> {
         let failure = self.assembler.label();
 
         self.compile_jump_if(&conditional.test, false, otherwise)?;
-        self.compile_loop_tail_condition(&conditional.body, false, copied_failure, restart)?;
+        self.compile_loop_tail_condition(&conditional.body, false, copied_failure, restart, false)?;
 
         self.assembler.mark(copied_failure);
         self.set_depth(base_depth);
@@ -11797,7 +11820,7 @@ impl Compiler<'_> {
 
         self.assembler.mark(otherwise);
         self.set_depth(base_depth);
-        self.compile_loop_tail_condition(&conditional.orelse, false, failure, restart)?;
+        self.compile_loop_tail_condition(&conditional.orelse, false, failure, restart, false)?;
 
         self.assembler.mark(failure);
         self.set_depth(base_depth);
@@ -11884,7 +11907,13 @@ impl Compiler<'_> {
         }
 
         let failure = self.assembler.label();
-        self.compile_loop_tail_condition(&statement.test, false, failure, restart)?;
+        self.compile_loop_tail_condition(
+            &statement.test,
+            false,
+            failure,
+            restart,
+            non_final_branch,
+        )?;
 
         self.assembler.mark(failure);
         self.set_depth(base_depth);
@@ -12271,6 +12300,7 @@ impl Compiler<'_> {
                                     true,
                                     body_label,
                                     restart,
+                                    non_final_branch,
                                 )
                             },
                         )
@@ -12368,27 +12398,48 @@ impl Compiler<'_> {
                     && matches!(test, Expr::BoolOp(_))
                     && condition_has_only_runtime_tests(test)
                     && final_chained_comparison_jump(test).is_some();
-                // A direct final chain keeps separate success and cleanup arrays, as
-                // does the final operand of a live Boolean condition. Leading AND
-                // operands also keep their separate false-edge backedges.
+                let (comparison_test, negated) = if let Expr::UnaryOp(unary) = test
+                    && unary.op == UnaryOp::Not
+                {
+                    (unary.operand.as_ref(), true)
+                } else {
+                    (test, false)
+                };
+                // A final chain keeps separate success and cleanup arrays, including when
+                // negated or in a coroutine whose comparison operands do not suspend.
+                // Leading AND operands also keep their separate false-edge backedges.
                 if !non_final_branch
-                    && self.control.generators.generator_region_start.is_none()
-                    && let Expr::Compare(comparison) = test
+                    && let Expr::Compare(comparison) = comparison_test
                     && comparison.ops.len() > 1
+                    && (self.control.generators.generator_region_start.is_none()
+                        || (self.unit.flags & CO_COROUTINE != 0
+                            && !expression_suspends_current_scope(test)))
                 {
                     self.compile_loop_tail_chained_condition(
                         comparison,
                         restart,
                         body_label,
-                        false,
+                        negated,
                         matches!(body, [Stmt::Return(_)]),
                     )?;
                 } else if split_final_boolean_chain
                     || (split_short_circuit && !expression_contains_chained_comparison(test))
                 {
-                    self.compile_loop_tail_condition(test, true, body_label, restart)?;
+                    self.compile_loop_tail_condition(
+                        test,
+                        true,
+                        body_label,
+                        restart,
+                        non_final_branch,
+                    )?;
                 } else {
-                    self.compile_loop_tail_condition_atom(test, true, body_label, restart)?;
+                    self.compile_loop_tail_condition_atom(
+                        test,
+                        true,
+                        body_label,
+                        restart,
+                        non_final_branch,
+                    )?;
                 }
                 self.assembler.mark(body_label);
                 self.set_depth(base_depth);
@@ -12429,6 +12480,11 @@ impl Compiler<'_> {
                 if nested_tail == LoopBackedge::Required && !suite_terminates(body) {
                     self.set_branch_end_location(body, body_start);
                     self.emit_jump_backward(JUMP_BACKWARD, restart, 0)?;
+                    if !non_final_branch && matches!(body.last(), Some(Stmt::Match(_))) {
+                        // The final arm's match join still starts the original common exit.
+                        // Earlier arms use copied exits and cannot certify this backward head.
+                        self.assembler.record_last_original_loop_backedge();
+                    }
                 }
                 return Ok(LoopBackedge::Emitted);
             }
@@ -12872,11 +12928,18 @@ impl Compiler<'_> {
         jump_on: bool,
         success: Label,
         restart: Label,
+        non_final_branch: bool,
     ) -> Result<(), CompileError> {
         if let Expr::UnaryOp(unary) = expression
             && unary.op == UnaryOp::Not
         {
-            return self.compile_loop_tail_condition(&unary.operand, !jump_on, success, restart);
+            return self.compile_loop_tail_condition(
+                &unary.operand,
+                !jump_on,
+                success,
+                restart,
+                non_final_branch,
+            );
         }
         if let Expr::BoolOp(boolean) = expression {
             let Some((last, leading)) = boolean.values.split_last() else {
@@ -12903,11 +12966,23 @@ impl Compiler<'_> {
             } else {
                 for value in leading {
                     let next = self.assembler.label();
-                    self.compile_loop_tail_condition(value, !short_circuit_value, next, restart)?;
+                    self.compile_loop_tail_condition(
+                        value,
+                        !short_circuit_value,
+                        next,
+                        restart,
+                        non_final_branch,
+                    )?;
                     self.assembler.mark(next);
                 }
             }
-            return self.compile_loop_tail_condition(last, jump_on, success, restart);
+            return self.compile_loop_tail_condition(
+                last,
+                jump_on,
+                success,
+                restart,
+                non_final_branch,
+            );
         }
         // The first conditional arm keeps a forward exit around the second arm's backedge.
         if let Expr::If(conditional) = expression
@@ -12917,7 +12992,13 @@ impl Compiler<'_> {
                 conditional,
                 success,
                 |compiler, arm, success| {
-                    compiler.compile_loop_tail_condition(arm, jump_on, success, restart)
+                    compiler.compile_loop_tail_condition(
+                        arm,
+                        jump_on,
+                        success,
+                        restart,
+                        non_final_branch,
+                    )
                 },
             );
         }
@@ -12928,7 +13009,13 @@ impl Compiler<'_> {
                 comparison, restart, success, !jump_on, false,
             );
         }
-        self.compile_loop_tail_condition_atom(expression, jump_on, success, restart)
+        self.compile_loop_tail_condition_atom(
+            expression,
+            jump_on,
+            success,
+            restart,
+            non_final_branch,
+        )
     }
 
     fn compile_loop_tail_condition_atom(
@@ -12937,6 +13024,7 @@ impl Compiler<'_> {
         jump_on: bool,
         success: Label,
         restart: Label,
+        non_final_branch: bool,
     ) -> Result<(), CompileError> {
         let control_region = (early_condition_truthiness(expression).is_none()
             && self.has_active_control_flow_region())
@@ -13028,7 +13116,22 @@ impl Compiler<'_> {
                     .mark_before_trailing_instructions(start, condition_tail);
             }
         }
-        self.emit_jump_backward(JUMP_BACKWARD, restart, 0)?;
+        if !non_final_branch
+            && condition_tail == 0
+            && jump_constant_truthiness(expression) == Some(!jump_on)
+        {
+            // A final tail reaches the backedge CPython appends after assigning
+            // exception owners. A folded non-final arm keeps its original shared
+            // exit's owner; retained condition instructions also keep theirs.
+            self.emit_jump_backward_with_exception_policy(
+                JUMP_BACKWARD,
+                restart,
+                0,
+                ExceptionPolicy::EXCLUDE_ALWAYS,
+            )?;
+        } else {
+            self.emit_jump_backward(JUMP_BACKWARD, restart, 0)?;
+        }
         if let Some((control_start, control_end)) = control_region {
             self.assembler.mark(control_end);
             self.add_control_flow_region_exclusion(control_start, control_end);
@@ -14211,6 +14314,11 @@ impl Compiler<'_> {
                     .set_location(self.source_location(statement.range()));
             }
             self.emit_jump_backward(JUMP_BACKWARD, start, 0)?;
+            if matches!(statement.body.last(), Some(Stmt::Match(_))) {
+                // Pattern failure and a wildcard body's false edge can share this
+                // original match-end backedge, just as in a synchronous iterator.
+                self.assembler.record_last_original_loop_backedge();
+            }
         }
 
         self.assembler.add_exception_region(
@@ -18129,9 +18237,36 @@ impl Compiler<'_> {
                         handler.body.last(),
                         Some(Stmt::Match(tail)) if match_has_multiple_normal_case_exits(tail)
                     )));
+            // Generic loop lowering keeps the same original conditional join as
+            // the specialized loop-tail path. Its cleanup must remain unlocated
+            // until each normal predecessor receives its own copy.
+            let handler_has_original_conditional_loop_join =
+                self.context.target_specific_rules_enabled()
+                    && handler.name.is_none()
+                    && !terminal
+                    && loop_tail.is_none()
+                    && !cleanup_has_small_return_successor
+                    && self.control.in_loop()
+                    && self.control.finally.active_normal_finally_bodies == 0
+                    && self.control.finally.active_finally_end_blocks == 0
+                    && self.control.finally.active_copied_finally_bodies == 0
+                    && matches!(handler.body.last(), Some(Stmt::If(tail))
+                    if tail.elif_else_clauses.is_empty()
+                        && condition_has_only_runtime_tests(&tail.test)
+                        && if_has_multiple_normal_exit_targets(tail)
+                        && matches!(tail.body.as_slice(), [Stmt::Break(_) | Stmt::Assign(_)]))
+                    && self.assembler.at_original_shared_conditional_join();
             let handler_ends_with_inlineable_cleanup = handler_ends_with_preordered_cleanup
+                || handler_has_original_conditional_loop_join
                 || handler_ends_with_named_conditional_cleanup
                 || handler_ends_with_loop_tail_join
+                // A named handler's five-record cleanup can be copied onto original
+                // break edges even when a loop's exhaustion arm also falls through.
+                || (self.context.target_specific_rules_enabled()
+                    && handler.name.is_some()
+                    && !terminal
+                    && !cleanup_has_small_return_successor
+                    && self.assembler.at_original_authored_break_join())
                 || (handler.name.is_none()
                     && self.control.finally.active_normal_finally_bodies == 0
                     && self.control.finally.active_finally_end_blocks == 0
@@ -18719,7 +18854,28 @@ impl Compiler<'_> {
                                 _ => handler_cleanup_has_normal_finally_successor
                                     && condition_has_linear_runtime_leaves(&tail.test),
                             }
-                );
+                ) || (handler.name.is_none()
+                    && loop_tail.is_none()
+                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                        == CO_COROUTINE
+                    && handler_cleanup_has_normal_finally_successor
+                    && self
+                        .control
+                        .finally
+                        .exceptional_finally_continuation_depths
+                        .is_none()
+                    && self
+                        .control
+                        .finally
+                        .copied_return_finally_loop_depth
+                        .is_none()
+                    && matches!(handler.body.last(), Some(Stmt::If(tail))
+                        if tail.elif_else_clauses.is_empty()
+                            && condition_has_linear_runtime_leaves(&tail.test)
+                            && condition_jump_target_count(&tail.test, false) > 1
+                            && suite_has_linear_raise_exit(&tail.body)
+                            && matches!(tail.body.last(), Some(Stmt::Raise(raise))
+                                if raise.exc.is_none() && raise.cause.is_none())));
                 // CPython propagates a handler's sole condition-fallthrough edge onto the
                 // normal cleanup block, even when code follows the enclosing try statement.
                 if handler_cleanup_from_original_join

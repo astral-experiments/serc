@@ -169,3 +169,49 @@ fn matches_cpython_handler_final_else_multiple_predecessors() {
 ";
     common::assert_matches_cpython_marshal(source, "handler_final_else_multiple_predecessors.py");
 }
+
+#[test]
+fn matches_cpython_coroutine_reraise_shared_false_finally_cleanup() {
+    for (filename, source) in [
+        (
+            "coroutine_unnamed_reraise_shared_false_finally_target.py",
+            r"async def run(queue, work, current_task, emit, finish):
+    while True:
+        item = await queue.get()
+        try:
+            await work(item)
+        except CancelledError:
+            current = current_task()
+            if current is not None and current.cancelling():
+                emit(current)
+                raise
+        except Exception as error:
+            emit(error)
+        finally:
+            await finish(item)
+        emit(item)
+",
+        ),
+        (
+            "coroutine_unnamed_reraise_single_false_finally_control.py",
+            r"async def run(queue, work, current_task, emit, finish):
+    while True:
+        item = await queue.get()
+        try:
+            await work(item)
+        except CancelledError:
+            current = current_task()
+            if current.cancelling():
+                emit(current)
+                raise
+        except Exception as error:
+            emit(error)
+        finally:
+            await finish(item)
+        emit(item)
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

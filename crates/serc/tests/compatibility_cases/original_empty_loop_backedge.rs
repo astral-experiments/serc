@@ -507,3 +507,75 @@ fn retained_setup_in_original_finally_array() {
         );
     }
 }
+
+#[test]
+fn matches_cpython_folded_loop_backedge_owner_prefixes() {
+    for (filename, source) in [
+        (
+            "protected_async_generator_folded_false_tail.py",
+            r"async def run(wait):
+    try:
+        while True:
+            await wait()
+            if False:
+                yield None
+    except ValueError:
+        raise
+",
+        ),
+        (
+            "protected_async_generator_runtime_tail_control.py",
+            r"async def run(wait, ready):
+    try:
+        while True:
+            await wait()
+            if ready:
+                yield None
+    except ValueError:
+        raise
+",
+        ),
+        (
+            "manager_iterator_assert_folded_true_arm.py",
+            r"def run(manager, items, ready, valid):
+    with manager:
+        for item in items:
+            assert valid(item) if ready(item) else 1.0
+",
+        ),
+        (
+            "manager_iterator_assert_runtime_arm_control.py",
+            r"def run(manager, items, ready, valid, fallback):
+    with manager:
+        for item in items:
+            assert valid(item) if ready(item) else fallback(item)
+",
+        ),
+        (
+            "finally_manager_iterator_folded_false_break.py",
+            r"def run(manager, items, limit, ready, cleanup):
+    try:
+        with manager:
+            for item in items:
+                if ready(item) if limit is not None else False:
+                    break
+    finally:
+        cleanup()
+",
+        ),
+        (
+            "finally_manager_iterator_runtime_break_control.py",
+            r"def run(manager, items, limit, ready, cleanup, fallback):
+    try:
+        with manager:
+            for item in items:
+                if ready(item) if limit is not None else fallback(item):
+                    break
+    finally:
+        cleanup()
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
