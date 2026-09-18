@@ -3494,6 +3494,25 @@ impl Assembler {
         instruction.add_pre_fold_extra_instructions(count);
     }
 
+    /// Certifies the same-line NOP authored immediately after a specialized super load.
+    pub(crate) fn record_last_same_line_super_owner_slot(&mut self) {
+        let instruction = self.required_last_instruction_mut("recording a super-load owner slot");
+        if instruction.opcode == crate::target::opcodes::LOAD_SUPER_ATTR
+            && matches!(instruction.operand(), Operand::Value(_))
+            && instruction.location.line >= 0
+            && instruction.location.line == instruction.location.end_line
+            && instruction.exception_policy() == ExceptionPolicy::NoneUnchanged
+            && instruction.local_policy.hidden_exception_owner_slots() == 1
+            && instruction.pre_fold_extra_instructions() == 0
+        {
+            instruction.jump_policy.mark_original_uniform_fold();
+            let original = *instruction;
+            self.exception_owner_provenance
+                .original_uniform_folds
+                .push(original);
+        }
+    }
+
     /// Certifies contiguous literal-fold records that share their survivor's owner.
     pub(crate) fn record_last_uniform_fold_owner_slots(&mut self, count: usize) {
         if count >= 4 && count < usize::from(LocalPolicy::MAX_HIDDEN_EXCEPTION_OWNER_SLOTS) {

@@ -1823,11 +1823,13 @@ impl Compiler<'_> {
                 self.assembler.set_location(location);
                 self.emit(NOP, 0, 0)?;
             } else if let Stmt::Pass(statement) = statement
-                // CPython retains pass markers in the exceptional copy of a multi-statement
-                // finally body, even though ordinary protected suites omit them.
+                // An authored continuation keeps this Pass in its protected original array.
+                // At a true suite end, normal cleanup can still absorb the omitted marker.
                 && (self.control.exceptions.active_exception_region_exclusions.is_empty()
                     || self.control.finally.active_finally_end_blocks > 0
-                    || protected_async_with_pass)
+                    || protected_async_with_pass
+                    || ((!is_final || inherited_statement_has_following)
+                        && self.control.withs.active_with_exits.is_empty()))
                 && (self.control.withs.active_with_region_exclusions.is_empty() || body.len() > 1)
             {
                 self.assembler
@@ -11369,6 +11371,9 @@ impl Compiler<'_> {
                     // try owner after the normal loop-exit edge is copied through the handler.
                     self.assembler.preserve_last_not_taken_exception_owner();
                 }
+                // The authored true branch starts a new original instruction array,
+                // including when its loop backedge is emitted by a nested cleanup.
+                self.assembler.record_short_circuit_owner_continuation();
             }
             let arm_start = self.assembler.emitted_region_start();
             // A non-final branch still targets the following `elif`; its nested Boolean joins
@@ -24639,9 +24644,9 @@ fn condition_has_linear_runtime_leaves(expression: &Expr) -> bool {
     }
 }
 
-// A synchronous loop's nonempty else-finally cleanup has a separate normal-exit jump.
+// A synchronous loop's else cleanup or outer-loop continue has a separate exit.
 // The surrounding condition's single false edge retains its own located join when
-// that cleanup jump (and any loop breaks) bypasses the original conditional exit.
+// those exits and the inner loop's breaks bypass the original conditional exit.
 fn conditional_for_else_cleanup_exit(statement: &ruff_python_ast::StmtIf) -> bool {
     if !statement.elif_else_clauses.is_empty()
         || early_condition_truthiness(&statement.test).is_some()
@@ -24658,6 +24663,15 @@ fn conditional_for_else_cleanup_exit(statement: &ruff_python_ast::StmtIf) -> boo
         || expression_contains_inline_branch(&loop_statement.target)
     {
         return false;
+    }
+    // Exhaustion continues the enclosing loop. Ordinary inner-loop breaks copy
+    // the following conditional exit, leaving its original false edge as donor.
+    // Nested exception cleanup needs its own original exit-boundary certificate.
+    if matches!(loop_statement.orelse.as_slice(), [Stmt::Continue(_)])
+        && suite_contains_loop_break(&loop_statement.body)
+        && !suite_contains_nested_exception_cleanup(&loop_statement.body)
+    {
+        return true;
     }
     let Some((Stmt::Try(cleanup), leading)) = loop_statement.orelse.split_last() else {
         return false;

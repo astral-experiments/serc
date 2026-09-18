@@ -3356,6 +3356,7 @@ impl Compiler<'_> {
             } else {
                 // CPython removes the same-line specialized-call NOP before appending markers.
                 self.assembler.add_last_hidden_exception_owner_slots(1);
+                self.assembler.record_last_same_line_super_owner_slot();
             }
             return Ok(SpecializedLowering::Applied);
         }
@@ -3416,6 +3417,7 @@ impl Compiler<'_> {
         } else {
             // CPython removes the same-line specialized-call NOP before appending markers.
             self.assembler.add_last_hidden_exception_owner_slots(1);
+            self.assembler.record_last_same_line_super_owner_slot();
         }
         Ok(SpecializedLowering::Applied)
     }
@@ -7939,15 +7941,13 @@ impl Compiler<'_> {
             self.add_constant(Constant::None)?;
             let left_location = self.source_location(comparison.left.range());
             let none_location = self.source_location(comparison.comparators[0].range());
-            let left_line = if matches!(
-                comparison.left.as_ref(),
-                Expr::Call(call)
-                    if call.arguments.args.is_empty() && call.arguments.keywords.is_empty()
-            ) {
-                left_location.end_line
-            } else {
-                left_location.line
-            };
+            // CPython compacts the specialized LOAD_CONST(None) against the
+            // preceding instruction in its original block, whose line need not
+            // be the start of a multiline operand (for example, LOAD_ATTR).
+            let left_line = self
+                .assembler
+                .current_block_last_instruction_location()
+                .map_or(left_location.line, |location| location.line);
             if left_line != none_location.line {
                 self.assembler.set_location(none_location);
                 self.emit(NOP, 0, 0)?;

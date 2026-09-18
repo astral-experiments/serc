@@ -326,6 +326,7 @@ impl Assembler {
             deferred_shared_jump_blocks: self.deferred_shared_jump_blocks,
             retained_pop_block_origins: self.retained_pop_block_origins,
             shared_jump_copy_location_blocks: self.shared_jump_copy_location_blocks,
+            nested_if_unlocated_join_blocks: self.nested_if_unlocated_join_blocks,
             folded_condition_exit_targets: self.folded_condition_exit_targets,
             has_assertion_side_exit_candidate: self.has_assertion_side_exit_candidate,
             has_synthesized_percent_target_locations: self.has_synthesized_percent_target_locations,

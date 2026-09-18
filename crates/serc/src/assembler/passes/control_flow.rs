@@ -620,6 +620,7 @@ impl OptimizationPipeline {
             .then_some([copy_position, to_bool_position, positions[index]])
         }
 
+        let nested_join_blocks = std::mem::take(&mut self.nested_if_unlocated_join_blocks);
         self.borrow_threaded_jump_entries.clear();
         // CPython threads the value-preserving jumps used by boolean
         // expressions through a nested boolean test. If both tests jump on
@@ -822,6 +823,54 @@ impl OptimizationPipeline {
                     Item::Instruction(_) => instruction_positions.push((block, offset)),
                 }
             }
+        }
+        // Bind only a surviving original nested join's complete jump record.
+        // Aliased labels containing work or omitted authored NOPs cannot certify it.
+        let mut nested_join_sources = FxHashMap::<usize, Vec<(Label, Instruction)>>::default();
+        let mut nested_join_blocks: Vec<_> = nested_join_blocks.into_iter().collect();
+        nested_join_blocks.sort_unstable_by_key(|label| label.0);
+        for entry in nested_join_blocks {
+            let Some(&index) = label_offsets.get(&entry) else {
+                continue;
+            };
+            let Some(&(block, offset)) = instruction_positions.get(index) else {
+                continue;
+            };
+            let items = graph[block].items();
+            let Item::Instruction(jump) = items[offset] else {
+                continue;
+            };
+            if offset + 1 != items.len()
+                || !items[..offset].contains(&Item::Label(entry))
+                || items[..offset].iter().any(|item| match item {
+                    Item::Instruction(_) => true,
+                    Item::Label(label) => {
+                        self.original_nop_targets.contains(label)
+                            || self
+                                .exception_owner_provenance
+                                .omitted_nop_counts
+                                .contains_key(label)
+                            || self
+                                .exception_owner_provenance
+                                .omitted_nop_locations
+                                .contains_key(label)
+                    }
+                })
+                || jump.opcode != JUMP_FORWARD
+                || jump.location != SourceLocation::NONE
+                || !jump.no_location_policy.preserves_location()
+                || jump.no_location_policy.is_artificial_eval_break()
+                || jump.jump_policy.is_interruptible()
+                || jump.jump_policy.always_retains_nop()
+                || jump.pre_fold_extra_instructions() != 0
+                || jump.local_policy.hidden_exception_owner_slots() != 0
+            {
+                continue;
+            }
+            nested_join_sources
+                .entry(index)
+                .or_default()
+                .push((entry, jump));
         }
         // A scheduled copy must still observe its original source target.
         let planned_blocks = self
@@ -1175,6 +1224,9 @@ impl OptimizationPipeline {
                 return;
             };
             let original_target = target;
+            let original_jump = *instruction;
+            let nested_join_origins = nested_join_sources.get(&source_index);
+            let mut nested_join_target_is_clean = true;
             let authored_break_copy_nop = instruction.fusion_policy.is_authored_break()
                 && instruction.opcode == JUMP_FORWARD
                 && instruction
@@ -1228,6 +1280,20 @@ impl OptimizationPipeline {
                 if next == target {
                     break;
                 }
+                if nested_join_origins.is_some() {
+                    // An authored NOP belongs to the entered original array even if
+                    // lowering removed it. Threading past it cannot certify the
+                    // nested join as an original unlocated eval-check exit.
+                    nested_join_target_is_clean &= !self.original_nop_targets.contains(&target)
+                        && !self
+                            .exception_owner_provenance
+                            .omitted_nop_counts
+                            .contains_key(&target)
+                        && !self
+                            .exception_owner_provenance
+                            .omitted_nop_locations
+                            .contains_key(&target);
+                }
                 operand = next_operand;
                 threaded_jump_count = threaded_jump_count.saturating_add(1);
                 crosses_normal_try_exit |= next_normal_try_exit;
@@ -1275,6 +1341,20 @@ impl OptimizationPipeline {
                 // Threading through JUMP preserves its eval-breaker check, including when
                 // another synthetic cleanup edge supplies the final target.
                 instruction.jump_policy.mark_interruptible();
+            }
+            if retargeted
+                && nested_join_target_is_clean
+                && (instruction.opcode == JUMP_BACKWARD
+                    || instruction.jump_policy.is_interruptible())
+                && let Some(origins) = nested_join_origins
+            {
+                // This exact original join acquired the threaded exit's eval check.
+                // Its private copies and sole survivor now inherit their own donors.
+                self.shared_jump_copy_location_blocks.extend(
+                    origins
+                        .iter()
+                        .filter_map(|(entry, origin)| (*origin == original_jump).then_some(*entry)),
+                );
             }
             if authored_break_copy_nop
                 && threaded_jump_count == 1

@@ -1472,7 +1472,7 @@ pub(crate) struct Assembler {
     pub(super) retained_pop_block_origins: FxHashMap<Label, Vec<Label>>,
     /// Shared jumps whose copies can acquire their new predecessor's source location.
     pub(super) shared_jump_copy_location_blocks: FxHashSet<Label>,
-    /// Nested joins awaiting their source-authored match-case successor; emission only.
+    /// Original nested joins awaiting a source-authored or threaded eval-check exit.
     pub(super) nested_if_unlocated_join_blocks: FxHashSet<Label>,
     /// Unique joins reached by the synthetic exits of early-folded conditions.
     pub(super) folded_condition_exit_targets: FxHashSet<Label>,
@@ -1574,6 +1574,8 @@ pub(super) struct OptimizationPipeline {
     /// Original label-only prefixes of retained normal-finally `POP_BLOCK` instructions.
     pub(super) retained_pop_block_origins: FxHashMap<Label, Vec<Label>>,
     pub(super) shared_jump_copy_location_blocks: FxHashSet<Label>,
+    /// Emitted nested joins consumed when their exact jump is threaded to an eval-check exit.
+    pub(super) nested_if_unlocated_join_blocks: FxHashSet<Label>,
     /// Unique joins reached by the synthetic exits of early-folded conditions.
     pub(super) folded_condition_exit_targets: FxHashSet<Label>,
     pub(super) has_assertion_side_exit_candidate: bool,

@@ -112,7 +112,7 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) noop_finally_locations: Vec<SourceLocation>,
     pub(super) with_context_locations: Vec<SourceLocation>,
     pub(super) uniform_fold_owner_slots: Vec<(SourceLocation, crate::target::Opcode, u16)>,
-    // Exact survivors of literal collection folds whose copy budget saturated.
+    // Exact survivors of uniformly owned removed records, including saturated literal folds.
     pub(super) original_uniform_folds: Vec<Instruction>,
     // Exact source comparison and original labels, before any jump copying or cleanup.
     pub(super) source_none_conditions: Vec<SourceNoneCondition>,
@@ -780,11 +780,10 @@ impl ExceptionOwnerProvenance {
                     setup_count += 1;
                 }
                 LOAD_FAST => {
-                    // Superinstruction creation would compact two live records.
-                    if instructions
-                        .get(index + 1)
-                        .is_some_and(|next| next.opcode == LOAD_FAST)
-                    {
+                    // Only same-line local loads can compact into a superinstruction.
+                    if instructions.get(index + 1).is_some_and(|next| {
+                        next.opcode == LOAD_FAST && next.location.line == instruction.location.line
+                    }) {
                         return false;
                     }
                 }
@@ -830,11 +829,13 @@ impl ExceptionOwnerProvenance {
                     }
                 }
                 PUSH_NULL => {
-                    // Attribute and module-name calls retain this separate record;
+                    // Attribute, local, and module-name calls retain this separate record;
                     // a direct global call instead folds it into LOAD_GLOBAL.
                     if instructions
                         .get(index.wrapping_sub(1))
-                        .is_none_or(|previous| !matches!(previous.opcode, LOAD_ATTR | LOAD_NAME))
+                        .is_none_or(|previous| {
+                            !matches!(previous.opcode, LOAD_ATTR | LOAD_FAST | LOAD_NAME)
+                        })
                     {
                         return false;
                     }
