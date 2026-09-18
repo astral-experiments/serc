@@ -279,3 +279,238 @@ fn matches_cpython_value_return_through_while_and_two_tries() {
         assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_named_handler_iterator_return_pop_runs() {
+    for (filename, source) in [
+        (
+            "named_iterator_return_outer_try_none_finally.py",
+            r#"async def f(items, result, resource):
+    try:
+        for item in items:
+            try:
+                await work(item)
+            except Exception as error:
+                if item:
+                    result["error"] = f"failed: {error}"
+                    return 1, result
+    except Exception as error:
+        return 2, result
+    finally:
+        if resource is not None:
+            cleanup(resource)
+"#,
+        ),
+        (
+            "named_iterator_return_outer_try_truth_finally.py",
+            r#"async def f(items, result, resource):
+    try:
+        for item in items:
+            try:
+                await work(item)
+            except Exception as error:
+                if item:
+                    result["error"] = f"failed: {error}"
+                    return 1, result
+    except Exception as error:
+        return 2, result
+    finally:
+        if resource:
+            cleanup(resource)
+"#,
+        ),
+        (
+            "named_iterator_return_direct_finally_control.py",
+            r#"async def f(items, result, resource):
+    try:
+        for item in items:
+            try:
+                await work(item)
+            except Exception as error:
+                if item:
+                    result["error"] = f"failed: {error}"
+                    return 1, result
+    finally:
+        if resource:
+            cleanup(resource)
+"#,
+        ),
+    ] {
+        assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn matches_cpython_bare_return_finally_truth_slots() {
+    for (filename, source) in [
+        (
+            "bare_return_global3_and_finally.py",
+            r"async def f(stop, left, right):
+    try:
+        if stop:
+            step_0()
+            step_1()
+            step_2()
+            return
+    finally:
+        if left and right:
+            cleanup()
+",
+        ),
+        (
+            "bare_return_global3_or_finally.py",
+            r"async def f(stop, left, right):
+    try:
+        if stop:
+            step_0()
+            step_1()
+            step_2()
+            return
+    finally:
+        if left or right:
+            cleanup()
+",
+        ),
+        (
+            "bare_return_global1_and_finally_control.py",
+            r"async def f(stop, left, right):
+    try:
+        if stop:
+            step_0()
+            return
+    finally:
+        if left and right:
+            cleanup()
+",
+        ),
+        (
+            "bare_return_global4_and_finally_control.py",
+            r"async def f(stop, left, right):
+    try:
+        if stop:
+            step_0()
+            step_1()
+            step_2()
+            step_3()
+            return
+    finally:
+        if left and right:
+            cleanup()
+",
+        ),
+    ] {
+        assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn matches_cpython_value_return_through_try_and_while() {
+    for (filename, source) in [
+        (
+            "value_return_inside_try_while_finally_none_target.py",
+            r#"async def cycle(metrics, events, watcher, completed=False, reason="end"):
+    count = 0
+    try:
+        while True:
+            event = await events.next()
+            if event is None:
+                return result(count=count, completed=False)
+            count += 1
+            if event.done:
+                completed = True
+                reason = None
+                return result(count=count, completed=True)
+    except Cancelled:
+        reason = None
+        raise
+    except Exception:
+        reason = "error"
+        raise
+    finally:
+        if (
+            metrics is not None
+            and not completed
+            and reason is not None
+        ):
+            metrics.finish(count, reason=reason)
+        watcher.stop()
+        if metrics is not None:
+            metrics.flush()
+"#,
+        ),
+        (
+            "bare_return_inside_try_while_finally_none_control.py",
+            r#"async def cycle(metrics, events, watcher, completed=False, reason="end"):
+    count = 0
+    try:
+        while True:
+            event = await events.next()
+            if event is None:
+                return
+            count += 1
+            if event.done:
+                completed = True
+                reason = None
+                return
+    except Cancelled:
+        reason = None
+        raise
+    except Exception:
+        reason = "error"
+        raise
+    finally:
+        if (
+            metrics is not None
+            and not completed
+            and reason is not None
+        ):
+            metrics.finish(count, reason=reason)
+        watcher.stop()
+        if metrics is not None:
+            metrics.flush()
+"#,
+        ),
+    ] {
+        assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn matches_cpython_async_iterator_return_finally_truth_slots() {
+    for (filename, source) in [
+        (
+            "yield_return_iterator_truth_negated.py",
+            r"async def f(items, stop, ready):
+    try:
+        async for item in items:
+            if stop:
+                step_0()
+                step_1()
+                step_2()
+                yield ready
+                return
+    finally:
+        if not ready:
+            cleanup()
+",
+        ),
+        (
+            "yield_return_iterator_truth_positive.py",
+            r"async def f(items, stop, ready):
+    try:
+        async for item in items:
+            if stop:
+                step_0()
+                step_1()
+                step_2()
+                yield ready
+                return
+    finally:
+        if ready:
+            cleanup()
+",
+        ),
+    ] {
+        assert_matches_cpython_marshal(source, filename);
+    }
+}

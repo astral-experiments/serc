@@ -488,3 +488,59 @@ fn matches_cpython_borrows_after_protected_async_elif_breaks() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_borrows_after_guarded_recovery_finally_joins() {
+    for (source, filename) in [
+        (
+            r"def collect(resource, work, recover, report, enabled, retry):
+    try:
+        try:
+            value = work(resource)
+            if enabled:
+                report(value)
+        except Exception:
+            if not retry:
+                raise
+            fallback = recover(resource)
+            try:
+                work(fallback)
+                report(fallback)
+            finally:
+                fallback.close(missing_ok=True)
+    finally:
+        resource.close(missing_ok=True)
+    report(resource)
+    report(enabled, retry)
+    return resource
+",
+            "guarded_recovery_linear_finalizer_target.py",
+        ),
+        (
+            r#"def collect(resource, work, report, enabled, option, retry):
+    try:
+        try:
+            value = work(resource, option=option if enabled else None)
+            if value.failed:
+                raise ValueError("failed")
+            report(value)
+            errors = []
+            if enabled and option:
+                errors = [{"error": "incomplete"}]
+        except Exception as error:
+            if not retry:
+                raise
+            errors = [{"error": str(error)}]
+    finally:
+        resource.close(missing_ok=True)
+    report(resource, errors)
+    if errors:
+        report(errors)
+    return errors
+"#,
+            "guarded_recovery_compound_join_target.py",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

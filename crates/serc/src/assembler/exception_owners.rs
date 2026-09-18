@@ -24,6 +24,8 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) ordinary_await_ends: Vec<OrdinaryAwaitEnd>,
     // Authored return NOP, immediately following finally POP, and original try target.
     pub(super) early_return_nop_pairs: Vec<(Instruction, Instruction, Label)>,
+    // Authored return NOP, iterator disposal, finally POP, and original try target.
+    pub(super) early_return_iterator_pops: Vec<(Instruction, Instruction, Instruction, Label)>,
     pub(super) copied_handler_cleanups: Vec<CopiedHandlerCleanup>,
     pub(super) named_handler_pop_pairs: Vec<OriginalPopBlockSpan>,
     pub(super) copied_handler_finally_pops: Vec<OriginalPopBlockSpan>,
@@ -1345,21 +1347,28 @@ impl LayoutAssembler {
         };
         let mut slots = FxHashMap::default();
         let mut aliases = FxHashSet::default();
-        for (origin, pop_count) in provenance
+        for (origin, pop_count, requires_handler_pair) in provenance
             .named_handler_pop_pairs
             .iter()
-            .map(|origin| (origin, 2))
-            .chain(
-                provenance
-                    .copied_handler_finally_pops
+            .map(|origin| (origin, 2, false))
+            .chain(provenance.copied_handler_finally_pops.iter().map(|origin| {
+                let pops = origin
+                    .items
                     .iter()
-                    .map(|origin| (origin, 1)),
-            )
+                    .filter(|item| {
+                        matches!(item, Item::Instruction(instruction)
+                        if instruction.fusion_policy.is_converted_pop_block())
+                    })
+                    .count();
+                (origin, pops, true)
+            }))
         {
             let Some(&array) = label_positions.get(&origin.entry) else {
                 continue;
             };
-            if pop_count == 1 && !slots.values().any(|entry| *entry == array) {
+            if requires_handler_pair
+                && (!(1..=2).contains(&pop_count) || !slots.values().any(|entry| *entry == array))
+            {
                 continue;
             }
             if copied(&origin.entry)
@@ -1405,27 +1414,31 @@ impl LayoutAssembler {
             }
             let mut expected = Vec::new();
             let mut successors = Vec::new();
-            let mut pending_pop = false;
+            let mut pending_pops = 0_u16;
+            let mut removed_pops = 0;
             for item in &origin.items {
                 match *item {
                     Item::Instruction(instruction)
                         if instruction.fusion_policy.is_converted_pop_block() =>
                     {
-                        pending_pop = true;
+                        pending_pops += 1;
+                        removed_pops += 1;
                     }
                     Item::Instruction(mut instruction) => {
-                        if pending_pop {
+                        if pending_pops > 0 {
                             successors.push(expected.len());
-                            instruction.local_policy.add_hidden_exception_owner_slots(1);
-                            pending_pop = false;
+                            instruction
+                                .local_policy
+                                .add_hidden_exception_owner_slots(pending_pops);
+                            pending_pops = 0;
                         }
                         expected.push(Item::Instruction(instruction));
                     }
                     label @ Item::Label(_) => expected.push(label),
                 }
             }
-            if pending_pop
-                || successors.len() != pop_count
+            if pending_pops != 0
+                || removed_pops != pop_count
                 || !matches!(expected.first(), Some(Item::Label(_)))
             {
                 continue;
@@ -2633,6 +2646,7 @@ impl LayoutAssembler {
         let mut transferred_pop_setup: Option<(Label, usize)> = None;
         let mut retained_pop_prefix = None;
         let mut early_return_nop_slot = None;
+        let mut early_return_iterator_slot = None;
         let mut early_return_truth_slot = None;
         let mut owner_history_exact = true;
         let mut pop_slot_epoch_known = true;
@@ -3317,7 +3331,50 @@ impl LayoutAssembler {
                             transferred_pop_setup = Some((*setup, original_array_start));
                         }
                     }
+                    // The authored return NOP compacts into iterator disposal.
+                    // Replay that exact survivor before counting its hidden NOP;
+                    // its original owned cell follows the authored cell by one.
+                    if instruction.opcode == POP_TOP
+                        && instruction.local_policy.hidden_exception_owner_slots() == 1
+                        && instruction.pre_fold_extra_instructions() == 0
+                        && owner_history_exact
+                        && tail.insertions == 0
+                        && tail.late_removals == 0
+                        && tail.post_compaction_fusions == 0
+                        && original_array_start < instruction_index
+                        && let Some(region) = self.uniform_exception_owner(
+                            instruction_index,
+                            instruction_index + 1,
+                            &label_positions,
+                        )
+                        && !self.exception_regions[region].is_scope_fallback
+                        && !self.exception_regions[region].preserve_lasti
+                        && self
+                            .exception_owner_provenance
+                            .early_return_iterator_pops
+                            .iter()
+                            .filter(|(_, iterator, _, target)| {
+                                let mut expected = *iterator;
+                                expected.local_policy.add_hidden_exception_owner_slots(1);
+                                expected == *instruction
+                                    && self.exception_regions[region].target == *target
+                            })
+                            .count()
+                            == 1
+                        && indexed_instructions
+                            .iter()
+                            .filter(|record| ***record == *instruction)
+                            .count()
+                            == 1
+                        && let Some(slot) = instruction_index
+                            .checked_add(tail.early_removals)
+                            .and_then(|slot| slot.checked_add(1))
+                    {
+                        early_return_iterator_slot =
+                            Some((original_array_start, instruction_index, slot, region));
+                    }
                     if instruction.opcode == NOP {
+                        early_return_iterator_slot = None;
                         early_return_nop_slot = None;
                         early_return_truth_slot = None;
                         if owner_history_exact
@@ -3599,7 +3656,13 @@ impl LayoutAssembler {
                         && tail.late_removals == 0
                         && tail.post_compaction_fusions == 0
                     {
-                        captured_null_slots.push((instruction_index, tail.early_removals));
+                        // Literal replay authenticated every adjacent POP in this run.
+                        for offset in 0..instruction.local_policy.hidden_exception_owner_slots() {
+                            captured_null_slots.push((
+                                instruction_index,
+                                tail.early_removals + usize::from(offset),
+                            ));
+                        }
                     }
                     // Locate the two original NULL cells before their transferred count
                     // is consumed. A surrounding manager has not unwound at this point.
@@ -5639,6 +5702,72 @@ impl LayoutAssembler {
                             },
                         );
                     }
+                    // A returned async iterator leaves its owned POP_TOP cell in
+                    // the old array. The adjacent finalizer POP transfers one hidden
+                    // slot to the local load; neither changes the disposal cell's owner.
+                    if instruction.opcode == NOT_TAKEN
+                        && owner_history_exact
+                        && tail.insertions == 0
+                        && tail.late_removals == 0
+                        && tail.post_compaction_fusions == 0
+                        && instruction.exception_policy().exclusion()
+                            == super::ExceptionExclusion::None
+                        && matches!(
+                            instruction.exception_policy().owner(),
+                            NormalizedExceptionOwner::Present
+                                | NormalizedExceptionOwner::DynamicCondition
+                        )
+                        && instruction.local_policy.hidden_exception_owner_slots() == 0
+                        && instruction.pre_fold_extra_instructions() == 0
+                        && owners
+                            .get(&instruction_index)
+                            .is_none_or(|decision| !decision.definitive)
+                        && let Some((array, iterator, slot, region)) = early_return_iterator_slot
+                        && original_array_start == array
+                        && instruction_index == slot
+                        && matches!(indexed_instructions.get(iterator + 1..instruction_index),
+                        Some([load, to_bool, condition])
+                            if matches!(load.opcode, crate::target::opcodes::LOAD_FAST | crate::target::opcodes::LOAD_FAST_BORROW)
+                                && matches!(load.operand(), Operand::Value(_))
+                                && load.local_policy.hidden_exception_owner_slots() == 1
+                                && to_bool.opcode == crate::target::opcodes::TO_BOOL
+                                && to_bool.operand() == Operand::Value(0)
+                                && to_bool.local_policy.hidden_exception_owner_slots() == 0
+                                && matches!(condition.opcode, crate::target::opcodes::POP_JUMP_IF_FALSE | crate::target::opcodes::POP_JUMP_IF_TRUE)
+                                && matches!(condition.operand(), Operand::Forward(_))
+                                && condition.local_policy.hidden_exception_owner_slots() == 0
+                                && [load, to_bool, condition].iter().all(|record| {
+                                    record.pre_fold_extra_instructions() == 0
+                                        && record.exception_policy() == super::ExceptionPolicy::NoneUnchanged
+                                        && record.location == instruction.location
+                                        && record.no_location_policy.borrow_fallthrough() == super::BorrowFallthrough::Reachable
+                                        && !record.jump_policy.borrow_empty_block()
+                                }))
+                        && self
+                            .exception_owner_provenance
+                            .removed_pop_block_boundaries
+                            .iter()
+                            .any(|label| {
+                                label_positions.get(label) == Some(&(iterator + 1))
+                                    && self
+                                        .exception_owner_provenance
+                                        .removed_pop_block_widths
+                                        .get(label)
+                                        .copied()
+                                        .unwrap_or(1)
+                                        == 1
+                            })
+                    {
+                        owners.insert(
+                            instruction_index,
+                            ExceptionOwnerDecision {
+                                has_owner: true,
+                                source_region: Some(region),
+                                definitive: true,
+                                override_existing: true,
+                            },
+                        );
+                    }
                     // The explicit TO_BOOL places a truthiness marker one cell later
                     // than a None test. Either original POP cell is still NULL; the
                     // preceding authored return NOP retains its protected owner.
@@ -5705,6 +5834,40 @@ impl LayoutAssembler {
                                     .count()
                                     == 1
                         });
+                    // One captured finally POP has the same NULL cell for a truth
+                    // test. Its explicit TO_BOOL moves the appended marker one cell
+                    // past the None-test shape without adding an original POP.
+                    let single_pop_truth_marker = instruction.opcode == NOT_TAKEN
+                        && instruction.local_policy.hidden_exception_owner_slots() == 0
+                        && instruction.pre_fold_extra_instructions() == 0
+                        && early_return_nop_slot.is_some_and(|(_, pop, _, _)| {
+                            indexed_instructions[pop]
+                                .local_policy
+                                .hidden_exception_owner_slots() == 1
+                                && matches!(
+                                    indexed_instructions.get(pop + 1..instruction_index),
+                                    Some([load, to_bool, condition])
+                                        if matches!(load.opcode,
+                                            crate::target::opcodes::LOAD_FAST
+                                                | crate::target::opcodes::LOAD_FAST_BORROW)
+                                            && matches!(load.operand(), Operand::Value(_))
+                                            && to_bool.opcode == crate::target::opcodes::TO_BOOL
+                                            && to_bool.operand() == Operand::Value(0)
+                                            && matches!(condition.opcode,
+                                                crate::target::opcodes::POP_JUMP_IF_FALSE | crate::target::opcodes::POP_JUMP_IF_TRUE)
+                                            && matches!(condition.operand(), Operand::Forward(_))
+                                            && [load, to_bool, condition].iter().all(|record| {
+                                                record.local_policy.hidden_exception_owner_slots() == 0
+                                                    && record.pre_fold_extra_instructions() == 0
+                                                    && record.exception_policy()
+                                                        == super::ExceptionPolicy::NoneUnchanged
+                                                    && record.location == instruction.location
+                                                    && record.no_location_policy.borrow_fallthrough()
+                                                        == super::BorrowFallthrough::Reachable
+                                                    && !record.jump_policy.borrow_empty_block()
+                                            })
+                                )
+                        });
                     // Early compaction leaves the authored exit NOP and its adjacent
                     // POP_BLOCK records in their old array cells. The first retains its
                     // try owner; either captured POP is NULL despite a scope fallback.
@@ -5737,21 +5900,22 @@ impl LayoutAssembler {
                                         .hidden_exception_owner_slots(),
                                 )
                         })
-                        && instruction_index - pop == 3
-                        && matches!(
-                            indexed_instructions[pop + 1].opcode,
-                            crate::target::opcodes::LOAD_FAST
-                                | crate::target::opcodes::LOAD_FAST_BORROW
-                                | crate::target::opcodes::LOAD_DEREF
-                        )
-                        && indexed_instructions[pop + 1]
-                            .local_policy
-                            .hidden_exception_owner_slots()
-                            == 0
-                        && previous.is_some_and(|previous: Instruction| {
-                            matches!(previous.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
-                                && previous.local_policy.hidden_exception_owner_slots() == 3
-                        })
+                        && ((instruction_index - pop == 3
+                            && matches!(
+                                indexed_instructions[pop + 1].opcode,
+                                crate::target::opcodes::LOAD_FAST
+                                    | crate::target::opcodes::LOAD_FAST_BORROW
+                                    | crate::target::opcodes::LOAD_DEREF
+                            )
+                            && indexed_instructions[pop + 1]
+                                .local_policy
+                                .hidden_exception_owner_slots()
+                                == 0
+                            && previous.is_some_and(|previous: Instruction| {
+                                matches!(previous.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+                                    && previous.local_policy.hidden_exception_owner_slots() == 3
+                            }))
+                            || single_pop_truth_marker)
                     {
                         let source_region = (instruction_index == slot).then_some(region);
                         owners.insert(

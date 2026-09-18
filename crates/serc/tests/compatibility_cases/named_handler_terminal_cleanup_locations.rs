@@ -130,3 +130,100 @@ fn matches_cpython_named_handler_terminal_while_break() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_nested_named_handler_false_cleanup_locations() {
+    for (filename, source) in [
+        (
+            "nested_named_handler_false_cleanup.py",
+            r#"async def run(value, request, retry, report, lookup):
+    try:
+        await request(value)
+    except TypeError as outer:
+        message = str(outer)
+        if "retry" not in message or "supported" not in message:
+            raise
+        try:
+            await retry(value)
+        except Exception as inner:
+            await report(inner)
+            state = await lookup(value)
+            if not isinstance(state, State) or state.status != "done":
+                await report(state)
+    except Exception as outer:
+        state = await lookup(value)
+        if not isinstance(state, State) or state.status != "done":
+            await report(state)
+"#,
+        ),
+        (
+            "nested_named_handler_sync_false_cleanup.py",
+            r#"def run(value, request, retry, report, lookup):
+    try:
+        request(value)
+    except TypeError as outer:
+        message = str(outer)
+        if "retry" not in message or "supported" not in message:
+            raise
+        try:
+            retry(value)
+        except Exception as inner:
+            report(inner)
+            state = lookup(value)
+            if not isinstance(state, State) or state.status != "done":
+                report(state)
+    except Exception as outer:
+        state = lookup(value)
+        if not isinstance(state, State) or state.status != "done":
+            report(state)
+"#,
+        ),
+        (
+            "nested_unnamed_outer_handler_false_cleanup.py",
+            r#"async def run(value, request, retry, report, lookup):
+    try:
+        await request(value)
+    except TypeError:
+        message = str(value)
+        if "retry" not in message or "supported" not in message:
+            raise
+        try:
+            await retry(value)
+        except Exception as inner:
+            await report(inner)
+            state = await lookup(value)
+            if not isinstance(state, State) or state.status != "done":
+                await report(state)
+    except Exception:
+        state = await lookup(value)
+        if not isinstance(state, State) or state.status != "done":
+            await report(state)
+"#,
+        ),
+        (
+            "nested_named_handler_explicit_none_return.py",
+            r#"async def run(value, request, retry, report, lookup):
+    try:
+        await request(value)
+    except TypeError as outer:
+        message = str(outer)
+        if "retry" not in message or "supported" not in message:
+            raise
+        try:
+            await retry(value)
+        except Exception as inner:
+            await report(inner)
+            state = await lookup(value)
+            if not isinstance(state, State) or state.status != "done":
+                await report(state)
+    except Exception as outer:
+        state = await lookup(value)
+        if not isinstance(state, State) or state.status != "done":
+            await report(state)
+    return None
+"#,
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

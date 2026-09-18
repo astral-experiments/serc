@@ -6196,7 +6196,7 @@ impl Assembler {
             });
     }
 
-    /// Captures an iterator return's final `POP_BLOCK` and its first local load.
+    /// Captures an iterator return's final POP run and its first local load.
     pub(crate) fn record_copied_handler_finally_pop_prefix(&mut self, pop_item: usize) {
         let items = self.linear_items();
         let Some(Item::Instruction(pop)) = items.get(pop_item) else {
@@ -6209,10 +6209,35 @@ impl Assembler {
         else {
             return;
         };
-        if pop.opcode != NOP
-            || pop.operand() != Operand::Value(0)
-            || !pop.fusion_policy.is_converted_pop_block()
-            || pop.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
+        // An ordinary try outside the iterator contributes one additional POP
+        // immediately before the finalizer POP. Retain both original NULL cells.
+        let preceding_pop = pop_item
+            .checked_sub(1)
+            .and_then(|index| items.get(index))
+            .and_then(|item| match item {
+                Item::Instruction(instruction)
+                    if instruction.fusion_policy.is_converted_pop_block() =>
+                {
+                    Some(instruction)
+                }
+                _ => None,
+            });
+        if [Some(pop), preceding_pop]
+            .into_iter()
+            .flatten()
+            .any(|record| {
+                record.opcode != NOP
+                    || record.operand() != Operand::Value(0)
+                    || !record.fusion_policy.is_converted_pop_block()
+                    || record.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
+                    || record.location != pop.location
+                    || record.depth_after() != pop.depth_after()
+                    || record.local_policy.hidden_exception_owner_slots() != 0
+                    || record.pre_fold_extra_instructions() != 0
+                    || record.jump_policy.borrow_empty_block()
+                    || record.no_location_policy.borrow_fallthrough()
+                        != BorrowFallthrough::Reachable
+            })
             || load.opcode != LOAD_FAST
             || !matches!(load.operand(), Operand::Value(_))
             || [pop, load].iter().any(|instruction| {
@@ -6225,11 +6250,16 @@ impl Assembler {
         {
             return;
         }
-        let mut start = pop_item;
+        let first_pop_item = if preceding_pop.is_some() {
+            pop_item - 1
+        } else {
+            pop_item
+        };
+        let mut start = first_pop_item;
         while start > 0 && matches!(items[start - 1], Item::Label(_)) {
             start -= 1;
         }
-        if start == pop_item {
+        if start == first_pop_item {
             return;
         }
         let Some(entry) = items[..start].iter().rev().find_map(|item| match item {
@@ -6733,7 +6763,7 @@ impl Assembler {
         }
     }
 
-    /// Records an authored return NOP immediately before its direct finally POP.
+    /// Records an authored return NOP and its direct finally unwind records.
     pub(crate) fn record_early_return_nop_pair(&mut self, return_item: usize, target: Label) {
         let items = self.linear_items();
         let Some(Item::Instruction(return_nop)) = items.get(return_item) else {
@@ -6746,6 +6776,36 @@ impl Assembler {
                 Item::Label(_) => None,
             })
             .collect::<Vec<_>>();
+        if let [authored, iterator, pop] = instructions.as_slice()
+            && authored == return_nop
+            && authored.opcode == NOP
+            && !authored.fusion_policy.is_converted_pop_block()
+            && iterator.opcode == POP_TOP
+            && pop.opcode == NOP
+            && pop.fusion_policy.is_converted_pop_block()
+            && authored.exception_policy() == ExceptionPolicy::NoneUnchanged
+            && iterator.exception_policy() == ExceptionPolicy::NoneUnchanged
+            && pop.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
+            && iterator
+                .depth_after()
+                .and_then(|depth| depth.checked_add(1))
+                == authored.depth_after()
+            && pop.depth_after() == iterator.depth_after()
+            && instructions.iter().all(|record| {
+                record.operand() == Operand::Value(0)
+                    && record.location == authored.location
+                    && record.local_policy.hidden_exception_owner_slots() == 0
+                    && record.pre_fold_extra_instructions() == 0
+                    && record.no_location_policy.borrow_fallthrough()
+                        == BorrowFallthrough::Reachable
+                    && !record.jump_policy.borrow_empty_block()
+            })
+        {
+            self.exception_owner_provenance
+                .early_return_iterator_pops
+                .push((*authored, *iterator, *pop, target));
+            return;
+        }
         let [authored, pop] = instructions.as_slice() else {
             return;
         };

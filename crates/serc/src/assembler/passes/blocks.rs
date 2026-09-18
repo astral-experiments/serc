@@ -1216,8 +1216,46 @@ fn named_handler_cleanup_exit_location(source: &[Item], target: &[Item]) -> Opti
         .iter()
         .take_while(|item| matches!(item, Item::Label(_)))
         .count();
-    let [Item::Instruction(jump)] = &target[target_entry_len..] else {
-        return None;
+    let target_body = &target[target_entry_len..];
+    let supported_exit = match target_body {
+        [Item::Instruction(jump)] => {
+            is_unconditional_jump(jump.opcode)
+                && jump.location.line < 0
+                && jump.no_location_policy.allows_block_inlining()
+                && !jump.no_location_policy.preserves_location()
+        }
+        [
+            Item::Instruction(outer_pop),
+            clearing @ ..,
+            Item::Instruction(none),
+            Item::Instruction(ret),
+        ] => {
+            outer_pop.opcode == POP_EXCEPT
+                && none.opcode == LOAD_CONST
+                && none.operand() == load.operand()
+                && ret.opcode == RETURN_VALUE
+                && match clearing {
+                    [] => true,
+                    [
+                        Item::Instruction(clear),
+                        Item::Instruction(store),
+                        Item::Instruction(delete),
+                    ] => {
+                        clear.opcode == LOAD_CONST
+                            && clear.operand() == load.operand()
+                            && store.opcode == STORE_FAST
+                            && delete.opcode == DELETE_FAST
+                            && store.operand() == delete.operand()
+                    }
+                    _ => false,
+                }
+                && target_body.iter().all(|item| {
+                    matches!(item, Item::Instruction(instruction)
+                        if instruction.location.line < 0
+                            && !instruction.no_location_policy.preserves_location())
+                })
+        }
+        _ => false,
     };
     (pop.opcode == POP_EXCEPT
         && pop.location.line >= 0
@@ -1229,11 +1267,8 @@ fn named_handler_cleanup_exit_location(source: &[Item], target: &[Item]) -> Opti
             instruction.location.line < 0 && !instruction.no_location_policy.preserves_location()
         })
         && target_entry_len > 0
-        && is_unconditional_jump(jump.opcode)
-        && jump.location.line < 0
-        && jump.no_location_policy.allows_block_inlining()
-        && !jump.no_location_policy.preserves_location())
-    .then_some(pop.location)
+        && supported_exit)
+        .then_some(pop.location)
 }
 
 /// Resolves only an original match cleanup whose complete fallthrough array still matches.
@@ -1283,6 +1318,9 @@ fn propagate_exit_block_locations(
     original_boundaries: &FxHashSet<Label>,
     original_location_absence: &FxHashSet<Label>,
     comprehension_assignment_exits: &FxHashMap<Label, (Vec<Label>, [Instruction; 3])>,
+    preserved_boundaries: &FxHashSet<Label>,
+    source_boundaries: &FxHashSet<Label>,
+    setups: &[(Label, Option<SourceLocation>)],
 ) {
     for target in order.iter().copied() {
         if analysis.exception_handler_blocks[target.index()] {
@@ -1373,6 +1411,32 @@ fn propagate_exit_block_locations(
                 graph[target].items(),
                 comprehension_assignment_exits,
             ) {
+                return Some(location);
+            }
+            if analysis.predecessors[target.index()] == 1
+                && analysis.positions[source.index()] + 1 == target_position
+                && block_has_fallthrough(graph[source].items())
+                && let Some(location) = named_handler_cleanup_exit_location(
+                    graph[source].items(),
+                    graph[target].items(),
+                )
+                && graph[target]
+                    .items()
+                    .iter()
+                    .take_while(|item| matches!(item, Item::Label(_)))
+                    .all(|item| {
+                        let Item::Label(label) = item else {
+                            unreachable!();
+                        };
+                        exception_regions.iter().any(|region| region.end == *label)
+                            && !preserved_boundaries.contains(label)
+                            && !source_boundaries.contains(label)
+                            && !original_boundaries.contains(label)
+                            && !setups.iter().any(|(setup, _)| setup == label)
+                    })
+            {
+                // The inner POP_EXCEPT has its sole predecessor's line already.
+                // Its unlocated name-clearing tail receives that line later.
                 return Some(location);
             }
             let last = graph[source].last_instruction()?;
@@ -2530,6 +2594,9 @@ impl OptimizationPipeline {
                 &self.exception_owner_provenance.block_boundaries,
                 original_location_absence,
                 &self.comprehension_assignment_exits,
+                &self.preserved_block_boundaries,
+                &self.exception_owner_provenance.source_boundaries,
+                &self.exception_owner_provenance.setups,
             );
             let heads = shared_pop_block_heads
                 .iter()
