@@ -14003,3 +14003,194 @@ fn matches_cpython_folded_or_true_discarded_call_exits() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_name_returns_with_conditional_finalizers() {
+    for (source, filename) in [
+        (
+            r"def mutate(client, resource, credential, attempts):
+    try:
+        for attempt in range(attempts):
+            current = read(resource)
+            updated = normalize(current)
+            try:
+                write(resource, updated)
+            except (Conflict, AlreadyExists) as error:
+                last_error = error
+                continue
+            return updated
+        raise Failure from last_error
+    finally:
+        if resource is not None:
+            resource.close()
+",
+            "simple_existing_cleanup_control.py",
+        ),
+        (
+            r"def mutate(client, resource, credential, attempts):
+    try:
+        for attempt in range(attempts):
+            current = read(resource)
+            updated = normalize(current)
+            try:
+                write(resource, updated)
+            except (Conflict, AlreadyExists) as error:
+                last_error = error
+                continue
+            return updated
+        raise Failure from last_error
+    finally:
+        if resource is not None:
+            resource.close()
+            if credential is not None:
+                credential.close()
+",
+            "simple_test_nested_cleanup.py",
+        ),
+        (
+            r"def mutate(client, resource, credential, attempts):
+    try:
+        for attempt in range(attempts):
+            current = read(resource)
+            updated = normalize(current)
+            try:
+                write(resource, updated)
+            except (Conflict, AlreadyExists) as error:
+                last_error = error
+                continue
+            return updated
+        raise Failure from last_error
+    finally:
+        if False:
+            resource.close()
+            if credential is not None:
+                credential.close()
+",
+            "folded_false_cleanup_control.py",
+        ),
+        (
+            r"def mutate(client, resource, credential, attempts):
+    try:
+        for attempt in range(attempts):
+            current = read(resource)
+            updated = normalize(current)
+            try:
+                write(resource, updated)
+            except (Conflict, AlreadyExists) as error:
+                last_error = error
+                continue
+            return updated
+        raise Failure from last_error
+    finally:
+        if client is None and resource is not None:
+            resource.close()
+            if credential is not None:
+                credential.close()
+",
+            "compound_cleanup.py",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn matches_cpython_handler_retry_break_with_finalizer() {
+    let (source, filename) = (
+        r"def run(items, manager, value):
+    try:
+        work(value)
+    except OuterError:
+        error = None
+        for item in items:
+            prepare(item)
+            try:
+                retry(item, value)
+                error = None
+                break
+            except InnerError as caught:
+                error = caught
+            finally:
+                manager.finished(item)
+        if error is not None:
+            raise error
+    consume(value)
+",
+        "retry_finalizer_break_target.py",
+    );
+    common::assert_matches_cpython_marshal(source, filename);
+}
+
+#[test]
+fn matches_cpython_threaded_async_loop_exit_borrow_boundaries() {
+    for (source, filename) in [
+        (
+            r"async def run(manager, source, sink):
+    async with manager:
+        try:
+            try:
+                async for item in await source():
+                    break
+            except Error as error:
+                if bad(error) or worse(error):
+                    raise Wrapped(error) from error
+                record(error)
+            try:
+                await sink(source)
+            except Error:
+                pass
+        except Error:
+            recover(source)
+    consume(source)
+",
+            "protected_async_direct_break.py",
+        ),
+        (
+            r"async def run(manager, trace, source, value):
+    async with manager:
+        with trace:
+            matched = False
+            try:
+                async for item in source:
+                    if selected(item) and item.key == value:
+                        matched = True
+                        break
+            except (Error, OtherError):
+                pass
+            if not matched:
+                consume(value)
+            consume(source)
+",
+            "protected_async_terminal_conditional_break.py",
+        ),
+        (
+            r"async def run(manager, source, value):
+    async with manager:
+        try:
+            async for item in source:
+                if selected(item):
+                    break
+                consume(item)
+        except Error:
+            pass
+        consume(value)
+        consume(source)
+",
+            "protected_async_surviving_break_control.py",
+        ),
+        (
+            r"async def run(manager, source, value):
+    async with manager:
+        try:
+            async for item in source:
+                break
+        except Error:
+            pass
+        return value
+",
+            "protected_async_small_return_control.py",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

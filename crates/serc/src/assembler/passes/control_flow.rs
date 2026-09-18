@@ -1002,6 +1002,9 @@ impl OptimizationPipeline {
                                         instruction.jump_policy.borrow_empty_block(),
                                         instruction.no_location_policy.borrow_fallthrough()
                                             == BorrowFallthrough::Barrier
+                                            || (self.borrow_loop_exit_blocks.contains_key(label)
+                                                && normal_try_exits
+                                                    .contains(&label_offsets[label]))
                                             || !instruction
                                                 .jump_policy
                                                 .allows_borrow_threading_target(),

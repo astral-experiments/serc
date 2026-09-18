@@ -14946,6 +14946,14 @@ impl Compiler<'_> {
                                     if matches!(expression.value.as_ref(), Expr::Call(_))
                                         && !expression_contains_inline_branch(&expression.value)
                                         && !expression_suspends_current_scope(&expression.value)))
+                        || matches!(context.body.as_slice(), [Stmt::If(conditional)]
+                            if conditional.elif_else_clauses.is_empty()
+                                && condition_has_linear_runtime_leaves(&conditional.test)
+                                && !expression_suspends_current_scope(&conditional.test)
+                                && matches!(conditional.body.first(), Some(Stmt::Expr(expression))
+                                    if matches!(expression.value.as_ref(), Expr::Call(_))
+                                        && !expression_contains_inline_branch(&expression.value)
+                                        && !expression_suspends_current_scope(&expression.value)))
                         || matches!(context.body.as_slice(), [Stmt::For(loop_statement)]
                             if !loop_statement.is_async
                                 && matches!(loop_statement.target.as_ref(), Expr::Name(_))
@@ -24169,7 +24177,36 @@ fn suite_contains_orphan_cold_cleanup(body: &[Stmt]) -> bool {
             !statement.is_async
                 && (statement.orelse.is_empty()
                     || suite_terminates_before_constant_folding(&statement.orelse))
-                && has_recovery_tail(&statement.body)
+                && (has_recovery_tail(&statement.body)
+                    || (statement.orelse.is_empty()
+                        && !expression_contains_inline_branch(&statement.iter)
+                        && !expression_suspends_current_scope(&statement.iter)
+                        && !expression_contains_inline_branch(&statement.target)
+                        && !expression_suspends_current_scope(&statement.target)
+                        && statement.body.split_last().is_some_and(|(_, prefix)| {
+                            prefix.is_empty() || linear_nonsuspending(prefix)
+                        })
+                        && matches!(statement.body.last(), Some(Stmt::Try(recovery))
+                            if !recovery.is_star
+                                && recovery.orelse.is_empty()
+                                && recovery.body.split_last().is_some_and(|(last, prefix)| {
+                                    matches!(last, Stmt::Break(_))
+                                        && linear_nonsuspending(prefix)
+                                })
+                                && matches!(recovery.handlers.as_slice(), [handler]
+                                    if handler.as_except_handler().is_some_and(|handler| {
+                                        handler.name.is_some()
+                                            && handler.type_.as_ref().is_some_and(|type_| {
+                                                !expression_contains_inline_branch(type_)
+                                                    && !expression_suspends_current_scope(type_)
+                                            })
+                                            && matches!(handler.body.as_slice(), [Stmt::Assign(_)])
+                                            && linear_nonsuspending(&handler.body)
+                                    }))
+                                && matches!(recovery.finalbody.as_slice(), [Stmt::Expr(cleanup)]
+                                    if matches!(cleanup.value.as_ref(), Expr::Call(_))
+                                        && !expression_contains_inline_branch(&cleanup.value)
+                                        && !expression_suspends_current_scope(&cleanup.value)))))
         }
         Stmt::While(statement) => {
             condition_has_only_runtime_tests(&statement.test)
