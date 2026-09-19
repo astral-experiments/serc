@@ -1,6 +1,8 @@
+use crate::InitialInternState;
 use crate::code_object::{CodeObject, Constant};
 
 use super::graph::{ObjectGraph, OccurrenceCursor, OccurrenceKind};
+use super::key::FrozenSetMembers;
 use super::plan::{MarshalVisitor, ObjectId, ReferenceMode, traverse_code};
 use super::v5::{
     FLAG_REF, TYPE_ASCII, TYPE_ASCII_INTERNED, TYPE_BINARY_COMPLEX, TYPE_BINARY_FLOAT, TYPE_CODE,
@@ -11,14 +13,26 @@ use super::v5::{
 
 const UNSEEN_REFERENCE: u32 = u32::MAX;
 
+#[cfg(test)]
 pub(crate) fn encode_code(code: &CodeObject) -> Vec<u8> {
+    encode_code_with_intern_state(code, &InitialInternState::default())
+}
+
+pub(crate) fn encode_code_with_intern_state(
+    code: &CodeObject,
+    initial_intern_state: &InitialInternState,
+) -> Vec<u8> {
     let mut output = Vec::new();
-    encode_code_into(code, &mut output);
+    encode_code_into_with_intern_state(code, initial_intern_state, &mut output);
     output
 }
 
-pub(crate) fn encode_code_into(code: &CodeObject, output: &mut Vec<u8>) {
-    let graph = ObjectGraph::for_code(code);
+pub(crate) fn encode_code_into_with_intern_state(
+    code: &CodeObject,
+    initial_intern_state: &InitialInternState,
+    output: &mut Vec<u8>,
+) {
+    let graph = ObjectGraph::for_code_with_intern_state(code, initial_intern_state);
     let mut writer = Writer {
         graph: &graph,
         output,
@@ -450,6 +464,10 @@ impl Writer<'_, '_, '_> {
 
 impl<'code> MarshalVisitor<'code> for Writer<'_, '_, 'code> {
     const USES_METADATA_IDS: bool = false;
+
+    fn frozen_set_members(&self, values: &'code [Constant]) -> FrozenSetMembers<'code> {
+        self.graph.frozen_set_members(values)
+    }
 
     #[inline]
     fn code(&mut self, code: &'code CodeObject, reference_mode: ReferenceMode) -> bool {

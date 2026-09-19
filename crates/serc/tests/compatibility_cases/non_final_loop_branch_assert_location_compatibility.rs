@@ -140,3 +140,93 @@ def check(item):
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_marshal_for_non_final_loop_conjunction_assert() {
+    let cases = [
+        (
+            "nonfinal_loop_boolean_assert.py",
+            r"def probe(items, outer, first, second, work):
+    for item in items:
+        if outer(item):
+            assert first(item) and second(item)
+        else:
+            work(item)
+",
+        ),
+        (
+            "nonfinal_loop_single_assert_control.py",
+            r"def probe(items, outer, first, second, work):
+    for item in items:
+        if outer(item):
+            assert first(item)
+        else:
+            work(item)
+",
+        ),
+        (
+            "nonfinal_loop_ifexp_false_arm_control.py",
+            r"def probe(items, outer, first, selector, work):
+    for item in items:
+        if outer(item):
+            assert (first(item) if selector(item) else False)
+        else:
+            work(item)
+",
+        ),
+    ];
+
+    for (filename, source) in cases {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn matches_cpython_marshal_for_non_final_loop_disjunction_assert() {
+    let cases = [
+        (
+            "nonfinal_loop_or_assert.py",
+            r"def check_gradients(values):
+    for left, right in values:
+        if left is None:
+            assert right is None or (right == 0).all(), right
+        else:
+            assert left.ready is None
+            assert right.ready is None
+            assert (left == right).all(), (left, right)
+",
+        ),
+        (
+            "nonfinal_loop_and_assert_control.py",
+            r"def check_gradients(values):
+    for left, right in values:
+        if left is None:
+            assert right is None and (right == 0).all(), right
+        else:
+            assert left.ready is None
+            assert right.ready is None
+            assert (left == right).all(), (left, right)
+",
+        ),
+    ];
+
+    for (filename, source) in cases {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn matches_cpython_marshal_for_non_final_loop_negated_and_assertion() {
+    common::assert_matches_cpython_marshal(
+        r#"async def check_calls(calls, manager, prepare):
+    with manager:
+        await prepare()
+        for call in calls:
+            if call.args:
+                assert not (call.args[0] == "kind" and call.args[1] == "channel")
+            else:
+                assert call.ready
+"#,
+        "nonfinal_loop_negated_and_assertion_target.py",
+    );
+}

@@ -12,8 +12,159 @@ use crate::target::operands::{CommonConstant, ResumeLocation};
 #[test]
 #[cfg(target_pointer_width = "64")]
 fn instruction_items_remain_cache_compact() {
-    assert_eq!(std::mem::size_of::<Instruction>(), 32);
-    assert_eq!(std::mem::size_of::<Item>(), 32);
+    // Five copied-slot counts plus the original-entry state give six metadata states.
+    // 23 policies * 6 states * 2 copy modes require 276 nonzero values, so metadata
+    // uses NonZeroU16. The intentional 32-to-36-byte increase costs 12.5% per item.
+    // Keep the Item and Option layouts compact despite the wider metadata.
+    assert_eq!(std::mem::size_of::<Instruction>(), 36);
+    assert_eq!(std::mem::size_of::<Item>(), 36);
+    assert_eq!(
+        std::mem::size_of::<Option<Instruction>>(),
+        std::mem::size_of::<Instruction>(),
+    );
+}
+
+#[test]
+fn compact_instruction_metadata_keeps_block_size_and_exception_policy_independent() {
+    let policies = [
+        ExceptionPolicy::NoneUnchanged,
+        ExceptionPolicy::NonePresent,
+        ExceptionPolicy::NoneOverridePresent,
+        ExceptionPolicy::NoneAbsent,
+        ExceptionPolicy::IfExtendedUnchanged,
+        ExceptionPolicy::IfExtendedPresent,
+        ExceptionPolicy::IfExtendedOverridePresent,
+        ExceptionPolicy::IfExtendedAbsent,
+        ExceptionPolicy::AlwaysUnchanged,
+        ExceptionPolicy::AlwaysPresent,
+        ExceptionPolicy::AlwaysOverridePresent,
+        ExceptionPolicy::AlwaysAbsent,
+        ExceptionPolicy::NoneDynamic,
+        ExceptionPolicy::IfExtendedDynamic,
+        ExceptionPolicy::AlwaysDynamic,
+        ExceptionPolicy::NoneDynamicCondition,
+        ExceptionPolicy::IfExtendedDynamicCondition,
+        ExceptionPolicy::AlwaysDynamicCondition,
+        ExceptionPolicy::NoneDynamicConditionStrict,
+        ExceptionPolicy::IfExtendedDynamicConditionStrict,
+        ExceptionPolicy::AlwaysDynamicConditionStrict,
+    ];
+    for unconditional_copy in [false, true] {
+        for policy in policies {
+            for count in 0..=5 {
+                let mut instruction =
+                    Instruction::new(LOAD_CONST, Operand::Value(0), SourceLocation::NONE, None);
+                if unconditional_copy {
+                    instruction.allow_unconditional_block_inlining();
+                }
+                instruction.set_exception_policy(policy);
+                instruction.add_pre_fold_extra_instructions(count);
+                assert_eq!(instruction.exception_policy(), policy);
+                assert_eq!(instruction.pre_fold_extra_instructions(), count.min(4));
+                assert_eq!(instruction.local_policy.hidden_exception_owner_slots(), 0);
+
+                instruction.set_exception_owner(NormalizedExceptionOwner::OverridePresent);
+                assert_eq!(
+                    instruction.exception_policy().exclusion(),
+                    policy.exclusion()
+                );
+                assert_eq!(
+                    instruction.exception_policy().owner(),
+                    NormalizedExceptionOwner::OverridePresent
+                );
+                instruction.exclude_from_exception_table(ExceptionExclusion::Always);
+                assert_eq!(
+                    instruction.exception_policy().exclusion(),
+                    ExceptionExclusion::Always
+                );
+                assert_eq!(instruction.pre_fold_extra_instructions(), count.min(4));
+                assert_eq!(
+                    instruction.only_allows_unconditional_inlining(),
+                    unconditional_copy
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn compact_initial_borrow_metadata_keeps_all_logical_fields_independent() {
+    let policies = [
+        ExceptionPolicy::NoneUnchanged,
+        ExceptionPolicy::NonePresent,
+        ExceptionPolicy::NoneOverridePresent,
+        ExceptionPolicy::NoneAbsent,
+        ExceptionPolicy::IfExtendedUnchanged,
+        ExceptionPolicy::IfExtendedPresent,
+        ExceptionPolicy::IfExtendedOverridePresent,
+        ExceptionPolicy::IfExtendedAbsent,
+        ExceptionPolicy::AlwaysUnchanged,
+        ExceptionPolicy::AlwaysPresent,
+        ExceptionPolicy::AlwaysOverridePresent,
+        ExceptionPolicy::AlwaysAbsent,
+        ExceptionPolicy::NoneDynamic,
+        ExceptionPolicy::IfExtendedDynamic,
+        ExceptionPolicy::AlwaysDynamic,
+        ExceptionPolicy::NoneDynamicCondition,
+        ExceptionPolicy::IfExtendedDynamicCondition,
+        ExceptionPolicy::AlwaysDynamicCondition,
+        ExceptionPolicy::NoneDynamicConditionStrict,
+        ExceptionPolicy::IfExtendedDynamicConditionStrict,
+        ExceptionPolicy::AlwaysDynamicConditionStrict,
+    ];
+    for unconditional_copy in [false, true] {
+        for policy in policies {
+            for count in 0..=5 {
+                let mut instruction = Instruction::new(
+                    JUMP_FORWARD,
+                    Operand::Forward(super::Label(u32::MAX)),
+                    SourceLocation::NONE,
+                    None,
+                );
+                if unconditional_copy {
+                    instruction.allow_unconditional_block_inlining();
+                }
+                instruction.set_exception_policy(policy);
+                instruction.add_pre_fold_extra_instructions(count);
+                instruction.mark_initial_borrow_jump_target(super::Label(u32::MAX));
+                assert_eq!(
+                    instruction.initial_borrow_jump_target(),
+                    (count == 0).then_some(super::Label(u32::MAX))
+                );
+                assert_eq!(instruction.exception_policy(), policy);
+                assert_eq!(instruction.pre_fold_extra_instructions(), count.min(4));
+                assert_eq!(instruction.local_policy.hidden_exception_owner_slots(), 0);
+
+                instruction.set_exception_owner(NormalizedExceptionOwner::OverridePresent);
+                assert_eq!(
+                    instruction.exception_policy().exclusion(),
+                    policy.exclusion()
+                );
+                assert_eq!(
+                    instruction.exception_policy().owner(),
+                    NormalizedExceptionOwner::OverridePresent
+                );
+                instruction.exclude_from_exception_table(ExceptionExclusion::Always);
+                assert_eq!(
+                    instruction.exception_policy().exclusion(),
+                    ExceptionExclusion::Always
+                );
+                assert_eq!(instruction.pre_fold_extra_instructions(), count.min(4));
+                assert_eq!(
+                    instruction.only_allows_unconditional_inlining(),
+                    unconditional_copy
+                );
+                assert_eq!(
+                    instruction.initial_borrow_jump_target(),
+                    (count == 0).then_some(super::Label(u32::MAX))
+                );
+                instruction.add_pre_fold_extra_instructions(1);
+                assert_eq!(instruction.initial_borrow_jump_target(), None);
+                instruction.add_pre_fold_extra_instructions(0);
+                assert_eq!(instruction.initial_borrow_jump_target(), None);
+            }
+        }
+    }
 }
 
 #[test]
@@ -60,7 +211,7 @@ fn instruction_constructors_set_audited_defaults() {
     expected_synthetic_policy.prevent_small_exit_inlining();
     assert_eq!(synthetic.jump_policy, expected_synthetic_policy);
     assert!(!synthetic.fusion_policy.is_authored_break());
-    assert_eq!(synthetic.exception_policy, ExceptionPolicy::default());
+    assert_eq!(synthetic.exception_policy(), ExceptionPolicy::default());
     assert_eq!(
         regular.no_location_policy.borrow_fallthrough(),
         BorrowFallthrough::Reachable
@@ -85,7 +236,7 @@ fn direct_value_instruction_constructor_matches_regular_instruction() {
     assert_eq!(direct.no_location_policy, regular.no_location_policy);
     assert_eq!(direct.fusion_policy, regular.fusion_policy);
     assert_eq!(direct.jump_policy, regular.jump_policy);
-    assert_eq!(direct.exception_policy, regular.exception_policy);
+    assert_eq!(direct.exception_policy(), regular.exception_policy());
 }
 
 #[test]
@@ -134,6 +285,7 @@ fn jump_policy_defaults_are_explicit() {
     assert!(policy.inline_small_exit());
     assert_eq!(policy.retained_nop(), RetainedJumpNop::None);
     assert!(policy.allows_threading_target());
+    assert!(policy.allows_borrow_threading_target());
     assert!(!policy.defers_redundant_removal());
     assert!(!policy.preserves_nop_after_threading());
 }
@@ -159,6 +311,9 @@ fn jump_policy_fusion_is_exhaustive() {
         if bits & 8 != 0 {
             policy.preserve_nop_after_threading_for_test();
         }
+        if bits & 16 == 0 {
+            policy.prevent_borrow_threading_target();
+        }
         policy
     }
 
@@ -167,8 +322,8 @@ fn jump_policy_fusion_is_exhaustive() {
         RetainedJumpNop::DirectTarget,
         RetainedJumpNop::Always,
     ];
-    for first_bits in 0..16 {
-        for second_bits in 0..16 {
+    for first_bits in 0..32 {
+        for second_bits in 0..32 {
             for first_retained in retained_nops {
                 for second_retained in retained_nops {
                     let first = policy(first_bits, first_retained);
@@ -185,7 +340,11 @@ fn jump_policy_fusion_is_exhaustive() {
                             | (u8::from(
                                 first.preserves_nop_after_threading()
                                     || second.preserves_nop_after_threading(),
-                            ) << 3);
+                            ) << 3)
+                            | (u8::from(
+                                first.allows_borrow_threading_target()
+                                    && second.allows_borrow_threading_target(),
+                            ) << 4);
                     assert_eq!(
                         JumpPolicy::fused(first, second),
                         policy(expected_bits, RetainedJumpNop::None)
@@ -388,9 +547,9 @@ fn value_emission_attaches_exception_policy_across_intervening_labels() {
     };
     assert_eq!(*actual_first_boundary, first_boundary);
     assert_eq!(*actual_second_boundary, second_boundary);
-    assert_eq!(normalized.exception_policy, normalized_owner);
-    assert_eq!(excluded.exception_policy, ExceptionPolicy::EXCLUDE_ALWAYS);
-    assert_eq!(default.exception_policy, ExceptionPolicy::default());
+    assert_eq!(normalized.exception_policy(), normalized_owner);
+    assert_eq!(excluded.exception_policy(), ExceptionPolicy::EXCLUDE_ALWAYS);
+    assert_eq!(default.exception_policy(), ExceptionPolicy::default());
 }
 
 #[test]
@@ -416,9 +575,9 @@ fn jump_emission_attaches_exception_policy_after_an_intervening_label() {
         panic!("expected two instructions separated by one label");
     };
     assert_eq!(*actual_boundary, boundary);
-    assert_eq!(default.exception_policy, ExceptionPolicy::default());
+    assert_eq!(default.exception_policy(), ExceptionPolicy::default());
     assert_eq!(
-        excluded.exception_policy,
+        excluded.exception_policy(),
         ExceptionPolicy::EXCLUDE_IF_EXTENDED
     );
 }
@@ -659,6 +818,30 @@ fn dynamic_exception_owner_tracks_fusible_loads_and_null_globals() {
 }
 
 #[test]
+fn dynamic_exception_owner_counts_only_removable_comprehension_restore_swaps() {
+    for (consumer, expected_slots) in [(STORE_FAST, 1), (STORE_DEREF, 0), (CALL, 0)] {
+        for restore_count in 1..=3 {
+            let mut assembler = Assembler::default();
+            assembler.set_location(SourceLocation::new(1, 1, 0, 1));
+            assembler.emit(SWAP, restore_count + 1);
+            for index in 1..=restore_count {
+                if index > 1 {
+                    assembler.fusion_barrier();
+                }
+                let restore = assembler.emit(STORE_FAST, index);
+                assembler.prevent_instruction_fusion_with_previous(restore);
+                assembler.prevent_last_instruction_fusion();
+            }
+            assembler.emit(consumer, restore_count + 1);
+            assert_eq!(
+                assembler.current_block_dynamic_exception_owner_slots(),
+                expected_slots,
+            );
+        }
+    }
+}
+
+#[test]
 fn dynamic_exception_owner_stops_at_emitted_boundaries() {
     let mut assembler = Assembler::default();
     assembler.set_location(SourceLocation::new(1, 1, 0, 1));
@@ -774,6 +957,7 @@ fn fusion_preserves_each_typed_instruction_policy() {
     first.no_location_policy.percent_target_location = 7;
     first.fusion_policy.mark_converted_pop_block();
     first.local_policy.add_hidden_exception_owner_slots(2);
+    first.add_pre_fold_extra_instructions(2);
     first.fusion_policy.prevent_with_next();
     first.jump_policy.prevent_threading_target();
     first.jump_policy.defer_removal();
@@ -782,12 +966,8 @@ fn fusion_preserves_each_typed_instruction_policy() {
     first.jump_policy.preserve_explicit_nop();
     first.fusion_policy.mark_authored_break();
     first.fusion_policy.allow_transitive_small_exit_inlining();
-    first
-        .exception_policy
-        .exclude(ExceptionExclusion::IfExtended);
-    first
-        .exception_policy
-        .set_owner(NormalizedExceptionOwner::Absent);
+    first.exclude_from_exception_table(ExceptionExclusion::IfExtended);
+    first.set_exception_owner(NormalizedExceptionOwner::Absent);
 
     let mut second = Instruction::new(
         LOAD_FAST,
@@ -801,11 +981,10 @@ fn fusion_preserves_each_typed_instruction_policy() {
     second.jump_policy.prevent_small_exit_inlining();
     second.jump_policy.retain_redundant_nop_after_threading();
     second.jump_policy.retain_nop_for_direct_target();
-    second.exception_policy.exclude(ExceptionExclusion::Always);
-    second
-        .exception_policy
-        .set_owner(NormalizedExceptionOwner::Present);
+    second.exclude_from_exception_table(ExceptionExclusion::Always);
+    second.set_exception_owner(NormalizedExceptionOwner::Present);
     second.local_policy.add_hidden_exception_owner_slots(2);
+    second.add_pre_fold_extra_instructions(3);
     second
         .no_location_policy
         .set_borrow_fallthrough(BorrowFallthrough::Barrier);
@@ -814,7 +993,7 @@ fn fusion_preserves_each_typed_instruction_policy() {
 
     let mut expected_local_policy = LocalPolicy::for_load(true, true);
     expected_local_policy.mark_maybe_null_comprehension_restore();
-    expected_local_policy.add_hidden_exception_owner_slots(3);
+    expected_local_policy.add_hidden_exception_owner_slots(4);
     assert_eq!(fused.local_policy, expected_local_policy);
     assert!(fused.no_location_policy.allows_block_inlining());
     assert!(
@@ -832,7 +1011,8 @@ fn fusion_preserves_each_typed_instruction_policy() {
     assert!(fused.jump_policy.preserves_explicit_nop());
     assert!(fused.fusion_policy.is_authored_break());
     assert!(fused.fusion_policy.transitive_small_exit_inlining());
-    assert_eq!(fused.local_policy.hidden_exception_owner_slots(), 3);
+    assert_eq!(fused.local_policy.hidden_exception_owner_slots(), 4);
+    assert_eq!(fused.pre_fold_extra_instructions(), 4);
     assert_eq!(fused.location, first.location);
     assert_eq!(fused.depth_after(), second.depth_after());
     let mut expected_jump_policy = JumpPolicy::default();
@@ -847,11 +1027,11 @@ fn fusion_preserves_each_typed_instruction_policy() {
         BorrowFallthrough::Barrier
     );
     assert_eq!(
-        fused.exception_policy.exclusion(),
+        fused.exception_policy().exclusion(),
         ExceptionExclusion::Always
     );
     assert_eq!(
-        fused.exception_policy.owner(),
+        fused.exception_policy().owner(),
         NormalizedExceptionOwner::Absent
     );
 
@@ -1145,6 +1325,7 @@ fn fused_final_artifacts_preserve_cache_extended_argument_location_and_depth_sem
             )),
         ],
         exception_regions: Vec::new(),
+        exception_owner_provenance: super::exception_owners::ExceptionOwnerProvenance::default(),
         preserved_block_boundaries: rustc_hash::FxHashSet::default(),
         removed_max_depth: None,
         next_label: 1,
@@ -1227,6 +1408,7 @@ fn unextended_final_artifacts_preserve_jump_cache_location_and_depth_semantics()
             )),
         ],
         exception_regions: Vec::new(),
+        exception_owner_provenance: super::exception_owners::ExceptionOwnerProvenance::default(),
         preserved_block_boundaries: rustc_hash::FxHashSet::default(),
         removed_max_depth: None,
         next_label: 1,
@@ -1352,7 +1534,7 @@ fn discarded_value_emission_matches_handle_emission() {
             assert_eq!(actual.no_location_policy, expected.no_location_policy);
             assert_eq!(actual.fusion_policy, expected.fusion_policy);
             assert_eq!(actual.jump_policy, expected.jump_policy);
-            assert_eq!(actual.exception_policy, expected.exception_policy);
+            assert_eq!(actual.exception_policy(), expected.exception_policy());
         }
     }
 
@@ -1638,6 +1820,54 @@ fn optimization_pipeline(items: Vec<Item>) -> super::OptimizationPipeline {
 }
 
 #[test]
+fn backward_conditional_normalization_preserves_successor_labels() {
+    for labelled_successor in [false, true] {
+        let restart = super::Label(0);
+        let mut items = vec![
+            Item::Label(restart),
+            pass_instruction(LOAD_FAST, 0, 1),
+            Item::Instruction(Instruction::new(
+                POP_JUMP_IF_FALSE,
+                Operand::Backward(restart),
+                SourceLocation::new(1, 1, 0, 1),
+                None,
+            )),
+        ];
+        if labelled_successor {
+            items.push(Item::Label(super::Label(1)));
+        }
+        items.extend([
+            pass_instruction(NOT_TAKEN, 0, 1),
+            pass_instruction(LOAD_CONST, 0, 2),
+            pass_instruction(RETURN_VALUE, 0, 2),
+        ]);
+        let mut pipeline = optimization_pipeline(items);
+
+        pipeline.normalize_backward_conditionals().unwrap();
+
+        pipeline.graph.validate().unwrap();
+        for item in pipeline.graph.iter_items() {
+            if let Item::Instruction(instruction) = item
+                && let Operand::Forward(target) | Operand::Backward(target) = instruction.operand()
+            {
+                assert!(pipeline.graph.label_block(target).is_some());
+            }
+        }
+        assert_eq!(
+            graph_opcodes(&pipeline),
+            [
+                LOAD_FAST,
+                POP_JUMP_IF_TRUE,
+                NOT_TAKEN,
+                JUMP_BACKWARD,
+                LOAD_CONST,
+                RETURN_VALUE
+            ],
+        );
+    }
+}
+
+#[test]
 fn assertion_side_exit_fast_path_accepts_all_conditional_directions() {
     let targets = [
         super::Label(0),
@@ -1787,6 +2017,8 @@ fn assertion_side_exit_fast_path_rejects_exception_regions() {
         pass_instruction(RETURN_VALUE, 0, 1),
     ]);
     assembler.exception_regions.push(super::ExceptionRegion {
+        priority: super::ExceptionRegionPriority::OriginalRange(target, target),
+        is_scope_fallback: false,
         start: target,
         end: target,
         target,
@@ -1893,6 +2125,171 @@ fn threads_unconditional_forward_jumps_without_conditional_jumps() {
         })
         .unwrap();
     assert!(matches!(first.operand(), Operand::Forward(label) if label == final_target));
+}
+
+#[test]
+fn threads_forward_operands_with_backward_jump_kinds() {
+    for source_opcode in [JUMP_FORWARD, JUMP_BACKWARD, JUMP_BACKWARD_NO_INTERRUPT] {
+        for intermediate in [None, Some(JUMP_BACKWARD)] {
+            let entry = super::Label(0);
+            let source_label = super::Label(1);
+            let first_target = super::Label(2);
+            let last_target = super::Label(3);
+            let mut source = Instruction::new(
+                source_opcode,
+                Operand::Forward(first_target),
+                SourceLocation::new(10, 10, 2, 9),
+                Some(0),
+            );
+            source.mark_initial_borrow_jump_target(first_target);
+            source.jump_policy.retain_nop_for_direct_target();
+            let mut items = vec![
+                Item::Label(entry),
+                pass_instruction(NOP, 0, 1),
+                Item::Label(source_label),
+                Item::Instruction(source),
+                Item::Label(first_target),
+            ];
+            if let Some(opcode) = intermediate {
+                items.extend([
+                    Item::Instruction(Instruction::new(
+                        opcode,
+                        Operand::Forward(last_target),
+                        SourceLocation::NONE,
+                        None,
+                    )),
+                    Item::Label(last_target),
+                ]);
+            }
+            items.push(Item::Instruction(Instruction::new(
+                JUMP_BACKWARD_NO_INTERRUPT,
+                Operand::Backward(entry),
+                SourceLocation::NONE,
+                None,
+            )));
+            let mut assembler = optimization_pipeline(items);
+            assert!(assembler.exception_regions.is_empty());
+            assert!(assembler.thread_forward_jumps());
+            let block = assembler.graph.label_block(source_label).unwrap();
+            let actual = *assembler.graph[block].last_instruction().unwrap();
+            let keeps_interrupt = source_opcode != JUMP_FORWARD
+                && (source_opcode == JUMP_BACKWARD || intermediate.is_some());
+            let mut expected = source;
+            expected.add_pre_fold_extra_instructions(1 + u8::from(intermediate.is_some()));
+            expected.retarget(Operand::Backward(entry));
+            expected.opcode = if keeps_interrupt {
+                JUMP_BACKWARD
+            } else {
+                JUMP_BACKWARD_NO_INTERRUPT
+            };
+            if keeps_interrupt {
+                expected.jump_policy.mark_interruptible();
+            }
+            assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
+        }
+    }
+}
+
+#[test]
+fn forward_operand_threading_preserves_barriers_and_unthreaded_metadata() {
+    for control in 0..4 {
+        let entry = super::Label(0);
+        let source_label = super::Label(1);
+        let target = super::Label(2);
+        let mut source = Instruction::new(
+            JUMP_BACKWARD,
+            if control == 2 {
+                Operand::Backward(target)
+            } else {
+                Operand::Forward(target)
+            },
+            SourceLocation::new(10, 10, 2, 9),
+            Some(0),
+        );
+        let mut destination = Instruction::new(
+            if control == 3 {
+                RETURN_VALUE
+            } else {
+                JUMP_BACKWARD_NO_INTERRUPT
+            },
+            if control == 3 {
+                Operand::Value(0)
+            } else {
+                Operand::Backward(entry)
+            },
+            SourceLocation::NONE,
+            None,
+        );
+        source.jump_policy.retain_nop_for_direct_target();
+        if control == 0 {
+            source.jump_policy.retain_nop();
+        }
+        if control == 1 {
+            destination.jump_policy.retain_nop();
+        }
+        let mut assembler = optimization_pipeline(vec![
+            Item::Label(entry),
+            pass_instruction(NOP, 0, 1),
+            Item::Label(source_label),
+            Item::Instruction(source),
+            Item::Label(target),
+            Item::Instruction(destination),
+        ]);
+        let original = format!("{:?}", assembler.graph.iter_items().collect::<Vec<_>>());
+        assert!(!assembler.thread_forward_jumps(), "control {control}");
+        assert_eq!(
+            format!("{:?}", assembler.graph.iter_items().collect::<Vec<_>>()),
+            original,
+            "control {control}",
+        );
+    }
+}
+
+#[test]
+fn a_threaded_target_cycle_keeps_direct_target_retention() {
+    let first = super::Label(0);
+    let second = super::Label(1);
+    let mut source = Instruction::new(
+        JUMP_BACKWARD,
+        Operand::Forward(first),
+        SourceLocation::new(10, 10, 2, 9),
+        Some(0),
+    );
+    source.jump_policy.retain_nop_for_direct_target();
+    let mut interruptible_target = Instruction::new(
+        JUMP_BACKWARD_NO_INTERRUPT,
+        Operand::Forward(first),
+        SourceLocation::NONE,
+        None,
+    );
+    interruptible_target.jump_policy.mark_interruptible();
+    let mut assembler = optimization_pipeline(vec![
+        Item::Instruction(source),
+        Item::Label(first),
+        Item::Instruction(Instruction::new(
+            JUMP_BACKWARD_NO_INTERRUPT,
+            Operand::Forward(second),
+            SourceLocation::NONE,
+            None,
+        )),
+        Item::Label(second),
+        Item::Instruction(interruptible_target),
+    ]);
+    assembler.thread_forward_jumps();
+    let actual = assembler
+        .graph
+        .iter_items()
+        .find_map(|item| match item {
+            Item::Instruction(instruction) => Some(*instruction),
+            Item::Label(_) => None,
+        })
+        .unwrap();
+    let mut expected = source;
+    expected.add_pre_fold_extra_instructions(2);
+    // The bounded walk returns to the same forward operand, so retargeting has
+    // not cleared the original direct-target NOP policy. Inherited interrupt
+    // checks must not overwrite it or trigger mark_interruptible's assertion.
+    assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
 }
 
 #[test]
@@ -2055,6 +2452,22 @@ fn threads_chained_conditional_jumps_to_the_final_target() {
         })
         .collect::<Vec<_>>();
     assert_eq!(jumps, [Operand::Forward(final_target); 3]);
+    let policies = assembler
+        .graph
+        .iter_items()
+        .filter_map(|item| match item {
+            Item::Instruction(instruction) => Some(instruction.exception_policy()),
+            Item::Label(_) => None,
+        })
+        .collect::<Vec<_>>();
+    for start in [0, 5] {
+        assert_eq!(
+            policies[start..start + 3],
+            [ExceptionPolicy::EXCLUDE_ALWAYS; 3]
+        );
+        assert_eq!(policies[start + 3], ExceptionPolicy::default());
+    }
+    assert_eq!(policies[10..], [ExceptionPolicy::default(); 6]);
 }
 
 #[test]
@@ -2157,9 +2570,7 @@ fn redundant_jump_removal_streams_consecutive_cross_block_jumps() {
     let second_target = super::Label(2);
     let location = SourceLocation::new(7, 7, 0, 0);
     let mut first = Instruction::new(JUMP_FORWARD, Operand::Forward(first_target), location, None);
-    first
-        .exception_policy
-        .exclude(ExceptionExclusion::IfExtended);
+    first.exclude_from_exception_table(ExceptionExclusion::IfExtended);
     first
         .no_location_policy
         .set_borrow_fallthrough(BorrowFallthrough::Barrier);
@@ -2197,7 +2608,7 @@ fn redundant_jump_removal_streams_consecutive_cross_block_jumps() {
     assert_eq!(instructions.len(), 2);
     assert_eq!(instructions[0].opcode, LOAD_CONST);
     assert_eq!(
-        instructions[0].exception_policy.exclusion(),
+        instructions[0].exception_policy().exclusion(),
         ExceptionExclusion::IfExtended
     );
     assert_eq!(
@@ -2503,6 +2914,35 @@ fn redundant_swap_removal_preserves_forward_scan_semantics() {
 }
 
 #[test]
+fn redundant_swap_removal_preserves_distinct_pop_lines() {
+    for (first_pop_line, second_pop_line, retain_rotation) in
+        [(5, 5, false), (5, 6, true), (-1, 6, false)]
+    {
+        let mut items = vec![pass_instruction(SWAP, 3, 4), pass_instruction(SWAP, 2, 4)];
+        let pops_and_store = [
+            pass_instruction(POP_TOP, 0, first_pop_line),
+            pass_instruction(POP_TOP, 0, second_pop_line),
+            pass_instruction(STORE_FAST, 1, 3),
+        ];
+        items.extend(pops_and_store.iter().copied());
+        let mut assembler = optimization_pipeline(items);
+
+        assembler.remove_redundant_swaps_before_pops();
+
+        let mut expected = vec![pass_instruction(SWAP, 3, 4)];
+        if retain_rotation {
+            expected.push(pass_instruction(SWAP, 2, 4));
+        }
+        expected.extend(pops_and_store);
+        assert_eq!(
+            assembler.graph.iter_items().copied().collect::<Vec<_>>(),
+            expected,
+            "pop lines {first_pop_line} and {second_pop_line}"
+        );
+    }
+}
+
+#[test]
 fn redundant_nop_removal_preserves_forward_scan_semantics() {
     let mut converted = match pass_instruction(NOP, 0, 1) {
         Item::Instruction(instruction) => instruction,
@@ -2538,6 +2978,126 @@ fn cold_block_terminal_restore_accounts_for_the_drained_range() {
 }
 
 #[test]
+fn consecutive_pop_slot_width_respects_original_array_boundaries() {
+    use super::{ExceptionRegion, ExceptionRegionPriority, Label};
+
+    let converted = || {
+        let mut instruction = Instruction::new(NOP, Operand::Value(0), SourceLocation::NONE, None);
+        instruction.fusion_policy.mark_converted_pop_block();
+        Item::Instruction(instruction)
+    };
+    let setup = Label(0);
+    let end = Label(1);
+    let interior = Label(2);
+    let handler = Label(3);
+    let location = SourceLocation::new(1, 1, 0, 0);
+    for (case, expected_width) in [
+        ("contiguous", Some(2)),
+        ("bookkeeping_alias", Some(2)),
+        ("end_inside_run", Some(2)),
+        ("jump_into_first", None),
+        ("jump_into_interior", None),
+        ("block_boundary_first", None),
+        ("block_boundary_interior", None),
+        ("removed_source_nop", None),
+        ("hidden_pop_record", None),
+        ("setup_nop_inside_run", None),
+        ("count_does_not_fit", None),
+    ] {
+        let mut items = vec![
+            pass_instruction(NOP, 0, 1),
+            Item::Label(setup),
+            pass_instruction(LOAD_CONST, 0, 2),
+        ];
+        if case.starts_with("jump_into_") {
+            items.push(Item::Instruction(Instruction::new(
+                POP_JUMP_IF_FALSE,
+                Operand::Forward(if case == "jump_into_first" {
+                    end
+                } else {
+                    interior
+                }),
+                location,
+                None,
+            )));
+        }
+        if case == "removed_source_nop" {
+            items.push(pass_instruction(NOP, 0, -1));
+        }
+        if case != "end_inside_run" {
+            items.push(Item::Label(end));
+        }
+        let mut first = converted();
+        if case == "hidden_pop_record" {
+            let Item::Instruction(instruction) = &mut first else {
+                unreachable!()
+            };
+            instruction.local_policy.add_hidden_exception_owner_slots(1);
+        }
+        items.push(first);
+        if case == "end_inside_run" {
+            items.push(Item::Label(end));
+        }
+        items.push(Item::Label(interior));
+        if case == "bookkeeping_alias" {
+            items.push(Item::Label(Label(4)));
+            items.push(Item::Label(Label(5)));
+        }
+        let count = if case == "count_does_not_fit" {
+            usize::from(LocalPolicy::MAX_HIDDEN_EXCEPTION_OWNER_SLOTS)
+        } else {
+            1
+        };
+        items.extend((0..count).map(|_| converted()));
+        items.extend([
+            pass_instruction(LOAD_FAST, 0, 3),
+            Item::Label(handler),
+            pass_instruction(RETURN_VALUE, 0, 4),
+        ]);
+        let mut assembler = optimization_pipeline(items);
+        assembler.exception_regions.push(ExceptionRegion {
+            is_scope_fallback: false,
+            priority: ExceptionRegionPriority::OriginalRange(setup, end),
+            start: setup,
+            end,
+            target: handler,
+            depth: 0,
+            preserve_lasti: false,
+        });
+        assembler
+            .exception_owner_provenance
+            .setups
+            .push((setup, Some(location)));
+        if case == "setup_nop_inside_run" {
+            assembler
+                .exception_owner_provenance
+                .setups
+                .push((interior, Some(SourceLocation::NONE)));
+        }
+        if case.starts_with("block_boundary_") {
+            assembler
+                .exception_owner_provenance
+                .block_boundaries
+                .insert(if case == "block_boundary_first" {
+                    end
+                } else {
+                    interior
+                });
+        }
+        assembler.remove_redundant_nops();
+        assert_eq!(
+            assembler
+                .exception_owner_provenance
+                .removed_pop_block_widths
+                .get(&end)
+                .copied(),
+            expected_width,
+            "{case}",
+        );
+    }
+}
+
+#[test]
 fn duplicated_exit_blocks_retain_transitively_targeted_blocks() {
     let source = r"def f():
     try:
@@ -2551,6 +3111,115 @@ fn duplicated_exit_blocks_retain_transitively_targeted_blocks() {
 ";
 
     crate::compile(source, "nested_exit_copy.py").unwrap();
+}
+
+#[test]
+fn duplicated_finally_exits_keep_internal_jump_labels_local() {
+    for prefix in ["", "async "] {
+        for condition in ["flag", "not flag"] {
+            let source = format!(
+                "{prefix}def function(flag):\n    try:\n        pass\n    except Exception as error:\n        return None\n    finally:\n        try:\n            if {condition}:\n                cleanup()\n        except Exception:\n            pass\n",
+            );
+            // Shared exits can already contain an inlined return when conditional
+            // predecessors duplicate them. Their internal jumps must use copied labels.
+            crate::compile(&source, "copied_finally_internal_jump.py").unwrap();
+        }
+    }
+}
+
+#[test]
+fn empty_exception_regions_follow_their_original_entry() {
+    for reachable_entry in [false, true] {
+        let start = super::Label(0);
+        let end = super::Label(1);
+        let handler = super::Label(2);
+        let mut items = Vec::new();
+        if !reachable_entry {
+            items.extend([
+                pass_instruction(LOAD_CONST, 0, 1),
+                pass_instruction(RETURN_VALUE, 0, 1),
+            ]);
+        }
+        items.extend([
+            Item::Label(start),
+            Item::Label(end),
+            pass_instruction(LOAD_CONST, 0, 2),
+            pass_instruction(RETURN_VALUE, 0, 2),
+            Item::Label(handler),
+            pass_instruction(RERAISE, 0, -1),
+        ]);
+        let mut assembler = optimization_pipeline(items);
+        assembler.exception_regions.push(super::ExceptionRegion {
+            priority: super::ExceptionRegionPriority::OriginalRange(start, end),
+            is_scope_fallback: false,
+            start,
+            end,
+            target: handler,
+            depth: 0,
+            preserve_lasti: false,
+        });
+        let handler = assembler.graph.label_block(handler).unwrap();
+        let reachable = assembler
+            .graph
+            .reachable_blocks(&assembler.exception_regions);
+        assert_eq!(reachable[handler.index()], reachable_entry);
+    }
+}
+
+#[test]
+fn copied_return_pop_origins_retire_only_with_erased_unreachable_arrays() {
+    for reachable in [false, true] {
+        let mut assembler = Assembler::default();
+        let origin = assembler.label();
+        let exit = assembler.label();
+        assembler.emit_forward_with_depth(
+            JUMP_FORWARD,
+            if reachable { origin } else { exit },
+            0,
+            ExceptionPolicy::default(),
+        );
+        assembler.record_exception_owner_block_boundary(origin);
+        assembler.mark(origin);
+        let first_pop_item = assembler.item_count();
+        for _ in 0..2 {
+            assembler.emit_with_depth(NOP, 0, 0, ExceptionPolicy::EXCLUDE_ALWAYS);
+            assembler.mark_last_as_converted_pop_block();
+        }
+        assembler.set_location(SourceLocation::new(2, 2, 0, 4));
+        assembler.emit(LOAD_CONST, 1);
+        assembler.record_copied_return_pop_prefix(first_pop_item);
+        assembler.emit(POP_TOP, 0);
+        assembler.emit_forward_with_depth(JUMP_FORWARD, exit, 0, ExceptionPolicy::default());
+        assembler.mark(exit);
+        assembler.emit(LOAD_CONST, 0);
+        assembler.emit(RETURN_VALUE, 0);
+        assert_eq!(
+            assembler
+                .exception_owner_provenance
+                .copied_return_pop_prefixes
+                .len(),
+            1
+        );
+        let mut pipeline = assembler.into_optimization_pipeline();
+        pipeline.remove_unreachable_instructions();
+        assert_eq!(
+            pipeline
+                .exception_owner_provenance
+                .copied_return_pop_prefixes
+                .len(),
+            usize::from(reachable),
+            "reachable={reachable}",
+        );
+        if reachable {
+            assert_eq!(
+                pipeline
+                    .exception_owner_provenance
+                    .copied_return_pop_prefixes[0]
+                    .entry,
+                origin,
+            );
+        }
+    }
 }
 
 #[test]
@@ -2596,8 +3265,33 @@ fn no_location_block_inlining_reaches_a_fixed_point() {
         Item::Instruction(second_cleanup_jump),
     ]);
 
-    assembler.duplicate_exit_blocks();
+    // Track only origin lifecycle here; existing assertions below verify the copied CFG.
+    // Source is replaced by inlined records, both cleanup originals disappear, and restart survives.
+    let records = [
+        Instruction::new(NOP, Operand::Value(0), SourceLocation::NONE, None),
+        Instruction::new(NOP, Operand::Value(0), SourceLocation::NONE, None),
+        Instruction::new(LOAD_CONST, Operand::Value(0), SourceLocation::NONE, None),
+    ];
+    assembler
+        .exception_owner_provenance
+        .copied_return_pop_prefixes = [restart, source, first_cleanup, second_cleanup]
+        .into_iter()
+        .map(|entry| super::exception_owners::CopiedReturnPopPrefix { entry, records })
+        .collect();
+
+    let original_location_absence = assembler.capture_original_location_absence();
+    assembler.duplicate_exit_blocks(&original_location_absence, &mut Vec::new());
     assembler.propagate_locations_within_blocks();
+
+    assert_eq!(
+        assembler
+            .exception_owner_provenance
+            .copied_return_pop_prefixes
+            .iter()
+            .map(|origin| origin.entry)
+            .collect::<Vec<_>>(),
+        [restart],
+    );
 
     assert_eq!(
         graph_opcodes(&assembler),
@@ -2620,6 +3314,88 @@ fn no_location_block_inlining_reaches_a_fixed_point() {
             .collect::<Vec<_>>(),
         [0, 1, 1, 1, 1]
     );
+}
+
+#[test]
+fn shared_inlined_cleanup_locations_distinguish_exit_and_continuation() {
+    for terminal in [JUMP_BACKWARD_NO_INTERRUPT, RERAISE, JUMP_BACKWARD] {
+        let restart = super::Label(0);
+        let condition = super::Label(1);
+        let body = super::Label(2);
+        let first_cleanup = super::Label(3);
+        let second_cleanup = super::Label(4);
+        let mut first_jump = Instruction::new(
+            JUMP_FORWARD,
+            Operand::Forward(second_cleanup),
+            SourceLocation::NONE,
+            None,
+        );
+        first_jump.jump_policy.prevent_threading_target();
+        first_jump.no_location_policy.allow_block_inlining();
+        let mut last = Instruction::new(
+            terminal,
+            if terminal == RERAISE {
+                Operand::Value(0)
+            } else {
+                Operand::Backward(restart)
+            },
+            SourceLocation::NONE,
+            None,
+        );
+        last.jump_policy.prevent_threading_target();
+        last.no_location_policy.allow_block_inlining();
+        let mut assembler = optimization_pipeline(vec![
+            Item::Label(restart),
+            pass_instruction(NOP, 0, 0),
+            Item::Label(condition),
+            pass_instruction(LOAD_CONST, 0, 1),
+            Item::Instruction(Instruction::new(
+                POP_JUMP_IF_FALSE,
+                Operand::Forward(first_cleanup),
+                SourceLocation::new(1, 1, 0, 0),
+                None,
+            )),
+            Item::Label(body),
+            pass_instruction(LOAD_CONST, 0, 2),
+            Item::Label(first_cleanup),
+            pass_instruction(POP_EXCEPT, 0, -1),
+            Item::Instruction(first_jump),
+            Item::Label(second_cleanup),
+            pass_instruction(POP_EXCEPT, 0, -1),
+            Item::Instruction(last),
+        ]);
+
+        let original_location_absence = assembler.capture_original_location_absence();
+        assembler.duplicate_exit_blocks(&original_location_absence, &mut Vec::new());
+        assembler.propagate_locations_within_blocks();
+
+        let cleanups = assembler
+            .graph
+            .iter_items()
+            .filter_map(|item| match item {
+                Item::Instruction(instruction) if instruction.opcode == POP_EXCEPT => {
+                    Some(instruction.location.line)
+                }
+                Item::Instruction(_) | Item::Label(_) => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(!cleanups.is_empty());
+        assert_eq!(cleanups.len() % 2, 0);
+        let mut outer_locations = cleanups
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| pair[1])
+            .collect::<Vec<_>>();
+        outer_locations.sort_unstable();
+        // Native source resolution duplicates exits and eval checks. A normal
+        // continuation keeps its original shared, unlocated cleanup boundary.
+        if terminal == JUMP_BACKWARD_NO_INTERRUPT {
+            assert!(outer_locations.iter().all(|line| *line < 0));
+        } else {
+            assert_eq!(outer_locations, [1, 2]);
+        }
+    }
 }
 
 #[test]
@@ -2657,6 +3433,8 @@ fn no_location_block_inlining_crosses_exception_splits() {
         pass_instruction(RERAISE, 0, -1),
     ]);
     assembler.exception_regions.push(super::ExceptionRegion {
+        priority: super::ExceptionRegionPriority::OriginalRange(source, outer_unwind),
+        is_scope_fallback: false,
         start: source,
         end: outer_unwind,
         target: handler,
@@ -2664,7 +3442,8 @@ fn no_location_block_inlining_crosses_exception_splits() {
         preserve_lasti: true,
     });
 
-    assembler.duplicate_exit_blocks();
+    let original_location_absence = assembler.capture_original_location_absence();
+    assembler.duplicate_exit_blocks(&original_location_absence, &mut Vec::new());
     assembler.propagate_locations_within_blocks();
 
     assert_eq!(
@@ -2695,6 +3474,81 @@ fn no_location_block_inlining_crosses_exception_splits() {
 }
 
 #[test]
+fn unconditional_cleanup_inlining_keeps_the_conditional_target_shared() {
+    let restart = super::Label(0);
+    let conditional = super::Label(1);
+    let normal = super::Label(2);
+    let handler = super::Label(3);
+    let cleanup = super::Label(4);
+    let mut backedge = Instruction::new(
+        JUMP_BACKWARD,
+        Operand::Backward(restart),
+        SourceLocation::NONE,
+        None,
+    );
+    backedge.jump_policy.prevent_threading_target();
+    backedge.allow_unconditional_block_inlining();
+    let mut assembler = optimization_pipeline(vec![
+        Item::Label(restart),
+        pass_instruction(NOP, 0, 1),
+        Item::Label(conditional),
+        pass_instruction(LOAD_CONST, 0, 2),
+        Item::Instruction(Instruction::new(
+            POP_JUMP_IF_FALSE,
+            Operand::Forward(cleanup),
+            SourceLocation::new(2, 2, 0, 1),
+            None,
+        )),
+        Item::Label(normal),
+        pass_instruction(LOAD_CONST, 0, 3),
+        Item::Instruction(Instruction::new(
+            JUMP_FORWARD,
+            Operand::Forward(cleanup),
+            SourceLocation::NONE,
+            None,
+        )),
+        Item::Label(handler),
+        pass_instruction(POP_EXCEPT, 0, 4),
+        Item::Instruction(Instruction::new(
+            JUMP_FORWARD,
+            Operand::Forward(cleanup),
+            SourceLocation::NONE,
+            None,
+        )),
+        Item::Label(cleanup),
+        Item::Instruction(backedge),
+    ]);
+
+    let original_location_absence = assembler.capture_original_location_absence();
+    assembler.duplicate_exit_blocks(&original_location_absence, &mut Vec::new());
+
+    let branch = assembler.graph.label_block(conditional).unwrap();
+    assert_eq!(
+        assembler.graph[branch]
+            .last_instruction()
+            .unwrap()
+            .operand(),
+        Operand::Forward(cleanup)
+    );
+    for (start, end) in [(normal, handler), (handler, cleanup)] {
+        let mut within_source = false;
+        let mut found_backedge = false;
+        for item in assembler.graph.iter_items() {
+            match item {
+                Item::Label(label) if *label == start => within_source = true,
+                Item::Label(label) if *label == end => break,
+                Item::Instruction(instruction) if within_source => {
+                    found_backedge |= instruction.opcode == JUMP_BACKWARD
+                        && instruction.operand() == Operand::Backward(restart);
+                }
+                _ => {}
+            }
+        }
+        assert!(found_backedge);
+    }
+}
+
+#[test]
 fn direct_target_return_copy_crosses_an_exception_boundary() {
     let return_start = super::Label(0);
     let return_split = super::Label(1);
@@ -2716,6 +3570,8 @@ fn direct_target_return_copy_crosses_an_exception_boundary() {
         pass_instruction(RERAISE, 0, -1),
     ]);
     assembler.exception_regions.push(super::ExceptionRegion {
+        priority: super::ExceptionRegionPriority::OriginalRange(return_start, return_split),
+        is_scope_fallback: false,
         start: return_start,
         end: return_split,
         target: handler,
@@ -2723,7 +3579,8 @@ fn direct_target_return_copy_crosses_an_exception_boundary() {
         preserve_lasti: false,
     });
 
-    assembler.duplicate_exit_blocks();
+    let original_location_absence = assembler.capture_original_location_absence();
+    assembler.duplicate_exit_blocks(&original_location_absence, &mut Vec::new());
 
     assert_eq!(
         graph_opcodes(&assembler),
@@ -2740,4 +3597,1078 @@ fn direct_target_return_copy_crosses_an_exception_boundary() {
             .collect::<Vec<_>>(),
         [1, 2, 2, 2, -1]
     );
+}
+
+#[test]
+fn retained_setup_nop_identity_survives_consecutive_labels_without_aliasing_removed_setups() {
+    let location = SourceLocation::new(2, 9, 4, 16);
+    let start = super::Label(0);
+    let end = super::Label(1);
+    let intermediate = super::Label(2);
+    let setup = super::Label(3);
+    let nop = Item::Instruction(Instruction::new(NOP, Operand::Value(0), location, None));
+    for retained in [false, true] {
+        // Both layouts have the same NOP location followed by consecutive labels.
+        // Only the first contains that instruction inside the authored SETUP range.
+        let items = if retained {
+            vec![
+                Item::Label(start),
+                nop,
+                Item::Label(end),
+                Item::Label(intermediate),
+                Item::Label(setup),
+            ]
+        } else {
+            vec![
+                nop,
+                Item::Label(start),
+                Item::Label(end),
+                Item::Label(intermediate),
+                Item::Label(setup),
+            ]
+        };
+        let mut label_positions = rustc_hash::FxHashMap::default();
+        let mut position = 0;
+        for item in &items {
+            match item {
+                Item::Instruction(_) => position += 1,
+                Item::Label(label) => {
+                    label_positions.insert(*label, position);
+                }
+            }
+        }
+        let assembler = super::LayoutAssembler {
+            items,
+            exception_regions: Vec::new(),
+            exception_owner_provenance: super::exception_owners::ExceptionOwnerProvenance {
+                setups: vec![(setup, Some(location))],
+                setup_nop_ranges: vec![(start, end)],
+                setup_nop_boundaries: [start, end].into_iter().collect(),
+                ..Default::default()
+            },
+            preserved_block_boundaries: rustc_hash::FxHashSet::default(),
+            removed_max_depth: None,
+            next_label: 4,
+            has_next_location: false,
+        };
+        let positions = assembler.retained_setup_nops(&label_positions);
+        assert_eq!(positions.contains(&0), retained);
+        assert_eq!(positions.len(), usize::from(retained));
+    }
+}
+
+#[test]
+fn emitted_region_requires_a_reachable_final_fallthrough_edge() {
+    // Reaching the trailing join through a jump does not make the return fall through.
+    let mut assembler = Assembler::default();
+    let start = assembler.emitted_region_start();
+    let join = assembler.label();
+    assembler.emit_operand(JUMP_FORWARD, Operand::Forward(join));
+    assembler.emit(RETURN_VALUE, 0);
+    assembler.mark(join);
+    assert!(!assembler.emitted_region_has_final_fallthrough(start));
+
+    // An instruction emitted after a return is not a normal predecessor either.
+    let mut assembler = Assembler::default();
+    let start = assembler.emitted_region_start();
+    assembler.emit(RETURN_VALUE, 0);
+    assembler.emit(STORE_FAST, 0);
+    assert!(!assembler.emitted_region_has_final_fallthrough(start));
+
+    // Ordinary flow continues through label-only blocks, unlike borrow traversal.
+    let mut assembler = Assembler::default();
+    let start = assembler.emitted_region_start();
+    let join = assembler.label();
+    let alias = assembler.label();
+    assembler.emit_operand(JUMP_FORWARD, Operand::Forward(join));
+    assembler.emit(RETURN_VALUE, 0);
+    assembler.mark(join);
+    assembler.mark(alias);
+    assembler.emit(STORE_FAST, 0);
+    assert!(assembler.emitted_region_has_final_fallthrough(start));
+}
+
+#[test]
+fn emitted_region_follows_runtime_branches_but_not_monitoring_targets() {
+    for opcode in [POP_JUMP_IF_FALSE, FOR_ITER, SEND, END_ASYNC_FOR] {
+        let mut assembler = Assembler::default();
+        let start = assembler.emitted_region_start();
+        let join = assembler.label();
+        assembler.emit_operand(opcode, Operand::Forward(join));
+        assembler.emit(RETURN_VALUE, 0);
+        assembler.mark(join);
+        assembler.emit(STORE_FAST, 0);
+        assert_eq!(
+            assembler.emitted_region_has_final_fallthrough(start),
+            opcode != END_ASYNC_FOR
+        );
+    }
+}
+
+#[test]
+fn emitted_region_boundaries_survive_label_insertion_but_not_instruction_removal() {
+    let mut assembler = Assembler::default();
+    assembler.emit(RETURN_VALUE, 0);
+    let start = assembler.emitted_region_start();
+    assembler.emit(STORE_FAST, 0);
+    let label = assembler.label();
+    assembler.mark_before_trailing_instructions(label, 2);
+    assert!(assembler.emitted_region_has_final_fallthrough(start));
+
+    assembler.emit(NOP, 0);
+    assert!(assembler.take_trailing_nop_location().is_some());
+    assert!(!assembler.emitted_region_has_final_fallthrough(start));
+    assert!(!Assembler::default().emitted_region_has_final_fallthrough(start));
+}
+
+#[test]
+fn empty_emitted_regions_fall_through_without_reusing_a_previous_terminator() {
+    let mut assembler = Assembler::default();
+    assembler.emit(RETURN_VALUE, 0);
+    let start = assembler.emitted_region_start();
+    assert!(assembler.emitted_region_has_final_fallthrough(start));
+
+    // Labels and omitted no-op provenance do not introduce a terminal edge.
+    let label = assembler.label();
+    assembler.mark(label);
+    assembler.record_omitted_nop_targets(assembler.location);
+    assert!(assembler.emitted_region_has_final_fallthrough(start));
+
+    assembler.emit(RETURN_VALUE, 0);
+    assert!(!assembler.emitted_region_has_final_fallthrough(start));
+}
+
+#[test]
+fn unpack_rotation_nop_removal_does_not_expose_capture_store_cascades() {
+    let cases = [
+        (
+            vec![
+                pass_instruction(UNPACK_SEQUENCE, 3, 1),
+                pass_instruction(NOP, 0, 1),
+                pass_instruction(SWAP, 3, 2),
+            ],
+            vec![UNPACK_SEQUENCE, SWAP],
+        ),
+        (
+            vec![
+                pass_instruction(UNPACK_SEQUENCE, 3, 1),
+                pass_instruction(NOP, 0, 2),
+                pass_instruction(SWAP, 3, 3),
+            ],
+            vec![UNPACK_SEQUENCE, NOP, SWAP],
+        ),
+        (
+            vec![
+                pass_instruction(UNPACK_SEQUENCE, 1, 1),
+                pass_instruction(NOP, 0, 1),
+                pass_instruction(NOP, 0, 2),
+                pass_instruction(STORE_FAST_STORE_FAST, 1, 3),
+            ],
+            vec![UNPACK_SEQUENCE, NOP, STORE_FAST_STORE_FAST],
+        ),
+        (
+            vec![
+                pass_instruction(UNPACK_SEQUENCE, 1, 1),
+                pass_instruction(NOP, 0, 2),
+                pass_instruction(STORE_FAST, 0, 3),
+            ],
+            vec![UNPACK_SEQUENCE, NOP, STORE_FAST],
+        ),
+    ];
+    for (items, expected) in cases {
+        let mut assembler = optimization_pipeline(items);
+        assembler.remove_redundant_nops();
+        assert_eq!(graph_opcodes(&assembler), expected);
+    }
+}
+
+#[test]
+fn canceled_unpack_rotations_preserve_distinct_capture_nop_lines() {
+    let cases = [
+        (
+            vec![
+                (UNPACK_SEQUENCE, 5),
+                (NOP, 5),
+                (NOP, 5),
+                (NOP, 6),
+                (NOP, 6),
+                (STORE_FAST, 3),
+            ],
+            vec![(UNPACK_SEQUENCE, 5), (NOP, 6), (STORE_FAST, 3)],
+        ),
+        (
+            vec![(UNPACK_SEQUENCE, 5), (NOP, 5), (NOP, 6), (STORE_FAST, 6)],
+            vec![(UNPACK_SEQUENCE, 5), (STORE_FAST, 6)],
+        ),
+        (
+            vec![(UNPACK_SEQUENCE, 5), (NOP, 6), (NOP, 7), (STORE_FAST, 3)],
+            vec![(UNPACK_SEQUENCE, 5), (NOP, 6), (NOP, 7), (STORE_FAST, 3)],
+        ),
+        (
+            vec![
+                (UNPACK_SEQUENCE, 5),
+                (NOP, 5),
+                (NOP, 6),
+                (UNPACK_SEQUENCE, 7),
+                (NOP, 8),
+                (STORE_FAST, 9),
+            ],
+            vec![
+                (UNPACK_SEQUENCE, 5),
+                (NOP, 6),
+                (UNPACK_SEQUENCE, 7),
+                (NOP, 8),
+                (STORE_FAST, 9),
+            ],
+        ),
+    ];
+    for (input, expected) in cases {
+        let items = input
+            .into_iter()
+            .map(|(opcode, line)| pass_instruction(opcode, 0, line))
+            .collect();
+        let mut assembler = optimization_pipeline(items);
+        assembler.remove_redundant_nops();
+        let actual = assembler
+            .graph
+            .iter_items()
+            .filter_map(|item| match item {
+                Item::Instruction(instruction) => {
+                    Some((instruction.opcode, instruction.location.line))
+                }
+                Item::Label(_) => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+}
+
+#[test]
+fn cleanup_prefix_locations_retain_original_donors_through_late_writers() {
+    for full_copy_path in [false, true] {
+        for original_donor in [false, true] {
+            for deferred_location in [0, 1, 2] {
+                let [first, second, intermediate, cleanup, suffix, exit, handler] =
+                    std::array::from_fn(|index| super::Label(u32::try_from(index).unwrap()));
+                let jump = |opcode, target, line| {
+                    Item::Instruction(Instruction::new(
+                        opcode,
+                        Operand::Forward(target),
+                        SourceLocation::new(line, line, 0, 0),
+                        None,
+                    ))
+                };
+                let mut items = vec![
+                    pass_instruction(LOAD_CONST, 0, 12),
+                    pass_instruction(LOAD_CONST, 1, 12),
+                    pass_instruction(LOAD_FAST, 0, 12),
+                    jump(POP_JUMP_IF_TRUE, second, 12),
+                    Item::Label(first),
+                    pass_instruction(NOP, 0, 12),
+                    jump(JUMP_FORWARD, intermediate, 12),
+                    Item::Label(second),
+                    pass_instruction(NOP, 0, 12),
+                    jump(JUMP_FORWARD, intermediate, 12),
+                    Item::Label(intermediate),
+                    jump(JUMP_FORWARD, cleanup, if original_donor { 12 } else { -1 }),
+                    Item::Label(cleanup),
+                    pass_instruction(SWAP, 2, -1),
+                    pass_instruction(POP_TOP, 0, -1),
+                    Item::Label(suffix),
+                    pass_instruction(NOP, 0, 2),
+                    pass_instruction(NOP, 0, 2),
+                    pass_instruction(NOP, 0, 2),
+                ];
+                if full_copy_path {
+                    items.extend([
+                        jump(JUMP_FORWARD, exit, 2),
+                        Item::Label(exit),
+                        pass_instruction(RETURN_VALUE, 0, 2),
+                    ]);
+                } else {
+                    items.push(pass_instruction(RETURN_VALUE, 0, 2));
+                }
+                items.extend([Item::Label(handler), pass_instruction(RERAISE, 0, -1)]);
+                let mut assembler = optimization_pipeline(items);
+                if deferred_location != 0 {
+                    let block = assembler.graph.label_block(cleanup).unwrap();
+                    let pop = assembler
+                        .graph
+                        .instructions_mut(block)
+                        .find(|instruction| instruction.opcode == POP_TOP)
+                        .unwrap();
+                    if deferred_location == 1 {
+                        pop.fusion_policy.mark_location_from_next();
+                    } else {
+                        pop.no_location_policy.percent_target_location = 1;
+                    }
+                }
+                assembler.exception_regions.push(super::ExceptionRegion {
+                    priority: super::ExceptionRegionPriority::OriginalRange(cleanup, suffix),
+                    is_scope_fallback: false,
+                    start: cleanup,
+                    end: suffix,
+                    target: handler,
+                    depth: 0,
+                    preserve_lasti: false,
+                });
+                let original = assembler.capture_original_location_absence();
+                assert_eq!(original.contains(&cleanup), !original_donor);
+                assert!(assembler.thread_forward_jumps());
+                assembler.remove_unreachable_instructions();
+                let target = assembler.graph.label_block(cleanup).unwrap();
+                let suffix_block = assembler.graph.label_block(suffix).unwrap();
+                assert_ne!(target, suffix_block);
+                let incoming = assembler
+                    .graph
+                    .iter_items()
+                    .filter(|item| {
+                        matches!(item, Item::Instruction(instruction)
+                    if instruction.operand() == Operand::Forward(cleanup))
+                    })
+                    .count();
+                assert_eq!(incoming, 2);
+                // Reconstructing this certificate now would lose the original located predecessor.
+                assert!(
+                    assembler
+                        .capture_original_location_absence()
+                        .contains(&cleanup)
+                );
+                let copies = assembler.duplicate_exit_blocks(&original, &mut Vec::new());
+                assert_eq!(copies.is_empty(), !full_copy_path);
+                assembler.remove_redundant_forward_jumps(true);
+                assembler.propagate_locations_within_blocks();
+                let target = assembler.graph.label_block(cleanup).unwrap();
+                let locations = assembler.graph[target]
+                    .items()
+                    .iter()
+                    .filter_map(|item| match item {
+                        Item::Instruction(instruction) => Some(instruction.location.line),
+                        Item::Label(_) => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    locations,
+                    vec![
+                        if original_donor || deferred_location != 0 {
+                            12
+                        } else {
+                            -1
+                        };
+                        2
+                    ]
+                );
+                let suffix_block = assembler.graph.label_block(suffix).unwrap();
+                assert_eq!(
+                    assembler.graph[suffix_block]
+                        .items()
+                        .iter()
+                        .find_map(|item| match item {
+                            Item::Instruction(instruction) => Some(instruction.location.line),
+                            Item::Label(_) => None,
+                        })
+                        .unwrap(),
+                    2
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn uninitialized_load_analysis_preserves_original_exception_region_priority() {
+    for fallback in [false, true] {
+        for resolved in [false, true] {
+            for cleared in [false, true] {
+                let outer = super::Label(0);
+                let inner = super::Label(1);
+                let fragment = super::Label(2);
+                let end = super::Label(3);
+                let handler = super::Label(4);
+                let other_handler = super::Label(5);
+                let mut instructions = vec![
+                    Item::Label(outer),
+                    pass_instruction(LOAD_CONST, 0, 1),
+                    pass_instruction(STORE_FAST, 0, 1),
+                    Item::Label(inner),
+                    pass_instruction(NOP, 0, 2),
+                    Item::Label(fragment),
+                ];
+                if cleared {
+                    instructions.push(pass_instruction(DELETE_FAST, 0, 3));
+                }
+                instructions.extend([
+                    pass_instruction(LOAD_CONST, 0, 4),
+                    pass_instruction(POP_TOP, 0, 4),
+                    Item::Label(end),
+                    pass_instruction(LOAD_CONST, 0, 5),
+                    pass_instruction(RETURN_VALUE, 0, 5),
+                    Item::Label(handler),
+                    pass_instruction(LOAD_FAST, 0, 6),
+                    pass_instruction(POP_TOP, 0, 6),
+                    pass_instruction(RERAISE, 0, -1),
+                    Item::Label(other_handler),
+                    pass_instruction(RERAISE, 0, -1),
+                ]);
+                let mut assembler = optimization_pipeline(instructions);
+                let priority = |start: super::Label| {
+                    if resolved {
+                        super::ExceptionRegionPriority::Resolved {
+                            start: usize::try_from(start.0).unwrap(),
+                            end: 20,
+                        }
+                    } else {
+                        super::ExceptionRegionPriority::OriginalRange(start, end)
+                    }
+                };
+                assembler.exception_regions.extend([
+                    super::ExceptionRegion {
+                        start: inner,
+                        end,
+                        target: handler,
+                        depth: 0,
+                        preserve_lasti: false,
+                        is_scope_fallback: false,
+                        priority: priority(inner),
+                    },
+                    super::ExceptionRegion {
+                        start: fragment,
+                        end,
+                        target: other_handler,
+                        depth: 0,
+                        preserve_lasti: false,
+                        is_scope_fallback: fallback,
+                        priority: priority(if fallback { fragment } else { outer }),
+                    },
+                ]);
+                assembler.add_checks_for_uninitialized_loads(1, 0);
+                let block = assembler.graph.label_block(handler).unwrap();
+                let load = assembler.graph[block]
+                    .items()
+                    .iter()
+                    .find_map(|item| match item {
+                        Item::Instruction(instruction) => Some(instruction.opcode),
+                        Item::Label(_) => None,
+                    })
+                    .unwrap();
+                assert_eq!(load, if cleared { LOAD_FAST_CHECK } else { LOAD_FAST });
+            }
+        }
+    }
+}
+
+#[test]
+fn late_redundant_jump_removal_revisits_newly_adjacent_targets() {
+    let intermediate = super::Label(0);
+    let target = super::Label(1);
+    let location = SourceLocation::new(7, 7, 3, 9);
+    let mut jump = Instruction::new(JUMP_FORWARD, Operand::Forward(target), location, None);
+    jump.exclude_from_exception_table(ExceptionExclusion::IfExtended);
+    jump.no_location_policy
+        .set_borrow_fallthrough(BorrowFallthrough::Barrier);
+    let mut assembler = optimization_pipeline(vec![
+        pass_instruction(POP_TOP, 0, 7),
+        Item::Instruction(jump),
+        Item::Label(intermediate),
+        Item::Instruction(Instruction::new(
+            JUMP_FORWARD,
+            Operand::Forward(target),
+            SourceLocation::NONE,
+            None,
+        )),
+        Item::Label(target),
+        pass_instruction(RETURN_VALUE, 0, 8),
+    ]);
+
+    assembler.remove_redundant_forward_jumps(true);
+
+    let instructions = assembler
+        .graph
+        .iter_items()
+        .filter_map(|item| match item {
+            Item::Instruction(instruction) => Some(instruction),
+            Item::Label(_) => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(instructions.len(), 2);
+    assert_eq!(instructions[0].opcode, POP_TOP);
+    assert_eq!(
+        instructions[0].exception_policy().exclusion(),
+        ExceptionExclusion::IfExtended
+    );
+    assert_eq!(
+        instructions[0].no_location_policy.borrow_fallthrough(),
+        BorrowFallthrough::Barrier
+    );
+    assert_eq!(instructions[1].opcode, RETURN_VALUE);
+    assert_eq!(instructions[1].location.line, 8);
+}
+
+#[test]
+fn late_jump_retries_preserve_deferred_and_borrowed_markers() {
+    for policy in ["deferred", "borrowed", "retained"] {
+        let intermediate = super::Label(0);
+        let target = super::Label(1);
+        let mut jump = Instruction::new(
+            JUMP_FORWARD,
+            Operand::Forward(target),
+            SourceLocation::NONE,
+            None,
+        );
+        match policy {
+            "deferred" => jump.jump_policy.defer_removal(),
+            "borrowed" => jump.jump_policy.mark_borrow_empty_block(),
+            "retained" => jump.jump_policy.retain_nop(),
+            _ => unreachable!(),
+        }
+        let mut assembler = optimization_pipeline(vec![
+            pass_instruction(LOAD_CONST, 0, 1),
+            Item::Instruction(jump),
+            Item::Label(intermediate),
+            Item::Instruction(Instruction::new(
+                JUMP_FORWARD,
+                Operand::Forward(target),
+                SourceLocation::NONE,
+                None,
+            )),
+            Item::Label(target),
+            pass_instruction(RETURN_VALUE, 0, 1),
+        ]);
+
+        assembler.remove_redundant_forward_jumps(true);
+
+        let instructions = assembler
+            .graph
+            .iter_items()
+            .filter_map(|item| match item {
+                Item::Instruction(instruction) => Some(instruction),
+                Item::Label(_) => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(instructions.len(), 3, "{policy}");
+        let marker = instructions[1];
+        match policy {
+            "deferred" => {
+                assert_eq!(marker.opcode, JUMP_FORWARD);
+                assert!(!marker.jump_policy.defers_redundant_removal());
+            }
+            "borrowed" => {
+                assert_eq!(marker.opcode, NOP);
+                assert!(marker.jump_policy.borrow_empty_block());
+            }
+            "retained" => {
+                assert_eq!(marker.opcode, NOP);
+                assert!(marker.jump_policy.always_retains_nop());
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[test]
+fn late_jump_retries_require_proven_empty_line_blocks() {
+    for (middle_line, next_line, preserved, retains_jump) in [
+        (-1, 8, false, false),
+        (7, 8, false, true),
+        (7, 7, false, false),
+        (7, -1, false, true),
+        (-1, 8, true, true),
+    ] {
+        let intermediate = super::Label(0);
+        let target = super::Label(1);
+        let mut middle = Instruction::new(
+            JUMP_FORWARD,
+            Operand::Forward(target),
+            if middle_line < 0 {
+                SourceLocation::NONE
+            } else {
+                SourceLocation::new(middle_line, middle_line, 3, 9)
+            },
+            None,
+        );
+        if preserved {
+            middle.no_location_policy.preserve_location();
+        }
+        let mut assembler = optimization_pipeline(vec![
+            pass_instruction(POP_TOP, 0, 7),
+            Item::Instruction(Instruction::new(
+                JUMP_FORWARD,
+                Operand::Forward(target),
+                SourceLocation::new(7, 7, 3, 9),
+                None,
+            )),
+            Item::Label(intermediate),
+            Item::Instruction(middle),
+            Item::Label(target),
+            pass_instruction(RETURN_VALUE, 0, next_line),
+        ]);
+        assembler.remove_redundant_forward_jumps(true);
+        let instructions = assembler
+            .graph
+            .iter_items()
+            .filter_map(|item| match item {
+                Item::Instruction(instruction) => Some(instruction),
+                Item::Label(_) => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(instructions.len(), if retains_jump { 3 } else { 2 });
+        if retains_jump {
+            assert_eq!(instructions[1].opcode, JUMP_FORWARD);
+            assert_eq!(instructions[1].location, SourceLocation::new(7, 7, 3, 9));
+            assert_eq!(instructions[1].operand(), Operand::Forward(target));
+        }
+    }
+}
+
+#[test]
+fn shared_unlocated_jump_retries_require_original_conditional_predecessors() {
+    for case in [
+        "shared",
+        "one",
+        "aliases",
+        "merged_arrays",
+        "unreachable",
+        "located_nop",
+        "omitted_nop",
+        "hidden_slot",
+        "lost_predecessor",
+    ] {
+        let entry = super::Label(0);
+        let target = super::Label(1);
+        let alias = super::Label(2);
+        let second = super::Label(3);
+        let instruction = |opcode, target, line| {
+            Item::Instruction(Instruction::new(
+                opcode,
+                Operand::Forward(target),
+                SourceLocation::new(line, line, 0, 1),
+                None,
+            ))
+        };
+        let mut items = Vec::new();
+        if case == "unreachable" {
+            items.push(instruction(JUMP_FORWARD, second, 1));
+        }
+        items.push(instruction(POP_JUMP_IF_FALSE, entry, 2));
+        items.push(Item::Label(second));
+        if case != "one" {
+            items.push(instruction(
+                POP_JUMP_IF_TRUE,
+                if matches!(case, "aliases" | "merged_arrays") {
+                    alias
+                } else {
+                    entry
+                },
+                3,
+            ));
+        }
+        items.extend([
+            pass_instruction(POP_TOP, 0, 7),
+            instruction(JUMP_FORWARD, target, 7),
+            Item::Label(entry),
+        ]);
+        if case == "merged_arrays" {
+            let mut first_array = Instruction::new(
+                JUMP_FORWARD,
+                Operand::Forward(target),
+                SourceLocation::NONE,
+                None,
+            );
+            first_array.no_location_policy.preserve_location();
+            items.push(Item::Instruction(first_array));
+        }
+        items.push(Item::Label(alias));
+        if case == "located_nop" {
+            items.push(pass_instruction(NOP, 0, 9));
+        }
+        let mut middle = Instruction::new(
+            JUMP_FORWARD,
+            Operand::Forward(target),
+            SourceLocation::NONE,
+            None,
+        );
+        middle.no_location_policy.preserve_location();
+        if case == "hidden_slot" {
+            middle.local_policy.add_hidden_exception_owner_slots(1);
+        }
+        items.extend([
+            Item::Instruction(middle),
+            Item::Label(target),
+            pass_instruction(RETURN_VALUE, 0, 8),
+        ]);
+        let mut assembler = optimization_pipeline(items);
+        if case == "omitted_nop" {
+            assembler
+                .exception_owner_provenance
+                .omitted_nop_locations
+                .insert(entry, SourceLocation::new(9, 9, 0, 1));
+        }
+        assembler.record_shared_unlocated_jump_entries();
+        assert_eq!(
+            assembler
+                .original_shared_unlocated_jump_entries
+                .contains_key(&entry),
+            matches!(case, "shared" | "aliases" | "lost_predecessor"),
+            "{case}"
+        );
+        // Later compaction can hide an authored NOP or merge labels. Neither creates
+        // an original shared unlocated array; losing an edge also invalidates admission.
+        let head = assembler.graph.label_block(entry).unwrap();
+        assembler.graph.retain_items(
+            head,
+            |item| !matches!(item, Item::Instruction(instruction) if instruction.opcode == NOP),
+        );
+        assembler.graph.for_each_instruction_mut(|instruction| {
+            if instruction.opcode == POP_JUMP_IF_TRUE {
+                if matches!(case, "aliases" | "merged_arrays") {
+                    instruction.retarget(Operand::Forward(entry));
+                } else if case == "lost_predecessor" {
+                    instruction.retarget(Operand::Forward(target));
+                }
+            }
+        });
+        assembler.remove_redundant_forward_jumps(true);
+        let kept_body_jump = assembler.graph.iter_items().any(|item| matches!(item,
+            Item::Instruction(instruction) if instruction.opcode == JUMP_FORWARD && instruction.location.line == 7));
+        assert_eq!(
+            kept_body_jump,
+            !matches!(case, "shared" | "aliases"),
+            "{case}"
+        );
+    }
+}
+
+#[test]
+fn folded_borrow_entries_resolve_before_graph_preparation() {
+    let mut assembler = Assembler::default();
+    let other = assembler.label();
+    let target = assembler.label();
+    assembler.emit(LOAD_CONST, 0);
+    assembler.emit_forward_with_depth(POP_JUMP_IF_FALSE, other, 0, ExceptionPolicy::default());
+    assembler.emit_forward_with_depth(JUMP_FORWARD, target, 0, ExceptionPolicy::default());
+    assembler.record_folded_condition_borrow_entry(target);
+    // A second branch emitted in the dead remainder must not replace the captured
+    // predecessor set. The earlier independent destination is in a different block.
+    assembler.emit_forward_with_depth(JUMP_FORWARD, target, 0, ExceptionPolicy::default());
+    assembler.mark(target);
+    assembler.emit(LOAD_CONST, 1);
+    assembler.emit(RETURN_VALUE, 0);
+    assembler.mark(other);
+    assembler.emit(LOAD_CONST, 2);
+    assembler.emit(RETURN_VALUE, 0);
+
+    assembler.used_constant_indices(LOAD_CONST, 3);
+    assert!(matches!(assembler.code, UnoptimizedCode::Prepared { .. }));
+    assert!(assembler.deferred_borrow_entries.is_empty());
+    assert!(assembler.borrow_unreachable_blocks.contains(&target));
+    assert!(assembler.borrow_jump_entry_labels.contains(&target));
+    // A second consumer must not reinterpret the already prepared graph's offsets.
+    assembler.used_constant_indices(LOAD_CONST, 3);
+    let pipeline = assembler.into_optimization_pipeline();
+    assert!(pipeline.borrow_jump_entry_labels.contains(&target));
+}
+
+#[test]
+fn folded_borrow_entries_preserve_a_future_alias() {
+    let mut assembler = Assembler::default();
+    let outer = assembler.label();
+    let inner = assembler.label();
+    assembler.emit(LOAD_CONST, 0);
+    assembler.emit_forward_with_depth(POP_JUMP_IF_TRUE, outer, 0, ExceptionPolicy::default());
+    assembler.emit_forward_with_depth(JUMP_FORWARD, inner, 0, ExceptionPolicy::default());
+    assembler.record_folded_condition_borrow_entry(inner);
+    // The label names differ during emission, but their completed original offsets
+    // establish one block entered by the earlier live outer condition.
+    assembler.mark(inner);
+    assembler.mark(outer);
+    assembler.emit(LOAD_CONST, 1);
+    assembler.emit(RETURN_VALUE, 0);
+
+    assembler.optimize_constant_pops();
+    assert!(assembler.deferred_borrow_entries.is_empty());
+    assert!(!assembler.borrow_unreachable_blocks.contains(&inner));
+    assert!(!assembler.borrow_jump_entry_labels.contains(&inner));
+    let pipeline = assembler.into_optimization_pipeline();
+    assert!(!pipeline.borrow_jump_entry_labels.contains(&inner));
+}
+
+#[test]
+fn copied_regions_retarget_only_handlers_copied_with_instructions() {
+    for fallback in [false, true] {
+        for shape in ["external", "internal", "other region end"] {
+            let start = super::Label(0);
+            let end = super::Label(1);
+            let handler = super::Label(2);
+            let outer_handler = super::Label(3);
+            let mut jump = Instruction::new(
+                JUMP_FORWARD,
+                Operand::Forward(start),
+                SourceLocation::new(1, 1, 0, 0),
+                None,
+            );
+            jump.jump_policy.retain_nop_for_direct_target();
+            let mut items = vec![
+                Item::Instruction(jump),
+                Item::Label(start),
+                pass_instruction(LOAD_CONST, 0, 2),
+            ];
+            if shape == "internal" {
+                items.push(Item::Label(handler));
+            }
+            items.push(pass_instruction(RETURN_VALUE, 0, 2));
+            if shape == "other region end" {
+                items.extend([Item::Label(end), pass_instruction(RERAISE, 0, -1)]);
+            }
+            if shape != "internal" {
+                items.extend([Item::Label(handler), pass_instruction(RERAISE, 0, -1)]);
+            }
+            items.extend([Item::Label(outer_handler), pass_instruction(RERAISE, 0, -1)]);
+            let region_end = if shape == "other region end" {
+                end
+            } else {
+                handler
+            };
+            let priority = super::ExceptionRegionPriority::OriginalRange(start, region_end);
+            let mut assembler = optimization_pipeline(items);
+            assembler.exception_regions.push(super::ExceptionRegion {
+                priority,
+                is_scope_fallback: fallback,
+                start,
+                end: region_end,
+                target: handler,
+                depth: 0,
+                preserve_lasti: true,
+            });
+            if shape == "other region end" {
+                // Another region's trailing end is also a handler label. Its boundary
+                // alias must not redirect the first region's actual handler.
+                assembler.exception_regions.push(super::ExceptionRegion {
+                    priority: super::ExceptionRegionPriority::OriginalRange(start, handler),
+                    is_scope_fallback: fallback,
+                    start,
+                    end: handler,
+                    target: outer_handler,
+                    depth: 1,
+                    preserve_lasti: false,
+                });
+            }
+
+            let original = assembler.capture_original_location_absence();
+            assembler.duplicate_exit_blocks(&original, &mut Vec::new());
+
+            let copied = assembler
+                .exception_regions
+                .iter()
+                .find(|region| {
+                    region.start != start
+                        && matches!(
+                            region.priority,
+                            super::ExceptionRegionPriority::OriginalRange(first, last)
+                                if first == start && last == region_end
+                        )
+                })
+                .expect("the exit copy must retain its protected region");
+            assert_ne!(copied.end, region_end, "{shape}/{fallback}");
+            assert_eq!(copied.depth, 0, "{shape}/{fallback}");
+            assert!(copied.preserve_lasti, "{shape}/{fallback}");
+            assert_eq!(copied.is_scope_fallback, fallback, "{shape}/{fallback}");
+            if shape == "internal" {
+                assert_ne!(copied.target, handler, "{shape}/{fallback}");
+                assert_eq!(copied.target, copied.end, "{shape}/{fallback}");
+                let target = assembler.graph.label_block(copied.target).unwrap();
+                assert_eq!(
+                    assembler.graph[target].last_instruction().unwrap().opcode,
+                    RETURN_VALUE,
+                    "{shape}/{fallback}",
+                );
+            } else {
+                assert_eq!(copied.target, handler, "{shape}/{fallback}");
+                let target = assembler.graph.label_block(copied.target).unwrap();
+                assert_eq!(
+                    assembler.graph[target].last_instruction().unwrap().opcode,
+                    RERAISE,
+                    "{shape}/{fallback}",
+                );
+            }
+            if shape == "other region end" {
+                let other = assembler
+                    .exception_regions
+                    .iter()
+                    .find(|region| region.start != start && region.depth == 1)
+                    .expect("the second copied region must retain its handler");
+                assert_eq!(other.target, outer_handler);
+            }
+        }
+    }
+}
+
+#[test]
+fn unlocated_borrow_marker_does_not_block_redundant_jump_removal() {
+    for location in [SourceLocation::NONE, SourceLocation::new(2, 2, 0, 0)] {
+        let target = super::Label(1);
+        let mut marker = Instruction::new(NOP, Operand::Value(0), location, None);
+        marker.jump_policy.mark_borrow_empty_block();
+        let mut assembler = optimization_pipeline(vec![
+            pass_instruction(LOAD_CONST, 0, 1),
+            Item::Instruction(Instruction::new(
+                JUMP_FORWARD,
+                Operand::Forward(target),
+                SourceLocation::new(1, 1, 0, 0),
+                None,
+            )),
+            Item::Label(super::Label(0)),
+            Item::Instruction(marker),
+            Item::Label(target),
+            pass_instruction(RETURN_VALUE, 0, 3),
+        ]);
+
+        assembler.remove_redundant_forward_jumps(true);
+
+        let instructions = assembler
+            .graph
+            .iter_items()
+            .filter_map(|item| match item {
+                Item::Instruction(instruction) => Some(instruction),
+                Item::Label(_) => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            instructions
+                .iter()
+                .filter(|instruction| instruction.opcode == JUMP_FORWARD)
+                .count(),
+            usize::from(location.line >= 0),
+        );
+        assert!(instructions.contains(&&marker));
+    }
+}
+
+#[test]
+fn borrow_marker_conversion_retries_without_another_jump_deletion() {
+    let target = super::Label(1);
+    let mut marker = Instruction::new(
+        JUMP_FORWARD,
+        Operand::Forward(target),
+        SourceLocation::NONE,
+        None,
+    );
+    marker.jump_policy.mark_borrow_empty_block();
+    let mut assembler = optimization_pipeline(vec![
+        pass_instruction(LOAD_CONST, 0, 1),
+        Item::Instruction(Instruction::new(
+            JUMP_FORWARD,
+            Operand::Forward(target),
+            SourceLocation::new(1, 1, 0, 0),
+            None,
+        )),
+        Item::Label(super::Label(0)),
+        Item::Instruction(marker),
+        Item::Label(target),
+        pass_instruction(RETURN_VALUE, 0, 3),
+    ]);
+
+    assembler.remove_redundant_forward_jumps(true);
+
+    let instructions = assembler
+        .graph
+        .iter_items()
+        .filter_map(|item| match item {
+            Item::Instruction(instruction) => Some(instruction),
+            Item::Label(_) => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        instructions
+            .iter()
+            .map(|instruction| instruction.opcode)
+            .collect::<Vec<_>>(),
+        [LOAD_CONST, NOP, RETURN_VALUE]
+    );
+    assert!(instructions[1].jump_policy.borrow_empty_block());
+    assert_eq!(instructions[1].location, SourceLocation::NONE);
+    assert_eq!(instructions[1].operand(), Operand::Value(0));
+}
+
+#[test]
+fn split_return_condition_transports_only_a_unique_exact_source_witness() {
+    use super::Label;
+    use super::exception_owners::SourceNoneCondition;
+
+    let location = SourceLocation::new(13, 13, 15, 35);
+    let mut condition = Instruction::new(
+        POP_JUMP_IF_NOT_NONE,
+        Operand::Forward(Label(3)),
+        location,
+        Some(2),
+    );
+    condition.local_policy.add_hidden_exception_owner_slots(3);
+    let mut updated = condition;
+    updated.no_location_policy.allow_split_return_exit_copy();
+    let marker = Instruction::new(NOT_TAKEN, Operand::Value(0), location, Some(2));
+
+    for change in [
+        "unique",
+        "no origin",
+        "duplicate origin",
+        "original clone",
+        "updated clone",
+        "different operand",
+        "different location",
+        "different hidden slots",
+    ] {
+        let mut items = vec![Item::Label(Label(0))];
+        match change {
+            "original clone" => items.push(Item::Instruction(condition)),
+            "updated clone" => items.push(Item::Instruction(updated)),
+            _ => {}
+        }
+        items.push(Item::Instruction(condition));
+        items.push(Item::Instruction(marker));
+        let mut assembler = Assembler::from_linear_items(items.clone());
+        let mut source = condition;
+        match change {
+            "different operand" => source.set_operand(Operand::Forward(Label(4))),
+            "different location" => source.location = SourceLocation::new(14, 14, 15, 35),
+            "different hidden slots" => source.local_policy.add_hidden_exception_owner_slots(1),
+            _ => {}
+        }
+        let source_count = match change {
+            "no origin" => 0,
+            "duplicate origin" => 2,
+            _ => 1,
+        };
+        for _ in 0..source_count {
+            assembler
+                .exception_owner_provenance
+                .source_none_conditions
+                .push(SourceNoneCondition {
+                    entry: Label(0),
+                    labels: vec![Label(0)],
+                    instruction: source,
+                    entry_prefix: Some(vec![Item::Label(Label(0))]),
+                });
+        }
+        let condition_item = items.len() - 2;
+        items[condition_item] = Item::Instruction(updated);
+        for _ in 0..2 {
+            assembler.allow_last_condition_split_return_copy();
+            assert_eq!(assembler.linear_items(), items.as_slice(), "{change}");
+            let origins = &assembler.exception_owner_provenance.source_none_conditions;
+            assert_eq!(origins.len(), source_count, "{change}");
+            for origin in origins {
+                assert_eq!(
+                    origin.instruction,
+                    if change == "unique" { updated } else { source },
+                    "{change}"
+                );
+                assert_eq!(origin.entry, Label(0), "{change}");
+                assert_eq!(origin.labels, vec![Label(0)], "{change}");
+                assert_eq!(
+                    origin.entry_prefix,
+                    Some(vec![Item::Label(Label(0))]),
+                    "{change}"
+                );
+            }
+        }
+    }
 }

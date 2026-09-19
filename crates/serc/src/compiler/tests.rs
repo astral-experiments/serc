@@ -50,7 +50,7 @@ fn compiler_stack_effects_distinguish_values_from_scope_exit_bookkeeping() {
 }
 
 #[test]
-fn protected_loop_tail_mode_requires_assign_then_raise_handlers() {
+fn protected_loop_tail_mode_preserves_supported_handlers() {
     let cases = [
         (
             "def f():\n    try:\n        action()\n    except FirstError:\n        raise\n    except SecondError as error:\n        message = 'details'\n        raise WrappedError(message) from error\n",
@@ -66,6 +66,10 @@ fn protected_loop_tail_mode_requires_assign_then_raise_handlers() {
         ),
         (
             "def f():\n    try:\n        action()\n    except Error:\n        recover()\n",
+            true,
+        ),
+        (
+            "def f():\n    try:\n        action()\n    except Error:\n        if retry():\n            recover()\n",
             false,
         ),
     ];
@@ -272,7 +276,7 @@ def direct_name(check, item):
 }
 
 #[test]
-fn generator_call_name_condition_owner_excludes_protected_and_folded_tests() {
+fn generator_call_condition_owners_preserve_original_while_blocks() {
     fn read_exception_varint(table: &[u8], index: &mut usize) -> u32 {
         let mut byte = table[*index];
         *index += 1;
@@ -386,19 +390,19 @@ async def async_generator_control(item, consume):
         ("debug_callable_control", &[false][..]),
         (
             "optimized_generator_controls",
-            &[true, false, false, true, false, false, true, false][..],
+            &[false, false, false, false, false, false, false, false][..],
         ),
-        ("unary_not_control", &[false][..]),
-        ("nested_non_tail_control", &[false][..]),
-        ("protected_try_control", &[false, true][..]),
-        ("handler_control", &[true, false][..]),
-        ("exception_group_handler_control", &[true, true, true][..]),
-        ("protected_with_control", &[false, true][..]),
-        ("finally_control", &[false, false][..]),
-        ("nested_finally_control", &[false, true][..]),
-        ("inline_controls", &[true, false, false, false][..]),
-        ("coroutine_control", &[false][..]),
-        ("async_generator_control", &[false][..]),
+        ("unary_not_control", &[true][..]),
+        ("nested_non_tail_control", &[true][..]),
+        ("protected_try_control", &[true, true][..]),
+        ("handler_control", &[true, true][..]),
+        ("exception_group_handler_control", &[true, true, false][..]),
+        ("protected_with_control", &[true, true][..]),
+        ("finally_control", &[true, true][..]),
+        ("nested_finally_control", &[true, true][..]),
+        ("inline_controls", &[false, false, false, false][..]),
+        ("coroutine_control", &[true][..]),
+        ("async_generator_control", &[true][..]),
     ] {
         let function = module
             .constants
@@ -419,7 +423,9 @@ async def async_generator_control(item, consume):
         }
         let marker_owners = function
             .bytecode
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .enumerate()
             .filter(|(_, instruction)| instruction[0] == NOT_TAKEN.code())
             .map(|(offset, _)| {
@@ -1771,7 +1777,9 @@ async def owned(self):
         }
         let nop_owners = function
             .bytecode
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .enumerate()
             .filter(|(_, instruction)| instruction[0] == NOP.code())
             .map(|(offset, _)| {
@@ -1853,8 +1861,8 @@ async def iterator_keyword_gap(items, fallback, run):
         ("nested_region", &[true, true][..]),
         ("after_suspension", &[false][..]),
         ("one_slot_after_condition", &[true, false][..]),
-        ("iterator_one_slot_after_condition", &[true, true][..]),
-        ("iterator_keyword_gap", &[false, false, true][..]),
+        ("iterator_one_slot_after_condition", &[true, false][..]),
+        ("iterator_keyword_gap", &[true, false, false][..]),
     ] {
         let function = module
             .constants
@@ -1875,7 +1883,9 @@ async def iterator_keyword_gap(items, fallback, run):
         }
         let marker_owners = function
             .bytecode
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .enumerate()
             .filter(|(_, instruction)| instruction[0] == NOT_TAKEN.code())
             .map(|(offset, _)| {
@@ -2014,9 +2024,9 @@ async def nested_manager_inner_single(outer, inner, state, value):
             "hazardous_method_ifexp_arg",
             &[true, true, false, false][..],
         ),
-        ("later_nested_if_terminal", &[true, true, false, false][..]),
+        ("later_nested_if_terminal", &[true, false, false, false][..]),
         ("cap_16", &[true, false, false][..]),
-        ("cap_17", &[true, true, false][..]),
+        ("cap_17", &[true, false, false][..]),
         (
             "sibling_manager_reset",
             &[true, false, true, false, false][..],
@@ -2049,7 +2059,9 @@ async def nested_manager_inner_single(outer, inner, state, value):
         }
         let marker_owners = function
             .bytecode
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .enumerate()
             .filter(|(_, instruction)| instruction[0] == NOT_TAKEN.code())
             .map(|(offset, _)| {
@@ -2208,28 +2220,28 @@ def unfiltered_with(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, 
         .unwrap();
 
     for (name, expected) in [
-        ("multiline_set", &[false, false][..]),
-        ("multiline_dict", &[false, false][..]),
-        ("multiline_try", &[false, false, true][..]),
-        ("multiline_with", &[false, false, true][..]),
-        ("multiline_is_not", &[false, false][..]),
-        ("multiline_trailing_truth", &[false, false][..]),
-        ("multiline_leading_named", &[false, false][..]),
-        ("multiline_leading_subscript", &[false, false][..]),
-        ("multiline_three_arm", &[false, false, false][..]),
+        ("multiline_set", &[true, false][..]),
+        ("multiline_dict", &[true, false][..]),
+        ("multiline_try", &[true, false, true][..]),
+        ("multiline_with", &[true, false, true][..]),
+        ("multiline_is_not", &[true, false][..]),
+        ("multiline_trailing_truth", &[true, false][..]),
+        ("multiline_leading_named", &[true, false][..]),
+        ("multiline_leading_subscript", &[true, false][..]),
+        ("multiline_three_arm", &[true, true, false][..]),
         ("multiline_second_filter", &[false, true, false][..]),
         (
             "multiline_nested_comprehension_filter",
-            &[false, false, false][..],
+            &[true, false, false][..],
         ),
         (
             "multiline_singleton_after_outer_filter",
             &[false, true, false][..],
         ),
-        ("unfiltered_nested_inner", &[false, true][..]),
-        ("unfiltered_try", &[false, true, true][..]),
-        ("unfiltered_finally", &[false, true][..]),
-        ("unfiltered_with", &[false, true, true][..]),
+        ("unfiltered_nested_inner", &[true, true][..]),
+        ("unfiltered_try", &[true, true, true][..]),
+        ("unfiltered_finally", &[true, true][..]),
+        ("unfiltered_with", &[true, true, true][..]),
     ] {
         let function = module
             .constants
@@ -2250,7 +2262,9 @@ def unfiltered_with(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, 
         }
         let marker_owners = function
             .bytecode
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .enumerate()
             .filter(|(_, instruction)| instruction[0] == NOT_TAKEN.code())
             .map(|(offset, _)| {
@@ -2422,14 +2436,14 @@ async def async_generator_control(values, get_state, use):
         .unwrap();
 
     for (name, expected) in [
-        ("protected_loop", &[false, true][..]),
-        ("with_loop", &[false, true][..]),
-        ("async_with_loop", &[false, false][..]),
-        ("handler_loop", &[true, false][..]),
-        ("finally_loop", &[true, false][..]),
-        ("async_for_control", &[true, false][..]),
-        ("generator_control", &[false][..]),
-        ("async_generator_control", &[false][..]),
+        ("protected_loop", &[true, true][..]),
+        ("with_loop", &[true, true][..]),
+        ("async_with_loop", &[true, false][..]),
+        ("handler_loop", &[true, true][..]),
+        ("finally_loop", &[true, true][..]),
+        ("async_for_control", &[true, true][..]),
+        ("generator_control", &[true][..]),
+        ("async_generator_control", &[true][..]),
     ] {
         let function = module
             .constants
@@ -2450,7 +2464,9 @@ async def async_generator_control(values, get_state, use):
         }
         let marker_owners = function
             .bytecode
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .enumerate()
             .filter(|(_, instruction)| instruction[0] == NOT_TAKEN.code())
             .map(|(offset, _)| {
@@ -2520,7 +2536,9 @@ def surrogate_filter(items):
         }
         let marker_owners = generator
             .bytecode
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .enumerate()
             .filter(|(_, instruction)| instruction[0] == NOT_TAKEN.code())
             .map(|(offset, _)| {
@@ -2534,7 +2552,83 @@ def surrogate_filter(items):
 }
 
 #[test]
-fn copied_finally_exits_keep_multi_edge_condition_nops() {
+fn copied_returns_omit_nops_at_original_conditional_joins() {
+    let source = r#"import json
+
+def event_shape(event, issues, sink):
+    kind = event.get("kind")
+    if kind == "request":
+        if event.get("accepted"):
+            if event.get("served"):
+                sink(issues)
+            else:
+                if not event.get("first"):
+                    sink(issues)
+                if event.get("first") and event.get("first") == event.get("last"):
+                    for field in ("first", "last"):
+                        if field not in issues:
+                            issues.append(field)
+        elif event.get("requested"):
+            sink(issues)
+        elif event.get("observed"):
+            if "context" not in issues:
+                issues.append("context")
+    elif kind == "attempt":
+        sink(issues)
+    return issues
+
+def validate_payload(state, text, errors):
+    if state == "empty":
+        if text:
+            errors.append("unexpected text")
+    elif state in ("partial", "complete"):
+        if state == "complete":
+            if not isinstance(text, str) or not text.strip():
+                errors.append("missing text")
+            else:
+                try:
+                    decoded = json.loads(text)
+                except json.JSONDecodeError:
+                    decoded = None
+                if not isinstance(decoded, dict):
+                    errors.append("expected an object")
+        elif text not in ("", None):
+            errors.append("unexpected partial text")
+    elif state in ("invalid", "mixed"):
+        if text not in ("", None):
+            errors.append("unexpected invalid text")
+    return state
+"#;
+    let parsed = parse_module(source).unwrap();
+    let module = module_compiler(source, &parsed)
+        .compile_module(parsed.suite())
+        .unwrap();
+
+    for (name, expected_nops) in [("event_shape", 0), ("validate_payload", 1)] {
+        let function = module
+            .constants
+            .iter()
+            .find_map(|constant| match constant {
+                Constant::Code(code) if code.name == name => Some(code),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("module should contain {name}"));
+        let nops = function
+            .bytecode
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .filter(|instruction| instruction[0] == NOP.code())
+            .count();
+
+        // The decode function retains its try-statement marker. Neither copied
+        // return adds a line event at the preceding conditional's shared join.
+        assert_eq!(nops, expected_nops, "unexpected NOP count for {name}");
+    }
+}
+
+#[test]
+fn copied_finally_exits_keep_statement_and_assertion_nops() {
     let source = r"def boolean_condition(manager, left, right):
     with manager:
         try:
@@ -2579,11 +2673,15 @@ def negated_boolean_condition(manager, left, right):
             .unwrap_or_else(|| panic!("module should contain {name}"));
         let nops = function
             .bytecode
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .filter(|instruction| instruction[0] == NOP.code())
             .count();
 
-        assert_eq!(nops, 3, "unexpected NOP count for {name}");
+        // CPython keeps the try-statement and assertion markers; the copied conditional
+        // fallthrough reaches an unlocated exit and does not retain another NOP.
+        assert_eq!(nops, 2, "unexpected NOP count for {name}");
     }
 }
 
@@ -2654,7 +2752,9 @@ def loop_name(manager, flag, items):
             .unwrap_or_else(|| panic!("module should contain {name}"));
         let nops = function
             .bytecode
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .filter(|instruction| instruction[0] == NOP.code())
             .count();
 
@@ -2690,7 +2790,7 @@ def nested_finally_break(manager, active, stop):
         .compile_module(parsed.suite())
         .unwrap();
 
-    for (name, expected_nops) in [("protected_break", 2), ("nested_finally_break", 3)] {
+    for (name, expected_nops) in [("protected_break", 2), ("nested_finally_break", 2)] {
         let function = module
             .constants
             .iter()
@@ -2701,7 +2801,9 @@ def nested_finally_break(manager, active, stop):
             .unwrap_or_else(|| panic!("module should contain {name}"));
         let nops = function
             .bytecode
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .filter(|instruction| instruction[0] == NOP.code())
             .count();
 
@@ -2761,7 +2863,9 @@ fn comparison_markers_distinguish_forward_and_threaded_loop_fallthroughs() {
     }
     let marker_owners = function
         .bytecode
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .enumerate()
         .filter(|(_, instruction)| instruction[0] == NOT_TAKEN.code())
         .map(|(offset, _)| {
@@ -2783,4 +2887,80 @@ fn cleans_docstrings_like_cpython() {
         "first\n  second\nthird\n"
     );
     assert_eq!(clean_doc("\tfirst\n\t\tsecond"), "first\nsecond");
+}
+
+#[test]
+fn uncopied_assertion_backedges_keep_source_positions() {
+    use crate::target::opcodes::JUMP_BACKWARD;
+
+    // Decode only record widths and whether a position exists. This invariant also
+    // holds when future lowering duplicates the backedge onto each success edge.
+    fn located_words(table: &[u8]) -> Vec<bool> {
+        let mut result = Vec::new();
+        let mut cursor = 0;
+        while cursor < table.len() {
+            let header = table[cursor];
+            assert_ne!(header & 0x80, 0);
+            cursor += 1;
+            let kind = (header >> 3) & 15;
+            result.extend(std::iter::repeat_n(kind != 15, usize::from(header & 7) + 1));
+            match kind {
+                0..=9 => cursor += 1,
+                10..=12 => cursor += 2,
+                13 | 14 => {
+                    for _ in 0..if kind == 13 { 1 } else { 4 } {
+                        loop {
+                            let value = table[cursor];
+                            cursor += 1;
+                            if value & 0x40 == 0 {
+                                break;
+                            }
+                        }
+                    }
+                }
+                15 => {}
+                _ => unreachable!(),
+            }
+        }
+        assert_eq!(cursor, table.len());
+        result
+    }
+
+    for condition in [
+        "left(value) or right(value)",
+        "not (left(value) and right(value))",
+    ] {
+        let source = format!(
+            "def f(items, left, right):\n    for value in items:\n        try:\n            assert {condition}\n        except Exception:\n            raise\n    return items\n"
+        );
+        let parsed = parse_module(&source).unwrap();
+        let module = module_compiler(&source, &parsed)
+            .compile_module(parsed.suite())
+            .unwrap();
+        let function = module
+            .constants
+            .iter()
+            .find_map(|constant| match constant {
+                Constant::Code(code) if code.name == "f" => Some(code),
+                _ => None,
+            })
+            .unwrap();
+        let positions = located_words(&function.line_table);
+        assert_eq!(positions.len() * 2, function.bytecode.len());
+        let backedges = function
+            .bytecode
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .enumerate()
+            .filter(|(_, word)| word[0] == JUMP_BACKWARD.code())
+            .collect::<Vec<_>>();
+        assert!(!backedges.is_empty());
+        for (offset, _) in backedges {
+            assert!(
+                positions[offset],
+                "missing backedge location for {condition}"
+            );
+        }
+    }
 }

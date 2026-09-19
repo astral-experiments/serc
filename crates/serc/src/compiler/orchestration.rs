@@ -13,7 +13,7 @@ use super::{
     MAKE_FUNCTION, NOP, POP_TOP, RETURN_GENERATOR, RETURN_VALUE, SETUP_ANNOTATIONS, STORE_DEREF,
 };
 use crate::CompileError;
-use crate::assembler::{AssembledCode, Assembler, SourceLocation};
+use crate::assembler::{AssembledCode, Assembler, ConstantTable, SourceLocation};
 use crate::code_object::{
     CodeObject, Constant, LocalsIdentity, MarshalMetadataIds, MarshalProvenance,
 };
@@ -27,20 +27,20 @@ use crate::target::local_kinds::{
 };
 use crate::target::operands::{FunctionAttribute, ResumeLocation, UnaryIntrinsic};
 
-use super::constant::{OutputState, fold_constant};
+use super::constant::{DeferredConstantTarget, OutputState, fold_constant};
 use super::definition::clean_doc;
 use super::scope::{
     LoweringFunctionPlan, NameId, NameSet, ScopeId, class_static_attributes,
-    collect_conditional_simple_annotations, has_simple_annotations,
+    collect_conditional_simple_annotations, collect_simple_annotations, has_simple_annotations,
 };
 use super::source::{CompilationContext, implicit_return_range};
 use super::statement::{
-    ControlFlowState, statement_uses_implicit_return_location, suite_terminates,
+    ControlFlowState, suite_terminates, terminal_statement_uses_implicit_return_location,
 };
 use super::symbol::{ReraiseStackState, ResumeDepth, SymbolState, to_u32};
 use super::{Compiler, Scope};
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct CodeUnit {
     pub(super) scope: Scope,
     pub(super) scope_id: ScopeId,
@@ -48,11 +48,14 @@ pub(super) struct CodeUnit {
     pub(super) child_qualified_name_parent: Option<String>,
     pub(super) class_scope_is_nested: bool,
     pub(super) module_annotation_index: u32,
+    pub(super) module_annotation_indices: FxHashMap<TextRange, u32>,
     pub(super) class_conditional_annotations: VecDeque<TextRange>,
     pub(super) annotation_classdict_index: Option<u32>,
     name: String,
     pub(super) qualified_name: String,
     pub(super) private_name: Option<String>,
+    pub(super) mangled_names: Option<FxHashSet<String>>,
+    pub(super) pending_private_type_parameters: FxHashSet<NameId>,
     pub(super) arg_count: u32,
     positional_only_arg_count: u32,
     keyword_only_arg_count: u32,
@@ -75,6 +78,32 @@ struct CodeUnitSpec {
     first_line_number: u32,
 }
 
+/// Records constants created by late assembler passes at their cache-admission point.
+struct InterningConstantTable<'a, 'source> {
+    output: &'a mut OutputState,
+    context: &'a CompilationContext<'source>,
+}
+
+impl ConstantTable for InterningConstantTable<'_, '_> {
+    fn get(&self, index: u32) -> &Constant {
+        self.output.get(index)
+    }
+
+    fn intern(&mut self, constant: Constant) -> Result<u32, CompileError> {
+        self.context
+            .record_constant_string_origins(&constant, false);
+        self.output.intern(constant)
+    }
+
+    fn len(&self) -> usize {
+        self.output.len()
+    }
+
+    fn retain_used(&mut self, used: &[bool], order: &[u32]) -> Vec<Option<u32>> {
+        self.output.retain_used(used, order)
+    }
+}
+
 impl<'source> Compiler<'source> {
     fn new(
         context: Arc<CompilationContext<'source>>,
@@ -90,6 +119,15 @@ impl<'source> Compiler<'source> {
             control: ControlFlowState::default(),
             assembler: Assembler::default(),
         }
+    }
+
+    /// Shares lexical context while keeping discarded parent instructions in a fresh emitter.
+    pub(super) fn discarded_builder(&self) -> Self {
+        Self::new(
+            Arc::clone(&self.context),
+            self.unit.clone(),
+            self.symbols.clone(),
+        )
     }
 
     pub(crate) fn module(
@@ -217,6 +255,7 @@ impl<'source> Compiler<'source> {
         nonlocals: FxHashSet<NameId>,
         freevars: &[NameId],
         comprehension_targets: &[NameId],
+        comprehension_cells: &FxHashSet<NameId>,
         bound_names: FxHashSet<NameId>,
         needs_class_closure: bool,
         has_methods: bool,
@@ -225,7 +264,7 @@ impl<'source> Compiler<'source> {
     ) -> Self {
         let mut locals = comprehension_targets.to_vec();
         let fast_local_count = locals.len();
-        let mut cell_names = NameSet::default();
+        let mut cell_names: NameSet = comprehension_cells.iter().copied().collect();
         let temporary_indices = comprehension_targets
             .iter()
             .copied()
@@ -349,6 +388,26 @@ impl<'source> Compiler<'source> {
         }
         self.assembler.set_location(SourceLocation::new(0, 1, 0, 0));
         self.emit_resume(ResumeLocation::AT_FUNC_START, ResumeDepth::Zero)?;
+        // Match the deferred annotation function's visitation order, including suites
+        // omitted during lowering. Repeated cleanup visits require occurrence IDs,
+        // so those modules retain their existing sequential registration path.
+        if simple_module_annotations && !future_module_annotations {
+            let mut annotations = Vec::new();
+            collect_simple_annotations(body, &mut annotations);
+            for (index, annotation) in annotations.into_iter().enumerate() {
+                let index = to_u32(index, "module annotation index")?;
+                if self
+                    .unit
+                    .module_annotation_indices
+                    .insert(annotation.range, index)
+                    .is_some()
+                {
+                    self.unit.module_annotation_indices.clear();
+                    break;
+                }
+            }
+        }
+        let mut deferred_module_annotations = None;
         if module_annotations {
             self.name_index("__conditional_annotations__")?;
             if let Some(statement) = body.first() {
@@ -357,10 +416,16 @@ impl<'source> Compiler<'source> {
             }
             if !future_module_annotations {
                 if simple_module_annotations {
-                    let annotation_child = self.compile_module_annotations(body)?;
-                    self.emit_deferred_constant_before_return(Constant::Code(Box::new(
-                        annotation_child,
-                    )))?;
+                    self.apply_compiler_stack_effect(LOAD_CONST, 0, 1)?;
+                    let instruction = self.assembler.emit_placeholder_with_depth(
+                        LOAD_CONST,
+                        self.control.stack.depth.cast_unsigned(),
+                    );
+                    deferred_module_annotations = Some((
+                        instruction,
+                        self.output.deferred_constants_before_return.len(),
+                        body.as_slice(),
+                    ));
                     self.emit(MAKE_FUNCTION, 0, 0)?;
                     self.emit_deferred_store_name("__annotate__")?;
                 }
@@ -393,12 +458,22 @@ impl<'source> Compiler<'source> {
         let body_start = self.assembler.instruction_count();
         let add_implicit_return = !suite_terminates(body);
         self.compile_suite_inner(body, add_implicit_return)?;
+        if let Some((instruction, constant_position, annotation_body)) = deferred_module_annotations
+        {
+            // CPython lowers the deferred annotation thunk after the entire module body,
+            // although its setup instructions are placed in the module's initial block.
+            let annotation_child = self.compile_module_annotations(annotation_body)?;
+            self.output.deferred_constants_before_return.insert(
+                constant_position,
+                (instruction, Constant::Code(Box::new(annotation_child))),
+            );
+        }
         let add_implicit_return =
             add_implicit_return && !self.control.statements.emitted_fallthrough_return;
         if add_implicit_return
             && body
                 .last()
-                .is_some_and(statement_uses_implicit_return_location)
+                .is_some_and(terminal_statement_uses_implicit_return_location)
         {
             self.assembler.set_location(
                 self.source_location(implicit_return_range(&self, body.last().unwrap())),
@@ -442,7 +517,7 @@ impl<'source> Compiler<'source> {
         if add_implicit_return
             && body
                 .last()
-                .is_some_and(statement_uses_implicit_return_location)
+                .is_some_and(terminal_statement_uses_implicit_return_location)
         {
             self.assembler.set_location(
                 self.source_location(implicit_return_range(&self, body.last().unwrap())),
@@ -495,6 +570,8 @@ impl<'source> Compiler<'source> {
         self.emit_resume(ResumeLocation::AT_FUNC_START, ResumeDepth::Zero)?;
         self.load_name("__name__")?;
         self.store_name("__module__")?;
+        self.context
+            .record_constant_string_origin(&self.unit.qualified_name, true);
         let qualified_name =
             self.add_constant(Constant::String(self.unit.qualified_name.clone()))?;
         self.emit(LOAD_CONST, qualified_name, 1)?;
@@ -570,8 +647,12 @@ impl<'source> Compiler<'source> {
             && let Some(Stmt::Expr(expression)) = statement.body.last()
             && fold_constant(&expression.value).is_some()
         {
-            // CPython transfers the final folded expression's location to the class footer.
-            footer_location = self.source_location(expression.range);
+            if statement.elif_else_clauses.is_empty() {
+                // Without an exit jump, the footer inherits the final expression's location.
+                footer_location = self.source_location(expression.range);
+            }
+            // A discarded else leaves an exit jump to the originally unlocated footer.
+            // Keep it unlocated until exit copying transfers the predecessor's location.
         } else if self.assembler.instruction_count() > body_start
             && let Some(location) = self.assembler.last_instruction_location()
         {
@@ -660,29 +741,33 @@ impl<'source> Compiler<'source> {
             self.emit(LOAD_CONST, none, 1)?;
             self.emit(RETURN_VALUE, 0, -1)?;
         }
+        if matches!(&self.unit.scope, Scope::Class { .. }) {
+            // CPython first inlines unlocated class footers, then duplicates shared
+            // exits for conditional predecessors before propagating locations.
+            self.assembler.allow_last_no_location_block_inlining();
+        }
         if self.output.constants.is_empty()
             && !(self.unit.name == "<lambda>" && self.unit.flags & CO_GENERATOR != 0)
         {
             self.add_constant(Constant::None)?;
         }
         if let Some(start) = self.control.generators.generator_region_start {
+            self.assembler.record_exception_setup(start, false);
             let handler = self.assembler.label();
             self.assembler.mark(handler);
             let mut region_start = start;
             for (exclusion_start, exclusion_end) in
                 &self.control.generators.generator_region_exclusions
             {
-                self.assembler.add_exception_region(
+                self.assembler.add_stopiteration_exception_region(
                     region_start,
                     *exclusion_start,
                     handler,
-                    0,
-                    true,
                 );
                 region_start = *exclusion_end;
             }
             self.assembler
-                .add_exception_region(region_start, handler, handler, 0, true);
+                .add_stopiteration_exception_region(region_start, handler, handler);
             self.assembler.set_location(SourceLocation::NONE);
             self.set_depth(1);
             self.emit_unary_intrinsic(UnaryIntrinsic::STOPITERATION_ERROR)?;
@@ -696,10 +781,17 @@ impl<'source> Compiler<'source> {
             )));
         }
 
-        for (instruction, constant) in std::mem::take(&mut self.output.deferred_constants) {
+        self.output.first_flowgraph_constant = self.output.constants.len();
+        for (target, constant) in std::mem::take(&mut self.output.deferred_constants) {
             let index = self.add_constant(constant)?;
-            if let Some(instruction) = instruction {
-                self.assembler.patch_argument(instruction, index)?;
+            match target {
+                Some(DeferredConstantTarget::Instruction(instruction)) => {
+                    self.assembler.patch_argument(instruction, index)?;
+                }
+                Some(DeferredConstantTarget::DiscardedExpression(label)) => {
+                    self.assembler.record_discarded_fold_admission(label, index);
+                }
+                None => {}
             }
         }
         for (instruction, name) in std::mem::take(&mut self.output.deferred_names) {
@@ -751,7 +843,7 @@ impl<'source> Compiler<'source> {
                     };
                 argument_kind
                     | storage_kind
-                    | if self.is_hidden_id(*name) {
+                    | if storage_kind & CO_FAST_LOCAL != 0 && self.is_hidden_id(*name) {
                         CO_FAST_HIDDEN
                     } else {
                         0
@@ -779,7 +871,7 @@ impl<'source> Compiler<'source> {
             domain_len: filename_id
                 .checked_add(1)
                 .ok_or_else(|| CompileError::Internal("too many marshal metadata names".into()))?,
-            names: self.output.name_ids,
+            names: std::mem::take(&mut self.output.name_ids),
             locals: local_ids,
             filename: filename_id,
             name: interner.get(&self.unit.name).map(|id| id.0),
@@ -792,16 +884,21 @@ impl<'source> Compiler<'source> {
                 + u32::from(self.unit.flags & CO_VARKEYWORDS != 0),
         )
         .unwrap_or(usize::MAX);
+        let mut constants = InterningConstantTable {
+            output: &mut self.output,
+            context: &self.context,
+        };
         let AssembledCode {
             bytecode,
             line_table,
             exception_table,
             max_depth: assembled_max_depth,
             removed_max_depth,
-        } = self.assembler.finish_code(
+        } = self.assembler.finish_code_with_constants(
             self.unit.first_line_number,
             self.symbols.fast_local_count,
             parameter_count,
+            Some(&mut constants),
         )?;
         let max_depth = if removed_max_depth == Some(self.control.stack.max_depth)
             && assembled_max_depth < self.control.stack.max_depth
@@ -818,7 +915,13 @@ impl<'source> Compiler<'source> {
         } else {
             max_depth.max(1)
         };
-        let code = CodeObject {
+        let (parser_interned_strings, canonical_constant_strings) =
+            if matches!(self.unit.scope, Scope::Module) {
+                self.context.constant_string_provenance()
+            } else {
+                (FxHashSet::default(), FxHashSet::default())
+            };
+        let mut code = CodeObject {
             arg_count: self.unit.arg_count,
             positional_only_arg_count: self.unit.positional_only_arg_count,
             keyword_only_arg_count: self.unit.keyword_only_arg_count,
@@ -836,18 +939,31 @@ impl<'source> Compiler<'source> {
             line_table,
             exception_table,
             marshal_provenance: MarshalProvenance {
+                assembly_order: None,
+                interning_events: Vec::new(),
                 locals_identity: if self.unit.annotation_thunk {
                     LocalsIdentity::Fresh
                 } else {
                     LocalsIdentity::ByValue
                 },
                 explicitly_interned_strings: self.output.interned_constant_strings,
+                parser_interned_strings,
+                generated_mangled_strings: if matches!(self.unit.scope, Scope::Module) {
+                    self.context.generated_mangled_strings.clone()
+                } else {
+                    FxHashSet::default()
+                },
+                canonical_constant_strings,
                 qualified_name_constant_index: self.output.qualified_name_constant_index,
                 metadata_ids: Some(metadata_ids),
                 subtree_has_frozenset_constants: Some(self.output.has_frozenset_constants),
             },
         };
         code.validate()?;
+        code.marshal_provenance.assembly_order = self.context.record_code_assembly(&code);
+        if matches!(self.unit.scope, Scope::Module) {
+            code.marshal_provenance.interning_events = self.context.interning_events();
+        }
         Ok(code)
     }
 
@@ -900,11 +1016,14 @@ impl CodeUnit {
             child_qualified_name_parent: None,
             class_scope_is_nested: false,
             module_annotation_index: 0,
+            module_annotation_indices: FxHashMap::default(),
             class_conditional_annotations: VecDeque::new(),
             annotation_classdict_index: None,
             name: spec.name,
             qualified_name: spec.qualified_name,
             private_name: spec.private_name,
+            mangled_names: None,
+            pending_private_type_parameters: FxHashSet::default(),
             arg_count: spec.arg_count,
             positional_only_arg_count: spec.positional_only_arg_count,
             keyword_only_arg_count: spec.keyword_only_arg_count,

@@ -263,6 +263,12 @@ async def coroutine():
     }
 
     #[test]
+    fn matches_cpython_marshal_for_iterator_return_collector_lifetimes() {
+        let source = include_str!("fixtures/iterator_return_collector_lifetimes.py");
+        assert_matches_cpython_marshal(source, "iterator_return_collector_lifetimes.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_an_empty_module() {
         assert_matches_cpython_marshal("", "empty.py");
     }
@@ -1783,6 +1789,129 @@ def try_finally(values):
                 cleanup()
 ";
         assert_matches_cpython_marshal(source, "shared_artificial_loop_backedges.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_selected_try_else_loop_backedges() {
+        for (filename, source) in [
+            (
+                "backward_join_selected_try_else_conditional_following_call_control.py",
+                r#"def collect(rows, parse, output, report, ignore_errors, finish):
+    for kind, payload in rows:
+        if kind == "record":
+            try:
+                value = parse(payload)
+            except ValueError as error:
+                if not ignore_errors:
+                    raise error
+                report(payload)
+            else:
+                if value is not None:
+                    output.append(value)
+            finish()
+"#,
+            ),
+            (
+                "backward_join_selected_try_else_conditional_tail.py",
+                r#"def collect(rows, parse, output, report, ignore_errors, finish):
+    for kind, payload in rows:
+        if kind == "record":
+            try:
+                value = parse(payload)
+            except ValueError as error:
+                if not ignore_errors:
+                    raise error
+                report(payload)
+            else:
+                if value is not None:
+                    output.append(value)
+"#,
+            ),
+        ] {
+            assert_matches_cpython_marshal(source, filename);
+        }
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_try_else_elif_loop_backedges() {
+        for (filename, source) in [
+            (
+                "selected_try_else_elif_chained_backedge.py",
+                r#"def collect(rows, output):
+    for row in rows:
+        if row.enabled:
+            try:
+                low = float(row.low)
+                middle = float(row.middle)
+                high = float(row.high)
+            except ValueError:
+                output.append("invalid input")
+            else:
+                if not all(is_finite(value) for value in (low, middle, high)):
+                    output.append("nonfinite")
+                elif not low <= middle <= high:
+                    output.append("out of order")
+"#,
+            ),
+            (
+                "direct_try_else_elif_chained_backedge.py",
+                r#"def collect(rows, output):
+    for row in rows:
+        try:
+            low = float(row.low)
+            middle = float(row.middle)
+            high = float(row.high)
+        except ValueError:
+            output.append("invalid input")
+        else:
+            if not all(is_finite(value) for value in (low, middle, high)):
+                output.append("nonfinite")
+            elif not low <= middle <= high:
+                output.append("out of order")
+"#,
+            ),
+            (
+                "selected_try_else_elif_following_call_control.py",
+                r#"def collect(rows, output):
+    for row in rows:
+        if row.enabled:
+            try:
+                low = float(row.low)
+                middle = float(row.middle)
+                high = float(row.high)
+            except ValueError:
+                output.append("invalid input")
+            else:
+                if not all(is_finite(value) for value in (low, middle, high)):
+                    output.append("nonfinite")
+                elif not low <= middle <= high:
+                    output.append("out of order")
+            finish(row)
+"#,
+            ),
+            (
+                "selected_try_else_elif_final_else_control.py",
+                r#"def collect(rows, output):
+    for row in rows:
+        if row.enabled:
+            try:
+                low = float(row.low)
+                middle = float(row.middle)
+                high = float(row.high)
+            except ValueError:
+                output.append("invalid input")
+            else:
+                if not all(is_finite(value) for value in (low, middle, high)):
+                    output.append("nonfinite")
+                elif not low <= middle <= high:
+                    output.append("out of order")
+                else:
+                    output.append("accepted")
+"#,
+            ),
+        ] {
+            assert_matches_cpython_marshal(source, filename);
+        }
     }
 
     #[test]
@@ -5026,6 +5155,105 @@ def direct_assertion_control(items):
                 reject(item)
 ";
         assert_matches_cpython_marshal(source, "protected_loop_tail_first_branch_owners.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_async_comprehension_assignment_restores() {
+        for source in [
+            r"async def f(chunks, obj):
+    obj.value = [chunk async for chunk in chunks]
+    return obj
+",
+            r"async def f(chunks):
+    value = [chunk async for chunk in chunks]
+    return value
+",
+            r#"async def f(chunks, out):
+    out["value"] = [chunk async for chunk in chunks]
+    return out
+"#,
+            r"async def f(chunks):
+    chunk = [chunk async for chunk in chunks]
+    return chunk
+",
+            r"async def f(chunks):
+    value = (
+        [chunk async for chunk in chunks]
+    )
+    return value
+",
+            r"async def f(chunks):
+    value = [
+        chunk async for chunk in chunks
+    ]
+    return value
+",
+            r"async def f(chunks):
+    a = b = [chunk async for chunk in chunks]
+    return a, b
+",
+            r"async def f(chunks):
+    value, = [chunk async for chunk in chunks]
+    return value
+",
+            r"async def f(chunks):
+    [value] = [chunk async for chunk in chunks]
+    return value
+",
+            r"async def f(chunks):
+    global value
+    value = [chunk async for chunk in chunks]
+    return value
+",
+            r"def outer():
+    value = None
+    async def f(chunks):
+        nonlocal value
+        value = [chunk async for chunk in chunks]
+        return value
+    return f
+",
+            r"async def f(chunks):
+    value = [chunk async for chunk in chunks]
+    def read():
+        return value
+    return read
+",
+            r"async def f(chunks, obj):
+    obj.value = {chunk async for chunk in chunks}
+    return obj
+",
+            r"async def f(chunks, obj):
+    obj.value = {chunk: chunk async for chunk in chunks}
+    return obj
+",
+            r"async def f(chunks, obj):
+    obj.value = [chunk async for chunk in chunks]
+    yield obj
+",
+            r"async def f(chunks, obj):
+    try:
+        obj.value = [chunk async for chunk in chunks]
+    finally:
+        await obj.close()
+    return obj
+",
+            r"async def f(chunks):
+    a = [a async for a, b in chunks]
+    return a
+",
+            r"async def f(chunks):
+    inner = [[inner for inner in chunk] async for chunk in chunks]
+    return inner
+",
+            r"class C:
+    async def f(self, chunks):
+        __x = [__x async for __x in chunks]
+        return __x
+",
+        ] {
+            assert_matches_cpython_marshal(source, "async_comprehension_assignment.py");
+        }
     }
 
     #[test]
@@ -10629,9 +10857,10 @@ for function in (
 ):
     print(','.join(result_loads(function)))
 ";
+        assert_matches_cpython_marshal(source, "constant_loop_exit_shapes.py");
         assert_executes(
             source,
-            "LOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST_BORROW\nLOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST_BORROW\nLOAD_FAST,LOAD_FAST,LOAD_FAST,LOAD_FAST,LOAD_FAST,LOAD_FAST\nLOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST,LOAD_FAST,LOAD_FAST,LOAD_FAST,LOAD_FAST,LOAD_FAST\n",
+            "LOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST_BORROW\nLOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST_BORROW\nLOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST_BORROW\nLOAD_FAST_BORROW,LOAD_FAST_BORROW,LOAD_FAST,LOAD_FAST,LOAD_FAST,LOAD_FAST,LOAD_FAST,LOAD_FAST\n",
         );
     }
 
@@ -11008,7 +11237,7 @@ for function in (
 "#;
         assert_executes(
             source,
-            "LOAD_FAST_BORROW LOAD_FAST\nLOAD_FAST_BORROW LOAD_FAST\nLOAD_FAST LOAD_FAST\nLOAD_FAST_BORROW LOAD_FAST\nLOAD_FAST LOAD_FAST\nLOAD_FAST LOAD_FAST\nLOAD_FAST LOAD_FAST\nLOAD_FAST LOAD_FAST\nLOAD_FAST LOAD_FAST\n",
+            "LOAD_FAST_BORROW LOAD_FAST\nLOAD_FAST_BORROW LOAD_FAST\nLOAD_FAST LOAD_FAST\nLOAD_FAST_BORROW LOAD_FAST\nLOAD_FAST_BORROW LOAD_FAST\nLOAD_FAST LOAD_FAST\nLOAD_FAST LOAD_FAST\nLOAD_FAST LOAD_FAST\nLOAD_FAST LOAD_FAST\n",
         );
     }
 
@@ -11127,15 +11356,131 @@ def final_elif(action, first, second):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_post_try_fused_condition_owner() {
+        let source = include_str!("fixtures/async_post_try.py");
+        assert_matches_cpython_marshal(source, "async_post_try.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_post_try_coroutine_condition_owners() {
         let source = include_str!("fixtures/post_try_coroutine_condition_owners.py");
         assert_matches_cpython_marshal(source, "post_try_coroutine_condition_owners.py");
     }
 
     #[test]
+    fn matches_cpython_marshal_for_unpreserved_handler_enclosing_try_owners() {
+        let source = include_str!("fixtures/unpreserved_handler_enclosing_try_owners.py");
+        assert_matches_cpython_marshal(source, "unpreserved_handler_enclosing_try_owners.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_named_handler_enclosing_try_owners() {
+        let source = include_str!("fixtures/named_handler_enclosing_try_owners.py");
+        assert_matches_cpython_marshal(source, "named_handler_enclosing_try_owners.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_named_handler_finally_owner_slots() {
+        let source = include_str!("fixtures/named_handler_finally_owner_slots.py");
+        assert_matches_cpython_marshal(source, "named_handler_finally_owner_slots.py");
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_nested_handler_return_owners() {
         let source = include_str!("fixtures/nested_handler_return_owners.py");
         assert_matches_cpython_marshal(source, "nested_handler_return_owners.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_ordinary_try_handler_return_owners() {
+        let source = include_str!("fixtures/ordinary_try_handler_return_owners.py");
+        assert_matches_cpython_marshal(source, "ordinary_try_handler_return_owners.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_generator_two_handlers_in_ordinary_try_generator() {
+        let source = r"def f(value):
+    yield value
+    try:
+        prepare(value)
+        try:
+            first(value)
+        except FirstError:
+            try:
+                second(value)
+            except SecondError as error:
+                observe(error)
+                return None
+        return value
+    except OuterError:
+        return None
+";
+        assert_matches_cpython_marshal(source, "generator_inner_named_excluded.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_generator_two_handlers_in_ordinary_try_async_generator() {
+        let source = r"async def f(value):
+    yield value
+    try:
+        await prepare(value)
+        try:
+            first(value)
+        except FirstError:
+            try:
+                second(value)
+            except SecondError as error:
+                observe(error)
+                return
+        return
+    except OuterError:
+        return
+";
+        assert_matches_cpython_marshal(source, "async_generator_inner_named_excluded.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_two_named_handlers_inside_ordinary_try() {
+        let source = r"async def f(value):
+    try:
+        await prepare(value)
+        try:
+            first(value)
+        except FirstError as outer_error:
+            try:
+                second(value)
+            except SecondError as error:
+                observe(error)
+                return None
+        return value
+    except OuterError:
+        return None
+";
+        assert_matches_cpython_marshal(source, "coro_outer_named_excluded.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_coroutine_handler_return_through_older_iterator() {
+        let source = r"async def f(values):
+    try:
+        for value in values:
+            try:
+                first(value)
+            except FirstError:
+                try:
+                    return second(value)
+                except SecondError:
+                    observe(value)
+    except OuterError:
+        return None
+";
+        assert_matches_cpython_marshal(source, "coro_single_handler_iterator_excluded.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_manager_handler_enclosing_try_owners() {
+        let source = include_str!("fixtures/manager_handler_enclosing_try_owners.py");
+        assert_matches_cpython_marshal(source, "manager_handler_enclosing_try_owners.py");
     }
 
     #[test]
@@ -11244,6 +11589,22 @@ def final_elif(action, first, second):
     fn matches_cpython_marshal_for_sync_with_none_condition_owners() {
         let source = include_str!("fixtures/sync_with_none_condition_owners.py");
         assert_matches_cpython_marshal(source, "sync_with_none_condition_owners.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_async_setup_cleanup_bridges() {
+        for (filename, source) in [
+            (
+                "async_entry_five_sync_managers.py",
+                include_bytes!("fixtures/async_entry_five_sync_managers.py").as_slice(),
+            ),
+            (
+                "async_entry_fifteen_sync_managers.py",
+                include_bytes!("fixtures/async_entry_fifteen_sync_managers.py").as_slice(),
+            ),
+        ] {
+            assert_matches_cpython_marshal_bytes(source, filename);
+        }
     }
 
     #[test]
@@ -11704,6 +12065,96 @@ huge_negative_right_shift = -1 >> 999999999999999999999999999999999999999
             "def constant_loop():\n    for item in [{constants}]:\n        consume(item)\n\n\ndef dynamic_loop(value):\n    for item in [{dynamic}]:\n        consume(item)\n\n\ndef constant_contains(item):\n    return item in [{constants}]\n\n\ndef dynamic_contains(item, value):\n    return item in [{dynamic}]\n"
         );
         assert_matches_cpython_marshal(&source, "large_list_iterables.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_large_starred_collections() {
+        for length in [30, 31, 32] {
+            for starred_index in [0, 3, length - 1] {
+                for element in ["value", "1"] {
+                    let elements = (0..length)
+                        .map(|index| {
+                            if index == starred_index {
+                                "*items"
+                            } else {
+                                element
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let source = format!(
+                        "def build(value, items):\n    a = [{elements}]\n    b = ({elements},)\n    c = {{{elements}}}\n    return a, b, c\n"
+                    );
+                    assert_matches_cpython_marshal(&source, "large_starred_collections.py");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_large_constant_set_iterables() {
+        for length in [30, 31, 32] {
+            let elements = (0..length)
+                .map(|index| format!("'value{index}'"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let source = format!(
+                "def check(value):\n    present = value in {{{elements}}}\n    for item in {{{elements}}}:\n        consume(item)\n    return present\n"
+            );
+            assert_matches_cpython_marshal(&source, "large_constant_set_iterables.py");
+        }
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_large_unpacked_dictionaries() {
+        for length in [15, 16, 17, 18, 34] {
+            for unpack_index in [0, 15, length] {
+                let mut items = (0..length)
+                    .map(|index| format!("{index}: value"))
+                    .collect::<Vec<_>>();
+                items.insert(unpack_index, "**mapping".to_string());
+                let items = items.join(", ");
+                let source = format!("def build(value, mapping):\n    return {{{items}}}\n");
+                assert_matches_cpython_marshal(&source, "large_unpacked_dictionaries.py");
+            }
+        }
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_multiline_large_keyword_calls() {
+        for count in [15, 16, 17] {
+            for (prefix, suffix) in [
+                ("", ""),
+                ("        *args,\n", ""),
+                ("        **mapping,\n", ""),
+                ("", "        **mapping,\n"),
+            ] {
+                for callee in ["consume", "obj.method"] {
+                    let mut keywords = String::new();
+                    for index in 0..count {
+                        writeln!(&mut keywords, "        k{index}=value.attr,").unwrap();
+                    }
+                    let source = format!(
+                        "def f(consume, obj, value, args, mapping):\n    return outer({callee}(\n{prefix}{keywords}{suffix}    ))\n"
+                    );
+                    assert_matches_cpython_marshal(&source, "multiline_large_keyword_calls.py");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_large_keyword_call_conditional_returns() {
+        let keywords = (0..16)
+            .map(|index| format!("p{index}=value"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        for expression in ["make() if flag else None", "value if flag else make()"] {
+            let source = format!(
+                "def build(flag, value):\n    return construct({keywords}, final={expression})\n"
+            );
+            assert_matches_cpython_marshal(&source, "large_keyword_call_conditional_returns.py");
+        }
     }
 
     #[test]
@@ -12211,6 +12662,531 @@ def filled(action, self, mask, result):
     }
 
     #[test]
+    fn matches_cpython_marshal_for_copied_finally_outer_iterator() {
+        for (filename, source) in [
+            (
+                "outer_iterator_copied_return_none_target.py",
+                r#"async def run(items, resource):
+    for item in items:
+        try:
+            value = await obtain(item)
+            return finish(value).result
+        except Error as error:
+            if retry(error):
+                await pause()
+        finally:
+            if resource is not None:
+                close = getattr(resource, "close", None)
+                if close is not None:
+                    await close()
+"#,
+            ),
+            (
+                "outer_iterator_copied_return_none_no_call_control.py",
+                r#"async def run(items, resource):
+    for item in items:
+        try:
+            value = await obtain(item)
+            return value.result
+        except Error as error:
+            if retry(error):
+                await pause()
+        finally:
+            if resource is not None:
+                close = getattr(resource, "close", None)
+                if close is not None:
+                    await close()
+"#,
+            ),
+            (
+                "outer_iterator_copied_return_none_two_calls_control.py",
+                r#"async def run(items, resource):
+    for item in items:
+        try:
+            value = await obtain(item)
+            return finish(convert(value)).result
+        except Error as error:
+            if retry(error):
+                await pause()
+        finally:
+            if resource is not None:
+                close = getattr(resource, "close", None)
+                if close is not None:
+                    await close()
+"#,
+            ),
+            (
+                "outer_iterator_copied_return_none_sync_control.py",
+                r#"def run(items, resource):
+    for item in items:
+        try:
+            value = obtain(item)
+            return finish(value).result
+        except Error as error:
+            if retry(error):
+                pause()
+        finally:
+            if resource is not None:
+                close = getattr(resource, "close", None)
+                if close is not None:
+                    close()
+"#,
+            ),
+        ] {
+            assert_matches_cpython_marshal(source, filename);
+        }
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_copied_finally_outer_async_manager_membership() {
+        for (filename, source) in [
+            (
+                "membership_return_4_global_calls_target.py",
+                r#"async def run(manager, resource, result, selected):
+    async with manager:
+        try:
+            if selected:
+                tick()
+                tick()
+                tick()
+                tick()
+                return result
+            else:
+                return None
+        except Error as error:
+            report(error)
+            return None
+        finally:
+            if "resource" in locals():
+                try:
+                    await resource.close()
+                except Error:
+                    report_failure()
+"#,
+            ),
+            (
+                "membership_return_3_global_calls_upper_owned_control.py",
+                r#"async def run(manager, resource, result, selected):
+    async with manager:
+        try:
+            if selected:
+                tick()
+                tick()
+                tick()
+                return result
+            else:
+                return None
+        except Error as error:
+            report(error)
+            return None
+        finally:
+            if "resource" in locals():
+                try:
+                    await resource.close()
+                except Error:
+                    report_failure()
+"#,
+            ),
+            (
+                "membership_return_6_global_calls_lower_owned_control.py",
+                r#"async def run(manager, resource, result, selected):
+    async with manager:
+        try:
+            if selected:
+                tick()
+                tick()
+                tick()
+                tick()
+                tick()
+                tick()
+                return result
+            else:
+                return None
+        except Error as error:
+            report(error)
+            return None
+        finally:
+            if "resource" in locals():
+                try:
+                    await resource.close()
+                except Error:
+                    report_failure()
+"#,
+            ),
+        ] {
+            assert_matches_cpython_marshal(source, filename);
+        }
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_folded_value_borrow_boundaries() {
+        for (filename, source) in [
+            (
+                "folded_value_else_none_or_attribute.py",
+                r"def choose(flag, primary, fallback):
+    value = primary if flag else None or fallback.value
+    consume(value)
+",
+            ),
+            (
+                "folded_value_else_none_or_chain.py",
+                r"def choose(flag, primary, fallback):
+    value = primary if flag else None or fallback.value or default()
+    consume(value)
+",
+            ),
+            (
+                "folded_value_after_if_expression_join.py",
+                r"def choose(flag, enabled, tail):
+    value = build(select() if flag else other(), enabled=False or enabled)
+    consume(tail, value)
+",
+            ),
+            (
+                "folded_value_no_constant_control.py",
+                r"def choose(flag, primary, fallback):
+    value = primary if flag else fallback.value
+    consume(value)
+",
+            ),
+            (
+                "folded_value_nonempty_prefix_control.py",
+                r"def choose(flag, primary, prefix, fallback):
+    value = primary if flag else combine(prefix, None or fallback.value)
+    consume(value)
+",
+            ),
+        ] {
+            assert_matches_cpython_marshal(source, filename);
+        }
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_false_assert_handler_finalizers() {
+        for (filename, source) in [
+            (
+                "false_assert_handler_async.py",
+                r"async def run(resource, value):
+    result = None
+    try:
+        result = await resource.work(value)
+    except Error as error:
+        message = str(error)
+        report(message)
+        assert False
+    finally:
+        await resource.close()
+    return convert(result)
+",
+            ),
+            (
+                "false_assert_handler_sync_control.py",
+                r"def run(resource, value):
+    result = None
+    try:
+        result = resource.work(value)
+    except Error as error:
+        message = str(error)
+        report(message)
+        assert False
+    finally:
+        resource.close()
+    return convert(result)
+",
+            ),
+            (
+                "raise_handler_async_control.py",
+                r"async def run(resource, value):
+    result = None
+    try:
+        result = await resource.work(value)
+    except Error as error:
+        message = str(error)
+        report(message)
+        raise Error
+    finally:
+        await resource.close()
+    return convert(result)
+",
+            ),
+            (
+                "runtime_assert_handler_async_control.py",
+                r"async def run(resource, value):
+    result = None
+    try:
+        result = await resource.work(value)
+    except Error as error:
+        message = str(error)
+        report(message)
+        assert value
+    finally:
+        await resource.close()
+    return convert(result)
+",
+            ),
+        ] {
+            assert_matches_cpython_marshal(source, filename);
+        }
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_nested_terminal_handler_else() {
+        for (filename, source) in [
+            (
+                "nested_terminal_else_target.py",
+                r"def run(factory, first, second, value, consume):
+    try:
+        value = factory()
+    except Error:
+        if first:
+            value = {}
+        else:
+            if second:
+                value = {}
+            else:
+                raise
+    consume(value)
+    return value
+",
+            ),
+            (
+                "nested_terminal_else_suffix_control.py",
+                r"def run(factory, first, second, value, consume):
+    try:
+        value = factory()
+    except Error:
+        if first:
+            value = {}
+        else:
+            if second:
+                value = {}
+            else:
+                raise
+            consume(second)
+    consume(value)
+    return value
+",
+            ),
+        ] {
+            assert_matches_cpython_marshal(source, filename);
+        }
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_nested_handler_manager_arms() {
+        for (filename, source) in [
+            (
+                "nested_manager_arm_target.py",
+                r"def run(manager, other, flag, value, work):
+    try:
+        work(value)
+    except Error:
+        if flag:
+            with manager:
+                with other:
+                    work(value)
+        else:
+            work(value)
+    try:
+        work(value)
+    except Error:
+        pass
+    work(value)
+    return value
+",
+            ),
+            (
+                "nested_manager_arm_suffix_control.py",
+                r"def run(manager, other, flag, value, work):
+    try:
+        work(value)
+    except Error:
+        if flag:
+            with manager:
+                with other:
+                    work(value)
+            work(value)
+        else:
+            work(value)
+    try:
+        work(value)
+    except Error:
+        pass
+    work(value)
+    return value
+",
+            ),
+        ] {
+            assert_matches_cpython_marshal(source, filename);
+        }
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_worker_recovery_finally_cleanup() {
+        for (filename, source) in [
+            (
+                "async_conditional_recovery.py",
+                r"async def worker(queue, process):
+    while True:
+        item = await queue.get()
+        await prepare()
+        try:
+            if item is None:
+                return
+            try:
+                result = await process(item.value)
+            except Error as error:
+                if not item.done():
+                    item.set_error(error)
+            else:
+                if not item.done():
+                    item.set_result(result)
+        finally:
+            queue.task_done()
+",
+            ),
+            (
+                "sync_nested_recovery.py",
+                r#"def worker(queue, output, metric, logger, sentinel):
+    while True:
+        item = queue.get()
+        try:
+            if item is sentinel:
+                queue.put(sentinel)
+                return
+            try:
+                prepare(item)
+                result = item.convert()
+                output.put(result)
+            except Error:
+                logger.report(item)
+                try:
+                    metric.update(item)
+                except Error:
+                    logger.report("failed")
+        finally:
+            queue.task_done()
+"#,
+            ),
+            (
+                "async_populated_suffix_control.py",
+                r"async def worker(queue, process):
+    while True:
+        item = await queue.get()
+        await prepare()
+        try:
+            if item is None:
+                return
+            try:
+                result = await process(item.value)
+            except Error as error:
+                if not item.done():
+                    item.set_error(error)
+            else:
+                if not item.done():
+                    item.set_result(result)
+            record(item)
+        finally:
+            queue.task_done()
+",
+            ),
+            (
+                "sync_populated_suffix_control.py",
+                r#"def worker(queue, output, metric, logger, sentinel):
+    while True:
+        item = queue.get()
+        try:
+            if item is sentinel:
+                queue.put(sentinel)
+                return
+            try:
+                prepare(item)
+                result = item.convert()
+                output.put(result)
+            except Error:
+                logger.report(item)
+                try:
+                    metric.update(item)
+                except Error:
+                    logger.report("failed")
+            record(item)
+        finally:
+            queue.task_done()
+"#,
+            ),
+        ] {
+            assert_matches_cpython_marshal(source, filename);
+        }
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_protected_async_surviving_break() {
+        let source = r"async def run(manager, source, value):
+    async with manager:
+        try:
+            async for item in source:
+                if selected(item):
+                    break
+                consume(item)
+        except Error:
+            pass
+        consume(value)
+        consume(source)
+";
+        assert_matches_cpython_marshal(source, "protected_async_surviving_break_control.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_terminal_finally_while_controls() {
+        for (filename, source) in [
+            (
+                "finally_terminal_while_multi_false.py",
+                r"def run(service, release, clock):
+    try:
+        start(service)
+    finally:
+        release()
+        deadline = clock() + 2
+        while service.pending and clock() < deadline:
+            pause()
+    assert service.pending == {}
+",
+            ),
+            (
+                "finally_terminal_while_suffix_control.py",
+                r"def run(service, release, clock):
+    try:
+        start(service)
+    finally:
+        release()
+        deadline = clock() + 2
+        while service.pending and clock() < deadline:
+            pause()
+        complete()
+    assert service.pending == {}
+",
+            ),
+            (
+                "finally_terminal_while_break_control.py",
+                r"def run(service, release, clock):
+    try:
+        start(service)
+    finally:
+        release()
+        deadline = clock() + 2
+        while service.pending and clock() < deadline:
+            if stop():
+                break
+            pause()
+    assert service.pending == {}
+",
+            ),
+        ] {
+            assert_matches_cpython_marshal(source, filename);
+        }
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_copied_finally_prefix_owners() {
         let source = include_str!("fixtures/copied_finally_prefix_owners.py");
         assert_matches_cpython_marshal(source, "copied_finally_prefix_owners.py");
@@ -12274,6 +13250,54 @@ def filled(action, self, mask, result):
     fn matches_cpython_marshal_for_nested_iterator_tail_conditions() {
         let source = include_str!("fixtures/nested_iterator_tail_conditions.py");
         assert_matches_cpython_marshal(source, "nested_iterator_tail_conditions.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_async_iterator_manager_tail_break_owners() {
+        for (name, source) in [
+            (
+                "manager_tail_break_target.py",
+                include_str!("fixtures/borrow_finally_reachability/manager_tail_break_target.py"),
+            ),
+            (
+                "conditional_manager_break_control.py",
+                include_str!(
+                    "fixtures/borrow_finally_reachability/conditional_manager_break_control.py"
+                ),
+            ),
+            (
+                "manager_following_work_control.py",
+                include_str!(
+                    "fixtures/borrow_finally_reachability/manager_following_work_control.py"
+                ),
+            ),
+            (
+                "manager_small_return_control.py",
+                include_str!(
+                    "fixtures/borrow_finally_reachability/manager_small_return_control.py"
+                ),
+            ),
+        ] {
+            assert_matches_cpython_marshal(source, name);
+        }
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_generator_manager_recovery_owners() {
+        for (name, source) in [
+            (
+                "yield_manager_recovery_target.py",
+                include_str!(
+                    "fixtures/borrow_finally_reachability/yield_manager_recovery_target.py"
+                ),
+            ),
+            (
+                "yield_no_handler_control.py",
+                include_str!("fixtures/borrow_finally_reachability/yield_no_handler_control.py"),
+            ),
+        ] {
+            assert_matches_cpython_marshal(source, name);
+        }
     }
 
     #[test]
@@ -12796,5 +13820,556 @@ def generator(values, predicate):
     assert predicate(values)
 ";
         assert_matches_cpython_marshal(source, "linear_assert_conditions_and_fallbacks.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_normal_async_for_pop_lineage() {
+        let source = include_str!("fixtures/normal_async_for_pop_lineage.py");
+        assert_matches_cpython_marshal(source, "normal_async_for_pop_lineage.py");
+    }
+
+    #[test]
+    fn matches_cpython_marshal_for_folded_loop_with_pop_location() {
+        let source = include_str!("fixtures/folded_loop_with_pop_location.py");
+        assert_matches_cpython_marshal(source, "folded_loop_with_pop_location.py");
+    }
+}
+
+#[path = "compatibility_cases/handler_loop_continuation_locations.rs"]
+mod handler_loop_continuation_locations;
+
+#[path = "compatibility_cases/optimized_generator_join_owners.rs"]
+mod optimized_generator_join_owners;
+
+#[path = "compatibility_cases/optimized_boolean_backedge_owners.rs"]
+mod optimized_boolean_backedge_owners;
+
+#[path = "compatibility_cases/async_for_exhaustion_owners.rs"]
+mod async_for_exhaustion_owners;
+
+#[path = "compatibility_cases/terminal_and_while_tail.rs"]
+mod terminal_and_while_tail;
+
+#[path = "compatibility_cases/sourceless_try_body_exit.rs"]
+mod sourceless_try_body_exit;
+
+#[path = "compatibility_cases/copied_finally_continue_tail.rs"]
+mod copied_finally_continue_tail;
+
+#[path = "compatibility_cases/sourceless_try_else_exit.rs"]
+mod sourceless_try_else_exit;
+
+#[path = "compatibility_cases/for_body_owner_slots.rs"]
+mod for_body_owner_slots;
+
+#[path = "compatibility_cases/handler_continue_cleanup_owners.rs"]
+mod handler_continue_cleanup_owners;
+
+#[path = "compatibility_cases/shared_original_jump_aliases.rs"]
+mod shared_original_jump_aliases;
+
+#[path = "compatibility_cases/nested_async_terminal_conditionals.rs"]
+mod nested_async_terminal_conditionals;
+
+#[path = "compatibility_cases/original_empty_loop_backedge.rs"]
+mod original_empty_loop_backedge;
+
+#[path = "compatibility_cases/original_named_cleanup_join.rs"]
+mod original_named_cleanup_join;
+
+#[test]
+fn matches_cpython_name_returns_after_terminal_handlers_with_awaited_finally() {
+    for (source, filename) in [
+        (
+            r"async def run(channel, result):
+    try:
+        try:
+            await channel.work()
+        except Error as error:
+            raise convert(error) from error
+        return result
+    finally:
+        await channel.close()
+",
+            "awaited_finally_name_return.py",
+        ),
+        (
+            r"async def run(channel, result):
+    try:
+        try:
+            await channel.work()
+        except Error as error:
+            raise convert(error) from error
+        return result
+    finally:
+        channel.close()
+",
+            "synchronous_call_finally_name_return_control.py",
+        ),
+        (
+            r"async def run(channel, result):
+    try:
+        try:
+            await channel.work()
+        except Error as error:
+            raise convert(error) from error
+        return result
+    finally:
+        pass
+",
+            "pass_finally_name_return_control.py",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn matches_cpython_midbody_continue_recovery_borrow_exits() {
+    for (source, filename) in [
+        (
+            r#"def parse(source, decoder):
+    parsed_values = []
+    try:
+        parsed_values.append(decode(source))
+    except DecodeError:
+        index = 0
+        while True:
+            index = source.find("{", index)
+            if index == -1:
+                break
+            try:
+                parsed, end = decoder.read(source, index)
+            except DecodeError:
+                index += 1
+                continue
+            parsed_values.append(parsed)
+            index = end
+    for parsed in parsed_values:
+        result = convert(parsed)
+        if result is not None:
+            return result
+    return None
+"#,
+            "continue_recovery_while_target.py",
+        ),
+        (
+            r"def collect(options, value):
+    result = {}
+    try:
+        batches = initial(value)
+        for batch in batches:
+            merge(result, batch)
+    except Error:
+        for option in options:
+            try:
+                batches = retry(option, value)
+            except Error:
+                continue
+            for batch in batches:
+                merge(result, batch)
+    return [result[name] for name in sorted(result)]
+",
+            "continue_recovery_for_target.py",
+        ),
+        (
+            r"def collect(options, value):
+    result = {}
+    try:
+        batches = initial(value)
+        for batch in batches:
+            merge(result, batch)
+    except Error:
+        for option in options:
+            try:
+                batches = retry(option, value)
+            except Error:
+                batches = ()
+            for batch in batches:
+                merge(result, batch)
+    return [result[name] for name in sorted(result)]
+",
+            "continue_recovery_fallthrough_control.py",
+        ),
+        (
+            r"def collect(options, value):
+    result = {}
+    try:
+        batches = initial(value)
+        for batch in batches:
+            merge(result, batch)
+    except Error:
+        for option in options:
+            break
+            try:
+                batches = retry(option, value)
+            except Error:
+                continue
+            for batch in batches:
+                merge(result, batch)
+    return [result[name] for name in sorted(result)]
+",
+            "continue_recovery_dead_prefix_control.py",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn matches_cpython_folded_or_true_discarded_call_exits() {
+    for (source, filename) in [
+        (
+            r"def run(exists, write, read, cache, items, consume, force):
+    if not exists(cache) or True:
+        values = []
+        for item in items:
+            values.append(item)
+        write([(item,) for item in values], cache)
+    else:
+        values = [item for (item,) in read(cache)]
+    result = consume(values)
+    consume(cache, result, values)
+",
+            "folded_or_true_comprehension_call_tail.py",
+        ),
+        (
+            r"def run(exists, write, read, cache, items, consume, force):
+    if not exists(cache) or force:
+        values = []
+        for item in items:
+            values.append(item)
+        write([(item,) for item in values], cache)
+    else:
+        values = [item for (item,) in read(cache)]
+    result = consume(values)
+    consume(cache, result, values)
+",
+            "runtime_or_comprehension_call_tail_control.py",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn matches_cpython_name_returns_with_conditional_finalizers() {
+    for (source, filename) in [
+        (
+            r"def mutate(client, resource, credential, attempts):
+    try:
+        for attempt in range(attempts):
+            current = read(resource)
+            updated = normalize(current)
+            try:
+                write(resource, updated)
+            except (Conflict, AlreadyExists) as error:
+                last_error = error
+                continue
+            return updated
+        raise Failure from last_error
+    finally:
+        if resource is not None:
+            resource.close()
+",
+            "simple_existing_cleanup_control.py",
+        ),
+        (
+            r"def mutate(client, resource, credential, attempts):
+    try:
+        for attempt in range(attempts):
+            current = read(resource)
+            updated = normalize(current)
+            try:
+                write(resource, updated)
+            except (Conflict, AlreadyExists) as error:
+                last_error = error
+                continue
+            return updated
+        raise Failure from last_error
+    finally:
+        if resource is not None:
+            resource.close()
+            if credential is not None:
+                credential.close()
+",
+            "simple_test_nested_cleanup.py",
+        ),
+        (
+            r"def mutate(client, resource, credential, attempts):
+    try:
+        for attempt in range(attempts):
+            current = read(resource)
+            updated = normalize(current)
+            try:
+                write(resource, updated)
+            except (Conflict, AlreadyExists) as error:
+                last_error = error
+                continue
+            return updated
+        raise Failure from last_error
+    finally:
+        if False:
+            resource.close()
+            if credential is not None:
+                credential.close()
+",
+            "folded_false_cleanup_control.py",
+        ),
+        (
+            r"def mutate(client, resource, credential, attempts):
+    try:
+        for attempt in range(attempts):
+            current = read(resource)
+            updated = normalize(current)
+            try:
+                write(resource, updated)
+            except (Conflict, AlreadyExists) as error:
+                last_error = error
+                continue
+            return updated
+        raise Failure from last_error
+    finally:
+        if client is None and resource is not None:
+            resource.close()
+            if credential is not None:
+                credential.close()
+",
+            "compound_cleanup.py",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn matches_cpython_handler_retry_break_with_finalizer() {
+    let (source, filename) = (
+        r"def run(items, manager, value):
+    try:
+        work(value)
+    except OuterError:
+        error = None
+        for item in items:
+            prepare(item)
+            try:
+                retry(item, value)
+                error = None
+                break
+            except InnerError as caught:
+                error = caught
+            finally:
+                manager.finished(item)
+        if error is not None:
+            raise error
+    consume(value)
+",
+        "retry_finalizer_break_target.py",
+    );
+    common::assert_matches_cpython_marshal(source, filename);
+}
+
+#[test]
+fn matches_cpython_threaded_async_loop_exit_borrow_boundaries() {
+    for (source, filename) in [
+        (
+            r"async def run(manager, source, sink):
+    async with manager:
+        try:
+            try:
+                async for item in await source():
+                    break
+            except Error as error:
+                if bad(error) or worse(error):
+                    raise Wrapped(error) from error
+                record(error)
+            try:
+                await sink(source)
+            except Error:
+                pass
+        except Error:
+            recover(source)
+    consume(source)
+",
+            "protected_async_direct_break.py",
+        ),
+        (
+            r"async def run(manager, trace, source, value):
+    async with manager:
+        with trace:
+            matched = False
+            try:
+                async for item in source:
+                    if selected(item) and item.key == value:
+                        matched = True
+                        break
+            except (Error, OtherError):
+                pass
+            if not matched:
+                consume(value)
+            consume(source)
+",
+            "protected_async_terminal_conditional_break.py",
+        ),
+        (
+            r"async def run(manager, source, value):
+    async with manager:
+        try:
+            async for item in source:
+                if selected(item):
+                    break
+                consume(item)
+        except Error:
+            pass
+        consume(value)
+        consume(source)
+",
+            "protected_async_surviving_break_control.py",
+        ),
+        (
+            r"async def run(manager, source, value):
+    async with manager:
+        try:
+            async for item in source:
+                break
+        except Error:
+            pass
+        return value
+",
+            "protected_async_small_return_control.py",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn matches_cpython_located_conditional_finally_cleanup_owners() {
+    for (source, filename) in [
+        (
+            r"async def test(cm, proc):
+    with cm:
+        try:
+            await work()
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.communicate(timeout=5)
+                except TimeoutError:
+                    proc.kill()
+                    proc.communicate(timeout=5)
+",
+            "01_async_outer_with_guarded_try.py",
+        ),
+        (
+            r"async def test(cm, timeout, client):
+    with cm:
+        try:
+            await work()
+        except Exception as exc:
+            recover(exc)
+        finally:
+            if client is not None:
+                try:
+                    async with timeout:
+                        await client.cleanup()
+                except Exception as exc:
+                    recover(exc)
+",
+            "05_async_guarded_cleanup_async_with_try.py",
+        ),
+        (
+            r"async def test(cm, suppressor, task):
+    with cm:
+        try:
+            await work()
+        except Exception:
+            recover()
+            raise
+        finally:
+            if task is not None:
+                task.cancel()
+                with suppressor:
+                    await task
+    done()
+",
+            "06_async_guarded_with_await_cleanup.py",
+        ),
+        (
+            r"async def test(cm, second, lock, enabled):
+    with cm, second:
+        try:
+            await work()
+        except Exception as exc:
+            recover(exc)
+        finally:
+            flush()
+            if enabled:
+                with lock:
+                    collect()
+",
+            "07_async_two_outer_with_cleanup.py",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn matches_cpython_located_conditional_finally_owner_boundaries() {
+    for (source, filename) in [
+        (
+            r"async def test(proc):
+    try:
+        await work()
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.communicate(timeout=5)
+            except TimeoutError:
+                proc.kill()
+                proc.communicate(timeout=5)
+",
+            "03_async_without_outer_with_control.py",
+        ),
+        (
+            r"async def test(cm, enabled):
+    with cm:
+        try:
+            await work()
+        finally:
+            if enabled:
+                cleanup()
+",
+            "08_async_linear_conditional_cleanup_control.py",
+        ),
+        (
+            r"async def test(cm, lock, enabled):
+    async with cm:
+        try:
+            await work()
+        finally:
+            if enabled:
+                with lock:
+                    collect()
+",
+            "09_async_outer_async_with_control.py",
+        ),
+        (
+            r"def test(cm, lock, enabled):
+    with cm:
+        try:
+            yield work()
+        finally:
+            if enabled:
+                with lock:
+                    collect()
+",
+            "14_generator_guarded_cleanup_control.py",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
     }
 }

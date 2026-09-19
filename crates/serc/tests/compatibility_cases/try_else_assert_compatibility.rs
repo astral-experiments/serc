@@ -109,3 +109,56 @@ def nested_suite(value, flag):
 ";
     common::assert_matches_cpython_marshal(source, "try_else_assertion_exit_joins.py");
 }
+
+#[test]
+fn matches_cpython_assert_try_at_end_of_if_with_following_statement() {
+    let source = r"def f(enabled, value, recover, tail):
+    if enabled:
+        try:
+            assert value.ready
+        except Exception as error:
+            recover(error)
+    tail()
+";
+    common::assert_matches_cpython_marshal(source, "if_tail_try_assert.py");
+}
+
+#[test]
+fn matches_cpython_assert_try_at_end_of_else_with_following_statement() {
+    let source = r"def f(enabled, left, right, work, recover, tail):
+    if enabled:
+        work()
+    else:
+        try:
+            assert left and right
+        except Exception as error:
+            recover(error)
+    tail()
+";
+    common::assert_matches_cpython_marshal(source, "else_tail_try_assert_and.py");
+}
+
+#[test]
+fn retains_cpython_direct_try_assert_following_statement() {
+    let source = r"def f(value, recover, tail):
+    try:
+        assert value.ready
+    except Exception as error:
+        recover(error)
+    tail()
+";
+    common::assert_matches_cpython_marshal(source, "direct_try_assert_control.py");
+}
+
+#[test]
+fn retains_cpython_expression_try_at_end_of_if() {
+    let source = r"def f(enabled, work, recover, tail):
+    if enabled:
+        try:
+            work()
+        except Exception as error:
+            recover(error)
+    tail()
+";
+    common::assert_matches_cpython_marshal(source, "if_tail_try_expression_control.py");
+}

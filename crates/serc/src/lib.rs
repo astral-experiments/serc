@@ -7,6 +7,7 @@
 mod assembler;
 mod code_object;
 mod compiler;
+mod initial_intern_state;
 mod marshal;
 mod source;
 mod target;
@@ -16,6 +17,7 @@ use std::fmt;
 
 use code_object::{CodeObject, CodeObjectValidationError};
 use compiler::Compiler;
+pub use initial_intern_state::InitialInternState;
 use ruff_text_size::TextRange;
 pub use source::{SourceDecodeError, decode_source};
 
@@ -67,6 +69,7 @@ pub const CPYTHON_TARGET: CpythonTarget = CpythonTarget {
 #[derive(Clone, Debug)]
 pub struct CompiledModule {
     code: CodeObject,
+    initial_intern_state: InitialInternState,
 }
 
 impl CompiledModule {
@@ -77,7 +80,7 @@ impl CompiledModule {
 
     /// Marshal the module code object using CPython 3.14.5's format.
     pub fn marshal(&self) -> Vec<u8> {
-        marshal::encode_code(&self.code)
+        marshal::encode_code_with_intern_state(&self.code, &self.initial_intern_state)
     }
 
     /// Build a timestamp-invalidated CPython 3.14.5 `.pyc` file.
@@ -91,7 +94,11 @@ impl CompiledModule {
         output.extend_from_slice(&0_u32.to_le_bytes());
         output.extend_from_slice(&source_mtime.to_le_bytes());
         output.extend_from_slice(&source_size.to_le_bytes());
-        marshal::encode_code_into(&self.code, &mut output);
+        marshal::encode_code_into_with_intern_state(
+            &self.code,
+            &self.initial_intern_state,
+            &mut output,
+        );
         output
     }
 }
@@ -177,8 +184,20 @@ impl From<CodeObjectValidationError> for CompileError {
 
 /// Compile a Python module for CPython 3.14.5.
 pub fn compile(source: &str, filename: &str) -> Result<CompiledModule, CompileError> {
+    compile_with_intern_state(source, filename, &InitialInternState::default())
+}
+
+/// Compile a Python module with a fixed initial CPython string intern state.
+///
+/// The state is retained by the result for marshal and `.pyc` serialization. It does
+/// not execute source imports or accumulate interned strings across compilations.
+pub fn compile_with_intern_state(
+    source: &str,
+    filename: &str,
+    initial_intern_state: &InitialInternState,
+) -> Result<CompiledModule, CompileError> {
     let source = source::normalize_source(source);
-    compile_normalized(&source, filename)
+    compile_normalized(&source, filename, initial_intern_state)
 }
 
 /// Decode and compile Python source bytes for CPython 3.14.5.
@@ -186,11 +205,27 @@ pub fn compile(source: &str, filename: &str) -> Result<CompiledModule, CompileEr
 /// This function performs no filesystem I/O. See [`decode_source`] for the accepted source
 /// encoding and normalization behavior.
 pub fn compile_bytes(source: &[u8], filename: &str) -> Result<CompiledModule, CompileError> {
-    let source = decode_source(source).map_err(CompileError::Decode)?;
-    compile_normalized(&source, filename)
+    compile_bytes_with_intern_state(source, filename, &InitialInternState::default())
 }
 
-fn compile_normalized(source: &str, filename: &str) -> Result<CompiledModule, CompileError> {
+/// Decode and compile source bytes with a fixed initial CPython string intern state.
+///
+/// This function performs no filesystem I/O. The state has the same meaning as in
+/// [`compile_with_intern_state`].
+pub fn compile_bytes_with_intern_state(
+    source: &[u8],
+    filename: &str,
+    initial_intern_state: &InitialInternState,
+) -> Result<CompiledModule, CompileError> {
+    let source = decode_source(source).map_err(CompileError::Decode)?;
+    compile_normalized(&source, filename, initial_intern_state)
+}
+
+fn compile_normalized(
+    source: &str,
+    filename: &str,
+    initial_intern_state: &InitialInternState,
+) -> Result<CompiledModule, CompileError> {
     let options = ruff_python_parser::ParseOptions::from(ruff_python_parser::Mode::Module)
         .with_target_version(ruff_python_ast::PythonVersion::PY314);
     let parsed = ruff_python_parser::parse(source, options)
@@ -199,7 +234,10 @@ fn compile_normalized(source: &str, filename: &str) -> Result<CompiledModule, Co
         .ok_or_else(|| CompileError::Internal("parser did not return a module".to_string()))?;
     let code = Compiler::module(filename, source, parsed.tokens(), parsed.suite())
         .compile_module(parsed.suite())?;
-    Ok(CompiledModule { code })
+    Ok(CompiledModule {
+        code,
+        initial_intern_state: initial_intern_state.clone(),
+    })
 }
 
 /// Compile Python source bytes directly to a CPython 3.14.5 `.pyc` file.

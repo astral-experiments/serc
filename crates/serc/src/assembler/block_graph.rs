@@ -3,13 +3,13 @@ use std::ops::Index;
 use rustc_hash::FxHashSet;
 
 use crate::target::opcodes::{
-    JUMP_FORWARD, LOAD_FAST, LOAD_FAST_BORROW, LOAD_FAST_CHECK, LOAD_FAST_LOAD_FAST,
-    POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE, STORE_FAST, SWAP, TO_BOOL, UNARY_NOT,
+    LOAD_FAST, LOAD_FAST_BORROW, LOAD_FAST_CHECK, LOAD_FAST_LOAD_FAST, POP_JUMP_IF_FALSE,
+    POP_JUMP_IF_TRUE, STORE_FAST, SWAP, TO_BOOL, UNARY_NOT,
 };
 
 use super::{
     ExceptionRegion, Instruction, Item, Label, Operand, block_has_fallthrough, block_jump_target,
-    ends_scope,
+    ends_scope, is_unconditional_jump,
 };
 
 /// A stable handle to a basic block.
@@ -95,7 +95,10 @@ impl PipelineFeatures {
 
     fn record(&mut self, instruction: &Instruction) {
         self.0 |= match instruction.opcode {
-            JUMP_FORWARD if matches!(instruction.operand(), Operand::Forward(_)) => {
+            opcode
+                if is_unconditional_jump(opcode)
+                    && matches!(instruction.operand(), Operand::Forward(_)) =>
+            {
                 Self::FORWARD_JUMP
             }
             POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE
@@ -152,7 +155,7 @@ impl PipelineFeatures {
 /// `blocks` is an append-only arena and `order` is the current emission order.
 /// Keeping those concepts separate lets CFG passes reorder or duplicate blocks
 /// without invalidating identities captured by data-flow state.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct BlockGraph {
     blocks: Vec<BasicBlock>,
     order: Vec<BasicBlockId>,
@@ -450,6 +453,74 @@ impl BlockGraph {
         }
         self.order = order;
         self.rebuild_label_index();
+    }
+
+    /// Rejoins certified internal continuations without changing any instruction or label.
+    ///
+    /// The caller supplies original-array owner boundaries, never general CFG entries.
+    /// Validate every boundary before changing the graph; the surviving head keeps its ID.
+    pub(super) fn join_continuation_blocks(
+        &mut self,
+        labels: &[Label],
+        forbidden_entries: &FxHashSet<Label>,
+    ) -> Result<(), String> {
+        if labels.is_empty() {
+            return Ok(());
+        }
+        let internal = labels.iter().copied().collect::<FxHashSet<_>>();
+        if internal.len() != labels.len()
+            || labels.iter().any(|label| {
+                self.label_block(*label).is_none() || forbidden_entries.contains(label)
+            })
+            || self.iter_items().any(|item| {
+                matches!(item, Item::Instruction(instruction)
+                    if matches!(instruction.operand(), Operand::Forward(label) | Operand::Backward(label)
+                        if internal.contains(&label)))
+            })
+        {
+            return Err("original array continuation acquired a control-flow entry".into());
+        }
+        let mut join = Vec::with_capacity(self.order.len());
+        let mut found = FxHashSet::default();
+        for (position, block) in self.order.iter().copied().enumerate() {
+            let head = self[block]
+                .items()
+                .iter()
+                .map_while(|item| match item {
+                    Item::Label(label) => Some(*label),
+                    Item::Instruction(_) => None,
+                })
+                .collect::<Vec<_>>();
+            let continuation = head.iter().any(|label| internal.contains(label));
+            if continuation {
+                if position == 0
+                    || head.iter().any(|label| !internal.contains(label))
+                    || self[self.order[position - 1]].last_instruction().is_none()
+                    || !block_has_fallthrough(self[self.order[position - 1]].items())
+                {
+                    return Err("original array continuation lost its adjacent prefix".into());
+                }
+                found.extend(head);
+            }
+            join.push(continuation);
+        }
+        if found != internal {
+            return Err("original array continuation is not a normalized block head".into());
+        }
+        let old_order = std::mem::take(&mut self.order);
+        let mut order = Vec::with_capacity(old_order.len());
+        for (block, continuation) in old_order.into_iter().zip(join) {
+            if continuation {
+                let head: BasicBlockId = *order.last().expect("validated continuation prefix");
+                let items = std::mem::take(&mut self.blocks[block.index()].items);
+                self.blocks[head.index()].items.extend(items);
+            } else {
+                order.push(block);
+            }
+        }
+        self.order = order;
+        self.rebuild_label_index();
+        Ok(())
     }
 
     /// Returns whether normalization would preserve every physical block boundary.
@@ -898,6 +969,16 @@ impl BlockGraph {
         }
     }
 
+    /// Retains an erased CFG boundary until borrowed-load analysis finishes.
+    pub(super) fn mark_borrow_empty_block(&mut self, position: ItemPosition) {
+        let instruction = self
+            .instruction_mut(position)
+            .expect("borrow boundary instruction");
+        instruction.jump_policy.mark_borrow_empty_block();
+        let instruction = *instruction;
+        self.features.record(&instruction);
+    }
+
     pub(super) fn insert_item(&mut self, position: ItemPosition, item: Item) {
         debug_assert!(self.order.contains(&position.block));
         if let Item::Label(label) = item {
@@ -926,24 +1007,24 @@ impl BlockGraph {
             .filter_map(|region| {
                 let start = self.label_block(region.start)?;
                 let end = self.label_block(region.end)?;
+                let start_position = order_positions[start.index()];
+                let end_position = order_positions[end.index()];
+                // An empty protected body still has an original control-flow entry.
+                // Its handler is reachable only if that entry is reachable, including
+                // when a copied finally body has become dead before optimization.
                 Some((
-                    order_positions[start.index()],
-                    order_positions[end.index()],
+                    start_position,
+                    if start == end {
+                        start_position + 1
+                    } else {
+                        end_position
+                    },
                     self.label_block(region.target)?,
-                    start == end,
                 ))
             })
             .collect::<Vec<_>>();
         let mut pending = Vec::with_capacity(region_blocks.len().saturating_add(1));
         pending.push(entry);
-        region_blocks.retain(|(_, _, handler, empty)| {
-            if *empty {
-                pending.push(*handler);
-                false
-            } else {
-                true
-            }
-        });
         if region_blocks.len() <= 4 {
             while let Some(block) = pending.pop() {
                 if std::mem::replace(&mut reachable[block.index()], true) {
@@ -960,7 +1041,7 @@ impl BlockGraph {
                 {
                     pending.push(target);
                 }
-                region_blocks.retain(|(start, end, handler, _)| {
+                region_blocks.retain(|(start, end, handler)| {
                     let is_protected = *start <= position && position < *end;
                     if is_protected {
                         pending.push(*handler);
@@ -999,7 +1080,7 @@ impl BlockGraph {
                 reachable_prefix[position + 1] =
                     reachable_prefix[position] + usize::from(reachable[block.index()]);
             }
-            region_blocks.retain(|(start, end, handler, _)| {
+            region_blocks.retain(|(start, end, handler)| {
                 if *start < *end && reachable_prefix[*start] < reachable_prefix[*end] {
                     pending.push(*handler);
                     false

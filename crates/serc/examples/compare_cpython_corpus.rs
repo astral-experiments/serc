@@ -7,7 +7,17 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::Instant;
 
-use serc::{CPYTHON_TARGET, CompileError, compile, compile_bytes};
+use serc::{
+    CPYTHON_TARGET, CompileError, CompiledModule, InitialInternState, compile, compile_bytes,
+    compile_bytes_with_intern_state, compile_with_intern_state,
+};
+
+#[path = "support/initial_intern_profile.rs"]
+mod initial_intern_profile;
+#[path = "support/native_output_cache.rs"]
+mod native_output_cache;
+#[path = "support/native_output_reader.rs"]
+mod native_output_reader;
 use rayon::prelude::*;
 use walkdir::WalkDir;
 
@@ -130,6 +140,7 @@ struct Options {
     examples: usize,
     dump_mismatches: Option<PathBuf>,
     source_bytes: bool,
+    initial_intern_state: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -140,9 +151,42 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let read_config = env::var_os("SERC_NATIVE_CACHE_READ");
+    if read_config.is_some()
+        && (env::var_os("SERC_NATIVE_CACHE_WRITE").is_some()
+            || options.dump_mismatches.is_some()
+            || !options.source_bytes
+            || options.initial_intern_state.is_none())
+    {
+        eprintln!(
+            "native cache reading requires byte sources and an intern profile, and cannot combine writing or native mismatch dumping"
+        );
+        return ExitCode::from(2);
+    }
     if let Err(message) = verify_python(&options.python) {
         eprintln!("{message}");
         return ExitCode::from(2);
+    }
+    let profile = match options
+        .initial_intern_state
+        .as_deref()
+        .map(|path| {
+            initial_intern_profile::load(path, &options.python, options.source_bytes, ORACLE)
+        })
+        .transpose()
+    {
+        Ok(profile) => profile,
+        Err(error) => {
+            eprintln!("invalid initial intern-state profile: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let initial_intern_state = profile.as_ref().map(|profile| &profile.state);
+    if let Some(profile) = &profile {
+        println!(
+            "Initial intern-state snapshot: {} ({} entries; captured process state)",
+            profile.snapshot_sha256, profile.entries
+        );
     }
     let mut paths = match discover(&options.roots, &options.extensions) {
         Ok(paths) => paths,
@@ -168,6 +212,60 @@ fn main() -> ExitCode {
         paths.truncate(limit);
     }
 
+    let cache = match env::var_os("SERC_NATIVE_CACHE_WRITE") {
+        Some(config) => {
+            let Some(profile) = options
+                .initial_intern_state
+                .as_deref()
+                .filter(|_| options.source_bytes)
+            else {
+                eprintln!(
+                    "native output capture requires --source-bytes and --initial-intern-state"
+                );
+                return ExitCode::from(2);
+            };
+            match native_output_cache::Writer::new(
+                Path::new(&config),
+                profile,
+                &options.python,
+                ORACLE,
+                &paths,
+            ) {
+                Ok(writer) => Some(writer),
+                Err(error) => {
+                    eprintln!("failed to initialize native output capture: {error}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        None => None,
+    };
+
+    let reader = match read_config {
+        Some(config) => match native_output_reader::Reader::new(
+            Path::new(&config),
+            options
+                .initial_intern_state
+                .as_deref()
+                .expect("reader profile checked"),
+            &options.python,
+            ORACLE,
+            &paths,
+        ) {
+            Ok(reader) => {
+                println!(
+                    "Native oracle source: admitted cached bytes; every candidate is freshly compiled"
+                );
+                Some(reader)
+            }
+            Err(error) => {
+                eprintln!("failed to open admitted native cache: {error}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => None,
+    };
+
     let pool = match rayon::ThreadPoolBuilder::new()
         .stack_size(WORKER_STACK_SIZE)
         .build()
@@ -183,7 +281,24 @@ fn main() -> ExitCode {
     let outcomes: Vec<_> = pool.install(|| {
         paths
             .par_iter()
-            .map(|path| compare(path, &options.python, options.source_bytes))
+            .enumerate()
+            .map(|(index, path)| {
+                if let Some(reader) = &reader {
+                    return reader.compare(index, path, initial_intern_state);
+                }
+                let mut observation = cache.as_ref().map(|writer| writer.begin(index, path));
+                let outcome = compare(
+                    path,
+                    &options.python,
+                    options.source_bytes,
+                    initial_intern_state,
+                    observation.as_mut(),
+                );
+                if let Some(observation) = observation {
+                    observation.finish(&outcome);
+                }
+                outcome
+            })
             .collect()
     });
 
@@ -245,9 +360,13 @@ fn main() -> ExitCode {
     }
 
     if let Some(directory) = &options.dump_mismatches {
-        if let Err(error) =
-            dump_mismatches(&outcomes, &options.python, directory, options.source_bytes)
-        {
+        if let Err(error) = dump_mismatches(
+            &outcomes,
+            &options.python,
+            directory,
+            options.source_bytes,
+            initial_intern_state,
+        ) {
             eprintln!("failed to dump mismatches: {error}");
             return ExitCode::FAILURE;
         }
@@ -287,6 +406,18 @@ fn main() -> ExitCode {
     );
     for failure in &gate_failures {
         eprintln!("compatibility gate failed: {failure}");
+    }
+    if let Some(reader) = reader {
+        if let Err(error) = reader.finish(gate_failures.is_empty()) {
+            eprintln!("admitted native cache comparison failed: {error}");
+            return ExitCode::FAILURE;
+        }
+    }
+    if let Some(cache) = cache {
+        if let Err(error) = cache.finish(gate_failures.is_empty()) {
+            eprintln!("native output capture failed: {error}");
+            return ExitCode::FAILURE;
+        }
     }
     if gate_failures.is_empty() {
         ExitCode::SUCCESS
@@ -389,6 +520,7 @@ fn parse_options() -> Result<Options, String> {
     let mut examples = 10;
     let mut dump_mismatches = None;
     let mut source_bytes = false;
+    let mut initial_intern_state = None;
     let mut arguments = env::args().skip(1);
 
     while let Some(argument) = arguments.next() {
@@ -468,12 +600,20 @@ fn parse_options() -> Result<Options, String> {
                         "--dump-mismatches requires a directory".to_string()
                     })?));
             }
+            "--initial-intern-state" => {
+                let path = arguments
+                    .next()
+                    .ok_or_else(|| "--initial-intern-state requires a profile file".to_string())?;
+                if initial_intern_state.replace(PathBuf::from(path)).is_some() {
+                    return Err("--initial-intern-state may only be specified once".to_string());
+                }
+            }
             "--require-all" => require_all = true,
             "--require-rejection-parity" => require_rejection_parity = true,
             "--source-bytes" => source_bytes = true,
             "--help" | "-h" => {
                 return Err(
-                    "usage: compare_cpython_corpus [--python PATH] [--extension EXT] [--source-bytes] [--limit N] [--expected-files N] [--expected-exact N] [--expected-cpython-rejected N] [--examples N] [--require-all] [--require-rejection-parity] [--dump-mismatches DIR] [ROOT ...]"
+                    "usage: compare_cpython_corpus [--python PATH] [--extension EXT] [--source-bytes] [--initial-intern-state PROFILE.json] [--limit N] [--expected-files N] [--expected-exact N] [--expected-cpython-rejected N] [--examples N] [--require-all] [--require-rejection-parity] [--dump-mismatches DIR] [ROOT ...]"
                         .to_string(),
                 );
             }
@@ -511,6 +651,7 @@ fn parse_options() -> Result<Options, String> {
         examples,
         dump_mismatches,
         source_bytes,
+        initial_intern_state,
     })
 }
 
@@ -556,6 +697,7 @@ fn dump_mismatches(
     python: &str,
     directory: &Path,
     source_bytes: bool,
+    initial_intern_state: Option<&InitialInternState>,
 ) -> Result<(), std::io::Error> {
     fs_err::create_dir_all(directory)?;
     outcomes
@@ -569,12 +711,9 @@ fn dump_mismatches(
                 CompilerInput::Text(fs_err::read_to_string(&outcome.path)?)
             };
             let filename = outcome.path.to_string_lossy();
-            let ours = match &source {
-                CompilerInput::Bytes(source) => compile_bytes(source, &filename),
-                CompilerInput::Text(source) => compile(source, &filename),
-            }
-            .expect("a mismatch compiled successfully in the first pass")
-            .marshal();
+            let ours = compile_module_input(&source, &filename, initial_intern_state)
+                .expect("a mismatch compiled successfully in the first pass")
+                .marshal();
             let oracle = Command::new(python)
                 .args(["-I", "-S", "-c", ORACLE])
                 .arg(&outcome.path)
@@ -610,12 +749,21 @@ fn discover(roots: &[PathBuf], extensions: &[String]) -> Result<Vec<PathBuf>, St
     Ok(paths)
 }
 
-fn compare(path: &Path, python: &str, source_bytes: bool) -> Outcome {
-    let oracle = match Command::new(python)
+fn compare(
+    path: &Path,
+    python: &str,
+    source_bytes: bool,
+    initial_intern_state: Option<&InitialInternState>,
+    mut observation: Option<&mut native_output_cache::Observation<'_>>,
+) -> Outcome {
+    let output = Command::new(python)
         .args(["-I", "-S", "-c", ORACLE])
         .arg(path)
-        .output()
-    {
+        .output();
+    if let Some(observation) = &mut observation {
+        observation.native(&output);
+    }
+    let oracle = match output {
         Ok(output) if output.status.success() => OracleOutcome::Compiled(output.stdout),
         Ok(output) if output.status.code() == Some(2) => {
             OracleOutcome::Rejected(one_line(&output.stderr))
@@ -669,18 +817,38 @@ fn compare(path: &Path, python: &str, source_bytes: bool) -> Outcome {
     };
 
     let filename = path.to_string_lossy();
-    let compiled = compile_input(&source, &filename);
+    let compiled = compile_input(&source, &filename, initial_intern_state);
+    if let Some(observation) = observation {
+        observation.compiled(&source, &compiled);
+    }
 
     classify(path, oracle, compiled)
 }
 
-fn compile_input(source: &CompilerInput, filename: &str) -> CompilerOutcome {
-    capture_compiler(|| {
-        match source {
-            CompilerInput::Bytes(source) => compile_bytes(source, filename),
-            CompilerInput::Text(source) => compile(source, filename),
+fn compile_module_input(
+    source: &CompilerInput,
+    filename: &str,
+    initial_intern_state: Option<&InitialInternState>,
+) -> Result<CompiledModule, CompileError> {
+    match (source, initial_intern_state) {
+        (CompilerInput::Bytes(source), Some(state)) => {
+            compile_bytes_with_intern_state(source, filename, state)
         }
-        .map(|module| module.marshal())
+        (CompilerInput::Text(source), Some(state)) => {
+            compile_with_intern_state(source, filename, state)
+        }
+        (CompilerInput::Bytes(source), None) => compile_bytes(source, filename),
+        (CompilerInput::Text(source), None) => compile(source, filename),
+    }
+}
+
+fn compile_input(
+    source: &CompilerInput,
+    filename: &str,
+    initial_intern_state: Option<&InitialInternState>,
+) -> CompilerOutcome {
+    capture_compiler(|| {
+        compile_module_input(source, filename, initial_intern_state).map(|module| module.marshal())
     })
 }
 
@@ -784,11 +952,81 @@ fn one_line(bytes: &[u8]) -> String {
 mod tests {
     use super::{
         CompilerInput, CompilerOutcome, ORACLE, OracleOutcome, OutcomeKind, capture_compiler,
-        classify, compile_input, discover, validate_outcome_counts,
+        classify, compile_input, compile_module_input, discover, validate_outcome_counts,
     };
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::Path;
+
+    #[cfg(unix)]
+    #[test]
+    fn mismatch_dumps_reuse_the_explicit_state_for_both_input_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let oracle = directory.path().join("oracle");
+        fs::write(&oracle, "#!/bin/sh\nprintf 'oracle bytes'\n").unwrap();
+        fs::set_permissions(&oracle, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.path().join("source.py");
+        let source = "f = lambda x: x in {'profile_specific_identifier', 'z'}\nx in {'profile_specific_identifier', 'z'}\n";
+        fs::write(&path, source).unwrap();
+        let state = serc::InitialInternState::new(["profile_specific_identifier"]);
+        let expected = serc::compile_with_intern_state(source, path.to_str().unwrap(), &state)
+            .unwrap()
+            .marshal();
+        let outcomes = [super::Outcome {
+            path,
+            kind: OutcomeKind::ByteMismatch,
+            detail: String::new(),
+            oracle_rejected: false,
+        }];
+        for source_bytes in [false, true] {
+            let dump = directory
+                .path()
+                .join(if source_bytes { "bytes" } else { "text" });
+            super::dump_mismatches(
+                &outcomes,
+                oracle.to_str().unwrap(),
+                &dump,
+                source_bytes,
+                Some(&state),
+            )
+            .unwrap();
+            assert_eq!(fs::read(dump.join("0000.ours.marshal")).unwrap(), expected);
+            assert_eq!(
+                fs::read(dump.join("0000.cpython.marshal")).unwrap(),
+                b"oracle bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_state_reaches_both_input_modes_and_default_stays_unchanged() {
+        let source = "f = lambda x: x in {'profile_specific_identifier', 'z'}\nx in {'profile_specific_identifier', 'z'}\n";
+        let state = serc::InitialInternState::new(["profile_specific_identifier"]);
+        for input in [
+            CompilerInput::Text(source.to_string()),
+            CompilerInput::Bytes(source.as_bytes().to_vec()),
+        ] {
+            let default = compile_module_input(&input, "profile.py", None)
+                .unwrap()
+                .marshal();
+            let supplied = compile_module_input(&input, "profile.py", Some(&state))
+                .unwrap()
+                .marshal();
+            assert_eq!(
+                default,
+                serc::compile(source, "profile.py").unwrap().marshal()
+            );
+            assert_eq!(
+                supplied,
+                serc::compile_with_intern_state(source, "profile.py", &state)
+                    .unwrap()
+                    .marshal()
+            );
+            assert_ne!(default, supplied);
+        }
+    }
 
     #[test]
     fn require_all_rejects_a_corpus_without_exact_matches() {
@@ -824,7 +1062,7 @@ mod tests {
             CompilerInput::Text("if:\n".to_string()),
             CompilerInput::Bytes(b"if:\n".to_vec()),
         ] {
-            let compiled = compile_input(&source, "invalid.py");
+            let compiled = compile_input(&source, "invalid.py", None);
             let outcome = classify(
                 Path::new("invalid.py"),
                 OracleOutcome::Rejected("SyntaxError: invalid syntax".to_string()),
@@ -839,7 +1077,11 @@ mod tests {
 
     #[test]
     fn cpython_semantic_rejection_requires_serc_rejection() {
-        let compiled = compile_input(&CompilerInput::Text("return\n".to_string()), "invalid.py");
+        let compiled = compile_input(
+            &CompilerInput::Text("return\n".to_string()),
+            "invalid.py",
+            None,
+        );
         let outcome = classify(
             Path::new("invalid.py"),
             OracleOutcome::Rejected("SyntaxError: 'return' outside function".to_string()),
@@ -857,7 +1099,7 @@ mod tests {
             CompilerInput::Text("pass\n".to_string()),
             CompilerInput::Bytes(b"pass\n".to_vec()),
         ] {
-            let compiled = compile_input(&source, "valid.py");
+            let compiled = compile_input(&source, "valid.py", None);
             let outcome = classify(
                 Path::new("valid.py"),
                 OracleOutcome::Rejected("SyntaxError: invalid syntax".to_string()),

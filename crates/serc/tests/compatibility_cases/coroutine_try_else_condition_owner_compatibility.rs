@@ -160,6 +160,33 @@ async def async_with_in_try(user_input, manager, validate):
     return errors
 
 
+async def embedded_await_in_try(value, validate):
+    errors = {}
+    result = None
+    try:
+        result = [await validate(value)]
+    except ValueError:
+        errors["error"] = True
+    else:
+        if not result:
+            errors["empty"] = True
+    return errors
+
+
+async def retained_async_iterator_exit(values, validate):
+    errors = {}
+    result = None
+    try:
+        async for item in values:
+            result = validate(item)
+    except ValueError:
+        errors["error"] = True
+    else:
+        if not result:
+            errors["empty"] = True
+    return errors
+
+
 async def terminal_return_body(user_input, validate):
     errors = {}
     try:

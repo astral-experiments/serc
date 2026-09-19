@@ -40,7 +40,7 @@ const SHADOWED_SUPER_SENTINEL: &str = "\0shadowed super";
 // `_PY_STACK_USE_GUIDELINE` elements.
 const CPYTHON_STACK_USE_GUIDELINE: usize = 30;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum Scope {
     Module,
     Class {

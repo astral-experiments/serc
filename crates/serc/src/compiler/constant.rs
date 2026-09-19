@@ -13,7 +13,7 @@ use smallvec::SmallVec;
 
 use super::{LOAD_CONST, LOAD_SMALL_INT, NOP, STORE_NAME};
 use crate::CompileError;
-use crate::assembler::OperandPatchId;
+use crate::assembler::{Label, OperandPatchId};
 use crate::target::operands::Conversion;
 
 use super::Compiler;
@@ -240,7 +240,9 @@ pub(super) struct OutputState {
     pub(super) constants: ConstantPool,
     pub(super) has_deferred_break_none: bool,
     pub(super) deferred_constants_before_return: Vec<(OperandPatchId, Constant)>,
-    pub(super) deferred_constants: Vec<(Option<OperandPatchId>, Constant)>,
+    pub(super) deferred_constants: Vec<(Option<DeferredConstantTarget>, Constant)>,
+    pub(super) folded_constant_dependencies: Vec<(Constant, Vec<Constant>)>,
+    pub(super) has_untracked_discarded_collection: bool,
     pub(super) deferred_names: Vec<(OperandPatchId, String)>,
     pub(super) names: Vec<String>,
     pub(super) name_ids: Vec<u32>,
@@ -248,6 +250,144 @@ pub(super) struct OutputState {
     pub(super) interned_constant_strings: FxHashSet<String>,
     pub(super) qualified_name_constant_index: Option<u32>,
     pub(super) has_frozenset_constants: bool,
+    pub(super) first_flowgraph_constant: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) enum DeferredConstantTarget {
+    Instruction(OperandPatchId),
+    DiscardedExpression(Label),
+}
+
+impl crate::assembler::ConstantTable for OutputState {
+    fn get(&self, index: u32) -> &Constant {
+        &self.constants.values[index as usize]
+    }
+
+    fn intern(&mut self, constant: Constant) -> Result<u32, CompileError> {
+        self.constants.intern(constant)
+    }
+
+    fn len(&self) -> usize {
+        self.constants.len()
+    }
+
+    fn retain_used(&mut self, used: &[bool], order: &[u32]) -> Vec<Option<u32>> {
+        fn append_folded_dependencies(
+            constant: &Constant,
+            pool: &ConstantPool,
+            dependencies: &[(Constant, Vec<Constant>)],
+            first_deferred: usize,
+            used: &[bool],
+            seen: &mut [bool],
+            order: &mut Vec<u32>,
+        ) {
+            if let Some((_, operands)) = dependencies
+                .iter()
+                .find(|(result, _)| ConstantEquality::PoolKey.equal(result, constant))
+            {
+                for operand in operands {
+                    append_folded_dependencies(
+                        operand,
+                        pool,
+                        dependencies,
+                        first_deferred,
+                        used,
+                        seen,
+                        order,
+                    );
+                }
+            }
+            if let Constant::Tuple(elements) = constant {
+                for element in elements {
+                    append_folded_dependencies(
+                        element,
+                        pool,
+                        dependencies,
+                        first_deferred,
+                        used,
+                        seen,
+                        order,
+                    );
+                }
+            }
+            let index = if let Some(indices) = &pool.indices {
+                indices
+                    .find(&pool.values, constant, constant_pool_fingerprint(constant))
+                    .map(|index| index as usize)
+            } else {
+                pool.values
+                    .iter()
+                    .position(|value| ConstantEquality::PoolKey.equal(value, constant))
+            };
+            if let Some(index) = index
+                && index >= first_deferred
+                && used[index]
+                && !seen[index]
+            {
+                seen[index] = true;
+                order.push(u32::try_from(index).expect("constant index fits in u32"));
+            }
+        }
+
+        if self.has_untracked_discarded_collection {
+            // Copying a discarded runtime collection can create constants absent from
+            // the source-fold reservations, so their relative admissions remain unknown.
+            self.folded_constant_dependencies
+                .retain(|(result, _)| !matches!(result, Constant::FrozenSet(_)));
+        }
+        // Folded values are created after their operands, even when their first surviving
+        // load precedes the operands' later loads. Preserve those dependencies while
+        // allowing independent constants to follow the copied block order.
+        let mut construction_order = Vec::with_capacity(order.len());
+        let mut seen = vec![false; self.constants.len()];
+        for index in order {
+            if seen[*index as usize] {
+                continue;
+            }
+            append_folded_dependencies(
+                &self.constants.values[*index as usize],
+                &self.constants,
+                &self.folded_constant_dependencies,
+                self.first_flowgraph_constant,
+                used,
+                &mut seen,
+                &mut construction_order,
+            );
+            if !seen[*index as usize] {
+                seen[*index as usize] = true;
+                construction_order.push(*index);
+            }
+        }
+        // Code generation reserves literals first; flowgraph-created constants then follow
+        // basic-block order. Late exit folding must interleave with front-folded constants.
+        let mut values = std::mem::take(&mut self.constants.values)
+            .into_iter()
+            .map(Some)
+            .collect::<Vec<_>>();
+        self.constants.indices = None;
+        let mut index_map = vec![None; values.len()];
+        for index in (0..self.first_flowgraph_constant)
+            .filter(|index| *index == 0 || used[*index])
+            .chain(
+                construction_order
+                    .iter()
+                    .map(|index| *index as usize)
+                    .filter(|index| *index >= self.first_flowgraph_constant),
+            )
+        {
+            if let Some(value) = values[index].take() {
+                index_map[index] = Some(
+                    u32::try_from(self.constants.values.len()).expect("constant index fits in u32"),
+                );
+                self.constants.values.push(value);
+            }
+        }
+        self.qualified_name_constant_index = self
+            .qualified_name_constant_index
+            .and_then(|index| index_map[index as usize]);
+        index_map
+    }
 }
 
 impl Compiler<'_> {
@@ -280,7 +420,40 @@ impl Compiler<'_> {
             self.emit_deferred_constant(constant)?;
         }
         self.assembler
-            .add_last_hidden_exception_owner_slots(hidden_owner_slots);
+            .add_last_constant_fold_slots(hidden_owner_slots);
+        // Literal tuple elements, including prebuilt constant slices, each remove
+        // one load from this owner's block when the tuple is folded.
+        if let Expr::Tuple(tuple) = expression
+            && tuple.elts.iter().all(|element| {
+                matches!(
+                    element,
+                    Expr::NoneLiteral(_)
+                        | Expr::BooleanLiteral(_)
+                        | Expr::NumberLiteral(_)
+                        | Expr::StringLiteral(_)
+                        | Expr::BytesLiteral(_)
+                        | Expr::EllipsisLiteral(_)
+                ) || matches!(element, Expr::Slice(slice) if constant_slice(slice).is_some())
+            })
+        {
+            self.assembler
+                .record_last_uniform_fold_owner_slots(tuple.elts.len());
+        } else if matches!(expression, Expr::UnaryOp(unary)
+            if unary.op == UnaryOp::USub
+                && matches!(unary.operand.as_ref(), Expr::NumberLiteral(_)))
+        {
+            // Numeric negation removes its adjacent, equally owned literal load.
+            self.assembler.record_last_uniform_fold_owner_slots(1);
+        } else if matches!(expression, Expr::BinOp(_))
+            && is_literal_binary_tree(expression)
+            && self.source_location(expression.range()).line
+                == self.source_location(expression.range()).end_line
+        {
+            // Each folded binary operation removes two adjacent literal loads. A single
+            // source line keeps all nested operands in the same owner without line NOPs.
+            self.assembler
+                .record_last_uniform_fold_owner_slots(hidden_owner_slots);
+        }
         Ok(())
     }
 
@@ -318,7 +491,67 @@ impl Compiler<'_> {
             Expr::UnaryOp(unary) => self.record_folded_value(&unary.operand)?,
             _ => {}
         }
+        let operands: Vec<_> = match expression {
+            Expr::BinOp(binary) => [&*binary.left, &*binary.right]
+                .into_iter()
+                .filter_map(fold_constant)
+                .collect(),
+            Expr::UnaryOp(unary) => fold_constant(&unary.operand).into_iter().collect(),
+            Expr::Subscript(subscript) => [&*subscript.value, &*subscript.slice]
+                .into_iter()
+                .filter_map(fold_constant)
+                .collect(),
+            _ => Vec::new(),
+        };
+        if !operands.is_empty()
+            && let Some(result) = fold_constant(expression)
+        {
+            self.record_folded_constant_dependencies(&result, operands);
+        }
         Ok(())
+    }
+
+    /// Retains the operands used for a constant's first flowgraph construction.
+    pub(super) fn record_folded_constant_dependencies(
+        &mut self,
+        result: &Constant,
+        mut operands: Vec<Constant>,
+    ) {
+        if matches!(result, Constant::FrozenSet(_)) {
+            // Cached operands retain their earlier construction order, including folds
+            // from discarded branches preceding this set display.
+            operands.sort_by_cached_key(|operand| {
+                self.output
+                    .constants
+                    .values
+                    .iter()
+                    .chain(
+                        self.output
+                            .deferred_constants
+                            .iter()
+                            .map(|(_, value)| value),
+                    )
+                    .position(|value| ConstantEquality::PoolKey.equal(value, operand))
+                    .unwrap_or(usize::MAX)
+            });
+        }
+        let already_reserved = self
+            .output
+            .constants
+            .values
+            .iter()
+            .chain(
+                self.output
+                    .deferred_constants
+                    .iter()
+                    .map(|(_, constant)| constant),
+            )
+            .any(|constant| ConstantEquality::PoolKey.equal(constant, result));
+        if !already_reserved {
+            self.output
+                .folded_constant_dependencies
+                .push((result.clone(), operands));
+        }
     }
 
     /// Emits operand-load residue retained when CPython's flowgraph folds a tuple containing
@@ -362,9 +595,21 @@ impl Compiler<'_> {
             self.add_constant(Constant::Bool(true))?;
             return Ok(());
         }
-        if matches!(expression, Expr::FString(_))
-            && let Some(constant) = fold_constant(expression)
+        if let Expr::FString(fstring) = expression
+            && fold_constant(expression).is_some()
         {
+            let constant = match super::expression::fstring_components(fstring, self.context.source)
+                .into_iter()
+                .next()
+            {
+                Some(super::expression::InterpolatedStringComponent::Literal(literal)) => {
+                    literal.into_constant()
+                }
+                None => Constant::String(String::new()),
+                Some(super::expression::InterpolatedStringComponent::Interpolation(_, _)) => {
+                    unreachable!("a folded f-string has no interpolated expressions")
+                }
+            };
             self.add_constant(constant)?;
             return Ok(());
         }
@@ -408,13 +653,16 @@ impl Compiler<'_> {
         name: &str,
         name_id: NameId,
     ) -> Result<u32, CompileError> {
-        let name = self
+        let name = if self
             .unit
-            .private_name
-            .as_deref()
-            .map_or(Cow::Borrowed(name), |private_name| {
-                mangle_name(name, Some(private_name))
-            });
+            .mangled_names
+            .as_ref()
+            .is_some_and(|names| !names.contains(name))
+        {
+            Cow::Borrowed(name)
+        } else {
+            mangle_name(name, self.unit.private_name.as_deref())
+        };
         let name_id = match &name {
             Cow::Borrowed(_) => name_id,
             Cow::Owned(name) => self.required_name_id(name),
@@ -443,6 +691,8 @@ impl Compiler<'_> {
     }
 
     pub(super) fn add_constant(&mut self, constant: Constant) -> Result<u32, CompileError> {
+        self.context
+            .record_constant_string_origins(&constant, false);
         if let Constant::Code(code) = &constant {
             self.output.has_frozenset_constants |= code
                 .marshal_provenance
@@ -450,6 +700,28 @@ impl Compiler<'_> {
                 .unwrap_or(true);
         }
         self.output.constants.intern(constant)
+    }
+
+    pub(super) fn retain_discarded_first_constant(
+        &mut self,
+        discarded: &Self,
+    ) -> Result<(), CompileError> {
+        debug_assert!(self.output.constants.is_empty());
+        if let Some(constant) = discarded.output.constants.values.first() {
+            // The child builder already recorded cache admissions. Copy only the parent's
+            // retained slot, without replaying those compilation-wide chronology events.
+            if let Constant::Code(code) = constant {
+                self.output.has_frozenset_constants |= code
+                    .marshal_provenance
+                    .subtree_has_frozenset_constants
+                    .unwrap_or(true);
+            }
+            self.output.constants.intern(constant.clone())?;
+            self.output
+                .interned_constant_strings
+                .extend(discarded.output.interned_constant_strings.iter().cloned());
+        }
+        Ok(())
     }
 
     pub(super) fn add_interned_string_tuple(
@@ -460,6 +732,7 @@ impl Compiler<'_> {
             Constant::String(value) => Some(value),
             _ => None,
         }) {
+            self.context.record_constant_string_origin(value, true);
             if !self
                 .output
                 .interned_constant_strings
@@ -486,6 +759,11 @@ impl Compiler<'_> {
             return;
         }
         let index_map = self.output.constants.retain_used(&used);
+        self.output.first_flowgraph_constant = index_map
+            .iter()
+            .take(self.output.first_flowgraph_constant)
+            .flatten()
+            .count();
         self.assembler
             .remap_constant_indices(LOAD_CONST, &index_map);
         self.output.qualified_name_constant_index =
@@ -503,9 +781,10 @@ impl Compiler<'_> {
         let instruction = self
             .assembler
             .emit_placeholder_with_depth(LOAD_CONST, self.control.stack.depth.cast_unsigned());
-        self.output
-            .deferred_constants
-            .push((Some(instruction), constant));
+        self.output.deferred_constants.push((
+            Some(DeferredConstantTarget::Instruction(instruction)),
+            constant,
+        ));
         Ok(())
     }
 
@@ -535,6 +814,16 @@ impl Compiler<'_> {
     }
 }
 
+/// Returns whether a binary-expression tree contains only primitive literal leaves.
+fn is_literal_binary_tree(expression: &Expr) -> bool {
+    match expression {
+        Expr::BinOp(binary) => {
+            is_literal_binary_tree(&binary.left) && is_literal_binary_tree(&binary.right)
+        }
+        _ => is_literal_constant(expression),
+    }
+}
+
 /// Returns instruction slots removed when CPython's flow graph folds `expression`.
 ///
 /// The count is attached to the emitted folded result so labels and other control-flow
@@ -542,22 +831,11 @@ impl Compiler<'_> {
 pub(super) fn folded_constant_owner_slots(expression: &Expr) -> usize {
     fn direct(expression: &Expr) -> usize {
         match expression {
-            Expr::BinOp(binary) => {
-                let left = direct(&binary.left);
-                if left > 0 {
-                    3
-                } else {
-                    2 + direct(&binary.right).min(1)
-                }
-            }
-            Expr::Tuple(tuple) => {
-                if tuple.elts.len() >= 3 {
-                    return 3;
-                }
-                tuple.elts.iter().fold(tuple.elts.len(), |slots, element| {
-                    (slots + direct(element)).min(3)
-                })
-            }
+            Expr::BinOp(binary) => 2 + direct(&binary.left) + direct(&binary.right),
+            Expr::Tuple(tuple) => tuple
+                .elts
+                .iter()
+                .fold(tuple.elts.len(), |slots, element| slots + direct(element)),
             Expr::UnaryOp(unary) => {
                 if unary.op == UnaryOp::Not
                     && matches!(unary.operand.as_ref(), Expr::Tuple(_))
@@ -565,17 +843,10 @@ pub(super) fn folded_constant_owner_slots(expression: &Expr) -> usize {
                 {
                     1
                 } else {
-                    (1 + direct(&unary.operand)).min(3)
+                    1 + direct(&unary.operand)
                 }
             }
-            Expr::Subscript(subscript) => {
-                let value = direct(&subscript.value);
-                if value > 0 {
-                    3
-                } else {
-                    2 + direct(&subscript.slice).min(1)
-                }
-            }
+            Expr::Subscript(subscript) => 2 + direct(&subscript.value) + direct(&subscript.slice),
             _ => 0,
         }
     }
@@ -1086,7 +1357,7 @@ fn parse_percent_format(
 
 #[expect(
     clippy::cast_precision_loss,
-    reason = "CPython constant folding intentionally rounds integer operands to binary64"
+    reason = "CPython mixed integer/float folding rounds integer operands to binary64"
 )]
 pub(super) fn fold_constant(expression: &Expr) -> Option<Constant> {
     if let Some(constant) = literal_constant(expression) {
@@ -1126,46 +1397,22 @@ pub(super) fn fold_constant(expression: &Expr) -> Option<Constant> {
         Expr::UnaryOp(unary) => match unary.op {
             UnaryOp::UAdd => fold_constant(&unary.operand),
             UnaryOp::Not => literal_truthiness(&unary.operand).map(|value| Constant::Bool(!value)),
-            UnaryOp::USub => match fold_constant(&unary.operand)? {
-                Constant::Int(0) => Some(Constant::Int(0)),
-                Constant::Int(value) => match value.cmp(&i64::MIN.unsigned_abs()) {
-                    std::cmp::Ordering::Less => Some(Constant::SignedInt(
-                        -i64::try_from(value).expect("magnitude below 2^63 fits in i64"),
-                    )),
-                    std::cmp::Ordering::Equal => Some(Constant::SignedInt(i64::MIN)),
-                    std::cmp::Ordering::Greater => Some(Constant::BigInt {
-                        negative: true,
-                        digits: big_integer_digits(&value.to_string()),
-                    }),
-                },
-                Constant::BigInt { negative, digits } => Some(Constant::BigInt {
-                    negative: !negative,
-                    digits,
-                }),
-                Constant::Float(value) => Some(Constant::Float(-value)),
-                Constant::Complex { real, imag } => Some(Constant::Complex {
-                    real: -real,
-                    imag: -imag,
-                }),
-                _ => None,
-            },
-            UnaryOp::Invert => match fold_constant(&unary.operand)? {
-                Constant::Int(value) => {
-                    let magnitude = u128::from(value) + 1;
-                    match magnitude.cmp(&u128::from(i64::MIN.unsigned_abs())) {
-                        std::cmp::Ordering::Less => Some(Constant::SignedInt(
-                            -i64::try_from(magnitude).expect("magnitude below 2^63 fits in i64"),
-                        )),
-                        std::cmp::Ordering::Equal => Some(Constant::SignedInt(i64::MIN)),
-                        std::cmp::Ordering::Greater => Some(Constant::BigInt {
-                            negative: true,
-                            digits: big_integer_digits(&magnitude.to_string()),
-                        }),
-                    }
+            UnaryOp::USub => fold_constant(&unary.operand)?.negated(),
+            UnaryOp::Invert => {
+                let operand = fold_constant(&unary.operand)?;
+                // CPython leaves boolean inversion at runtime for its deprecation warning.
+                if matches!(operand, Constant::Bool(_)) {
+                    return None;
                 }
-                Constant::SignedInt(value) => Some(Constant::SignedInt(!value)),
-                _ => None,
-            },
+                let value = folded_integer(&operand)?;
+                // Python integer inversion is exactly -(value + 1).
+                let digits = if value.negative {
+                    subtract_magnitudes(&value.digits, &[1])
+                } else {
+                    add_magnitudes(&value.digits, &[1])
+                };
+                Some(integer_constant(!value.negative, digits))
+            }
         },
         Expr::BinOp(binary) => {
             let left = fold_constant(&binary.left)?;
@@ -1176,14 +1423,19 @@ pub(super) fn fold_constant(expression: &Expr) -> Option<Constant> {
                 {
                     fold_integer_arithmetic(&left, operator, &right)
                 }
-                (Constant::Int(left), Operator::Div, Constant::Int(right)) if right != 0 => {
-                    Some(Constant::Float(left as f64 / right as f64))
-                }
-                (Constant::SignedInt(left), Operator::Div, Constant::Int(right)) if right != 0 => {
-                    Some(Constant::Float(left as f64 / right as f64))
+                (left, Operator::Div, right)
+                    if is_integer_constant(&left) && is_integer_constant(&right) =>
+                {
+                    fold_integer_true_divide(&left, &right).map(Constant::Float)
                 }
                 (Constant::Int(left), Operator::FloorDiv, Constant::Int(right)) if right != 0 => {
                     Some(Constant::Int(left / right))
+                }
+                (left, Operator::FloorDiv, right)
+                    if matches!(left, Constant::Float(_))
+                        || matches!(right, Constant::Float(_)) =>
+                {
+                    fold_float_floor_divide(&left, &right).map(Constant::Float)
                 }
                 (Constant::Int(left), Operator::Mod, Constant::Int(right)) if right != 0 => {
                     Some(Constant::Int(left % right))
@@ -1222,16 +1474,12 @@ pub(super) fn fold_constant(expression: &Expr) -> Option<Constant> {
                     fold_integer_shift(&left, operator, &right)
                 }
                 (
-                    left @ (Constant::Int(_)
-                    | Constant::BigInt {
-                        negative: false, ..
-                    }),
+                    left,
                     operator @ (Operator::BitAnd | Operator::BitOr | Operator::BitXor),
-                    right @ (Constant::Int(_)
-                    | Constant::BigInt {
-                        negative: false, ..
-                    }),
-                ) => fold_positive_integer_bitwise(&left, operator, &right),
+                    right,
+                ) if is_integer_constant(&left) && is_integer_constant(&right) => {
+                    fold_integer_bitwise(&left, operator, &right)
+                }
                 (Constant::Float(left), Operator::Add, Constant::Float(right)) => {
                     Some(Constant::Float(left + right))
                 }
@@ -1303,9 +1551,6 @@ pub(super) fn fold_constant(expression: &Expr) -> Option<Constant> {
                     let result = left.powf(right);
                     result.is_finite().then_some(Constant::Float(result))
                 }
-                (Constant::Float(left), Operator::FloorDiv, Constant::Int(right)) if right != 0 => {
-                    Some(Constant::Float((left / right as f64).floor()))
-                }
                 (Constant::Bool(left), Operator::Pow, Constant::Bool(right)) => {
                     Some(Constant::Int(u64::from(left).pow(u32::from(right))))
                 }
@@ -1313,18 +1558,7 @@ pub(super) fn fold_constant(expression: &Expr) -> Option<Constant> {
                     if matches!(left, Constant::Complex { .. })
                         || matches!(right, Constant::Complex { .. }) =>
                 {
-                    let (left_real, left_imag) = constant_complex_parts(&left)?;
-                    let (right_real, right_imag) = constant_complex_parts(&right)?;
-                    let (real, imag) = match operator {
-                        Operator::Add => (left_real + right_real, left_imag + right_imag),
-                        Operator::Sub => (left_real - right_real, left_imag - right_imag),
-                        Operator::Mult => (
-                            left_real * right_real - left_imag * right_imag,
-                            left_real * right_imag + left_imag * right_real,
-                        ),
-                        _ => unreachable!(),
-                    };
-                    Some(Constant::Complex { real, imag })
+                    fold_complex_arithmetic(&left, operator, &right)
                 }
                 (left, Operator::Div, right)
                     if matches!(left, Constant::Complex { .. })
@@ -1345,6 +1579,10 @@ pub(super) fn fold_constant(expression: &Expr) -> Option<Constant> {
                 (Constant::Bytes(mut left), Operator::Add, Constant::Bytes(right)) => {
                     left.extend(right);
                     Some(Constant::Bytes(left))
+                }
+                (Constant::Tuple(mut left), Operator::Add, Constant::Tuple(right)) => {
+                    left.extend(right);
+                    Some(Constant::Tuple(left))
                 }
                 (Constant::String(value), Operator::Mult, Constant::Int(times))
                 | (Constant::Int(times), Operator::Mult, Constant::String(value)) => {
@@ -1380,30 +1618,52 @@ pub(super) fn fold_constant(expression: &Expr) -> Option<Constant> {
     }
 }
 
-fn fold_positive_integer_bitwise(
-    left: &Constant,
-    operator: Operator,
-    right: &Constant,
-) -> Option<Constant> {
-    let left = positive_integer_digits(left)?;
-    let right = positive_integer_digits(right)?;
-    let length = match operator {
-        Operator::BitAnd => left.len().min(right.len()),
-        Operator::BitOr | Operator::BitXor => left.len().max(right.len()),
-        _ => unreachable!(),
-    };
-    let mut digits = Vec::with_capacity(length);
-    for index in 0..length {
-        let left = left.get(index).copied().unwrap_or(0);
-        let right = right.get(index).copied().unwrap_or(0);
-        digits.push(match operator {
+fn fold_integer_bitwise(left: &Constant, operator: Operator, right: &Constant) -> Option<Constant> {
+    if let (Constant::Bool(left), Constant::Bool(right)) = (left, right) {
+        return Some(Constant::Bool(match operator {
             Operator::BitAnd => left & right,
             Operator::BitOr => left | right,
             Operator::BitXor => left ^ right,
             _ => unreachable!(),
-        });
+        }));
     }
-    Some(positive_integer_constant(digits))
+    let mut left = folded_integer(left)?;
+    let mut right = folded_integer(right)?;
+    let negative = match operator {
+        Operator::BitAnd => left.negative && right.negative,
+        Operator::BitOr => left.negative || right.negative,
+        Operator::BitXor => left.negative != right.negative,
+        _ => unreachable!(),
+    };
+
+    // A negative integer is the infinite bitwise complement of (its magnitude minus one).
+    // Keep that finite magnitude and use the sign mask to extend each operand's high bits.
+    if left.negative {
+        left.digits = subtract_magnitudes(&left.digits, &[1]);
+    }
+    if right.negative {
+        right.digits = subtract_magnitudes(&right.digits, &[1]);
+    }
+    let left_mask = if left.negative { 0x7fff } else { 0 };
+    let right_mask = if right.negative { 0x7fff } else { 0 };
+    let result_mask = if negative { 0x7fff } else { 0 };
+    let length = left.digits.len().max(right.digits.len());
+    let mut digits = Vec::with_capacity(length);
+    for index in 0..length {
+        let left = left.digits.get(index).copied().unwrap_or(0) ^ left_mask;
+        let right = right.digits.get(index).copied().unwrap_or(0) ^ right_mask;
+        let digit = match operator {
+            Operator::BitAnd => left & right,
+            Operator::BitOr => left | right,
+            Operator::BitXor => left ^ right,
+            _ => unreachable!(),
+        };
+        digits.push(digit ^ result_mask);
+    }
+    if negative {
+        digits = add_magnitudes(&digits, &[1]);
+    }
+    Some(integer_constant(negative, digits))
 }
 
 struct FoldedInteger {
@@ -1439,6 +1699,128 @@ fn integer_digits(mut value: u64) -> Vec<u16> {
         value >>= 15;
     }
     digits
+}
+
+/// Match the quotient from CPython's `_float_div_mod`, including rounding and signed zero.
+fn fold_float_floor_divide(left: &Constant, right: &Constant) -> Option<f64> {
+    let to_float = |constant: &Constant| match constant {
+        Constant::Float(value) => Some(*value),
+        // Dividing an integer by one provides PyLong_AsDouble's rounding and overflow checks.
+        constant => fold_integer_true_divide(constant, &Constant::Int(1)),
+    };
+    let left = to_float(left)?;
+    let right = to_float(right)?;
+    if right == 0.0 {
+        return None;
+    }
+
+    let remainder = left % right;
+    let mut quotient = (left - remainder) / right;
+    if remainder != 0.0 && (right < 0.0) != (remainder < 0.0) {
+        quotient -= 1.0;
+    }
+    if quotient != 0.0 {
+        let mut result = quotient.floor();
+        if quotient - result > 0.5 {
+            result += 1.0;
+        }
+        Some(result)
+    } else {
+        Some(0.0_f64.copysign(left / right))
+    }
+}
+
+/// Round an exact integer ratio to binary64, as CPython's `long_true_divide` does.
+/// Quantizing subnormal results directly avoids rounding twice near underflow.
+fn fold_integer_true_divide(left: &Constant, right: &Constant) -> Option<f64> {
+    let left = folded_integer(left)?;
+    let right = folded_integer(right)?;
+    if right.digits.is_empty() {
+        return None;
+    }
+    let sign = u64::from(left.negative != right.negative) << 63;
+    let left_bits = magnitude_bit_length(&left.digits);
+    let right_bits = magnitude_bit_length(&right.digits);
+    if left_bits == 0 || right_bits.saturating_sub(left_bits) > 1075 {
+        return Some(f64::from_bits(sign));
+    }
+    if left_bits.saturating_sub(right_bits) > 1024 {
+        return None;
+    }
+
+    // The bit-length difference is at most one above floor(log2(left / right)).
+    let difference = if left_bits >= right_bits {
+        i32::try_from(left_bits - right_bits).expect("bounded exponent difference")
+    } else {
+        -i32::try_from(right_bits - left_bits).expect("bounded exponent difference")
+    };
+    let comparison = if difference >= 0 {
+        compare_magnitudes(
+            &left.digits,
+            &left_shift_magnitude(&right.digits, difference.unsigned_abs() as usize),
+        )
+    } else {
+        compare_magnitudes(
+            &left_shift_magnitude(&left.digits, difference.unsigned_abs() as usize),
+            &right.digits,
+        )
+    };
+    let exponent = difference - i32::from(comparison.is_lt());
+    let quantum = (exponent - 52).max(-1074);
+    let (numerator, denominator) = if quantum < 0 {
+        (
+            left_shift_magnitude(&left.digits, quantum.unsigned_abs() as usize),
+            right.digits,
+        )
+    } else {
+        (
+            left.digits,
+            left_shift_magnitude(&right.digits, quantum.unsigned_abs() as usize),
+        )
+    };
+
+    // Scaling leaves at most 53 quotient bits, even for arbitrarily large inputs.
+    // Keep the full remainder so ties and values immediately beside ties differ.
+    let mut remainder = numerator;
+    let mut quotient = 0_u64;
+    if let Some(top_bit) =
+        magnitude_bit_length(&remainder).checked_sub(magnitude_bit_length(&denominator))
+    {
+        debug_assert!(top_bit < 64);
+        for bit in (0..=top_bit).rev() {
+            let divisor = left_shift_magnitude(&denominator, bit);
+            if !compare_magnitudes(&remainder, &divisor).is_lt() {
+                remainder = subtract_magnitudes(&remainder, &divisor);
+                quotient |= 1 << bit;
+            }
+        }
+    }
+    let half = compare_magnitudes(&add_magnitudes(&remainder, &remainder), &denominator);
+    if half.is_gt() || (half.is_eq() && quotient & 1 != 0) {
+        quotient += 1;
+    }
+    if quotient == 0 {
+        return Some(f64::from_bits(sign));
+    }
+
+    // Construct the already-rounded float without another floating-point rounding.
+    let bits = u64::BITS - quotient.leading_zeros();
+    let exponent = quantum + i32::try_from(bits).expect("u64 bit length fits in i32") - 1;
+    if exponent > 1023 {
+        return None;
+    }
+    let magnitude = if exponent < -1022 {
+        quotient << (quantum + 1074)
+    } else {
+        let significand = if bits > 53 {
+            quotient >> (bits - 53)
+        } else {
+            quotient << (53 - bits)
+        };
+        (u64::try_from(exponent + 1023).expect("normal exponent is positive") << 52)
+            | (significand & ((1 << 52) - 1))
+    };
+    Some(f64::from_bits(sign | magnitude))
 }
 
 fn fold_integer_arithmetic(
@@ -1672,41 +2054,6 @@ fn right_shift_magnitude(digits: &[u16], shift: usize) -> (Vec<u16>, bool) {
     (normalized_digits(output), discarded)
 }
 
-fn positive_integer_digits(value: &Constant) -> Option<Vec<u16>> {
-    match value {
-        Constant::Int(value) => {
-            let mut value = *value;
-            let mut digits = Vec::new();
-            while value != 0 {
-                digits.push((value & 0x7fff) as u16);
-                value >>= 15;
-            }
-            Some(digits)
-        }
-        Constant::BigInt {
-            negative: false,
-            digits,
-        } => Some(normalized_digits(digits.clone())),
-        _ => None,
-    }
-}
-
-fn positive_integer_constant(digits: Vec<u16>) -> Constant {
-    let digits = normalized_digits(digits);
-    if digits.len() <= 5 {
-        let value = digits
-            .iter()
-            .enumerate()
-            .fold(0_u128, |value, (index, digit)| {
-                value | (u128::from(*digit) << (index * 15))
-            });
-        if let Ok(value) = u64::try_from(value) {
-            return Constant::Int(value);
-        }
-    }
-    integer_constant(false, digits)
-}
-
 fn integer_constant(negative: bool, digits: Vec<u16>) -> Constant {
     let digits = normalized_digits(digits);
     if digits.is_empty() {
@@ -1861,12 +2208,49 @@ pub(super) fn folded_bool_operand(expression: &Expr) -> Option<(&Expr, Constant)
 )]
 fn constant_complex_parts(constant: &Constant) -> Option<(f64, f64)> {
     match constant {
+        Constant::Bool(value) => Some((f64::from(*value), 0.0)),
         Constant::Int(value) => Some((*value as f64, 0.0)),
         Constant::SignedInt(value) => Some((*value as f64, 0.0)),
+        Constant::BigInt { .. } => {
+            fold_integer_true_divide(constant, &Constant::Int(1)).map(|real| (real, 0.0))
+        }
         Constant::Float(value) => Some((*value, 0.0)),
         Constant::Complex { real, imag } => Some((*real, *imag)),
         _ => None,
     }
+}
+
+fn fold_complex_arithmetic(
+    left: &Constant,
+    operator: Operator,
+    right: &Constant,
+) -> Option<Constant> {
+    let (left_real, left_imag) = constant_complex_parts(left)?;
+    let (right_real, right_imag) = constant_complex_parts(right)?;
+    // CPython uses mixed real/complex formulas without introducing an imaginary
+    // zero for the real operand. That distinction preserves signed zeros.
+    let (real, imag) = match (left, right) {
+        (Constant::Complex { .. }, Constant::Complex { .. }) => match operator {
+            Operator::Add => (left_real + right_real, left_imag + right_imag),
+            Operator::Sub => (left_real - right_real, left_imag - right_imag),
+            Operator::Mult => complex_product((left_real, left_imag), (right_real, right_imag)),
+            _ => unreachable!(),
+        },
+        (Constant::Complex { .. }, _) => match operator {
+            Operator::Add => (left_real + right_real, left_imag),
+            Operator::Sub => (left_real - right_real, left_imag),
+            Operator::Mult => (left_real * right_real, left_imag * right_real),
+            _ => unreachable!(),
+        },
+        (_, Constant::Complex { .. }) => match operator {
+            Operator::Add => (right_real + left_real, right_imag),
+            Operator::Sub => (left_real - right_real, -right_imag),
+            Operator::Mult => (right_real * left_real, right_imag * left_real),
+            _ => unreachable!(),
+        },
+        _ => return None,
+    };
+    Some(Constant::Complex { real, imag })
 }
 
 fn complex_product(left: (f64, f64), right: (f64, f64)) -> (f64, f64) {
@@ -2025,24 +2409,376 @@ pub(super) fn first_literal_constant(expression: &Expr) -> Option<Constant> {
     }
 }
 
-pub(super) fn first_suite_literal_constant(body: &[Stmt]) -> Option<Constant> {
-    #[derive(Default)]
-    struct Collector {
-        constant: Option<Constant>,
+pub(super) enum FirstConstant {
+    Literal(Constant),
+    NestedScope,
+}
+
+pub(super) fn first_suite_literal_constant(
+    compiler: &Compiler<'_>,
+    body: &[Stmt],
+) -> Option<Constant> {
+    match first_constant(compiler, body, None, false, false) {
+        Some(FirstConstant::Literal(constant)) => Some(constant),
+        Some(FirstConstant::NestedScope) | None => None,
+    }
+}
+
+pub(super) fn first_suite_constant(
+    compiler: &Compiler<'_>,
+    body: &[Stmt],
+) -> Option<FirstConstant> {
+    // A live generator expression admits its code object before evaluating its iterable.
+    // Do not reserve a later literal ahead of that allocation.
+    first_constant(compiler, body, None, true, true)
+}
+
+pub(super) fn first_expression_constant(
+    compiler: &Compiler<'_>,
+    expression: &Expr,
+) -> Option<FirstConstant> {
+    first_constant(compiler, &[], Some(expression), true, false)
+}
+
+fn first_constant(
+    compiler: &Compiler<'_>,
+    body: &[Stmt],
+    expression: Option<&Expr>,
+    stop_at_generators: bool,
+    include_implicit_constants: bool,
+) -> Option<FirstConstant> {
+    #[derive(Clone, Copy)]
+    enum Frame<'ast> {
+        ImplicitNone,
+        Finally(&'ast [Stmt]),
+        Loop,
     }
 
-    impl<'ast> Visitor<'ast> for Collector {
-        fn visit_stmt(&mut self, statement: &'ast Stmt) {
-            if self.constant.is_some()
-                || matches!(statement, Stmt::FunctionDef(_) | Stmt::ClassDef(_))
+    struct Collector<'compiler, 'source, 'ast> {
+        compiler: &'compiler Compiler<'source>,
+        constant: Option<Constant>,
+        reached_nested_scope: bool,
+        stop_at_generators: bool,
+        include_implicit_constants: bool,
+        frames: Vec<Frame<'ast>>,
+    }
+
+    impl<'ast> Collector<'_, '_, 'ast> {
+        fn is_complete(&self) -> bool {
+            self.constant.is_some() || self.reached_nested_scope
+        }
+
+        fn visit_unwind(&mut self, stop_at_loop: bool) {
+            if self.is_complete()
+                || self.frames.is_empty()
+                || (stop_at_loop && matches!(self.frames.last(), Some(Frame::Loop)))
             {
                 return;
+            }
+            let frame = self.frames.pop().unwrap();
+            match frame {
+                Frame::ImplicitNone => self.constant = Some(Constant::None),
+                Frame::Finally(body) => self.visit_body(body),
+                Frame::Loop => {}
+            }
+            // A jump inside this finalizer sees only the surrounding frames, including
+            // loops that have not already been unwound by an enclosing return.
+            self.visit_unwind(stop_at_loop);
+            self.frames.push(frame);
+        }
+
+        fn visit_annotation_subscript(&mut self, expression: &'ast Expr) {
+            match expression {
+                Expr::Slice(slice) => {
+                    // Annotation-only targets evaluate explicit bounds without building a slice.
+                    for bound in [&slice.lower, &slice.upper, &slice.step]
+                        .into_iter()
+                        .flatten()
+                    {
+                        self.visit_expr(bound);
+                    }
+                }
+                Expr::Tuple(tuple) => {
+                    for element in &tuple.elts {
+                        self.visit_annotation_subscript(element);
+                    }
+                }
+                _ => self.visit_expr(expression),
+            }
+        }
+
+        fn visit_interpolated_components(
+            &mut self,
+            components: Vec<super::expression::InterpolatedStringComponent<'ast>>,
+        ) {
+            use super::expression::{InterpolatedStringComponent, format_spec_components};
+
+            if components.len() > 30 || components.is_empty() {
+                self.constant = Some(Constant::String(String::new()));
+                return;
+            }
+            for component in components {
+                if self.is_complete() {
+                    break;
+                }
+                match component {
+                    InterpolatedStringComponent::Literal(literal) => {
+                        self.constant = Some(literal.into_constant());
+                    }
+                    InterpolatedStringComponent::Interpolation(interpolation, is_raw) => {
+                        self.visit_expr(&interpolation.expression);
+                        if !self.is_complete()
+                            && let Some(specification) = &interpolation.format_spec
+                        {
+                            self.visit_interpolated_components(format_spec_components(
+                                &specification.elements,
+                                is_raw,
+                                self.compiler.context.source,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    impl<'ast> Visitor<'ast> for Collector<'_, '_, 'ast> {
+        fn visit_stmt(&mut self, statement: &'ast Stmt) {
+            if self.is_complete() {
+                return;
+            }
+            if matches!(statement, Stmt::FunctionDef(_) | Stmt::ClassDef(_)) {
+                // This statement allocates a code object in the enclosing pool. Leave
+                // that allocation to code generation instead of reserving a later literal.
+                self.reached_nested_scope = true;
+                return;
+            }
+            if self.include_implicit_constants {
+                match statement {
+                    Stmt::With(manager) => {
+                        for item in &manager.items {
+                            self.visit_expr(&item.context_expr);
+                            if manager.is_async && !self.is_complete() {
+                                self.constant = Some(Constant::None);
+                            }
+                            if let Some(target) = &item.optional_vars {
+                                self.visit_expr(target);
+                            }
+                        }
+                        self.frames.push(Frame::ImplicitNone);
+                        self.visit_body(&manager.body);
+                        self.frames.pop();
+                        if !self.is_complete() {
+                            self.constant = Some(Constant::None);
+                        }
+                        return;
+                    }
+                    Stmt::Break(_) | Stmt::Continue(_) => {
+                        // Finalizers run before any enclosing manager's exit constants.
+                        // A loop jump unwinds only frames entered inside its own loop.
+                        self.visit_unwind(true);
+                        return;
+                    }
+                    Stmt::For(loop_) => {
+                        self.visit_expr(&loop_.iter);
+                        if loop_.is_async && !self.is_complete() {
+                            self.constant = Some(Constant::None);
+                        }
+                        self.frames.push(Frame::Loop);
+                        self.visit_expr(&loop_.target);
+                        self.visit_body(&loop_.body);
+                        self.frames.pop();
+                        self.visit_body(&loop_.orelse);
+                        return;
+                    }
+                    Stmt::While(loop_) => {
+                        self.visit_expr(&loop_.test);
+                        self.frames.push(Frame::Loop);
+                        self.visit_body(&loop_.body);
+                        self.frames.pop();
+                        self.visit_body(&loop_.orelse);
+                        return;
+                    }
+                    Stmt::Return(return_) => {
+                        // CPython defers a syntactic Constant return until after unwind.
+                        // Tuple, unary and binary expressions still admit their components
+                        // before cleanup, even when later optimization folds their value.
+                        if let Some(value) = &return_.value
+                            && !is_literal_constant(value)
+                        {
+                            self.visit_expr(value);
+                        }
+                        self.visit_unwind(false);
+                        if !self.is_complete() {
+                            if let Some(value) = &return_.value {
+                                self.visit_expr(value);
+                            } else {
+                                self.constant = Some(Constant::None);
+                            }
+                        }
+                        return;
+                    }
+                    Stmt::Try(try_) => {
+                        if !try_.finalbody.is_empty() {
+                            self.frames.push(Frame::Finally(&try_.finalbody));
+                        }
+                        self.visit_body(&try_.body);
+                        // Ordinary except emits else before its handlers; except* emits
+                        // else after them. This is constant admission order, not AST order.
+                        if !try_.is_star {
+                            self.visit_body(&try_.orelse);
+                        }
+                        for handler in &try_.handlers {
+                            let handler = handler.as_except_handler().unwrap();
+                            if let Some(type_) = &handler.type_ {
+                                self.visit_expr(type_);
+                            }
+                            if handler.name.is_some() {
+                                self.frames.push(Frame::ImplicitNone);
+                            }
+                            self.visit_body(&handler.body);
+                            if handler.name.is_some() {
+                                self.frames.pop();
+                                if !self.is_complete() {
+                                    self.constant = Some(Constant::None);
+                                }
+                            }
+                        }
+                        if try_.is_star {
+                            self.visit_body(&try_.orelse);
+                        }
+                        if !try_.finalbody.is_empty() {
+                            self.frames.pop();
+                            self.visit_body(&try_.finalbody);
+                        }
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            match statement {
+                Stmt::AnnAssign(assignment) => {
+                    if let Some(value) = &assignment.value {
+                        self.visit_expr(value);
+                        self.visit_expr(&assignment.target);
+                    } else {
+                        match assignment.target.as_ref() {
+                            Expr::Subscript(subscript) => {
+                                self.visit_expr(&subscript.value);
+                                self.visit_annotation_subscript(&subscript.slice);
+                            }
+                            Expr::Attribute(attribute) => self.visit_expr(&attribute.value),
+                            _ => {}
+                        }
+                    }
+                    return;
+                }
+                Stmt::Import(_) => {
+                    self.constant = Some(Constant::Int(0));
+                    return;
+                }
+                Stmt::ImportFrom(import) => {
+                    self.constant = Some(Constant::Int(u64::from(import.level)));
+                    return;
+                }
+                _ => {}
             }
             walk_stmt(self, statement);
         }
 
         fn visit_expr(&mut self, expression: &'ast Expr) {
-            if self.constant.is_some() || matches!(expression, Expr::Lambda(_)) {
+            if self.is_complete() {
+                return;
+            }
+            if let Expr::FString(fstring) = expression {
+                self.visit_interpolated_components(super::expression::fstring_components(
+                    fstring,
+                    self.compiler.context.source,
+                ));
+                return;
+            }
+            if matches!(expression, Expr::Lambda(_))
+                || self.stop_at_generators && matches!(expression, Expr::Generator(_))
+            {
+                self.reached_nested_scope = true;
+                return;
+            }
+            if matches!(expression, Expr::Name(name) if name.id.as_str() == "__debug__") {
+                self.constant = Some(Constant::Bool(true));
+                return;
+            }
+            if let Expr::Call(call) = expression {
+                self.visit_expr(&call.func);
+                for argument in &call.arguments.args {
+                    self.visit_expr(argument);
+                }
+                let shape = self.compiler.call_shape(call);
+                let expanded = shape.has_starred
+                    || shape.has_keyword_unpack
+                    || (shape.direct_method.is_none()
+                        && shape.positional_count + shape.keyword_count * 2 > 30);
+                if expanded {
+                    for keyword in &call.arguments.keywords {
+                        if !self.is_complete()
+                            && let Some(name) = &keyword.arg
+                        {
+                            self.constant = Some(Constant::String(name.to_string()));
+                        }
+                        self.visit_expr(&keyword.value);
+                    }
+                } else {
+                    for keyword in &call.arguments.keywords {
+                        self.visit_expr(&keyword.value);
+                    }
+                    if !self.is_complete() && !call.arguments.keywords.is_empty() {
+                        self.constant = Some(Constant::Tuple(
+                            call.arguments
+                                .keywords
+                                .iter()
+                                .map(|keyword| {
+                                    Constant::String(keyword.arg.as_ref().unwrap().to_string())
+                                })
+                                .collect(),
+                        ));
+                    }
+                }
+                return;
+            }
+            if let Expr::Slice(slice) = expression {
+                if let Some(constant) = constant_slice(slice) {
+                    self.constant = Some(constant);
+                } else {
+                    // Slice lowering admits an implicit None for each omitted bound.
+                    for bound in [&slice.lower, &slice.upper] {
+                        if let Some(bound) = bound {
+                            self.visit_expr(bound);
+                        } else if !self.is_complete() {
+                            self.constant = Some(Constant::None);
+                        }
+                    }
+                    if let Some(step) = &slice.step {
+                        self.visit_expr(step);
+                    }
+                }
+                return;
+            }
+            if let Expr::Await(await_expression) = expression {
+                self.visit_expr(&await_expression.value);
+                if !self.is_complete() {
+                    // The first SEND loads None after evaluating the awaited expression.
+                    self.constant = Some(Constant::None);
+                }
+                return;
+            }
+            if let Expr::YieldFrom(yield_from) = expression {
+                self.visit_expr(&yield_from.value);
+                if !self.is_complete() {
+                    self.constant = Some(Constant::None);
+                }
+                return;
+            }
+            if matches!(expression, Expr::Yield(yield_) if yield_.value.is_none()) {
+                self.constant = Some(Constant::None);
                 return;
             }
             if let Some(constant) = literal_constant(expression) {
@@ -2053,14 +2789,29 @@ pub(super) fn first_suite_literal_constant(body: &[Stmt]) -> Option<Constant> {
         }
     }
 
-    let mut collector = Collector::default();
-    for statement in body {
-        collector.visit_stmt(statement);
-        if collector.constant.is_some() {
-            break;
+    let mut collector = Collector {
+        compiler,
+        constant: None,
+        reached_nested_scope: false,
+        stop_at_generators,
+        include_implicit_constants,
+        frames: Vec::new(),
+    };
+    if let Some(expression) = expression {
+        collector.visit_expr(expression);
+    } else {
+        for statement in body {
+            collector.visit_stmt(statement);
+            if collector.is_complete() {
+                break;
+            }
         }
     }
-    collector.constant
+    collector.constant.map(FirstConstant::Literal).or_else(|| {
+        collector
+            .reached_nested_scope
+            .then_some(FirstConstant::NestedScope)
+    })
 }
 pub(super) fn is_literal_constant(expression: &Expr) -> bool {
     matches!(
