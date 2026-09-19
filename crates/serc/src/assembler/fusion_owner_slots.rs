@@ -162,6 +162,10 @@ impl<'a> View<'a> {
         for (s, e) in &provenance.setup_nop_ranges {
             references.extend([*s, *e]);
         }
+        #[expect(
+            clippy::iter_over_hash_type,
+            reason = "The references set is only queried for membership."
+        )]
         for origin in provenance.retained_normal_pop_blocks.values() {
             references.extend(origin.before.iter().copied());
             references.extend(origin.after.iter().copied());
@@ -183,12 +187,12 @@ impl<'a> View<'a> {
         }
     }
 
-    fn label_index(&self, label: &Label) -> Option<&usize> {
-        self.labels.get(label).map(|(index, _)| index)
+    fn label_index(&self, label: Label) -> Option<&usize> {
+        self.labels.get(&label).map(|(index, _)| index)
     }
 
-    fn label_position(&self, label: &Label) -> Option<&usize> {
-        self.labels.get(label).map(|(_, position)| position)
+    fn label_position(&self, label: Label) -> Option<&usize> {
+        self.labels.get(&label).map(|(_, position)| position)
     }
 
     fn endpoint(&self, condition: Instruction, marker: Instruction) -> Option<(usize, usize)> {
@@ -221,8 +225,8 @@ impl<'a> View<'a> {
             .count();
         let mut owner = None;
         for (index, r) in self.regions.iter().enumerate() {
-            let s = *self.label_position(&r.start)?;
-            let e = *self.label_position(&r.end)?;
+            let s = *self.label_position(r.start)?;
+            let e = *self.label_position(r.end)?;
             if s <= pos && pos < e {
                 // A cleanup stack can retain an owner on the original array record
                 // even when the lowered condition is excluded. The local interval
@@ -232,7 +236,7 @@ impl<'a> View<'a> {
                 }
                 let (ps, pe) = match r.priority {
                     ExceptionRegionPriority::OriginalRange(s, e) => {
-                        (*self.label_position(&s)?, *self.label_position(&e)?)
+                        (*self.label_position(s)?, *self.label_position(e)?)
                     }
                     ExceptionRegionPriority::Resolved { start, end } => (start, end),
                 };
@@ -258,7 +262,7 @@ impl<'a> View<'a> {
     fn no_late_insertions_or_setups(&self, start: usize, end: usize) -> bool {
         if self.items[start..=end].iter().any(|x|matches!(x,Item::Instruction(i) if matches!(i.opcode,COPY_FREE_VARS|MAKE_CELL|RETURN_GENERATOR)||i.pre_fold_extra_instructions()!=0||i.local_policy.hidden_exception_owner_slots()==super::LocalPolicy::MAX_HIDDEN_EXCEPTION_OWNER_SLOTS)){return false;}
         for (l, location) in &self.provenance.setups {
-            let Some(&p) = self.label_index(l) else {
+            let Some(&p) = self.label_index(*l) else {
                 return false;
             };
             if start <= p && p <= end {
@@ -299,7 +303,7 @@ impl Certificate {
         let (c, m) = v.endpoint(self.condition, self.marker)?;
         let start = match self.anchor {
             Anchor::Entry => 0,
-            Anchor::Label(l) => *v.label_index(&l)?,
+            Anchor::Label(l) => *v.label_index(l)?,
             Anchor::Marker(c, m) => v.endpoint(c, m)?.1 + 1,
             Anchor::OriginalMarker(prior, marker) => {
                 // Repeated sequence predicates may have equal predecessor pairs.
@@ -568,8 +572,8 @@ impl FreshSingletonCertificate {
                 .count();
             let mut expected = Vec::new();
             for region in &self.manager_regions {
-                let begin = *view.label_position(&region.start)?;
-                let end = *view.label_position(&region.end)?;
+                let begin = *view.label_position(region.start)?;
+                let end = *view.label_position(region.end)?;
                 if begin <= position && position < end {
                     expected.push(region);
                 }
@@ -637,7 +641,7 @@ impl FallbackCertificate {
             return None;
         };
         let (after_condition, after_marker) = after.endpoint(condition, marker)?;
-        let after_start = *after.label_index(&anchor)?;
+        let after_start = *after.label_index(anchor)?;
         if after_start > after_condition {
             return None;
         }
@@ -941,7 +945,7 @@ impl View<'_> {
                 .hidden_exception_owner_slots()
                 != 0
             || self.provenance.setups.iter().any(|(label, _)| {
-                self.label_index(label)
+                self.label_index(*label)
                     .is_none_or(|&index| start <= index && index <= marker)
             })
             || !self.items[start..condition].iter().any(|item| {
@@ -1041,7 +1045,7 @@ impl View<'_> {
         }
         // Missing labels, hidden SETUP/POP cells, and unknown original entries fail closed.
         for (label, _) in &self.provenance.setups {
-            let position = *self.label_index(label)?;
+            let position = *self.label_index(*label)?;
             if start <= position && position <= condition {
                 return None;
             }
@@ -1051,7 +1055,7 @@ impl View<'_> {
             .removed_pop_block_boundaries
             .iter()
             .any(|label| {
-                self.label_index(label)
+                self.label_index(*label)
                     .is_none_or(|&position| start <= position && position <= condition)
             })
         {
@@ -1091,8 +1095,8 @@ impl View<'_> {
             }
             let mut current = Vec::new();
             for region in self.regions {
-                let begin = *self.label_position(&region.start)?;
-                let end = *self.label_position(&region.end)?;
+                let begin = *self.label_position(region.start)?;
+                let end = *self.label_position(region.end)?;
                 if begin <= position && position < end {
                     current.push(*region);
                 }
@@ -1138,7 +1142,7 @@ impl View<'_> {
         // No hidden SETUP/POP_BLOCK records or second true boundary may enter
         // the certificate, including aliases that only become adjacent later.
         for (label, _) in &self.provenance.setups {
-            let p = *self.label_index(label)?;
+            let p = *self.label_index(*label)?;
             if start <= p && p <= condition {
                 return None;
             }
@@ -1148,7 +1152,7 @@ impl View<'_> {
             .removed_pop_block_boundaries
             .iter()
             .all(|label| {
-                self.label_index(label)
+                self.label_index(*label)
                     .is_some_and(|&p| p < start || p > condition)
             })
         {
@@ -1222,8 +1226,8 @@ impl View<'_> {
             previous_instruction = Some(instruction);
             let mut covered = None;
             for region in self.regions {
-                let s = *self.label_position(&region.start)?;
-                let e = *self.label_position(&region.end)?;
+                let s = *self.label_position(region.start)?;
+                let e = *self.label_position(region.end)?;
                 if s <= pos && pos < e {
                     let fallback = region.is_scope_fallback && region.depth == 0;
                     // This authored singleton array has no erased or inserted records.
@@ -1371,12 +1375,12 @@ impl ManagerSetupCertificate {
             .count();
         let mut regions = Vec::new();
         for (index, region) in after.regions.iter().enumerate() {
-            let begin = *after.label_position(&region.start)?;
-            let end = *after.label_position(&region.end)?;
+            let begin = *after.label_position(region.start)?;
+            let end = *after.label_position(region.end)?;
             if begin <= position && position < end {
                 let (priority_start, priority_end) = match region.priority {
                     ExceptionRegionPriority::OriginalRange(start, end) => {
-                        (*after.label_position(&start)?, *after.label_position(&end)?)
+                        (*after.label_position(start)?, *after.label_position(end)?)
                     }
                     ExceptionRegionPriority::Resolved { start, end } => (start, end),
                 };
@@ -1420,8 +1424,8 @@ impl ManagerSetupCertificate {
             .iter()
             .filter(|item| matches!(item, Item::Instruction(_)))
             .count();
-        if !(*before.label_position(&region.start)? <= original_position
-            && original_position < *before.label_position(&region.end)?)
+        if !(*before.label_position(region.start)? <= original_position
+            && original_position < *before.label_position(region.end)?)
         {
             return None;
         }
@@ -1498,8 +1502,8 @@ impl ManagerSetupCertificate {
             .iter()
             .filter(|item| matches!(item, Item::Instruction(_)))
             .count();
-        if !(*view.label_position(&region.start)? <= position
-            && position < *view.label_position(&region.end)?)
+        if !(*view.label_position(region.start)? <= position
+            && position < *view.label_position(region.end)?)
         {
             return None;
         }
@@ -1591,12 +1595,12 @@ impl HandlerDispatchCertificate {
     fn owner_at(view: &View<'_>, position: usize) -> Option<ExceptionRegion> {
         let mut owner = None;
         for (order, region) in view.regions.iter().enumerate() {
-            let start = *view.label_position(&region.start)?;
-            let end = *view.label_position(&region.end)?;
+            let start = *view.label_position(region.start)?;
+            let end = *view.label_position(region.end)?;
             if start <= position && position < end {
                 let (start, end) = match region.priority {
                     ExceptionRegionPriority::OriginalRange(start, end) => {
-                        (*view.label_position(&start)?, *view.label_position(&end)?)
+                        (*view.label_position(start)?, *view.label_position(end)?)
                     }
                     ExceptionRegionPriority::Resolved { start, end } => (start, end),
                 };
@@ -1623,7 +1627,7 @@ impl HandlerDispatchCertificate {
 
         if !view.no_late_insertions_or_setups(start, condition)
             || view.provenance.setups.iter().any(|(label, _)| {
-                view.label_index(label)
+                view.label_index(*label)
                     .is_none_or(|position| start <= *position && *position <= condition)
             })
             || view
@@ -1631,7 +1635,7 @@ impl HandlerDispatchCertificate {
                 .removed_pop_block_boundaries
                 .iter()
                 .any(|label| {
-                    view.label_index(label)
+                    view.label_index(*label)
                         .is_none_or(|position| start <= *position && *position <= condition)
                 })
         {
@@ -1759,8 +1763,8 @@ impl FoldedAssertSuccessCertificate {
             .count();
         let mut owner = None;
         for region in view.regions {
-            let start = *view.label_position(&region.start)?;
-            let end = *view.label_position(&region.end)?;
+            let start = *view.label_position(region.start)?;
+            let end = *view.label_position(region.end)?;
             if start <= position && position < end {
                 if !region.is_scope_fallback
                     || region.depth != 0
@@ -1821,7 +1825,7 @@ impl FoldedAssertSuccessCertificate {
     }
 
     fn valid(&self, view: &View<'_>) -> Option<usize> {
-        let start = *view.label_index(&self.entry)?;
+        let start = *view.label_index(self.entry)?;
         if view.items.get(start..start + 3)?
             != [
                 Item::Label(self.entry),
@@ -2308,8 +2312,8 @@ impl FusionOwnerCertificates {
                     if !same_manager_region(original, &certificate.region) {
                         return None;
                     }
-                    let start = *view.label_position(&rebuilt.start)?;
-                    let end = *view.label_position(&rebuilt.end)?;
+                    let start = *view.label_position(rebuilt.start)?;
+                    let end = *view.label_position(rebuilt.end)?;
                     (start <= position && position < end).then_some(*rebuilt)
                 });
                 let Some(region) = candidates.next() else {
