@@ -4818,6 +4818,14 @@ impl Compiler<'_> {
         }
         if early_condition_truthiness(condition) == Some(true) {
             self.record_folded_value(condition)?;
+            if matches!(condition, Expr::BooleanLiteral(_)) {
+                // The removed filter jump still separates the original instruction arrays.
+                self.assembler
+                    .record_exception_owner_block_boundary(accepted);
+                self.assembler
+                    .set_location(self.source_location(condition.range()));
+                self.emit(NOP, 0, 0)?;
+            }
             return Ok(());
         }
         if let Expr::BoolOp(boolean) = condition

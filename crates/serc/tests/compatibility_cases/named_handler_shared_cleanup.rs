@@ -251,3 +251,54 @@ fn nested_named_handler_arms_share_the_original_cleanup() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn named_except_star_conditional_exits_copy_name_cleanup() {
+    for (filename, source) in [
+        (
+            "named_except_star_conditional_cleanup_copy_target.py",
+            r"async def run(work, choose, report):
+    try:
+        await work()
+    except* ValueError as group:
+        if choose(group):
+            report(group)
+        else:
+            assert len(group.exceptions) == 1
+    except* TypeError:
+        raise
+",
+        ),
+        (
+            "named_except_star_linear_cleanup_copy_control.py",
+            r"async def run(work, choose, report):
+    try:
+        await work()
+    except* ValueError as group:
+        report(group)
+        assert len(group.exceptions) == 1
+    except* TypeError:
+        raise
+",
+        ),
+        (
+            "named_except_star_elif_cleanup_copy_target.py",
+            r"async def run(work, choose, report):
+    try:
+        await work()
+    except* ValueError as group:
+        if choose(group, 0):
+            report(group, 0)
+        elif choose(group, 1):
+            report(group, 1)
+        else:
+            assert len(group.exceptions) == 1
+            report(group, 2)
+    except* TypeError:
+        raise
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

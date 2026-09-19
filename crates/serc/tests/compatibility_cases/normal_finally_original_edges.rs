@@ -1096,3 +1096,91 @@ fn matches_cpython_marshal_for_nested_finally_result_write() {
 "#;
     common::assert_matches_cpython_marshal(source, "normal_nested_finally_result_write_borrow.py");
 }
+
+#[test]
+fn matches_cpython_guarded_finally_original_normal_exits() {
+    for (filename, source) in [
+        (
+            "guarded_finally_unique_exit_async_target.py",
+            r"async def collect(task, poll, finish):
+    result = None
+    try:
+        await poll()
+        if task.done():
+            try:
+                result = task.result()
+            finally:
+                task.pending = None
+    except TimeoutError:
+        pass
+    finish(result)
+    return result
+",
+        ),
+        (
+            "guarded_finally_populated_exit_async_control.py",
+            r"async def collect(task, poll, finish):
+    result = None
+    try:
+        await poll()
+        if task.done():
+            try:
+                result = task.result()
+            finally:
+                task.pending = None
+            finish(result)
+    except TimeoutError:
+        pass
+    finish(result)
+    return result
+",
+        ),
+        (
+            "guarded_finally_unique_exit_nested_target.py",
+            r"def collect(available, ready, acquire, load, release, finish):
+    value = None
+    try:
+        value = ready()
+        if not available():
+            acquire()
+            try:
+                value = load()
+            finally:
+                if value:
+                    try:
+                        release()
+                    except OSError:
+                        pass
+    except RuntimeError:
+        return None
+    finish(value)
+    return value
+",
+        ),
+        (
+            "guarded_finally_populated_exit_nested_control.py",
+            r"def collect(available, ready, acquire, load, release, finish):
+    value = None
+    try:
+        value = ready()
+        if not available():
+            acquire()
+            try:
+                value = load()
+            finally:
+                if value:
+                    try:
+                        release()
+                    except OSError:
+                        pass
+            finish(value)
+    except RuntimeError:
+        return None
+    finish(value)
+    return value
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

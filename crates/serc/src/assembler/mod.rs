@@ -995,6 +995,90 @@ impl Assembler {
         })
     }
 
+    /// Certifies a guard-false donor beside a separate normal-finally exit.
+    ///
+    /// The two source labels alias an empty original array after exceptional cleanup.
+    /// Its unconditional predecessor threads through the array; the guard stays here.
+    pub(crate) fn original_guarded_finally_has_false_donor(
+        &self,
+        try_end: Label,
+        location: SourceLocation,
+    ) -> bool {
+        let items = self.linear_items();
+        let labels = items
+            .iter()
+            .rev()
+            .map_while(|item| match item {
+                Item::Label(label) => Some(*label),
+                Item::Instruction(_) => None,
+            })
+            .collect::<Vec<_>>();
+        if !labels.contains(&try_end)
+            || self.join_labels_have_authored_location(&labels)
+            || labels.iter().any(|label| {
+                self.folded_away_condition_targets.contains(label)
+                    || self.folded_away_loop_else_targets.contains(label)
+            })
+        {
+            return false;
+        }
+        let end = items.len() - labels.len();
+        let Some(start) = end.checked_sub(3) else {
+            return false;
+        };
+        let [
+            Item::Instruction(copy),
+            Item::Instruction(pop),
+            Item::Instruction(reraise),
+        ] = &items[start..end]
+        else {
+            return false;
+        };
+        if copy.opcode != COPY
+            || copy.operand() != Operand::Value(3)
+            || pop.opcode != POP_EXCEPT
+            || reraise.opcode != RERAISE
+            || reraise.operand() != Operand::Value(1)
+            || [copy, pop, reraise].iter().any(|instruction| {
+                instruction.location != SourceLocation::NONE
+                    || instruction.pre_fold_extra_instructions() != 0
+                    || instruction.local_policy.hidden_exception_owner_slots() != 0
+            })
+        {
+            return false;
+        }
+        let mut incoming = items.iter().filter_map(|item| match item {
+            Item::Instruction(instruction)
+                if matches!(instruction.operand(), Operand::Forward(label) | Operand::Backward(label)
+                    if labels.contains(&label)) => Some(instruction),
+            _ => None,
+        });
+        let (Some(guard), Some(cleanup), None) =
+            (incoming.next(), incoming.next(), incoming.next())
+        else {
+            return false;
+        };
+        is_conditional_jump(guard.opcode)
+            && guard.location == location
+            && location.line >= 0
+            && cleanup.opcode == JUMP_FORWARD
+            && cleanup.location.line >= 0
+            && guard.operand() != cleanup.operand()
+            && guard.depth_after().is_some()
+            && guard.depth_after() == cleanup.depth_after()
+            && [guard, cleanup].iter().all(|instruction| {
+                instruction.pre_fold_extra_instructions() == 0
+                    && instruction.local_policy.hidden_exception_owner_slots() == 0
+                    && instruction.exception_policy() == ExceptionPolicy::default()
+                    && !instruction.no_location_policy.preserves_location()
+                    && !instruction.fusion_policy.is_authored_break()
+                    && instruction.jump_policy.inline_small_exit()
+                    && matches!(instruction.operand(), Operand::Forward(label)
+                        if self.exception_owner_provenance.source_boundaries.contains(&label)
+                            && self.exception_owner_provenance.block_boundaries.contains(&label))
+            })
+    }
+
     /// Returns the sole conditional donor at a source-authored match failure join.
     pub(crate) fn original_match_failure_location(&self) -> Option<SourceLocation> {
         let end = self.original_match_join?;
@@ -1115,6 +1199,73 @@ impl Assembler {
             conditional_edges += 1;
         }
         conditional_edges > 0 && conditional_edges + usize::from(falls_through) > 1
+    }
+
+    /// Certifies an empty shared handler join with an authored unconditional predecessor.
+    ///
+    /// A final assertion may also enter through a conditional success edge. Every edge
+    /// must retain its original source boundary and have no omitted instruction slots.
+    pub(crate) fn at_original_shared_handler_join(&self) -> bool {
+        let items = self.linear_items();
+        let labels = items
+            .iter()
+            .rev()
+            .map_while(|item| match item {
+                Item::Label(label) => Some(*label),
+                Item::Instruction(_) => None,
+            })
+            .collect::<Vec<_>>();
+        if labels.is_empty()
+            || self.join_labels_have_authored_location(&labels)
+            || self.current_join_has_located_compacted_predecessor()
+            || labels.iter().any(|label| {
+                self.folded_away_condition_targets.contains(label)
+                    || self.folded_away_loop_else_targets.contains(label)
+            })
+        {
+            return false;
+        }
+        let Some(Item::Instruction(previous)) =
+            items.get(items.len().saturating_sub(labels.len() + 1))
+        else {
+            return false;
+        };
+        let falls_through = !ends_scope(previous.opcode) && !is_unconditional_jump(previous.opcode);
+        let mut incoming_edges = 0;
+        let mut has_unconditional_edge = false;
+        for item in items {
+            let Item::Instruction(instruction) = item else {
+                continue;
+            };
+            let target = match instruction.operand() {
+                Operand::Forward(target) | Operand::Backward(target)
+                    if labels.contains(&target) =>
+                {
+                    target
+                }
+                _ => continue,
+            };
+            if !(is_unconditional_jump(instruction.opcode)
+                || is_conditional_jump(instruction.opcode))
+                || !matches!(instruction.operand(), Operand::Forward(_))
+                || instruction.location.line < 0
+                || instruction.pre_fold_extra_instructions() != 0
+                || instruction.local_policy.hidden_exception_owner_slots() != 0
+                || !self
+                    .exception_owner_provenance
+                    .source_boundaries
+                    .contains(&target)
+                || !self
+                    .exception_owner_provenance
+                    .block_boundaries
+                    .contains(&target)
+            {
+                return false;
+            }
+            incoming_edges += 1;
+            has_unconditional_edge |= is_unconditional_jump(instruction.opcode);
+        }
+        has_unconditional_edge && incoming_edges + usize::from(falls_through) > 1
     }
 
     /// Records an original conditional target whose edge folded into fallthrough.

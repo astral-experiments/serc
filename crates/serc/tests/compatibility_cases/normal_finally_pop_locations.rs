@@ -353,3 +353,80 @@ fn preserves_absent_location_after_generator_else_loop_break() {
 ";
     common::assert_matches_cpython_marshal(source, "generator_else_while_break_local_finally.py");
 }
+
+#[test]
+fn retains_normal_finally_pop_before_nested_try_after_structured_cleanup() {
+    for (filename, source) in [
+        (
+            "normal_finally_nested_try_after_async_generator_cleanup.py",
+            r"async def target(stream, cleanup, finish):
+    failure = None
+    try:
+        try:
+            async for item in stream:
+                yield item
+        finally:
+            cleanup()
+    except BaseException as exc:
+        failure = exc
+        raise
+    finally:
+        try:
+            finish(failure)
+        except Exception:
+            pass
+",
+        ),
+        (
+            "normal_finally_nested_try_after_sync_manager_return.py",
+            r"def target(manager, consume, finish):
+    try:
+        with manager as value:
+            consume(value)
+            return True, None
+    except Exception as exc:
+        return False, exc
+    finally:
+        try:
+            finish()
+        except Exception:
+            pass
+",
+        ),
+        (
+            "normal_finally_nested_try_after_async_manager_return.py",
+            r"async def target(manager, work, finish):
+    try:
+        async with manager:
+            value = await work()
+            return value
+    except TimeoutError:
+        return None
+    except RuntimeError:
+        raise
+    except Exception:
+        return None
+    finally:
+        try:
+            finish()
+        except Exception:
+            pass
+",
+        ),
+        (
+            "normal_finally_linear_cleanup_after_manager_return_control.py",
+            r"def target(manager, consume, finish):
+    try:
+        with manager as value:
+            consume(value)
+            return True, None
+    except Exception as exc:
+        return False, exc
+    finally:
+        finish()
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
