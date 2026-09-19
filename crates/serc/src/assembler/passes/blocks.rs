@@ -15,6 +15,23 @@ use crate::target::opcodes::{
 };
 use crate::target::{is_conditional_jump, is_unconditional_jump};
 
+/// Retains exactly the incoming-edge information used by original-line propagation.
+#[derive(Clone, Copy)]
+enum LocationPredecessors {
+    None,
+    One(usize),
+    Multiple,
+}
+
+impl LocationPredecessors {
+    fn add(&mut self, predecessor: usize) {
+        *self = match *self {
+            Self::None => Self::One(predecessor),
+            Self::One(_) | Self::Multiple => Self::Multiple,
+        };
+    }
+}
+
 /// Recognizes an ordinary jump that retains CPython's interrupt check before layout.
 fn has_jump_eval_check(instruction: &Instruction) -> bool {
     instruction.opcode == JUMP_BACKWARD
@@ -2816,6 +2833,14 @@ impl OptimizationPipeline {
     // can therefore retain a line inherited while it still had one predecessor. Capture the
     // original relation before threading, including omitted NOP and folded-slot evidence.
     pub(in crate::assembler) fn capture_original_location_absence(&self) -> FxHashSet<Label> {
+        // Without jumps, an instruction has at most its physical predecessor.
+        // No sole-predecessor chain can reach the shared entry that proves absence.
+        if !self.graph.iter_items().any(|item| {
+            matches!(item, Item::Instruction(instruction)
+                if matches!(instruction.operand(), Operand::Forward(_) | Operand::Backward(_)))
+        }) {
+            return FxHashSet::default();
+        }
         let mut instructions = Vec::new();
         let mut label_entries = FxHashMap::default();
         let mut pending_labels = Vec::new();
@@ -2836,18 +2861,18 @@ impl OptimizationPipeline {
                 }
             }
         }
-        let mut predecessors = vec![Vec::new(); instructions.len()];
+        let mut predecessors = vec![LocationPredecessors::None; instructions.len()];
         for (index, instruction) in instructions.iter().enumerate() {
             if index > 0 {
                 let previous = instructions[index - 1];
                 if !ends_scope(previous.opcode) && !is_unconditional_jump(previous.opcode) {
-                    predecessors[index].push(index - 1);
+                    predecessors[index].add(index - 1);
                 }
             }
             if let Operand::Forward(label) | Operand::Backward(label) = instruction.operand()
                 && let Some(&target) = label_entries.get(&label)
             {
-                predecessors[target].push(index);
+                predecessors[target].add(index);
             }
         }
         // An entry with no predecessor, a cycle, or hidden original instructions is unknown.
@@ -2867,9 +2892,10 @@ impl OptimizationPipeline {
                 }
                 visited[entry] = start;
                 path.push(entry);
-                match predecessors[entry].as_slice() {
-                    [previous] => entry = *previous,
-                    incoming => break incoming.len() > 1,
+                match predecessors[entry] {
+                    LocationPredecessors::One(previous) => entry = previous,
+                    LocationPredecessors::None => break false,
+                    LocationPredecessors::Multiple => break true,
                 }
             };
             absence[start] = Some(absent);

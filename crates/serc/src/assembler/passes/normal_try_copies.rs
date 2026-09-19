@@ -129,10 +129,11 @@ impl OptimizationPipeline {
             BUILD_LIST, LOAD_CONST, LOAD_GLOBAL, NOT_TAKEN, STORE_FAST, SWAP,
         };
 
-        if !self
-            .exception_owner_provenance
-            .normal_try_copy_steps
-            .is_empty()
+        if !self.graph.features().has_forward_jump()
+            || !self
+                .exception_owner_provenance
+                .normal_try_copy_steps
+                .is_empty()
             || !self
                 .exception_owner_provenance
                 .normal_try_copy_blocks
@@ -1689,6 +1690,10 @@ impl OptimizationPipeline {
     /// the original `POP_BLOCK` and Pass slots lets the existing copier carry their labels
     /// and exception ranges through the same ascending, once-per-round copy schedule.
     pub(in crate::assembler) fn prepare_normal_try_copy_plan(&mut self) {
+        // Prefix restoration and every selected cleanup require a forward jump.
+        if !self.graph.features().has_forward_jump() {
+            return;
+        }
         let pass_prefixes = self.restore_normal_try_pass_prefixes();
         let mut discard_joins = self.original_discard_try_exit_joins();
         let handler_joins = self.original_discard_handler_exit_joins();

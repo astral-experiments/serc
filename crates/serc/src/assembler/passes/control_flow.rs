@@ -2795,6 +2795,10 @@ impl OptimizationPipeline {
 
     /// Preserves original empty jump-head boundaries for the final borrowing traversal.
     pub(in crate::assembler) fn record_borrow_empty_jump_heads(&mut self) {
+        // Every admitted original array ends in a forward unconditional jump.
+        if !self.graph.features().has_forward_jump() {
+            return;
+        }
         let graph = &self.graph;
         let order = graph.order();
         let positions = order
@@ -3677,6 +3681,10 @@ impl OptimizationPipeline {
 
     /// Captures shared original jump arrays before threading or copying can merge their entries.
     pub(in crate::assembler) fn record_shared_unlocated_jump_entries(&mut self) {
+        // Every admitted original array ends in a forward unconditional jump.
+        if !self.graph.features().has_forward_jump() {
+            return;
+        }
         let reachable = self.graph.reachable_blocks(&self.exception_regions);
         let mut predecessors = FxHashMap::<Label, usize>::default();
         for block in self.graph.order().iter().copied() {

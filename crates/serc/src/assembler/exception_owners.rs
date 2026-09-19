@@ -1,3 +1,4 @@
+use std::cell::OnceCell;
 use std::cmp::Reverse;
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -501,6 +502,12 @@ pub(super) struct UncompactedConditionalArray {
     source_entry: Option<Label>,
 }
 
+/// Whole-input lookup tables shared by conditional-array certificates.
+struct UncompactedPrefixIndexes {
+    positions: FxHashMap<Label, usize>,
+    targets: FxHashSet<Label>,
+}
+
 impl ExceptionOwnerProvenance {
     /// Retires an async entry before erased labels can migrate to another live array.
     pub(super) fn retire_async_with_setup(&mut self, label: Label) {
@@ -697,6 +704,7 @@ impl ExceptionOwnerProvenance {
         use crate::target::opcodes::{POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE};
 
         self.capture_retained_setup_value_arrays(items);
+        let indexes = OnceCell::new();
         let mut begin = 0;
         for (index, item) in items.iter().enumerate() {
             let Item::Instruction(instruction) = item else {
@@ -713,15 +721,15 @@ impl ExceptionOwnerProvenance {
                     && matches!(items[end], Item::Instruction(marker) if marker.opcode == NOT_TAKEN)
                 {
                     let prefix = &items[begin..=end];
-                    let certified = if self.uncompacted_prefix(prefix, items, 0, false) {
+                    let certified = if self.uncompacted_prefix(prefix, items, &indexes, 0, false) {
                         Some((prefix, None, None))
                     } else if let Some((entry, prefix, restore_count)) =
                         self.comprehension_normal_prefix(prefix, items)
-                        && self.uncompacted_prefix(prefix, items, restore_count, false)
+                        && self.uncompacted_prefix(prefix, items, &indexes, restore_count, false)
                     {
                         Some((prefix, Some(entry), None))
                     } else if let Some((entry, prefix)) = self.original_source_prefix(prefix)
-                        && self.uncompacted_prefix(prefix, items, 0, true)
+                        && self.uncompacted_prefix(prefix, items, &indexes, 0, true)
                     {
                         Some((prefix, None, Some(entry)))
                     } else {
@@ -942,6 +950,7 @@ impl ExceptionOwnerProvenance {
         &self,
         prefix: &[Item],
         all: &[Item],
+        indexes: &OnceCell<UncompactedPrefixIndexes>,
         comprehension_restore_count: usize,
         source_head: bool,
     ) -> bool {
@@ -1023,30 +1032,33 @@ impl ExceptionOwnerProvenance {
         } else if !has_original_target && comprehension_restore_count == 0 && !empty_class_success {
             return false;
         }
-        let positions = all
-            .iter()
-            .enumerate()
-            .filter_map(|(index, item)| {
-                if let Item::Label(label) = item {
-                    Some((*label, index))
-                } else {
-                    None
-                }
-            })
-            .collect::<FxHashMap<_, _>>();
-        let targets = all
-            .iter()
-            .filter_map(|item| {
-                if let Item::Instruction(instruction) = item
-                    && let Operand::Forward(label) | Operand::Backward(label) =
-                        instruction.operand()
-                {
-                    Some(label)
-                } else {
-                    None
-                }
-            })
-            .collect::<FxHashSet<_>>();
+        let UncompactedPrefixIndexes { positions, targets } = indexes.get_or_init(|| {
+            let positions = all
+                .iter()
+                .enumerate()
+                .filter_map(|(index, item)| {
+                    if let Item::Label(label) = item {
+                        Some((*label, index))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let targets = all
+                .iter()
+                .filter_map(|item| {
+                    if let Item::Instruction(instruction) = item
+                        && let Operand::Forward(label) | Operand::Backward(label) =
+                            instruction.operand()
+                    {
+                        Some(label)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            UncompactedPrefixIndexes { positions, targets }
+        });
         let mut instructions = Vec::new();
         let mut labels = FxHashSet::default();
         let mut from_import_members = FxHashSet::default();
