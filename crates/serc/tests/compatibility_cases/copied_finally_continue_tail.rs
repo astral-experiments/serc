@@ -367,3 +367,50 @@ fn sync_continue_copies_preserve_nested_pass_cleanup() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_closed_recovery_none_conjunction_continues() {
+    for (filename, source) in [
+        (
+            "continued_coroutine_closed_recovery_none_and_raise_target.py",
+            r"async def run(values, task, active_error):
+    for value in values:
+        error = None
+        try:
+            await work(value)
+        except RuntimeError as exc:
+            continue
+        finally:
+            if task is not None:
+                try:
+                    await task()
+                except RuntimeError as exc:
+                    error = exc
+            if error is not None and active_error is None:
+                raise error
+",
+        ),
+        (
+            "continued_async_generator_none_and_cleanup_target.py",
+            r"async def watch(process, retry):
+    while True:
+        try:
+            if retry:
+                continue
+            yield process
+        except OSError:
+            await pause()
+        finally:
+            if process is not None and process.returncode is None:
+                process.terminate()
+                try:
+                    await process.wait()
+                except RuntimeError:
+                    process.kill()
+                    await process.wait()
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

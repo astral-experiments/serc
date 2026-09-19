@@ -273,6 +273,72 @@ fn block_is_local_raise(items: &[Item], original_nop_targets: &FxHashSet<Label>)
         && instructions.next().is_none()
 }
 
+/// Recognizes a named-handler cleanup followed by a short, located value return.
+fn named_cleanup_has_short_return(graph: &BlockGraph, target: BasicBlockId) -> bool {
+    let cleanup = graph[target]
+        .items()
+        .iter()
+        .filter_map(|item| match item {
+            Item::Instruction(instruction) => Some(instruction),
+            Item::Label(_) => None,
+        })
+        .collect::<Vec<_>>();
+    let [pop, value, store, delete, jump] = cleanup.as_slice() else {
+        return false;
+    };
+    if pop.opcode != POP_EXCEPT
+        || value.opcode != LOAD_CONST
+        || store.opcode != STORE_FAST
+        || delete.opcode != DELETE_FAST
+        || store.operand() != delete.operand()
+        || jump.opcode != JUMP_FORWARD
+        || cleanup.iter().any(|instruction| {
+            instruction.pre_fold_extra_instructions() != 0
+                || instruction.local_policy.hidden_exception_owner_slots() != 0
+        })
+    {
+        return false;
+    }
+    let Operand::Forward(label) = jump.operand() else {
+        return false;
+    };
+    let Some(successor) = graph.label_block(label) else {
+        return false;
+    };
+    let mut returned = graph[successor]
+        .items()
+        .iter()
+        .filter_map(|item| match item {
+            Item::Instruction(instruction) => Some(instruction),
+            Item::Label(_) => None,
+        });
+    let Some(mut value) = returned.next() else {
+        return false;
+    };
+    if value.opcode == NOP {
+        if value.pre_fold_extra_instructions() != 0
+            || value.local_policy.hidden_exception_owner_slots() != 0
+        {
+            return false;
+        }
+        let Some(next) = returned.next() else {
+            return false;
+        };
+        value = next;
+    }
+    let Some(exit) = returned.next() else {
+        return false;
+    };
+    matches!(value.opcode, LOAD_FAST | LOAD_CONST)
+        && exit.opcode == RETURN_VALUE
+        && returned.next().is_none()
+        && [value, exit].iter().all(|instruction| {
+            instruction.location.line >= 0
+                && instruction.pre_fold_extra_instructions() == 0
+                && instruction.local_policy.hidden_exception_owner_slots() == 0
+        })
+}
+
 // Every restored POP_BLOCK is outside ordinary handlers but inside the scope fallback.
 // Reapply its exact one-slot hole after all source and copied regions have been formed.
 fn restore_normal_try_pop_holes(
@@ -3583,6 +3649,34 @@ impl OptimizationPipeline {
                     });
             let inline_no_location_block =
                 !source_has_fallthrough && target_is_no_location_no_fallthrough;
+            if !planned_copy
+                && inline_no_location_block
+                && target_chain_end == target_position
+                && graph[source].last_instruction().is_some_and(|jump| {
+                    jump.opcode == JUMP_FORWARD
+                        // Unlocated cleanup continuations retain their original copy order
+                        // so removing one predecessor can still locate the shared cleanup.
+                        && jump.location.line >= 0
+                        // Retained authored line slots keep their original copy order.
+                        && !jump.jump_policy.retains_nop_for(jump.operand())
+                        && jump.pre_fold_extra_instructions() > 0
+                        && jump.local_policy.hidden_exception_owner_slots() == 0
+                })
+                && named_cleanup_has_short_return(graph, target)
+                // Ordinary try exits have a separately recorded POP_BLOCK/copy order.
+                // Their retained entry labels must not use the branch-join rule.
+                && !self
+                    .exception_owner_provenance
+                    .normal_try_exits
+                    .iter()
+                    .any(|(entry, _)| graph.label_block(*entry) == Some(source))
+            {
+                // Threading bypassed an original join before this cleanup. Its return is
+                // appended before that earlier edge can copy the expanded named cleanup.
+                // Direct predecessors still copy here; the existing queue revisits this
+                // edge after the cleanup's own return copy and checks its new size/location.
+                continue;
+            }
             if planned_copy {
                 assert!(
                     inline_small_exit || inline_no_location_block,

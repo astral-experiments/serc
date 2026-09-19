@@ -255,3 +255,141 @@ fn matches_cpython_nested_manager_terminating_handler_return_copies() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_threaded_named_handler_small_return_copies() {
+    for (filename, source) in [
+        (
+            "named_handler_direct_cleanup_small_return_control.py",
+            r"def recover(fetch, report, choose):
+    result = None
+    try:
+        result = fetch()
+    except Exception as error:
+        if choose:
+            report(error)
+        else:
+            report(error)
+    return result
+",
+        ),
+        (
+            "named_handler_inherited_nested_if_call_return_control.py",
+            r"def update(callback, report, types, state, displayed):
+    if displayed:
+        try:
+            callback()
+        except Exception as error:
+            if types:
+                matches = [index for index, kind in enumerate(types) if isinstance(error, kind)]
+                if matches:
+                    state[0] = matches[0] + 1
+                else:
+                    report(error)
+            else:
+                report(error)
+    return finish(displayed)
+",
+        ),
+        (
+            "named_handler_inherited_nested_if_small_return_target.py",
+            r"def update(callback, report, types, state, displayed):
+    if displayed:
+        try:
+            callback()
+        except Exception as error:
+            if types:
+                matches = [index for index, kind in enumerate(types) if isinstance(error, kind)]
+                if matches:
+                    state[0] = matches[0] + 1
+                else:
+                    report(error)
+            else:
+                report(error)
+    return displayed
+",
+        ),
+        (
+            "named_handler_nested_elif_call_return_control.py",
+            r"async def recover(fetch, report, allow_missing):
+    result = None
+    try:
+        result = await fetch()
+    except Exception as error:
+        if error.status == 404:
+            report(error)
+        elif error.status == 403:
+            if allow_missing:
+                report(error)
+            else:
+                report(error)
+                raise
+        else:
+            report(error)
+            raise error
+    return finish(result)
+",
+        ),
+        (
+            "named_handler_nested_elif_small_return_target.py",
+            r"async def recover(fetch, report, allow_missing):
+    result = None
+    try:
+        result = await fetch()
+    except Exception as error:
+        if error.status == 404:
+            report(error)
+        elif error.status == 403:
+            if allow_missing:
+                report(error)
+            else:
+                report(error)
+                raise
+        else:
+            report(error)
+            raise error
+    return result
+",
+        ),
+        (
+            "named_handler_nested_try_call_return_control.py",
+            r"def recover(fetch, fallback, report, allow_fallback):
+    try:
+        return fetch()
+    except Exception as error:
+        if allow_fallback:
+            request = error.args
+            try:
+                result = fallback(request)
+                assert result is not None
+                return result
+            except Exception as nested_error:
+                report(nested_error)
+        else:
+            report(error)
+    return finish(None)
+",
+        ),
+        (
+            "named_handler_nested_try_small_return_target.py",
+            r"def recover(fetch, fallback, report, allow_fallback):
+    try:
+        return fetch()
+    except Exception as error:
+        if allow_fallback:
+            request = error.args
+            try:
+                result = fallback(request)
+                assert result is not None
+                return result
+            except Exception as nested_error:
+                report(nested_error)
+        else:
+            report(error)
+    return None
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

@@ -109,3 +109,65 @@ fn sync_with_one_fallthrough_two_arms_control() {
 ";
     common::assert_matches_cpython_marshal(source, "sync_with_one_fallthrough_two_arms_control.py");
 }
+
+#[test]
+fn matches_cpython_original_manager_break_donor_joins() {
+    for (filename, source) in [
+        (
+            "manager_break_nested_assignment_donor_target.py",
+            r"def run(values, outer, inner, state):
+    for value in values:
+        with outer(value), inner(value):
+            if not value:
+                break
+            else:
+                state.result = value
+    return state
+",
+        ),
+        (
+            "manager_continue_nested_assignment_donor_control.py",
+            r"def run(values, outer, inner, state):
+    for value in values:
+        with outer(value), inner(value):
+            if not value:
+                continue
+            else:
+                state.result = value
+    return state
+",
+        ),
+        (
+            "manager_break_chained_call_donor_target.py",
+            r"def send(values, manager):
+    for value in values:
+        with manager(value):
+            if value.ready:
+                return value.result
+            elif value.retry:
+                retry(value)
+            else:
+                report(value)
+                break
+    return None
+",
+        ),
+        (
+            "manager_return_chained_call_donor_control.py",
+            r"def send(values, manager):
+    for value in values:
+        with manager(value):
+            if value.ready:
+                return value.result
+            elif value.retry:
+                retry(value)
+            else:
+                report(value)
+                return None
+    return None
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

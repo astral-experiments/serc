@@ -125,3 +125,92 @@ fn matches_cpython_marshal_for_conditional_finally_break_ordinary_continuations(
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_marshal_for_guarded_try_finally_iterator_breaks() {
+    for (filename, source) in [
+        (
+            "guarded_body_and_handler_break_none_guard.py",
+            r"def connect(resources, limit, ping):
+    last_error = None
+    for attempt, resource in enumerate(resources):
+        try:
+            ping(resource)
+            last_error = None
+            break
+        except Exception as error:
+            last_error = error
+            if attempt == limit:
+                break
+        finally:
+            if resource is not None:
+                try:
+                    resource.close()
+                except Exception:
+                    pass
+    if last_error is not None:
+        raise last_error
+    return True
+",
+        ),
+        (
+            "guarded_continue_cleanup_control.py",
+            r"def visit(resources, perform):
+    count = 0
+    for resource in resources:
+        try:
+            if perform(resource):
+                continue
+            count += 1
+        finally:
+            if resource is not None:
+                try:
+                    resource.close()
+                except Exception:
+                    pass
+    return count
+",
+        ),
+        (
+            "guarded_handler_break_call_guard.py",
+            r"def transfer(resource, attempts, limit, perform, already_done):
+    last_error = None
+    for attempt in attempts:
+        try:
+            perform()
+            return
+        except Exception as error:
+            if already_done(error):
+                return
+            last_error = error
+            if attempt == limit:
+                break
+        finally:
+            if resource.exists():
+                try:
+                    resource.close()
+                except OSError:
+                    pass
+    assert last_error is not None
+    raise last_error
+",
+        ),
+        (
+            "guarded_return_cleanup_control.py",
+            r"def first(resources):
+    for resource in resources:
+        try:
+            return resource
+        finally:
+            if resource is not None:
+                try:
+                    resource.close()
+                except Exception:
+                    pass
+    return None
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

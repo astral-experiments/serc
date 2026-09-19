@@ -127,3 +127,87 @@ fn matches_cpython_discarded_if_expression_exit_copies() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_terminal_final_else_name_if_expression_assignments() {
+    for (filename, source) in [
+        (
+            "terminal_final_else_local_ifexp_assignment.py",
+            r"def target(enabled, preferred, fallback):
+    if enabled:
+        result = preferred
+    else:
+        result = fallback if fallback else None
+",
+        ),
+        (
+            "terminal_final_else_module_ifexp_assignment.py",
+            r"if checking:
+    class Selected(Base):
+        pass
+else:
+    Selected = Fast if available else Slow
+",
+        ),
+        (
+            "terminal_tested_arm_name_ifexp_control.py",
+            r"def target(enabled, choose, left, right):
+    if enabled:
+        result = left if choose else right
+    else:
+        fallback()
+",
+        ),
+        (
+            "terminal_direct_name_ifexp_control.py",
+            r"def target(choose, left, right):
+    result = left if choose else right
+",
+        ),
+        (
+            "terminal_nested_final_else_name_ifexp.py",
+            r"def target(outer, inner, choose, left, right):
+    if outer:
+        if inner:
+            fallback()
+        else:
+            result = left if choose else right
+    else:
+        finish()
+",
+        ),
+        (
+            "terminal_nested_tested_name_ifexp_control.py",
+            r"def target(outer, inner, choose, left, right):
+    if outer:
+        fallback()
+    else:
+        if inner:
+            result = left if choose else right
+        else:
+            finish()
+",
+        ),
+        (
+            "nonterminal_final_else_name_ifexp_control.py",
+            r"def target(enabled, choose, left, right):
+    if enabled:
+        fallback()
+    else:
+        result = left if choose else right
+    finish()
+",
+        ),
+        (
+            "terminal_final_else_attribute_ifexp_control.py",
+            r"def target(holder, enabled, choose, left, right):
+    if enabled:
+        fallback()
+    else:
+        holder.value = left if choose else right
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

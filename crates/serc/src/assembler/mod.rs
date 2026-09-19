@@ -5309,6 +5309,330 @@ impl Assembler {
             .extend(labels.into_iter().map(|label| (label, location)));
     }
 
+    /// Proves the three exits of a guarded, pass-only handler share an ownerless iterator discard.
+    fn is_guarded_try_iterator_break(
+        &self,
+        items: &[Item],
+        jump: Instruction,
+        target: Label,
+        named_handler: bool,
+    ) -> bool {
+        let (prefix, unwind) = if named_handler {
+            let (Some(prefix), Some(unwind)) = (items.get(..5), items.get(5..)) else {
+                return false;
+            };
+            (Some(prefix), unwind)
+        } else {
+            (None, items)
+        };
+        let [Item::Label(_), Item::Instruction(load_guard), ..] = unwind else {
+            return false;
+        };
+        let (condition, marker, guard_call, cleanup) = match unwind {
+            [
+                Item::Label(_),
+                Item::Instruction(_),
+                Item::Instruction(condition),
+                Item::Instruction(marker),
+                cleanup @ ..,
+            ] if condition.opcode == POP_JUMP_IF_NONE => (condition, marker, None, cleanup),
+            [
+                Item::Label(_),
+                Item::Instruction(_),
+                Item::Instruction(method),
+                Item::Instruction(call),
+                Item::Instruction(boolean),
+                Item::Instruction(condition),
+                Item::Instruction(marker),
+                cleanup @ ..,
+            ] => (condition, marker, Some((method, call, boolean)), cleanup),
+            _ => return false,
+        };
+        let [
+            Item::Label(body),
+            Item::Label(_),
+            Item::Instruction(try_nop),
+            Item::Label(_),
+            Item::Label(try_start),
+            Item::Instruction(load_receiver),
+            Item::Instruction(method),
+            Item::Instruction(call),
+            Item::Instruction(discard_call),
+            Item::Label(try_end),
+            Item::Instruction(normal_jump),
+            Item::Label(handler),
+            Item::Instruction(push_exception),
+            Item::Instruction(load_type),
+            Item::Instruction(check),
+            Item::Instruction(handler_condition),
+            Item::Label(_),
+            Item::Instruction(handler_marker),
+            Item::Label(handler_body),
+            Item::Instruction(discard_exception),
+            Item::Label(pass),
+            Item::Label(handler_end),
+            Item::Instruction(pop_handler),
+            Item::Instruction(handled_jump),
+            Item::Label(reraise),
+            Item::Instruction(reraise_unmatched),
+            Item::Label(reraise_end),
+            Item::Label(handler_cleanup),
+            Item::Instruction(copy_exception),
+            Item::Instruction(pop_cleanup),
+            Item::Instruction(reraise_cleanup),
+            Item::Label(try_join),
+            Item::Label(join),
+            Item::Instruction(discard_iterator),
+            Item::Instruction(last),
+        ] = cleanup
+        else {
+            return false;
+        };
+        // The producer admits this extension only for one ordinary synchronous loop,
+        // with no enclosing owner. Its iterator is the sole remaining stack value.
+        if condition.depth_after() != Some(1)
+            || *last != jump
+            || !matches!(load_guard.operand(), Operand::Value(_))
+            || !matches!(method.operand(), Operand::Value(argument) if argument & 1 != 0)
+            || !matches!(load_type.operand(), Operand::Value(argument) if argument & 1 == 0)
+            || load_guard.location.line < 0
+            || condition.location.line != load_guard.location.line
+            || marker.location != condition.location
+            || try_nop.location.line <= condition.location.line
+            || call.location.line <= try_nop.location.line
+            || load_receiver.location.line != call.location.line
+            || method.location.line != call.location.line
+            || discard_call.location != call.location
+            || normal_jump.location != call.location
+            || load_type.location.line <= call.location.line
+            || check.location.line != load_type.location.line
+            || handler_condition.location != check.location
+            || handler_marker.location != check.location
+            || discard_exception.location != check.location
+            || reraise_unmatched.location != check.location
+            || pop_handler.location.line <= check.location.line
+            || handled_jump.location != pop_handler.location
+            || try_nop.location.end_line != pop_handler.location.end_line
+            || check.location.end_line != pop_handler.location.end_line
+            || [
+                push_exception,
+                copy_exception,
+                pop_cleanup,
+                reraise_cleanup,
+                discard_iterator,
+                last,
+            ]
+            .iter()
+            .any(|instruction| instruction.location != SourceLocation::NONE)
+        {
+            return false;
+        }
+        let mut expected_load = Instruction::new(
+            LOAD_FAST,
+            load_guard.operand(),
+            load_guard.location,
+            Some(2),
+        );
+        expected_load.local_policy = LocalPolicy::for_load(named_handler, false);
+        if *load_guard != expected_load {
+            return false;
+        }
+        let mut expected_condition = Instruction::new(
+            if guard_call.is_some() {
+                POP_JUMP_IF_FALSE
+            } else {
+                POP_JUMP_IF_NONE
+            },
+            Operand::Forward(*join),
+            condition.location,
+            Some(1),
+        );
+        let mut expected_marker =
+            Instruction::new(NOT_TAKEN, Operand::Value(0), marker.location, Some(1));
+        if let Some((guard_method, guard_call, boolean)) = guard_call {
+            if !matches!(guard_method.operand(), Operand::Value(argument) if argument & 1 != 0)
+                || guard_method.location.line != condition.location.line
+                || guard_call.location != condition.location
+                || boolean.location != condition.location
+                || *guard_method
+                    != Instruction::new(
+                        LOAD_ATTR,
+                        guard_method.operand(),
+                        guard_method.location,
+                        Some(3),
+                    )
+                || *guard_call
+                    != Instruction::new(
+                        crate::target::opcodes::CALL,
+                        Operand::Value(0),
+                        guard_call.location,
+                        Some(2),
+                    )
+                || *boolean
+                    != Instruction::new(TO_BOOL, Operand::Value(0), boolean.location, Some(2))
+            {
+                return false;
+            }
+            expected_marker.set_exception_policy(ExceptionPolicy::NoneDynamicCondition);
+        } else {
+            expected_condition
+                .local_policy
+                .add_hidden_exception_owner_slots(3);
+            expected_marker.set_exception_policy(ExceptionPolicy::NonePresent);
+        }
+        if *condition != expected_condition || *marker != expected_marker {
+            return false;
+        }
+        // Construct every original record explicitly. This rejects copied instructions,
+        // alternate stack effects, hidden slots, and pre-existing copy permissions.
+        for (instruction, opcode, operand, depth) in [
+            (try_nop, NOP, Operand::Value(0), 1),
+            (load_receiver, LOAD_FAST, load_guard.operand(), 2),
+            (method, LOAD_ATTR, method.operand(), 3),
+            (call, crate::target::opcodes::CALL, Operand::Value(0), 2),
+            (discard_call, POP_TOP, Operand::Value(0), 1),
+            (normal_jump, JUMP_FORWARD, Operand::Forward(*try_join), 1),
+            (push_exception, PUSH_EXC_INFO, Operand::Value(0), 3),
+            (load_type, LOAD_GLOBAL, load_type.operand(), 4),
+            (check, CHECK_EXC_MATCH, Operand::Value(0), 4),
+            (
+                handler_condition,
+                POP_JUMP_IF_FALSE,
+                Operand::Forward(*reraise),
+                3,
+            ),
+            (handler_marker, NOT_TAKEN, Operand::Value(0), 3),
+            (discard_exception, POP_TOP, Operand::Value(0), 2),
+            (pop_handler, POP_EXCEPT, Operand::Value(0), 1),
+            (handled_jump, JUMP_FORWARD, Operand::Forward(*try_join), 1),
+            (reraise_unmatched, RERAISE, Operand::Value(0), 1),
+            (copy_exception, COPY, Operand::Value(3), 5),
+            (pop_cleanup, POP_EXCEPT, Operand::Value(0), 4),
+            (reraise_cleanup, RERAISE, Operand::Value(1), 1),
+            (discard_iterator, POP_TOP, Operand::Value(0), 0),
+            (last, JUMP_FORWARD, Operand::Forward(target), 0),
+        ] {
+            let mut expected = Instruction::new(opcode, operand, instruction.location, Some(depth));
+            if std::ptr::eq(instruction, try_nop) {
+                expected.set_exception_policy(ExceptionPolicy::AlwaysUnchanged);
+            } else if std::ptr::eq(instruction, load_receiver) {
+                expected.local_policy = expected_load.local_policy;
+            } else if std::ptr::eq(instruction, normal_jump)
+                || std::ptr::eq(instruction, handled_jump)
+            {
+                expected.jump_policy.prevent_small_exit_inlining();
+            } else if std::ptr::eq(instruction, last) {
+                expected.fusion_policy.mark_authored_break();
+                expected.jump_policy.prevent_threading_target();
+            }
+            if *instruction != expected {
+                return false;
+            }
+        }
+        if let Some(prefix) = prefix {
+            let [
+                Item::Label(_),
+                Item::Instruction(pop),
+                Item::Instruction(none),
+                Item::Instruction(store),
+                Item::Instruction(delete),
+            ] = prefix
+            else {
+                return false;
+            };
+            if pop.location.line < 0
+                || !matches!(none.operand(), Operand::Value(_))
+                || !matches!(store.operand(), Operand::Value(_))
+            {
+                return false;
+            }
+            for (instruction, opcode, operand, depth) in [
+                (pop, POP_EXCEPT, Operand::Value(0), 1),
+                (none, LOAD_CONST, none.operand(), 2),
+                (store, STORE_FAST, store.operand(), 1),
+                (delete, DELETE_FAST, store.operand(), 1),
+            ] {
+                if *instruction != Instruction::new(opcode, operand, pop.location, Some(depth)) {
+                    return false;
+                }
+            }
+        }
+        let labels: Vec<_> = items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Label(label) => Some(*label),
+                Item::Instruction(_) => None,
+            })
+            .collect();
+        if labels.iter().copied().collect::<FxHashSet<_>>().len() != labels.len()
+            || labels.contains(&target)
+            || [body, handler_body, try_join, join]
+                .into_iter()
+                .any(|label| {
+                    !self
+                        .exception_owner_provenance
+                        .source_boundaries
+                        .contains(label)
+                        || !self
+                            .exception_owner_provenance
+                            .block_boundaries
+                            .contains(label)
+                })
+            || labels.iter().any(|label| {
+                self.borrow_block_aliases.contains(label)
+                    || self.preserved_block_boundaries.contains(label)
+                    || self.original_nop_targets.contains(label) != (label == pass)
+                    || self
+                        .exception_owner_provenance
+                        .omitted_nop_counts
+                        .get(label)
+                        .copied()
+                        != (label == pass).then_some(1)
+            })
+        {
+            return false;
+        }
+        let expected_regions = [
+            (*try_start, *try_end, *handler, 1, false),
+            (*handler, *handler_end, *handler_cleanup, 2, true),
+            (*reraise, *reraise_end, *handler_cleanup, 2, true),
+        ];
+        let regions: Vec<_> = self
+            .exception_regions
+            .iter()
+            .filter(|region| {
+                labels.contains(&region.start)
+                    || labels.contains(&region.end)
+                    || labels.contains(&region.target)
+            })
+            .collect();
+        if regions.len() != expected_regions.len()
+            || expected_regions.iter().any(|expected| {
+                regions
+                    .iter()
+                    .filter(|region| {
+                        !region.is_scope_fallback
+                            && (
+                                region.start,
+                                region.end,
+                                region.target,
+                                region.depth,
+                                region.preserve_lasti,
+                            ) == *expected
+                    })
+                    .count()
+                    != 1
+            })
+        {
+            return false;
+        }
+        // Both nested-try exits and the guard's false edge are the only incoming
+        // branches. The join follows RERAISE, so there is no physical fallthrough.
+        self.linear_items().iter().filter(|item| matches!(item,
+            Item::Instruction(instruction) if matches!(instruction.operand(), Operand::Forward(label) | Operand::Backward(label)
+                if label == *try_join || label == *join))).count() == 3
+    }
+
     /// Certifies the iterator discard shared by a copied local-None-guarded method call.
     pub(crate) fn prepare_copied_finally_iterator_break(
         &mut self,
@@ -5316,12 +5640,27 @@ impl Assembler {
         target: Label,
         unwind_start: usize,
         named_handler: bool,
+        guarded_try_break: Option<usize>,
     ) {
         let jump =
             *self.emitted_jump_mut(emitted, "copying a conditional finalizer iterator break");
         let Some(unwind) = self.linear_items().get(unwind_start..) else {
             return;
         };
+        if let Some(break_item) = guarded_try_break
+            && self.is_guarded_try_iterator_break(unwind, jump, target, named_handler)
+        {
+            if named_handler {
+                // Preserve the authored break and name-clear prefix before the None
+                // marker replays its original exception-owner slot.
+                self.record_copied_break_handler_cleanup(break_item);
+            }
+            self.prepare_no_location_block_for_inlining(emitted);
+            self.mark_as_artificial_eval_break(emitted);
+            let origin = self.linear_items()[unwind_start..].to_vec();
+            self.copied_finally_iterator_break_origins.push(origin);
+            return;
+        }
         let (handler_cleanup, unwind) = if named_handler {
             let (Some(prefix), Some(tail)) = (unwind.get(..5), unwind.get(5..)) else {
                 return;
@@ -8270,6 +8609,93 @@ impl Assembler {
             && jump.jump_policy.retained_nop() == ir::RetainedJumpNop::DirectTarget
             && !jump.jump_policy.borrow_empty_block()
             && jump.depth_after().is_some()
+    }
+
+    /// Certifies the sole original donor of a manager join beside a separate break exit.
+    ///
+    /// The complete runtime conditional is checked by the caller. Its normal arm either
+    /// falls through directly or jumps over the break's copied manager cleanup. The break
+    /// targets the enclosing iterator exit and contributes no edge to this normal join.
+    pub(crate) fn original_manager_has_unique_break_donor(
+        &self,
+        protected_end: Label,
+        location: SourceLocation,
+        break_target: Label,
+    ) -> bool {
+        let items = self.linear_items();
+        let aliases = items
+            .iter()
+            .rev()
+            .map_while(|item| match item {
+                Item::Label(label) => Some(*label),
+                Item::Instruction(_) => None,
+            })
+            .collect::<Vec<_>>();
+        if location.line < 0
+            || !aliases.contains(&protected_end)
+            || aliases.contains(&break_target)
+            || self.join_labels_have_authored_location(&aliases)
+            || aliases.iter().any(|label| {
+                self.folded_away_condition_targets.contains(label)
+                    || self.folded_away_loop_else_targets.contains(label)
+            })
+        {
+            return false;
+        }
+        let provenance = &self.exception_owner_provenance;
+        let mut entries = aliases
+            .iter()
+            .copied()
+            .filter(|label| provenance.block_boundaries.contains(label));
+        let Some(entry) = entries.next() else {
+            return false;
+        };
+        if entries.next().is_some() || !provenance.source_boundaries.contains(&entry) {
+            return false;
+        }
+        let Some(Item::Instruction(previous)) =
+            items.get(items.len().saturating_sub(aliases.len() + 1))
+        else {
+            return false;
+        };
+        let intact = |instruction: &Instruction| {
+            instruction.pre_fold_extra_instructions() == 0
+                && instruction.local_policy.hidden_exception_owner_slots() == 0
+                && instruction.exception_policy() == ExceptionPolicy::default()
+                && instruction.no_location_policy == ir::NoLocationPolicy::default()
+                && !instruction.fusion_policy.is_converted_pop_block()
+                && instruction.depth_after().is_some()
+        };
+        let mut incoming = items.iter().filter_map(|item| match item {
+            Item::Instruction(instruction)
+                if matches!(instruction.operand(), Operand::Forward(label) | Operand::Backward(label)
+                    if aliases.contains(&label)) => Some(instruction),
+            _ => None,
+        });
+        if !ends_scope(previous.opcode) && !is_unconditional_jump(previous.opcode) {
+            return incoming.next().is_none()
+                && previous.location == location
+                && intact(previous)
+                && !previous.fusion_policy.is_authored_break()
+                && previous.jump_policy == ir::JumpPolicy::default();
+        }
+        if previous.opcode != JUMP_FORWARD
+            || previous.operand() != Operand::Forward(break_target)
+            || !previous.fusion_policy.is_authored_break()
+            || !intact(previous)
+        {
+            return false;
+        }
+        let Some(jump) = incoming.next() else {
+            return false;
+        };
+        incoming.next().is_none()
+            && jump.opcode == JUMP_FORWARD
+            && jump.operand() == Operand::Forward(entry)
+            && jump.location == location
+            && intact(jump)
+            && !jump.fusion_policy.is_authored_break()
+            && jump.jump_policy == ir::JumpPolicy::default()
     }
 
     /// Finds the original manager exit following a completed cold handler cleanup.

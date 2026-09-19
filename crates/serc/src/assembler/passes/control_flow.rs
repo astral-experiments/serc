@@ -832,7 +832,8 @@ impl OptimizationPipeline {
             std::mem::take(&mut self.copied_finally_iterator_break_origins)
                 .into_iter()
                 .filter_map(|mut origin| {
-                    if !matches!(origin.len(), 12 | 17) {
+                    let guarded_try = matches!(origin.len(), 39 | 42 | 44 | 47);
+                    if !matches!(origin.len(), 12 | 17) && !guarded_try {
                         return None;
                     }
                     let last = origin.len() - 1;
@@ -854,6 +855,32 @@ impl OptimizationPipeline {
                         // the same original direct edge; ownership stays literal.
                         jump.mark_initial_borrow_jump_target(target);
                         origin[last] = Item::Instruction(jump);
+                    }
+                    if guarded_try {
+                        // The complete certificate includes two ordinary nested-try exits.
+                        // They receive the same initial-borrow tag as the final break; no
+                        // other original field may change before copy permission survives.
+                        for offset in [last - 24, last - 11] {
+                            let Item::Instruction(mut original) = origin[offset] else {
+                                return None;
+                            };
+                            let Some(Item::Instruction(current)) = graph
+                                .iter_items()
+                                .skip_while(|item| **item != Item::Label(start))
+                                .nth(offset)
+                            else {
+                                return None;
+                            };
+                            if let Some(target) = current.initial_borrow_jump_target() {
+                                if original.opcode != JUMP_FORWARD
+                                    || original.operand() != Operand::Forward(target)
+                                {
+                                    return None;
+                                }
+                                original.mark_initial_borrow_jump_target(target);
+                                origin[offset] = Item::Instruction(original);
+                            }
+                        }
                     }
                     if !graph
                         .iter_items()

@@ -46,3 +46,57 @@ fn explicit_none_retires_inner_try_before_manager_iterator_control() {
         "explicit_none_retires_inner_try_before_manager_iterator_control.py",
     );
 }
+
+#[test]
+fn matches_cpython_bare_return_interleaved_manager_iterators() {
+    for (filename, source) in [
+        (
+            "bare_return_interleaved_sync_manager_iterators.py",
+            r"def target(groups, manager, stop):
+    try:
+        for group in groups:
+            with manager(group) as values:
+                for value in values:
+                    consume(value)
+                    if stop(value):
+                        return
+    finally:
+        finish()
+",
+        ),
+        (
+            "generator_return_interleaved_manager_outer_try.py",
+            r"def target(groups, retries, manager, stop):
+    try:
+        for group in groups:
+            for retry in retries:
+                try:
+                    with manager(group) as values:
+                        for value in values:
+                            yield value
+                            if stop(value):
+                                return
+                    break
+                except Exception:
+                    recover(retry)
+    finally:
+        finish()
+",
+        ),
+        (
+            "bare_return_manager_inside_all_iterators_control.py",
+            r"def target(groups, manager, stop):
+    try:
+        for group in groups:
+            for value in group:
+                with manager(value):
+                    if stop(value):
+                        return
+    finally:
+        finish()
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
