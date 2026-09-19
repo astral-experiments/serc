@@ -82,3 +82,46 @@ fn matches_cpython_marshal_for_copied_finally_break_threading_after_finally_cont
 "#;
     common::assert_matches_cpython_marshal(source, "after_finally_break_control.py");
 }
+
+#[test]
+fn matches_cpython_marshal_for_conditional_finally_break_ordinary_continuations() {
+    for (filename, source) in [
+        (
+            "conditional_finally_iterator_break_ordinary_continuation.py",
+            r"def process(items, acquire, choose, finish):
+    for item in items:
+        reader = None
+        try:
+            reader = acquire(item)
+            if choose(item):
+                break
+        finally:
+            if reader is not None:
+                reader.close()
+    finish(reader)
+    return reader
+",
+        ),
+        (
+            "conditional_finally_named_handler_break_ordinary_continuation.py",
+            r"def process(items, acquire, choose, report, finish):
+    reader = None
+    for item in items:
+        try:
+            reader = acquire(item)
+            if choose(item):
+                break
+        except Exception as error:
+            report(error)
+            break
+        finally:
+            if reader is not None:
+                reader.close()
+    finish(reader)
+    return reader
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

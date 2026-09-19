@@ -824,6 +824,48 @@ impl OptimizationPipeline {
                 }
             }
         }
+        // The compiler certified both incoming paths to this iterator discard.
+        // Preserve its copy permission only while the complete original array,
+        // including every label and instruction field, still survives unchanged.
+        // Only the earlier pass's exact initial-borrow tag can extend its jump.
+        let copied_finally_iterator_breaks =
+            std::mem::take(&mut self.copied_finally_iterator_break_origins)
+                .into_iter()
+                .filter_map(|mut origin| {
+                    if !matches!(origin.len(), 12 | 17) {
+                        return None;
+                    }
+                    let last = origin.len() - 1;
+                    let (Item::Label(start), Item::Label(join), Item::Instruction(mut jump)) =
+                        (origin[0], origin[last - 2], origin[last])
+                    else {
+                        return None;
+                    };
+                    let jump_index = label_offsets.get(&join)?.checked_add(1)?;
+                    let &(block, offset) = instruction_positions.get(jump_index)?;
+                    let Item::Instruction(current) = graph[block].items()[offset] else {
+                        return None;
+                    };
+                    if let Some(target) = current.initial_borrow_jump_target() {
+                        if jump.operand() != Operand::Forward(target) {
+                            return None;
+                        }
+                        // The earlier borrowing pass adds only this proof tag to
+                        // the same original direct edge; ownership stays literal.
+                        jump.mark_initial_borrow_jump_target(target);
+                        origin[last] = Item::Instruction(jump);
+                    }
+                    if !graph
+                        .iter_items()
+                        .skip_while(|item| **item != Item::Label(start))
+                        .take(origin.len())
+                        .eq(origin.iter())
+                    {
+                        return None;
+                    }
+                    Some((jump_index, jump))
+                })
+                .collect::<FxHashMap<_, _>>();
         // Bind only a surviving original nested join's complete jump record.
         // Aliased labels containing work or omitted authored NOPs cannot certify it.
         let mut nested_join_sources = FxHashMap::<usize, Vec<(Label, Instruction)>>::default();
@@ -1671,6 +1713,7 @@ impl OptimizationPipeline {
             if artificial_eval_break
                 && instruction.opcode == JUMP_FORWARD
                 && threaded_jump_count == 0
+                && copied_finally_iterator_breaks.get(&source_index) != Some(&original_jump)
             {
                 // An untouched ordinary head still threads through the original-head path.
                 // Only replacement by an early copy leaves the hidden NOP prefix that needs

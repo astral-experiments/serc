@@ -414,3 +414,143 @@ fn copies_named_elif_handler_cleanup_before_async_for() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_unnamed_handler_for_else_assignment_cleanup() {
+    for (filename, source) in [
+        (
+            "unnamed_handler_for_else_assignment_cleanup_target.py",
+            r"def lookup(mapping, key):
+    try:
+        value = mapping[key]
+    except KeyError:
+        for candidate, replacement in mapping.items():
+            if candidate.lower() == key.lower():
+                value = replacement
+                break
+        else:
+            value = range(8)
+    return value.start, value.stop
+",
+        ),
+        (
+            "named_handler_for_else_assignment_cleanup_control.py",
+            r"def lookup(mapping, key):
+    try:
+        value = mapping[key]
+    except KeyError as error:
+        for candidate, replacement in mapping.items():
+            if candidate.lower() == key.lower():
+                value = replacement
+                break
+        else:
+            value = range(8)
+    return value.start, value.stop
+",
+        ),
+        (
+            "unnamed_handler_for_else_nested_try_cleanup_target.py",
+            r#"def decode(data, pieces, tag):
+    try:
+        value = data.decode("utf-8")
+    except UnicodeDecodeError:
+        for piece in pieces:
+            try:
+                value = piece.decode("utf-8")
+                break
+            except UnicodeDecodeError:
+                continue
+        else:
+            value = None
+    return tag, value
+"#,
+        ),
+        (
+            "unnamed_handler_for_else_no_break_control.py",
+            r"def lookup(mapping, key):
+    try:
+        value = mapping[key]
+    except KeyError:
+        for candidate, replacement in mapping.items():
+            if candidate.lower() == key.lower():
+                value = replacement
+        else:
+            value = range(8)
+    return value.start, value.stop
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn matches_cpython_unnamed_handler_runtime_while_break_cleanup() {
+    for (filename, source) in [
+        (
+            "unnamed_handler_runtime_while_break_cleanup_target.py",
+            r"def run(load, recover, pending, accept):
+    try:
+        value = load()
+    except RuntimeError:
+        value = None
+        while pending():
+            value = recover()
+            if accept(value):
+                break
+    return value is not None, value
+",
+        ),
+        (
+            "unnamed_handler_runtime_while_nested_recovery_target.py",
+            r"def run(load, recover, limit):
+    attempt = 0
+    try:
+        value = load()
+    except RuntimeError:
+        value = None
+        while attempt < limit:
+            attempt += 1
+            try:
+                candidate = recover(attempt)
+            except ValueError as error:
+                report(error)
+                continue
+            value = candidate
+            break
+    return finish(value is not None, value)
+",
+        ),
+        (
+            "unnamed_handler_runtime_while_comprehension_target.py",
+            r"def run(load, recover, limit, stop):
+    try:
+        values = load()
+    except RuntimeError:
+        values = []
+        offset = 0
+        while offset < limit:
+            value = recover(offset)
+            values.append(value)
+            offset += 1
+            if stop(value):
+                break
+    return {item[0]: int(item[1]) for item in values if isinstance(item, tuple)}
+",
+        ),
+        (
+            "unnamed_handler_runtime_while_no_break_control.py",
+            r"def run(load, recover, pending):
+    try:
+        value = load()
+    except RuntimeError:
+        value = None
+        while pending():
+            value = recover()
+    return value is not None, value
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

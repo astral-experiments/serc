@@ -392,6 +392,7 @@ impl Assembler {
             original_nop_targets: self.original_nop_targets,
             original_unlocated_cleanup_targets: self.original_unlocated_cleanup_targets,
             original_unlocated_discard_targets: self.original_unlocated_discard_targets,
+            copied_finally_iterator_break_origins: self.copied_finally_iterator_break_origins,
             original_shared_unlocated_jump_entries: rustc_hash::FxHashMap::default(),
             original_jump_head_targets: rustc_hash::FxHashSet::default(),
             deferred_shared_jump_blocks: self.deferred_shared_jump_blocks,
@@ -419,6 +420,7 @@ impl OptimizationPipeline {
         parameter_count: usize,
         constants: Option<&mut dyn ConstantTable>,
     ) -> Result<LayoutAssembler, CompileError> {
+        let triple_store_handler_exits = self.capture_triple_store_handler_exits();
         self.preserve_shared_original_manager_pop_locations();
         self.record_shared_unlocated_jump_entries();
         let mut original_owners = FusionOwnerCertificates::capture_original_owners(&self);
@@ -506,7 +508,11 @@ impl OptimizationPipeline {
             self.propagate_assertion_exit_locations();
             Vec::new()
         } else {
-            self.duplicate_exit_blocks(&original_location_absence, &mut copied_exit_owner_retargets)
+            self.duplicate_exit_blocks_with_store_origins(
+                &original_location_absence,
+                &mut copied_exit_owner_retargets,
+                &triple_store_handler_exits,
+            )
         };
         self.borrow_threaded_jump_entries.clear();
         self.borrow_authored_finally_break_origins =

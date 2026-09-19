@@ -4192,6 +4192,36 @@ impl Compiler<'_> {
                             finally.with_depth == context.with_depth
                                 && matches!(finally.body.last(), Some(Stmt::With(_)))
                         });
+                let copied_finally_iterator_handler = self.unit.flags
+                    & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                    == 0
+                    && self.control.exceptions.active_exception_group_handlers == 0
+                    && matches!(self.control.exceptions.active_exception_handlers.as_slice(), [handler]
+                        if handler.name.is_some()
+                            && handler.loop_depth == self.control.loops.contexts.len()
+                            && handler.with_depth == context.with_depth
+                            && handler.finally_end_depth == context.finally_end_depth
+                            && handler.exception_region_depth == context.exception_region_depth + 1
+                            && self.control.exceptions.active_exception_region_exclusions.len()
+                                == handler.exception_region_depth + 1);
+                let copied_finally_iterator_join = context.iterator_cleanup
+                    == IteratorCleanup::Sync
+                    && !context.prevent_break_exit_inlining
+                    && context.break_policy == LoopBreakPolicy::Jump
+                    && self.control.withs.active_with_exits.is_empty()
+                    && (self.control.exceptions.active_exception_handlers.is_empty()
+                        || copied_finally_iterator_handler)
+                    && self.control.finally.active_finally_try_bodies == 1
+                    && self.control.finally.active_finally_end_blocks == 0
+                    && self.control.finally.active_normal_finally_bodies == 0
+                    && self.control.finally.active_copied_finally_bodies == 0
+                    && matches!(self.control.finally.active_loop_finally_contexts.as_slice(), [finally]
+                        if finally.loop_depth == self.control.loops.contexts.len()
+                            && finally.with_depth == context.with_depth
+                            && finally.handler_depth == 0
+                            && finally.exception_region_depth == context.exception_region_depth
+                            && matches!(finally.body.as_slice(), [Stmt::If(guard)]
+                                if guard.elif_else_clauses.is_empty()));
                 self.emit_with_exception_policy(
                     NOP,
                     0,
@@ -4379,6 +4409,13 @@ impl Compiler<'_> {
                         // the final return, so preserve it for repeated no-location inlining.
                         self.assembler
                             .prepare_no_location_block_for_inlining(break_jump);
+                    } else if copied_finally_iterator_join {
+                        self.assembler.prepare_copied_finally_iterator_break(
+                            break_jump,
+                            context.break_label,
+                            finally_unwind_start,
+                            copied_finally_iterator_handler,
+                        );
                     } else if context.prevent_break_exit_inlining {
                         self.assembler.prevent_jump_inlining(break_jump);
                     } else if context.break_policy.preserves_jump_exit() {
@@ -7826,6 +7863,25 @@ impl Compiler<'_> {
                     self.emit_with_exception_policy(NOP, 0, 0, ExceptionPolicy::EXCLUDE_ALWAYS)?;
                     if !starts_jump_target
                         || matches!(finally_context.body.as_slice(), [Stmt::Pass(_)])
+                        // Adjacent copied cleanup tries share the outer POP_BLOCK between
+                        // the inner normal and handled exits. Preserve its original kind
+                        // so shared-head location repair can keep that POP_BLOCK unlocated.
+                        || (unwind_location == SourceLocation::NONE
+                            && matches!(finally_context.body.as_slice(), [Stmt::Try(cleanup)]
+                                if !cleanup.is_star
+                                    && !cleanup.handlers.is_empty()
+                                    && cleanup.orelse.is_empty()
+                                    && cleanup.finalbody.is_empty())
+                            && return_finally_contexts.get(context_index + 1).is_some_and(|inner| {
+                                inner.loop_depth == finally_context.loop_depth
+                                    && inner.with_depth == finally_context.with_depth
+                                    && inner.handler_depth == finally_context.handler_depth
+                                    && matches!(inner.body.as_slice(), [Stmt::Try(cleanup)]
+                                        if !cleanup.is_star
+                                            && !cleanup.handlers.is_empty()
+                                            && cleanup.orelse.is_empty()
+                                            && cleanup.finalbody.is_empty())
+                            }))
                     {
                         self.assembler.mark_last_as_converted_pop_block();
                     }
@@ -15554,6 +15610,46 @@ impl Compiler<'_> {
                 .as_except_handler()
                 .is_some_and(|handler| suite_contains_orphan_cold_cleanup(&handler.body))
         });
+        // A runtime while in a bare-name cleanup joins its false edge with
+        // authored breaks. Copying that cleanup leaves its original cold exit
+        // empty; relocating the handler must not reconnect normal borrowing.
+        let handler_has_runtime_while_break_cleanup = self.context.target_specific_rules_enabled()
+            && !statement.is_star
+            && !terminal
+            && loop_tail.is_none()
+            && statement.orelse.is_empty()
+            && statement.finalbody.is_empty()
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && self.control.loops.contexts.is_empty()
+            && self.control.withs.active_with_exits.is_empty()
+            && self.control.exceptions.active_exception_handlers.is_empty()
+            && self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
+            && self.control.finally.active_finally_try_bodies == 0
+            && self.control.finally.active_normal_finally_bodies == 0
+            && self.control.finally.active_copied_finally_bodies == 0
+            && self.control.finally.active_finally_end_blocks == 0
+            && !self
+                .control
+                .statements
+                .current_statement_followed_by_literal_return
+            && !self
+                .control
+                .statements
+                .current_statement_followed_by_name_return
+            && (self.control.statements.current_statement_has_following
+                || !self
+                    .control
+                    .statements
+                    .inherited_statement_followed_by_small_return)
+            && statement.handlers.iter().any(|handler| {
+                handler.as_except_handler().is_some_and(|handler| {
+                    handler.name.is_none() && handler_ends_in_runtime_while_break(&handler.body)
+                })
+            });
         let normal_exit_starts_in_empty_block = borrow_exit_has_successor
             && (suite_ends_in_empty_try_exit_block(normal_exit_suite, loop_tail.is_some())
                 || handler_contains_terminal_nested_try
@@ -17394,6 +17490,7 @@ impl Compiler<'_> {
                     && self.control.withs.active_with_exits.is_empty()
                     && !following_name_return_has_noncopyable_cleanup))
                 || handler_has_orphan_cold_cleanup
+                || handler_has_runtime_while_break_cleanup
                 || recovery_value_match_loop
                 || named_handler_cleanup_suffix
                 || has_bare_handler
@@ -18522,10 +18619,18 @@ impl Compiler<'_> {
                         && if_has_multiple_normal_exit_targets(tail)
                         && matches!(tail.body.as_slice(), [Stmt::Break(_) | Stmt::Assign(_)]))
                     && self.assembler.at_original_shared_conditional_join();
+            let handler_ends_with_runtime_while_break_cleanup =
+                handler_has_runtime_while_break_cleanup
+                    && handler.name.is_none()
+                    && handler_ends_in_runtime_while_break(&handler.body);
+            if handler_ends_with_runtime_while_break_cleanup {
+                self.assembler.defer_original_while_break_cleanup_edges();
+            }
             let handler_ends_with_inlineable_cleanup = handler_ends_with_preordered_cleanup
                 || handler_has_original_conditional_loop_join
                 || handler_ends_with_named_conditional_cleanup
                 || handler_ends_with_loop_tail_join
+                || handler_ends_with_runtime_while_break_cleanup
                 // A named handler's five-record cleanup can be copied onto original
                 // break edges even when a loop's exhaustion arm also falls through.
                 || (self.context.target_specific_rules_enabled()
@@ -18625,7 +18730,15 @@ impl Compiler<'_> {
                             && (tail.orelse.is_empty()
                                 || (handler.name.is_none()
                                     && matches!(tail.orelse.as_slice(), [Stmt::Return(ret)]
-                                        if ret.value.as_deref().is_some_and(is_literal_constant))))
+                                        if ret.value.as_deref().is_some_and(is_literal_constant)))
+                                // A fallthrough exhaustion assignment does not locate the
+                                // artificial cleanup at the separate authored-break join.
+                                || (self.context.target_specific_rules_enabled()
+                                    && handler.name.is_none()
+                                    && !terminal
+                                    && !cleanup_has_small_return_successor
+                                    && matches!(tail.orelse.as_slice(), [Stmt::Assign(_)])
+                                    && self.assembler.at_original_authored_break_join()))
                             && suite_contains_loop_break(&tail.body)
                             && !suite_contains_loop_break_with_finally(&tail.body)
                     }
@@ -28407,6 +28520,21 @@ fn suite_contains_conditional_nested_recovery(body: &[Stmt]) -> bool {
                 .iter()
                 .any(|clause| suite_contains_conditional_nested_recovery(&clause.body))
     })
+}
+
+// A runtime false edge and authored breaks share the source-less handler exit.
+// Folded tests, multiple false exits, else work, and finally unwinds have distinct
+// original arrays and keep their existing cleanup and borrowed-entry policies.
+fn handler_ends_in_runtime_while_break(body: &[Stmt]) -> bool {
+    let Some(Stmt::While(tail)) = body.last() else {
+        return false;
+    };
+    tail.orelse.is_empty()
+        && condition_has_only_runtime_tests(&tail.test)
+        && !expression_contains_chained_comparison(&tail.test)
+        && condition_jump_target_count(&tail.test, false) == 1
+        && suite_contains_loop_break(&tail.body)
+        && !suite_contains_loop_break_with_finally(&tail.body)
 }
 
 // A terminal recovery can share the containing handler's unlocated cleanup.

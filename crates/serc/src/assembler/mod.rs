@@ -995,6 +995,92 @@ impl Assembler {
         })
     }
 
+    /// Keeps a cleanup-free while break until the shared handler exit can be copied.
+    ///
+    /// The caller certifies an unnamed handler ending in a runtime while without else.
+    /// Its single false edge enters a source boundary beside the distinct break target.
+    /// Removing the break first would merge those two original cleanup predecessors.
+    pub(crate) fn defer_original_while_break_cleanup_edges(&mut self) {
+        let items = self.linear_items();
+        let labels = items
+            .iter()
+            .rev()
+            .map_while(|item| match item {
+                Item::Label(label) => Some(*label),
+                Item::Instruction(_) => None,
+            })
+            .collect::<Vec<_>>();
+        if labels.is_empty()
+            || self.join_labels_have_authored_location(&labels)
+            || labels.iter().any(|label| {
+                self.folded_away_condition_targets.contains(label)
+                    || self.folded_away_loop_else_targets.contains(label)
+            })
+        {
+            return;
+        }
+        let mut false_edge = None;
+        let mut breaks = Vec::new();
+        for (index, item) in items.iter().enumerate() {
+            let Item::Instruction(instruction) = item else {
+                continue;
+            };
+            let Operand::Forward(target) = instruction.operand() else {
+                continue;
+            };
+            if !labels.contains(&target) {
+                continue;
+            }
+            if instruction.location.line < 0
+                || instruction.local_policy.hidden_exception_owner_slots() != 0
+                || instruction.no_location_policy.preserves_location()
+            {
+                return;
+            }
+            if matches!(
+                instruction.opcode,
+                POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE | POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE
+            ) && instruction.pre_fold_extra_instructions() == 0
+                && self
+                    .exception_owner_provenance
+                    .source_boundaries
+                    .contains(&target)
+            {
+                if false_edge
+                    .replace((target, instruction.depth_after()))
+                    .is_some()
+                {
+                    return;
+                }
+            } else if instruction.opcode == JUMP_FORWARD
+                && instruction.fusion_policy.is_authored_break()
+                && instruction.jump_policy.inline_small_exit()
+                && instruction.jump_policy.retained_nop() == ir::RetainedJumpNop::DirectTarget
+                && instruction.pre_fold_extra_instructions() == 1
+            {
+                breaks.push((index, target, instruction.depth_after()));
+            } else {
+                return;
+            }
+        }
+        let Some((false_target, depth)) = false_edge else {
+            return;
+        };
+        if breaks.is_empty()
+            || breaks
+                .iter()
+                .any(|(_, target, break_depth)| *target == false_target || *break_depth != depth)
+        {
+            return;
+        }
+        for (index, _, _) in breaks {
+            let Item::Instruction(jump) = &mut self.linear_items_mut()[index] else {
+                unreachable!("the original authored break was checked above");
+            };
+            jump.jump_policy.defer_removal();
+        }
+    }
+
     /// Certifies a guard-false donor beside a separate normal-finally exit.
     ///
     /// The two source labels alias an empty original array after exceptional cleanup.
@@ -5077,6 +5163,194 @@ impl Assembler {
             .collect::<Vec<_>>();
         self.conditional_threading_targets
             .extend(labels.into_iter().map(|label| (label, location)));
+    }
+
+    /// Certifies the iterator discard shared by a copied local-None-guarded method call.
+    pub(crate) fn prepare_copied_finally_iterator_break(
+        &mut self,
+        emitted: EmittedJump,
+        target: Label,
+        unwind_start: usize,
+        named_handler: bool,
+    ) {
+        let jump =
+            *self.emitted_jump_mut(emitted, "copying a conditional finalizer iterator break");
+        let Some(unwind) = self.linear_items().get(unwind_start..) else {
+            return;
+        };
+        let (handler_cleanup, unwind) = if named_handler {
+            let (Some(prefix), Some(tail)) = (unwind.get(..5), unwind.get(5..)) else {
+                return;
+            };
+            (Some(prefix), tail)
+        } else {
+            (None, unwind)
+        };
+        let [
+            Item::Label(start),
+            Item::Instruction(load_guard),
+            Item::Instruction(condition),
+            Item::Instruction(not_taken),
+            Item::Label(body),
+            Item::Instruction(load_receiver),
+            Item::Instruction(method),
+            Item::Instruction(call),
+            Item::Instruction(discard_call),
+            Item::Label(join),
+            Item::Instruction(discard_iterator),
+            Item::Instruction(last),
+        ] = unwind
+        else {
+            return;
+        };
+        let Some(depth) = condition.depth_after() else {
+            return;
+        };
+        let (Some(after_discard), Some(loaded), Some(method_depth)) = (
+            depth.checked_sub(1),
+            depth.checked_add(1),
+            depth.checked_add(2),
+        ) else {
+            return;
+        };
+        if let Some(prefix) = handler_cleanup {
+            let [
+                Item::Label(handler_end),
+                Item::Instruction(pop),
+                Item::Instruction(none),
+                Item::Instruction(store),
+                Item::Instruction(delete),
+            ] = prefix
+            else {
+                return;
+            };
+            // The selected named-handler unwind emits None between POP_EXCEPT
+            // and clearing that same local. Its protected prefix ends before
+            // the copied finalizer, so retain both original boundary labels.
+            if handler_end == start
+                || handler_end == body
+                || handler_end == join
+                || pop.opcode != POP_EXCEPT
+                || pop.operand() != Operand::Value(0)
+                || pop.depth_after() != Some(depth)
+                || pop.location.line < 0
+                || none.opcode != LOAD_CONST
+                || !matches!(none.operand(), Operand::Value(_))
+                || none.depth_after() != Some(loaded)
+                || store.opcode != STORE_FAST
+                || !matches!(store.operand(), Operand::Value(_))
+                || store.depth_after() != Some(depth)
+                || delete.opcode != DELETE_FAST
+                || delete.operand() != store.operand()
+                || delete.depth_after() != Some(depth)
+                || [pop, none, store, delete].iter().any(|instruction| {
+                    instruction.location != pop.location
+                        || instruction.exception_policy() != ExceptionPolicy::default()
+                        || instruction.pre_fold_extra_instructions() != 0
+                        || instruction.local_policy != LocalPolicy::default()
+                        || instruction.no_location_policy != ir::NoLocationPolicy::default()
+                        || instruction.fusion_policy != ir::FusionPolicy::default()
+                        || instruction.jump_policy != ir::JumpPolicy::default()
+                })
+            {
+                return;
+            }
+        }
+        if *last != jump
+            || jump.opcode != JUMP_FORWARD
+            || jump.operand() != Operand::Forward(target)
+            || jump.location != SourceLocation::NONE
+            || jump.depth_after() != Some(after_discard)
+            || discard_iterator.opcode != POP_TOP
+            || discard_iterator.operand() != Operand::Value(0)
+            || discard_iterator.location != SourceLocation::NONE
+            || discard_iterator.depth_after() != Some(after_discard)
+            || load_guard.opcode != LOAD_FAST
+            || !matches!(load_guard.operand(), Operand::Value(_))
+            || load_guard.depth_after() != Some(loaded)
+            || condition.opcode != POP_JUMP_IF_NONE
+            || condition.operand() != Operand::Forward(*join)
+            || condition.local_policy.hidden_exception_owner_slots() != 3
+            || not_taken.opcode != NOT_TAKEN
+            || not_taken.operand() != Operand::Value(0)
+            || not_taken.depth_after() != Some(depth)
+            || not_taken.pre_fold_extra_instructions() != 0
+            || not_taken.exception_policy() != ExceptionPolicy::NonePresent
+            || load_guard.location.line < 0
+            || load_guard.location.line != condition.location.line
+            || not_taken.location != condition.location
+            || load_receiver.opcode != LOAD_FAST
+            || !matches!(load_receiver.operand(), Operand::Value(_))
+            || load_receiver.depth_after() != Some(loaded)
+            || method.opcode != LOAD_ATTR
+            || !matches!(method.operand(), Operand::Value(argument) if argument & 1 != 0)
+            || method.depth_after() != Some(method_depth)
+            || call.opcode != crate::target::opcodes::CALL
+            || call.operand() != Operand::Value(0)
+            || call.depth_after() != Some(loaded)
+            || discard_call.opcode != POP_TOP
+            || discard_call.operand() != Operand::Value(0)
+            || discard_call.depth_after() != Some(depth)
+            || call.location.line < 0
+            || load_receiver.location.line != call.location.line
+            || method.location.line != call.location.line
+            || discard_call.location != call.location
+            || start == body
+            || start == join
+            || body == join
+            || [body, join].into_iter().any(|label| {
+                !self
+                    .exception_owner_provenance
+                    .source_boundaries
+                    .contains(label)
+                    || !self
+                        .exception_owner_provenance
+                        .block_boundaries
+                        .contains(label)
+                    || self.borrow_block_aliases.contains(label)
+                    || self.original_nop_targets.contains(label)
+                    || self
+                        .exception_owner_provenance
+                        .omitted_nop_counts
+                        .contains_key(label)
+            })
+            || [
+                load_guard,
+                condition,
+                load_receiver,
+                method,
+                call,
+                discard_call,
+                discard_iterator,
+                last,
+            ]
+            .iter()
+            .any(|instruction| {
+                instruction.pre_fold_extra_instructions() != 0
+                    || instruction.exception_policy() != ExceptionPolicy::default()
+            })
+            || [
+                load_guard,
+                not_taken,
+                load_receiver,
+                method,
+                call,
+                discard_call,
+                discard_iterator,
+                last,
+            ]
+            .iter()
+            .any(|instruction| instruction.local_policy.hidden_exception_owner_slots() != 0)
+        {
+            return;
+        }
+        // The conditional false edge and method-call fallthrough share this original
+        // source-less discard. Both need their own copy, even when the break reaches
+        // ordinary code after the loop rather than an unlocated scope exit.
+        self.prepare_no_location_block_for_inlining(emitted);
+        self.mark_as_artificial_eval_break(emitted);
+        let origin = self.linear_items()[unwind_start..].to_vec();
+        self.copied_finally_iterator_break_origins.push(origin);
     }
 
     /// Certifies a conditional join that starts at the jump after copied finalizer cleanup.

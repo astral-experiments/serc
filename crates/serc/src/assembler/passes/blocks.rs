@@ -1268,6 +1268,44 @@ fn comprehension_assignment_exit_location(
     static_swap_tail_location(tail, *instructions)
 }
 
+/// Original triple-store fallthroughs whose unnamed handler cleanup is shared.
+pub(in crate::assembler) struct TripleStoreHandlerExits {
+    original_labels: FxHashSet<Label>,
+    entries: FxHashMap<Label, TripleStoreHandlerExit>,
+}
+
+struct TripleStoreHandlerExit {
+    swapped_source: Vec<Item>,
+    cleanup: Vec<Item>,
+    donor: SourceLocation,
+}
+
+impl TripleStoreHandlerExits {
+    /// Replays only the captured SWAP-to-NOP conversion and complete store exchange.
+    fn location(&self, source: &[Item], target: &[Item]) -> Option<SourceLocation> {
+        let origin = target
+            .iter()
+            .take_while(|item| matches!(item, Item::Label(_)))
+            .find_map(|item| match item {
+                Item::Label(label) => self.entries.get(label),
+                Item::Instruction(_) => None,
+            })?;
+        if target != origin.cleanup.as_slice() || !source.ends_with(&origin.swapped_source) {
+            return None;
+        }
+        // Exit copying can prepend fresh aliases, but cannot replace an original
+        // boundary, insert an instruction, or alter any captured source record.
+        let aliases = &source[..source.len() - origin.swapped_source.len()];
+        aliases
+            .iter()
+            .all(|item| {
+                matches!(item,
+            Item::Label(label) if !self.original_labels.contains(label))
+            })
+            .then_some(origin.donor)
+    }
+}
+
 /// Predicts the surviving donor of a reversed store pair at the end of an array.
 fn fused_store_tail_location(source: &[Item]) -> Option<SourceLocation> {
     let [.., Item::Instruction(first), Item::Instruction(second)] = source else {
@@ -2638,10 +2676,115 @@ impl OptimizationPipeline {
             .collect()
     }
 
+    /// Captures the original donor before static swaps reverse a three-store tail.
+    pub(in crate::assembler) fn capture_triple_store_handler_exits(
+        &self,
+    ) -> TripleStoreHandlerExits {
+        let mut entries = FxHashMap::default();
+        for pair in self.graph.order().windows(2) {
+            let source = self.graph[pair[0]].items();
+            let target = self.graph[pair[1]].items();
+            let Some(label) = self.graph[pair[1]].first_label() else {
+                continue;
+            };
+            if !self
+                .exception_owner_provenance
+                .source_boundaries
+                .contains(&label)
+            {
+                continue;
+            }
+            let entry_len = target
+                .iter()
+                .take_while(|item| matches!(item, Item::Label(_)))
+                .count();
+            let [Item::Instruction(pop), Item::Instruction(jump)] = &target[entry_len..] else {
+                continue;
+            };
+            if pop.opcode != POP_EXCEPT
+                || pop.location != SourceLocation::NONE
+                || jump.opcode != JUMP_FORWARD
+                || jump.location != SourceLocation::NONE
+                || !matches!(jump.operand(), Operand::Forward(_))
+            {
+                continue;
+            }
+            let [
+                ..,
+                Item::Instruction(swap),
+                Item::Instruction(first),
+                Item::Instruction(middle),
+                Item::Instruction(last),
+            ] = source
+            else {
+                continue;
+            };
+            if swap.opcode != SWAP
+                || swap.operand() != Operand::Value(3)
+                || [first, middle, last].iter().any(|store| {
+                    store.opcode != STORE_FAST
+                        || store.location.line < 0
+                        || store.location.line != swap.location.line
+                })
+            {
+                continue;
+            }
+            let mut swapped_source = source.to_vec();
+            let start = swapped_source.len() - 4;
+            let mut removed_swap = *swap;
+            removed_swap.opcode = NOP;
+            removed_swap.set_operand(Operand::Value(0));
+            swapped_source[start..].copy_from_slice(&[
+                Item::Instruction(removed_swap),
+                Item::Instruction(*last),
+                Item::Instruction(*middle),
+                Item::Instruction(*first),
+            ]);
+            entries.insert(
+                label,
+                TripleStoreHandlerExit {
+                    swapped_source,
+                    cleanup: target.to_vec(),
+                    donor: last.location,
+                },
+            );
+        }
+        let original_labels = if entries.is_empty() {
+            FxHashSet::default()
+        } else {
+            self.graph
+                .iter_items()
+                .filter_map(|item| match item {
+                    Item::Label(label) => Some(*label),
+                    Item::Instruction(_) => None,
+                })
+                .collect()
+        };
+        TripleStoreHandlerExits {
+            original_labels,
+            entries,
+        }
+    }
+
+    #[cfg(test)]
     pub(in crate::assembler) fn duplicate_exit_blocks(
         &mut self,
         original_location_absence: &FxHashSet<Label>,
         owner_retargets: &mut Vec<(Instruction, Instruction)>,
+    ) -> Vec<Label> {
+        let origins = self.capture_triple_store_handler_exits();
+        self.duplicate_exit_blocks_with_store_origins(
+            original_location_absence,
+            owner_retargets,
+            &origins,
+        )
+    }
+
+    pub(in crate::assembler) fn duplicate_exit_blocks_with_store_origins(
+        &mut self,
+        original_location_absence: &FxHashSet<Label>,
+        owner_retargets: &mut Vec<(Instruction, Instruction)>,
+        triple_store_handler_exits: &TripleStoreHandlerExits,
     ) -> Vec<Label> {
         let graph = &mut self.graph;
         if graph.is_normalized_jump_free_single_block(&self.preserved_block_boundaries) {
@@ -5439,10 +5582,12 @@ impl OptimizationPipeline {
                     && !planned_blocks.contains(&target)
                     && positions[source.index()] + 1 == target_position
                     && block_has_fallthrough(graph[source].items())
-                    && let Some(location) = fused_store_tail_location(graph[source].items())
+                    && let Some(location) = triple_store_handler_exits
+                        .location(graph[source].items(), graph[target].items())
+                        .or_else(|| fused_store_tail_location(graph[source].items()))
                 {
-                    // Native resolves the surviving original exit after local fusion.
-                    // A reversed store pair contributes its surviving first location.
+                    // The captured triple keeps its original last-store donor across
+                    // static swaps. Other reversed pairs use their surviving fused line.
                     return Some(location);
                 }
                 graph[source]
