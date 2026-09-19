@@ -554,6 +554,7 @@ impl OptimizationPipeline {
         }
         original_owners.retain_pipeline(&self);
         self.record_original_jump_heads();
+        self.capture_normal_try_break_pop_owners();
         original_owners.retain_pipeline(&self);
         self.prepare_original_conditional_jump_targets();
         original_owners.retain_pipeline(&self);
@@ -580,6 +581,7 @@ impl OptimizationPipeline {
         original_owners.retain_pipeline(&self);
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::OptimizeBooleanConversions)?;
+        let threaded_normal_try_joins = self.capture_threaded_normal_try_joins();
         let threaded_jumps = !assertion_side_exits && self.thread_forward_jumps();
         self.borrow_threaded_jump_targets.clear();
         original_owners.retain_pipeline(&self);
@@ -613,6 +615,7 @@ impl OptimizationPipeline {
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::ApplyStaticSwaps)?;
         let mut copied_exit_owner_retargets = Vec::new();
+        let mut copied_exit_region_retargets = Vec::new();
         let copied_entry_labels = if assertion_side_exits {
             self.propagate_assertion_exit_locations();
             Vec::new()
@@ -620,7 +623,9 @@ impl OptimizationPipeline {
             self.duplicate_exit_blocks_with_store_origins(
                 &original_location_absence,
                 &mut copied_exit_owner_retargets,
+                &mut copied_exit_region_retargets,
                 &triple_store_handler_exits,
+                &threaded_normal_try_joins,
             )
         };
         self.borrow_threaded_jump_entries.clear();
@@ -628,10 +633,28 @@ impl OptimizationPipeline {
             crate::assembler::ir::AuthoredFinallyBreakOrigins::default();
         // Also clear scratch origins on assertion-only and duplicate-pass early-return paths.
         Self::clear_initial_borrow_jump_entries(&mut self.graph);
-        original_owners.retain_after_exit_copy(&self, &copied_exit_owner_retargets);
+        original_owners.retain_after_exit_copy(
+            &self,
+            &copied_exit_owner_retargets,
+            &copied_exit_region_retargets,
+        );
         // Exit duplication changes this surviving conditional's target, not its
         // original array or the normal-finally comparison cells recorded within it.
         for (before, after) in &copied_exit_owner_retargets {
+            for origin in &mut self
+                .exception_owner_provenance
+                .uncompacted_conditional_arrays
+            {
+                for item in &mut origin.prefix {
+                    if let Item::Instruction(condition) = item
+                        && condition == before
+                    {
+                        // Transport only the recorded retarget; final replay still
+                        // requires equality of every original array record.
+                        *condition = *after;
+                    }
+                }
+            }
             for (_, _, condition) in
                 &mut self.exception_owner_provenance.normal_finally_none_prefixes
             {
@@ -666,6 +689,18 @@ impl OptimizationPipeline {
             {
                 if records[5] == *before {
                     records[5] = *after;
+                }
+            }
+            for origin in &mut self
+                .exception_owner_provenance
+                .saved_named_handler_none_prefixes
+            {
+                for item in &mut origin.items {
+                    if let Item::Instruction(condition) = item
+                        && condition == before
+                    {
+                        *condition = *after;
+                    }
                 }
             }
             for origin in &mut self

@@ -202,3 +202,57 @@ fn unchanged_match_markers_use_fresh_entry_slots() {
         assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_original_truth_array_owners() {
+    for (filename, source) in [
+        (
+            "original_truth_array_manager_loop_target.py",
+            r#"def f(manager):
+    total = 0
+    try:
+        with manager as stream:
+            for item in stream:
+                try:
+                    value = item()
+                except Exception:
+                    continue
+                if isinstance(value, dict):
+                    choices = value.get("metadata", {}).get("choices")
+                    if choices:
+                        if isinstance(choices, list):
+                            total += len(choices)
+                        elif isinstance(choices, dict):
+                            total += len(choices)
+                        else:
+                            total += 1
+                    else:
+                        total += 1
+    except Exception:
+        pass
+    return total
+"#,
+        ),
+        (
+            "original_truth_array_folded_prefix_control.py",
+            r#"def f(manager, values):
+    total = 0
+    with manager:
+        for value in values:
+            try:
+                if value is not None:
+                    choices = value.get("choices")
+                    padding = (1, 2, 3)
+                    if choices:
+                        total += len(choices)
+                    else:
+                        total += len(padding)
+            except Exception:
+                continue
+    return total
+"#,
+        ),
+    ] {
+        assert_matches_cpython_marshal(source, filename);
+    }
+}

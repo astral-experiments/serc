@@ -19,6 +19,8 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) setups: Vec<(Label, Option<SourceLocation>)>,
     // Authored ordinary-try SETUP and its original handler, independently of split ranges.
     pub(super) ordinary_try_setups: FxHashMap<Label, Label>,
+    // Authored name-clearing exception handlers, independent of overlapping outer regions.
+    pub(super) named_handler_cleanup_targets: FxHashSet<Label>,
     // Original ordinary-await suspension regions, resolved alongside their live regions.
     pub(super) ordinary_await_cleanups: Vec<super::ExceptionRegion>,
     // Authored SEND, completion entry, and END_SEND before any cleanup or copying.
@@ -46,6 +48,8 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) value_jump_continuation_boundaries: FxHashSet<Label>,
     // Complete authored COPY/TO_BOOL/condition/marker records and intervening labels.
     pub(super) original_value_jump_prefixes: Vec<(Label, Vec<Item>)>,
+    // Complete source arrays containing a retained SETUP before a value Boolean.
+    pub(super) retained_setup_value_arrays: Vec<RetainedSetupValueArray>,
     // Region re-entry after a return emits no original instruction or unwind slot.
     pub(super) return_region_reentries: FxHashSet<Label>,
     // Proven CALL/POP or unique conditional-join donor and its exact disposal array.
@@ -71,6 +75,7 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) copied_return_call_prefixes: Vec<CopiedReturnCallPrefix>,
     pub(super) copied_return_attribute_truth_prefixes: Vec<CopiedReturnAttributeTruthPrefix>,
     pub(super) copied_handler_return_none_prefixes: Vec<(Label, [Instruction; 6])>,
+    pub(super) saved_named_handler_none_prefixes: Vec<SavedNamedHandlerNonePrefix>,
     pub(super) copied_manager_return_none_prefixes: Vec<CopiedManagerReturnNonePrefix>,
     pub(super) retained_manager_return_none_prefixes: Vec<RetainedManagerReturnNonePrefix>,
     pub(super) copied_manager_return_compactions: Vec<CopiedManagerReturnCompaction>,
@@ -96,6 +101,8 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) synthetic_manager_join_exits: Vec<(Label, Instruction)>,
     // Original ordinary-try exits contain POP_BLOCK followed by JUMP_NO_INTERRUPT.
     pub(super) normal_try_exits: Vec<(Label, Label)>,
+    // Sole authored break, retired ordinary-try bridge, and intact normal-finally array.
+    pub(super) normal_try_break_pop_owners: Vec<NormalTryBreakPopOwner>,
     // Exact final wildcard call/discard or class-pattern failure pops at a normal try exit.
     pub(super) normal_try_fallthrough_donors: FxHashMap<Label, (Instruction, Instruction)>,
     // Exact final wildcard CALL/POP before a compound try's original normal exit.
@@ -151,6 +158,18 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) source_none_conditions: Vec<SourceNoneCondition>,
     // Exact terminal pairs produced by original conditional jump threading.
     pub(super) threaded_condition_origins: Vec<(Instruction, Instruction)>,
+}
+
+/// Original try-exit slot absorbed by a normal-finally marker after jump threading.
+#[derive(Debug)]
+pub(super) struct NormalTryBreakPopOwner {
+    pub(super) source_labels: Vec<Label>,
+    pub(super) handler: Label,
+    pub(super) entry: Label,
+    pub(super) prefix: Vec<Item>,
+    pub(super) exit: Label,
+    pub(super) location: SourceLocation,
+    pub(super) region: super::ExceptionRegion,
 }
 
 /// Exact original `POP_BLOCK` records and the successors receiving their erased slots.
@@ -301,8 +320,12 @@ pub(super) struct RetainedManagerReturnNonePrefix {
 #[derive(Debug)]
 pub(super) struct CopiedManagerReturnCompaction {
     pub(super) ordinary_try_pops: usize,
+    /// A still-live manager can be replaced only by a captured original cleanup cell.
+    pub(super) retained_outer_handler: Option<Label>,
     pub(super) cleanup: Vec<Instruction>,
     pub(super) earlier_cleanup: Option<[Instruction; 7]>,
+    /// `SWAP`, `POP_EXCEPT`, and name clearing after two omitted named-handler POPs.
+    pub(super) named_handler_cleanup: Option<[Instruction; 5]>,
     pub(super) constant_return_prefix: Option<ConstantManagerReturnPrefix>,
     pub(super) to_bool: Option<Instruction>,
     pub(super) pop: Instruction,
@@ -315,9 +338,19 @@ pub(super) struct CopiedManagerReturnCompaction {
 pub(super) struct ConstantManagerReturnPrefix {
     pub(super) authored_nop: Instruction,
     pub(super) retained_authored: bool,
+    // Adjacent original ordinary-try POP that replaces the authored NOP before a manager.
+    pub(super) retained_inner_try_pop: Option<Instruction>,
     pub(super) handler_pop: Option<Instruction>,
     pub(super) instructions: Vec<Instruction>,
     pub(super) missing_null_pops: usize,
+}
+
+/// An original saved-value return array with two omitted named-handler POP cells.
+#[derive(Debug)]
+pub(super) struct SavedNamedHandlerNonePrefix {
+    pub(super) entry: Label,
+    pub(super) items: Vec<Item>,
+    pub(super) unwind_offset: usize,
 }
 
 /// Original constant-return cleanup, including NULL records omitted under a manager.
@@ -383,6 +416,15 @@ pub(super) struct ExceptionOwnerDecision {
     pub(super) override_existing: bool,
 }
 
+/// A complete original array through one value Boolean, captured before CFG rewrites.
+#[derive(Debug)]
+pub(super) struct RetainedSetupValueArray {
+    entry: Label,
+    value_entry: Label,
+    prefix: Vec<Item>,
+    setups: Vec<(Label, Option<SourceLocation>)>,
+}
+
 /// The unused instruction-array suffix across CPython's three relevant assembler stages.
 #[derive(Clone, Copy, Debug, Default)]
 struct ExceptionOwnerTail {
@@ -439,7 +481,7 @@ impl ExceptionOwnerTail {
 /// An emitted conditional array whose unchanged records prove a NULL append cell.
 #[derive(Debug)]
 pub(super) struct UncompactedConditionalArray {
-    prefix: Vec<Item>,
+    pub(super) prefix: Vec<Item>,
     comprehension_entry: Option<Label>,
     source_entry: Option<Label>,
 }
@@ -557,6 +599,59 @@ impl ExceptionOwnerProvenance {
             .collect()
     }
 
+    /// Captures resolved source records before later passes can copy or change the array.
+    fn capture_retained_setup_value_arrays(&mut self, items: &[Item]) {
+        for (value_entry, value_prefix) in &self.original_value_jump_prefixes {
+            let mut starts = items
+                .iter()
+                .enumerate()
+                .filter_map(|(index, item)| (*item == Item::Label(*value_entry)).then_some(index));
+            let Some(start) = starts.next() else {
+                continue;
+            };
+            if starts.next().is_some()
+                || items.get(start..start + value_prefix.len()) != Some(value_prefix.as_slice())
+            {
+                continue;
+            }
+            let Some(begin) = items[..start].iter().rposition(|item| {
+                matches!(item, Item::Label(label)
+                    if self.source_boundaries.contains(label)
+                        && self.block_boundaries.contains(label))
+            }) else {
+                continue;
+            };
+            let Item::Label(entry) = items[begin] else {
+                unreachable!();
+            };
+            let prefix = &items[begin..start + value_prefix.len()];
+            let setups = self
+                .setups
+                .iter()
+                .filter(|(label, _)| prefix.contains(&Item::Label(*label)))
+                .copied()
+                .collect::<Vec<_>>();
+            if setups
+                .iter()
+                .filter(|(_, location)| location.is_some())
+                .count()
+                != 1
+                || !setups.iter().any(|(label, location)| {
+                    location.is_none() && self.synchronous_with_setups.contains(label)
+                })
+            {
+                continue;
+            }
+            self.retained_setup_value_arrays
+                .push(RetainedSetupValueArray {
+                    entry,
+                    value_entry: *value_entry,
+                    prefix: prefix.to_vec(),
+                    setups,
+                });
+        }
+    }
+
     /// Finds a unique unchanged survivor whose literal-fold witness has not retired.
     fn original_uniform_fold_positions(&self, instructions: &[&Instruction]) -> FxHashSet<usize> {
         self.original_uniform_folds
@@ -586,6 +681,7 @@ impl ExceptionOwnerProvenance {
     pub(super) fn capture_uncompacted_conditional_arrays(&mut self, items: &[Item]) {
         use crate::target::opcodes::{POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE};
 
+        self.capture_retained_setup_value_arrays(items);
         let mut begin = 0;
         for (index, item) in items.iter().enumerate() {
             let Item::Instruction(instruction) = item else {
@@ -2854,6 +2950,229 @@ impl LayoutAssembler {
         result
     }
 
+    /// Proves the retained SETUP's NULL cell after exact late manager-SETUP compaction.
+    fn retained_setup_value_null_markers(
+        &self,
+        positions: &FxHashMap<Label, usize>,
+        jump_targets: &FxHashSet<Label>,
+        retained_setup_nops: &FxHashSet<usize>,
+        value_jump_positions: &FxHashMap<Label, usize>,
+    ) -> FxHashSet<usize> {
+        let provenance = &self.exception_owner_provenance;
+        let mut result = FxHashSet::default();
+        for origin in &provenance.retained_setup_value_arrays {
+            let Some(&marker_index) = value_jump_positions.get(&origin.value_entry) else {
+                continue;
+            };
+            if !provenance.source_boundaries.contains(&origin.entry)
+                || !provenance.block_boundaries.contains(&origin.entry)
+                || provenance
+                    .retained_setup_value_arrays
+                    .iter()
+                    .filter(|other| other.value_entry == origin.value_entry)
+                    .count()
+                    != 1
+            {
+                continue;
+            }
+            let mut starts =
+                self.items.iter().enumerate().filter_map(|(index, item)| {
+                    (*item == Item::Label(origin.entry)).then_some(index)
+                });
+            let Some(begin) = starts.next() else {
+                continue;
+            };
+            let Some(current) = self.items.get(begin..begin + origin.prefix.len()) else {
+                continue;
+            };
+            if starts.next().is_some()
+                || current
+                    .iter()
+                    .zip(&origin.prefix)
+                    .any(|(actual, expected)| {
+                        let mut expected = *expected;
+                        if let (Item::Instruction(actual), Item::Instruction(expected)) =
+                            (actual, &mut expected)
+                            && expected.opcode == crate::target::opcodes::LOAD_FAST
+                            && actual.opcode == crate::target::opcodes::LOAD_FAST_BORROW
+                        {
+                            expected.opcode = actual.opcode;
+                        }
+                        *actual != expected
+                    })
+            {
+                continue;
+            }
+            let labels = origin
+                .prefix
+                .iter()
+                .filter_map(|item| match item {
+                    Item::Label(label) => Some(*label),
+                    Item::Instruction(_) => None,
+                })
+                .collect::<Vec<_>>();
+            if labels.iter().copied().collect::<FxHashSet<_>>().len() != labels.len()
+                || labels.iter().any(|label| {
+                    self.items
+                        .iter()
+                        .filter(|item| **item == Item::Label(*label))
+                        .count()
+                        != 1
+                        || provenance.retired_normal_try_copy_labels.contains(label)
+                        || provenance.normal_try_copy_blocks.contains(label)
+                        || provenance.normal_try_copy_inline_labels.contains(label)
+                        || provenance.normal_try_copy_internal_labels.contains(label)
+                        || provenance
+                            .normal_try_copy_jump_nop_successors
+                            .contains(label)
+                        || provenance
+                            .normal_try_copy_steps
+                            .iter()
+                            .any(|(a, b, _)| a == label || b == label)
+                        || provenance
+                            .normal_try_copy_pop_ranges
+                            .iter()
+                            .any(|(a, b)| a == label || b == label)
+                        || provenance.removed_pop_block_boundaries.contains(label)
+                        || provenance.omitted_nop_counts.contains_key(label)
+                        || provenance.omitted_nop_locations.contains_key(label)
+                        || (*label != origin.entry
+                            && (provenance.block_boundaries.contains(label)
+                                || provenance.source_boundaries.contains(label)
+                                || self.preserved_block_boundaries.contains(label)
+                                || jump_targets.contains(label)
+                                || self
+                                    .exception_regions
+                                    .iter()
+                                    .any(|region| region.target == *label)))
+                })
+                || provenance
+                    .setups
+                    .iter()
+                    .filter(|(label, _)| labels.contains(label))
+                    .copied()
+                    .collect::<Vec<_>>()
+                    != origin.setups
+            {
+                continue;
+            }
+            let Some(&array_start) = positions.get(&origin.entry) else {
+                continue;
+            };
+            let mut logical = array_start;
+            let mut removed = 0;
+            let mut null_cell = None;
+            let mut previous = None;
+            let mut tail = ExceptionOwnerTail::default();
+            let mut valid = true;
+            for item in &current[..current.len() - 1] {
+                match item {
+                    Item::Label(label) => {
+                        if *label == origin.entry {
+                            continue;
+                        }
+                        let setups = origin
+                            .setups
+                            .iter()
+                            .filter(|(setup, _)| setup == label)
+                            .collect::<Vec<_>>();
+                        match setups.as_slice() {
+                            [(_, None)] if provenance.synchronous_with_setups.contains(label) => {
+                                removed += 1;
+                            }
+                            [(_, Some(location))] => {
+                                if null_cell.is_some()
+                                    || !logical
+                                        .checked_sub(1)
+                                        .is_some_and(|index| retained_setup_nops.contains(&index))
+                                    || !previous.is_some_and(|instruction: Instruction| {
+                                        instruction.opcode == NOP
+                                            && instruction.location == *location
+                                    })
+                                {
+                                    valid = false;
+                                    break;
+                                }
+                                null_cell = Some(logical - 1 + removed);
+                            }
+                            [] => {
+                                let retained_endpoint =
+                                    provenance.setup_nop_ranges.iter().any(|(start, end)| {
+                                        (label == start || label == end)
+                                            && labels.contains(start)
+                                            && labels.contains(end)
+                                            && positions.get(start).is_some_and(|index| {
+                                                retained_setup_nops.contains(index)
+                                                    && positions.get(end) == Some(&(index + 1))
+                                            })
+                                    });
+                                let value_label = provenance
+                                    .original_value_jump_prefixes
+                                    .iter()
+                                    .any(|(entry, prefix)| {
+                                        *entry == origin.value_entry
+                                            && prefix.contains(&Item::Label(*label))
+                                    });
+                                if !retained_endpoint
+                                    && !value_label
+                                    && !provenance.continuation_boundaries.contains(label)
+                                {
+                                    valid = false;
+                                    break;
+                                }
+                            }
+                            _ => {
+                                valid = false;
+                                break;
+                            }
+                        }
+                    }
+                    Item::Instruction(instruction) => {
+                        let final_condition = logical + 1 == marker_index
+                            && matches!(
+                                instruction.opcode,
+                                crate::target::opcodes::POP_JUMP_IF_FALSE
+                                    | crate::target::opcodes::POP_JUMP_IF_TRUE
+                            )
+                            && matches!(instruction.operand(), Operand::Forward(_));
+                        if instruction.local_policy.hidden_exception_owner_slots() != 0
+                            || instruction.pre_fold_extra_instructions() != 0
+                            || instruction.exception_policy()
+                                != super::ExceptionPolicy::NoneUnchanged
+                            || instruction.no_location_policy.borrow_fallthrough()
+                                != super::BorrowFallthrough::Reachable
+                            || instruction.jump_policy.borrow_empty_block()
+                            || instruction.fusion_policy.is_converted_pop_block()
+                            || (instruction.opcode == NOP
+                                && !retained_setup_nops.contains(&logical))
+                            || (!matches!(instruction.operand(), Operand::Value(_))
+                                && !final_condition)
+                            || matches!(instruction.opcode, NOT_TAKEN | FOR_ITER | SEND)
+                            || is_scope_exit(instruction.opcode)
+                        {
+                            valid = false;
+                            break;
+                        }
+                        tail.instruction(*instruction, previous);
+                        if tail.insertions != 0 || tail.post_compaction_fusions != 0 {
+                            valid = false;
+                            break;
+                        }
+                        previous = Some(*instruction);
+                        logical += 1;
+                    }
+                }
+            }
+            // The exact Boolean expansion is already revalidated. Reinsert the
+            // preceding erased manager SETUPs to recover the retained NOP's cell;
+            // earlier folds occur before this final compaction and cancel out.
+            if valid && removed > 0 && logical == marker_index && null_cell == Some(marker_index) {
+                result.insert(marker_index);
+            }
+        }
+        result
+    }
+
     /// Recovers an original named-handler cleanup cell before a complete value Boolean.
     fn copied_handler_value_owner(
         &self,
@@ -2977,6 +3296,119 @@ impl LayoutAssembler {
         let region = self.uniform_exception_owner(start, end, positions)?;
         let owner = self.exception_regions[region];
         (!owner.is_scope_fallback && !owner.preserve_lasti).then_some(region)
+    }
+
+    /// Replays the exact finalizer NULL cell after a saved named-handler return.
+    fn saved_named_handler_none_is_null(
+        &self,
+        marker: usize,
+        array: usize,
+        tail: ExceptionOwnerTail,
+        instructions: &[&Instruction],
+        positions: &FxHashMap<Label, usize>,
+        jump_targets: &FxHashSet<Label>,
+    ) -> bool {
+        if tail.early_removals != 4
+            || tail.insertions != 0
+            || tail.late_removals != 0
+            || tail.post_compaction_fusions != 0
+        {
+            return false;
+        }
+        let provenance = &self.exception_owner_provenance;
+        let mut matching = provenance
+            .saved_named_handler_none_prefixes
+            .iter()
+            .filter(|origin| {
+                origin.items.last() == Some(&Item::Instruction(*instructions[marker]))
+                    && positions.get(&origin.entry) == Some(&array)
+            });
+        let Some(origin) = matching.next() else {
+            return false;
+        };
+        if matching.next().is_some()
+            || !provenance.source_boundaries.contains(&origin.entry)
+            || !provenance.block_boundaries.contains(&origin.entry)
+            || provenance
+                .retired_normal_try_copy_labels
+                .contains(&origin.entry)
+            || provenance.normal_try_copy_blocks.contains(&origin.entry)
+            || provenance
+                .normal_try_copy_internal_labels
+                .contains(&origin.entry)
+            || array.checked_add(origin.unwind_offset + 7) != Some(marker)
+            || jump_targets
+                .iter()
+                .chain(&provenance.source_boundaries)
+                .chain(&provenance.block_boundaries)
+                .chain(&self.preserved_block_boundaries)
+                .any(|label| {
+                    positions
+                        .get(label)
+                        .is_some_and(|position| array < *position && *position <= marker)
+                })
+            || provenance.setups.iter().any(|(label, _)| {
+                positions
+                    .get(label)
+                    .is_some_and(|position| array <= *position && *position <= marker)
+            })
+            || self.exception_regions.iter().any(|region| {
+                positions
+                    .get(&region.target)
+                    .is_some_and(|position| array < *position && *position <= marker)
+            })
+        {
+            return false;
+        }
+        let mut original = 0;
+        let mut live = array;
+        let mut labels = FxHashSet::default();
+        for item in &origin.items {
+            match *item {
+                Item::Label(label) => {
+                    if !labels.insert(label)
+                        || positions.get(&label) != Some(&live)
+                        || provenance.retired_normal_try_copy_labels.contains(&label)
+                        || provenance.normal_try_copy_blocks.contains(&label)
+                        || provenance.normal_try_copy_internal_labels.contains(&label)
+                        || self
+                            .items
+                            .iter()
+                            .filter(|item| **item == Item::Label(label))
+                            .count()
+                            != 1
+                    {
+                        return false;
+                    }
+                }
+                Item::Instruction(mut expected) => {
+                    let offset = original;
+                    original += 1;
+                    if offset == origin.unwind_offset + 5 {
+                        // Only the captured finalizer POP is erased from this live prefix.
+                        continue;
+                    }
+                    let Some(actual) = instructions.get(live) else {
+                        return false;
+                    };
+                    if offset == origin.unwind_offset + 6 {
+                        expected.local_policy.add_hidden_exception_owner_slots(1);
+                    }
+                    if expected.opcode == crate::target::opcodes::LOAD_FAST
+                        && actual.opcode == crate::target::opcodes::LOAD_FAST_BORROW
+                    {
+                        expected.opcode = actual.opcode;
+                    }
+                    if **actual != expected {
+                        return false;
+                    }
+                    live += 1;
+                }
+            }
+        }
+        // The omitted handler POPs precede SWAP and POP_EXCEPT. They put the
+        // finalizer POP at original SWAP+7, exactly the appended marker's cell.
+        original == origin.unwind_offset + 9 && live == marker + 1
     }
 
     /// Replays only fully captured constant-return cleanup and its original NULL cells.
@@ -3427,6 +3859,130 @@ impl LayoutAssembler {
         Some(())
     }
 
+    /// Replays a retired original try-exit JUMP on its unchanged normal-finally NOP.
+    fn normal_try_break_pop_owners(
+        &self,
+        positions: &FxHashMap<Label, usize>,
+        targets: &FxHashSet<Label>,
+    ) -> FxHashMap<usize, ExceptionOwnerDecision> {
+        use crate::target::opcodes::{LOAD_FAST, LOAD_FAST_BORROW};
+
+        let mut result = FxHashMap::default();
+        for origin in &self.exception_owner_provenance.normal_try_break_pop_owners {
+            // Threading retires the bridge's sole instruction; its original labels
+            // remain empty immediately before the same original inner handler.
+            let Some(first) = origin.source_labels.first() else {
+                continue;
+            };
+            let Some(source) = self
+                .items
+                .iter()
+                .position(|item| *item == Item::Label(*first))
+            else {
+                continue;
+            };
+            if origin
+                .source_labels
+                .iter()
+                .enumerate()
+                .any(|(offset, label)| {
+                    self.items.get(source + offset) != Some(&Item::Label(*label))
+                        || targets.contains(label)
+                        || positions.get(label) != positions.get(&origin.handler)
+                })
+                || self.items.get(source + origin.source_labels.len())
+                    != Some(&Item::Label(origin.handler))
+            {
+                continue;
+            }
+            let Some(start) = self
+                .items
+                .iter()
+                .position(|item| *item == Item::Label(origin.entry))
+            else {
+                continue;
+            };
+            let Some(current) = self.items.get(start..start + origin.prefix.len()) else {
+                continue;
+            };
+            if self.items.get(start + origin.prefix.len()) != Some(&Item::Label(origin.exit)) {
+                continue;
+            }
+            let mut expected = origin.prefix.clone();
+            let Some(marker_at) = expected
+                .iter()
+                .position(|item| matches!(item, Item::Instruction(_)))
+            else {
+                continue;
+            };
+            let Item::Instruction(marker) = &mut expected[marker_at] else {
+                unreachable!();
+            };
+            marker.location = origin.location;
+            for (expected, current) in expected.iter_mut().zip(current) {
+                if let (Item::Instruction(expected), Item::Instruction(current)) =
+                    (expected, current)
+                    && expected.opcode == LOAD_FAST
+                    && current.opcode == LOAD_FAST_BORROW
+                {
+                    expected.opcode = LOAD_FAST_BORROW;
+                }
+            }
+            if current != expected.as_slice()
+                || current.iter().any(|item| {
+                    matches!(item, Item::Label(label)
+                    if targets.contains(label)
+                        || self.exception_regions.iter().any(|region| region.target == *label))
+                })
+            {
+                continue;
+            }
+            let Some(&marker) = positions.get(&origin.entry) else {
+                continue;
+            };
+            if positions.get(&origin.region.end) != Some(&marker) {
+                continue;
+            }
+            let Some(&region_start) = positions.get(&origin.region.start) else {
+                continue;
+            };
+            if region_start >= marker {
+                continue;
+            }
+            let mut regions = self
+                .exception_regions
+                .iter()
+                .enumerate()
+                .filter(|(_, region)| {
+                    let mut original_labels = **region;
+                    original_labels.start = origin.region.start;
+                    original_labels.end = origin.region.end;
+                    positions.get(&region.start) == Some(&region_start)
+                        && positions.get(&region.end) == Some(&marker)
+                        && super::fusion_owner_slots::same_manager_region(
+                            &original_labels,
+                            &origin.region,
+                        )
+                });
+            let Some((region, _)) = regions.next() else {
+                continue;
+            };
+            if regions.next().is_some() {
+                continue;
+            }
+            result.insert(
+                marker,
+                ExceptionOwnerDecision {
+                    has_owner: true,
+                    source_region: Some(region),
+                    definitive: true,
+                    override_existing: true,
+                },
+            );
+        }
+        result
+    }
+
     /// Resolves inserted markers after fusion and complete SETUP provenance is available.
     pub(super) fn dynamic_exception_owners(&self) -> FxHashMap<usize, ExceptionOwnerDecision> {
         if self.exception_regions.is_empty() {
@@ -3450,6 +4006,10 @@ impl LayoutAssembler {
             .synchronous_with_setups
             .is_empty()
             && self.exception_owner_provenance.source_boundaries.is_empty()
+            && self
+                .exception_owner_provenance
+                .normal_try_break_pop_owners
+                .is_empty()
             && !self.items.iter().any(|item| {
                 let Item::Instruction(instruction) = item else {
                     return false;
@@ -3587,6 +4147,12 @@ impl LayoutAssembler {
             };
         let retained_setup_null_markers =
             self.retained_setup_null_markers(&label_positions, &jump_targets, &retained_setup_nops);
+        let retained_setup_value_null_markers = self.retained_setup_value_null_markers(
+            &label_positions,
+            &jump_targets,
+            &retained_setup_nops,
+            &original_value_jump_positions,
+        );
         let retained_normal_pop_terminators =
             self.retained_normal_pop_terminators(&jump_targets, &label_positions);
         let (captured_pop_slots, captured_pop_aliases) =
@@ -5515,7 +6081,7 @@ impl LayoutAssembler {
                         && instruction.exception_policy() == super::ExceptionPolicy::NonePresent
                         && original_array_start == 0
                         && owner_history_exact
-                        && tail.insertions == 2
+                        && matches!(tail.insertions, 0 | 2)
                         && tail.late_removals == 3
                         && tail.post_compaction_fusions == 0
                         && owners
@@ -5523,6 +6089,7 @@ impl LayoutAssembler {
                             .is_none_or(|owner| !owner.definitive)
                         && let Some(region) = self.entry_manager_return_setup_owner(
                             instruction_index,
+                            tail.insertions,
                             &indexed_instructions,
                             &label_positions,
                             &jump_targets,
@@ -5591,6 +6158,7 @@ impl LayoutAssembler {
                             &indexed_instructions,
                             &label_positions,
                             &jump_targets,
+                            false,
                         )
                     {
                         owners.insert(instruction_index, decision);
@@ -5622,6 +6190,30 @@ impl LayoutAssembler {
                             &indexed_instructions,
                             &label_positions,
                             &jump_targets,
+                            false,
+                        )
+                    {
+                        owners.insert(instruction_index, decision);
+                    }
+                    // This exact adjacent authored-NOP/inner-try-POP pair certifies the
+                    // retained NULL cell independently of the generic POP epoch.
+                    if instruction.opcode == NOT_TAKEN
+                        && instruction.exception_policy() == super::ExceptionPolicy::NonePresent
+                        && owner_history_exact
+                        && tail.insertions == 0
+                        && tail.late_removals == 0
+                        && tail.post_compaction_fusions == 0
+                        && owners
+                            .get(&instruction_index)
+                            .is_none_or(|owner| !owner.definitive)
+                        && let Some(decision) = self.copied_manager_return_compaction_owner(
+                            instruction_index,
+                            original_array_start,
+                            tail,
+                            &indexed_instructions,
+                            &label_positions,
+                            &jump_targets,
+                            true,
                         )
                     {
                         owners.insert(instruction_index, decision);
@@ -5925,6 +6517,69 @@ impl LayoutAssembler {
                                 },
                             );
                         }
+                    }
+                    // An unchanged authored conditional array appends into a fresh NULL
+                    // cell. Certify its original terminator before a marker-only range
+                    // label obscures the array epoch; no removed cell can be reused.
+                    if is_conditional_jump(instruction.opcode)
+                        && matches!(instruction.operand(), Operand::Forward(_))
+                        && instruction.exception_policy() == super::ExceptionPolicy::NoneUnchanged
+                        && owner_history_exact
+                        && retained_epoch_known
+                        && pop_slot_epoch_known
+                        && tail.early_removals == 0
+                        && tail.insertions == 0
+                        && tail.late_removals == 0
+                        && tail.post_compaction_fusions == 0
+                        && original_array_start > 0
+                        && self
+                            .exception_owner_provenance
+                            .block_boundaries
+                            .iter()
+                            .any(|label| label_positions.get(label) == Some(&original_array_start))
+                        && self
+                            .exception_owner_provenance
+                            .original_primitive_condition_boundaries
+                            .iter()
+                            .filter(|origin| **origin == *instruction)
+                            .count()
+                            == 1
+                        && indexed_instructions
+                            .iter()
+                            .filter(|record| ***record == *instruction)
+                            .count()
+                            == 1
+                        && !boundaries
+                            .iter()
+                            .chain(&jump_targets)
+                            .chain(&self.exception_owner_provenance.source_boundaries)
+                            .chain(&self.exception_owner_provenance.removed_pop_block_boundaries)
+                            .chain(setups.keys())
+                            .any(|label| {
+                                label_positions.get(label) == Some(&(instruction_index + 1))
+                            })
+                        && let Some(marker) = indexed_instructions.get(instruction_index + 1)
+                        && marker.opcode == NOT_TAKEN
+                        && marker.exception_policy() == super::ExceptionPolicy::NonePresent
+                        && marker.location == instruction.location
+                        && marker.depth_after() == instruction.depth_after()
+                        && marker.pre_fold_extra_instructions() == 0
+                        && marker.local_policy.hidden_exception_owner_slots() == 0
+                        && marker.no_location_policy.borrow_fallthrough()
+                            != super::BorrowFallthrough::Barrier
+                        && owners
+                            .get(&(instruction_index + 1))
+                            .is_none_or(|owner| !owner.definitive)
+                    {
+                        owners.insert(
+                            instruction_index + 1,
+                            ExceptionOwnerDecision {
+                                has_owner: false,
+                                source_region: None,
+                                definitive: true,
+                                override_existing: true,
+                            },
+                        );
                     }
                     // Certify the fresh append slot at the original terminator, before
                     // bookkeeping labels ahead of NOT_TAKEN obscure its array epoch.
@@ -6764,6 +7419,17 @@ impl LayoutAssembler {
                             },
                         );
                     }
+                    if retained_setup_value_null_markers.contains(&instruction_index) {
+                        owners.insert(
+                            instruction_index,
+                            ExceptionOwnerDecision {
+                                has_owner: false,
+                                source_region: None,
+                                definitive: true,
+                                override_existing: true,
+                            },
+                        );
+                    }
                     if instruction.opcode == NOT_TAKEN
                         && instruction.exception_policy().exclusion()
                             == super::ExceptionExclusion::None
@@ -6892,6 +7558,34 @@ impl LayoutAssembler {
                                 &jump_targets,
                             )
                             .is_some()
+                    {
+                        owners.insert(
+                            instruction_index,
+                            ExceptionOwnerDecision {
+                                has_owner: false,
+                                source_region: None,
+                                definitive: true,
+                                override_existing: true,
+                            },
+                        );
+                    }
+                    // This saved-value cleanup certifies two omitted handler POPs and
+                    // the exact later finalizer NULL cell without changing generic history.
+                    if instruction.opcode == NOT_TAKEN
+                        && instruction.exception_policy() == super::ExceptionPolicy::NonePresent
+                        && owner_history_exact
+                        && pop_slot_epoch_known
+                        && owners
+                            .get(&instruction_index)
+                            .is_none_or(|decision| !decision.definitive)
+                        && self.saved_named_handler_none_is_null(
+                            instruction_index,
+                            original_array_start,
+                            tail,
+                            &indexed_instructions,
+                            &label_positions,
+                            &jump_targets,
+                        )
                     {
                         owners.insert(
                             instruction_index,
@@ -7704,6 +8398,7 @@ impl LayoutAssembler {
                 },
             );
         }
+        owners.extend(self.normal_try_break_pop_owners(&label_positions, &jump_targets));
         owners
     }
 
@@ -8163,6 +8858,7 @@ impl LayoutAssembler {
         instructions: &[&Instruction],
         positions: &FxHashMap<Label, usize>,
         jump_targets: &FxHashSet<Label>,
+        retained_inner_try_only: bool,
     ) -> Option<ExceptionOwnerDecision> {
         use crate::target::opcodes::LOAD_FAST_BORROW;
 
@@ -8172,6 +8868,13 @@ impl LayoutAssembler {
             .exception_owner_provenance
             .copied_manager_return_compactions
             .iter()
+            .filter(|origin| {
+                !retained_inner_try_only
+                    || origin
+                        .constant_return_prefix
+                        .as_ref()
+                        .is_some_and(|prefix| prefix.retained_inner_try_pop.is_some())
+            })
             .filter_map(|origin| {
                 let load_index = marker.checked_sub(2 + usize::from(origin.to_bool.is_some()))?;
                 let load = *instructions.get(load_index)?;
@@ -8192,7 +8895,10 @@ impl LayoutAssembler {
                     origin
                         .constant_return_prefix
                         .as_ref()
-                        .map_or(0, |prefix| prefix.instructions.len()),
+                        .map_or(0, |prefix| prefix.instructions.len())
+                        + origin
+                            .named_handler_cleanup
+                            .map_or(0, |prefix| prefix.len()),
                 )?;
                 if array_start > prefix_start
                     || jump_targets
@@ -8244,7 +8950,33 @@ impl LayoutAssembler {
                 {
                     return None;
                 }
+                if let Some(prefix) = origin.named_handler_cleanup {
+                    if tail.post_compaction_fusions != 0
+                        || origin.constant_return_prefix.is_some()
+                        || origin.earlier_cleanup.is_some()
+                        || !instructions[prefix_start..start]
+                            .iter()
+                            .zip(prefix)
+                            .all(|(actual, expected)| **actual == expected)
+                    {
+                        return None;
+                    }
+                }
                 if let Some(prefix) = &origin.constant_return_prefix {
+                    if prefix.retained_inner_try_pop.is_some_and(|pop| {
+                        !prefix.retained_authored
+                            || prefix.handler_pop.is_some()
+                            || prefix.instructions.as_slice() != [pop]
+                            || pop.opcode != NOP
+                            || !pop.fusion_policy.is_converted_pop_block()
+                            || pop.exception_policy() != super::ExceptionPolicy::EXCLUDE_ALWAYS
+                            || pop.location != prefix.authored_nop.location
+                            || pop.depth_after() != prefix.authored_nop.depth_after()
+                            || origin.ordinary_try_pops != 0
+                            || prefix.missing_null_pops != 0
+                    }) {
+                        return None;
+                    }
                     if tail.post_compaction_fusions != 0
                         || prefix.authored_nop.opcode != NOP
                         || prefix
@@ -8257,7 +8989,9 @@ impl LayoutAssembler {
                             .enumerate()
                             .all(|(offset, (actual, expected))| {
                                 let mut expected = *expected;
-                                if offset == 0 && !prefix.retained_authored {
+                                if offset == 0 && prefix.retained_inner_try_pop.is_some() {
+                                    expected.local_policy.add_hidden_exception_owner_slots(1);
+                                } else if offset == 0 && !prefix.retained_authored {
                                     expected.local_policy.add_hidden_exception_owner_slots(
                                         1 + u16::from(prefix.handler_pop.is_some()),
                                     );
@@ -8280,7 +9014,11 @@ impl LayoutAssembler {
         for (offset, instruction) in instructions[array_start..start].iter().enumerate() {
             let authored_return_slots =
                 origin.constant_return_prefix.as_ref().map_or(0, |prefix| {
-                    if array_start + offset == prefix_start && !prefix.retained_authored {
+                    if array_start + offset == prefix_start
+                        && prefix.retained_inner_try_pop.is_some()
+                    {
+                        1
+                    } else if array_start + offset == prefix_start && !prefix.retained_authored {
                         1 + usize::from(prefix.handler_pop.is_some())
                     } else {
                         0
@@ -8308,7 +9046,16 @@ impl LayoutAssembler {
             if usize::from(instruction.local_policy.hidden_exception_owner_slots())
                 != authored_return_slots + literal_slots
                 || usize::from(instruction.pre_fold_extra_instructions()) != literal_slots
-                || instruction.exception_policy() != super::ExceptionPolicy::NoneUnchanged
+                || (instruction.exception_policy() != super::ExceptionPolicy::NoneUnchanged
+                    && !origin
+                        .constant_return_prefix
+                        .as_ref()
+                        .is_some_and(|prefix| {
+                            prefix.retained_inner_try_pop.is_some()
+                                && array_start + offset == prefix_start
+                                && instruction.exception_policy()
+                                    == super::ExceptionPolicy::EXCLUDE_ALWAYS
+                        }))
                 || (instruction.opcode == NOP
                     && !origin
                         .constant_return_prefix
@@ -8316,7 +9063,13 @@ impl LayoutAssembler {
                         .is_some_and(|prefix| {
                             prefix.retained_authored
                                 && array_start + offset == prefix_start
-                                && **instruction == prefix.authored_nop
+                                && if let Some(pop) = prefix.retained_inner_try_pop {
+                                    let mut expected = pop;
+                                    expected.local_policy.add_hidden_exception_owner_slots(1);
+                                    **instruction == expected
+                                } else {
+                                    **instruction == prefix.authored_nop
+                                }
                         }))
                 || instruction.no_location_policy.borrow_fallthrough()
                     == super::BorrowFallthrough::Barrier
@@ -8356,6 +9109,9 @@ impl LayoutAssembler {
                 .checked_add(prefix_tail.early_removals)?
                 // A preceding captured manager contributes its own omitted POP.
                 .checked_add(usize::from(origin.earlier_cleanup.is_some()))?
+                // Named-handler cleanup omits one POP before SWAP and another
+                // before POP_EXCEPT. Both precede the captured manager records.
+                .checked_add(2 * usize::from(origin.named_handler_cleanup.is_some()))?
                 .checked_add(
                     origin
                         .constant_return_prefix
@@ -8377,15 +9133,32 @@ impl LayoutAssembler {
         let region = self.uniform_exception_owner(start, load_index, positions)?;
         let owner = self.exception_regions[region];
         let current = self.uniform_exception_owner(marker, marker + 1, positions);
-        (!owner.is_scope_fallback
-            && !owner.preserve_lasti
-            && current.is_none_or(|current| self.exception_regions[current].is_scope_fallback))
-        .then_some(ExceptionOwnerDecision {
-            has_owner: owns_cleanup_record,
-            source_region: owns_cleanup_record.then_some(region),
-            definitive: true,
-            override_existing: true,
-        })
+        let current_owner_matches = if let Some(handler) = origin.retained_outer_handler {
+            // The frontend retained this exact outer manager after the inner exit.
+            // A captured named-handler prefix can leave the append slot inside the
+            // manager cleanup's ordinary-try owner, before its following NULL POPs.
+            (!owns_cleanup_record || origin.named_handler_cleanup.is_some())
+                && current.is_some_and(|region| {
+                    let retained = self.exception_regions[region];
+                    !retained.is_scope_fallback
+                        && retained.preserve_lasti
+                        && retained.target == handler
+                        && retained.depth == owner.depth
+                        && origin.pop.depth_after() == retained.depth.checked_add(1)
+                        && self.uniform_exception_owner(load_index, marker + 1, positions)
+                            == Some(region)
+                })
+        } else {
+            current.is_none_or(|current| self.exception_regions[current].is_scope_fallback)
+        };
+        (!owner.is_scope_fallback && !owner.preserve_lasti && current_owner_matches).then_some(
+            ExceptionOwnerDecision {
+                has_owner: owns_cleanup_record,
+                source_region: owns_cleanup_record.then_some(region),
+                definitive: true,
+                override_existing: true,
+            },
+        )
     }
 
     /// Locates a retained NULL SETUP record in an entry array's last compacted tail.
@@ -8564,6 +9337,7 @@ impl LayoutAssembler {
     fn entry_manager_return_setup_owner(
         &self,
         marker: usize,
+        entry_insertions: usize,
         instructions: &[&Instruction],
         positions: &FxHashMap<Label, usize>,
         jump_targets: &FxHashSet<Label>,
@@ -8624,10 +9398,6 @@ impl LayoutAssembler {
             || *try_start >= *manager_start
             || retained.as_slice() != [*try_start]
             || !self
-                .exception_regions
-                .iter()
-                .any(|region| region.is_scope_fallback && region.start == *scope)
-            || !self
                 .exception_owner_provenance
                 .synchronous_with_setups
                 .contains(manager)
@@ -8658,10 +9428,39 @@ impl LayoutAssembler {
         let region = self.uniform_exception_owner(source, source + 1, positions)?;
         let owner = self.exception_regions[region];
         let current = self.uniform_exception_owner(marker, marker + 1, positions)?;
+        let current_owner = self.exception_regions[current];
+        let outer_setup_matches = if entry_insertions == 2 {
+            current_owner.is_scope_fallback
+                && self
+                    .exception_regions
+                    .iter()
+                    .any(|region| region.is_scope_fallback && region.start == *scope)
+        } else {
+            // An ordinary scope can retain an outer synchronous manager instead.
+            // Bind that setup to the live guard owner before restoring the exact
+            // ordinary-try POP_TOP donor left by the same three SETUP removals.
+            entry_insertions == 0
+                && !current_owner.is_scope_fallback
+                && current_owner.preserve_lasti
+                && current_owner.depth == owner.depth
+                && self
+                    .exception_owner_provenance
+                    .synchronous_with_setups
+                    .contains(scope)
+                && self.exception_regions.iter().any(|region| {
+                    region.start == *scope
+                        && !region.is_scope_fallback
+                        && region.preserve_lasti
+                        && region.target == current_owner.target
+                        && region.depth == current_owner.depth
+                })
+                && self.uniform_exception_owner(marker.checked_sub(2)?, marker + 1, positions)
+                    == Some(current)
+        };
         (!owner.is_scope_fallback
             && !owner.preserve_lasti
             && owner.target == handler
-            && self.exception_regions[current].is_scope_fallback)
+            && outer_setup_matches)
             .then_some(region)
     }
 

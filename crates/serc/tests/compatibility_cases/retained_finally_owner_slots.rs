@@ -187,3 +187,98 @@ fn matches_cpython_iterator_between_ordinary_try_finalizer_owners() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_guarded_raise_finalizer_retained_owner() {
+    let source = r"def run(work, clean, report, finish, resource):
+    try:
+        try:
+            try:
+                return work()
+            finally:
+                if resource is not None:
+                    errors, interrupt = clean(resource)
+                    if errors:
+                        report(errors)
+                    if interrupt is not None:
+                        raise interrupt
+        except Exception:
+            raise
+    finally:
+        finish()
+";
+    common::assert_matches_cpython_marshal(
+        source,
+        "guarded_raise_finalizer_retained_try_owner_target.py",
+    );
+}
+
+#[test]
+fn matches_cpython_guarded_raise_finalizer_named_handler_boundaries() {
+    for (filename, source) in [
+        (
+            "guarded_raise_finalizer_literal_named_owner_target.py",
+            r"def run(work, clean, report, finish):
+    try:
+        try:
+            work()
+        except Exception as error:
+            try:
+                report(error)
+                return 2
+            finally:
+                errors, interrupt = clean(error)
+                if errors:
+                    report(errors)
+                if interrupt is not None:
+                    raise interrupt
+    finally:
+        finish()
+",
+        ),
+        (
+            "guarded_raise_finalizer_named_owner_target.py",
+            r"def run(work, clean, report, finish):
+    try:
+        try:
+            work()
+        except Exception as error:
+            try:
+                return work(error)
+            finally:
+                errors, interrupt = clean(error)
+                if errors:
+                    report(errors)
+                if interrupt is not None:
+                    raise interrupt
+    finally:
+        finish()
+",
+        ),
+        (
+            "guarded_raise_finalizer_unwound_inner_handler_target.py",
+            r"def run(work, clean, report, finish):
+    try:
+        try:
+            work()
+        except Exception as error:
+            try:
+                try:
+                    work(error)
+                except LookupError as inner_error:
+                    report(inner_error)
+                    return 2
+            finally:
+                errors, interrupt = clean(error)
+                if errors:
+                    report(errors)
+                if interrupt is not None:
+                    raise interrupt
+    finally:
+        finish()
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

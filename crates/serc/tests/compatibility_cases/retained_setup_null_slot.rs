@@ -838,3 +838,158 @@ fn matches_cpython_condition_after_original_comprehension_restore_span() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_value_returns_after_retained_setup() {
+    for (filename, source) in [
+        (
+            "five_managers_retained_setup_intervening_call_control.py",
+            r"def f(a, b, c, d, e, extra, flag, value, fallback, audit, finish):
+    if flag:
+        audit()
+    with a, b, c, d, e:
+        try:
+            audit()
+            result = value or fallback()
+            return result
+        finally:
+            finish()
+",
+        ),
+        (
+            "five_managers_retained_setup_value_and_null_target.py",
+            r"def f(a, b, c, d, e, extra, flag, value, fallback, audit, finish):
+    if flag:
+        audit()
+    with a, b, c, d, e:
+        try:
+            result = value and fallback()
+            return result
+        finally:
+            finish()
+",
+        ),
+        (
+            "five_managers_retained_setup_value_or_null_target.py",
+            r"def f(a, b, c, d, e, extra, flag, value, fallback, audit, finish):
+    if flag:
+        audit()
+    with a, b, c, d, e:
+        try:
+            result = value or fallback()
+            return result
+        finally:
+            finish()
+",
+        ),
+        (
+            "four_managers_retained_setup_value_owner_control.py",
+            r"def f(a, b, c, d, e, extra, flag, value, fallback, audit, finish):
+    if flag:
+        audit()
+    with a, b, c, d:
+        try:
+            result = value or fallback()
+            return result
+        finally:
+            finish()
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn matches_cpython_uncompacted_conditional_copy_retargets() {
+    for (filename, source) in [
+        (
+            "uncompacted_copied_exit_nested_try_owner_target.py",
+            r#"async def record_history(read, history, store, enabled, limit):
+    while True:
+        answer = read()
+        if answer is None:
+            break
+        try:
+            if answer:
+                compact = answer if len(answer) <= limit else answer[:limit]
+                history.append(f"Q: {answer}")
+                history.append(f"A: {compact}")
+                try:
+                    if enabled and store is not None:
+                        store.append_string(answer)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+"#,
+        ),
+        (
+            "uncompacted_copied_exit_nested_try_sync_control.py",
+            r#"def record_history(read, history, store, enabled, limit):
+    while True:
+        answer = read()
+        if answer is None:
+            break
+        try:
+            if answer:
+                compact = answer if len(answer) <= limit else answer[:limit]
+                history.append(f"Q: {answer}")
+                history.append(f"A: {compact}")
+                try:
+                    if enabled and store is not None:
+                        store.append_string(answer)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+"#,
+        ),
+        (
+            "uncompacted_copied_exit_live_join_control.py",
+            r#"async def record_history(read, history, store, enabled, limit):
+    while True:
+        answer = read()
+        if answer is None:
+            break
+        try:
+            if answer:
+                compact = answer if len(answer) <= limit else answer[:limit]
+                history.append(f"Q: {answer}")
+                history.append(f"A: {compact}")
+                try:
+                    if enabled and store is not None:
+                        store.append_string(answer)
+                except Exception:
+                    pass
+                history.append("done")
+        except Exception:
+            pass
+"#,
+        ),
+        (
+            "uncompacted_copied_exit_compacted_prefix_control.py",
+            r#"async def record_history(read, history, store, enabled, limit):
+    while True:
+        answer = read()
+        if answer is None:
+            break
+        try:
+            if answer:
+                compact = answer if len(answer) <= limit else answer[:limit]
+                question, response = answer, compact
+                history.append(f"Q: {question}")
+                history.append(f"A: {response}")
+                try:
+                    if enabled and store is not None:
+                        store.append_string(answer)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+"#,
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

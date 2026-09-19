@@ -699,3 +699,57 @@ fn matches_cpython_bare_pass_match_success_threading() {
         common::assert_matches_cpython_marshal(&source, &filename);
     }
 }
+
+#[test]
+fn matches_cpython_nested_value_match_final_pass_success_exit() {
+    for (filename, source) in [
+        (
+            "nested_value_match_final_pass_success_exit_target.py",
+            r"def choose(outer, inner, ready):
+    match outer:
+        case Outer.FIRST:
+            values = []
+        case Outer.NESTED:
+            values = []
+            match inner:
+                case Inner.FIRST:
+                    if ready:
+                        values.append(1)
+                case Inner.SECOND:
+                    if ready:
+                        values.append(2)
+                case Inner.LAST:
+                    pass
+        case _:
+            values = []
+    consume(values)
+    return values
+",
+        ),
+        (
+            "nested_value_match_final_call_success_exit_control.py",
+            r"def choose(outer, inner, ready):
+    match outer:
+        case Outer.FIRST:
+            values = []
+        case Outer.NESTED:
+            values = []
+            match inner:
+                case Inner.FIRST:
+                    if ready:
+                        values.append(1)
+                case Inner.SECOND:
+                    if ready:
+                        values.append(2)
+                case Inner.LAST:
+                    consume(values)
+        case _:
+            values = []
+    consume(values)
+    return values
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

@@ -22,6 +22,10 @@ pub(super) enum OriginalTail {
         // Two unfused local loads, BUILD_TUPLE, RETURN_VALUE.
         located: [bool; 4],
     },
+    ComputedReturn {
+        // Intact located global attribute/call slots, including a fused PUSH_NULL.
+        width: usize,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -131,9 +135,9 @@ pub(super) fn plan_normal_try_copies(nodes: &[OriginalNode]) -> Option<CopyResul
             }
             match nodes[current].tail {
                 OriginalTail::Jump { target, .. } => current = index_of(target)?,
-                OriginalTail::ConstantReturn { .. } | OriginalTail::LocalTupleReturn { .. } => {
-                    break;
-                }
+                OriginalTail::ConstantReturn { .. }
+                | OriginalTail::LocalTupleReturn { .. }
+                | OriginalTail::ComputedReturn { .. } => break,
             }
         }
     }
@@ -206,6 +210,27 @@ pub(super) fn plan_normal_try_copies(nodes: &[OriginalNode]) -> Option<CopyResul
                     slots.push(Slot {
                         kind,
                         located,
+                        #[cfg(test)]
+                        origin: SlotOrigin {
+                            node: node.id,
+                            slot: slots.len(),
+                        },
+                    });
+                }
+                None
+            }
+            OriginalTail::ComputedReturn { width } => {
+                if !(3..=4).contains(&width) {
+                    return None;
+                }
+                for index in 0..width {
+                    slots.push(Slot {
+                        kind: if index + 1 == width {
+                            SlotKind::ReturnValue
+                        } else {
+                            SlotKind::Other
+                        },
+                        located: true,
                         #[cfg(test)]
                         origin: SlotOrigin {
                             node: node.id,

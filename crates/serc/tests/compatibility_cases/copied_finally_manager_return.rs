@@ -530,3 +530,121 @@ fn matches_cpython_copied_finally_async_manager_return_owners() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_retained_outer_manager_value_return_none_guards() {
+    for (filename, source) in [
+        (
+            "retained_outer_manager_factory_call_handlers_none_guard.py",
+            r#"def run(outer, inner, cleanup, factory, value, report):
+    with outer:
+        try:
+            with inner:
+                return factory(normalize(value))
+        except LookupError as error:
+            raise RuntimeError("lookup") from error
+        except ValueError as error:
+            raise RuntimeError("invalid") from error
+        except Exception as error:
+            raise RuntimeError("failed") from error
+        finally:
+            if cleanup is not None:
+                cleanup.close()
+                report("closed")
+"#,
+        ),
+        (
+            "retained_outer_manager_constant_return_none_control.py",
+            r"def run(outer, inner, cleanup):
+    with outer:
+        try:
+            with inner:
+                return 7
+        except Exception:
+            raise
+        finally:
+            if cleanup is not None:
+                cleanup.close()
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn matches_cpython_retained_manager_computed_and_named_return_none() {
+    for (filename, source) in [
+        (
+            "retained_managers_computed_return_none_finally_target.py",
+            r#"def run(outer, retained, choose, report):
+    outcome = None
+    result = None
+    complete = False
+    with outer, retained:
+        try:
+            if choose:
+                complete = True
+                logger.info("completed")
+                return build_result(
+                    value=None,
+                    complete=True,
+                )
+            return build_result(value=None, complete=True)
+        except Exception:
+            raise
+        finally:
+            if outcome is not None or (result is None and not complete):
+                report(outcome)
+"#,
+        ),
+        (
+            "retained_managers_local_return_none_finally_control.py",
+            r#"def run(outer, retained, choose, value, report):
+    outcome = None
+    complete = False
+    with outer, retained:
+        try:
+            if choose:
+                complete = True
+                logger.info("completed")
+                return value
+            return value
+        except Exception:
+            raise
+        finally:
+            if outcome is not None or not complete:
+                report(outcome)
+"#,
+        ),
+        (
+            "retained_managers_named_return_none_finally_target.py",
+            r#"def run(outer, retained, inner, choose, report):
+    outcome = None
+    result = None
+    complete = False
+    details = None
+    with outer, retained:
+        try:
+            with inner:
+                try:
+                    operation()
+                except Exception as error:
+                    outcome = 1 if choose else 2
+                    details = {
+                        "reason": "retry",
+                        "exception_type": type(error).__name__,
+                        "exception_message": str(error),
+                    }
+                    return build_result(value=None)
+        except Exception:
+            raise
+        finally:
+            if outcome is not None or (result is None and not complete):
+                report(details)
+"#,
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

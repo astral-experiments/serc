@@ -533,3 +533,76 @@ fn matches_cpython_newer_try_named_handler_return_owners() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_private_exit_and_nested_handler_value_joins() {
+    for (filename, source) in [
+        (
+            "named_outer_unnamed_handler_value_returns.py",
+            r#"def call_then_dict(value):
+    try:
+        return primary(value)
+    except ValueError as error:
+        try:
+            return secondary(value)
+        except ValueError:
+            try:
+                return fallback(value)
+            except ValueError:
+                return {}
+
+
+def dict_then_call(value):
+    try:
+        return primary(value)
+    except ValueError as error:
+        try:
+            return secondary(value)
+        except ValueError:
+            try:
+                return {"value": value}
+            except ValueError:
+                return fallback(value)
+"#,
+        ),
+        (
+            "nested_unnamed_handlers_zero_return_target.py",
+            r"def run(work, cleanup, report, fallback):
+    try:
+        try:
+            work()
+            try:
+                cleanup()
+            except LookupError:
+                pass
+        except ValueError:
+            try:
+                report()
+            except RuntimeError:
+                fallback()
+    except Exception:
+        return 0
+    return 0
+",
+        ),
+        (
+            "unnested_handlers_zero_return_control.py",
+            r"def run(work, cleanup, report, fallback):
+    try:
+        work()
+        try:
+            cleanup()
+        except LookupError:
+            pass
+    except ValueError:
+        try:
+            report()
+        except RuntimeError:
+            fallback()
+    return 0
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

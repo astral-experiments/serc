@@ -176,3 +176,85 @@ fn matches_cpython_folded_list_try_else_search_join_locations() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_flat_tuple_closure_setup_owners() {
+    for (filename, source) in [
+        (
+            "flat_tuple_list_closure_first_setup_owner_target.py",
+            r"def f(probe):
+    table = [(0, 100), (1, 101), (2, 102), (3, 103), (4, 104), (5, 105), (6, 106), (7, 107), (8, 108), (9, 109), (10, 110), (11, 111), (12, 112), (13, 113), (14, 114), (15, 115), (16, 116)]
+    def read():
+        return table
+    try:
+        value = probe()
+        if not value:
+            raise ValueError
+    except Exception:
+        value = ()
+    return value, read
+",
+        ),
+        (
+            "flat_tuple_set_closure_first_setup_owner_target.py",
+            r"def f(probe):
+    table = {(0, 100), (1, 101), (2, 102), (3, 103), (4, 104), (5, 105), (6, 106), (7, 107), (8, 108), (9, 109), (10, 110), (11, 111), (12, 112), (13, 113), (14, 114), (15, 115), (16, 116)}
+    def read():
+        return table
+    try:
+        value = probe()
+        if not value:
+            raise ValueError
+    except Exception:
+        value = ()
+    return value, read
+",
+        ),
+        (
+            "flat_tuple_list_protected_fold_owner_control.py",
+            r"def f(probe):
+    try:
+        table = [(0, 100), (1, 101), (2, 102), (3, 103), (4, 104), (5, 105), (6, 106), (7, 107), (8, 108), (9, 109), (10, 110), (11, 111), (12, 112), (13, 113), (14, 114), (15, 115), (16, 116)]
+        if not probe():
+            raise ValueError
+    except Exception:
+        return None
+    return table
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn matches_cpython_post_try_literal_tuple_condition_owners() {
+    for (filename, source) in [
+        (
+            "post_try_literal_tuple_condition_target.py",
+            r#"async def inspect_payload(payload):
+    try:
+        text = payload.strip()
+    except (TypeError, ValueError):
+        return None
+    if text.startswith(("skip:", "empty:")):
+        return None
+    return text
+"#,
+        ),
+        (
+            "post_try_runtime_prefix_condition_control.py",
+            r"async def inspect_payload(payload, prefixes):
+    try:
+        text = payload.strip()
+    except (TypeError, ValueError):
+        return None
+    if text.startswith(prefixes):
+        return None
+    return text
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

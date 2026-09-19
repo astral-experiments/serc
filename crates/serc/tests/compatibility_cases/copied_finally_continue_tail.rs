@@ -414,3 +414,110 @@ fn matches_cpython_closed_recovery_none_conjunction_continues() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_generator_finally_guarded_handler_continue() {
+    for (filename, source) in [
+        (
+            "generator_finally_guard_nested_handler_continue_target.py",
+            r"def run(receive, remove, recover, retry):
+    while True:
+        item = receive()
+        success = False
+        try:
+            yield item
+            success = True
+        except Exception as error:
+            recover(error)
+            continue
+        finally:
+            if success:
+                try:
+                    remove(item)
+                except ValueError as error:
+                    recover(error)
+                    if retry(error):
+                        continue
+                    else:
+                        raise
+",
+        ),
+        (
+            "async_generator_finally_guard_nested_handler_continue_target.py",
+            r"async def run(receive, remove, recover, retry):
+    while True:
+        item = await receive()
+        success = False
+        try:
+            yield item
+            success = True
+        except Exception as error:
+            recover(error)
+            continue
+        finally:
+            if success:
+                try:
+                    await remove(item)
+                except ValueError as error:
+                    recover(error)
+                    if retry(error):
+                        continue
+                    else:
+                        raise
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn matches_cpython_awaited_handler_continue_finally_join() {
+    for (filename, source) in [
+        (
+            "async_iterator_handler_continue_await_finally_following_control.py",
+            r"async def run(events, state, process, recover, cleanup):
+    async for event in events:
+        try:
+            match event:
+                case 1:
+                    try:
+                        await process(event)
+                    except ValueError:
+                        await recover(event)
+                        continue
+                    finally:
+                        if state.value != state.expected:
+                            await cleanup(event)
+                        await recover(event)
+                case _:
+                    await process(event)
+        except Exception:
+            raise
+",
+        ),
+        (
+            "async_iterator_handler_continue_await_finally_join.py",
+            r"async def run(events, state, process, recover, cleanup):
+    async for event in events:
+        try:
+            match event:
+                case 1:
+                    try:
+                        await process(event)
+                    except ValueError:
+                        await recover(event)
+                        continue
+                    finally:
+                        if state.value != state.expected:
+                            await cleanup(event)
+                case _:
+                    await process(event)
+        except Exception:
+            raise
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

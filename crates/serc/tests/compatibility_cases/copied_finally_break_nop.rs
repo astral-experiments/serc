@@ -74,3 +74,28 @@ fn matches_cpython_marshal_for_copied_finally_break_nop_populated_control() {
 ";
     common::assert_matches_cpython_marshal(source, "populated_finally_break_join_control.py");
 }
+
+#[test]
+fn matches_cpython_copied_finally_handler_break_locations() {
+    let source = r#"def choose(paths, ready, remove):
+    index = 0
+    result = None
+    while index < len(paths):
+        current = paths[index]
+        try:
+            result = ready(current)
+            if result is not None:
+                break
+        finally:
+            if current is not None:
+                try:
+                    remove(current)
+                except FileNotFoundError:
+                    pass
+        index += 1
+    if result is None:
+        raise ValueError("no result")
+    return result
+"#;
+    common::assert_matches_cpython_marshal(source, "copied_finally_pass_handler_break_target.py");
+}

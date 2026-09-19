@@ -677,11 +677,28 @@ impl Compiler<'_> {
                     } else {
                         self.control.loops.non_final_match_tail
                     };
+                    // Only a direct case-tail match can thread into this case's exit.
+                    // A later case or default keeps that outer exit distinct from its join.
+                    let match_tail_before_case_exit = if !terminal
+                        && (copied_subject || has_default)
+                        && let Some(Stmt::Match(nested)) = case.body.last()
+                    {
+                        Some(nested.range)
+                    } else {
+                        None
+                    };
                     self.with_control_override(
                         |control| &mut control.loops.non_final_match_tail,
                         non_final_match_tail,
                         |compiler| {
-                            compiler.compile_match_case_suite(&case.body, match_has_following)
+                            compiler.with_control_override(
+                                |control| &mut control.statements.match_tail_before_case_exit,
+                                match_tail_before_case_exit,
+                                |compiler| {
+                                    compiler
+                                        .compile_match_case_suite(&case.body, match_has_following)
+                                },
+                            )
                         },
                     )?;
                     false
@@ -763,7 +780,28 @@ impl Compiler<'_> {
                         // incoming jump to retain the slot replaced by a small return.
                         let original_empty_join =
                             self.assembler.at_original_match_join() || fallthrough_if_join;
-                        let success_exit = self.emit_jump_forward_instruction(JUMP_FORWARD, end)?;
+                        // The final async-for exhaustion falls directly into the following
+                        // match continuation before cold blocks move. Its surviving bridge
+                        // represents that fallthrough, not an interruptible case-success jump.
+                        let final_async_exhaustion = match_has_following
+                            && index + 1 == matched_cases
+                            && !has_default
+                            && self
+                                .assembler
+                                .instruction_opcode_at(self.assembler.instruction_count() - 1)
+                                == Some(END_ASYNC_FOR);
+                        let success_exit = self
+                            .emit_jump_forward_instruction_with_exception_policy(
+                                JUMP_FORWARD,
+                                end,
+                                if final_async_exhaustion {
+                                    // Cold ordering materializes the original fallthrough as a
+                                    // new bridge; it has no original exception-owner slot.
+                                    ExceptionPolicy::EXCLUDE_ALWAYS
+                                } else {
+                                    ExceptionPolicy::default()
+                                },
+                            )?;
                         self.assembler
                             .record_original_match_success(success_exit, original_empty_join);
                         if original_unlocated_head {
@@ -835,7 +873,22 @@ impl Compiler<'_> {
                                     && matches!(case.pattern, Pattern::MatchValue(_)))
                                     || !context.fail_pop.is_empty()))
                         {
-                            if copied_subject
+                            if authored_pass_exit
+                                && self.control.statements.match_tail_before_case_exit
+                                    == Some(statement.range)
+                                && !copied_subject
+                                && !has_default
+                                && index + 1 == matched_cases
+                                && case.guard.is_none()
+                                && matches!(case.pattern, Pattern::MatchValue(_))
+                                && context.fail_pop.len() == 1
+                                && !self.control.falls_through_to_loop_backedge()
+                            {
+                                // This final value-pattern failure has a zero-pop join.
+                                // Keep the Pass line on its success jump while allowing it
+                                // to thread through an enclosing case's original exit.
+                                self.assembler.preserve_authored_pass_jump_nop(success_exit);
+                            } else if copied_subject
                                 && case.guard.is_none()
                                 && matches!(case.body.as_slice(), [Stmt::Pass(_)])
                                 && !context.fail_pop.is_empty()
@@ -865,7 +918,9 @@ impl Compiler<'_> {
                         } else {
                             // A surviving case-success edge is CPython's JUMP. Cleanup
                             // predecessors threaded through it keep its eval-breaker check.
-                            self.assembler.mark_jump_as_interruptible(success_exit);
+                            if !final_async_exhaustion {
+                                self.assembler.mark_jump_as_interruptible(success_exit);
+                            }
                             if original_unlocated_head {
                                 self.assembler.inherit_nested_if_match_exit_locations(
                                     success_exit,
@@ -6132,12 +6187,10 @@ impl Compiler<'_> {
                     1,
                     -1,
                 )?;
+                let hidden_owner_slots = folded_elements_owner_slots(elements, elements.len() - 2);
                 self.assembler
-                    .add_last_constant_fold_slots(folded_elements_owner_slots(
-                        elements,
-                        elements.len().saturating_sub(2),
-                    ));
-                if elements.iter().all(|element| {
+                    .add_last_constant_fold_slots(hidden_owner_slots);
+                let scalar_literal = |element: &Expr| {
                     matches!(
                         element,
                         Expr::NoneLiteral(_)
@@ -6147,9 +6200,18 @@ impl Compiler<'_> {
                             | Expr::BytesLiteral(_)
                             | Expr::EllipsisLiteral(_)
                     )
+                };
+                // Flat literal tuples fold in this same original array. Count their
+                // removed loads as well as the outer display's removed records.
+                // Larger tuples use LIST_APPEND and need a different certificate.
+                if elements.iter().all(|element| {
+                    scalar_literal(element)
+                        || matches!(element, Expr::Tuple(tuple)
+                            if tuple.elts.len() <= 30
+                                && tuple.elts.iter().all(scalar_literal))
                 }) {
                     self.assembler
-                        .record_last_uniform_fold_owner_slots(elements.len() - 2);
+                        .record_last_uniform_fold_owner_slots(hidden_owner_slots);
                 }
                 return Ok(());
             }

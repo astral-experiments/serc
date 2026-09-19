@@ -108,3 +108,43 @@ converted = [str(value) for value in after]
         common::assert_matches_cpython_marshal(&source, "folded_true_chain_module_borrows.py");
     }
 }
+
+#[test]
+fn matches_cpython_folded_false_after_join_stores() {
+    for (filename, source) in [
+        (
+            "async_nonlocal_join_folded_false_target.py",
+            r"def outer():
+    captured = None
+    async def choose(value):
+        nonlocal captured
+        captured = value.attribute if value else None
+        if False:
+            yield None
+    return choose
+",
+        ),
+        (
+            "async_local_join_folded_false_control.py",
+            r"async def choose(value):
+    captured = value.attribute if value else None
+    if False:
+        yield None
+",
+        ),
+        (
+            "async_nonlocal_two_stores_folded_false_control.py",
+            r"def outer():
+    captured = None
+    async def choose(value):
+        nonlocal captured
+        local = captured = value.attribute if value else None
+        if False:
+            yield None
+    return choose
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

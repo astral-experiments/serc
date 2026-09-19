@@ -54,3 +54,91 @@ class Refresher:
 ";
     common::assert_matches_cpython_marshal(source, "linear_arm_finally_borrow_control.py");
 }
+
+#[test]
+fn matches_cpython_guarded_compound_finally_entries() {
+    for (filename, source) in [
+        (
+            "coroutine_guarded_compound_finally_entry.py",
+            r"async def f(flag, value, closer, first, second, task):
+    try:
+        if flag:
+            return
+        value = await task.run()
+        if value is not None:
+            task.log(value)
+            try:
+                if flag:
+                    await task.work(value)
+            finally:
+                task.record(value)
+    except ValueError:
+        task.cancelled()
+        raise
+    except Exception:
+        task.failed()
+    finally:
+        try:
+            if closer is not None:
+                try:
+                    async with task.timeout():
+                        await closer.close()
+                except Exception:
+                    task.failed()
+        finally:
+            if first is not None:
+                try:
+                    await first.close()
+                except Exception:
+                    task.failed()
+            if second is not None:
+                try:
+                    await second.close()
+                except Exception:
+                    task.failed()
+",
+        ),
+        (
+            "coroutine_shared_guard_compound_finally_control.py",
+            r"async def f(flag, value, closer, first, second, task):
+    try:
+        if flag:
+            return
+        value = await task.run()
+        if flag and value is not None:
+            task.log(value)
+            try:
+                if flag:
+                    await task.work(value)
+            finally:
+                task.record(value)
+    except ValueError:
+        task.cancelled()
+        raise
+    except Exception:
+        task.failed()
+    finally:
+        try:
+            if closer is not None:
+                try:
+                    async with task.timeout():
+                        await closer.close()
+                except Exception:
+                    task.failed()
+        finally:
+            if first is not None:
+                try:
+                    await first.close()
+                except Exception:
+                    task.failed()
+            if second is not None:
+                try:
+                    await second.close()
+                except Exception:
+                    task.failed()
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

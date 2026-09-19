@@ -398,8 +398,10 @@ struct FallbackCertificate {
 /// An authored singleton's entire original fallthrough array, with no vacant-slot reuse.
 struct FreshSingletonCertificate {
     interval: Certificate,
-    // Original manager ranges, transferred only through the cold pass's split records.
+    // Protected ranges transferred through cold splits, or recorded named-handler copy splits.
     manager_regions: Vec<ExceptionRegion>,
+    // A separate fresh-array proof may retain overlapping named-handler/outer ranges.
+    named_handler_target: Option<Label>,
 }
 
 impl FreshSingletonCertificate {
@@ -431,7 +433,7 @@ impl FreshSingletonCertificate {
         }
         key(tail[2], tail[3])?;
         let condition = view.endpoint(tail[2], tail[3])?.0;
-        let manager_regions = view
+        let mut manager_regions = view
             .regions
             .iter()
             .copied()
@@ -456,8 +458,17 @@ impl FreshSingletonCertificate {
                     })
             })
             .collect::<Vec<_>>();
-        let (owner, removed) =
-            view.uniform_owned_interval(start, condition, false, Some(&manager_regions))?;
+        let (owner, removed, named_handler_target) = if let Some((owner, removed)) =
+            view.uniform_owned_interval(start, condition, false, Some(&manager_regions), false)
+        {
+            (owner, removed, None)
+        } else {
+            // Overlapping exception ranges do not populate a never-used array cell.
+            // Keep this authored handler proof separate from uniform-owner recovery.
+            let (target, regions) = view.fresh_named_handler_singleton_regions(start, condition)?;
+            manager_regions = regions;
+            (None, 0, Some(target))
+        };
         if removed != 0 {
             return None;
         }
@@ -483,6 +494,7 @@ impl FreshSingletonCertificate {
                 setups: view.provenance.setups.clone(),
             },
             manager_regions,
+            named_handler_target,
         };
         result.valid(view, false)?;
         Some(result)
@@ -495,8 +507,37 @@ impl FreshSingletonCertificate {
         {
             return None;
         }
-        let (owner, removed) =
-            view.uniform_owned_interval(start, condition, false, Some(&self.manager_regions))?;
+        if let Some(target) = self.named_handler_target {
+            let (current_target, current) =
+                view.fresh_named_handler_singleton_regions(start, condition)?;
+            if current_target != target {
+                return None;
+            }
+            let position = view.items[..condition]
+                .iter()
+                .filter(|item| matches!(item, Item::Instruction(_)))
+                .count();
+            let mut expected = Vec::new();
+            for region in &self.manager_regions {
+                let begin = *view.positions.get(&region.start)?;
+                let end = *view.positions.get(&region.end)?;
+                if begin <= position && position < end {
+                    expected.push(region);
+                }
+            }
+            return (expected.len() == current.len()
+                && expected
+                    .iter()
+                    .all(|old| current.iter().any(|new| same_manager_region(old, new))))
+            .then_some(marker);
+        }
+        let (owner, removed) = view.uniform_owned_interval(
+            start,
+            condition,
+            false,
+            Some(&self.manager_regions),
+            false,
+        )?;
         (owner == self.interval.owner && removed == 0).then_some(marker)
     }
 }
@@ -510,8 +551,10 @@ impl FallbackCertificate {
     ) -> Option<Self> {
         if matches!(before.items.get(marker_index), Some(Item::Instruction(marker))
             if marker.exception_policy() == ExceptionPolicy::AlwaysAbsentPostTryCondition)
+            && let Some(certificate) =
+                Self::capture_post_try_fusion(before, after, start, marker_index, previous?)
         {
-            return Self::capture_post_try_fusion(before, after, start, marker_index, previous?);
+            return Some(certificate);
         }
         let start = before.original_array_start(start)?;
         let Item::Label(anchor) = before.items[start] else {
@@ -626,16 +669,22 @@ impl FallbackCertificate {
             return None;
         };
         key(condition, marker)?;
-        if marker.exception_policy().exclusion() != ExceptionExclusion::None
-            || !matches!(
-                marker.exception_policy().owner(),
-                NormalizedExceptionOwner::Present | NormalizedExceptionOwner::Absent
-            )
+        let (owner, removed_slots) = if marker.exception_policy()
+            == ExceptionPolicy::AlwaysAbsentPostTryCondition
+            && matches!(anchor, Anchor::Label(_))
         {
-            return None;
-        }
-        let (owner, removed_slots) =
-            before.uniform_fallback_interval(start, condition_index, false)?;
+            before.post_try_fold_array(start, condition_index, marker_index)?
+        } else {
+            if marker.exception_policy().exclusion() != ExceptionExclusion::None
+                || !matches!(
+                    marker.exception_policy().owner(),
+                    NormalizedExceptionOwner::Present | NormalizedExceptionOwner::Absent
+                )
+            {
+                return None;
+            }
+            before.uniform_fallback_interval(start, condition_index, false)?
+        };
         let items = before.items[start..=marker_index].to_vec();
         let boundaries = before
             .boundaries
@@ -767,10 +816,14 @@ impl FallbackCertificate {
                 if self.interval.marker.exception_policy()
                     == ExceptionPolicy::AlwaysAbsentPostTryCondition
                 {
-                    (
-                        view.post_try_fusion_array(start, condition, marker, true)?,
-                        1,
-                    )
+                    if self.observed_local_fusion {
+                        (
+                            view.post_try_fusion_array(start, condition, marker, true)?,
+                            1,
+                        )
+                    } else {
+                        view.post_try_fold_array(start, condition, marker)?
+                    }
                 } else {
                     view.uniform_fallback_slots(start, condition)?
                 }
@@ -817,6 +870,83 @@ impl View<'_> {
         (removed == usize::from(fused)).then_some(owner)
     }
 
+    /// Certifies literal-fold vacancies in one uninterrupted post-try source array.
+    fn post_try_fold_array(
+        &self,
+        start: usize,
+        condition: usize,
+        marker: usize,
+    ) -> Option<(Owner, usize)> {
+        if start > condition || condition >= marker || marker >= self.items.len() {
+            return None;
+        }
+        let (Item::Label(anchor), Item::Instruction(marker_instruction)) =
+            (self.items[start], self.items[marker])
+        else {
+            return None;
+        };
+        if self.original_array_start(start)? != start
+            || !self.provenance.source_boundaries.contains(&anchor)
+            || self.items[start + 1..=marker].iter().any(|item| {
+                matches!(item,
+                Item::Label(label) if self.boundaries.contains(label)
+                    || self.provenance.source_boundaries.contains(label))
+            })
+            || marker_instruction.pre_fold_extra_instructions() != 0
+            || marker_instruction
+                .local_policy
+                .hidden_exception_owner_slots()
+                != 0
+            || self.provenance.setups.iter().any(|(label, _)| {
+                self.labels
+                    .get(label)
+                    .is_none_or(|&index| start <= index && index <= marker)
+            })
+            || !self.items[start..condition].iter().any(|item| {
+                matches!(item, Item::Instruction(instruction)
+                    if self.uniform_literal_fold_slots(*instruction).is_some())
+            })
+        {
+            return None;
+        }
+        self.uniform_owned_interval(start, condition, false, None, true)
+    }
+
+    /// Matches the unsaturated literal-fold count to its unique recorded survivor.
+    fn uniform_literal_fold_slots(&self, instruction: Instruction) -> Option<usize> {
+        let hidden = instruction.local_policy.hidden_exception_owner_slots();
+        if instruction.opcode != crate::target::opcodes::LOAD_CONST
+            || !(1..4).contains(&hidden)
+            || u16::from(instruction.pre_fold_extra_instructions()) != hidden
+        {
+            return None;
+        }
+        let key = (instruction.location, instruction.opcode, hidden);
+        let same_survivor = |current: Instruction| {
+            (
+                current.location,
+                current.opcode,
+                current.local_policy.hidden_exception_owner_slots(),
+            ) == key
+        };
+        (self
+            .provenance
+            .uniform_fold_owner_slots
+            .iter()
+            .filter(|original| **original == key)
+            .count()
+            == 1
+            && self
+                .items
+                .iter()
+                .filter(
+                    |item| matches!(item, Item::Instruction(current) if same_survivor(*current)),
+                )
+                .count()
+                == 1)
+            .then_some(usize::from(hidden))
+    }
+
     /// Finds the sole original boundary in an adjacent run of labels.
     fn original_array_start(&self, start: usize) -> Option<usize> {
         let mut first = start;
@@ -854,7 +984,106 @@ impl View<'_> {
         condition: usize,
         observed_local_fusion: bool,
     ) -> Option<(Owner, usize)> {
-        self.uniform_owned_interval(start, condition, observed_local_fusion, None)
+        self.uniform_owned_interval(start, condition, observed_local_fusion, None, false)
+    }
+
+    /// Proves a literal singleton array under one authored named-handler target.
+    /// No owner is copied: the marker is appended beyond every original live cell.
+    fn fresh_named_handler_singleton_regions(
+        &self,
+        start: usize,
+        condition: usize,
+    ) -> Option<(Label, Vec<ExceptionRegion>)> {
+        if start > condition || condition >= self.items.len() {
+            return None;
+        }
+        // Missing labels, hidden SETUP/POP cells, and unknown original entries fail closed.
+        for (label, _) in &self.provenance.setups {
+            let position = *self.labels.get(label)?;
+            if start <= position && position <= condition {
+                return None;
+            }
+        }
+        if self
+            .provenance
+            .removed_pop_block_boundaries
+            .iter()
+            .any(|label| {
+                self.labels
+                    .get(label)
+                    .is_none_or(|&position| start <= position && position <= condition)
+            })
+        {
+            return None;
+        }
+        let mut position = self.items[..start]
+            .iter()
+            .filter(|item| matches!(item, Item::Instruction(_)))
+            .count();
+        let mut original_regions: Option<Vec<ExceptionRegion>> = None;
+        for (offset, item) in self.items[start..=condition].iter().enumerate() {
+            let instruction = match item {
+                Item::Label(label) => {
+                    if offset != 0 && self.boundaries.contains(label) {
+                        return None;
+                    }
+                    continue;
+                }
+                Item::Instruction(instruction) => instruction,
+            };
+            if instruction.exception_policy() != ExceptionPolicy::NoneUnchanged
+                || instruction.pre_fold_extra_instructions() != 0
+                || instruction.local_policy.hidden_exception_owner_slots() != 0
+                || instruction.only_allows_unconditional_inlining()
+                || instruction.no_location_policy.borrow_fallthrough()
+                    == super::BorrowFallthrough::Barrier
+                || !matches!(
+                    instruction.opcode,
+                    crate::target::opcodes::UNPACK_SEQUENCE
+                        | crate::target::opcodes::LOAD_CONST
+                        | crate::target::opcodes::IS_OP
+                        | POP_JUMP_IF_FALSE
+                )
+                || (instruction.opcode.has_jump() && start + offset != condition)
+            {
+                return None;
+            }
+            let mut current = Vec::new();
+            for region in self.regions {
+                let begin = *self.positions.get(&region.start)?;
+                let end = *self.positions.get(&region.end)?;
+                if begin <= position && position < end {
+                    current.push(*region);
+                }
+            }
+            if let Some(expected) = &original_regions {
+                if expected.len() != current.len()
+                    || !expected
+                        .iter()
+                        .all(|old| current.iter().any(|new| same_manager_region(old, new)))
+                {
+                    return None;
+                }
+            } else {
+                original_regions = Some(current);
+            }
+            position += 1;
+        }
+        let regions = original_regions?;
+        let mut named = regions.iter().filter(|region| {
+            !region.is_scope_fallback
+                && region.preserve_lasti
+                && region.depth > 0
+                && self
+                    .provenance
+                    .named_handler_cleanup_targets
+                    .contains(&region.target)
+        });
+        let target = named.next()?.target;
+        if named.next().is_some() {
+            return None;
+        }
+        Some((target, regions))
     }
 
     fn uniform_owned_interval(
@@ -863,6 +1092,7 @@ impl View<'_> {
         condition: usize,
         observed_local_fusion: bool,
         manager_regions: Option<&[ExceptionRegion]>,
+        allow_literal_folds: bool,
     ) -> Option<(Owner, usize)> {
         // No hidden SETUP/POP_BLOCK records or second true boundary may enter
         // the certificate, including aliases that only become adjacent later.
@@ -901,10 +1131,16 @@ impl View<'_> {
                 }
                 Item::Instruction(instruction) => instruction,
             };
+            let literal_fold_slots = if allow_literal_folds {
+                self.uniform_literal_fold_slots(instruction)
+            } else {
+                None
+            };
             if instruction.exception_policy() != ExceptionPolicy::NoneUnchanged
-                || instruction.pre_fold_extra_instructions() != 0
+                || instruction.pre_fold_extra_instructions() != 0 && literal_fold_slots.is_none()
                 || instruction.only_allows_unconditional_inlining()
                 || instruction.local_policy.hidden_exception_owner_slots() != 0
+                    && literal_fold_slots.is_none()
                 || instruction.no_location_policy.borrow_fallthrough()
                     == super::BorrowFallthrough::Barrier
                 || matches!(
@@ -969,6 +1205,7 @@ impl View<'_> {
                 return None;
             }
             owner = Some(current);
+            removed += literal_fold_slots.unwrap_or(0);
             if matches!((instruction.opcode, instruction.operand()),
                 (crate::target::opcodes::LOAD_GLOBAL, Operand::Value(argument)) if argument & 1 != 0)
                 || matches!(
@@ -1725,12 +1962,41 @@ impl FusionOwnerCertificates {
         }
         result
     }
-    /// Carries already-validated original fallback arrays across this exit-copy transaction.
+    /// Carries original fallback arrays and named-handler singleton proofs across exit copying.
     pub(super) fn retain_after_exit_copy(
         &mut self,
         p: &OptimizationPipeline,
         retargets: &[(Instruction, Instruction)],
+        region_retargets: &[(ExceptionRegion, ExceptionRegion)],
     ) {
+        // Copies carve exact holes in the original named-handler ranges. Transfer only
+        // those certificates through the producer's records before checking the full array.
+        for certificate in self
+            .fresh_singleton_certificates
+            .iter_mut()
+            .filter(|certificate| certificate.named_handler_target.is_some())
+        {
+            let mut transferred = Vec::new();
+            for region in &certificate.manager_regions {
+                let replacements = region_retargets
+                    .iter()
+                    .filter_map(|(original, rebuilt)| {
+                        let mut original_shape = *rebuilt;
+                        original_shape.start = region.start;
+                        original_shape.end = region.end;
+                        (same_manager_region(original, region)
+                            && same_manager_region(&original_shape, region))
+                        .then_some(*rebuilt)
+                    })
+                    .collect::<Vec<_>>();
+                if replacements.is_empty() {
+                    transferred.push(*region);
+                } else {
+                    transferred.extend(replacements);
+                }
+            }
+            certificate.manager_regions = transferred;
+        }
         self.fallback_certificates
             .retain_mut(|certificate| certificate.rebind_copied_exit(retargets).is_some());
         // The complete array, owner, slot count, setups, and boundaries must still match.
@@ -2223,6 +2489,74 @@ mod tests {
             &pipeline.preserved_block_boundaries,
         );
         assert_eq!(items, expected);
+    }
+
+    fn post_try_literal_fold_pipeline() -> OptimizationPipeline {
+        let mut pipeline = post_try_fusion_pipeline();
+        let mut constant = instruction(crate::target::opcodes::LOAD_CONST, Operand::Value(0));
+        constant.location = SourceLocation::new(2, 2, 10, 20);
+        constant.local_policy.add_hidden_exception_owner_slots(2);
+        constant.add_pre_fold_extra_instructions(2);
+        edit_singleton(&mut pipeline, |items| {
+            items[2] = Item::Instruction(constant);
+        });
+        pipeline
+            .exception_owner_provenance
+            .uniform_fold_owner_slots
+            .push((constant.location, constant.opcode, 2));
+        pipeline
+    }
+
+    #[test]
+    fn post_try_literal_fold_reuses_only_its_certified_original_slot() {
+        let pipeline = post_try_literal_fold_pipeline();
+        let before = FusionOwnerCertificates::snapshot(&pipeline);
+        let certificates = FusionOwnerCertificates::capture(&before, &pipeline);
+        assert_eq!(certificates.fallback_certificates.len(), 1);
+        let mut items = before.clone();
+        certificates.apply(
+            &mut items,
+            &pipeline.exception_regions,
+            &pipeline.exception_owner_provenance,
+            &pipeline.preserved_block_boundaries,
+        );
+        let mut expected = before;
+        for item in &mut expected {
+            if let Item::Instruction(marker) = item
+                && marker.opcode == NOT_TAKEN
+            {
+                marker.set_exception_policy(ExceptionPolicy::NoneOverridePresent);
+            }
+        }
+        assert_eq!(items, expected);
+    }
+
+    #[test]
+    fn post_try_literal_fold_rejects_missing_or_changed_provenance() {
+        for change in 0..4 {
+            let mut pipeline = post_try_literal_fold_pipeline();
+            let before = FusionOwnerCertificates::snapshot(&pipeline);
+            match change {
+                0 => pipeline
+                    .exception_owner_provenance
+                    .uniform_fold_owner_slots
+                    .clear(),
+                1 => pipeline.exception_owner_provenance.uniform_fold_owner_slots[0].2 = 1,
+                2 => edit_singleton(&mut pipeline, |items| {
+                    let Item::Instruction(constant) = &mut items[2] else {
+                        unreachable!()
+                    };
+                    constant.set_operand(Operand::Value(1));
+                }),
+                3 => pipeline.exception_regions[0].is_scope_fallback = false,
+                _ => unreachable!(),
+            }
+            let certificates = FusionOwnerCertificates::capture(&before, &pipeline);
+            assert!(
+                certificates.fallback_certificates.is_empty(),
+                "case {change}"
+            );
+        }
     }
 
     #[test]
@@ -3436,7 +3770,7 @@ mod tests {
         assert!(!retargets.is_empty());
         without_transfer.retain_pipeline(&pipeline);
         assert!(without_transfer.fallback_certificates.is_empty());
-        certificates.retain_after_exit_copy(&pipeline, &retargets);
+        certificates.retain_after_exit_copy(&pipeline, &retargets, &[]);
         assert_eq!(certificates.fallback_certificates.len(), 1);
         let mut items = pipeline.graph.into_items();
         certificates.apply(

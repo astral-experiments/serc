@@ -102,3 +102,27 @@ fn matches_cpython_marshal_for_suppressed_return_loop_backedges() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_folded_loop_bare_raise_break_marker() {
+    let source = r"async def run(work, cleanup, done, kind):
+    try:
+        await work()
+    except BaseException as error:
+        if isinstance(error, kind):
+            while True:
+                try:
+                    await cleanup()
+                    break
+                except kind:
+                    if done():
+                        break
+        else:
+            await cleanup()
+        raise
+";
+    common::assert_matches_cpython_marshal(
+        source,
+        "folded_loop_break_bare_raise_handler_target.py",
+    );
+}

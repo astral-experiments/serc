@@ -74,3 +74,47 @@ def protected_terminal(manager, left, right):
 "#;
     common::assert_matches_cpython_marshal(source, "terminal_chained_none_conditions.py");
 }
+
+#[test]
+fn matches_cpython_chained_compare_constant_else_fallthrough() {
+    for (filename, source) in [
+        (
+            "chained_compare_literal_else_fallthrough.py",
+            r"def choose(worker, files, position):
+    if 0 <= position < len(files):
+        return (worker, files[position:])
+    else:
+        42
+",
+        ),
+        (
+            "chained_compare_none_else_fallthrough.py",
+            r"def choose(worker, files, position):
+    if 0 <= position < len(files):
+        return (worker, files[position:])
+    else:
+        None
+",
+        ),
+        (
+            "chained_compare_small_return_none_else.py",
+            r"def choose(lower, value, upper):
+    if lower < value < upper:
+        return value
+    else:
+        None
+",
+        ),
+        (
+            "simple_compare_none_else_fallthrough_control.py",
+            r"def choose(worker, files, position):
+    if position < len(files):
+        return (worker, files[position:])
+    else:
+        None
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

@@ -105,3 +105,77 @@ fn matches_cpython_manager_cleanup_pop_slot_owners() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_conditional_unwind_pop_owners() {
+    for (filename, source) in [
+        (
+            "conditional_value_return_protected_manager_pop_target.py",
+            r"def run(manager, ready):
+    with manager:
+        try:
+            while True:
+                if step():
+                    return 0 if ready else 1
+        except StopIteration:
+            return 2
+",
+        ),
+        (
+            "conditional_value_assignment_protected_manager_pop_control.py",
+            r"def run(manager, ready):
+    with manager:
+        try:
+            while True:
+                if step():
+                    result = 0 if ready else 1
+                    return result
+        except StopIteration:
+            return 2
+",
+        ),
+        (
+            "copied_cleanup_terminal_raise_outer_finally_pop_target.py",
+            r#"async def collect(items):
+    try:
+        try:
+            await prepare()
+            return build(), describe()
+        finally:
+            errors = []
+            for item in items:
+                try:
+                    await item.close()
+                except Exception as error:
+                    errors.append(error)
+            if errors:
+                raise ExceptionGroup("cleanup failed", errors)
+    finally:
+        finish()
+"#,
+        ),
+        (
+            "copied_cleanup_following_call_outer_finally_pop_control.py",
+            r#"async def collect(items):
+    try:
+        try:
+            await prepare()
+            return build(), describe()
+        finally:
+            errors = []
+            for item in items:
+                try:
+                    await item.close()
+                except Exception as error:
+                    errors.append(error)
+            if errors:
+                raise ExceptionGroup("cleanup failed", errors)
+            completed()
+    finally:
+        finish()
+"#,
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

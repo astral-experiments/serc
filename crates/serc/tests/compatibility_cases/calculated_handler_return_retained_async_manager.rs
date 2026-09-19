@@ -42,3 +42,26 @@ fn calculated_named_handler_return_retained_async_manager() {
         "calculated_named_handler_return_retained_async_manager.py",
     );
 }
+
+#[test]
+fn matches_cpython_awaited_named_handler_none_return_cleanup() {
+    let source = r#"async def run(manager, resource):
+    async with manager:
+        try:
+            await work()
+        except Exception as error:
+            if resource is not None:
+                await report(error)
+            return f"failed: {error}"
+        finally:
+            if resource is not None:
+                try:
+                    await resource.close()
+                except Exception as cleanup_error:
+                    warn(cleanup_error)
+"#;
+    assert_matches_cpython_marshal(
+        source,
+        "saved_named_handler_none_async_await_return_target.py",
+    );
+}

@@ -482,3 +482,171 @@ fn matches_cpython_linear_finally_named_handler_return_owners() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_normal_finally_manager_join_after_raising_handlers() {
+    for (filename, source) in [
+        (
+            "normal_finally_raising_handlers_manager_jump_owner.py",
+            r#"def run(manager, cleanup, work, report):
+    with manager:
+        try:
+            work()
+        except LookupError as error:
+            report(error)
+            if cleanup is None:
+                raise ValueError("missing") from error
+            raise RuntimeError("lookup") from error
+        except ValueError as error:
+            report(error)
+            raise RuntimeError("invalid") from error
+        except Exception as error:
+            raise RuntimeError("failed") from error
+        finally:
+            if cleanup is not None:
+                cleanup.close()
+                report("closed")
+"#,
+        ),
+        (
+            "normal_finally_raising_handlers_populated_exit_control.py",
+            r#"def run(manager, cleanup, work, report):
+    with manager:
+        try:
+            work()
+        except LookupError as error:
+            report(error)
+            if cleanup is None:
+                raise ValueError("missing") from error
+            raise RuntimeError("lookup") from error
+        except ValueError as error:
+            report(error)
+            raise RuntimeError("invalid") from error
+        except Exception as error:
+            raise RuntimeError("failed") from error
+        finally:
+            if cleanup is not None:
+                cleanup.close()
+                report("closed")
+            report("finished")
+"#,
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn matches_cpython_protected_manager_match_and_nested_finally_joins() {
+    for (filename, source) in [
+        (
+            "sync_manager_protected_match_failure_join_target.py",
+            r"async def protected_match(manager, value):
+    with manager:
+        try:
+            match value:
+                case First():
+                    await handle_first(value)
+                case Second():
+                    await handle_second(value)
+        except Exception as error:
+            record(error)
+            raise
+    finish()
+",
+        ),
+        (
+            "sync_manager_generator_nested_finally_join_target.py",
+            r"def nested_cleanup(manager, resource, lease):
+    with manager:
+        try:
+            yield
+        finally:
+            try:
+                restore()
+            finally:
+                try:
+                    if resource is not None:
+                        resource.close()
+                finally:
+                    if lease is not None:
+                        try:
+                            unlock(lease)
+                        finally:
+                            close(lease)
+",
+        ),
+        (
+            "sync_manager_generator_nested_finally_following_call_control.py",
+            r"def nested_cleanup(manager, resource, lease):
+    with manager:
+        try:
+            yield
+        finally:
+            try:
+                restore()
+            finally:
+                try:
+                    if resource is not None:
+                        resource.close()
+                finally:
+                    if lease is not None:
+                        try:
+                            unlock(lease)
+                        finally:
+                            close(lease)
+        after_protected()
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn matches_cpython_async_generator_and_nested_raising_manager_join_owners() {
+    for (filename, source) in [
+        (
+            "async_generator_manager_normal_finally_join_owner_target.py",
+            r"async def stream(manager, values, result, emit, cleanup, restore):
+    try:
+        with manager():
+            try:
+                async for value in values():
+                    yield value
+            except Exception:
+                for value in await cleanup():
+                    yield value
+                raise
+            finally:
+                emit()
+                if result is not None:
+                    emit(result)
+                    await cleanup()
+    finally:
+        restore()
+",
+        ),
+        (
+            "nested_conditional_raising_finally_manager_join_owner_target.py",
+            r"def run(first, second, third, work, close, collect, report, state):
+    with first(), second(), third():
+        try:
+            work()
+        finally:
+            failures = collect()
+            try:
+                close()
+            except Exception as error:
+                failures.append(error)
+            if failures:
+                if state[0] is not None:
+                    report(errors=[repr(error) for error in failures])
+                else:
+                    raise RuntimeError(failures)
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

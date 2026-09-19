@@ -90,3 +90,32 @@ fn matches_cpython_handler_join_location_controls() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_unlocated_conditional_discard_local_return() {
+    for (filename, source) in [
+        (
+            "unlocated_try_conditional_discard_local_return_target.py",
+            r"def validate(value):
+    try:
+        decode(value) if value is not None else None
+    except ValueError:
+        return None
+    return value
+",
+        ),
+        (
+            "unlocated_try_conditional_discard_pass_control.py",
+            r"def validate(value):
+    try:
+        decode(value) if value is not None else None
+        pass
+    except ValueError:
+        return None
+    return value
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

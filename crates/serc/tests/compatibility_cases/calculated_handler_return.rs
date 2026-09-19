@@ -132,3 +132,37 @@ def run_probe(snapshot: object, seed: int) -> dict[str, object]:
         "calculated_named_handler_return_one_manager.py",
     );
 }
+
+#[test]
+fn matches_cpython_conditional_finally_named_return_copies() {
+    for (filename, source) in [
+        (
+            "conditional_finally_named_literal_return_control.py",
+            r"def retry(engine, dispose):
+    try:
+        return engine.run()
+    except Exception as exc:
+        try:
+            return None
+        finally:
+            if dispose:
+                engine.close()
+",
+        ),
+        (
+            "conditional_finally_named_return_target.py",
+            r"def retry(engine, dispose):
+    try:
+        return engine.run()
+    except Exception as exc:
+        try:
+            return engine.retry()
+        finally:
+            if dispose:
+                engine.close()
+",
+        ),
+    ] {
+        assert_matches_cpython_marshal(source, filename);
+    }
+}

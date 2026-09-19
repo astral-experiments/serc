@@ -286,3 +286,64 @@ fn matches_cpython_protected_backedges_after_nested_while_and_assertion() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_original_ordinary_try_compound_loop_exits() {
+    for (filename, source) in [
+        (
+            "ordinary_try_compound_while_loop_exit_target.py",
+            r"def run(groups, ready, remaining, consume):
+    for group in groups:
+        try:
+            iterator = iter(group)
+            while ready(iterator) and remaining():
+                consume(next(iterator))
+        except Exception:
+            pass
+",
+        ),
+        (
+            "ordinary_try_single_while_loop_exit_control.py",
+            r"def run(groups, ready, consume):
+    for group in groups:
+        try:
+            iterator = iter(group)
+            while ready(iterator):
+                consume(next(iterator))
+        except Exception:
+            pass
+",
+        ),
+        (
+            "ordinary_try_completed_recovery_compound_break_target.py",
+            r"def run(items, limit, recover):
+    for item in items:
+        try:
+            try:
+                recover(item)
+            except LookupError:
+                pass
+            if limit is not None and item >= limit:
+                break
+        except Exception:
+            continue
+    return None
+",
+        ),
+        (
+            "ordinary_try_compound_break_linear_prefix_control.py",
+            r"def run(items, limit, recover):
+    for item in items:
+        try:
+            recover(item)
+            if limit is not None and item >= limit:
+                break
+        except Exception:
+            continue
+    return None
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

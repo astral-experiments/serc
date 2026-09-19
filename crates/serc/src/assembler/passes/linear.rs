@@ -24,7 +24,8 @@ fn optimize_boolean_conversions_and_redundant_stores(
 ) {
     let was_boolean_conversion = items
         .iter()
-        .map(|item| matches!(item, Item::Instruction(instruction) if matches!(instruction.opcode, TO_BOOL | UNARY_NOT)))
+        // Match the graph pass: a comparison moved into TO_BOOL leaves a folded slot.
+        .map(|item| matches!(item, Item::Instruction(instruction) if matches!(instruction.opcode, TO_BOOL | UNARY_NOT | COMPARE_OP)))
         .collect::<Vec<_>>();
     if let Some(constants) = constants {
         remove_none_comparison_boolean_conversions(

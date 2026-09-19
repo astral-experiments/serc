@@ -227,3 +227,49 @@ fn matches_cpython_nested_named_handler_false_cleanup_locations() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_named_handler_complete_else_cleanup_joins() {
+    for (filename, source) in [
+        (
+            "named_complete_else_terminal_call.py",
+            r"def test(outer, inner):
+    try:
+        work()
+    except Error as error:
+        if outer:
+            first(error)
+        else:
+            if inner:
+                second()
+            else:
+                third()
+",
+        ),
+        (
+            "named_complete_else_loop_value_join.py",
+            r"def test(items, limit, random_mode):
+    count = 0
+    success = False
+    while count <= limit and not success:
+        try:
+            work()
+            success = True
+        except Error as error:
+            count += 1
+            if count > limit:
+                raise RuntimeError() from error
+            else:
+                wait()
+                if random_mode:
+                    remove(items)
+                    value = choose(items) if items else None
+                else:
+                    value = items.pop() if items else None
+    done()
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

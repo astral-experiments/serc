@@ -374,3 +374,90 @@ fn preserves_original_cleanup_copy_targets_after_nested_try_elif() {
 ";
     common::assert_matches_cpython_marshal(source, "nested_try_elif_cleanup.py");
 }
+
+#[test]
+fn matches_cpython_async_manager_and_pass_handler_cleanup_copies() {
+    for (filename, source) in [
+        (
+            "named_pass_cleanup_control.py",
+            r"def handle(flag, owner, work, send):
+    try:
+        work()
+    except ValueError as error:
+        if flag:
+            try:
+                send(str(error))
+                owner.closed = True
+            except Exception as nested:
+                pass
+        else:
+            send(str(error))
+    except Exception as error:
+        if flag:
+            try:
+                send(str(error))
+                owner.closed = True
+            except Exception as nested:
+                pass
+        else:
+            send(str(error))
+",
+        ),
+        (
+            "protected_async_manager_branch_implicit_return.py",
+            r"async def consume(manager, items, write, managed):
+    try:
+        if managed:
+            async with manager:
+                async for item in items:
+                    await write(item)
+        else:
+            async for item in items:
+                await write(item)
+    except RuntimeError:
+        raise
+    except BaseException:
+        raise
+",
+        ),
+        (
+            "protected_async_manager_continuation_control.py",
+            r"async def consume(manager, items, write, finish):
+    try:
+        async with manager:
+            async for item in items:
+                await write(item)
+        await finish()
+    except RuntimeError:
+        raise
+",
+        ),
+        (
+            "unnamed_pass_cleanup_target.py",
+            r"def handle(flag, owner, work, send):
+    try:
+        work()
+    except ValueError as error:
+        if flag:
+            try:
+                send(str(error))
+                owner.closed = True
+            except Exception:
+                pass
+        else:
+            send(str(error))
+    except Exception as error:
+        if flag:
+            try:
+                send(str(error))
+                owner.closed = True
+            except Exception:
+                pass
+        else:
+            send(str(error))
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

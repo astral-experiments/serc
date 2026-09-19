@@ -393,3 +393,89 @@ fn matches_cpython_threaded_named_handler_small_return_copies() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_named_handler_nested_recovery_exit_copies() {
+    for (filename, source) in [
+        (
+            "named_handler_nested_recovery_short_return_target.py",
+            r#"def choose(value, first, fallback):
+    result = {}
+    try:
+        result["value"] = primary(value)
+    except ValueError as error:
+        if first:
+            result["value"] = "exists"
+        elif fallback:
+            try:
+                result["value"] = secondary(value)
+            except ValueError as recovery:
+                if can_recover(recovery):
+                    result["value"] = "recovered"
+                else:
+                    raise
+        else:
+            raise
+    return result
+"#,
+        ),
+        (
+            "named_nested_try_normal_exit_copy_order_control.py",
+            r"def recover(fetch, retry, report, result, first, fallback, accepted):
+    try:
+        result[0] = fetch()
+    except Exception as error:
+        if first(error):
+            report(error)
+        elif fallback(error):
+            try:
+                result[0] = retry()
+            except Exception as nested_error:
+                if accepted(nested_error):
+                    result[1] = True
+                else:
+                    raise
+        else:
+            raise
+    return result
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn matches_cpython_interleaved_unnamed_handler_literal_returns() {
+    let source = r#"def string_return(primary, secondary, finish):
+    try:
+        return primary()
+    except Exception:
+        try:
+            try:
+                secondary()
+            except Exception:
+                return ""
+            return finish()
+        except Exception:
+            return "fallback"
+
+
+def bare_return(primary, secondary, finish):
+    try:
+        return primary()
+    except Exception:
+        try:
+            try:
+                secondary()
+            except Exception:
+                return
+            return finish()
+        except Exception:
+            return None
+"#;
+    common::assert_matches_cpython_marshal(
+        source,
+        "interleaved_unnamed_handler_literal_returns.py",
+    );
+}

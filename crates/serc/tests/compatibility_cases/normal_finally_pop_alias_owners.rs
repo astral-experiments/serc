@@ -181,3 +181,25 @@ fn normal_finally_truth_parent_owner_before_marker_exclusion() {
         assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn preserves_shared_normal_try_break_pop_owner_boundary() {
+    let source = r"def nested_try_break_pop_owner(read, ready, cancel, close, finish):
+    try:
+        try:
+            while True:
+                if cancel is not None and cancel():
+                    finish()
+                    return None
+                if ready():
+                    value = read()
+                    break
+        except EOFError as error:
+            value = None
+    finally:
+        close()
+        finish()
+    return value
+";
+    assert_matches_cpython_marshal(source, "nested_try_break_pop_shared_control.py");
+}

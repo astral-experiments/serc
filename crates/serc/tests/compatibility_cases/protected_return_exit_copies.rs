@@ -102,3 +102,71 @@ fn matches_cpython_single_try_iterator_conditional_return_control() {
         "single_try_iterator_conditional_return_control.py",
     );
 }
+
+#[test]
+fn matches_cpython_private_nested_try_tuple_return_exits() {
+    for (filename, source) in [
+        (
+            "nested_try_private_exit_tuple_target.py",
+            r"async def choose(value, take_outer, take_inner):
+    left = 0
+    right = value
+    try:
+        if take_outer:
+            if take_inner:
+                right = first(value)
+            else:
+                right = second(value)
+        else:
+            try:
+                right = fallback(value)
+            except ValueError:
+                right = recover(value)
+    except ValueError:
+        right = recover_outer(value)
+    return left, right
+",
+        ),
+        (
+            "direct_assignment_tuple_control.py",
+            r"async def choose(value, take_outer, take_inner):
+    left = 0
+    right = value
+    try:
+        if take_outer:
+            if take_inner:
+                right = first(value)
+            else:
+                right = second(value)
+        else:
+            right = fallback(value)
+    except ValueError:
+        right = recover_outer(value)
+    return left, right
+",
+        ),
+        (
+            "nested_try_three_local_tuple_control.py",
+            r"async def choose(value, take_outer, take_inner):
+    left = 0
+    right = value
+    try:
+        if take_outer:
+            if take_inner:
+                right = first(value)
+            else:
+                right = second(value)
+        else:
+            try:
+                right = fallback(value)
+            except ValueError:
+                right = recover(value)
+    except ValueError:
+        right = recover_outer(value)
+    return left, right, value
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
