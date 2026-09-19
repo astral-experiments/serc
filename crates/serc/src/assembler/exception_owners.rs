@@ -65,6 +65,7 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) copied_cleanup_return_none_prefixes: Vec<CopiedCleanupReturnNonePrefix>,
     pub(super) copied_return_pop_prefixes: Vec<CopiedReturnPopPrefix>,
     pub(super) copied_return_truth_prefixes: Vec<CopiedReturnTruthPrefix>,
+    pub(super) copied_return_membership_prefixes: Vec<CopiedReturnMembershipPrefix>,
     pub(super) copied_return_call_prefixes: Vec<CopiedReturnCallPrefix>,
     pub(super) copied_return_attribute_truth_prefixes: Vec<CopiedReturnAttributeTruthPrefix>,
     pub(super) copied_handler_return_none_prefixes: Vec<(Label, [Instruction; 6])>,
@@ -247,6 +248,20 @@ pub(super) struct CopiedReturnTruthPrefix {
     pub(super) load: Instruction,
     pub(super) to_bool: Instruction,
     pub(super) condition: Instruction,
+}
+
+/// A direct-name return's two original NULL POPs and source-literal membership test.
+#[derive(Debug)]
+pub(super) struct CopiedReturnMembershipPrefix {
+    pub(super) entry: Label,
+    pub(super) return_value: Instruction,
+    pub(super) cleanup_labels: Vec<Label>,
+    pub(super) pops: [Instruction; 2],
+    pub(super) load: Instruction,
+    pub(super) constant: Instruction,
+    pub(super) contains: Instruction,
+    pub(super) condition: Instruction,
+    pub(super) marker: Instruction,
 }
 
 /// Exact awaited return and manager unwind, with two omitted POPs before its finally POP.
@@ -6621,6 +6636,25 @@ impl LayoutAssembler {
                             },
                         );
                     }
+                    // This independent source certificate proves every erased cell in
+                    // a direct-name return's membership array. It never revives the
+                    // generic history flag invalidated by an uncertified literal fold.
+                    if instruction.opcode == NOT_TAKEN
+                        && instruction.exception_policy() == super::ExceptionPolicy::NonePresent
+                        && owners
+                            .get(&instruction_index)
+                            .is_none_or(|owner| !owner.definitive)
+                        && let Some(owner) = self.copied_return_membership_owner(
+                            instruction_index,
+                            original_array_start,
+                            tail,
+                            &indexed_instructions,
+                            &label_positions,
+                            &jump_targets,
+                        )
+                    {
+                        owners.insert(instruction_index, owner);
+                    }
                     // The captured marker aliases may delimit exception ranges without
                     // introducing another original array or invalidating its fresh cell.
                     if original_normal_finally_null_markers.contains(&instruction_index) {
@@ -8601,6 +8635,155 @@ impl LayoutAssembler {
             return None;
         }
         let region = self.uniform_exception_owner(array, pop, positions)?;
+        (!self.exception_regions[region].is_scope_fallback
+            && !self.exception_regions[region].preserve_lasti)
+            .then_some(ExceptionOwnerDecision {
+                has_owner: true,
+                source_region: Some(region),
+                definitive: true,
+                override_existing: true,
+            })
+    }
+
+    /// Replays a source-certified membership return without assuming generic fold history.
+    fn copied_return_membership_owner(
+        &self,
+        marker: usize,
+        array: usize,
+        tail: ExceptionOwnerTail,
+        instructions: &[&Instruction],
+        positions: &FxHashMap<Label, usize>,
+        jump_targets: &FxHashSet<Label>,
+    ) -> Option<ExceptionOwnerDecision> {
+        use crate::target::opcodes::LOAD_FAST_BORROW;
+
+        let load = marker.checked_sub(4)?;
+        if load <= array
+            || tail.insertions != 0
+            || tail.late_removals != 0
+            || tail.post_compaction_fusions != 0
+        {
+            return None;
+        }
+        let provenance = &self.exception_owner_provenance;
+        let copied = |label: &Label| {
+            provenance.retired_normal_try_copy_labels.contains(label)
+                || provenance.normal_try_copy_blocks.contains(label)
+                || provenance.normal_try_copy_inline_labels.contains(label)
+                || provenance.normal_try_copy_internal_labels.contains(label)
+                || provenance
+                    .normal_try_copy_jump_nop_successors
+                    .contains(label)
+                || provenance
+                    .normal_try_copy_steps
+                    .iter()
+                    .any(|(a, b, _)| a == label || b == label)
+                || provenance
+                    .normal_try_copy_pop_ranges
+                    .iter()
+                    .any(|(a, b)| a == label || b == label)
+        };
+        let mut matches = provenance
+            .copied_return_membership_prefixes
+            .iter()
+            .filter(|origin| {
+                let mut expected_load = origin.load;
+                expected_load
+                    .local_policy
+                    .add_hidden_exception_owner_slots(2);
+                if instructions[load].opcode == LOAD_FAST_BORROW {
+                    expected_load.opcode = LOAD_FAST_BORROW;
+                }
+                positions.get(&origin.entry) == Some(&array)
+                    && provenance.block_boundaries.contains(&origin.entry)
+                    && provenance.source_boundaries.contains(&origin.entry)
+                    && !copied(&origin.entry)
+                    && self
+                        .items
+                        .iter()
+                        .filter(|item| **item == Item::Label(origin.entry))
+                        .count()
+                        == 1
+                    && origin.cleanup_labels.iter().all(|label| {
+                        positions.get(label) == Some(&load)
+                            && self
+                                .items
+                                .iter()
+                                .filter(|item| **item == Item::Label(*label))
+                                .count()
+                                == 1
+                            && !copied(label)
+                    })
+                    && *instructions[load - 1] == origin.return_value
+                    && instructions
+                        .iter()
+                        .filter(|record| ***record == origin.return_value)
+                        .count()
+                        == 1
+                    && origin
+                        .pops
+                        .iter()
+                        .all(|pop| pop.depth_after() == origin.return_value.depth_after())
+                    && *instructions[load] == expected_load
+                    && *instructions[load + 1] == origin.constant
+                    && *instructions[load + 2] == origin.contains
+                    && *instructions[load + 3] == origin.condition
+                    && *instructions[marker] == origin.marker
+                    && provenance
+                        .block_boundaries
+                        .iter()
+                        .chain(&provenance.source_boundaries)
+                        .chain(&self.preserved_block_boundaries)
+                        .chain(jump_targets)
+                        .all(|label| {
+                            positions
+                                .get(label)
+                                .is_none_or(|position| *position <= array || *position > marker)
+                        })
+            });
+        matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        let prefix = &instructions[array..load];
+        if prefix.iter().any(|record| {
+            record.exception_policy() != super::ExceptionPolicy::NoneUnchanged
+                || record.opcode == NOP
+                || !matches!(record.operand(), Operand::Value(_))
+                || record.local_policy.hidden_exception_owner_slots() != 0
+                || record.pre_fold_extra_instructions() != 0
+                || record.no_location_policy.borrow_fallthrough()
+                    == super::BorrowFallthrough::Barrier
+        }) {
+            return None;
+        }
+        // Only the original PUSH_NULL paired with each flagged global disappears
+        // before the two captured POPs. The membership suffix removes its three
+        // literal loads and one Boolean-conversion cell afterward. Any other
+        // compaction, including a local fusion, fails this complete accounting.
+        let globals = prefix
+            .iter()
+            .filter(|record| {
+                matches!((record.opcode, record.operand()), (LOAD_GLOBAL, Operand::Value(argument))
+                if argument & 1 != 0)
+            })
+            .count();
+        if tail.early_removals != globals.checked_add(6)? {
+            return None;
+        }
+        let first_pop = load.checked_add(globals)?;
+        if marker == first_pop || first_pop.checked_add(1) == Some(marker) {
+            return Some(ExceptionOwnerDecision {
+                has_owner: false,
+                source_region: None,
+                definitive: true,
+                override_existing: true,
+            });
+        }
+        if marker >= first_pop || first_pop - marker > prefix.len() {
+            return None;
+        }
+        let region = self.uniform_exception_owner(array, load, positions)?;
         (!self.exception_regions[region].is_scope_fallback
             && !self.exception_regions[region].preserve_lasti)
             .then_some(ExceptionOwnerDecision {

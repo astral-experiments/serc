@@ -175,3 +175,62 @@ fn ordinary_try_inside_iterator_return_finally_keyword_truth() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn copied_return_membership_preserves_original_owner_slots() {
+    for (filename, source) in [
+        (
+            "copied_return_membership_three_calls_null_target.py",
+            r#"async def target(flag, state, item, stage, metrics):
+    try:
+        if flag:
+            one()
+            two()
+            three()
+            return item
+        return item
+    except Exception:
+        raise
+    finally:
+        failure = stage if state in {"cancelled", "exception", "unknown"} else None
+        metrics.record(failure)
+"#,
+        ),
+        (
+            "copied_return_membership_five_calls_owner_target.py",
+            r#"async def target(flag, state, item, stage, metrics):
+    try:
+        if flag:
+            one()
+            two()
+            three()
+            four()
+            five()
+            return item
+        return item
+    except Exception:
+        raise
+    finally:
+        failure = stage if state in {"cancelled", "exception", "unknown"} else None
+        metrics.record(failure)
+"#,
+        ),
+        (
+            "copied_return_membership_one_call_control.py",
+            r#"async def target(flag, state, item, stage, metrics):
+    try:
+        if flag:
+            one()
+            return item
+        return item
+    except Exception:
+        raise
+    finally:
+        failure = stage if state in {"cancelled", "exception", "unknown"} else None
+        metrics.record(failure)
+"#,
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

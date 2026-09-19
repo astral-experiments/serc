@@ -392,3 +392,71 @@ fn matches_cpython_retry_manager_suppression_owner() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_sync_manager_unique_normal_branch_donors() {
+    for (filename, source) in [
+        (
+            "sync_manager_nested_if_unique_donor_target.py",
+            r"def consume(open_task, stop_when_idle, work, pause):
+    while True:
+        with open_task() as task:
+            if task is None:
+                if stop_when_idle:
+                    return
+            else:
+                work(task)
+                continue
+        pause()
+",
+        ),
+        (
+            "sync_manager_nested_if_two_normal_paths_control.py",
+            r"def consume(open_task, stop_when_idle, work, pause):
+    while True:
+        with open_task() as task:
+            if task is None:
+                if stop_when_idle:
+                    return
+            else:
+                work(task)
+        pause()
+",
+        ),
+        (
+            "sync_manager_chained_pass_unique_donor_target.py",
+            r"def stream(lock, read_batch, finished, wait):
+    while True:
+        with lock:
+            entries = read_batch()
+            if entries:
+                pass
+            elif finished():
+                return
+            else:
+                wait()
+                continue
+        for entry in entries:
+            yield entry
+",
+        ),
+        (
+            "sync_manager_chained_pass_two_normal_paths_control.py",
+            r"def stream(lock, read_batch, finished, wait):
+    while True:
+        with lock:
+            entries = read_batch()
+            if entries:
+                pass
+            elif finished():
+                return
+            else:
+                wait()
+        for entry in entries:
+            yield entry
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

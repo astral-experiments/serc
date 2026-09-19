@@ -8023,6 +8023,26 @@ impl Compiler<'_> {
                             copied_handler_return_item,
                             first_pop_item,
                         );
+                        // Direct string literals contribute one original load each
+                        // before their membership container folds. Preserve this
+                        // exact source witness separately from generic fold history.
+                        if matches!(finally_context.body.first(), Some(Stmt::Assign(assignment))
+                            if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                                && matches!(assignment.value.as_ref(), Expr::If(value)
+                                    if matches!(value.body.as_ref(), Expr::Name(_))
+                                        && matches!(value.orelse.as_ref(), Expr::NoneLiteral(_))
+                                        && matches!(value.test.as_ref(), Expr::Compare(test)
+                                            if matches!(test.left.as_ref(), Expr::Name(_))
+                                                && matches!(test.ops.as_ref(), [CmpOp::In])
+                                                && matches!(test.comparators.as_ref(), [Expr::Set(set)]
+                                                    if set.elts.len() == 3
+                                                        && set.elts.iter().all(|element| matches!(element, Expr::StringLiteral(_)))))))
+                        {
+                            self.assembler.record_copied_return_membership_prefix(
+                                copied_handler_return_item,
+                                first_pop_item,
+                            );
+                        }
                         if copied_return_keeps_outer_async_manager {
                             self.assembler
                                 .record_copied_return_pop_prefix(first_pop_item);
@@ -11986,8 +12006,15 @@ impl Compiler<'_> {
         {
             return self.compile_loop_tail_ifexp_assert(statement, conditional, restart);
         }
+        // Negating an AND gives each false operand the same successful assertion exit
+        // as an OR's true operands. Keep that shared exit before copying the backedge.
+        let success_disjunction = matches!(statement.test.as_ref(), Expr::BoolOp(boolean) if boolean.op == BoolOp::Or)
+            || matches!(statement.test.as_ref(), Expr::UnaryOp(unary)
+                    if unary.op == UnaryOp::Not
+                        && matches!(unary.operand.as_ref(), Expr::BoolOp(boolean)
+                            if boolean.op == BoolOp::And));
         let copy_success_backedge = non_final_branch
-            && matches!(statement.test.as_ref(), Expr::BoolOp(boolean) if boolean.op == BoolOp::Or)
+            && success_disjunction
             && condition_jump_target_count(&statement.test, true) > 1
             && condition_has_linear_runtime_leaves(&statement.test);
         if non_final_branch
@@ -12244,8 +12271,29 @@ impl Compiler<'_> {
             // exit even when a surrounding exception or suspension region protects both
             // the loop and its backedge.
             // Folded tests have no runtime edge to copy within a protected region.
+            // Exhaustion enters a for-else suite separately from the continuing
+            // backedge. Keep its unprotected compound false edges on one forward exit.
+            let copied_for_else_branch_exit = non_final_branch
+                && !self.has_active_control_flow_region()
+                && self.control.loops.contexts.last().is_some_and(|context| {
+                    context.has_orelse
+                        && context.iterator_cleanup == IteratorCleanup::Sync
+                        && context.continue_label == restart
+                        && context.with_depth == self.control.withs.active_with_exits.len()
+                        && context.finally_end_depth
+                            == self.control.finally.active_finally_end_blocks
+                        && context.exception_region_depth
+                            == self
+                                .control
+                                .exceptions
+                                .active_exception_region_exclusions
+                                .len()
+                })
+                && condition_has_only_runtime_tests(&statement.test)
+                && condition_jump_target_count(&statement.test, false) > 1;
             let copied_loop_branch_exit = non_final_branch
-                && self.control.in_loop_tail_without_nested_cleanup()
+                && (self.control.in_loop_tail_without_nested_cleanup()
+                    || copied_for_else_branch_exit)
                 && (!self.has_active_control_flow_region()
                     || condition_has_only_runtime_tests(&statement.test));
             // CPython keeps a non-final branch's nested condition body before the fallback
@@ -12476,7 +12524,13 @@ impl Compiler<'_> {
                 let test = test.expect("last branch without else has a test");
                 let copied_loop_branch_exit = non_final_branch
                     && self.control.in_loop_tail_without_nested_cleanup()
-                    && !expression_contains_chained_comparison(test);
+                    && (!expression_contains_chained_comparison(test)
+                        // A direct runtime chain has two false paths into this original
+                        // exit: its comparison edge and the intermediate-value cleanup.
+                        // Keep both forward until the existing exit-copy pass runs.
+                        || (!self.has_active_control_flow_region()
+                            && matches!(test, Expr::Compare(comparison) if comparison.ops.len() > 1)
+                            && condition_has_only_runtime_tests(test)));
                 if copied_loop_branch_exit
                     || (non_final_branch
                         && !self.has_active_control_flow_region()
@@ -23919,6 +23973,22 @@ impl Compiler<'_> {
                         .map(WithBodyExitNoop::RetainedConvertedPopBlock)
                 })
                 .or_else(|| {
+                    if !remaining.is_empty()
+                        || self.control.loops.contexts.is_empty()
+                        || !self.context.target_specific_rules_enabled()
+                    {
+                        return None;
+                    }
+                    let (range, removed_slots) = with_body_continue_exit_donor(body)?;
+                    self.assembler
+                        .original_manager_has_unique_branch_donor(
+                            protected_end,
+                            self.source_location(range),
+                            removed_slots,
+                        )
+                        .then_some(WithBodyExitNoop::RetainedConvertedPopBlock(range))
+                })
+                .or_else(|| {
                     remaining
                         .is_empty()
                         .then(|| with_body_match_exit_location(body))
@@ -25750,6 +25820,42 @@ fn with_match_manager_exit_location(statement: &ruff_python_ast::StmtMatch) -> O
         }
     }
     location
+}
+
+// These complete runtime branches leave one normal donor before the final continue.
+// The assembler must still certify its original, unlocated manager join and sole edge.
+fn with_body_continue_exit_donor(body: &[Stmt]) -> Option<(TextRange, u8)> {
+    let Some(Stmt::If(statement)) = body.last() else {
+        return None;
+    };
+    let (otherwise, clauses) = statement.elif_else_clauses.split_last()?;
+    if otherwise.test.is_some()
+        || !matches!(otherwise.body.last(), Some(Stmt::Continue(_)))
+        || !condition_has_only_runtime_tests(&statement.test)
+        || clauses.iter().any(|clause| {
+            clause
+                .test
+                .as_ref()
+                .is_none_or(|test| !condition_has_only_runtime_tests(test))
+                || !matches!(clause.body.last(), Some(Stmt::Return(_) | Stmt::Raise(_)))
+        })
+    {
+        return None;
+    }
+    match statement.body.as_slice() {
+        // The pass NOP was compacted into this arm's original forward jump.
+        [Stmt::Pass(pass)] => Some((pass.range, 1)),
+        [Stmt::If(nested)]
+            if clauses.is_empty()
+                && nested.elif_else_clauses.is_empty()
+                && condition_has_only_runtime_tests(&nested.test)
+                && matches!(nested.body.last(), Some(Stmt::Return(_) | Stmt::Raise(_)))
+                && original_condition_has_unique_jump_target(&nested.test, false) =>
+        {
+            unique_condition_jump_target(&nested.test, false).map(|test| (test.range(), 0))
+        }
+        _ => None,
+    }
 }
 
 // A complete conditional with one terminal arm leaves the other arm as the sole

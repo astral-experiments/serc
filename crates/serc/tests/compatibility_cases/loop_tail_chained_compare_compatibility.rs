@@ -239,3 +239,49 @@ fn matches_cpython_final_elif_chain_original_cleanup_donors() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_nonfinal_elif_chained_compare_exit() {
+    for (filename, source) in [
+        (
+            "nonfinal_nested_elif_chained_compare_target.py",
+            r"def compare_levels(rows):
+    changed = False
+    for current, middle, target in rows:
+        if target < current:
+            changed = True
+        elif target > current:
+            if middle is not None:
+                if middle < current:
+                    changed = True
+                elif current < middle <= target:
+                    changed = True
+        else:
+            if middle is not None and middle < current:
+                changed = True
+    return changed
+",
+        ),
+        (
+            "nonfinal_nested_elif_simple_compare_control.py",
+            r"def compare_levels(rows):
+    changed = False
+    for current, middle, target in rows:
+        if target < current:
+            changed = True
+        elif target > current:
+            if middle is not None:
+                if middle < current:
+                    changed = True
+                elif middle <= target:
+                    changed = True
+        else:
+            if middle is not None and middle < current:
+                changed = True
+    return changed
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
