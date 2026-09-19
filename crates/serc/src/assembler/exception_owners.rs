@@ -109,6 +109,8 @@ pub(super) struct ExceptionOwnerProvenance {
     // Original try/except POP_BLOCK exits inside their own finally, for owner transfer
     // and late redundant-exit removal, but not ordinary-try exit copying.
     pub(super) compound_try_owner_exits: Vec<(Label, Label)>,
+    // Exact original direct exits whose late retained NOP represents an ownerless POP_BLOCK.
+    pub(super) ownerless_compound_try_nops: Vec<(Label, Label, Instruction)>,
     // Sole original guard-false try-else edges; absorption by a later POP_BLOCK only.
     pub(super) guarded_try_else_exits: Vec<(Label, Label)>,
     // Populated authored else arrays with direct normal edges into their own finally.

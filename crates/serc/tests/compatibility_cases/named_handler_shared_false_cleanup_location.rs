@@ -176,3 +176,76 @@ fn coroutine_named_recovery_raising_guard_keeps_cleanup_unlocated() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_shared_named_handler_normal_finally_cleanup() {
+    for (filename, source) in [
+        (
+            "conditional_named_raise_shared_finally_nop_target.py",
+            r"async def f(call, first, second, should_raise, cleanup):
+    try:
+        return await call()
+    except RuntimeError as error:
+        if first or (second and should_raise(error)):
+            raise
+    finally:
+        cleanup()
+",
+        ),
+        (
+            "conditional_named_raise_unique_finally_nop_control.py",
+            r"async def f(call, first, cleanup):
+    try:
+        return await call()
+    except RuntimeError as error:
+        if first:
+            raise
+    finally:
+        cleanup()
+",
+        ),
+        (
+            "conditional_named_assert_shared_finally_nop_target.py",
+            r"def f(work, first, second, enabled, cleanup):
+    try:
+        try:
+            work()
+        except RuntimeError as error:
+            assert first(error)
+            if enabled:
+                assert second(error)
+        else:
+            raise AssertionError()
+    finally:
+        cleanup()
+",
+        ),
+        (
+            "conditional_named_assert_unique_finally_nop_control.py",
+            r"def f(work, first, second, cleanup):
+    try:
+        try:
+            work()
+        except RuntimeError as error:
+            assert first(error)
+            assert second(error)
+        else:
+            raise AssertionError()
+    finally:
+        cleanup()
+",
+        ),
+        (
+            "conditional_named_raise_no_finally_control.py",
+            r"async def f(call, first, second, should_raise):
+    try:
+        return await call()
+    except RuntimeError as error:
+        if first or (second and should_raise(error)):
+            raise
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

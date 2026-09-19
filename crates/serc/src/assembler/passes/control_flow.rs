@@ -3218,9 +3218,28 @@ impl OptimizationPipeline {
                             }
                         }
                     } else {
+                        let ownerless_compound_exit = finalize_borrow_empty_blocks
+                            && self
+                                .exception_owner_provenance
+                                .ownerless_compound_try_nops
+                                .iter()
+                                .any(|(entry, original_target, original)| {
+                                    *original_target == target
+                                        && *original == instruction
+                                        && graph[block].items()[..offset]
+                                            .iter()
+                                            .all(|item| matches!(item, Item::Label(_)))
+                                        && graph[block].items()[..offset]
+                                            .contains(&Item::Label(*entry))
+                                });
                         let instruction = graph.instruction_mut(position).unwrap();
                         instruction.opcode = NOP;
                         instruction.set_operand(Operand::Value(0));
+                        if ownerless_compound_exit {
+                            // Only this unchanged original jump survived as the normal-exit NOP.
+                            // Copied, retargeted, and still-live exits retain their own owners.
+                            instruction.set_exception_owner(NormalizedExceptionOwner::Absent);
+                        }
                         previous = Some(position);
                     }
                 }

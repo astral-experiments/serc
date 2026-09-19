@@ -18095,6 +18095,36 @@ impl Compiler<'_> {
                 // Keep this exemption only until its original target width is known.
                 self.assembler.defer_name_return_borrow_exit(normal_exit);
             }
+            if self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR) != 0
+                && statement.orelse.is_empty()
+                && handlers_terminate
+                && direct_exit_location.is_some_and(|exit| !exit.chained_comparison_cleanup)
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .len()
+                    == 1
+                && self.control.exceptions.active_exception_handlers.is_empty()
+                && self.control.withs.active_with_exits.is_empty()
+                && self.control.loops.contexts.is_empty()
+                && self.control.finally.active_finally_try_bodies == 1
+                && self.control.finally.active_normal_finally_bodies == 0
+                && self.control.finally.active_copied_finally_bodies == 0
+                && matches!(statement.body.last(), Some(Stmt::If(branch))
+                    if branch.elif_else_clauses.is_empty()
+                        && condition_has_only_runtime_tests(&branch.test)
+                        && original_condition_has_unique_jump_target(&branch.test, false)
+                        && suite_terminates_before_constant_folding(&branch.body))
+                && matches!(statement.finalbody.as_slice(), [Stmt::Try(cleanup)]
+                    if !cleanup.is_star && cleanup.orelse.is_empty())
+            {
+                // The sole condition-false exit precedes a fresh protected cleanup array.
+                // Its retained NOP represents the ownerless inner POP_BLOCK, while a live
+                // jump or copied exit must keep its existing policy until late removal.
+                self.assembler
+                    .record_ownerless_compound_try_nop(try_end, end, normal_exit);
+            }
             if !statement.is_star
                 && !statement.orelse.is_empty()
                 && !statement.finalbody.is_empty()
@@ -19351,6 +19381,46 @@ impl Compiler<'_> {
                         *loop_depth == self.control.loops.contexts.len()
                             || has_lowered_loop_condition_successor
                     });
+                // These shared normal exits have no unique source donor. Keep the
+                // artificial named cleanup unlocated so its jump cannot give the
+                // following finally POP_BLOCK the last terminating arm's line.
+                let handler_has_shared_normal_finally_cleanup = handler.name.is_some()
+                    && !terminal
+                    && loop_tail.is_none()
+                    && handler_cleanup_has_normal_finally_successor
+                    && !has_lowered_loop_condition_successor
+                    && !self.control.statements.current_statement_has_following
+                    && !self.control.statements.inherited_statement_has_following
+                    && self.control.withs.active_with_exits.is_empty()
+                    && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+                    && self
+                        .control
+                        .finally
+                        .exceptional_finally_continuation_depths
+                        .is_none()
+                    && self
+                        .control
+                        .finally
+                        .copied_return_finally_loop_depth
+                        .is_none()
+                    && matches!(handler.body.last(), Some(Stmt::If(tail))
+                    if tail.elif_else_clauses.is_empty()
+                        && condition_has_linear_runtime_leaves(&tail.test)
+                        && !expression_contains_chained_comparison(&tail.test)
+                        && match tail.body.as_slice() {
+                            [Stmt::Raise(raise)] => {
+                                raise.exc.is_none()
+                                    && raise.cause.is_none()
+                                    && condition_jump_target_count(&tail.test, false) > 1
+                            }
+                            [Stmt::Assert(assertion)] => {
+                                assertion.msg.is_none()
+                                    && early_condition_truthiness(&assertion.test).is_none()
+                                    && condition_jump_target_count(&tail.test, false) == 1
+                                    && condition_jump_target_count(&assertion.test, true) == 1
+                            }
+                            _ => false,
+                        });
                 let handler_ends_with_terminating_unlocated_cleanup = matches!(
                     handler.body.last(),
                     Some(Stmt::If(tail))
@@ -19446,6 +19516,7 @@ impl Compiler<'_> {
                 // CPython propagates a handler's sole condition-fallthrough edge onto the
                 // normal cleanup block, even when code follows the enclosing try statement.
                 if handler_cleanup_from_original_join
+                    || handler_has_shared_normal_finally_cleanup
                     || handler_ends_with_unlocated_bare_raise_branch_cleanup
                     || handler_has_shared_terminal_false_cleanup
                 {
@@ -19569,6 +19640,7 @@ impl Compiler<'_> {
                         .make_last_no_location_copy_inherit_shared_predecessor();
                 }
                 if handler_ends_with_preserved_unlocated_cleanup
+                    || handler_has_shared_normal_finally_cleanup
                     || handler_ends_with_unlocated_bare_raise_branch_cleanup
                     || (handler_ends_with_unlocated_if_cleanup
                         && !handler_cleanup_is_terminal_exceptional_finally_exit)
@@ -20296,12 +20368,21 @@ impl Compiler<'_> {
                     )
                 }
             };
-            // A final manager's normal and suppression jumps share an artificial
-            // named-handler cleanup. Copy that unlocated cleanup before resolving
-            // either predecessor's location, even when clearing the name makes it large.
-            let inline_manager_cleanup = self.context.target_specific_rules_enabled()
-                && matches!(body.last(), Some(Stmt::With(statement))
+            // A final manager or ordinary try can leave two original normal exits
+            // into the artificial named-handler cleanup. Copy it while unlocated,
+            // even when clearing the name makes the exit larger than a small return.
+            let inline_join_cleanup = self.context.target_specific_rules_enabled()
+                && (matches!(body.last(), Some(Stmt::With(statement))
                     if !statement.is_async && !suite_terminates(&statement.body))
+                    || matches!(body.last(), Some(Stmt::Try(nested))
+                    if !nested.is_star
+                        && nested.orelse.is_empty()
+                        && nested.finalbody.is_empty()
+                        && !suite_terminates(&nested.body)
+                        && matches!(nested.handlers.as_slice(), [handler]
+                            if handler.as_except_handler().is_some_and(|handler| {
+                                handler.name.is_some() && !suite_terminates(&handler.body)
+                            }))))
                 && self.assembler.at_original_unconditional_join();
             // A nested runtime conditional's normal edges also reach one original
             // artificial cleanup. Assign each copied exit its own predecessor's location.
@@ -20312,19 +20393,19 @@ impl Compiler<'_> {
                         && condition_has_linear_runtime_leaves(&tail.test)
                         && if_normal_exit_count(tail) > 1
             );
-            if inline_manager_cleanup || shared_conditional_cleanup {
+            if inline_join_cleanup || shared_conditional_cleanup {
                 self.assembler.record_unlocated_cleanup_targets();
             }
             exclusions.push(self.emit_terminal_exception_handler_action(
                 name,
                 handler_depth,
-                if inline_manager_cleanup || shared_conditional_cleanup {
+                if inline_join_cleanup || shared_conditional_cleanup {
                     SourceLocation::NONE
                 } else {
                     action_location
                 },
             )?);
-            if inline_manager_cleanup {
+            if inline_join_cleanup {
                 self.assembler.allow_last_no_location_block_inlining();
                 self.assembler.allow_last_unconditional_block_inlining();
             }
@@ -24251,6 +24332,8 @@ impl Compiler<'_> {
                 body_noop = Some(WithBodyExitNoop::Located(statement.range()));
             } else if terminal_if
                 && let Some(Stmt::If(statement)) = body.last()
+                // A folded infinite loop still has an original normal false exit.
+                && suite_terminates_before_constant_folding(&statement.body)
                 && condition_jump_target_count(&statement.test, false) == 1
             {
                 // CPython drops a converted `POP_BLOCK` marker fed by multiple normal
@@ -26145,6 +26228,19 @@ fn with_body_normal_exit(body: &[Stmt]) -> WithBodyNormalExit {
             // The condition bypass and the while exit share the original unlocated
             // finally jump. Neither is its sole predecessor, so the manager's
             // converted POP_BLOCK cannot inherit the while condition's location.
+            WithBodyNormalExit::Other
+        }
+        Some(Stmt::With(manager))
+            if !manager.is_async
+                && manager.items.len() == 1
+                && matches!(manager.body.as_slice(), [Stmt::While(loop_statement)]
+                    if loop_statement.orelse.is_empty()
+                        && condition_has_only_runtime_tests(&loop_statement.test)
+                        && !suite_contains_loop_break(&loop_statement.body)) =>
+        {
+            // The inner manager's completed cleanup supplies a normal exit at this
+            // depth. A sibling while therefore cannot solely locate the outer `POP_BLOCK`.
+            // The inner while still uses its own manager's `While` classification.
             WithBodyNormalExit::Other
         }
         // These suites have their own cleanup and join paths. A while in an else or

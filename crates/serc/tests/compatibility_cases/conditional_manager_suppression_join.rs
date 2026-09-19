@@ -561,3 +561,56 @@ fn matches_cpython_nested_manager_terminal_suppression_joins() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_manager_original_normal_exit_joins() {
+    for (filename, source) in [
+        (
+            "manager_infinite_if_original_false_join_target.py",
+            r"def f(manager, enabled, work):
+    with manager():
+        work()
+        if enabled:
+            while True:
+                work()
+",
+        ),
+        (
+            "manager_terminal_if_return_unique_join_control.py",
+            r"def f(manager, enabled, work):
+    with manager():
+        work()
+        if enabled:
+            return
+",
+        ),
+        (
+            "manager_nested_with_else_while_shared_join_target.py",
+            r"def f(manager, inner, mode, pending, step, finish):
+    with manager():
+        if mode:
+            with inner():
+                while pending():
+                    step()
+        else:
+            while pending():
+                step()
+    finish()
+",
+        ),
+        (
+            "manager_return_else_while_unique_join_control.py",
+            r"def f(manager, mode, pending, step, finish):
+    with manager():
+        if mode:
+            return
+        else:
+            while pending():
+                step()
+    finish()
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

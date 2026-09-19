@@ -4837,6 +4837,44 @@ impl Assembler {
         }
     }
 
+    /// Captures a direct compound-try exit whose retained NOP represents an ownerless `POP_BLOCK`.
+    pub(crate) fn record_ownerless_compound_try_nop(
+        &mut self,
+        entry: Label,
+        target: Label,
+        emitted: EmittedJump,
+    ) {
+        let jump = *self.emitted_jump_mut(emitted, "recording an ownerless compound-try NOP");
+        if jump.opcode != JUMP_FORWARD
+            || jump.operand() != Operand::Forward(target)
+            || !jump.jump_policy.retains_nop_for(jump.operand())
+            || jump.jump_policy.always_retains_nop()
+            || jump.exception_policy() != ExceptionPolicy::default()
+            || jump.location.line < 0
+            || jump.pre_fold_extra_instructions() != 0
+            || jump.local_policy.hidden_exception_owner_slots() != 0
+            || !self
+                .exception_owner_provenance
+                .compound_try_owner_exits
+                .contains(&(entry, target))
+        {
+            return;
+        }
+        let index = usize::try_from(emitted.instruction().item_index)
+            .expect("emitted instruction index should fit in usize");
+        if !self.linear_items()[..index]
+            .iter()
+            .rev()
+            .take_while(|item| matches!(item, Item::Label(_)))
+            .any(|item| *item == Item::Label(entry))
+        {
+            return;
+        }
+        self.exception_owner_provenance
+            .ownerless_compound_try_nops
+            .push((entry, target, jump));
+    }
+
     /// Captures a terminal try-else guard's original empty normal edge.
     /// This only certifies late absorption by the original ownerless `POP_BLOCK`.
     pub(crate) fn record_guarded_try_else_exit(&mut self, emitted: EmittedJump) {

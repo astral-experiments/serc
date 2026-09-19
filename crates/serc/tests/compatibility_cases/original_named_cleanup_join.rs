@@ -96,3 +96,45 @@ fn ordinary_with_control() {
         "ordinary_with_control.py",
     );
 }
+
+#[test]
+fn matches_cpython_nested_named_generator_cleanup_joins() {
+    for (filename, source) in [
+        (
+            "nested_named_generator_handler_copy.py",
+            r"def run(first, read, reraise):
+    try:
+        yield read()
+    except ValueError as error:
+        if first:
+            try:
+                yield read()
+            except TypeError as error:
+                if reraise:
+                    raise error
+                yield read()
+        else:
+            yield read()
+",
+        ),
+        (
+            "nested_named_generator_distinct_name_control.py",
+            r"def run(first, read, reraise):
+    try:
+        yield read()
+    except ValueError as error:
+        if first:
+            try:
+                yield read()
+            except TypeError as nested:
+                if reraise:
+                    raise nested
+                yield read()
+        else:
+            yield read()
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
