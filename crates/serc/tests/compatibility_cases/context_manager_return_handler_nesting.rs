@@ -192,3 +192,67 @@ fn owner_transfer_async_manager_depth_matrix() {
         }
     }
 }
+
+#[test]
+fn matches_cpython_named_handler_while_returns_through_manager_finally() {
+    for (filename, source) in [
+        (
+            "named_manager_while_return_truth_finally.py",
+            r"async def worker(manager, ready, read, report, client):
+    skip = False
+    with manager:
+        try:
+            while ready():
+                try:
+                    read()
+                except Exception as error:
+                    skip = True
+                    report(error)
+                    return
+        except OSError:
+            report(None)
+        finally:
+            if skip:
+                return
+            report(None)
+            await client.finish()
+",
+        ),
+        (
+            "named_manager_while_return_two_finally.py",
+            r"def worker(manager, ready, read, report, process):
+    with manager:
+        try:
+            try:
+                while ready():
+                    try:
+                        read()
+                    except LookupError as error:
+                        report(error)
+                        return
+            except ValueError as error:
+                report(error)
+            finally:
+                try:
+                    report(None)
+                    while read():
+                        pass
+                except OSError as error:
+                    report(error)
+                report(None)
+                if process is not None:
+                    process.close()
+        except RuntimeError as error:
+            report(error)
+            report(None)
+            report(error)
+        finally:
+            report(None)
+            if ready():
+                report(None)
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

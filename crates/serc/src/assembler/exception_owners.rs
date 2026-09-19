@@ -836,7 +836,7 @@ impl ExceptionOwnerProvenance {
     ) -> bool {
         use crate::target::opcodes::{
             BINARY_OP, BUILD_LIST, BUILD_MAP, BUILD_STRING, BUILD_TUPLE, CALL, CALL_KW,
-            CONTAINS_OP, FORMAT_SIMPLE, IMPORT_FROM, IMPORT_NAME, LOAD_ATTR, LOAD_CONST,
+            CONTAINS_OP, FORMAT_SIMPLE, GET_ITER, IMPORT_FROM, IMPORT_NAME, LOAD_ATTR, LOAD_CONST,
             LOAD_DEREF, LOAD_FAST, LOAD_GLOBAL, LOAD_NAME, LOAD_SMALL_INT, MAKE_FUNCTION,
             POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE, PUSH_NULL, SET_FUNCTION_ATTRIBUTE, STORE_DEREF,
             STORE_FAST, STORE_NAME, TO_BOOL,
@@ -1172,13 +1172,20 @@ impl ExceptionOwnerProvenance {
                 MAKE_FUNCTION | SET_FUNCTION_ATTRIBUTE
                     if annotated_function_members.contains(&index) => {}
                 BUILD_LIST => {
-                    // An empty list stored as a local is neither a constant
-                    // sequence fold nor an iterable/containment conversion.
-                    if instruction.operand() != Operand::Value(0)
-                        || instructions
-                            .get(index + 1)
-                            .is_none_or(|next| next.opcode != STORE_FAST)
-                    {
+                    // Empty local lists retain their existing certificate. Nonempty
+                    // lists below CPython's three-item constant-fold threshold also
+                    // keep every record unless used for iteration or containment.
+                    let unchanged =
+                        instructions.get(index + 1).is_some_and(|next| {
+                            match instruction.operand() {
+                                Operand::Value(0) => next.opcode == STORE_FAST,
+                                Operand::Value(1..=2) => {
+                                    !matches!(next.opcode, GET_ITER | CONTAINS_OP)
+                                }
+                                _ => false,
+                            }
+                        });
+                    if !unchanged {
                         return false;
                     }
                 }

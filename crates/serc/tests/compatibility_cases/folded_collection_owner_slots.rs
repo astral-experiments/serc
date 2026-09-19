@@ -114,3 +114,65 @@ fn matches_cpython_literal_defaults_before_try_owner() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_folded_list_try_else_search_join_locations() {
+    for (filename, source) in [
+        (
+            "try_else_search_small_list_owner_and_location_target.py",
+            r#"def search(api):
+    found = False
+    try:
+        while api.pending():
+            try:
+                result = api.run(["first", "second"], enabled=True)
+                values = result.values()
+                if not result.ready():
+                    pass
+                else:
+                    for value in values:
+                        if api.matches(value):
+                            api.accept(value)
+                            found = True
+                            break
+                    if found:
+                        break
+            except LookupError:
+                pass
+            api.wait()
+    except Exception:
+        return False
+    return found
+"#,
+        ),
+        (
+            "try_else_search_tuple_location_target.py",
+            r#"def search(api):
+    found = False
+    try:
+        while api.pending():
+            try:
+                result = api.run(("first", "second"), enabled=True)
+                values = result.values()
+                if not result.ready():
+                    pass
+                else:
+                    for value in values:
+                        if api.matches(value):
+                            api.accept(value)
+                            found = True
+                            break
+                    if found:
+                        break
+            except LookupError:
+                pass
+            api.wait()
+    except Exception:
+        return False
+    return found
+"#,
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

@@ -243,3 +243,46 @@ fn protected_nested_if_preserves_forward_exit_before_conditional_handler() {
 ";
     common::assert_matches_cpython_marshal(source, "protected_nested_if_conditional_handler.py");
 }
+
+#[test]
+fn matches_cpython_protected_backedges_after_nested_while_and_assertion() {
+    for (filename, source) in [
+        (
+            "protected_try_inner_while_backedge_target.py",
+            r"def visit(rows, choose, make_iterator, consume):
+    try:
+        for row in rows:
+            try:
+                fast = choose(row)
+                if not fast:
+                    iterator = make_iterator(row)
+                    while iterator.has_next():
+                        value = iterator.next()
+                        try:
+                            consume(value)
+                        except Exception:
+                            continue
+            except Exception:
+                continue
+    except RuntimeError:
+        raise
+",
+        ),
+        (
+            "protected_try_final_assert_backedge_target.py",
+            r"def validate(pairs, report):
+    for left, right in pairs:
+        try:
+            if isinstance(left, int):
+                assert left == right
+            else:
+                assert (left == right).all()
+        except Exception as error:
+            report(error)
+            raise
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

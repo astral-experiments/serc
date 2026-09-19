@@ -484,3 +484,52 @@ fn matches_cpython_unmanaged_copied_handler_finally_slot_owners() {
         "unmanaged_handler_finally_local_call_control.py",
     );
 }
+
+#[test]
+fn matches_cpython_newer_try_named_handler_return_owners() {
+    for (filename, source) in [
+        (
+            "newer_try_named_handler_constant_return.py",
+            r"def run(first, second, flag):
+    try:
+        try:
+            first()
+        except LookupError as error:
+            try:
+                second()
+                if flag:
+                    return None
+                return False
+            except ValueError:
+                raise
+    except RuntimeError:
+        return 1
+",
+        ),
+        (
+            "newer_try_named_handler_chain_returns.py",
+            r"def run(first, second, third, fourth, flag):
+    try:
+        try:
+            first()
+        except LookupError as first_error:
+            try:
+                if flag:
+                    return None
+                return second()
+            except ValueError as second_error:
+                try:
+                    return third()
+                except KeyError as third_error:
+                    try:
+                        return fourth()
+                    except RuntimeError as fourth_error:
+                        return None
+    except Exception:
+        return False
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

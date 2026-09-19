@@ -434,3 +434,51 @@ fn matches_cpython_normal_finally_single_live_jump_setup_owner() {
         "normal_finally_single_live_jump_setup_owner.py",
     );
 }
+
+#[test]
+fn matches_cpython_linear_finally_named_handler_return_owners() {
+    for (filename, source) in [
+        (
+            "sync_named_handler_bare_return_finally_owner_target.py",
+            r#"def run(worker, token, recover, fatal):
+    try:
+        try:
+            worker.start(token)
+        except LookupError as error:
+            recover(error)
+            if fatal:
+                raise ValueError("failed") from error
+            return
+        except RuntimeError:
+            recover(None)
+            raise
+        finally:
+            worker.finish(token)
+    except OSError:
+        recover(None)
+    return None
+"#,
+        ),
+        (
+            "live_named_handler_inner_finally_call_owner_target.py",
+            r"def run(worker, cleanup, retry):
+    try:
+        try:
+            return worker()
+        except LookupError as error:
+            if retry:
+                try:
+                    return worker()
+                except OSError:
+                    pass
+                finally:
+                    cleanup.finish(missing_ok=True)
+            return worker()
+    finally:
+        cleanup.close()
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
