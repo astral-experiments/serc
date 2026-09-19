@@ -231,3 +231,78 @@ fn indent(source: &str) -> String {
     }
     indented
 }
+
+#[test]
+fn anonymous_handler_conditional_backedges_copy_cleanup() {
+    for (filename, source) in [
+        (
+            "generator_handler_conditional_break_copy_target.py",
+            r"def collect(manager, ready, work, pending, buffered):
+    with manager():
+        while True:
+            yield None
+            if ready():
+                try:
+                    work()
+                except LookupError:
+                    if pending() == 0 and buffered() == 0:
+                        break
+            else:
+                work()
+",
+        ),
+        (
+            "generator_handler_single_break_copy_control.py",
+            r"def collect(manager, ready, work, pending, buffered):
+    with manager():
+        while True:
+            yield None
+            if ready():
+                try:
+                    work()
+                except LookupError:
+                    if pending() == 0:
+                        break
+            else:
+                work()
+",
+        ),
+        (
+            "manager_handler_conditional_tuple_copy_target.py",
+            r"def consume(manager, items, select, read, convert):
+    value = None
+    with manager():
+        for item in items:
+            if select(item):
+                try:
+                    value = read(item)
+                except ValueError:
+                    pair = read(None)
+                    if len(pair) == 2:
+                        value = (convert(pair[0]), convert(pair[1]))
+            else:
+                value = item
+    return value
+",
+        ),
+        (
+            "manager_handler_unconditional_tuple_copy_control.py",
+            r"def consume(manager, items, select, read, convert):
+    value = None
+    with manager():
+        for item in items:
+            if select(item):
+                try:
+                    value = read(item)
+                except ValueError:
+                    pair = read(None)
+                    value = (convert(pair[0]), convert(pair[1]))
+            else:
+                value = item
+    return value
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

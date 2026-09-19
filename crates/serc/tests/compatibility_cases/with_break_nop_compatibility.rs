@@ -66,3 +66,63 @@ def conditional(manager, value):
 ";
     common::assert_matches_cpython_marshal(source, "with_break_nop_compatibility.py");
 }
+
+#[test]
+fn matches_cpython_marshal_for_suppressed_return_loop_backedges() {
+    for (filename, source) in [
+        (
+            "suppressed_return_retry.py",
+            r"def retry(managers):
+    try:
+        for manager in managers:
+            with manager:
+                return work()
+        raise Error
+    except Error as error:
+        raise Failure from error
+",
+        ),
+        (
+            "suppressed_return_retry_window.py",
+            r"def retry(managers):
+    while True:
+        try:
+            for manager in managers:
+                with manager:
+                    work()
+                    return result()
+            raise Error
+        except Error as error:
+            if failed(error):
+                raise
+            report(error)
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn matches_cpython_folded_loop_bare_raise_break_marker() {
+    let source = r"async def run(work, cleanup, done, kind):
+    try:
+        await work()
+    except BaseException as error:
+        if isinstance(error, kind):
+            while True:
+                try:
+                    await cleanup()
+                    break
+                except kind:
+                    if done():
+                        break
+        else:
+            await cleanup()
+        raise
+";
+    common::assert_matches_cpython_marshal(
+        source,
+        "folded_loop_break_bare_raise_handler_target.py",
+    );
+}

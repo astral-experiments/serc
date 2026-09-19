@@ -3,6 +3,51 @@ use std::io::Write as _;
 use std::process::Stdio;
 
 #[test]
+fn matches_cpython_condition_span_after_terminating_nested_handler() {
+    // Only the false edge reaches the outer POP_EXCEPT when every nested path returns.
+    // Runtime conjunctions keep multiple false edges; folded constants can leave one donor.
+    for condition in [
+        "flag",
+        "flag or other",
+        "flag and other",
+        "flag and True",
+        "True and flag",
+    ] {
+        for fallback in ["None", "value"] {
+            let source = format!(
+                "def f(flag, other, value):\n    try:\n        return primary(value)\n    except ValueError:\n        if {condition}:\n            try:\n                return secondary(value)\n            except TypeError:\n                return {fallback}\n    return None\n"
+            );
+            common::assert_matches_cpython_marshal(
+                &source,
+                "condition_span_after_terminating_nested_handler.py",
+            );
+        }
+    }
+}
+
+#[test]
+fn matches_cpython_nested_handler_condition_span_with_setup() {
+    let source = r"def f(flag, value):
+    if flag:
+        try:
+            return primary(value)
+        except ValueError:
+            try:
+                parsed = parse(value)
+            except TypeError:
+                return None
+            if isinstance(parsed, str):
+                prepared = parsed.strip()
+                try:
+                    return secondary(prepared)
+                except TypeError:
+                    return None
+    return None
+";
+    common::assert_matches_cpython_marshal(source, "nested_handler_condition_span_with_setup.py");
+}
+
+#[test]
 fn matches_cpython_nested_handler_cleanup_locations() {
     for binding in ["", " as error"] {
         for condition in ["flag", "flag and value", "flag or value"] {

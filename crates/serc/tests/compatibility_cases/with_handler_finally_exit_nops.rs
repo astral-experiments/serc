@@ -54,3 +54,28 @@ fn matches_cpython_with_finally_branch_join_ownership() {
         }
     }
 }
+
+#[test]
+fn matches_cpython_manager_pop_after_returning_try_handler_finally() {
+    for handler in ["await report(error)", "raise", "return"] {
+        let source = format!(
+            "async def example(manager, flag):\n    with manager:\n        await prepare()\n        try:\n            result = await work()\n            return result\n        except Exception as error:\n            {handler}\n        finally:\n            if flag:\n                mark()\n            finish()\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "manager_pop_returning_try.py");
+    }
+}
+
+#[test]
+fn matches_cpython_manager_pop_after_generator_try_else_finally() {
+    for (handler, otherwise) in [
+        ("raise", "await succeeded()"),
+        ("raise", "return"),
+        ("raise", "raise Error"),
+        ("await failed()", "return"),
+    ] {
+        let source = format!(
+            "async def example(manager, obj):\n    with manager:\n        old = obj.value\n        try:\n            await start()\n            yield obj\n        except Exception:\n            {handler}\n        else:\n            {otherwise}\n        finally:\n            obj.value = old\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "manager_pop_generator_else.py");
+    }
+}

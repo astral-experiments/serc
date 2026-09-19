@@ -40,3 +40,45 @@ def synchronous_control(value, prepare, cleanup, finish):
 ";
     common::assert_matches_cpython_marshal(source, "coroutine_try_assert_else_exit.py");
 }
+
+#[test]
+fn matches_cpython_named_handler_assertion_original_exit() {
+    for (filename, source) in [
+        (
+            "coroutine_named_handler_assertion_same_array_exit.py",
+            r"async def probe(operation, ready):
+    try:
+        await operation()
+    except ValueError as original:
+        try:
+            code = await operation()
+            assert code == 0
+        except TypeError as recovery:
+            print(recovery)
+        if ready(original):
+            raise RuntimeError() from original
+        raise
+",
+        ),
+        (
+            "coroutine_named_handler_assertion_else_boundary_control.py",
+            r"async def probe(operation, ready):
+    try:
+        await operation()
+    except ValueError as original:
+        try:
+            code = await operation()
+            assert code == 0
+        except TypeError as recovery:
+            print(recovery)
+        else:
+            print(code)
+        if ready(original):
+            raise RuntimeError() from original
+        raise
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

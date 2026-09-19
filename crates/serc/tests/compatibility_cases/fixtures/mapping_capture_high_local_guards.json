@@ -1,0 +1,5 @@
+{
+  "nested_guard_capture_local_15.py": "def sample(value, padding_1, padding_2, padding_3, padding_4, padding_5, padding_6, padding_7, padding_8, padding_9, padding_10, padding_11, padding_12, padding_13, padding_14):\n    match value:\n        case {\"outer\": {\"inner\": str(capture)}} if capture:\n            return capture\n        case _:\n            return None\n",
+  "nested_guard_capture_local_16.py": "def sample(value, padding_1, padding_2, padding_3, padding_4, padding_5, padding_6, padding_7, padding_8, padding_9, padding_10, padding_11, padding_12, padding_13, padding_14, padding_15):\n    match value:\n        case {\"outer\": {\"inner\": str(capture)}} if capture:\n            return capture\n        case _:\n            return None\n",
+  "high_local_two_capture_guard.py": "def sample(value, allowed, p00, p01, p02, p03, p04, p05, p06, p07, p08, p09, p10, p11, p12, p13, p14, p15):\n    match value:\n        case {\"version\": str(version), \"plugins\": list(plugins)} if version in allowed:\n            return plugins\n        case _:\n            return None\n"
+}

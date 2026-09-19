@@ -34,3 +34,31 @@ fn matches_cpython_conditional_comprehension_filters() {
         }
     }
 }
+
+#[test]
+fn matches_cpython_generator_conditional_filter_true_locations() {
+    for (filename, source) in [
+        (
+            "generator_conditional_filter_multiline_true_target.py",
+            r"def selected(items, enabled):
+    return tuple(
+        item
+        for item in items
+        if (
+            item.ready
+            if enabled
+            else True
+        )
+    )
+",
+        ),
+        (
+            "generator_conditional_filter_same_line_true_control.py",
+            r"def selected(items, enabled):
+    return tuple(item for item in items if (item.ready if enabled else True))
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

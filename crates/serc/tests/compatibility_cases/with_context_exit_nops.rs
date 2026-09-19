@@ -367,3 +367,134 @@ fn preserves_cpython_manager_exit_predecessor_boundaries() {
         common::assert_matches_cpython_marshal(source, "manager_exit_boundaries.py");
     }
 }
+
+#[test]
+fn terminal_match_call_preserves_manager_exit_nop() {
+    let source = r"def function(manager, value, fallback):
+    with manager:
+        match value:
+            case Kind.FIRST:
+                return handle(value)
+            case _:
+                fallback(value)
+";
+    common::assert_matches_cpython_marshal(source, "terminal_match_manager_exit.py");
+}
+
+#[test]
+fn terminal_async_match_call_preserves_manager_exit_nop() {
+    let source = r"async def function(manager, value, fallback):
+    with manager:
+        match value:
+            case Request():
+                return await handle(value)
+            case _:
+                fallback(value)
+";
+    common::assert_matches_cpython_marshal(source, "terminal_async_match_manager_exit.py");
+}
+
+#[test]
+fn terminal_match_prefix_preserves_manager_exit_nop() {
+    let source = r"def function(manager, value, prepare, fallback):
+    with manager:
+        match value:
+            case Kind.FIRST:
+                return handle(value)
+            case _:
+                prepare(value)
+                fallback(value)
+";
+    common::assert_matches_cpython_marshal(source, "terminal_match_prefix_manager_exit.py");
+}
+
+#[test]
+fn ordinary_call_manager_exit_control() {
+    let source = r"def function(manager, value, fallback):
+    with manager:
+        fallback(value)
+";
+    common::assert_matches_cpython_marshal(source, "ordinary_call_manager_exit.py");
+}
+
+#[test]
+fn matches_cpython_coroutine_return_join_before_sync_manager_exit() {
+    let source = r"async def f(manager, read, flag):
+    with manager:
+        try:
+            value = await read()
+            return value if flag else None
+        except ValueError:
+            raise
+";
+    common::assert_matches_cpython_marshal(source, "coroutine_return_join_sync_manager.py");
+}
+
+#[test]
+fn matches_cpython_coroutine_return_join_before_async_manager_exit() {
+    let source = r"async def f(manager, read, flag):
+    async with manager:
+        try:
+            value = await read()
+            return value if flag else None
+        except ValueError:
+            raise
+";
+    common::assert_matches_cpython_marshal(source, "coroutine_return_join_async_manager.py");
+}
+
+#[test]
+fn retains_cpython_sync_return_join_before_manager_exit() {
+    let source = r"def f(manager, read, flag):
+    with manager:
+        try:
+            value = read()
+            return value if flag else None
+        except ValueError:
+            raise
+";
+    common::assert_matches_cpython_marshal(source, "sync_return_join_manager_control.py");
+}
+
+#[test]
+fn retains_cpython_coroutine_return_join_without_inner_try() {
+    let source = r"async def f(manager, read, flag):
+    async with manager:
+        value = await read()
+        return value if flag else None
+";
+    common::assert_matches_cpython_marshal(source, "coroutine_return_join_no_try_control.py");
+}
+
+#[test]
+fn nested_manager_suppression_match_exit() {
+    let source = r#"
+def make_runner(outer, inner, kind):
+    with outer:
+        match kind:
+            case "primary":
+                with inner:
+                    def run(value):
+                        return consume(value)
+                    return run
+            case _:
+                raise ValueError(kind)
+"#;
+    common::assert_matches_cpython_marshal(source, "nested_manager_match_suppression.py");
+}
+
+#[test]
+fn nested_manager_suppression_if_exit_control() {
+    let source = r#"
+def make_runner(outer, inner, kind):
+    with outer:
+        if kind == "primary":
+            with inner:
+                def run(value):
+                    return consume(value)
+                return run
+        else:
+            raise ValueError(kind)
+"#;
+    common::assert_matches_cpython_marshal(source, "nested_manager_if_suppression.py");
+}

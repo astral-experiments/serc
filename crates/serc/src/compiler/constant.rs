@@ -421,7 +421,8 @@ impl Compiler<'_> {
         }
         self.assembler
             .add_last_constant_fold_slots(hidden_owner_slots);
-        // A primitive tuple removes only literal loads from this owner's block.
+        // Literal tuple elements, including prebuilt constant slices, each remove
+        // one load from this owner's block when the tuple is folded.
         if let Expr::Tuple(tuple) = expression
             && tuple.elts.iter().all(|element| {
                 matches!(
@@ -432,7 +433,7 @@ impl Compiler<'_> {
                         | Expr::StringLiteral(_)
                         | Expr::BytesLiteral(_)
                         | Expr::EllipsisLiteral(_)
-                )
+                ) || matches!(element, Expr::Slice(slice) if constant_slice(slice).is_some())
             })
         {
             self.assembler
@@ -443,6 +444,15 @@ impl Compiler<'_> {
         {
             // Numeric negation removes its adjacent, equally owned literal load.
             self.assembler.record_last_uniform_fold_owner_slots(1);
+        } else if matches!(expression, Expr::BinOp(_))
+            && is_literal_binary_tree(expression)
+            && self.source_location(expression.range()).line
+                == self.source_location(expression.range()).end_line
+        {
+            // Each folded binary operation removes two adjacent literal loads. A single
+            // source line keeps all nested operands in the same owner without line NOPs.
+            self.assembler
+                .record_last_uniform_fold_owner_slots(hidden_owner_slots);
         }
         Ok(())
     }
@@ -801,6 +811,16 @@ impl Compiler<'_> {
             .deferred_names
             .push((instruction, name.to_string()));
         Ok(())
+    }
+}
+
+/// Returns whether a binary-expression tree contains only primitive literal leaves.
+fn is_literal_binary_tree(expression: &Expr) -> bool {
+    match expression {
+        Expr::BinOp(binary) => {
+            is_literal_binary_tree(&binary.left) && is_literal_binary_tree(&binary.right)
+        }
+        _ => is_literal_constant(expression),
     }
 }
 

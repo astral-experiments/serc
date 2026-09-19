@@ -25,7 +25,7 @@ def git(checkout: Path, *arguments: str) -> str:
 
 class ReadInputsTest(unittest.TestCase):
     def test_parses_only_compiler_initialized_identifiers(self) -> None:
-        source = '''
+        source = """
         static int init_identifiers(struct ast_state *state)
         {
             state->right = PyUnicode_InternFromString("right");
@@ -35,7 +35,7 @@ class ReadInputsTest(unittest.TestCase):
             return 0;
 }
         PyUnicode_InternFromString("unrelated");
-        '''
+        """
         self.assertEqual(
             generator.parse_compiler_interned_strings(source),
             ["body", "left", "right"],
@@ -100,6 +100,15 @@ class RenderPreinternedLookupTest(unittest.TestCase):
         self.assertEqual(
             generator.rust_string_literal('quote" slash\\ \n\r\t\0 ☃\x01\x7f'),
             '"quote\\" slash\\\\ \\n\\r\\t\\0 ☃\\x01\\x7f"',
+        )
+
+    def test_gates_unix_startup_candidates(self) -> None:
+        rendered = generator.render_preinterned_lookup(
+            ["package"], ("patterns", "pause")
+        )
+        self.assertIn(
+            '            if value == "patterns" || (cfg!(unix) && value == "pause") {',
+            rendered,
         )
 
     def test_renders_exact_prefix_ranges_and_startup_candidates(self) -> None:

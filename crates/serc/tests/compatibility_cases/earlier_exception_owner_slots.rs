@@ -97,3 +97,233 @@ fn matches_cpython_targeted_finally_entry_rejects_prior_array_history() {
         }
     }
 }
+
+#[test]
+fn normal_finally_none_marker_reuses_removed_pop_slot() {
+    let source =
+        normal_finally_pop_slot_source(r#"create_client(f"{ROOT}/{key}/resource", credential)"#);
+    common::assert_matches_cpython_marshal(&source, "normal_finally_removed_pop_slot.py");
+}
+
+#[test]
+fn normal_finally_none_marker_keeps_slot_after_removed_pop() {
+    let source =
+        normal_finally_pop_slot_source(r#"client_factory(f"{ROOT}/{key}/resource", credential)"#);
+    common::assert_matches_cpython_marshal(&source, "normal_finally_slot_after_removed_pop.py");
+}
+
+#[test]
+fn normal_finally_none_marker_keeps_slot_before_removed_pop() {
+    let source = normal_finally_pop_slot_source(
+        r#"normalize(create_client(f"{ROOT}/{key}/resource", credential))"#,
+    );
+    common::assert_matches_cpython_marshal(&source, "normal_finally_slot_before_removed_pop.py");
+}
+
+fn normal_finally_pop_slot_source(client_call: &str) -> String {
+    format!(
+        r#"from contextlib import contextmanager
+
+@contextmanager
+def collect(key: str, client_factory) -> Iterator[None]:
+    with GATE:
+        local = LOCKS.setdefault(key, Lock())
+
+    with local:
+        if not ROOT.startswith("remote://"):
+            yield
+            return
+
+        from example import Credential
+
+        credential = Credential()
+        client = {client_call}
+        lease = None
+        try:
+            lease = acquire(client)
+            yield
+        finally:
+            if lease is not None:
+                lease.release()
+            client.close()
+            credential.close()
+"#
+    )
+}
+
+#[test]
+fn copied_return_none_marker_reuses_retained_pop_slot() {
+    let source =
+        copied_return_pop_slot_source(r#"request_json(http, "GET", f"/sessions/{session_id}")"#);
+    common::assert_matches_cpython_marshal(&source, "copied_return_retained_pop_slot.py");
+}
+
+#[test]
+fn copied_return_none_marker_preserves_slot_after_pop() {
+    let source =
+        copied_return_pop_slot_source(r#"request(http, "GET", f"/sessions/{session_id}")"#);
+    common::assert_matches_cpython_marshal(&source, "copied_return_slot_after_pop.py");
+}
+
+#[test]
+fn copied_return_none_marker_preserves_authored_return_slot() {
+    let source = copied_return_pop_slot_source(
+        r#"normalize(request_json(http, "GET", f"/sessions/{session_id}"))"#,
+    );
+    common::assert_matches_cpython_marshal(&source, "copied_return_authored_return_slot.py");
+}
+
+fn copied_return_pop_slot_source(request: &str) -> String {
+    format!(
+        r#"async def main(http, request, stream_output):
+    session_id = None
+    sandbox = None
+    try:
+        session_id = "session"
+        sandbox = http.sandbox()
+        await stream_output(http, session_id, sandbox)
+        final_session = {request}
+        print(f"final status: {{final_session['status']}}")
+        return 0
+    finally:
+        if session_id is not None:
+            with suppress(Exception):
+                request_json(http, "POST", f"/sessions/{{session_id}}/stop", {{}})
+        if sandbox is not None:
+            await sandbox.close()
+"#
+    )
+}
+
+#[test]
+fn copied_call_return_none_marker_after_completed_async_manager() {
+    common::assert_matches_cpython_marshal(
+        copied_call_return_none_source(),
+        "copied_call_return_none_after_async_manager.py",
+    );
+}
+
+#[test]
+fn copied_call_return_none_marker_without_handler_control() {
+    let source = copied_call_return_none_source().replace(
+        "    except Exception:\n        return Result(value=None)\n",
+        "",
+    );
+    common::assert_matches_cpython_marshal(&source, "copied_call_return_none_without_handler.py");
+}
+
+fn copied_call_return_none_source() -> &'static str {
+    r"async def collect(resource, payload):
+    try:
+        async with channel(resource):
+            await ready()
+        return Result(value=payload)
+    except Exception:
+        return Result(value=None)
+    finally:
+        if resource is not None:
+            await resource.close()
+"
+}
+
+fn missing_not_taken_owner_duplicate_store_source() -> &'static str {
+    r#"class Worker(Base):
+    async def run(self, sample):
+        result = await super().run(sample)
+        accepted = result.items[0].accepted if result.items else None
+        output = output = result.metadata.get("response")
+        extra = result.extra.copy() if result.extra else {}
+        extra["accepted"] = accepted
+        extra["output"] = output
+        if result.items:
+            data = result.metadata.copy()
+            data["accepted"] = accepted
+            return Result.good(
+                worker_name="worker",
+                sample_id=sample.sample_id,
+                reward_name="worker",
+                accepted=True,
+                metadata=data,
+                extra_metadata=extra,
+                metrics=result.metrics,
+            )
+        else:
+            data = result.metadata.copy()
+            data["accepted"] = None
+            return Result.failed(
+                worker_name="worker",
+                sample_id=sample.sample_id,
+                errors=result.errors,
+                answer=result.answer,
+                extra_metadata=extra,
+                metadata=data,
+            )
+"#
+}
+
+#[test]
+fn missing_not_taken_owner_after_duplicate_store() {
+    common::assert_matches_cpython_marshal(
+        missing_not_taken_owner_duplicate_store_source(),
+        "missing_not_taken_owner_after_duplicate_store.py",
+    );
+}
+
+#[test]
+fn missing_not_taken_owner_single_store_control() {
+    let source = missing_not_taken_owner_duplicate_store_source().replace(
+        "output = output = result.metadata.get(\"response\")",
+        "output = result.metadata.get(\"response\")",
+    );
+    common::assert_matches_cpython_marshal(
+        &source,
+        "missing_not_taken_owner_single_store_control.py",
+    );
+}
+
+fn cell_try_else_ternary_owner_source() -> &'static str {
+    r#"def select_values(rows, fraction=0.10):
+    values = (
+        rows.map(lambda item: item.get("value"))
+        .filter(lambda value: value is not None)
+        .map(lambda value: (float(value),))
+        .persist()
+    )
+    threshold = None
+    try:
+        try:
+            values.first()
+        except Exception:
+            threshold = None
+        else:
+            session = Session.builder.config(conf=rows.context.getConf()).getOrCreate()
+            table = session.createDataFrame(values, schema=["value"])
+            samples = table.approxQuantile("value", [fraction], 0.001)
+            threshold = samples[0] if samples else None
+    finally:
+        values.unpersist()
+    if threshold is None:
+        return rows.context.parallelize([])
+    return rows.filter(lambda item: item.get("value") is not None and float(item["value"]) <= threshold)
+"#
+}
+
+#[test]
+fn cell_try_else_ternary_owner() {
+    common::assert_matches_cpython_marshal(
+        cell_try_else_ternary_owner_source(),
+        "cell_try_else_ternary_owner.py",
+    );
+}
+
+#[test]
+fn cell_try_else_ternary_owner_uncaptured_control() {
+    let source = cell_try_else_ternary_owner_source().replace(
+        "float(item[\"value\"]) <= threshold",
+        "float(item[\"value\"]) <= 0",
+    );
+    common::assert_matches_cpython_marshal(
+        &source,
+        "cell_try_else_ternary_owner_uncaptured_control.py",
+    );
+}

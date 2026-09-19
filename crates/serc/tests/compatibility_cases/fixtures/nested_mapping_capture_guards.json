@@ -1,0 +1,4 @@
+{
+  "nested_capture_same_local_guard.py": "def sample(value, ready):\n    match value:\n        case {\"error\": {\"message\": str(message)}} if message:\n            return message\n        case _:\n            return None\n",
+  "nested_capture_next_line_control.py": "def sample(value, ready):\n    match value:\n        case {\"error\": {\"message\": str(message)}}:\n            return message\n        case _:\n            return None\n"
+}

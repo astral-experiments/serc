@@ -33,3 +33,491 @@ fn normalizes_continue_tail_when_try_encloses_the_whole_loop() {
         }
     }
 }
+
+#[test]
+fn continued_finally_pop_records_preserve_coroutine_marker_owners() {
+    for (filename, source) in [
+        (
+            "async_continue_after_suppress_before_finally_cancel.py",
+            r#"async def read(self):
+    if not self.enabled:
+        return await self.primary.read()
+    while True:
+        if not self.selected:
+            primary_read = asyncio.create_task(self.primary.read())
+            activation_wait = asyncio.create_task(self.activation.wait())
+            try:
+                done, _ = await asyncio.wait(
+                    {primary_read, activation_wait},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if activation_wait in done and self.selected:
+                    if primary_read.done():
+                        with suppress(asyncio.CancelledError, Exception):
+                            primary_read.result()
+                    continue
+                chunk = await primary_read
+                return Packet(
+                    data=chunk.data,
+                    time=chunk.time,
+                    speaker=chunk.speaker,
+                    enabled=chunk.enabled,
+                    epoch=chunk.epoch,
+                    generation=chunk.generation,
+                    source=chunk.source or "primary",
+                )
+            finally:
+                if not primary_read.done():
+                    primary_read.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await primary_read
+                if not activation_wait.done():
+                    activation_wait.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await activation_wait
+        return await self.fallback.read()
+"#,
+        ),
+        (
+            "continued_finally_counter.py",
+            r#"async def continued_finally_counter(queue, totals, interval):
+    processed = 0
+    cache = {}
+    while True:
+        item = await queue.get()
+        if item is None:
+            queue.done()
+            break
+        processed += 1
+        try:
+            if item.key:
+                if item.key in cache:
+                    value = cache[item.key]
+                else:
+                    try:
+                        value = await fetch(item.key)
+                    except Error as exc:
+                        report("lookup", extra={"key": item.key, "error": str(exc)})
+                        value = None
+                    cache[item.key] = value
+                if value is None:
+                    totals["skipped"] = totals.get("skipped", 0) + 1
+                    continue
+                async with context(value):
+                    status = await process(item=item)
+            else:
+                status = await process(item=item)
+            totals[status] = totals.get(status, 0) + 1
+        except Error as exc:
+            report("process", extra={"item": str(item.key), "error": str(exc)})
+            totals["errors"] = totals.get("errors", 0) + 1
+        finally:
+            if interval and processed % interval == 0:
+                report("progress", extra={"processed": processed, "totals": dict(totals)})
+            queue.done()
+"#,
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn continued_finally_pop_records_preserve_ordinary_for_marker_owners() {
+    for (filename, source) in [
+        (
+            "continued_finally_timing.py",
+            r#"async def continued_finally_timing(channels):
+    for channel in channels:
+        tags = channel_tags(channel)
+        started = clock()
+        count = 0
+        successes = 0
+        failures = 0
+        try:
+            items = await fetch(channel)
+            if len(items) == 0:
+                report("empty")
+                continue
+            count = len(items)
+            results = await process(items)
+            for result in results:
+                if isinstance(result, RecoverableError):
+                    failures += 1
+                    await record_failure(result)
+                elif isinstance(result, Exception):
+                    raise result
+                else:
+                    successes += 1
+            await flush(channel)
+        except RecoverableError as exc:
+            report("failed", extra={"error": str(exc)})
+            await record_failure(exc)
+        finally:
+            elapsed = clock() - started
+            if count:
+                distribution("count", count, tags=tags)
+            if successes:
+                increment("success", successes, tags=tags)
+            if failures:
+                increment("failure", failures, tags=tags)
+            increment("batches", tags=tags)
+            distribution("elapsed", elapsed, tags=tags)
+"#,
+        ),
+        (
+            "continued_finally_timing_attributes.py",
+            r#"async def continued_finally_timing(channels):
+    for channel in channels:
+        tags = channel_tags(channel)
+        started = time.perf_counter()
+        count = 0
+        successes = 0
+        failures = 0
+        try:
+            items = await fetch(channel)
+            if len(items) == 0:
+                logger.info("empty")
+                continue
+            count = len(items)
+            results = await process(items)
+            for result in results:
+                if isinstance(result, RecoverableError):
+                    failures += 1
+                    await record_failure(result)
+                elif isinstance(result, Exception):
+                    raise result
+                else:
+                    successes += 1
+            await flush(channel)
+        except RecoverableError as exc:
+            report("failed", extra={"error": str(exc)})
+            await record_failure(exc)
+        finally:
+            elapsed = time.perf_counter() - started
+            if count:
+                distribution("count", count, tags=tags)
+            if successes:
+                increment("success", successes, tags=tags)
+            if failures:
+                increment("failure", failures, tags=tags)
+            increment("batches", tags=tags)
+            distribution("elapsed", elapsed, tags=tags)
+"#,
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn matches_cpython_guarded_linear_cleanup_before_continue() {
+    for (source, filename) in [
+        (
+            r"async def f(items, client):
+    for item in items:
+        try:
+            if item:
+                continue
+            return item
+        finally:
+            if client is not None:
+                try:
+                    await client.close()
+                except Exception as error:
+                    report(error)
+",
+            "copied_continue_none_guard_try_cleanup_target.py",
+        ),
+        (
+            r"async def f(items, token, client):
+    for item in items:
+        try:
+            if item:
+                continue
+            work(item)
+        except Exception as error:
+            report(error)
+        finally:
+            cleanup_client = client
+            if token is not None and cleanup_client is not None:
+                try:
+                    await cleanup_client.close(token)
+                    mark_done()
+                except Exception as error:
+                    report(error)
+",
+            "copied_continue_and_none_guard_try_cleanup_target.py",
+        ),
+        (
+            r"async def f(items, preserve, attempts, last_error):
+    for attempt in items:
+        try:
+            await work(attempt)
+        except Exception:
+            if retry(attempt):
+                continue
+            raise
+        finally:
+            if not preserve and (attempt >= attempts or last_error is None):
+                started = clock()
+                try:
+                    await cleanup()
+                finally:
+                    record(started)
+",
+            "copied_continue_compound_guard_try_finally_target.py",
+        ),
+        (
+            r"async def f(items, client):
+    for item in items:
+        try:
+            if item:
+                continue
+            return item
+        finally:
+            if client is not None:
+                await client.close()
+",
+            "copied_continue_none_guard_linear_cleanup_control.py",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn sync_continue_copies_preserve_nested_pass_cleanup() {
+    for (filename, source) in [
+        (
+            "sync_iterator_nested_cleanup_continue_target.py",
+            r"def fetch_retry(attempts, open_resource, fetch, exists, remove, retry):
+    for attempt in attempts:
+        path = None
+        try:
+            with open_resource() as resource:
+                path = resource.name
+            return fetch(path), None
+        except Exception:
+            if retry(attempt):
+                continue
+            return None, None
+        finally:
+            if path and exists(path):
+                try:
+                    remove(path)
+                except Exception:
+                    pass
+",
+        ),
+        (
+            "sync_iterator_linear_cleanup_continue_control.py",
+            r"def fetch_retry(attempts, open_resource, fetch, exists, remove, retry):
+    for attempt in attempts:
+        path = None
+        try:
+            with open_resource() as resource:
+                path = resource.name
+            return fetch(path), None
+        except Exception:
+            if retry(attempt):
+                continue
+            return None, None
+        finally:
+            if path and exists(path):
+                remove(path)
+",
+        ),
+        (
+            "sync_while_nested_cleanup_continue_target.py",
+            r"def copy_retry(run, report, remove, atomic):
+    while True:
+        try:
+            run()
+        except TimeoutError as error:
+            report(error)
+            continue
+        else:
+            break
+        finally:
+            if atomic:
+                try:
+                    remove()
+                except FileNotFoundError:
+                    pass
+",
+        ),
+        (
+            "sync_while_linear_cleanup_continue_control.py",
+            r"def copy_retry(run, report, remove, atomic):
+    while True:
+        try:
+            run()
+        except TimeoutError as error:
+            report(error)
+            continue
+        else:
+            break
+        finally:
+            if atomic:
+                remove()
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn matches_cpython_closed_recovery_none_conjunction_continues() {
+    for (filename, source) in [
+        (
+            "continued_coroutine_closed_recovery_none_and_raise_target.py",
+            r"async def run(values, task, active_error):
+    for value in values:
+        error = None
+        try:
+            await work(value)
+        except RuntimeError as exc:
+            continue
+        finally:
+            if task is not None:
+                try:
+                    await task()
+                except RuntimeError as exc:
+                    error = exc
+            if error is not None and active_error is None:
+                raise error
+",
+        ),
+        (
+            "continued_async_generator_none_and_cleanup_target.py",
+            r"async def watch(process, retry):
+    while True:
+        try:
+            if retry:
+                continue
+            yield process
+        except OSError:
+            await pause()
+        finally:
+            if process is not None and process.returncode is None:
+                process.terminate()
+                try:
+                    await process.wait()
+                except RuntimeError:
+                    process.kill()
+                    await process.wait()
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn matches_cpython_generator_finally_guarded_handler_continue() {
+    for (filename, source) in [
+        (
+            "generator_finally_guard_nested_handler_continue_target.py",
+            r"def run(receive, remove, recover, retry):
+    while True:
+        item = receive()
+        success = False
+        try:
+            yield item
+            success = True
+        except Exception as error:
+            recover(error)
+            continue
+        finally:
+            if success:
+                try:
+                    remove(item)
+                except ValueError as error:
+                    recover(error)
+                    if retry(error):
+                        continue
+                    else:
+                        raise
+",
+        ),
+        (
+            "async_generator_finally_guard_nested_handler_continue_target.py",
+            r"async def run(receive, remove, recover, retry):
+    while True:
+        item = await receive()
+        success = False
+        try:
+            yield item
+            success = True
+        except Exception as error:
+            recover(error)
+            continue
+        finally:
+            if success:
+                try:
+                    await remove(item)
+                except ValueError as error:
+                    recover(error)
+                    if retry(error):
+                        continue
+                    else:
+                        raise
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn matches_cpython_awaited_handler_continue_finally_join() {
+    for (filename, source) in [
+        (
+            "async_iterator_handler_continue_await_finally_following_control.py",
+            r"async def run(events, state, process, recover, cleanup):
+    async for event in events:
+        try:
+            match event:
+                case 1:
+                    try:
+                        await process(event)
+                    except ValueError:
+                        await recover(event)
+                        continue
+                    finally:
+                        if state.value != state.expected:
+                            await cleanup(event)
+                        await recover(event)
+                case _:
+                    await process(event)
+        except Exception:
+            raise
+",
+        ),
+        (
+            "async_iterator_handler_continue_await_finally_join.py",
+            r"async def run(events, state, process, recover, cleanup):
+    async for event in events:
+        try:
+            match event:
+                case 1:
+                    try:
+                        await process(event)
+                    except ValueError:
+                        await recover(event)
+                        continue
+                    finally:
+                        if state.value != state.expected:
+                            await cleanup(event)
+                case _:
+                    await process(event)
+        except Exception:
+            raise
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

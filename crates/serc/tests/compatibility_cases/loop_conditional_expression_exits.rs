@@ -122,3 +122,22 @@ fn matches_cpython_loop_conditional_expression_exits() {
         }
     }
 }
+
+#[test]
+fn matches_cpython_shared_conditional_discard_at_loop_branch_tail() {
+    for branches in [
+        "",
+        "        if line == 0:\n            consume(line)\n        else:\n",
+        "        if line == 0:\n            consume(line)\n        elif line == 1:\n            continue\n        elif line == 2:\n            results.append(line)\n        else:\n",
+    ] {
+        let indent = if branches.is_empty() {
+            "        "
+        } else {
+            "            "
+        };
+        let source = format!(
+            "def parse(lines, results):\n    for line in lines:\n{branches}{indent}row = convert(line)\n{indent}results.append(row) if row else None\n    return results\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "loop_branch_conditional_discard.py");
+    }
+}

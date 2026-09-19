@@ -3,13 +3,13 @@ use std::ops::Index;
 use rustc_hash::FxHashSet;
 
 use crate::target::opcodes::{
-    JUMP_FORWARD, LOAD_FAST, LOAD_FAST_BORROW, LOAD_FAST_CHECK, LOAD_FAST_LOAD_FAST,
-    POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE, STORE_FAST, SWAP, TO_BOOL, UNARY_NOT,
+    LOAD_FAST, LOAD_FAST_BORROW, LOAD_FAST_CHECK, LOAD_FAST_LOAD_FAST, POP_JUMP_IF_FALSE,
+    POP_JUMP_IF_TRUE, STORE_FAST, SWAP, TO_BOOL, UNARY_NOT,
 };
 
 use super::{
     ExceptionRegion, Instruction, Item, Label, Operand, block_has_fallthrough, block_jump_target,
-    ends_scope,
+    ends_scope, is_unconditional_jump,
 };
 
 /// A stable handle to a basic block.
@@ -95,7 +95,10 @@ impl PipelineFeatures {
 
     fn record(&mut self, instruction: &Instruction) {
         self.0 |= match instruction.opcode {
-            JUMP_FORWARD if matches!(instruction.operand(), Operand::Forward(_)) => {
+            opcode
+                if is_unconditional_jump(opcode)
+                    && matches!(instruction.operand(), Operand::Forward(_)) =>
+            {
                 Self::FORWARD_JUMP
             }
             POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE
@@ -152,7 +155,7 @@ impl PipelineFeatures {
 /// `blocks` is an append-only arena and `order` is the current emission order.
 /// Keeping those concepts separate lets CFG passes reorder or duplicate blocks
 /// without invalidating identities captured by data-flow state.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct BlockGraph {
     blocks: Vec<BasicBlock>,
     order: Vec<BasicBlockId>,
@@ -450,6 +453,74 @@ impl BlockGraph {
         }
         self.order = order;
         self.rebuild_label_index();
+    }
+
+    /// Rejoins certified internal continuations without changing any instruction or label.
+    ///
+    /// The caller supplies original-array owner boundaries, never general CFG entries.
+    /// Validate every boundary before changing the graph; the surviving head keeps its ID.
+    pub(super) fn join_continuation_blocks(
+        &mut self,
+        labels: &[Label],
+        forbidden_entries: &FxHashSet<Label>,
+    ) -> Result<(), String> {
+        if labels.is_empty() {
+            return Ok(());
+        }
+        let internal = labels.iter().copied().collect::<FxHashSet<_>>();
+        if internal.len() != labels.len()
+            || labels.iter().any(|label| {
+                self.label_block(*label).is_none() || forbidden_entries.contains(label)
+            })
+            || self.iter_items().any(|item| {
+                matches!(item, Item::Instruction(instruction)
+                    if matches!(instruction.operand(), Operand::Forward(label) | Operand::Backward(label)
+                        if internal.contains(&label)))
+            })
+        {
+            return Err("original array continuation acquired a control-flow entry".into());
+        }
+        let mut join = Vec::with_capacity(self.order.len());
+        let mut found = FxHashSet::default();
+        for (position, block) in self.order.iter().copied().enumerate() {
+            let head = self[block]
+                .items()
+                .iter()
+                .map_while(|item| match item {
+                    Item::Label(label) => Some(*label),
+                    Item::Instruction(_) => None,
+                })
+                .collect::<Vec<_>>();
+            let continuation = head.iter().any(|label| internal.contains(label));
+            if continuation {
+                if position == 0
+                    || head.iter().any(|label| !internal.contains(label))
+                    || self[self.order[position - 1]].last_instruction().is_none()
+                    || !block_has_fallthrough(self[self.order[position - 1]].items())
+                {
+                    return Err("original array continuation lost its adjacent prefix".into());
+                }
+                found.extend(head);
+            }
+            join.push(continuation);
+        }
+        if found != internal {
+            return Err("original array continuation is not a normalized block head".into());
+        }
+        let old_order = std::mem::take(&mut self.order);
+        let mut order = Vec::with_capacity(old_order.len());
+        for (block, continuation) in old_order.into_iter().zip(join) {
+            if continuation {
+                let head: BasicBlockId = *order.last().expect("validated continuation prefix");
+                let items = std::mem::take(&mut self.blocks[block.index()].items);
+                self.blocks[head.index()].items.extend(items);
+            } else {
+                order.push(block);
+            }
+        }
+        self.order = order;
+        self.rebuild_label_index();
+        Ok(())
     }
 
     /// Returns whether normalization would preserve every physical block boundary.

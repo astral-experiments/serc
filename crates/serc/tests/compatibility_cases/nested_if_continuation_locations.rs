@@ -73,3 +73,66 @@ fn terminal_nested_arms_preserve_shared_exit_condition_locations() {
         }
     }
 }
+
+#[test]
+fn split_loop_prefix_keeps_original_shared_if_jumps_unlocated() {
+    for (function, prefix) in [
+        ("def", ""),
+        ("async def", ""),
+        ("def", "    yield value\n"),
+        ("async def", "    yield value\n"),
+    ] {
+        for loop_header in ["for value in values:", "while active:"] {
+            for tail in [
+                "if later:\n    consume(value)",
+                "while later:\n    consume(value)",
+                "assert later",
+            ] {
+                let tail = tail.replace('\n', "\n        ");
+                let source = format!(
+                    "{function} f(values, value, active, first, second, third, later):\n{prefix}    {loop_header}\n        if first:\n            if second:\n                work(value)\n            else:\n                if third:\n                    work(value)\n        else:\n            other(value)\n        {tail}\n    after()\n"
+                );
+                common::assert_matches_cpython_marshal(&source, "split_loop_prefix.py");
+            }
+        }
+    }
+}
+
+#[test]
+fn split_loop_prefix_preserves_copied_and_unique_exit_locations() {
+    for loop_header in ["for value in values:", "while active:"] {
+        for inner in [
+            "if second:\n    work(value)\nelse:\n    other(value)",
+            "if second:\n    work(value)\nelse:\n    if third:\n        return value",
+            "if second:\n    work(value)\nelse:\n    if third:\n        work(value)\n    else:\n        return value",
+        ] {
+            for tail in ["", "\n        if later:\n            return value"] {
+                let inner = inner.replace('\n', "\n            ");
+                let source = format!(
+                    "def f(values, value, active, first, second, third, later):\n    {loop_header}\n        if first:\n            {inner}\n        else:\n            other(value){tail}\n    return value\n"
+                );
+                common::assert_matches_cpython_marshal(&source, "split_loop_prefix_exit.py");
+            }
+        }
+    }
+}
+
+#[test]
+fn terminating_arms_preserve_unlocated_nested_else_continuations() {
+    for (function, prefix) in [("def", ""), ("async def", ""), ("def", "    yield value\n")] {
+        for head in [
+            "if second:\n    return value",
+            "if second:\n    raise Error(value)",
+            "if second:\n    work(value)\nelif other:\n    return value",
+        ] {
+            for condition in ["third", "third and other", "third < other < value"] {
+                let inner = format!("{head}\nelse:\n    if {condition}:\n        value = third")
+                    .replace('\n', "\n        ");
+                let source = format!(
+                    "{function} f(first, second, third, other, value):\n{prefix}    if first:\n        {inner}\n    else:\n        value = other\n    consume(value)\n    return value\n"
+                );
+                common::assert_matches_cpython_marshal(&source, "terminating_nested_else.py");
+            }
+        }
+    }
+}

@@ -189,3 +189,63 @@ def explicit_return_chain(x, obj):
         "terminal_chained_comparison_assignment_locations.py",
     );
 }
+
+#[test]
+fn matches_cpython_marshal_for_terminal_chained_nested_branch_returns() {
+    let source = r"def report(a, b, left, right):
+    if len(a) == len(b) == 1:
+        if left == right:
+            emit(
+                'same',
+            )
+        else:
+            if equivalent(left, right):
+                emit(
+                    'equivalent',
+                )
+            else:
+                emit('different')
+                rows = list(diff(left, right))
+                if rows:
+                    limit = 40
+                    for row in rows[:limit]:
+                        emit(row)
+                    if len(rows) > limit:
+                        emit('more')
+";
+    common::assert_matches_cpython_marshal(source, "terminal_chained_nested_branch_returns.py");
+}
+
+#[test]
+fn matches_cpython_marshal_for_terminal_chained_nested_branch_controls() {
+    let source = r"def nested_if(low, value, high, ready):
+    if low < value < high:
+        if ready:
+            emit(value)
+
+def nested_else(low, value, high, ready):
+    if low < value < high:
+        if ready:
+            emit(
+                value,
+            )
+        else:
+            emit(high)
+
+def folded_nested_if(low, value, high):
+    if low < value < high:
+        if True:
+            emit(value)
+
+def assignment_control(low, value, high):
+    if low < value < high:
+        result = value
+
+def nonterminal_control(low, value, high, ready):
+    if low < value < high:
+        if ready:
+            emit(value)
+    emit(high)
+";
+    common::assert_matches_cpython_marshal(source, "terminal_chained_nested_branch_controls.py");
+}

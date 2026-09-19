@@ -119,3 +119,46 @@ def generator(distance, time):
 ";
     common::assert_matches_cpython_marshal(source, "overriding_finally_returns.py");
 }
+
+#[test]
+fn matches_cpython_handler_exits_into_local_finally_returns() {
+    for (source, filename) in [
+        (
+            r"def f(work, value):
+    try:
+        work()
+        value = False
+    except Exception as error:
+        report(error)
+    finally:
+        return value
+",
+            "finally_local_return_named_handler_target.py",
+        ),
+        (
+            r"async def f(work, value):
+    try:
+        value = await work()
+        record(value)
+    except Exception:
+        report()
+    finally:
+        return value
+",
+            "coroutine_finally_local_return_handler_target.py",
+        ),
+        (
+            r"def f(work, value):
+    try:
+        work()
+        value = False
+    except Exception as error:
+        report(error)
+    return value
+",
+            "local_return_after_named_handler_control.py",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

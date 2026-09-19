@@ -192,3 +192,35 @@ fn matches_cpython_marshal_for_nested_loop_tail_conditions_with_pass_handler() {
         "nested_loop_tail_conditions_with_pass_handler.py",
     );
 }
+
+#[test]
+fn matches_cpython_marshal_for_non_final_for_else_compound_exit() {
+    let source = r"def probe(items, first, second, emit):
+    for item in items:
+        if item.active:
+            if first(item) and second(item):
+                emit(item)
+        elif item.stop:
+            break
+    else:
+        return None
+    return True
+";
+    common::assert_matches_cpython_marshal(source, "for_else_compound_exit.py");
+}
+
+#[test]
+fn matches_cpython_marshal_for_non_final_for_else_single_condition_control() {
+    let source = r"def probe(items, first, second, emit):
+    for item in items:
+        if item.active:
+            if first(item):
+                emit(item)
+        elif item.stop:
+            break
+    else:
+        return None
+    return True
+";
+    common::assert_matches_cpython_marshal(source, "for_else_single_condition_control.py");
+}

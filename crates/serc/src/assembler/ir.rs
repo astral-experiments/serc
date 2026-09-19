@@ -1,4 +1,4 @@
-use std::num::NonZeroU8;
+use std::num::NonZeroU16;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -209,6 +209,12 @@ impl LocalPolicy {
             | (slots << Self::HIDDEN_EXCEPTION_OWNER_SLOTS_SHIFT);
     }
 
+    /// Removes one known vacancy without changing the local-load policy bits.
+    pub(super) fn remove_hidden_exception_owner_slot(&mut self) {
+        assert!(self.hidden_exception_owner_slots() > 0);
+        self.0 -= 1 << Self::HIDDEN_EXCEPTION_OWNER_SLOTS_SHIFT;
+    }
+
     const fn fused(first: Self, second: Self) -> Self {
         let slots = first
             .hidden_exception_owner_slots()
@@ -304,6 +310,11 @@ impl NoLocationPolicy {
     pub(super) fn allow_block_inlining(&mut self) {
         self.block_policy
             .insert(NoLocationBlockPolicy::ALLOW_INLINING);
+    }
+
+    pub(super) fn prevent_block_inlining(&mut self) {
+        self.block_policy
+            .remove(NoLocationBlockPolicy::ALLOW_INLINING);
     }
 
     pub(super) fn make_first_copy_interruptible(&mut self) {
@@ -515,21 +526,28 @@ pub(super) enum RetainedJumpNop {
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
-pub(super) struct JumpPolicy(u8);
+pub(super) struct JumpPolicy(u16);
 
 impl JumpPolicy {
-    const RETAINED_NOP_MASK: u8 = 0b11;
-    const RETAINED_NOP_ALWAYS: u8 = 0b01;
-    const RETAINED_NOP_DIRECT_TARGET: u8 = 0b10;
+    const RETAINED_NOP_MASK: u16 = 0b11;
+    const RETAINED_NOP_ALWAYS: u16 = 0b01;
+    const RETAINED_NOP_DIRECT_TARGET: u16 = 0b10;
     // Surviving original JUMPs need an interrupt check and do not request a retained
     // jump NOP. Share the otherwise unused fourth tag to keep the IR compact.
-    const INTERRUPTIBLE: u8 = 0b11;
-    const PREVENT_SMALL_EXIT_INLINING: u8 = 1 << 2;
-    const PREVENT_THREADING_TARGET: u8 = 1 << 3;
-    const DEFER_REDUNDANT_REMOVAL: u8 = 1 << 4;
-    const PRESERVE_NOP_AFTER_THREADING: u8 = 1 << 5;
-    const BORROW_EMPTY_BLOCK: u8 = 1 << 6;
-    const PRESERVE_EXPLICIT_NOP: u8 = 1 << 7;
+    const INTERRUPTIBLE: u16 = 0b11;
+    const PREVENT_SMALL_EXIT_INLINING: u16 = 1 << 2;
+    const PREVENT_THREADING_TARGET: u16 = 1 << 3;
+    const DEFER_REDUNDANT_REMOVAL: u16 = 1 << 4;
+    const PRESERVE_NOP_AFTER_THREADING: u16 = 1 << 5;
+    const BORROW_EMPTY_BLOCK: u16 = 1 << 6;
+    const PRESERVE_EXPLICIT_NOP: u16 = 1 << 7;
+    const NORMALIZED_CONDITIONAL_BACKEDGE: u16 = 1 << 8;
+    const PREVENT_BORROW_THREADING_TARGET: u16 = 1 << 9;
+    const ORIGINAL_EMPTY_JOIN: u16 = 1 << 10;
+    const ORIGINAL_SHARED_EMPTY_JOIN: u16 = 1 << 11;
+    const ORIGINAL_UNIFORM_FOLD: u16 = 1 << 12;
+    const RETAIN_NOP_AFTER_RETARGETING: u16 = 1 << 13;
+    const ORIGINAL_MATCH_SUCCESS: u16 = 1 << 14;
 
     const SYNTHETIC: Self = Self(Self::PREVENT_SMALL_EXIT_INLINING);
     const DEFAULT: Self = Self(0);
@@ -541,6 +559,9 @@ impl JumpPolicy {
         }
         if !first.allows_threading_target() || !second.allows_threading_target() {
             policy.0 |= Self::PREVENT_THREADING_TARGET;
+        }
+        if !first.allows_borrow_threading_target() || !second.allows_borrow_threading_target() {
+            policy.0 |= Self::PREVENT_BORROW_THREADING_TARGET;
         }
         if first.defers_redundant_removal() || second.defers_redundant_removal() {
             policy.0 |= Self::DEFER_REDUNDANT_REMOVAL;
@@ -554,6 +575,16 @@ impl JumpPolicy {
         if first.preserves_explicit_nop() || second.preserves_explicit_nop() {
             policy.0 |= Self::PRESERVE_EXPLICIT_NOP;
         }
+        if first.is_normalized_conditional_backedge() || second.is_normalized_conditional_backedge()
+        {
+            policy.0 |= Self::NORMALIZED_CONDITIONAL_BACKEDGE;
+        }
+        if first.is_original_empty_join() || second.is_original_empty_join() {
+            policy.0 |= Self::ORIGINAL_EMPTY_JOIN;
+        }
+        if first.is_original_shared_empty_join() || second.is_original_shared_empty_join() {
+            policy.0 |= Self::ORIGINAL_SHARED_EMPTY_JOIN;
+        }
         policy
     }
 
@@ -563,6 +594,10 @@ impl JumpPolicy {
 
     pub(super) const fn allows_threading_target(self) -> bool {
         self.0 & Self::PREVENT_THREADING_TARGET == 0
+    }
+
+    pub(super) const fn allows_borrow_threading_target(self) -> bool {
+        self.0 & Self::PREVENT_BORROW_THREADING_TARGET == 0
     }
 
     pub(super) const fn defers_redundant_removal(self) -> bool {
@@ -581,6 +616,14 @@ impl JumpPolicy {
         self.0 & Self::PRESERVE_EXPLICIT_NOP != 0
     }
 
+    pub(super) const fn is_normalized_conditional_backedge(self) -> bool {
+        self.0 & Self::NORMALIZED_CONDITIONAL_BACKEDGE != 0
+    }
+
+    pub(super) fn mark_normalized_conditional_backedge(&mut self) {
+        self.0 |= Self::NORMALIZED_CONDITIONAL_BACKEDGE;
+    }
+
     pub(super) fn mark_borrow_empty_block(&mut self) {
         self.0 |= Self::BORROW_EMPTY_BLOCK;
     }
@@ -591,6 +634,10 @@ impl JumpPolicy {
 
     pub(super) fn preserve_explicit_nop(&mut self) {
         self.0 |= Self::PRESERVE_EXPLICIT_NOP;
+    }
+
+    pub(super) fn allow_explicit_nop_compaction(&mut self) {
+        self.0 &= !Self::PRESERVE_EXPLICIT_NOP;
     }
 
     pub(super) const fn retained_nop(self) -> RetainedJumpNop {
@@ -609,6 +656,12 @@ impl JumpPolicy {
     pub(super) fn mark_interruptible(&mut self) {
         debug_assert!(matches!(self.retained_nop(), RetainedJumpNop::None));
         self.0 = (self.0 & !Self::RETAINED_NOP_MASK) | Self::INTERRUPTIBLE;
+    }
+
+    /// Replaces a threaded jump's retained-NOP request with the inherited eval check.
+    pub(super) fn mark_interruptible_after_threading(&mut self) {
+        self.0 &= !Self::RETAINED_NOP_MASK;
+        self.mark_interruptible();
     }
 
     pub(super) const fn always_retains_nop(self) -> bool {
@@ -635,8 +688,58 @@ impl JumpPolicy {
         }
     }
 
+    /// Keeps an authored line event when jump threading changes its exit target.
+    pub(super) fn retain_nop_after_retargeting(&mut self) {
+        self.retain_nop_for_direct_target();
+        self.0 |= Self::RETAIN_NOP_AFTER_RETARGETING;
+    }
+
+    /// Identifies an unchanged literal fold after its copy budget has saturated.
+    pub(super) const fn has_original_uniform_fold(self) -> bool {
+        self.0 & Self::ORIGINAL_UNIFORM_FOLD != 0
+    }
+
+    pub(super) fn mark_original_uniform_fold(&mut self) {
+        self.0 |= Self::ORIGINAL_UNIFORM_FOLD;
+    }
+
+    pub(super) fn retire_original_uniform_fold(&mut self) {
+        self.0 &= !Self::ORIGINAL_UNIFORM_FOLD;
+    }
+
+    /// Identifies an emitted case-success edge before early cleanup-copy planning.
+    pub(super) const fn is_original_match_success(self) -> bool {
+        self.0 & Self::ORIGINAL_MATCH_SUCCESS != 0
+    }
+
+    pub(super) fn mark_original_match_success(&mut self) {
+        self.0 |= Self::ORIGINAL_MATCH_SUCCESS;
+    }
+
+    fn retire_original_match_success(&mut self) {
+        self.0 &= !Self::ORIGINAL_MATCH_SUCCESS;
+    }
+
+    pub(super) const fn is_original_empty_join(self) -> bool {
+        self.0 & Self::ORIGINAL_EMPTY_JOIN != 0
+    }
+
+    pub(super) fn mark_original_empty_join(&mut self) {
+        self.0 |= Self::ORIGINAL_EMPTY_JOIN;
+    }
+
+    pub(super) const fn is_original_shared_empty_join(self) -> bool {
+        self.0 & Self::ORIGINAL_SHARED_EMPTY_JOIN != 0
+    }
+
+    pub(super) fn mark_original_shared_empty_join(&mut self) {
+        self.0 |= Self::ORIGINAL_SHARED_EMPTY_JOIN;
+    }
+
     fn clear_direct_target_retention(&mut self) {
-        if matches!(self.retained_nop(), RetainedJumpNop::DirectTarget) {
+        if matches!(self.retained_nop(), RetainedJumpNop::DirectTarget)
+            && self.0 & Self::RETAIN_NOP_AFTER_RETARGETING == 0
+        {
             self.0 &= !Self::RETAINED_NOP_MASK;
         }
     }
@@ -647,6 +750,14 @@ impl JumpPolicy {
 
     pub(super) fn retain_redundant_nop_after_threading(&mut self) {
         self.0 |= Self::DEFER_REDUNDANT_REMOVAL | Self::PRESERVE_NOP_AFTER_THREADING;
+    }
+
+    /// Gives an accepted original-join copy plan ownership of its predicted NOP slots.
+    pub(super) fn consume_original_join_copy_prediction(&mut self) {
+        assert!(self.is_original_empty_join());
+        assert!(self.defers_redundant_removal());
+        assert!(self.preserves_nop_after_threading());
+        self.0 &= !(Self::DEFER_REDUNDANT_REMOVAL | Self::PRESERVE_NOP_AFTER_THREADING);
     }
 
     #[cfg(test)]
@@ -660,6 +771,10 @@ impl JumpPolicy {
 
     pub(super) fn prevent_threading_target(&mut self) {
         self.0 |= Self::PREVENT_THREADING_TARGET;
+    }
+
+    pub(super) fn prevent_borrow_threading_target(&mut self) {
+        self.0 |= Self::PREVENT_BORROW_THREADING_TARGET;
     }
 
     pub(super) fn resolve_deferred_removal(&mut self) {
@@ -682,6 +797,10 @@ impl std::fmt::Debug for JumpPolicy {
             .field("retained_nop", &self.retained_nop())
             .field("interruptible", &self.is_interruptible())
             .field("allow_threading_target", &self.allows_threading_target())
+            .field(
+                "allow_borrow_threading_target",
+                &self.allows_borrow_threading_target(),
+            )
             .field("defer_redundant_removal", &self.defers_redundant_removal())
             .field(
                 "preserve_nop_after_threading",
@@ -689,6 +808,10 @@ impl std::fmt::Debug for JumpPolicy {
             )
             .field("borrow_empty_block", &self.borrow_empty_block())
             .field("preserve_explicit_nop", &self.preserves_explicit_nop())
+            .field(
+                "normalized_conditional_backedge",
+                &self.is_normalized_conditional_backedge(),
+            )
             .finish()
     }
 }
@@ -772,6 +895,10 @@ pub(crate) enum ExceptionPolicy {
     NoneDynamicConditionStrict,
     IfExtendedDynamicConditionStrict,
     AlwaysDynamicConditionStrict,
+    /// Authored Boolean-singleton failure marker; ownership stays unchanged unless certified.
+    NoneUnchangedBooleanSingleton,
+    /// Post-try marker stays excluded unless an original owned slot is certified.
+    AlwaysAbsentPostTryCondition,
 }
 
 impl ExceptionPolicy {
@@ -858,7 +985,8 @@ impl ExceptionPolicy {
             | Self::NoneAbsent
             | Self::NoneDynamic
             | Self::NoneDynamicCondition
-            | Self::NoneDynamicConditionStrict => ExceptionExclusion::None,
+            | Self::NoneDynamicConditionStrict
+            | Self::NoneUnchangedBooleanSingleton => ExceptionExclusion::None,
             Self::IfExtendedUnchanged
             | Self::IfExtendedPresent
             | Self::IfExtendedOverridePresent
@@ -870,6 +998,7 @@ impl ExceptionPolicy {
             | Self::AlwaysPresent
             | Self::AlwaysOverridePresent
             | Self::AlwaysAbsent
+            | Self::AlwaysAbsentPostTryCondition
             | Self::AlwaysDynamic
             | Self::AlwaysDynamicCondition
             | Self::AlwaysDynamicConditionStrict => ExceptionExclusion::Always,
@@ -889,18 +1018,20 @@ impl ExceptionPolicy {
             Self::NoneDynamic | Self::IfExtendedDynamic | Self::AlwaysDynamic => {
                 NormalizedExceptionOwner::Dynamic
             }
-            Self::NoneUnchanged | Self::IfExtendedUnchanged | Self::AlwaysUnchanged => {
-                NormalizedExceptionOwner::Unchanged
-            }
+            Self::NoneUnchanged
+            | Self::IfExtendedUnchanged
+            | Self::AlwaysUnchanged
+            | Self::NoneUnchangedBooleanSingleton => NormalizedExceptionOwner::Unchanged,
             Self::NonePresent | Self::IfExtendedPresent | Self::AlwaysPresent => {
                 NormalizedExceptionOwner::Present
             }
             Self::NoneOverridePresent
             | Self::IfExtendedOverridePresent
             | Self::AlwaysOverridePresent => NormalizedExceptionOwner::OverridePresent,
-            Self::NoneAbsent | Self::IfExtendedAbsent | Self::AlwaysAbsent => {
-                NormalizedExceptionOwner::Absent
-            }
+            Self::NoneAbsent
+            | Self::IfExtendedAbsent
+            | Self::AlwaysAbsent
+            | Self::AlwaysAbsentPostTryCondition => NormalizedExceptionOwner::Absent,
         }
     }
 
@@ -920,12 +1051,38 @@ impl ExceptionPolicy {
     }
 }
 
-/// Packs independent instruction metadata while preserving the niche used by `Item`.
-#[derive(Clone, Copy, Debug)]
-struct InstructionMetadata(NonZeroU8);
+/// Packs independent instruction metadata with zero reserved.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct InstructionMetadata(NonZeroU16);
 
 impl InstructionMetadata {
-    const POLICY_COUNT: u8 = 21;
+    const POLICY_COUNT: u16 = 23;
+    const NORMAL_STATES: u16 = Self::POLICY_COUNT * 5 * 2;
+
+    // Values 231..=276 retain all 23 exception policies and both copy modes for
+    // a direct original jump with no earlier copied slots. Adding slots discards
+    // this conservative proof; existing slot counts keep their full range.
+    const fn has_initial_borrow_entry(self) -> bool {
+        self.0.get() > Self::NORMAL_STATES
+    }
+
+    const fn normal_bits(self) -> u16 {
+        if self.has_initial_borrow_entry() {
+            self.0.get() - Self::NORMAL_STATES - 1
+        } else {
+            self.0.get() - 1
+        }
+    }
+
+    fn with_initial_borrow_entry(self, retain: bool) -> Self {
+        let bits = self.normal_bits() + 1;
+        let bits = if retain && self.pre_fold_extra_instructions() == 0 {
+            bits + Self::NORMAL_STATES
+        } else {
+            bits
+        };
+        Self(NonZeroU16::new(bits).expect("instruction metadata reserves zero"))
+    }
 
     fn new(
         exception_policy: ExceptionPolicy,
@@ -934,17 +1091,17 @@ impl InstructionMetadata {
     ) -> Self {
         // The early exit pass copies at most four instructions, so four extra instructions
         // on any one surviving instruction are sufficient to rule it out.
-        // 21 policies, five slot counts, and two copy modes occupy 210 nonzero values.
-        let bits = ((pre_fold_extra_instructions.min(4) * Self::POLICY_COUNT)
-            + exception_policy as u8)
+        // 23 policies, five slot counts, and two copy modes occupy 230 nonzero values.
+        let bits = ((u16::from(pre_fold_extra_instructions.min(4)) * Self::POLICY_COUNT)
+            + exception_policy as u16)
             * 2
-            + u8::from(unconditional_inlining_only)
+            + u16::from(unconditional_inlining_only)
             + 1;
-        Self(NonZeroU8::new(bits).expect("exception policy reserves the zero discriminant"))
+        Self(NonZeroU16::new(bits).expect("exception policy reserves the zero discriminant"))
     }
 
     const fn exception_policy(self) -> ExceptionPolicy {
-        match ((self.0.get() - 1) / 2) % Self::POLICY_COUNT {
+        match (self.normal_bits() / 2) % Self::POLICY_COUNT {
             0 => ExceptionPolicy::NoneUnchanged,
             1 => ExceptionPolicy::NonePresent,
             2 => ExceptionPolicy::NoneOverridePresent,
@@ -966,16 +1123,26 @@ impl InstructionMetadata {
             18 => ExceptionPolicy::NoneDynamicConditionStrict,
             19 => ExceptionPolicy::IfExtendedDynamicConditionStrict,
             20 => ExceptionPolicy::AlwaysDynamicConditionStrict,
+            21 => ExceptionPolicy::NoneUnchangedBooleanSingleton,
+            22 => ExceptionPolicy::AlwaysAbsentPostTryCondition,
             _ => unreachable!(),
         }
     }
 
     const fn pre_fold_extra_instructions(self) -> u8 {
-        (self.0.get() - 1) / (Self::POLICY_COUNT * 2)
+        // Valid metadata reserves five slot counts; reject invalid encodings.
+        match self.normal_bits() / (Self::POLICY_COUNT * 2) {
+            0 => 0,
+            1 => 1,
+            2 => 2,
+            3 => 3,
+            4 => 4,
+            _ => unreachable!(),
+        }
     }
 
     const fn only_allows_unconditional_inlining(self) -> bool {
-        (self.0.get() - 1) & 1 != 0
+        self.normal_bits() & 1 != 0
     }
 }
 
@@ -985,7 +1152,7 @@ impl Default for InstructionMetadata {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct Instruction {
     pub(super) opcode: Opcode,
     operand_payload: u32,
@@ -1048,11 +1215,15 @@ impl Instruction {
     }
 
     pub(super) fn set_exception_policy(&mut self, policy: ExceptionPolicy) {
+        if policy != self.exception_policy() {
+            self.jump_policy.retire_original_uniform_fold();
+        }
         self.metadata = InstructionMetadata::new(
             policy,
             self.pre_fold_extra_instructions(),
             self.only_allows_unconditional_inlining(),
-        );
+        )
+        .with_initial_borrow_entry(self.metadata.has_initial_borrow_entry());
     }
 
     pub(super) fn set_exception_owner(&mut self, owner: NormalizedExceptionOwner) {
@@ -1072,11 +1243,17 @@ impl Instruction {
     }
 
     pub(super) fn add_pre_fold_extra_instructions(&mut self, count: u8) {
+        if count > 0 {
+            // A positive addition is observable even when the four-slot budget
+            // cannot change. It invalidates the original literal-only transaction.
+            self.jump_policy.retire_original_uniform_fold();
+        }
         self.metadata = InstructionMetadata::new(
             self.exception_policy(),
             self.pre_fold_extra_instructions().saturating_add(count),
             self.only_allows_unconditional_inlining(),
-        );
+        )
+        .with_initial_borrow_entry(self.metadata.has_initial_borrow_entry());
     }
 
     pub(super) fn allow_unconditional_block_inlining(&mut self) {
@@ -1085,7 +1262,8 @@ impl Instruction {
             self.exception_policy(),
             self.pre_fold_extra_instructions(),
             true,
-        );
+        )
+        .with_initial_borrow_entry(self.metadata.has_initial_borrow_entry());
     }
 
     pub(super) const fn only_allows_unconditional_inlining(&self) -> bool {
@@ -1115,7 +1293,35 @@ impl Instruction {
     }
 
     pub(super) fn set_operand(&mut self, operand: Operand) {
+        if self.operand() != operand {
+            self.jump_policy.retire_original_uniform_fold();
+            self.jump_policy.retire_original_match_success();
+            self.metadata = self.metadata.with_initial_borrow_entry(false);
+        }
         self.operand_payload = self.fusion_policy.set_operand(operand);
+    }
+
+    /// Records an initial direct edge until its operand changes or the proof is consumed.
+    pub(super) fn mark_initial_borrow_jump_target(&mut self, target: Label) {
+        debug_assert!(
+            matches!(self.operand(), Operand::Forward(label) | Operand::Backward(label) if label == target)
+        );
+        self.metadata = self.metadata.with_initial_borrow_entry(true);
+    }
+
+    pub(super) const fn initial_borrow_jump_target(&self) -> Option<Label> {
+        if self.metadata.has_initial_borrow_entry() {
+            match self.operand() {
+                Operand::Forward(target) | Operand::Backward(target) => Some(target),
+                Operand::Value(_) | Operand::Deferred(_) => None,
+            }
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn clear_initial_borrow_jump_target(&mut self) {
+        self.metadata = self.metadata.with_initial_borrow_entry(false);
     }
 
     /// Retargets a jump while keeping direct-target line-event provenance honest.
@@ -1141,6 +1347,12 @@ impl Instruction {
         let mut instruction = Self::new(opcode, operand, location, depth_after);
         instruction.jump_policy = JumpPolicy::SYNTHETIC;
         instruction
+    }
+
+    /// Retires source-only literal-fold provenance on a physical copy into another block.
+    pub(super) fn for_exit_copy(mut self) -> Self {
+        self.jump_policy.retire_original_uniform_fold();
+        self
     }
 
     /// Combines the provenance of two instructions replaced by one superinstruction.
@@ -1174,7 +1386,7 @@ impl Instruction {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Item {
     Instruction(Instruction),
     Label(Label),
@@ -1191,9 +1403,10 @@ pub(super) enum UnoptimizedCode {
     },
 }
 
-/// A call that keeps an original normal-cleanup entry nonempty.
+/// An exact instruction that keeps an original normal-cleanup entry nonempty.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct BorrowCleanupCall {
+    pub(super) opcode: Opcode,
     pub(super) argument: u32,
     pub(super) location: SourceLocation,
 }
@@ -1206,12 +1419,29 @@ pub(super) struct BorrowLoopExitPolicy {
     pub(super) cleanup_call: Option<BorrowCleanupCall>,
 }
 
+/// A folded condition whose entry must be compared with other pending destinations.
+#[derive(Debug)]
+pub(super) struct DeferredBorrowEntry {
+    pub(super) target: Label,
+    pub(super) other_pending_targets: Vec<Label>,
+}
+
 #[derive(Debug)]
 pub(crate) struct Assembler {
     pub(super) code: UnoptimizedCode,
     /// Number of instructions in the linear item stream; labels do not consume offsets.
     pub(super) instruction_count: usize,
     pub(super) emission_stream: EmissionStreamId,
+    /// Original conditional target edges removed by constant folding during lowering.
+    pub(super) folded_away_condition_targets: FxHashSet<Label>,
+    /// Original normal predecessors from discarded linear constant-loop else suites.
+    pub(super) folded_away_loop_else_targets: FxHashSet<Label>,
+    /// Existing source marker, target, and marker location of an original folded edge.
+    pub(super) folded_predecessor_sources: Vec<(Label, Label, SourceLocation)>,
+    /// Exact folded arm jumps awaiting the complete original return destination.
+    pub(super) folded_arm_exit_origins: Vec<(Label, Instruction)>,
+    /// Empty original anchors before folded constant-while exits without else suites.
+    pub(super) folded_loop_exit_anchors: FxHashSet<Label>,
     pub(super) operand_patches: Vec<OperandPatch>,
     pub(super) deferred_none_constant_index: Option<u32>,
     pub(super) discarded_fold_admissions: FxHashMap<Label, Vec<u32>>,
@@ -1220,9 +1450,22 @@ pub(crate) struct Assembler {
     pub(super) exception_regions: Vec<ExceptionRegion>,
     /// Original tail location retained when lowering emits an already-reordered restore.
     pub(super) original_fallthrough_location: Option<(EmittedInstruction, SourceLocation)>,
+    /// Source-authored match end awaiting its first emitted instruction.
+    pub(super) original_match_join: Option<Label>,
     pub(super) exception_owner_provenance: super::exception_owners::ExceptionOwnerProvenance,
     pub(super) preserved_block_boundaries: FxHashSet<Label>,
     pub(super) borrow_unreachable_blocks: FxHashSet<Label>,
+    /// Cleanup targets whose original for-loop backedge array was omitted during lowering.
+    pub(super) borrow_omitted_for_backedges: FxHashSet<Label>,
+    /// Entries whose empty original fallthrough can be bypassed by a surviving jump.
+    pub(super) borrow_jump_entry_labels: FxHashSet<Label>,
+    pub(super) deferred_borrow_entries: Vec<DeferredBorrowEntry>,
+    /// Normal edges whose following local return must prove its original copy width.
+    pub(super) deferred_name_return_borrow_exits: Vec<super::NameReturnBorrowExit>,
+    /// Exact omitted ordinary-try POP slots in pending local-return targets.
+    pub(super) name_return_pop_boundaries: FxHashSet<Label>,
+    /// Iterator-region aliases immediately following an ordinary-return POP boundary.
+    pub(super) name_return_iterator_region_aliases: FxHashMap<Label, Label>,
     /// Disconnected loop exits and the normal entries that remain reachable.
     pub(super) borrow_loop_exit_blocks: FxHashMap<Label, BorrowLoopExitPolicy>,
     /// Normal finally entries whose original nonempty cleanup can retain an explicit jump.
@@ -1230,16 +1473,31 @@ pub(crate) struct Assembler {
     pub(super) borrow_block_aliases: FxHashSet<Label>,
     /// Original ordinary jump blocks that can thread conditional predecessors after exit copying.
     pub(super) conditional_threading_targets: FxHashMap<Label, SourceLocation>,
+    /// Exact pre-swap comprehension assignment arrays and their shared match exits.
+    pub(super) comprehension_assignment_exits: FxHashMap<Label, (Vec<Label>, [Instruction; 3])>,
+    /// Original match fallthrough arrays ending in an ordinary two-store exchange.
+    pub(super) match_join_store_origins: FxHashMap<Label, Vec<Item>>,
     /// Labels preceding an authored NOP omitted during statement lowering.
     pub(super) original_nop_targets: FxHashSet<Label>,
     /// Normal handler cleanup originally emitted without source locations.
     pub(super) original_unlocated_cleanup_targets: FxHashSet<Label>,
+    /// Exact source-certified named cleanup spans, used only during statement emission.
+    pub(super) guarded_finally_handler_cleanup_origins: Vec<(usize, Vec<Item>)>,
     /// Unlocated Boolean discards with a fallback whose source instruction folded away.
     pub(super) original_unlocated_discard_targets: FxHashSet<Label>,
+    /// Complete emitted conditional-finalizer arrays with a shared iterator discard.
+    pub(super) copied_finally_iterator_break_origins: Vec<Vec<Item>>,
+    pub(super) copied_finally_conjunction_break_origins: Vec<Vec<Item>>,
+    /// Complete copied cleanup-try arrays certified at their original shared iterator join.
+    pub(super) shared_finally_iterator_break_origins: Vec<Vec<Item>>,
     /// Original shared jump blocks whose source locations are resolved after exit copying.
     pub(super) deferred_shared_jump_blocks: FxHashSet<Label>,
+    /// Original label-only prefixes of retained normal-finally `POP_BLOCK` instructions.
+    pub(super) retained_pop_block_origins: FxHashMap<Label, Vec<Label>>,
     /// Shared jumps whose copies can acquire their new predecessor's source location.
     pub(super) shared_jump_copy_location_blocks: FxHashSet<Label>,
+    /// Original nested joins awaiting a source-authored or threaded eval-check exit.
+    pub(super) nested_if_unlocated_join_blocks: FxHashSet<Label>,
     /// Unique joins reached by the synthetic exits of early-folded conditions.
     pub(super) folded_condition_exit_targets: FxHashSet<Label>,
     pub(super) load_fast_borrowing_enabled: bool,
@@ -1252,6 +1510,35 @@ pub(crate) struct Assembler {
     pub(super) has_next_location: bool,
 }
 
+/// A bounded proof retained between initial jump threading and exit copying.
+///
+/// The exact interleaved instructions and labels must remain contiguous. Physical
+/// normalization may split this sequence at its captured owner labels, but no label,
+/// instruction field, or relative position may change.
+#[derive(Debug)]
+pub(super) struct ThreadedBorrowSnapshot {
+    pub(super) items: Vec<Item>,
+    pub(super) eligible_jumps: FxHashSet<usize>,
+}
+
+pub(super) type ThreadedBorrowEntries = FxHashMap<Label, ThreadedBorrowSnapshot>;
+
+/// Original reachable authored-break spans and their permitted finally routes.
+#[derive(Debug, Default)]
+pub(super) struct AuthoredFinallyBreakOrigins {
+    pub(super) snapshots: ThreadedBorrowEntries,
+    pub(super) routes: FxHashMap<Label, Label>,
+}
+
+/// A threaded authored break consumed before copies can inherit its labels.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct AuthoredFinallyBreakEntry {
+    pub(super) original_source: Label,
+    pub(super) target: Label,
+}
+
+pub(super) type AuthoredFinallyBreakEntries = FxHashMap<Label, AuthoredFinallyBreakEntry>;
+
 /// The block-aware assembler state used by CFG optimization passes.
 ///
 /// Keeping this separate from [`Assembler`] makes it impossible to run a CFG
@@ -1259,30 +1546,65 @@ pub(crate) struct Assembler {
 #[derive(Debug)]
 pub(super) struct OptimizationPipeline {
     pub(super) graph: BlockGraph,
+    /// Original incoming edges removed before CPython resolves cleanup locations.
+    pub(super) folded_original_predecessor_targets: FxHashSet<Label>,
+    /// Source markers retained to prove that a folded edge was originally reachable.
+    pub(super) folded_predecessor_sources: Vec<(Label, Label, SourceLocation)>,
+    /// Empty original anchors before folded constant-while exits without else suites.
+    pub(super) folded_loop_exit_anchors: FxHashSet<Label>,
     /// First-fold admissions retained before their next surviving source label.
     pub(super) discarded_fold_admissions: FxHashMap<Label, Vec<u32>>,
     pub(super) initial_reachable: Option<Vec<bool>>,
+    /// Erased handler entries must not mark a later block reached through label aliasing.
+    pub(super) retired_exception_handler_targets: FxHashSet<Label>,
     pub(super) next_label: u32,
     pub(super) exception_regions: Vec<ExceptionRegion>,
     pub(super) exception_owner_provenance: super::exception_owners::ExceptionOwnerProvenance,
     pub(super) preserved_block_boundaries: FxHashSet<Label>,
     pub(super) borrow_unreachable_blocks: FxHashSet<Label>,
+    /// Cleanup targets whose original for-loop backedge array was omitted during lowering.
+    pub(super) borrow_omitted_for_backedges: FxHashSet<Label>,
+    pub(super) borrow_jump_entry_labels: FxHashSet<Label>,
+    /// Positive jump entries captured before exit copying; copies receive fresh labels.
+    pub(super) borrow_pre_copy_jump_entries: FxHashMap<Label, Label>,
+    /// Original forward jump-only routes eligible for intentional entry propagation.
+    pub(super) borrow_threaded_jump_targets: FxHashMap<Label, Label>,
+    /// Full block snapshots keep threaded origins independent of hidden-slot packing.
+    pub(super) borrow_threaded_jump_entries: ThreadedBorrowEntries,
+    /// Separately certified authored breaks into original normal-finally cleanup.
+    pub(super) borrow_authored_finally_break_origins: AuthoredFinallyBreakOrigins,
+    pub(super) borrow_authored_finally_break_entries: AuthoredFinallyBreakEntries,
     pub(super) borrow_loop_exit_blocks: FxHashMap<Label, BorrowLoopExitPolicy>,
     pub(super) borrow_finally_entries: FxHashMap<Label, Option<BorrowCleanupCall>>,
     pub(super) borrow_finally_jump_sources: FxHashMap<Label, bool>,
     pub(super) borrow_block_aliases: FxHashSet<Label>,
     /// Original ordinary jump blocks that can thread conditional predecessors after exit copying.
     pub(super) conditional_threading_targets: FxHashMap<Label, SourceLocation>,
+    /// Exact pre-swap comprehension assignment arrays and their shared match exits.
+    pub(super) comprehension_assignment_exits: FxHashMap<Label, (Vec<Label>, [Instruction; 3])>,
+    /// Original match fallthrough arrays ending in an ordinary two-store exchange.
+    pub(super) match_join_store_origins: FxHashMap<Label, Vec<Item>>,
     /// Labels preceding an authored NOP omitted during statement lowering.
     pub(super) original_nop_targets: FxHashSet<Label>,
     /// Normal handler cleanup originally emitted without source locations.
     pub(super) original_unlocated_cleanup_targets: FxHashSet<Label>,
     /// Unlocated Boolean discards with a fallback whose source instruction folded away.
     pub(super) original_unlocated_discard_targets: FxHashSet<Label>,
+    /// Complete emitted conditional-finalizer arrays with a shared iterator discard.
+    pub(super) copied_finally_iterator_break_origins: Vec<Vec<Item>>,
+    pub(super) copied_finally_conjunction_break_origins: Vec<Vec<Item>>,
+    /// Complete copied cleanup-try arrays certified at their original shared iterator join.
+    pub(super) shared_finally_iterator_break_origins: Vec<Vec<Item>>,
+    /// Conditional entry labels mapped to their shared original unlocated jump array.
+    pub(super) original_shared_unlocated_jump_entries: FxHashMap<Label, Label>,
     /// Original ordinary-jump heads, separate from synthetic source-location joins.
     pub(super) original_jump_head_targets: FxHashSet<Label>,
     pub(super) deferred_shared_jump_blocks: FxHashSet<Label>,
+    /// Original label-only prefixes of retained normal-finally `POP_BLOCK` instructions.
+    pub(super) retained_pop_block_origins: FxHashMap<Label, Vec<Label>>,
     pub(super) shared_jump_copy_location_blocks: FxHashSet<Label>,
+    /// Emitted nested joins consumed when their exact jump is threaded to an eval-check exit.
+    pub(super) nested_if_unlocated_join_blocks: FxHashSet<Label>,
     /// Unique joins reached by the synthetic exits of early-folded conditions.
     pub(super) folded_condition_exit_targets: FxHashSet<Label>,
     pub(super) has_assertion_side_exit_candidate: bool,
@@ -1354,6 +1676,11 @@ impl Default for Assembler {
             code: UnoptimizedCode::Linear(Vec::new()),
             instruction_count: 0,
             emission_stream: EmissionStreamId::next(),
+            folded_away_condition_targets: FxHashSet::default(),
+            folded_away_loop_else_targets: FxHashSet::default(),
+            folded_predecessor_sources: Vec::new(),
+            folded_arm_exit_origins: Vec::new(),
+            folded_loop_exit_anchors: FxHashSet::default(),
             operand_patches: Vec::new(),
             deferred_none_constant_index: None,
             discarded_fold_admissions: FxHashMap::default(),
@@ -1361,17 +1688,30 @@ impl Default for Assembler {
             location: SourceLocation::NONE,
             exception_regions: Vec::new(),
             original_fallthrough_location: None,
+            original_match_join: None,
             exception_owner_provenance: super::exception_owners::ExceptionOwnerProvenance::default(
             ),
             preserved_block_boundaries: FxHashSet::default(),
             borrow_unreachable_blocks: FxHashSet::default(),
+            borrow_omitted_for_backedges: FxHashSet::default(),
+            borrow_jump_entry_labels: FxHashSet::default(),
+            deferred_borrow_entries: Vec::new(),
+            deferred_name_return_borrow_exits: Vec::new(),
+            name_return_pop_boundaries: FxHashSet::default(),
+            name_return_iterator_region_aliases: FxHashMap::default(),
             borrow_loop_exit_blocks: FxHashMap::default(),
             borrow_finally_entries: FxHashMap::default(),
             borrow_block_aliases: FxHashSet::default(),
             conditional_threading_targets: FxHashMap::default(),
+            comprehension_assignment_exits: FxHashMap::default(),
+            match_join_store_origins: FxHashMap::default(),
             original_nop_targets: FxHashSet::default(),
             original_unlocated_cleanup_targets: FxHashSet::default(),
+            guarded_finally_handler_cleanup_origins: Vec::new(),
             original_unlocated_discard_targets: FxHashSet::default(),
+            copied_finally_iterator_break_origins: Vec::new(),
+            copied_finally_conjunction_break_origins: Vec::new(),
+            shared_finally_iterator_break_origins: Vec::new(),
             load_fast_borrowing_enabled: true,
             strict_owned_loads: false,
             forced_borrowed_loads: false,
@@ -1381,8 +1721,166 @@ impl Default for Assembler {
             has_synthesized_percent_target_locations: false,
             has_next_location: false,
             deferred_shared_jump_blocks: FxHashSet::default(),
+            retained_pop_block_origins: FxHashMap::default(),
             shared_jump_copy_location_blocks: FxHashSet::default(),
+            nested_if_unlocated_join_blocks: FxHashSet::default(),
             folded_condition_exit_targets: FxHashSet::default(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod initial_borrow_metadata_tests {
+    use super::{
+        ExceptionPolicy, Instruction, InstructionMetadata, Label, NonZeroU16, Operand,
+        SourceLocation,
+    };
+    use crate::target::opcodes::JUMP_FORWARD;
+
+    const POLICIES: [ExceptionPolicy; 23] = [
+        ExceptionPolicy::NoneUnchanged,
+        ExceptionPolicy::NonePresent,
+        ExceptionPolicy::NoneOverridePresent,
+        ExceptionPolicy::NoneAbsent,
+        ExceptionPolicy::IfExtendedUnchanged,
+        ExceptionPolicy::IfExtendedPresent,
+        ExceptionPolicy::IfExtendedOverridePresent,
+        ExceptionPolicy::IfExtendedAbsent,
+        ExceptionPolicy::AlwaysUnchanged,
+        ExceptionPolicy::AlwaysPresent,
+        ExceptionPolicy::AlwaysOverridePresent,
+        ExceptionPolicy::AlwaysAbsent,
+        ExceptionPolicy::NoneDynamic,
+        ExceptionPolicy::IfExtendedDynamic,
+        ExceptionPolicy::AlwaysDynamic,
+        ExceptionPolicy::NoneDynamicCondition,
+        ExceptionPolicy::IfExtendedDynamicCondition,
+        ExceptionPolicy::AlwaysDynamicCondition,
+        ExceptionPolicy::NoneDynamicConditionStrict,
+        ExceptionPolicy::IfExtendedDynamicConditionStrict,
+        ExceptionPolicy::AlwaysDynamicConditionStrict,
+        ExceptionPolicy::NoneUnchangedBooleanSingleton,
+        ExceptionPolicy::AlwaysAbsentPostTryCondition,
+    ];
+
+    #[test]
+    fn wide_initial_borrow_metadata_preserves_all_276_encodings() {
+        let mut above_byte_capacity = 0;
+        for raw in 1..=276 {
+            let value = InstructionMetadata(NonZeroU16::new(raw).unwrap());
+            let origin = raw > 230;
+            let payload = if origin { raw - 231 } else { raw - 1 };
+            assert_eq!(value.has_initial_borrow_entry(), origin);
+            assert_eq!(
+                value.exception_policy(),
+                POLICIES[usize::from(payload / 2 % 23)]
+            );
+            assert_eq!(u16::from(value.pre_fold_extra_instructions()), payload / 46);
+            assert_eq!(value.only_allows_unconditional_inlining(), payload % 2 != 0);
+            if origin {
+                assert_eq!(value.pre_fold_extra_instructions(), 0);
+            }
+            let rebuilt = InstructionMetadata::new(
+                value.exception_policy(),
+                value.pre_fold_extra_instructions(),
+                value.only_allows_unconditional_inlining(),
+            )
+            .with_initial_borrow_entry(origin);
+            assert_eq!(rebuilt.0.get(), raw);
+            let cleared = value.with_initial_borrow_entry(false);
+            assert!((1..=230).contains(&cleared.0.get()));
+            assert_eq!(cleared.exception_policy(), value.exception_policy());
+            assert_eq!(
+                cleared.pre_fold_extra_instructions(),
+                value.pre_fold_extra_instructions()
+            );
+            assert_eq!(
+                cleared.only_allows_unconditional_inlining(),
+                value.only_allows_unconditional_inlining()
+            );
+            if raw > u16::from(u8::MAX) {
+                above_byte_capacity += 1;
+                assert!(u8::try_from(rebuilt.0.get()).is_err());
+            }
+        }
+        assert_eq!(above_byte_capacity, 21);
+        for copy in [false, true] {
+            let tagged =
+                InstructionMetadata::new(ExceptionPolicy::NoneUnchangedBooleanSingleton, 0, copy)
+                    .with_initial_borrow_entry(true);
+            assert_eq!(tagged.0.get(), 273 + u16::from(copy));
+        }
+    }
+
+    #[test]
+    fn wide_metadata_preserves_policy_updates_and_invalidates_changed_origins() {
+        for raw in 1..=276 {
+            let metadata = InstructionMetadata(NonZeroU16::new(raw).unwrap());
+            let mut original = Instruction::synthetic(
+                JUMP_FORWARD,
+                Operand::Forward(Label(1)),
+                SourceLocation::NONE,
+                None,
+            );
+            original.metadata = metadata;
+            let origin = metadata.has_initial_borrow_entry();
+            for policy in POLICIES {
+                let mut changed = original;
+                changed.set_exception_policy(policy);
+                assert_eq!(changed.exception_policy(), policy);
+                assert_eq!(
+                    changed.pre_fold_extra_instructions(),
+                    original.pre_fold_extra_instructions()
+                );
+                assert_eq!(
+                    changed.only_allows_unconditional_inlining(),
+                    original.only_allows_unconditional_inlining()
+                );
+                assert_eq!(changed.metadata.has_initial_borrow_entry(), origin);
+            }
+            let mut copied = original;
+            copied.allow_unconditional_block_inlining();
+            assert!(copied.only_allows_unconditional_inlining());
+            assert_eq!(copied.exception_policy(), original.exception_policy());
+            assert_eq!(
+                copied.pre_fold_extra_instructions(),
+                original.pre_fold_extra_instructions()
+            );
+            assert_eq!(copied.metadata.has_initial_borrow_entry(), origin);
+            for extra in [0, 1, 4, u8::MAX] {
+                let mut changed = original;
+                changed.add_pre_fold_extra_instructions(extra);
+                assert_eq!(
+                    changed.pre_fold_extra_instructions(),
+                    original
+                        .pre_fold_extra_instructions()
+                        .saturating_add(extra)
+                        .min(4)
+                );
+                assert_eq!(changed.exception_policy(), original.exception_policy());
+                assert_eq!(
+                    changed.only_allows_unconditional_inlining(),
+                    original.only_allows_unconditional_inlining()
+                );
+                assert_eq!(
+                    changed.metadata.has_initial_borrow_entry(),
+                    origin && extra == 0
+                );
+            }
+            let mut retargeted = original;
+            retargeted.set_operand(Operand::Forward(Label(1)));
+            assert_eq!(retargeted.metadata.has_initial_borrow_entry(), origin);
+            retargeted.set_operand(Operand::Forward(Label(2)));
+            assert!(!retargeted.metadata.has_initial_borrow_entry());
+            assert_eq!(retargeted.exception_policy(), original.exception_policy());
+            assert_eq!(
+                retargeted.pre_fold_extra_instructions(),
+                original.pre_fold_extra_instructions()
+            );
+            assert_eq!(
+                retargeted.only_allows_unconditional_inlining(),
+                original.only_allows_unconditional_inlining()
+            );
         }
     }
 }

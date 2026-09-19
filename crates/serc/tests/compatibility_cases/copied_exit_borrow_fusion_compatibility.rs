@@ -469,3 +469,128 @@ fn matches_cpython_borrows_at_truthy_finally_while_headers_after_breaks() {
         }
     }
 }
+
+#[test]
+fn matches_cpython_local_fusion_at_copied_keyword_call_exits() {
+    let source = r"def conditional_keyword(flag, value, other):
+    return consume(value if flag else None, extra=other)
+
+def inverted_keyword(flag, value, other):
+    return consume(None if flag else value, extra=other)
+
+def multiline_keyword(flag, value, other):
+    return consume(value if flag else None,
+                   extra=other)
+";
+    common::assert_matches_cpython_marshal(source, "copied_keyword_local_fusion.py");
+}
+
+#[test]
+fn matches_cpython_local_fusion_at_copied_attribute_assignment_exits() {
+    let source = r"class Config:
+    def __init__(self, value):
+        self.value = value if value is not None else []
+
+    def replace(self, flag, value):
+        self.value = value if flag else None
+
+    def replace_and_return(self, flag, value):
+        self.value = value if flag else None
+        return value
+";
+    common::assert_matches_cpython_marshal(source, "copied_attribute_local_fusion.py");
+}
+
+#[test]
+fn matches_cpython_local_fusion_at_copied_operator_exits() {
+    let source = r#"def concatenate(flag, value, other):
+    return (value if flag else "") + other
+
+def identical(flag, value, other):
+    return (value if flag else None) is other
+
+def positional(flag, value, other):
+    return consume(value if flag else None, other)
+"#;
+    common::assert_matches_cpython_marshal(source, "copied_operator_local_fusion.py");
+}
+
+#[test]
+fn matches_cpython_local_fusion_at_keyword_return_seams_after_comprehensions() {
+    common::assert_matches_cpython_marshal(
+        r"async def f(values, selected, tail):
+    items = [item for item in values]
+    candidate = await fetch(items)
+    return pack(items=items, chosen=candidate if selected else None, tail=tail)
+",
+        "async_comprehension_conditional_keyword_tail.py",
+    );
+    common::assert_matches_cpython_marshal(
+        r"def f(values, candidate, selected, tail):
+    items = [item.copy() for item in values]
+    return pack(items, chosen=candidate if selected else None, tail=tail)
+",
+        "comprehension_conditional_keyword_tail.py",
+    );
+}
+
+#[test]
+fn matches_cpython_marshal_for_protected_conditional_positional_return_fusion_target() {
+    let source = r"import service
+
+def f(text, *, direct, sensitive):
+    if not text:
+        raise ValueError('text is required')
+    options = 0 if sensitive else service.DEFAULT
+    try:
+        return service.compile(text if direct else service.escape(text), options)
+    except service.Error as error:
+        raise ValueError(f'invalid pattern: {error}') from error
+";
+    common::assert_matches_cpython_marshal(
+        source,
+        "protected_conditional_positional_return_fusion_target.py",
+    );
+}
+
+#[test]
+fn matches_cpython_marshal_for_unprotected_conditional_positional_return_fusion_control() {
+    let source = r"import service
+
+def f(text, *, direct, sensitive):
+    if not text:
+        raise ValueError('text is required')
+    options = 0 if sensitive else service.DEFAULT
+    return service.compile(text if direct else service.escape(text), options)
+";
+    common::assert_matches_cpython_marshal(
+        source,
+        "unprotected_conditional_positional_return_fusion_control.py",
+    );
+}
+
+#[test]
+fn matches_cpython_marshal_for_protected_conditional_tuple_return_fusion_target() {
+    let source = r"def f(view, path, extra):
+    try:
+        return view, path if exists(path) else None, extra
+    except Error as error:
+        record(error)
+        return None, None, None
+";
+    common::assert_matches_cpython_marshal(
+        source,
+        "protected_conditional_tuple_return_fusion_target.py",
+    );
+}
+
+#[test]
+fn matches_cpython_marshal_for_unprotected_conditional_tuple_return_fusion_control() {
+    let source = r"def f(view, path, extra):
+    return view, path if exists(path) else None, extra
+";
+    common::assert_matches_cpython_marshal(
+        source,
+        "unprotected_conditional_tuple_return_fusion_control.py",
+    );
+}

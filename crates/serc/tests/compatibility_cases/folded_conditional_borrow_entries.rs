@@ -89,3 +89,35 @@ fn preserves_true_arm_assignment_borrow_entries() {
         }
     }
 }
+
+#[test]
+fn preserves_terminal_folded_if_statement_borrow_entries() {
+    for (scope, condition, tail) in [
+        ("sync", "0", ""),
+        ("sync", "False", ""),
+        ("sync", "True", ""),
+        ("sync", "flag", ""),
+        ("sync", "0", "\nconsume(flag)"),
+        ("gen", "0", ""),
+        ("async", "0", ""),
+        ("agen", "0", ""),
+    ] {
+        let body = format!(
+            "if {condition}:\n    consume(work(left), right)\nelse:\n    consume(work(left), right, flag){tail}"
+        );
+        common::assert_matches_cpython_marshal(
+            &function_source(scope, &body),
+            "terminal_folded_if_borrow_entry.py",
+        );
+    }
+}
+
+#[test]
+fn preserves_folded_boolean_call_argument_borrow_boundaries() {
+    let source = r"def f(options, value, consume):
+    result = options.get('key' or 'fallback')
+    consume(result, value)
+    return value
+";
+    common::assert_matches_cpython_marshal(source, "folded_bool_call_argument.py");
+}

@@ -57,3 +57,83 @@ fn prefixed_named_handler_boolean_exits_keep_predecessor_order() {
         }
     }
 }
+
+#[test]
+fn matches_cpython_conditional_cleanup_hole_containment() {
+    for (filename, source) in [
+        (
+            "named_handler_boolean_fallthrough_target.py",
+            r"def inspect_value(read, fallback):
+    try:
+        return read()
+    except BaseException as error:
+        if isinstance(error, LookupError):
+            raise error
+        elif isinstance(error, ValueError):
+            if error.code == 7 and not fallback:
+                return None
+        elif fallback:
+            return read()
+        else:
+            raise error
+",
+        ),
+        (
+            "named_handler_boolean_or_fallthrough_target.py",
+            r"def inspect_value(read, fallback):
+    try:
+        return read()
+    except BaseException as error:
+        if isinstance(error, LookupError):
+            raise error
+        elif isinstance(error, ValueError):
+            if error.code == 7 or fallback:
+                return None
+        elif fallback:
+            return read()
+        else:
+            raise error
+",
+        ),
+        (
+            "named_handler_live_join_control.py",
+            r"def inspect_value(read, fallback, report):
+    try:
+        return read()
+    except BaseException as error:
+        if isinstance(error, LookupError):
+            raise error
+        elif isinstance(error, ValueError):
+            if error.code == 7 and not fallback:
+                return None
+        elif fallback:
+            return read()
+        else:
+            raise error
+        report(error)
+",
+        ),
+        (
+            "named_handler_outer_owner_control.py",
+            r"def inspect_value(read, fallback, finish):
+    try:
+        try:
+            return read()
+        except BaseException as error:
+            if isinstance(error, LookupError):
+                raise error
+            elif isinstance(error, ValueError):
+                if error.code == 7 and not fallback:
+                    return None
+            elif fallback:
+                return read()
+            else:
+                raise error
+    finally:
+        finish()
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

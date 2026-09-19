@@ -61,3 +61,140 @@ fn matches_cpython_manager_exits_before_protected_terminal_breaks() {
         }
     }
 }
+
+#[test]
+fn matches_cpython_nested_try_iterator_conditional_return_target() {
+    let source = r"def fetch_parsed(attempts, fetch, decode, pause):
+    last_error = None
+    for attempt in attempts:
+        try:
+            payload = fetch()
+            try:
+                return decode(payload) if payload else {}
+            except ValueError as error:
+                raise RuntimeError('decode failed') from error
+        except Exception as error:
+            last_error = error
+            pause(attempt)
+    raise RuntimeError('attempts exhausted') from last_error
+";
+    common::assert_matches_cpython_marshal(
+        source,
+        "nested_try_iterator_conditional_return_target.py",
+    );
+}
+
+#[test]
+fn matches_cpython_single_try_iterator_conditional_return_control() {
+    let source = r"def fetch_parsed(attempts, fetch, decode, pause):
+    last_error = None
+    for attempt in attempts:
+        try:
+            payload = fetch()
+            return decode(payload) if payload else {}
+        except Exception as error:
+            last_error = error
+            pause(attempt)
+    raise RuntimeError('attempts exhausted') from last_error
+";
+    common::assert_matches_cpython_marshal(
+        source,
+        "single_try_iterator_conditional_return_control.py",
+    );
+}
+
+#[test]
+fn matches_cpython_private_nested_try_tuple_return_exits() {
+    for (filename, source) in [
+        (
+            "nested_try_private_exit_tuple_target.py",
+            r"async def choose(value, take_outer, take_inner):
+    left = 0
+    right = value
+    try:
+        if take_outer:
+            if take_inner:
+                right = first(value)
+            else:
+                right = second(value)
+        else:
+            try:
+                right = fallback(value)
+            except ValueError:
+                right = recover(value)
+    except ValueError:
+        right = recover_outer(value)
+    return left, right
+",
+        ),
+        (
+            "direct_assignment_tuple_control.py",
+            r"async def choose(value, take_outer, take_inner):
+    left = 0
+    right = value
+    try:
+        if take_outer:
+            if take_inner:
+                right = first(value)
+            else:
+                right = second(value)
+        else:
+            right = fallback(value)
+    except ValueError:
+        right = recover_outer(value)
+    return left, right
+",
+        ),
+        (
+            "nested_try_three_local_tuple_control.py",
+            r"async def choose(value, take_outer, take_inner):
+    left = 0
+    right = value
+    try:
+        if take_outer:
+            if take_inner:
+                right = first(value)
+            else:
+                right = second(value)
+        else:
+            try:
+                right = fallback(value)
+            except ValueError:
+                right = recover(value)
+    except ValueError:
+        right = recover_outer(value)
+    return left, right, value
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn matches_cpython_protected_conditional_local_return_copy() {
+    for (filename, source) in [
+        (
+            "protected_chained_local_return.py",
+            r"def select(value, upper):
+    try:
+        parsed = int(value)
+        return parsed if 1 <= parsed <= upper else None
+    except ValueError:
+        return None
+",
+        ),
+        (
+            "protected_primitive_local_return_control.py",
+            r"def select(value, upper):
+    try:
+        parsed = int(value)
+        return parsed if parsed <= upper else None
+    except ValueError:
+        return None
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

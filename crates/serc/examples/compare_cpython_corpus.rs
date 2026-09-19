@@ -14,6 +14,10 @@ use serc::{
 
 #[path = "support/initial_intern_profile.rs"]
 mod initial_intern_profile;
+#[path = "support/native_output_cache.rs"]
+mod native_output_cache;
+#[path = "support/native_output_reader.rs"]
+mod native_output_reader;
 use rayon::prelude::*;
 use walkdir::WalkDir;
 
@@ -147,6 +151,18 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let read_config = env::var_os("SERC_NATIVE_CACHE_READ");
+    if read_config.is_some()
+        && (env::var_os("SERC_NATIVE_CACHE_WRITE").is_some()
+            || options.dump_mismatches.is_some()
+            || !options.source_bytes
+            || options.initial_intern_state.is_none())
+    {
+        eprintln!(
+            "native cache reading requires byte sources and an intern profile, and cannot combine writing or native mismatch dumping"
+        );
+        return ExitCode::from(2);
+    }
     if let Err(message) = verify_python(&options.python) {
         eprintln!("{message}");
         return ExitCode::from(2);
@@ -196,6 +212,60 @@ fn main() -> ExitCode {
         paths.truncate(limit);
     }
 
+    let cache = match env::var_os("SERC_NATIVE_CACHE_WRITE") {
+        Some(config) => {
+            let Some(profile) = options
+                .initial_intern_state
+                .as_deref()
+                .filter(|_| options.source_bytes)
+            else {
+                eprintln!(
+                    "native output capture requires --source-bytes and --initial-intern-state"
+                );
+                return ExitCode::from(2);
+            };
+            match native_output_cache::Writer::new(
+                Path::new(&config),
+                profile,
+                &options.python,
+                ORACLE,
+                &paths,
+            ) {
+                Ok(writer) => Some(writer),
+                Err(error) => {
+                    eprintln!("failed to initialize native output capture: {error}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        None => None,
+    };
+
+    let reader = match read_config {
+        Some(config) => match native_output_reader::Reader::new(
+            Path::new(&config),
+            options
+                .initial_intern_state
+                .as_deref()
+                .expect("reader profile checked"),
+            &options.python,
+            ORACLE,
+            &paths,
+        ) {
+            Ok(reader) => {
+                println!(
+                    "Native oracle source: admitted cached bytes; every candidate is freshly compiled"
+                );
+                Some(reader)
+            }
+            Err(error) => {
+                eprintln!("failed to open admitted native cache: {error}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => None,
+    };
+
     let pool = match rayon::ThreadPoolBuilder::new()
         .stack_size(WORKER_STACK_SIZE)
         .build()
@@ -211,13 +281,23 @@ fn main() -> ExitCode {
     let outcomes: Vec<_> = pool.install(|| {
         paths
             .par_iter()
-            .map(|path| {
-                compare(
+            .enumerate()
+            .map(|(index, path)| {
+                if let Some(reader) = &reader {
+                    return reader.compare(index, path, initial_intern_state);
+                }
+                let mut observation = cache.as_ref().map(|writer| writer.begin(index, path));
+                let outcome = compare(
                     path,
                     &options.python,
                     options.source_bytes,
                     initial_intern_state,
-                )
+                    observation.as_mut(),
+                );
+                if let Some(observation) = observation {
+                    observation.finish(&outcome);
+                }
+                outcome
             })
             .collect()
     });
@@ -326,6 +406,18 @@ fn main() -> ExitCode {
     );
     for failure in &gate_failures {
         eprintln!("compatibility gate failed: {failure}");
+    }
+    if let Some(reader) = reader {
+        if let Err(error) = reader.finish(gate_failures.is_empty()) {
+            eprintln!("admitted native cache comparison failed: {error}");
+            return ExitCode::FAILURE;
+        }
+    }
+    if let Some(cache) = cache {
+        if let Err(error) = cache.finish(gate_failures.is_empty()) {
+            eprintln!("native output capture failed: {error}");
+            return ExitCode::FAILURE;
+        }
     }
     if gate_failures.is_empty() {
         ExitCode::SUCCESS
@@ -662,12 +754,16 @@ fn compare(
     python: &str,
     source_bytes: bool,
     initial_intern_state: Option<&InitialInternState>,
+    mut observation: Option<&mut native_output_cache::Observation<'_>>,
 ) -> Outcome {
-    let oracle = match Command::new(python)
+    let output = Command::new(python)
         .args(["-I", "-S", "-c", ORACLE])
         .arg(path)
-        .output()
-    {
+        .output();
+    if let Some(observation) = &mut observation {
+        observation.native(&output);
+    }
+    let oracle = match output {
         Ok(output) if output.status.success() => OracleOutcome::Compiled(output.stdout),
         Ok(output) if output.status.code() == Some(2) => {
             OracleOutcome::Rejected(one_line(&output.stderr))
@@ -722,6 +818,9 @@ fn compare(
 
     let filename = path.to_string_lossy();
     let compiled = compile_input(&source, &filename, initial_intern_state);
+    if let Some(observation) = observation {
+        observation.compiled(&source, &compiled);
+    }
 
     classify(path, oracle, compiled)
 }

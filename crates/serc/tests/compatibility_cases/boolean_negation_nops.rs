@@ -129,3 +129,57 @@ async def async_generator_loop(flag, value, values):
 ";
     common::assert_matches_cpython_marshal(source, "protected_value_negation.py");
 }
+
+#[test]
+fn preserves_negated_none_comparison_slots_before_boolean_folding() {
+    let source = r"def is_none(value):
+    return not (value is None)
+
+def is_not_none(value):
+    return not (value is not None)
+
+def multiline(value):
+    return not (
+        value is
+        None
+    )
+
+def protected(value):
+    try:
+        return not (value is None)
+    except Error:
+        return False
+
+def assertion(value):
+    assert not (value is None)
+
+def direct_condition(value):
+    if value is None:
+        return 1
+    return 2
+";
+    common::assert_matches_cpython_marshal(source, "negated_none_comparison_slots.py");
+}
+
+#[test]
+fn preserves_other_boolean_comparison_folding() {
+    let source = r"def dynamic(value, other):
+    return not (value is other)
+
+def none_on_left(value):
+    return not (None is value)
+
+def true_on_right(value):
+    return not (value is True)
+
+def false_on_right(value):
+    return not (value is False)
+
+def membership(value, values):
+    return not (value in values)
+
+def chained(value, other):
+    return not (value is None is other)
+";
+    common::assert_matches_cpython_marshal(source, "other_boolean_comparison_folding.py");
+}

@@ -1,3 +1,5 @@
+use std::fmt::Write as _;
+
 use crate::common;
 
 #[test]
@@ -67,5 +69,190 @@ fn matches_cpython_return_handler_cleanup_with_enclosing_exception_regions() {
                 );
             }
         }
+    }
+}
+
+#[test]
+fn owner_transfer_reducer_nested_bare_handler() {
+    common::assert_matches_cpython_marshal(
+        r"def f(outer, inner, value, ignore):
+    with outer:
+        try:
+            with inner:
+                return value
+        except:
+            if ignore:
+                return None
+            else:
+                raise
+",
+        "owner_transfer_reducer_nested_bare_handler.py",
+    );
+}
+
+#[test]
+fn owner_transfer_reducer_inner_call() {
+    common::assert_matches_cpython_marshal(
+        r"def f(outer, inner, ignore):
+    with outer:
+        prepare()
+        try:
+            with inner as stream:
+                value = read(stream)
+                return value
+        except:
+            if ignore:
+                return None
+            else:
+                raise
+",
+        "owner_transfer_reducer_inner_call.py",
+    );
+}
+
+#[test]
+fn owner_transfer_reducer_inner_conditions() {
+    common::assert_matches_cpython_marshal(
+        r#"def f(outer, inner, ignore):
+    with outer:
+        prepare()
+        try:
+            with inner as stream:
+                value = read(stream)
+                first = value.get("first")
+                if not isinstance(first, (bytes, bytearray, memoryview)):
+                    value.pop("first", None)
+                second = value.get("second")
+                if not isinstance(second, (bytes, bytearray)):
+                    value.pop("second", None)
+                return value
+        except:
+            if ignore:
+                return None
+            else:
+                raise
+"#,
+        "owner_transfer_reducer_inner_conditions.py",
+    );
+}
+
+#[test]
+fn owner_transfer_control_direct_return() {
+    common::assert_matches_cpython_marshal(
+        r"def f(outer, inner, value):
+    with outer:
+        with inner:
+            return value
+",
+        "owner_transfer_control_direct_return.py",
+    );
+}
+
+#[test]
+fn owner_transfer_nested_manager_depth_matrix() {
+    for outer_depth in [1, 2] {
+        for inner_depth in [0, 1, 2] {
+            for handler in ["except:", "except Error:"] {
+                for value in ["value", "None"] {
+                    let mut source = String::from("def f(a, b, c, d, value, ignore):\n");
+                    let mut indent = String::from("    ");
+                    for manager in ["a", "b"].into_iter().take(outer_depth) {
+                        writeln!(source, "{indent}with {manager}:").unwrap();
+                        indent.push_str("    ");
+                    }
+                    writeln!(source, "{indent}try:").unwrap();
+                    let mut body_indent = format!("{indent}    ");
+                    for manager in ["c", "d"].into_iter().take(inner_depth) {
+                        writeln!(source, "{body_indent}with {manager}:").unwrap();
+                        body_indent.push_str("    ");
+                    }
+                    writeln!(source, "{body_indent}return {value}").unwrap();
+                    writeln!(source, "{indent}{handler}\n{indent}    if ignore:\n{indent}        return None\n{indent}    else:\n{indent}        raise").unwrap();
+                    common::assert_matches_cpython_marshal(
+                        &source,
+                        "owner_transfer_nested_manager_depth_matrix.py",
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn owner_transfer_async_manager_depth_matrix() {
+    for outer in ["with", "async with"] {
+        for inner in ["with", "async with"] {
+            let source = format!(
+                "async def f(a, b, value, ignore):\n    {outer} a:\n        try:\n            {inner} b:\n                return value\n        except:\n            if ignore:\n                return None\n            else:\n                raise\n"
+            );
+            common::assert_matches_cpython_marshal(
+                &source,
+                "owner_transfer_async_manager_depth_matrix.py",
+            );
+        }
+    }
+}
+
+#[test]
+fn matches_cpython_named_handler_while_returns_through_manager_finally() {
+    for (filename, source) in [
+        (
+            "named_manager_while_return_truth_finally.py",
+            r"async def worker(manager, ready, read, report, client):
+    skip = False
+    with manager:
+        try:
+            while ready():
+                try:
+                    read()
+                except Exception as error:
+                    skip = True
+                    report(error)
+                    return
+        except OSError:
+            report(None)
+        finally:
+            if skip:
+                return
+            report(None)
+            await client.finish()
+",
+        ),
+        (
+            "named_manager_while_return_two_finally.py",
+            r"def worker(manager, ready, read, report, process):
+    with manager:
+        try:
+            try:
+                while ready():
+                    try:
+                        read()
+                    except LookupError as error:
+                        report(error)
+                        return
+            except ValueError as error:
+                report(error)
+            finally:
+                try:
+                    report(None)
+                    while read():
+                        pass
+                except OSError as error:
+                    report(error)
+                report(None)
+                if process is not None:
+                    process.close()
+        except RuntimeError as error:
+            report(error)
+            report(None)
+            report(error)
+        finally:
+            report(None)
+            if ready():
+                report(None)
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
     }
 }

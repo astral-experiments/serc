@@ -107,3 +107,65 @@ async def coroutine(flag):
 
     common::assert_matches_cpython_marshal(source, "exceptional_finally_shared_reraise.py");
 }
+
+#[test]
+fn matches_cpython_manager_delete_reraise_copy_widths() {
+    for (filename, source) in [
+        (
+            "exceptional_manager_four_delete_reraise_control.py",
+            r"def run(lock, again):
+    try:
+        while again():
+            first, second, third, fourth = values()
+            try:
+                work()
+            finally:
+                with lock:
+                    touch()
+                del first
+                del second
+                del third
+                del fourth
+    finally:
+        finish()
+",
+        ),
+        (
+            "exceptional_manager_three_delete_reraise_limit.py",
+            r"def run(lock, again):
+    try:
+        while again():
+            first, second, third, fourth = values()
+            try:
+                work()
+            finally:
+                with lock:
+                    touch()
+                del first
+                del second
+                del third
+    finally:
+        finish()
+",
+        ),
+        (
+            "exceptional_manager_two_delete_reraise_target.py",
+            r"def run(lock, again):
+    try:
+        while again():
+            first, second, third, fourth = values()
+            try:
+                work()
+            finally:
+                with lock:
+                    touch()
+                del first
+                del second
+    finally:
+        finish()
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

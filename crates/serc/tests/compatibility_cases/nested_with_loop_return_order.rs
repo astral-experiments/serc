@@ -63,3 +63,139 @@ fn indent(source: &str) -> String {
     }
     result
 }
+
+#[test]
+fn matches_cpython_with_return_iterator_exception_owners() {
+    for (filename, source) in [
+        (
+            "with_outer_iterator_try_finally.py",
+            r"def f(manager, items, done):
+    try:
+        for item in items:
+            try:
+                with manager:
+                    return item
+            except ValueError:
+                pass
+    finally:
+        if done:
+            done()
+",
+        ),
+        (
+            "with_two_outer_iterators_try_finally.py",
+            r"def f(manager, items, done):
+    try:
+        for item in items:
+            try:
+                for other in items:
+                    with manager:
+                        return item
+            except ValueError:
+                pass
+    finally:
+        if done:
+            done()
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn exits_async_managers_before_retry_iterator_in_finally_return() {
+    for (filename, source) in [
+        (
+            "async_manager_inside_retry_return_finally.py",
+            r"async def f(items, manager, value, cleanup):
+    try:
+        for item in items:
+            async with manager:
+                return value
+    finally:
+        cleanup()
+",
+        ),
+        (
+            "async_managers_around_retry_return_finally.py",
+            r"async def f(items, outer, inner, value, cleanup):
+    try:
+        async with outer:
+            for item in items:
+                async with inner:
+                    return value
+    finally:
+        cleanup()
+",
+        ),
+        (
+            "async_nested_managers_retry_await_return_finally.py",
+            r"async def f(items, outer, inner, work, cleanup):
+    try:
+        for item in items:
+            async with outer:
+                async with inner:
+                    return await work()
+    finally:
+        cleanup()
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn exits_async_managers_before_retry_iterator_with_handlers() {
+    for (filename, source) in [
+        (
+            "async_manager_retry_except_finally_call_return.py",
+            r"async def f(items, manager, make, cleanup):
+    try:
+        for item in items:
+            async with manager:
+                return make(item)
+    except ValueError:
+        raise
+    finally:
+        cleanup()
+",
+        ),
+        (
+            "async_managers_retry_except_loop_finally_await_return.py",
+            r"async def f(items, outer, inner, work, parts, cleanup):
+    try:
+        async with outer:
+            for item in items:
+                async with inner:
+                    return await work(item)
+    except ValueError:
+        raise
+    finally:
+        for part in parts:
+            await cleanup(part)
+",
+        ),
+        (
+            "async_three_managers_retry_outer_except_finally_call_return.py",
+            r"async def f(items, outer, middle, inner, make, cleanup):
+    try:
+        async with outer:
+            for item in items:
+                try:
+                    async with middle:
+                        async with inner:
+                            return make(item)
+                except ValueError:
+                    continue
+    except RuntimeError:
+        raise
+    finally:
+        cleanup()
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

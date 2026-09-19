@@ -44,3 +44,75 @@ fn annotation_indices_preserve_scope_and_cleanup_visitation() {
         common::assert_matches_cpython_marshal(source, "annotation_scope_indices.py");
     }
 }
+
+#[test]
+fn module_annotation_setup_removes_same_line_try_nop() {
+    let cases = [
+        (
+            "module_annotation_initial_try.py",
+            r"try:
+    values: list[int] = [1, 2]
+except LookupError:
+    values = []
+result = values
+",
+        ),
+        (
+            "module_unannotated_initial_try_control.py",
+            r"try:
+    values = [1, 2]
+except LookupError:
+    values = []
+result = values
+",
+        ),
+    ];
+
+    for (filename, source) in cases {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn setup_nop_preserves_deferred_match_subject_locations() {
+    let cases = [
+        (
+            "match_subject_pop_before_try.py",
+            r"def probe(kind, payload, decode, use):
+    match kind:
+        case 'counters':
+            try:
+                counters: dict[str, int] = decode(payload)
+            except Exception:
+                pass
+            else:
+                use(counters)
+        case 'date':
+            use(payload)
+        case _:
+            pass
+    return payload
+",
+        ),
+        (
+            "async_match_subject_pop_before_try.py",
+            r"async def probe(attachment, create, log):
+    match attachment:
+        case SharedPost():
+            try:
+                return await create(attachment)
+            except:
+                log()
+                raise
+        case OtherPost():
+            return None
+        case _:
+            return None
+",
+        ),
+    ];
+
+    for (filename, source) in cases {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

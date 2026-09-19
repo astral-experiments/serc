@@ -146,3 +146,96 @@ fn preserves_negated_chained_try_exit_provenance() {
         common::assert_matches_cpython_marshal(&source, "negated_chained_try_exit_provenance.py");
     }
 }
+
+#[test]
+fn splits_chained_try_else_implicit_return_locations() {
+    for (filename, source) in [
+        (
+            "terminal_chained_try_else.py",
+            r"def chained_recovery(left, right, token, decode):
+    if left.kind == right.kind == token:
+        try:
+            first = decode(left.value)
+            second = decode(right.value)
+        except ValueError:
+            pass
+        else:
+            if first == second:
+                right.value = left.value
+",
+        ),
+        (
+            "terminal_ordinary_try_else_control.py",
+            r"def ordinary_recovery(left, right, token, decode):
+    if left.kind == token:
+        try:
+            first = decode(left.value)
+            second = decode(right.value)
+        except ValueError:
+            pass
+        else:
+            if first == second:
+                right.value = left.value
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn retains_terminal_loop_chained_break_return_locations() {
+    for (filename, source) in [
+        (
+            "terminal_coroutine_chain_break_return_target.py",
+            r"async def f(settings, work, pause):
+    i = 0
+    while True:
+        i += 1
+        try:
+            await work()
+        except Exception as error:
+            record(error)
+        if 0 < settings.iteration <= i:
+            break
+        if settings.sleep_time > 0:
+            await pause(settings.sleep_time)
+",
+        ),
+        (
+            "terminal_coroutine_chain_explicit_return_control.py",
+            r"async def f(settings, work, pause):
+    i = 0
+    while True:
+        i += 1
+        try:
+            await work()
+        except Exception as error:
+            record(error)
+        if 0 < settings.iteration <= i:
+            return
+        if settings.sleep_time > 0:
+            await pause(settings.sleep_time)
+",
+        ),
+        (
+            "nonterminal_coroutine_chain_break_call_control.py",
+            r"async def f(settings, work, pause):
+    i = 0
+    while True:
+        i += 1
+        try:
+            await work()
+        except Exception as error:
+            record(error)
+        if 0 < settings.iteration <= i:
+            break
+        if settings.sleep_time > 0:
+            await pause(settings.sleep_time)
+    finish()
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

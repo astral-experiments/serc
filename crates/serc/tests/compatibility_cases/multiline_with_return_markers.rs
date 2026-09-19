@@ -15,3 +15,20 @@ fn matches_cpython_multiline_return_markers_before_with_cleanup() {
         }
     }
 }
+
+#[test]
+fn matches_cpython_same_line_multiline_and_return_in_manager() {
+    let source = r"def respond(manager, retained, response, completed):
+    with manager:
+        if completed:
+            return retained is not None and (
+                retained.status == response.status
+                and retained.read() == response.body
+            )
+        return True
+";
+    common::assert_matches_cpython_marshal(
+        source,
+        "same_line_multiline_and_manager_return_target.py",
+    );
+}

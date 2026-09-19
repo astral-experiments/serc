@@ -29,3 +29,37 @@ def nested_mapping_class(subject):
 "#;
     common::assert_matches_cpython_marshal(source, "mapping_class_captures.py");
 }
+
+#[test]
+fn matches_cpython_marshal_for_pending_mapping_class_captures() {
+    for (filename, source) in [
+        (
+            "pending_mapping_captures_class_as_control.py",
+            r#"def f(value):
+    match value:
+        case {
+            "pool": {
+                "created": created,
+                "name": name,
+                "kind": kind,
+                "label": label,
+            },
+            "pod": {"ready": bool() as ready},
+        }:
+            return created, name, kind, label, ready
+    return None
+"#,
+        ),
+        (
+            "same_line_pending_mapping_class_capture_control.py",
+            r#"def f(value):
+    match value:
+        case {"pool": {"created": created, "name": name, "kind": kind, "label": label}, "pod": {"ready": bool() as ready}}:
+            return created, name, kind, label, ready
+    return None
+"#,
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

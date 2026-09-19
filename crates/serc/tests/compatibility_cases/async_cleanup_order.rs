@@ -100,3 +100,52 @@ async def protected_nested_return(streams, recover):
 ";
     assert_matches_cpython_marshal(source, "terminal_async_comprehension_restores.py");
 }
+
+#[test]
+fn matches_cpython_outer_async_loop_comprehension_restore_order() {
+    for (filename, source) in [
+        (
+            "outer_async_for_comprehension_tuple_return_target.py",
+            r"async def f(pager):
+    async for page in pager:
+        return [item async for item in page], pager.token
+    return [], None
+",
+        ),
+        (
+            "direct_async_comprehension_tuple_return_control.py",
+            r"async def f(page, pager):
+    return [item async for item in page], pager.token
+",
+        ),
+        (
+            "outer_async_for_comprehension_early_return_target.py",
+            r"async def f(pages, finish):
+    try:
+        async for page in pages:
+            items = [item async for item in page]
+            if not items:
+                return
+            for item in items:
+                yield item
+    finally:
+        finish()
+",
+        ),
+        (
+            "direct_async_comprehension_early_return_control.py",
+            r"async def f(page, finish):
+    try:
+        items = [item async for item in page]
+        if not items:
+            return
+        for item in items:
+            yield item
+    finally:
+        finish()
+",
+        ),
+    ] {
+        assert_matches_cpython_marshal(source, filename);
+    }
+}

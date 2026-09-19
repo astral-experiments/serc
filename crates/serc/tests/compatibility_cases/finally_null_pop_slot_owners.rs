@@ -173,3 +173,519 @@ fn matches_cpython_nested_finally_markers_after_collection_folding() {
         assert_matches_cpython_marshal(&source, "nested_finally_collection_fold.py");
     }
 }
+
+#[test]
+fn async_iterator_returns_preserve_ordinary_try_null_pop_slots() {
+    for (filename, source) in [
+        (
+            "coroutine_async_iterator_bare_return_finally_none_owner.py",
+            r"async def f(source, open_result, stop, close, idle):
+    while True:
+        result = None
+        try:
+            result = await open_result()
+            async for item in source:
+                if stop(item):
+                    return
+        except Exception as error:
+            record(error)
+        finally:
+            if result is not None:
+                close(result)
+        await idle()
+",
+        ),
+        (
+            "coroutine_async_iterator_handlerless_finally_control.py",
+            r"async def f(source, make_result):
+    status = None
+    try:
+        async for item in source:
+            if item:
+                status = 1
+                return make_result(item=item)
+        return make_result(item=None)
+    finally:
+        if status is None:
+            status = 2
+        record(status)
+",
+        ),
+    ] {
+        assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn async_iterator_value_returns_capture_finally_null_pop_slots() {
+    let source = r"async def f(source, prepare, stop, process, cleanup):
+    reload = False
+    status = None
+    try:
+        if await prepare():
+            status = Result.SKIPPED
+            return Finish(retry=True, reload=reload)
+        accepted = True
+        async for item in source:
+            process(item)
+            if stop(item):
+                status = (
+                    Result.SUCCESS
+                    if accepted
+                    else Result.ERROR
+                )
+                return Finish(
+                    retry=False, reload=reload
+                )
+            if item.failed:
+                accepted = False
+        return Finish(retry=True, reload=reload)
+    except Exception:
+        status = Result.ERROR
+        raise
+    finally:
+        if status is None:
+            status = Result.MISSING
+        record(status.value)
+        cleanup(status)
+";
+    assert_matches_cpython_marshal(
+        source,
+        "coroutine_async_iterator_branched_call_return_finally_none_owner.py",
+    );
+}
+
+#[test]
+fn coroutine_return_cleanup_preserves_original_finally_none_slots() {
+    for (filename, source) in [
+        (
+            "coroutine_iterator_handler_return_none_finalizer.py",
+            r#"async def f(manager, handle, attempts):
+    try:
+        for attempt in range(attempts):
+            try:
+                await work()
+            except Exception:
+                if should_stop(attempt):
+                    record("abandoned", attempt, handle)
+                    return
+                if await cancelled():
+                    return
+                continue
+            record("success", attempt, handle)
+            return
+    finally:
+        if handle is not None:
+            async with manager():
+                await release(handle)
+"#,
+        ),
+        (
+            "coroutine_iterator_handler_linear_finalizer_control.py",
+            r#"async def f(manager, handle, attempts):
+    try:
+        for attempt in range(attempts):
+            try:
+                await work()
+            except Exception:
+                if should_stop(attempt):
+                    record("abandoned", attempt, handle)
+                    return
+                if await cancelled():
+                    return
+                continue
+            record("success", attempt, handle)
+            return
+    finally:
+        async with manager():
+            await release(handle)
+"#,
+        ),
+        (
+            "coroutine_manager_handler_return_none_finalizer.py",
+            r"from contextlib import suppress
+
+async def f(manager, handle, flag):
+    try:
+        await work()
+        with manager():
+            if flag:
+                return
+            record(handle)
+    except Exception as error:
+        with manager():
+            if flag:
+                record(error)
+                return
+            report(error)
+    finally:
+        if handle is not None:
+            handle.cancel()
+            with suppress(Exception):
+                await handle
+",
+        ),
+        (
+            "coroutine_manager_handler_linear_finalizer_control.py",
+            r"from contextlib import suppress
+
+async def f(manager, handle, flag):
+    try:
+        await work()
+        with manager():
+            if flag:
+                return
+            record(handle)
+    except Exception as error:
+        with manager():
+            if flag:
+                record(error)
+                return
+            report(error)
+    finally:
+        handle.cancel()
+        with suppress(Exception):
+            await handle
+",
+        ),
+    ] {
+        assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn iterator_handler_continue_preserves_nested_finalizer_setup_slot() {
+    for (filename, source) in [
+        (
+            "iterator_value_return_nested_try_finalizer.py",
+            r"def f(values, make):
+    for value in values:
+        resource = None
+        try:
+            resource = make(value)
+            resource.prepare()
+            resource.bind(value)
+            return value
+        except OSError:
+            continue
+        finally:
+            try:
+                if resource is not None:
+                    resource.close()
+            except Exception:
+                pass
+    return None
+",
+        ),
+        (
+            "iterator_value_return_plain_finalizer_control.py",
+            r"def f(values, make):
+    for value in values:
+        resource = None
+        try:
+            resource = make(value)
+            resource.prepare()
+            resource.bind(value)
+            return value
+        except OSError:
+            continue
+        finally:
+            if resource is not None:
+                resource.close()
+    return None
+",
+        ),
+    ] {
+        assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn retained_nested_try_arrays_preserve_truth_marker_slots() {
+    for (filename, source) in [
+        (
+            "nested_try_ifexp_local_truth_owner.py",
+            r#"def f(resources, run, parse):
+    outputs = []
+    for resource in resources:
+        try:
+            async def listing():
+                return await resource.list()
+            text = run(listing())
+            files = []
+            try:
+                files = parse(text.strip().split("\n")[-1]) if text else []
+            except Exception:
+                files = [line for line in text.split("\n") if line]
+        except Exception:
+            files = []
+        outputs.extend(files)
+    return outputs
+"#,
+        ),
+        (
+            "nested_try_ifexp_linear_control.py",
+            r#"def f(resources, run, parse):
+    outputs = []
+    for resource in resources:
+        try:
+            async def listing():
+                return await resource.list()
+            text = run(listing())
+            files = []
+            try:
+                files = parse(text.strip().split("\n")[-1])
+            except Exception:
+                files = [line for line in text.split("\n") if line]
+        except Exception:
+            files = []
+        outputs.extend(files)
+    return outputs
+"#,
+        ),
+        (
+            "nested_try_finally_local_and_owner.py",
+            r#"def f(stages, flag, duration, clock, work, release):
+    for index, stage in enumerate(stages):
+        started = clock()
+        phase = f"stage {index}: preparing"
+        nodes: list[str] = []
+        try:
+            try:
+                if flag and duration:
+                    phase = "draining"
+                    nodes = work(stage, duration)
+                work(stage)
+            finally:
+                if flag and duration:
+                    release(nodes)
+        except Exception as error:
+            raise Error(phase, error) from error
+        report(clock() - started)
+"#,
+        ),
+        (
+            "nested_try_finally_local_and_linear_control.py",
+            r#"def f(stages, flag, duration, clock, work, release):
+    for index, stage in enumerate(stages):
+        started = clock()
+        phase = f"stage {index}: preparing"
+        nodes: list[str] = []
+        try:
+            try:
+                phase = "draining"
+                nodes = work(stage, duration)
+                work(stage)
+            finally:
+                if flag and duration:
+                    release(nodes)
+        except Exception as error:
+            raise Error(phase, error) from error
+        report(clock() - started)
+"#,
+        ),
+    ] {
+        assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn matches_cpython_guarded_finally_iterator_return_and_continue_origins() {
+    for (filename, source) in [
+        (
+            "guarded_cleanup_iterator_return_location_target.py",
+            r"async def f(items, first, second):
+    try:
+        for item in items:
+            try:
+                return item
+            finally:
+                if first is not None:
+                    try:
+                        await first.close()
+                    except Exception as error:
+                        report(error)
+                if second is not None:
+                    try:
+                        await second.close()
+                    except Exception as error:
+                        report(error)
+    except Exception:
+        raise
+",
+        ),
+        (
+            "guarded_cleanup_iterator_return_continue_target.py",
+            r"async def f(items, first, second):
+    try:
+        for item in items:
+            try:
+                if item:
+                    return item
+                continue
+            finally:
+                if first is not None:
+                    try:
+                        await first.close()
+                    except Exception as error:
+                        report(error)
+                if second is not None:
+                    try:
+                        await second.close()
+                    except Exception as error:
+                        report(error)
+    except Exception:
+        raise
+",
+        ),
+        (
+            "guarded_cleanup_iterator_return_plain_tail_control.py",
+            r"async def f(items, first, second):
+    try:
+        for item in items:
+            try:
+                return item
+            finally:
+                cleanup(item)
+    except Exception:
+        raise
+",
+        ),
+        (
+            "continued_finally_none_pop_0_calls.py",
+            r"async def f(items, resource, recover):
+    try:
+        for item in items:
+            try:
+                if item:
+                    continue
+            finally:
+                if resource is not None:
+                    try:
+                        await resource.close()
+                    except Exception:
+                        recover()
+    except Exception:
+        recover()
+",
+        ),
+        (
+            "continued_finally_none_pop_1_calls.py",
+            r"async def f(items, resource, recover):
+    try:
+        for item in items:
+            try:
+                if item:
+                    work()
+                    continue
+            finally:
+                if resource is not None:
+                    try:
+                        await resource.close()
+                    except Exception:
+                        recover()
+    except Exception:
+        recover()
+",
+        ),
+        (
+            "continued_finally_none_pop_2_calls.py",
+            r"async def f(items, resource, recover):
+    try:
+        for item in items:
+            try:
+                if item:
+                    work()
+                    work()
+                    continue
+            finally:
+                if resource is not None:
+                    try:
+                        await resource.close()
+                    except Exception:
+                        recover()
+    except Exception:
+        recover()
+",
+        ),
+    ] {
+        assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn matches_cpython_copied_handler_and_iterator_none_cleanup_owners() {
+    for (filename, source) in [
+        (
+            "generator_two_handler_none_cleanup.py",
+            r"def f(value):
+    try:
+        try:
+            operation()
+        except LookupError:
+            try:
+                other()
+            except KeyError:
+                return
+        yield value
+    finally:
+        if value is not None:
+            cleanup(value)
+",
+        ),
+        (
+            "generator_one_handler_none_cleanup_control.py",
+            r"def f(value):
+    try:
+        try:
+            operation()
+        except LookupError:
+            return
+        yield value
+    finally:
+        if value is not None:
+            cleanup(value)
+",
+        ),
+        (
+            "async_generator_iterator_attribute_none_null.py",
+            r"async def f(outer, inner, items, state):
+    async with outer, inner:
+        try:
+            async for item in items:
+                first()
+                second()
+                yield item
+                return
+        finally:
+            if state.task is not None:
+                await state.task
+",
+        ),
+        (
+            "generator_two_handler_guarded_else_none_cleanup.py",
+            r"def f(value, expected):
+    try:
+        try:
+            operation()
+        except LookupError:
+            try:
+                other()
+            except KeyError:
+                return
+        try:
+            yield value
+        except BaseException:
+            raise
+        else:
+            if value != expected:
+                raise RuntimeError('changed')
+    finally:
+        if value is not None:
+            cleanup(value)
+",
+        ),
+    ] {
+        assert_matches_cpython_marshal(source, filename);
+    }
+}

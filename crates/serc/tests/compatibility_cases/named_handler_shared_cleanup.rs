@@ -61,3 +61,244 @@ fn handler_cleanup_keeps_a_separately_lowered_loop_successor() {
         }
     }
 }
+
+#[test]
+fn named_handler_original_cleanup_uses_surviving_store_location() {
+    for (filename, source) in [
+        (
+            "named_handler_reversed_store_pair.py",
+            r"async def sample(flag, work, report):
+    try:
+        await work()
+    except ValueError as error:
+        if flag:
+            report(error)
+            left, right = None, None
+        else:
+            report(error)
+            left, right = None, None
+    except Exception:
+        left, right = None, None
+    return left, right
+",
+        ),
+        (
+            "named_handler_forward_store_pair_control.py",
+            r"async def sample(flag, work, report):
+    try:
+        await work()
+    except ValueError as error:
+        if flag:
+            report(error)
+            left = right = None
+        else:
+            report(error)
+            left = right = None
+    except Exception:
+        left = right = None
+    return left, right
+",
+        ),
+        (
+            "named_handler_multiline_store_pair_control.py",
+            r"async def sample(flag, work, report):
+    try:
+        await work()
+    except ValueError as error:
+        if flag:
+            report(error)
+            (left,
+             right) = None, None
+        else:
+            report(error)
+            (left,
+             right) = None, None
+    except Exception:
+        left, right = None, None
+    return left, right
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn named_handler_loop_exits_copy_original_name_cleanup() {
+    for (filename, source) in [
+        (
+            "named_handler_nested_retry_break_target.py",
+            r"def run(items, retries, work, report):
+    for item in items:
+        try:
+            work(item)
+        except LookupError as caught:
+            report(item)
+            for retry in retries:
+                try:
+                    work(item)
+                    break
+                except LookupError as caught:
+                    report(retry)
+                except Exception as caught:
+                    report(item)
+                    break
+            else:
+                report(item)
+        report(item)
+",
+        ),
+        (
+            "async_named_handler_multi_break_target.py",
+            r"async def run(items, work, report):
+    try:
+        await work(None)
+    except LookupError as caught:
+        report(None)
+        for item in items:
+            value = await work(item)
+            if value is None:
+                report(item)
+                break
+            if value:
+                break
+            try:
+                await work(value)
+                break
+            except ValueError:
+                report(value)
+        else:
+            await work(None)
+    report(None)
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn nested_named_handler_arms_share_the_original_cleanup() {
+    for (filename, source) in [
+        (
+            "named_nested_assignment_cleanup_target.py",
+            r"async def run(operation, ready, choose, record):
+    result = None
+    try:
+        result = operation()
+    except ValueError as error:
+        record(error)
+        token = operation()
+        if token and ready(token):
+            fallback = operation()
+            if choose(fallback):
+                result = error.value
+            else:
+                result = fallback
+    await record(result)
+    return result
+",
+        ),
+        (
+            "named_linear_assignment_cleanup_control.py",
+            r"async def run(operation, ready, choose, record):
+    result = None
+    try:
+        result = operation()
+    except ValueError as error:
+        record(error)
+        token = operation()
+        if token and ready(token):
+            fallback = operation()
+            result = fallback
+    await record(result)
+    return result
+",
+        ),
+        (
+            "named_nested_call_cleanup_target.py",
+            r"async def run(operation, manager, ready, choose, enabled, record):
+    try:
+        with manager:
+            result = await operation()
+    except ValueError as error:
+        result = error
+        if ready():
+            if choose(error):
+                if enabled():
+                    record(error)
+            else:
+                record(error, result)
+    await record(result)
+    return result
+",
+        ),
+        (
+            "named_linear_call_cleanup_control.py",
+            r"async def run(operation, manager, ready, choose, enabled, record):
+    try:
+        with manager:
+            result = await operation()
+    except ValueError as error:
+        result = error
+        if ready():
+            record(error, result)
+    await record(result)
+    return result
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn named_except_star_conditional_exits_copy_name_cleanup() {
+    for (filename, source) in [
+        (
+            "named_except_star_conditional_cleanup_copy_target.py",
+            r"async def run(work, choose, report):
+    try:
+        await work()
+    except* ValueError as group:
+        if choose(group):
+            report(group)
+        else:
+            assert len(group.exceptions) == 1
+    except* TypeError:
+        raise
+",
+        ),
+        (
+            "named_except_star_linear_cleanup_copy_control.py",
+            r"async def run(work, choose, report):
+    try:
+        await work()
+    except* ValueError as group:
+        report(group)
+        assert len(group.exceptions) == 1
+    except* TypeError:
+        raise
+",
+        ),
+        (
+            "named_except_star_elif_cleanup_copy_target.py",
+            r"async def run(work, choose, report):
+    try:
+        await work()
+    except* ValueError as group:
+        if choose(group, 0):
+            report(group, 0)
+        elif choose(group, 1):
+            report(group, 1)
+        else:
+            assert len(group.exceptions) == 1
+            report(group, 2)
+    except* TypeError:
+        raise
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

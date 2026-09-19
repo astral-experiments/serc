@@ -35,7 +35,7 @@ use super::scope::{
 };
 use super::source::{CompilationContext, implicit_return_range};
 use super::statement::{
-    ControlFlowState, statement_uses_implicit_return_location, suite_terminates,
+    ControlFlowState, suite_terminates, terminal_statement_uses_implicit_return_location,
 };
 use super::symbol::{ReraiseStackState, ResumeDepth, SymbolState, to_u32};
 use super::{Compiler, Scope};
@@ -473,7 +473,7 @@ impl<'source> Compiler<'source> {
         if add_implicit_return
             && body
                 .last()
-                .is_some_and(statement_uses_implicit_return_location)
+                .is_some_and(terminal_statement_uses_implicit_return_location)
         {
             self.assembler.set_location(
                 self.source_location(implicit_return_range(&self, body.last().unwrap())),
@@ -517,7 +517,7 @@ impl<'source> Compiler<'source> {
         if add_implicit_return
             && body
                 .last()
-                .is_some_and(statement_uses_implicit_return_location)
+                .is_some_and(terminal_statement_uses_implicit_return_location)
         {
             self.assembler.set_location(
                 self.source_location(implicit_return_range(&self, body.last().unwrap())),
@@ -647,8 +647,12 @@ impl<'source> Compiler<'source> {
             && let Some(Stmt::Expr(expression)) = statement.body.last()
             && fold_constant(&expression.value).is_some()
         {
-            // CPython transfers the final folded expression's location to the class footer.
-            footer_location = self.source_location(expression.range);
+            if statement.elif_else_clauses.is_empty() {
+                // Without an exit jump, the footer inherits the final expression's location.
+                footer_location = self.source_location(expression.range);
+            }
+            // A discarded else leaves an exit jump to the originally unlocated footer.
+            // Keep it unlocated until exit copying transfers the predecessor's location.
         } else if self.assembler.instruction_count() > body_start
             && let Some(location) = self.assembler.last_instruction_location()
         {
@@ -736,6 +740,11 @@ impl<'source> Compiler<'source> {
             let none = self.add_constant(Constant::None)?;
             self.emit(LOAD_CONST, none, 1)?;
             self.emit(RETURN_VALUE, 0, -1)?;
+        }
+        if matches!(&self.unit.scope, Scope::Class { .. }) {
+            // CPython first inlines unlocated class footers, then duplicates shared
+            // exits for conditional predecessors before propagating locations.
+            self.assembler.allow_last_no_location_block_inlining();
         }
         if self.output.constants.is_empty()
             && !(self.unit.name == "<lambda>" && self.unit.flags & CO_GENERATOR != 0)

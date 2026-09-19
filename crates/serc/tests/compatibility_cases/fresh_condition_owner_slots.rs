@@ -123,3 +123,83 @@ fn matches_cpython_condition_marker_preserves_outer_finally_owner() {
 ";
     assert_matches_cpython_marshal(source, "fresh_owner_outer_finally.py");
 }
+
+#[test]
+fn matches_cpython_async_function_for_break_try_expr() {
+    assert_matches_cpython_marshal(
+        r"async def f(values):
+    value = None
+    for item in values:
+        if consume(item):
+            value = item
+            break
+    try:
+        result = finish(value) if value else None
+    except Error:
+        return None
+    return result
+",
+        "async_function_for_break_try_expr.py",
+    );
+}
+
+#[test]
+fn matches_cpython_async_function_for_break_try_assert() {
+    assert_matches_cpython_marshal(
+        r#"async def f(values):
+    value = None
+    for item in values:
+        if consume(item):
+            value = item
+            break
+    try:
+        assert value, "missing"
+        return finish(value)
+    except Error:
+        return None
+"#,
+        "async_function_for_break_try_assert.py",
+    );
+}
+
+#[test]
+fn matches_cpython_fresh_try_call_condition_after_branch_join() {
+    for (filename, source) in [
+        (
+            "fresh_try_call_after_join_with_continuation.py",
+            r"def f(values, flag):
+    for value in values:
+        if flag:
+            prepare(value)
+        else:
+            fallback(value)
+        try:
+            if isinstance(value.payload, Kind):
+                consume(value)
+            else:
+                discard(value)
+        except Error:
+            recover(value)
+        after(value)
+",
+        ),
+        (
+            "fresh_try_call_after_guard_with_continuation.py",
+            r"def f(values, flag):
+    for value in values:
+        if flag:
+            raise Error(value)
+        try:
+            if isinstance(value, Kind):
+                consume(value)
+            else:
+                discard(value)
+        except Error:
+            recover(value)
+        after(value)
+",
+        ),
+    ] {
+        assert_matches_cpython_marshal(source, filename);
+    }
+}

@@ -44,3 +44,27 @@ fn matches_cpython_marshal_for_pruned_folded_constants() {
         "pruned_constant_alias.py",
     );
 }
+
+#[test]
+fn preserves_discarded_suite_fold_order_without_cleanup() {
+    common::assert_matches_cpython_marshal(
+        "if False:\n    sink((5, 3), -1)\nfor item in ['left', 'right']:\n    sink(item)\nsink((5, 3), -0.5, -1)\n",
+        "discarded_suite_fold_order.py",
+    );
+}
+
+#[test]
+fn preserves_discarded_suite_fold_order_after_finally_copying() {
+    common::assert_matches_cpython_marshal(
+        "def sample(stop):\n    if False:\n        sink((5, 3), -1)\n    try:\n        if stop:\n            return\n    finally:\n        sink((7, 11))\n    for item in ['left', 'right']:\n        sink(item)\n    sink((5, 3), -0.5, -1)\n",
+        "discarded_suite_finally_fold_order.py",
+    );
+}
+
+#[test]
+fn preserves_discarded_suite_fold_order_across_manager_cleanup() {
+    common::assert_matches_cpython_marshal(
+        "for token in tokens:\n    with manager():\n        if False:\n            sink((5, 3), -1)\nwith manager():\n    for item in ['left', 'right']:\n        sink(item)\nsink((5, 3), -0.5, -1)\n",
+        "discarded_suite_manager_fold_order.py",
+    );
+}
