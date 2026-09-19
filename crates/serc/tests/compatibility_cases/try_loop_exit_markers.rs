@@ -248,3 +248,151 @@ fn matches_cpython_folded_while_false_exit_location() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_loop_break_normal_try_exit_nops() {
+    for (filename, source) in [
+        (
+            "try_else_sync_for_break_exhaustion_assign_exit_nop.py",
+            r"def f(items, choose, prepare, finish):
+    result = None
+    try:
+        prepare()
+    except ValueError:
+        result = None
+    else:
+        for item in items:
+            if choose(item):
+                result = item
+                break
+        else:
+            result = tuple(items)
+    finish(result)
+    return result
+",
+        ),
+        (
+            "coroutine_try_else_sync_for_break_empty_exhaustion_exit_nop.py",
+            r"async def f(items, prepare, recover, finish):
+    result = None
+    try:
+        await prepare()
+    except ValueError as exc:
+        result = str(exc)
+    else:
+        for item in items:
+            result = await recover(item)
+            if result:
+                break
+    await finish(result)
+    return result
+",
+        ),
+        (
+            "try_else_sync_for_no_break_exit_nop_control.py",
+            r"def f(items, choose, prepare, finish):
+    result = None
+    try:
+        prepare()
+    except ValueError:
+        result = None
+    else:
+        for item in items:
+            result = choose(item)
+        else:
+            result = tuple(items)
+    finish(result)
+    return result
+",
+        ),
+        (
+            "try_else_sync_for_break_following_work_exit_nop_control.py",
+            r"def f(items, choose, prepare, finish):
+    result = None
+    try:
+        prepare()
+    except ValueError:
+        result = None
+    else:
+        for item in items:
+            if choose(item):
+                result = item
+                break
+        else:
+            result = tuple(items)
+        finish(result)
+    finish(result)
+    return result
+",
+        ),
+        (
+            "runtime_while_break_else_assignment_conditional_finally_exit_nop.py",
+            r#"def example(active, choose, prepare, recover, finish, guard):
+    result = 1
+    try:
+        prepare()
+        while active():
+            result = prepare()
+            if choose(result):
+                break
+        else:
+            recover("done" if guard else "empty")
+            result = 0
+    except ValueError as error:
+        recover(error)
+        result = 2
+    finally:
+        if guard is not None:
+            finish(result)
+    return result
+"#,
+        ),
+        (
+            "runtime_while_break_else_assignment_following_work_control.py",
+            r#"def example(active, choose, prepare, recover, finish, guard):
+    result = 1
+    try:
+        prepare()
+        while active():
+            result = prepare()
+            if choose(result):
+                break
+        else:
+            recover("done" if guard else "empty")
+            result = 0
+        prepare()
+    except ValueError as error:
+        recover(error)
+        result = 2
+    finally:
+        if guard is not None:
+            finish(result)
+    return result
+"#,
+        ),
+        (
+            "constant_while_break_else_assignment_finally_control.py",
+            r#"def example(active, choose, prepare, recover, finish, guard):
+    result = 1
+    try:
+        prepare()
+        while True:
+            result = prepare()
+            if choose(result):
+                break
+        else:
+            recover("done" if guard else "empty")
+            result = 0
+    except ValueError as error:
+        recover(error)
+        result = 2
+    finally:
+        if guard is not None:
+            finish(result)
+    return result
+"#,
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

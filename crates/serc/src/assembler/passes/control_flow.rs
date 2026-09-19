@@ -2958,6 +2958,7 @@ impl OptimizationPipeline {
                                     .chain(
                                         &self.exception_owner_provenance.compound_try_owner_exits,
                                     )
+                                    .chain(&self.exception_owner_provenance.guarded_try_else_exits)
                                     .any(|(entry, end)| {
                                         *end == target
                                             && graph[block].items()[..offset]

@@ -34,3 +34,47 @@ def name_cleanup_control(manager, value, locked):
 ";
     common::assert_matches_cpython_marshal(source, "protected_finally_condition_owners.py");
 }
+
+#[test]
+fn matches_cpython_unlocated_manager_finally_join() {
+    for (filename, source) in [
+        (
+            "manager_compound_guard_raise_cleanup_target.py",
+            r"def store_checked(manager, operation):
+    result = None
+    with manager():
+        try:
+            result = operation()
+        finally:
+            if result is not None and not result.accepted:
+                raise RuntimeError('rejected')
+    return result
+",
+        ),
+        (
+            "manager_single_guard_raise_cleanup_control.py",
+            r"def store_checked(manager, operation, failed):
+    result = None
+    with manager():
+        try:
+            result = operation()
+        finally:
+            if failed:
+                raise RuntimeError('rejected')
+    return result
+",
+        ),
+        (
+            "manager_generator_linear_cleanup_control.py",
+            r"def managed_value(manager, cleanup):
+    with manager():
+        try:
+            yield
+        finally:
+            cleanup()
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

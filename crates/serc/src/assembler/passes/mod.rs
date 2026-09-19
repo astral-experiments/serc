@@ -535,6 +535,22 @@ impl OptimizationPipeline {
                     origin.condition = *after;
                 }
             }
+            for (_, _, records) in &mut self
+                .exception_owner_provenance
+                .copied_bare_handler_none_prefixes
+            {
+                if records[8] == *before {
+                    records[8] = *after;
+                }
+            }
+            for records in &mut self
+                .exception_owner_provenance
+                .copied_iterator_attribute_none_prefixes
+            {
+                if records[3] == *before {
+                    records[3] = *after;
+                }
+            }
             for (_, records) in &mut self
                 .exception_owner_provenance
                 .copied_handler_return_none_prefixes

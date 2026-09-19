@@ -381,3 +381,95 @@ fn matches_cpython_terminal_else_try_backedge_locations() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn preserves_original_pop_absorption_before_protected_raises() {
+    for (filename, source) in [
+        (
+            "terminal_manager_assertion_pop_absorption_target.py",
+            r"async def read_chunks(manager, failed):
+    if failed:
+        yield 'unavailable'
+        return
+    with manager() as stream:
+        try:
+            value = stream.read()
+            assert value is not None
+        except Exception as error:
+            yield str(error)
+            return
+    yield value
+",
+        ),
+        (
+            "terminal_manager_assertion_shared_handler_control.py",
+            r"async def read_chunks(manager, failed):
+    if failed:
+        yield 'unavailable'
+        return
+    with manager() as stream:
+        try:
+            value = stream.read()
+            assert value is not None
+        except Exception as error:
+            yield str(error)
+    yield value
+",
+        ),
+        (
+            "guarded_try_else_own_finally_pop_absorption_target.py",
+            r"async def acquire_checked(connect, cleanup, active, key):
+    try:
+        value = await connect()
+    except BaseException:
+        raise
+    else:
+        if key not in active:
+            await value.close()
+            raise RuntimeError('inactive')
+    finally:
+        if key in active:
+            cleanup(key)
+    return value
+",
+        ),
+        (
+            "guarded_try_else_outer_finally_pop_absorption_target.py",
+            r"def inspect_checked(acquire, cleanup, expected):
+    try:
+        prepare()
+        try:
+            value = acquire()
+        except OSError:
+            raise
+        else:
+            if value != expected:
+                raise RuntimeError('changed')
+    finally:
+        if expected is not None:
+            cleanup(expected)
+    return value
+",
+        ),
+        (
+            "guarded_try_else_shared_finally_entry_control.py",
+            r"def inspect_checked(acquire, cleanup, expected):
+    try:
+        prepare()
+        try:
+            value = acquire()
+        except OSError:
+            value = expected
+        else:
+            if value != expected:
+                raise RuntimeError('changed')
+    finally:
+        if expected is not None:
+            cleanup(expected)
+    return value
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

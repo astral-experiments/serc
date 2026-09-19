@@ -62,6 +62,8 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) normal_finally_method_none_prefixes: Vec<[Instruction; 5]>,
     pub(super) normal_finally_truth_prefixes: Vec<[Instruction; 4]>,
     pub(super) copied_return_none_prefixes: Vec<CopiedReturnNonePrefix>,
+    pub(super) copied_bare_handler_none_prefixes: Vec<(Label, Label, [Instruction; 10])>,
+    pub(super) copied_iterator_attribute_none_prefixes: Vec<[Instruction; 4]>,
     pub(super) copied_cleanup_return_none_prefixes: Vec<CopiedCleanupReturnNonePrefix>,
     pub(super) copied_return_pop_prefixes: Vec<CopiedReturnPopPrefix>,
     pub(super) copied_return_truth_prefixes: Vec<CopiedReturnTruthPrefix>,
@@ -105,6 +107,8 @@ pub(super) struct ExceptionOwnerProvenance {
     // Original try/except POP_BLOCK exits inside their own finally, for owner transfer
     // and late redundant-exit removal, but not ordinary-try exit copying.
     pub(super) compound_try_owner_exits: Vec<(Label, Label)>,
+    // Sole original guard-false try-else edges; absorption by a later POP_BLOCK only.
+    pub(super) guarded_try_else_exits: Vec<(Label, Label)>,
     // Populated authored else arrays with direct normal edges into their own finally.
     pub(super) populated_try_else_borrow_exits: Vec<(Label, Label)>,
     pub(super) omitted_nop_locations: FxHashMap<Label, SourceLocation>,
@@ -6093,6 +6097,36 @@ impl LayoutAssembler {
                             );
                         }
                     }
+                    // A bare return through two unnamed handlers retains both POP_EXCEPTs.
+                    // Its late marker reuses the second POP_EXCEPT's original array cell.
+                    if instruction.opcode == NOT_TAKEN
+                        && owner_history_exact
+                        && pop_slot_epoch_known
+                        && tail.early_removals == 7
+                        && tail.insertions == 0
+                        && tail.late_removals == 0
+                        && tail.post_compaction_fusions == 0
+                        && owners
+                            .get(&instruction_index)
+                            .is_none_or(|owner| !owner.definitive)
+                        && let Some(region) = self.copied_bare_handler_none_owner(
+                            instruction_index,
+                            original_array_start,
+                            &indexed_instructions,
+                            &label_positions,
+                            &jump_targets,
+                        )
+                    {
+                        owners.insert(
+                            instruction_index,
+                            ExceptionOwnerDecision {
+                                has_owner: true,
+                                source_region: Some(region),
+                                definitive: true,
+                                override_existing: true,
+                            },
+                        );
+                    }
                     // The unnamed-handler return has two separate NULL POP cells. If
                     // both disappear, the later comparison append can reuse POP_EXCEPT's
                     // original protected cell. Replay only the captured unwind records;
@@ -7260,6 +7294,83 @@ impl LayoutAssembler {
                             },
                         );
                     }
+                    // An attribute None test follows the same captured iterator disposal.
+                    // Its append cell is either that owned POP_TOP or the following NULL POP.
+                    if instruction.opcode == NOT_TAKEN
+                        && owner_history_exact
+                        && tail.insertions == 0
+                        && tail.late_removals == 0
+                        && tail.post_compaction_fusions == 0
+                        && instruction.exception_policy() == super::ExceptionPolicy::NonePresent
+                        && owners
+                            .get(&instruction_index)
+                            .is_none_or(|owner| !owner.definitive)
+                        && let Some((array, iterator, slot, region)) = early_return_iterator_slot
+                        && original_array_start == array
+                        && instruction_index.checked_sub(iterator) == Some(4)
+                        && (instruction_index == slot
+                            || slot.checked_add(1) == Some(instruction_index))
+                        && self
+                            .exception_owner_provenance
+                            .copied_iterator_attribute_none_prefixes
+                            .iter()
+                            .filter(|[original_pop, original_load, attribute, condition]| {
+                                let mut load = *original_load;
+                                load.local_policy.add_hidden_exception_owner_slots(1);
+                                let actual = indexed_instructions[iterator + 1];
+                                if actual.opcode == crate::target::opcodes::LOAD_FAST_BORROW {
+                                    load.opcode = actual.opcode;
+                                }
+                                self.exception_owner_provenance
+                                    .early_return_iterator_pops
+                                    .iter()
+                                    .any(|(_, original_iterator, pop, target)| {
+                                        let mut expected_iterator = *original_iterator;
+                                        expected_iterator
+                                            .local_policy
+                                            .add_hidden_exception_owner_slots(1);
+                                        pop == original_pop
+                                            && expected_iterator == *indexed_instructions[iterator]
+                                            && self.exception_regions[region].target == *target
+                                    })
+                                    && *actual == load
+                                    && *indexed_instructions[iterator + 2] == *attribute
+                                    && *indexed_instructions[iterator + 3] == *condition
+                                    && instruction.location == condition.location
+                            })
+                            .count()
+                            == 1
+                        && self
+                            .exception_owner_provenance
+                            .removed_pop_block_boundaries
+                            .iter()
+                            .any(|label| {
+                                label_positions.get(label) == Some(&(iterator + 1))
+                                    && self
+                                        .exception_owner_provenance
+                                        .removed_pop_block_widths
+                                        .get(label)
+                                        .copied()
+                                        .unwrap_or(1)
+                                        == 1
+                            })
+                        && !jump_targets.iter().any(|label| {
+                            label_positions
+                                .get(label)
+                                .is_some_and(|&p| iterator < p && p <= instruction_index)
+                        })
+                    {
+                        let source_region = (instruction_index == slot).then_some(region);
+                        owners.insert(
+                            instruction_index,
+                            ExceptionOwnerDecision {
+                                has_owner: source_region.is_some(),
+                                source_region,
+                                definitive: true,
+                                override_existing: true,
+                            },
+                        );
+                    }
                     // The explicit TO_BOOL places a truthiness marker one cell later
                     // than a None test. Either original POP cell is still NULL; the
                     // preceding authored return NOP and unchanged earlier array cells
@@ -7543,6 +7654,67 @@ impl LayoutAssembler {
             );
         }
         owners
+    }
+
+    /// Replays the complete original bare-return array through two unnamed handlers.
+    fn copied_bare_handler_none_owner(
+        &self,
+        marker: usize,
+        array: usize,
+        instructions: &[&Instruction],
+        positions: &FxHashMap<Label, usize>,
+        targets: &FxHashSet<Label>,
+    ) -> Option<usize> {
+        if marker.checked_sub(array) != Some(5)
+            || targets.iter().any(|label| {
+                positions
+                    .get(label)
+                    .is_some_and(|&p| array < p && p <= marker)
+            })
+        {
+            return None;
+        }
+        let mut matching = self
+            .exception_owner_provenance
+            .copied_bare_handler_none_prefixes
+            .iter()
+            .filter(|(entry, _, records)| {
+                if positions.get(entry) != Some(&array) || *instructions[marker] != records[9] {
+                    return false;
+                }
+                let mut inner = records[3];
+                inner.local_policy.add_hidden_exception_owner_slots(2);
+                let mut outer = records[5];
+                outer.local_policy.add_hidden_exception_owner_slots(1);
+                let mut load = records[7];
+                let actual_load = instructions[array + 3];
+                if !matches!(
+                    actual_load.opcode,
+                    crate::target::opcodes::LOAD_FAST | crate::target::opcodes::LOAD_FAST_BORROW
+                ) {
+                    return false;
+                }
+                // Borrow analysis can require an owned reference without changing this cell.
+                load.opcode = actual_load.opcode;
+                load.local_policy = super::LocalPolicy::for_load(
+                    actual_load.local_policy.force_owned_load(),
+                    false,
+                );
+                load.local_policy.add_hidden_exception_owner_slots(1);
+                *instructions[array] == records[0]
+                    && *instructions[array + 1] == inner
+                    && *instructions[array + 2] == outer
+                    && *actual_load == load
+                    && *instructions[array + 4] == records[8]
+            });
+        let (_, finally_handler, _) = matching.next()?;
+        if matching.next().is_some() {
+            return None;
+        }
+        let region = self.uniform_exception_owner(array + 2, array + 3, positions)?;
+        let owner = &self.exception_regions[region];
+        (!owner.is_scope_fallback && !owner.preserve_lasti && owner.target == *finally_handler)
+            .then_some(region)
     }
 
     /// Recognizes the unchanged result discard at an authored ordinary-await entry.

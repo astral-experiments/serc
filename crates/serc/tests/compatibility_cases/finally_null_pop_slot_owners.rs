@@ -612,3 +612,80 @@ fn matches_cpython_guarded_finally_iterator_return_and_continue_origins() {
         assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_copied_handler_and_iterator_none_cleanup_owners() {
+    for (filename, source) in [
+        (
+            "generator_two_handler_none_cleanup.py",
+            r"def f(value):
+    try:
+        try:
+            operation()
+        except LookupError:
+            try:
+                other()
+            except KeyError:
+                return
+        yield value
+    finally:
+        if value is not None:
+            cleanup(value)
+",
+        ),
+        (
+            "generator_one_handler_none_cleanup_control.py",
+            r"def f(value):
+    try:
+        try:
+            operation()
+        except LookupError:
+            return
+        yield value
+    finally:
+        if value is not None:
+            cleanup(value)
+",
+        ),
+        (
+            "async_generator_iterator_attribute_none_null.py",
+            r"async def f(outer, inner, items, state):
+    async with outer, inner:
+        try:
+            async for item in items:
+                first()
+                second()
+                yield item
+                return
+        finally:
+            if state.task is not None:
+                await state.task
+",
+        ),
+        (
+            "generator_two_handler_guarded_else_none_cleanup.py",
+            r"def f(value, expected):
+    try:
+        try:
+            operation()
+        except LookupError:
+            try:
+                other()
+            except KeyError:
+                return
+        try:
+            yield value
+        except BaseException:
+            raise
+        else:
+            if value != expected:
+                raise RuntimeError('changed')
+    finally:
+        if value is not None:
+            cleanup(value)
+",
+        ),
+    ] {
+        assert_matches_cpython_marshal(source, filename);
+    }
+}
