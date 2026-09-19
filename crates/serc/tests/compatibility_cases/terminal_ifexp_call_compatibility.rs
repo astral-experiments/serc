@@ -64,3 +64,66 @@ def first_argument_control(value):
 "#;
     common::assert_matches_cpython_marshal(source, "terminal_ifexp_call_compatibility.py");
 }
+
+#[test]
+fn matches_cpython_discarded_if_expression_exit_copies() {
+    for (filename, source) in [
+        (
+            "discarded_ifexp_normal_finally_await_target.py",
+            r"async def target(resource):
+    try:
+        await work()
+    finally:
+        await resource.close() if resource else None
+    return build_result()
+",
+        ),
+        (
+            "discarded_ifexp_outer_arm_calls_target.py",
+            r"def target(outer, choose, left, right):
+    if outer:
+        left() if choose else right()
+    else:
+        fallback()
+    finish()
+",
+        ),
+        (
+            "discarded_ifexp_protected_outer_arm_target.py",
+            r"def target(outer, choose, left, right):
+    try:
+        if outer:
+            left() if choose else right()
+        elif choose:
+            fallback()
+        finish()
+    except Exception:
+        recover()
+    return None
+",
+        ),
+        (
+            "discarded_ifexp_following_call_control.py",
+            r"def target(outer, choose, left, right):
+    if outer:
+        left() if choose else right()
+        following()
+    else:
+        fallback()
+    finish()
+",
+        ),
+        (
+            "discarded_ifexp_folded_false_selector_control.py",
+            r"def target(outer, left, right):
+    if outer:
+        left() if False else right()
+    else:
+        fallback()
+    finish()
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

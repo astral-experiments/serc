@@ -10101,6 +10101,14 @@ impl Compiler<'_> {
                         && self
                             .assembler
                             .current_original_block_ends_with_discarded_call();
+                    let discarded_if_exit = matches!(body.last(), Some(Stmt::Expr(expression))
+                        if matches!(expression.value.as_ref(), Expr::If(conditional)
+                            if early_condition_truthiness(&conditional.test).is_none()))
+                        && self
+                            .assembler
+                            .current_original_block_pre_fusion_instruction_count()
+                            == 1
+                        && self.assembler.current_original_block_location().is_none();
                     let branch_exit = if direct_try_body_exit
                         && self.control.in_iterator_loop()
                         && self
@@ -10140,6 +10148,14 @@ impl Compiler<'_> {
                         }
                         branch_exit
                     };
+                    if discarded_if_exit
+                        && !direct_try_body_exit
+                        && self.assembler.last_instruction_location() == Some(SourceLocation::NONE)
+                    {
+                        // Copy the original unlocated POP_TOP and outer exit onto the
+                        // conditional expression's unconditional true-arm jump.
+                        self.assembler.allow_last_unconditional_block_inlining();
+                    }
                     let folded_or_true_exit = branch_index == 0
                         && matches!(self.unit.scope, Scope::Function { .. })
                         && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
@@ -22761,6 +22777,11 @@ impl Compiler<'_> {
             let finalizer_tail_count = self
                 .assembler
                 .current_original_block_pre_fusion_instruction_count();
+            let discarded_if_exit = finalizer_tail_count == 1
+                && self.assembler.current_original_block_location().is_none()
+                && matches!(statement.finalbody.last(), Some(Stmt::Expr(expression))
+                    if matches!(expression.value.as_ref(), Expr::If(conditional)
+                        if early_condition_truthiness(&conditional.test).is_none()));
             let comprehension_restore_tail = finalizer_tail_count == 3
                 && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
                 && statement.handlers.is_empty()
@@ -22799,6 +22820,12 @@ impl Compiler<'_> {
                 end,
                 exception_policy,
             )?;
+            if discarded_if_exit
+                && self.assembler.last_instruction_location() == Some(SourceLocation::NONE)
+            {
+                // The normal-finally exit completes the same unlocated discard array.
+                self.assembler.allow_last_unconditional_block_inlining();
+            }
             if separate_manager_pop {
                 // Original exit copying and line resolution precede jump removal.
                 self.assembler.defer_jump_removal(normal_exit);
