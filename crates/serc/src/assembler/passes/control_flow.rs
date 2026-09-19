@@ -1394,6 +1394,88 @@ impl OptimizationPipeline {
                 Some((source_index, (source, target)))
             })
             .collect::<FxHashMap<_, _>>();
+        // A post-manager break retains a NOP for small-exit copying. That marker
+        // does not prevent threading its original, unowned single backedge.
+        // Keep all forward exits and cleanup-bearing targets under the usual guard.
+        let mut retained_break_policy = super::super::ir::JumpPolicy::default();
+        retained_break_policy.retain_nop();
+        retained_break_policy.prevent_threading_target();
+        let retained_break_backedges = instruction_positions
+            .iter()
+            .enumerate()
+            .filter_map(|(source_index, (block, offset))| {
+                let items = graph[*block].items();
+                let Item::Instruction(jump) = items[*offset] else {
+                    return None;
+                };
+                if jump.opcode != JUMP_FORWARD
+                    || !jump.fusion_policy.is_authored_break()
+                    || jump.jump_policy != retained_break_policy
+                    || jump.location.line < 0
+                    || jump.pre_fold_extra_instructions() != 0
+                    || jump.local_policy.hidden_exception_owner_slots() != 0
+                    || jump.exception_policy() != super::super::ExceptionPolicy::default()
+                    || jump.no_location_policy != super::super::ir::NoLocationPolicy::default()
+                    || *offset + 1 != items.len()
+                    || items[..*offset]
+                        .iter()
+                        .any(|item| !matches!(item, Item::Label(_)))
+                {
+                    return None;
+                }
+                let Operand::Forward(entry) = jump.operand() else {
+                    return None;
+                };
+                let entry_index = *label_offsets.get(&entry)?;
+                let target_block = graph.label_block(entry)?;
+                let [Item::Label(label), Item::Instruction(backedge)] = graph[target_block].items()
+                else {
+                    return None;
+                };
+                let Operand::Backward(target) = backedge.operand() else {
+                    return None;
+                };
+                let target_index = *label_offsets.get(&target)?;
+                (*label == entry
+                    && target_index < source_index
+                    && source_index < entry_index
+                    && self
+                        .exception_owner_provenance
+                        .source_boundaries
+                        .contains(&entry)
+                    && self
+                        .exception_owner_provenance
+                        .block_boundaries
+                        .contains(&entry)
+                    && !self.original_nop_targets.contains(&entry)
+                    && !self
+                        .exception_owner_provenance
+                        .omitted_nop_counts
+                        .contains_key(&entry)
+                    && !self
+                        .exception_owner_provenance
+                        .omitted_nop_locations
+                        .contains_key(&entry)
+                    && !planned_sources.contains(&entry_index)
+                    && region_ranges.iter().all(|range| {
+                        !range.contains(&source_index) && !range.contains(&entry_index)
+                    })
+                    && backedge.opcode == JUMP_BACKWARD
+                    && backedge.location == SourceLocation::NONE
+                    && backedge.jump_policy == super::super::ir::JumpPolicy::default()
+                    && backedge.no_location_policy == super::super::ir::NoLocationPolicy::default()
+                    && backedge.exception_policy() == super::super::ExceptionPolicy::default()
+                    && backedge.pre_fold_extra_instructions() == 0
+                    && backedge.local_policy.hidden_exception_owner_slots() == 0
+                    && backedge.depth_after().is_some()
+                    && backedge.depth_after() == jump.depth_after()
+                    && jump_targets[usize::try_from(entry.0).expect("label index fits in usize")]
+                        .is_some()
+                    && jump_targets[usize::try_from(target.0).expect("label index fits in usize")]
+                        .is_none())
+                .then_some(source_index)
+            })
+            .collect::<FxHashSet<_>>();
         let authored_finally_break_targets = Self::take_authored_finally_break_threading_targets(
             &self.graph,
             &mut self.borrow_authored_finally_break_origins,
@@ -1410,7 +1492,8 @@ impl OptimizationPipeline {
             // have a forward target here, including an original handler break.
             if planned_sources.contains(&source_index)
                 || !is_unconditional_jump(instruction.opcode)
-                || instruction.jump_policy.always_retains_nop()
+                || (instruction.jump_policy.always_retains_nop()
+                    && !retained_break_backedges.contains(&source_index))
             {
                 return;
             }

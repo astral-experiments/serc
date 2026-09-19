@@ -34,6 +34,7 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) named_handler_try_prefixes: Vec<OriginalPopBlockSpan>,
     pub(super) continued_handler_try_prefixes: Vec<OriginalPopBlockSpan>,
     pub(super) copied_handler_finally_pops: Vec<OriginalPopBlockSpan>,
+    pub(super) iterator_return_pop_spans: Vec<(Instruction, OriginalPopBlockSpan)>,
     pub(super) fused_manager_owners: Vec<(Instruction, Instruction, super::ExceptionRegion)>,
     pub(super) handler_dispatch_arrays: Vec<HandlerDispatchArray>,
     pub(super) block_boundaries: FxHashSet<Label>,
@@ -1596,10 +1597,10 @@ impl LayoutAssembler {
         };
         let mut slots = FxHashMap::default();
         let mut aliases = FxHashSet::default();
-        for (origin, pop_count, requires_handler_pair) in provenance
+        for (origin, pop_count, requires_handler_pair, returned_value) in provenance
             .named_handler_pop_pairs
             .iter()
-            .map(|origin| (origin, 2, false))
+            .map(|origin| (origin, 2, false, None))
             .chain(provenance.copied_handler_finally_pops.iter().map(|origin| {
                 let pops = origin
                     .items
@@ -1609,8 +1610,14 @@ impl LayoutAssembler {
                         if instruction.fusion_policy.is_converted_pop_block())
                     })
                     .count();
-                (origin, pops, true)
+                (origin, pops, true, None)
             }))
+            .chain(
+                provenance
+                    .iterator_return_pop_spans
+                    .iter()
+                    .map(|(value, origin)| (origin, 2, false, Some(*value))),
+            )
         {
             let Some(&array) = label_positions.get(&origin.entry) else {
                 continue;
@@ -1702,6 +1709,29 @@ impl LayoutAssembler {
             let Some(current) = self.items.get(begin..begin + expected.len()) else {
                 continue;
             };
+            if let Some(mut value) = returned_value {
+                let Some(Item::Instruction(current_value)) =
+                    begin.checked_sub(1).and_then(|index| self.items.get(index))
+                else {
+                    continue;
+                };
+                if current_value.opcode == super::LOAD_FAST_BORROW {
+                    value.opcode = super::LOAD_FAST_BORROW;
+                }
+                if *current_value != value
+                    || !provenance.source_boundaries.contains(&origin.entry)
+                    || provenance
+                        .retired_normal_try_copy_labels
+                        .contains(&origin.entry)
+                    || labels.iter().any(|label| {
+                        provenance.retired_normal_try_copy_labels.contains(label)
+                            || provenance.fusion_boundaries.contains(label)
+                            || provenance.omitted_nop_counts.contains_key(label)
+                    })
+                {
+                    continue;
+                }
+            }
             if !expected.iter().zip(current).all(|(expected, current)| {
                 let mut expected = *expected;
                 if let (Item::Instruction(expected), Item::Instruction(current)) =

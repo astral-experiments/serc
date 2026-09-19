@@ -124,3 +124,72 @@ fn while_break_named_retry_large_successor() {
         "while_break_named_retry_large_successor.py",
     );
 }
+
+#[test]
+fn retained_manager_break_threads_only_to_original_backedge() {
+    for (filename, source) in [
+        (
+            "retry_manager_success_break_backedge_original_shape_target.py",
+            r"def write_batches(batches, opener, report, stopped, delay):
+    index = 0
+    while index < len(batches):
+        items = batches[index]
+        index += 1
+        while True:
+            try:
+                with opener() as sink:
+                    for item in items:
+                        sink.write(item)
+                break
+            except Exception as error:
+                report(error)
+                if stopped():
+                    break
+                delay()
+",
+        ),
+        (
+            "retry_manager_success_break_live_continuation_control.py",
+            r"def write_batches(batches, opener, report, stopped, delay, completed):
+    index = 0
+    while index < len(batches):
+        items = batches[index]
+        index += 1
+        while True:
+            try:
+                with opener() as sink:
+                    for item in items:
+                        sink.write(item)
+                break
+            except Exception as error:
+                report(error)
+                if stopped():
+                    break
+                delay()
+        completed()
+",
+        ),
+        (
+            "retry_plain_success_break_backedge_control.py",
+            r"def write_batches(batches, opener, report, stopped, delay):
+    index = 0
+    while index < len(batches):
+        items = batches[index]
+        index += 1
+        while True:
+            try:
+                sink = opener()
+                for item in items:
+                    sink.write(item)
+                break
+            except Exception as error:
+                report(error)
+                if stopped():
+                    break
+                delay()
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

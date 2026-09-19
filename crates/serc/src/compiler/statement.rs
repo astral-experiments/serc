@@ -6868,6 +6868,68 @@ impl Compiler<'_> {
                                 && !cleanup.handlers.is_empty())
                             && self.assembler.location() == SourceLocation::NONE
                             && self.assembler.at_original_unconditional_join();
+                    // This ordinary try was entered inside the synchronous iterator.
+                    // CPython unwinds its POP_BLOCK before SWAP/POP_TOP disposes of the
+                    // iterator, then emits the outer finally's separate POP_BLOCK.
+                    let copied_iterator_try_pop = if self.context.target_specific_rules_enabled()
+                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                            == CO_COROUTINE
+                        && preserve_tos
+                        && !return_is_overridden
+                        && matches!(statement.value.as_deref(), Some(Expr::Name(_)))
+                        && context_index == 0
+                        && return_finally_contexts.len() == 1
+                        && handler_count == 0
+                        && finally_context.handler_depth == 0
+                        && finally_context.loop_depth == 0
+                        && finally_context.with_depth == 0
+                        && finally_context.try_body_depth == 0
+                        && finally_context.exception_region_depth == 0
+                        && next_loop == 1
+                        && next_with == 0
+                        && self.control.withs.active_with_exits.is_empty()
+                        && self.control.exceptions.active_try_marker_slots.len() == 1
+                        && self
+                            .control
+                            .exceptions
+                            .active_exception_region_exclusions
+                            .len()
+                            == 2
+                        && self.control.exceptions.active_exception_group_handlers == 0
+                        && self.control.finally.active_finally_end_blocks == 0
+                        && self.control.finally.active_normal_finally_bodies == 0
+                        && self.control.finally.active_copied_finally_bodies == 0
+                        && self.control.finally.copied_return_finally_preserved_values == 0
+                        && self
+                            .control
+                            .finally
+                            .active_pass_finally_locations
+                            .is_empty()
+                        && self
+                            .control
+                            .finally
+                            .preserved_return_value_contexts
+                            .is_empty()
+                        && matches!(self.control.loops.contexts.as_slice(), [iterator]
+                            if iterator.iterator_cleanup == IteratorCleanup::Sync
+                                && iterator.with_depth == 0
+                                && iterator.finally_end_depth == 0
+                                && iterator.exception_region_depth == 1)
+                    {
+                        let pop_item = self.assembler.item_count();
+                        self.assembler
+                            .set_location(self.source_location(statement.range));
+                        self.emit_with_exception_policy(
+                            NOP,
+                            0,
+                            0,
+                            ExceptionPolicy::EXCLUDE_ALWAYS,
+                        )?;
+                        self.assembler.mark_last_as_converted_pop_block();
+                        Some(pop_item)
+                    } else {
+                        None
+                    };
                     let iterator_cleanup_start = self.assembler.label();
                     self.assembler.mark(iterator_cleanup_start);
                     self.emit_return_loop_iterator_cleanup(
@@ -7935,6 +7997,12 @@ impl Compiler<'_> {
                     {
                         self.assembler
                             .record_copied_handler_return_none_prefix(pop_item);
+                    }
+                    if result.is_ok()
+                        && let Some(pop_item) = copied_iterator_try_pop
+                    {
+                        self.assembler
+                            .record_iterator_return_pop_span(copied_handler_return_item, pop_item);
                     }
                     if result.is_ok()
                         && let Some(pop_item) = copied_handler_finally_pop

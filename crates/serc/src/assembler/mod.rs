@@ -7863,6 +7863,143 @@ impl Assembler {
             });
     }
 
+    /// Captures the two original POP cells on either side of a saved iterator return.
+    pub(crate) fn record_iterator_return_pop_span(&mut self, return_item: usize, pop_item: usize) {
+        let items = self.linear_items();
+        let Some(end) = return_item.checked_add(11) else {
+            return;
+        };
+        let Some(
+            [
+                Item::Instruction(value),
+                Item::Label(start),
+                Item::Instruction(inner_pop),
+                Item::Label(iterator_start),
+                Item::Label(region_start),
+                Item::Instruction(swap),
+                Item::Instruction(discard),
+                Item::Label(iterator_end),
+                Item::Label(finally_start),
+                Item::Instruction(final_pop),
+                Item::Instruction(callable),
+            ],
+        ) = items.get(return_item..end)
+        else {
+            return;
+        };
+        let Some(depth) = value.depth_after() else {
+            return;
+        };
+        let Some(after_discard) = depth.checked_sub(1) else {
+            return;
+        };
+        let Some(after_callable) = after_discard.checked_add(2) else {
+            return;
+        };
+        let labels = [
+            *start,
+            *iterator_start,
+            *region_start,
+            *iterator_end,
+            *finally_start,
+        ];
+        let records = [value, inner_pop, swap, discard, final_pop, callable];
+        if return_item.checked_add(2) != Some(pop_item)
+            || value.opcode != LOAD_FAST
+            || !matches!(value.operand(), Operand::Value(_))
+            || value.exception_policy() != ExceptionPolicy::NoneUnchanged
+            || value.location.line != inner_pop.location.line
+            || value.location.end_line != inner_pop.location.end_line
+            || value.location.column < inner_pop.location.column
+            || value.location.end_column != inner_pop.location.end_column
+            || swap.opcode != SWAP
+            || swap.operand() != Operand::Value(2)
+            || swap.depth_after() != Some(depth)
+            || discard.opcode != POP_TOP
+            || discard.operand() != Operand::Value(0)
+            || discard.depth_after() != Some(after_discard)
+            || callable.opcode != LOAD_GLOBAL
+            || !matches!(callable.operand(), Operand::Value(argument) if argument & 1 != 0)
+            || callable.depth_after() != Some(after_callable)
+            || inner_pop.depth_after() != Some(depth)
+            || final_pop.depth_after() != Some(after_discard)
+            || [inner_pop, final_pop].iter().any(|record| {
+                record.opcode != NOP
+                    || record.operand() != Operand::Value(0)
+                    || !record.fusion_policy.is_converted_pop_block()
+                    || record.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
+            })
+            || [swap, discard, callable].iter().any(|record| {
+                record.exception_policy() != ExceptionPolicy::NoneUnchanged
+                    || record.fusion_policy.is_converted_pop_block()
+            })
+            || [swap, discard, final_pop]
+                .iter()
+                .any(|record| record.location != inner_pop.location)
+            || records.iter().any(|record| {
+                record.local_policy.hidden_exception_owner_slots() != 0
+                    || record.pre_fold_extra_instructions() != 0
+                    || record.jump_policy.borrow_empty_block()
+                    || record.no_location_policy.borrow_fallthrough()
+                        != BorrowFallthrough::Reachable
+            })
+            || labels.iter().enumerate().any(|(index, label)| {
+                labels[..index].contains(label)
+                    || self
+                        .exception_owner_provenance
+                        .block_boundaries
+                        .contains(label)
+                    || self
+                        .exception_owner_provenance
+                        .source_boundaries
+                        .contains(label)
+                    || self
+                        .exception_owner_provenance
+                        .fusion_boundaries
+                        .contains(label)
+                    || self
+                        .exception_owner_provenance
+                        .setups
+                        .iter()
+                        .any(|(setup, _)| setup == label)
+            })
+        {
+            return;
+        }
+        let Some(entry) = items[..return_item]
+            .iter()
+            .rev()
+            .find_map(|item| match item {
+                Item::Label(label)
+                    if self
+                        .exception_owner_provenance
+                        .block_boundaries
+                        .contains(label) =>
+                {
+                    Some(*label)
+                }
+                _ => None,
+            })
+        else {
+            return;
+        };
+        if !self
+            .exception_owner_provenance
+            .source_boundaries
+            .contains(&entry)
+        {
+            return;
+        }
+        let value = *value;
+        let span = exception_owners::OriginalPopBlockSpan {
+            entry,
+            items: items[return_item + 1..end].to_vec(),
+        };
+        self.exception_owner_provenance
+            .iterator_return_pop_spans
+            .push((value, span));
+    }
+
     /// Captures an iterator return's final POP run and its first local load.
     pub(crate) fn record_copied_handler_finally_pop_prefix(&mut self, pop_item: usize) {
         let items = self.linear_items();
