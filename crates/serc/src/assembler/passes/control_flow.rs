@@ -1041,6 +1041,60 @@ impl OptimizationPipeline {
                     .then_some(entry_index)
             })
             .collect::<FxHashSet<_>>();
+        // This producer-certified empty join has no original POP_BLOCK. Its
+        // synthetic exclusion label must not transfer the absent target owner
+        // onto an incoming branch when the redundant join is threaded away.
+        // Validate the complete original jump and all of its current entry aliases;
+        // copied, populated, or real ordinary-try exits keep the existing rules.
+        let synthetic_manager_join_offsets = self
+            .exception_owner_provenance
+            .synthetic_manager_join_exits
+            .iter()
+            .filter_map(|(entry, original)| {
+                let index = *label_offsets.get(entry)?;
+                let &(block, offset) = instruction_positions.get(index)?;
+                let items = graph[block].items();
+                let Item::Instruction(jump) = items[offset] else {
+                    return None;
+                };
+                (jump == *original
+                    && jump.opcode == JUMP_FORWARD
+                    && jump.location == SourceLocation::NONE
+                    && jump.no_location_policy.preserves_location()
+                    && jump.exception_policy() == super::super::ExceptionPolicy::default()
+                    && jump.pre_fold_extra_instructions() == 0
+                    && jump.local_policy.hidden_exception_owner_slots() == 0
+                    && !jump.fusion_policy.is_converted_pop_block()
+                    && !jump.fusion_policy.is_authored_break()
+                    && !jump.jump_policy.is_interruptible()
+                    && jump.jump_policy.defers_redundant_removal()
+                    && !jump.jump_policy.preserves_nop_after_threading()
+                    && offset + 1 == items.len()
+                    && items[..offset].contains(&Item::Label(*entry))
+                    && items[..offset].iter().all(|item| match item {
+                        Item::Instruction(_) => false,
+                        Item::Label(label) => {
+                            !self.original_nop_targets.contains(label)
+                                && !self.borrow_block_aliases.contains(label)
+                                && !self
+                                    .exception_owner_provenance
+                                    .original_manager_pop_blocks
+                                    .contains(label)
+                                && !self
+                                    .exception_owner_provenance
+                                    .omitted_nop_counts
+                                    .contains_key(label)
+                                && !self
+                                    .exception_owner_provenance
+                                    .omitted_nop_locations
+                                    .contains_key(label)
+                        }
+                    })
+                    && !normal_try_exits.contains(&index)
+                    && !compound_try_owner_exits.contains(&index))
+                .then_some(index)
+            })
+            .collect::<FxHashSet<_>>();
         let mut jump_targets =
             vec![None; usize::try_from(self.next_label).expect("label count fits in usize")];
         let mut jump_target_count = 0;
@@ -1074,6 +1128,7 @@ impl OptimizationPipeline {
                             // Borrowed-load reachability does not establish that provenance.
                             let pop_block_owner = (pop_block_offsets
                                 .contains(&label_offsets[label])
+                                && !synthetic_manager_join_offsets.contains(&label_offsets[label])
                                 && !(instruction.jump_policy.preserves_nop_after_threading()
                                     && instruction.location.line < 0
                                     && !normal_try_exits.contains(&label_offsets[label])

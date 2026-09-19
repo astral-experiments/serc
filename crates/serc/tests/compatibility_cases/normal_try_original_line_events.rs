@@ -473,3 +473,106 @@ fn preserves_original_pop_absorption_before_protected_raises() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn preserves_located_normal_try_borrow_join_nops() {
+    for (filename, source) in [
+        (
+            "normal_try_guard_terminal_recovery_nop_target.py",
+            r"def checked_value(acquire, recover, finish):
+    try:
+        value = acquire()
+        if value is None:
+            raise ValueError('missing')
+    except Exception as error:
+        try:
+            recover(error)
+        except OSError:
+            return None
+        return False
+    finish(value)
+    return value
+",
+        ),
+        (
+            "protected_normal_try_guard_recovery_nop_target.py",
+            r"def protected_step(check, recover, finish):
+    try:
+        try:
+            if not check():
+                raise ValueError('rejected')
+        except Exception as error:
+            try:
+                recover()
+            except OSError as recovery_error:
+                raise RuntimeError('recovery failed') from error
+            raise
+        finish()
+    except Exception as error:
+        raise RuntimeError('failed') from error
+",
+        ),
+        (
+            "normal_try_shared_guard_recovery_nop_control.py",
+            r"def checked_pair(first, second, recover, finish):
+    try:
+        if first() and second():
+            raise ValueError('rejected')
+    except Exception as error:
+        try:
+            recover(error)
+        except OSError:
+            return None
+        return False
+    finish()
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn preserves_guarded_async_finally_empty_borrow_exit_nops() {
+    for (filename, source) in [
+        (
+            "guarded_finally_empty_borrow_exit_async_target.py",
+            r"async def guarded_cleanup(enabled, work, release, pack):
+    result = None
+    try:
+        if enabled:
+            try:
+                result = await work()
+            finally:
+                try:
+                    await release()
+                except Exception:
+                    pass
+    except Exception:
+        result = False
+    return pack(result)
+",
+        ),
+        (
+            "guarded_finally_populated_borrow_exit_async_control.py",
+            r"async def guarded_cleanup(enabled, work, release, pack):
+    result = None
+    try:
+        if enabled:
+            try:
+                result = await work()
+            finally:
+                try:
+                    await release()
+                except Exception:
+                    pass
+            result = pack(result)
+    except Exception:
+        result = False
+    return pack(result)
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

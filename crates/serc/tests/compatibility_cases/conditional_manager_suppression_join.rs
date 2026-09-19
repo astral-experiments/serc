@@ -460,3 +460,104 @@ fn matches_cpython_sync_manager_unique_normal_branch_donors() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_nested_manager_terminal_suppression_joins() {
+    for (filename, source) in [
+        (
+            "nested_manager_literal_match_terminal.py",
+            r#"async def run(self, outer, inner, read):
+    with outer():
+        with inner() as value:
+            match self.kind:
+                case "a":
+                    return read(value, "a")
+                case "b":
+                    return read(value, "b")
+                case "c":
+                    return read(value, "c")
+                case _:
+                    raise RuntimeError("unknown kind")
+"#,
+        ),
+        (
+            "nested_manager_if_await_terminal.py",
+            r"async def run(outer, inner, request, first, second):
+    with outer():
+        if first:
+            if second is None:
+                with inner() as value:
+                    prepare(value)
+                    return await request()
+            else:
+                return await request()
+        else:
+            return await request()
+",
+        ),
+        (
+            "nested_manager_pair_if_await_terminal.py",
+            r"async def run(outer, other, inner, request, first, second):
+    with (
+        outer(),
+        other(),
+    ):
+        if first:
+            if second is None:
+                with inner() as value:
+                    prepare(value)
+                    return await request()
+            else:
+                return await request()
+        else:
+            return await request()
+",
+        ),
+        (
+            "nested_manager_literal_match_nonexhaustive_control.py",
+            r#"async def run(self, outer, inner, read):
+    with outer():
+        with inner() as value:
+            match self.kind:
+                case "a":
+                    return read(value, "a")
+                case "b":
+                    return read(value, "b")
+                case "c":
+                    return read(value, "c")
+"#,
+        ),
+        (
+            "nested_manager_if_await_fallthrough_control.py",
+            r"async def run(outer, inner, request, first, second):
+    with outer():
+        if first:
+            if second is None:
+                with inner() as value:
+                    prepare(value)
+                    return await request()
+            else:
+                await request()
+        else:
+            return await request()
+",
+        ),
+        (
+            "nested_manager_if_await_nonterminal_inner_control.py",
+            r"async def run(outer, inner, request, first, second):
+    with outer():
+        if first:
+            if second is None:
+                with inner() as value:
+                    prepare(value)
+                    await request()
+            else:
+                return await request()
+        else:
+            return await request()
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

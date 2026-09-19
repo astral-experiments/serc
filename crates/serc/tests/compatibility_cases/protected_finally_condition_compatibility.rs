@@ -78,3 +78,54 @@ fn matches_cpython_unlocated_manager_finally_join() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_certified_generator_manager_finally_joins() {
+    for (filename, source) in [
+        (
+            "manager_generator_guarded_while_cleanup_target.py",
+            r"def managed_chunks(manager, finish, ready, timed_out, pause):
+    with manager():
+        try:
+            yield
+        finally:
+            finish()
+            if ready is not None:
+                while not ready():
+                    if timed_out():
+                        break
+                    pause()
+",
+        ),
+        (
+            "manager_generator_elif_cleanup_target.py",
+            r"def managed_value(manager, primary, secondary, restore, remove):
+    with manager():
+        try:
+            yield
+        finally:
+            if primary():
+                restore()
+            elif secondary():
+                remove()
+",
+        ),
+        (
+            "manager_generator_elif_cleanup_else_control.py",
+            r"def managed_value(manager, primary, secondary, restore, remove, fallback):
+    with manager():
+        try:
+            yield
+        finally:
+            if primary():
+                restore()
+            elif secondary():
+                remove()
+            else:
+                fallback()
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

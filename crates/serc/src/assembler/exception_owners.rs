@@ -92,6 +92,8 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) async_with_setups: Vec<AsyncWithSetup>,
     pub(super) removed_pop_block_boundaries: FxHashSet<Label>,
     pub(super) removed_pop_block_widths: FxHashMap<Label, u16>,
+    // Exact empty normal-finalizer jumps whose range ends are synthetic manager holes.
+    pub(super) synthetic_manager_join_exits: Vec<(Label, Instruction)>,
     // Original ordinary-try exits contain POP_BLOCK followed by JUMP_NO_INTERRUPT.
     pub(super) normal_try_exits: Vec<(Label, Label)>,
     // Exact final wildcard call/discard or class-pattern failure pops at a normal try exit.

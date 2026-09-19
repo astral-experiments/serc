@@ -17761,6 +17761,15 @@ impl Compiler<'_> {
                 || chained_assertion_exit_location.is_some()
             {
                 self.assembler.preserve_direct_inlined_jump_nop(normal_exit);
+                if direct_exit_location.is_some()
+                    && !statement.is_star
+                    && statement.orelse.is_empty()
+                    && statement.finalbody.is_empty()
+                {
+                    // A unique original condition donates this normal exit's line
+                    // even when its continuation is too large for exit copying.
+                    self.assembler.preserve_located_borrow_join_nop(normal_exit);
+                }
             }
             // This existing manager cleanup owns the condition line after the try
             // exit disappears; retaining that preceding jump would duplicate its NOP.
@@ -23560,9 +23569,10 @@ impl Compiler<'_> {
                 && !statement.is_star
                 && statement.handlers.is_empty()
                 && statement.orelse.is_empty()
-                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
                 && matches!(conditional_exit, Some(NestedIfExitLocation::Unlocated))
                 && empty_unlocated_manager_tail
+                && let Some(exit_entry) = exit_exclusion_start
                 && self
                     .control
                     .withs
@@ -23586,7 +23596,8 @@ impl Compiler<'_> {
                 // The conditional's empty original exit is shared and unlocated.
                 // Its manager POP_BLOCK has no line event to retain. Keep the jump
                 // through exit copying, then let ordinary late removal retire it.
-                self.assembler.defer_original_join_removal(normal_exit);
+                self.assembler
+                    .defer_synthetic_manager_join_removal(normal_exit, exit_entry);
             } else if preserve_exit_nop && !separate_manager_pop {
                 self.assembler
                     .preserve_redundant_jump_nop_after_threading(normal_exit);
@@ -26424,6 +26435,45 @@ fn with_body_conditional_exit_location(
             // location to the outer manager's converted POP_BLOCK at the shared join.
             Some(manager.items[0].context_expr.range())
         }
+        Stmt::If(_) if condition_has_linear_runtime_leaves(&statement.test) => {
+            with_body_suppression_exit_location(fallthrough)
+        }
+        _ => None,
+    }
+}
+
+// Complete runtime branches can forward the sole suppression exit through more
+// than one join. Every other arm must leave directly, so no second normal donor
+// can locate the enclosing manager's POP_BLOCK.
+fn with_body_suppression_exit_location(body: &[Stmt]) -> Option<TextRange> {
+    match body.last()? {
+        Stmt::With(manager)
+            if !manager.is_async
+                && manager.items.len() == 1
+                && matches!(manager.body.last(), Some(Stmt::Return(_) | Stmt::Raise(_))) =>
+        {
+            Some(manager.items[0].context_expr.range())
+        }
+        Stmt::If(statement) if condition_has_linear_runtime_leaves(&statement.test) => {
+            let [otherwise] = statement.elif_else_clauses.as_slice() else {
+                return None;
+            };
+            if otherwise.test.is_some() {
+                return None;
+            }
+            let (terminal, fallthrough) = match (
+                suite_terminates(&statement.body),
+                suite_terminates(&otherwise.body),
+            ) {
+                (true, false) => (&statement.body, &otherwise.body),
+                (false, true) => (&otherwise.body, &statement.body),
+                _ => return None,
+            };
+            if !matches!(terminal.last(), Some(Stmt::Return(_) | Stmt::Raise(_))) {
+                return None;
+            }
+            with_body_suppression_exit_location(fallthrough)
+        }
         _ => None,
     }
 }
@@ -26533,10 +26583,37 @@ fn with_body_ends_in_retained_pop_block(body: &[Stmt], direct_body: bool) -> boo
                     Some(Stmt::Return(_) | Stmt::Raise(_))
                 ) || (direct_body
                     && (suite_terminates_before_constant_folding(&statement.body)
-                        || with_body_ends_in_terminal_try(&statement.body))))
+                        || with_body_ends_in_terminal_try(&statement.body)
+                        || (!statement.is_async
+                            && suite_ends_in_manager_terminal_match(&statement.body)))))
         }
         _ => false,
     }
+}
+
+// An exhaustive literal match makes the inner manager's ordinary exit unreachable.
+// Its suppression exit still reaches the outer POP_BLOCK. Keep this witness local
+// to that marker: general match termination also controls cleanup emission.
+fn suite_ends_in_manager_terminal_match(body: &[Stmt]) -> bool {
+    let Some(Stmt::Match(statement)) = body.last() else {
+        return false;
+    };
+    let Some((fallback, preceding)) = statement.cases.split_last() else {
+        return false;
+    };
+    !preceding.is_empty()
+        && is_wildcard_pattern(&fallback.pattern)
+        && preceding.iter().all(|case| {
+            matches!(&case.pattern, Pattern::MatchValue(pattern)
+                if is_literal_constant(&pattern.value))
+        })
+        && statement.cases.iter().all(|case| {
+            case.guard.is_none()
+                && case.body.split_last().is_some_and(|(last, prefix)| {
+                    matches!(last, Stmt::Return(_) | Stmt::Raise(_))
+                        && (prefix.is_empty() || suite_has_linear_borrow_fallthrough(prefix))
+                })
+        })
 }
 
 fn suite_ends_in_retained_try_exit_join(body: &[Stmt]) -> bool {

@@ -1133,22 +1133,29 @@ impl Assembler {
         {
             return false;
         }
-        let mut incoming = items.iter().filter_map(|item| match item {
+        let mut incoming = items.iter().enumerate().filter_map(|(index, item)| match item {
             Item::Instruction(instruction)
                 if matches!(instruction.operand(), Operand::Forward(label) | Operand::Backward(label)
-                    if labels.contains(&label)) => Some(instruction),
+                    if labels.contains(&label)) => Some((index, instruction)),
             _ => None,
         });
-        let (Some(guard), Some(cleanup), None) =
+        let (Some((_, guard)), Some((cleanup_index, cleanup)), None) =
             (incoming.next(), incoming.next(), incoming.next())
         else {
             return false;
         };
+        // A finalizer can end in an original empty borrowing block. Its single
+        // unlocated jump threads past this join without supplying another line.
+        let empty_cleanup_marker = cleanup.location == SourceLocation::NONE
+            && cleanup.jump_policy.borrow_empty_block()
+            && cleanup.jump_policy.retained_nop() == ir::RetainedJumpNop::None
+            && matches!(items[..cleanup_index].last(), Some(Item::Label(_)))
+            && matches!(items.get(cleanup_index + 1), Some(Item::Label(_)));
         is_conditional_jump(guard.opcode)
             && guard.location == location
             && location.line >= 0
             && cleanup.opcode == JUMP_FORWARD
-            && cleanup.location.line >= 0
+            && (cleanup.location.line >= 0 || empty_cleanup_marker)
             && guard.operand() != cleanup.operand()
             && guard.depth_after().is_some()
             && guard.depth_after() == cleanup.depth_after()
@@ -4504,10 +4511,18 @@ impl Assembler {
             .jump_policy
             .defer_removal();
     }
-    /// Defers an original join without assigning permanent NOP retention.
-    pub(crate) fn defer_original_join_removal(&mut self, emitted: EmittedJump) {
+    /// Defers a synthetic manager join without treating its range end as a `POP_BLOCK`.
+    pub(crate) fn defer_synthetic_manager_join_removal(
+        &mut self,
+        emitted: EmittedJump,
+        entry: Label,
+    ) {
         self.defer_jump_removal(emitted);
         self.record_original_empty_join(emitted);
+        let jump = *self.emitted_jump_mut(emitted, "recording a synthetic manager join");
+        self.exception_owner_provenance
+            .synthetic_manager_join_exits
+            .push((entry, jump));
     }
 
     pub(crate) fn allow_transitive_small_exit_inlining(&mut self, emitted: EmittedJump) {
@@ -5101,6 +5116,20 @@ impl Assembler {
                 .jump_policy
                 .retain_redundant_nop_after_threading();
         }
+    }
+
+    /// Keeps a located conditional join when empty-block borrowing outlives its direct exit.
+    pub(crate) fn preserve_located_borrow_join_nop(&mut self, emitted: EmittedJump) {
+        let instruction = self.emitted_jump_mut(emitted, "retaining a located normal borrow join");
+        if instruction.location.line < 0
+            || !instruction.jump_policy.borrow_empty_block()
+            || instruction.jump_policy.retained_nop() != ir::RetainedJumpNop::DirectTarget
+        {
+            return;
+        }
+        // Reuse the original empty-join proof without enrolling this jump in a
+        // new copy plan. Final marker cleanup still requires one live predecessor.
+        self.preserve_folded_nested_if_exit(emitted);
     }
 
     /// Records original empty-join identity and whether a direct copy keeps its line slot.
