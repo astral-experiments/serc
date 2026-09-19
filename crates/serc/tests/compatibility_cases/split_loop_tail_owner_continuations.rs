@@ -99,3 +99,56 @@ fn retains_nested_iterator_break_owner_before_nonterminal_tail() {
         "split_loop_tail_break_before_nonterminal_tail.py",
     );
 }
+
+#[test]
+fn matches_cpython_nested_split_loop_tail_shared_jump_locations() {
+    for (filename, source) in [
+        (
+            "split_loop_tail_elif_shared_jump.py",
+            r#"def run(items, flags, record):
+    for item in items:
+        if flags["mode"] == 0:
+            record["zero"] += item
+        elif flags["mode"] == 1:
+            record["prefix"] += item
+            if flags["middle"]:
+                if flags["inner"]:
+                    record["first"] += item
+                else:
+                    record["second"] += item
+                    if flags["left"] and flags["right"]:
+                        record["shared"] += item
+            else:
+                record["fallback"] += item
+        else:
+            record["other"] += item
+        if flags["after"]:
+            record["after"] += item
+    return record
+"#,
+        ),
+        (
+            "split_loop_tail_nested_shared_jump.py",
+            r#"def run(items, flags, record):
+    for item in items:
+        if flags["outer"]:
+            if flags["middle"]:
+                if flags["inner"]:
+                    record["first"] += item
+                else:
+                    record["second"] += item
+                    if flags["left"] and flags["right"]:
+                        record["shared"] += item
+            else:
+                record["fallback"] += item
+        else:
+            record["other"] += item
+        if flags["after"]:
+            record["after"] += item
+    return record
+"#,
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

@@ -58,3 +58,59 @@ fn preserves_finally_owners_for_other_collection_folds() {
         common::assert_matches_cpython_marshal(&source, "other_collection_owner_slots.py");
     }
 }
+
+#[test]
+fn matches_cpython_literal_defaults_before_try_owner() {
+    for (filename, source) in [
+        (
+            "six_literal_defaults_before_try_owner.py",
+            r#"async def run(value, invoke):
+    if isinstance(value, str):
+        value = 0
+
+    async def update(status: str, a=None, b=None, c=None, d=None, e=None, f=None) -> None:
+        await invoke(status)
+
+    try:
+        if value == 0:
+            await update("zero")
+    except Exception:
+        return
+"#,
+        ),
+        (
+            "five_literal_defaults_before_try_owner_boundary.py",
+            r#"async def run(value, invoke):
+    if isinstance(value, str):
+        value = 0
+
+    async def update(status: str, a=None, b=None, c=None, d=None, e=None) -> None:
+        await invoke(status)
+
+    try:
+        if value == 0:
+            await update("zero")
+    except Exception:
+        return
+"#,
+        ),
+        (
+            "nonconstant_defaults_before_try_owner_control.py",
+            r#"async def run(value, invoke):
+    if isinstance(value, str):
+        value = 0
+
+    async def update(status: str, a=value, b=None, c=None, d=None, e=None, f=None) -> None:
+        await invoke(status)
+
+    try:
+        if value == 0:
+            await update("zero")
+    except Exception:
+        return
+"#,
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

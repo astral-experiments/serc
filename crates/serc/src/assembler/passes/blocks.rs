@@ -1683,7 +1683,7 @@ fn propagate_exit_block_locations(
                         })
                         .nth(1);
                     if let Some(previous) = previous
-                        && previous.opcode == POP_TOP
+                        && matches!(previous.opcode, POP_TOP | STORE_ATTR | DELETE_FAST)
                         && previous.location.line >= 0
                     {
                         return Some(previous.location);

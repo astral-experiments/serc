@@ -580,6 +580,24 @@ impl Compiler<'_> {
                 self.emit_deferred_constant(Constant::Tuple(defaults))?;
                 self.assembler
                     .add_last_hidden_exception_owner_slots(hidden_owner_slots);
+                // Literal defaults are folded before CFG copy sizing, but their
+                // removed loads and BUILD_TUPLE still share this original owner.
+                if (4..=CPYTHON_STACK_USE_GUIDELINE).contains(&positional_defaults.len())
+                    && positional_defaults.iter().all(|default| {
+                        matches!(
+                            default,
+                            Expr::NoneLiteral(_)
+                                | Expr::BooleanLiteral(_)
+                                | Expr::NumberLiteral(_)
+                                | Expr::StringLiteral(_)
+                                | Expr::BytesLiteral(_)
+                                | Expr::EllipsisLiteral(_)
+                        )
+                    })
+                {
+                    self.assembler
+                        .record_last_uniform_fold_owner_slots(hidden_owner_slots);
+                }
             } else {
                 for default in &positional_defaults {
                     self.compile_expression(default)?;

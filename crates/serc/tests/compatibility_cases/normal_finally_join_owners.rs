@@ -411,3 +411,26 @@ fn matches_cpython_named_retry_normal_truth_finalizer() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_normal_finally_single_live_jump_setup_owner() {
+    let source = r#"def complete(manager, condition, exists, remove, report):
+    with manager():
+        try:
+            if condition():
+                raise ValueError("invalid")
+        except Exception:
+            report()
+            raise
+        finally:
+            try:
+                if exists():
+                    remove()
+            except Exception:
+                report()
+"#;
+    common::assert_matches_cpython_marshal(
+        source,
+        "normal_finally_single_live_jump_setup_owner.py",
+    );
+}

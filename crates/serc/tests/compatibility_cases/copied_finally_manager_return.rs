@@ -477,3 +477,56 @@ fn outer_try_manager_return_primitive_owners_match_cpython() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_copied_finally_async_manager_return_owners() {
+    for (filename, source) in [
+        (
+            "async_with_value_return_finally_owner.py",
+            r"async def run(source, manager, cleanup):
+    try:
+        try:
+            return await source()
+        except ValueError:
+            raise
+        finally:
+            try:
+                async with manager:
+                    await cleanup()
+            except TimeoutError as error:
+                raise RuntimeError(error) from error
+    except Exception as error:
+        raise RuntimeError(error) from error
+",
+        ),
+        (
+            "async_with_bare_return_finally_owner.py",
+            r"async def run(source, manager, cleanup):
+    try:
+        try:
+            await source()
+            return
+        finally:
+            try:
+                async with manager:
+                    await cleanup()
+            except TimeoutError as error:
+                raise RuntimeError(error) from error
+    except Exception as error:
+        raise RuntimeError(error) from error
+",
+        ),
+        (
+            "async_with_ordinary_suppression_owner_control.py",
+            r"async def run(manager, cleanup):
+    try:
+        async with manager:
+            await cleanup()
+    except Exception as error:
+        raise RuntimeError(error) from error
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

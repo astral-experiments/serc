@@ -242,6 +242,115 @@ impl Assembler {
             {
                 continue;
             }
+            // A folded successful arm can thread through an original unlocated
+            // branch exit. The remaining runtime None-test then owns that exit's line.
+            // Keep return arrays and every protected or multiply entered join separate.
+            let folded_join = (|| {
+                use crate::target::opcodes::{
+                    JUMP_FORWARD, POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE, RAISE_VARARGS,
+                };
+
+                if !self.exception_regions.is_empty() {
+                    return None;
+                }
+                let (Item::Instruction(bridge), labels) = graph[target].items().split_last()?
+                else {
+                    return None;
+                };
+                let Operand::Forward(end) = bridge.operand() else {
+                    return None;
+                };
+                let end = graph.label_block(end)?;
+                let mut unlocated = super::ir::NoLocationPolicy::default();
+                unlocated.preserve_location();
+                if labels.is_empty()
+                    || !labels.iter().all(|item| {
+                        matches!(item, Item::Label(label)
+                        if self.exception_owner_provenance.block_boundaries.contains(label)
+                            && !self.original_nop_targets.contains(label))
+                    })
+                    || bridge.opcode != JUMP_FORWARD
+                    || bridge.location != SourceLocation::NONE
+                    || bridge.no_location_policy != unlocated
+                    || bridge.jump_policy != super::ir::JumpPolicy::default()
+                    || bridge.exception_policy() != super::ExceptionPolicy::default()
+                    || bridge.pre_fold_extra_instructions() != 0
+                    || bridge.local_policy.hidden_exception_owner_slots() != 0
+                    || bridge.depth_after() != original.depth_after()
+                    || original.exception_policy() != super::ExceptionPolicy::default()
+                {
+                    return None;
+                }
+                let order = graph.order();
+                let source_position = order.iter().position(|block| *block == source)?;
+                let target_position = order.iter().position(|block| *block == target)?;
+                let end_position = order.iter().position(|block| *block == end)?;
+                if !(source_position < target_position && target_position < end_position)
+                    || graph[*order.get(target_position.checked_sub(1)?)?]
+                        .last_instruction()?
+                        .opcode
+                        != RAISE_VARARGS
+                {
+                    return None;
+                }
+                let mut incoming = graph
+                    .iter()
+                    .flat_map(|(block, array)| {
+                        array.items().iter().filter_map(move |item| match item {
+                            Item::Instruction(instruction) => Some((block, *instruction)),
+                            Item::Label(_) => None,
+                        })
+                    })
+                    .filter(|(_, instruction)| {
+                        matches!(instruction.operand(),
+                    Operand::Forward(label) | Operand::Backward(label)
+                        if graph.label_block(label) == Some(target))
+                    });
+                let first = incoming.next()?;
+                let second = incoming.next()?;
+                if incoming.next().is_some() {
+                    return None;
+                }
+                let (condition_block, condition) = if first == (source, original) {
+                    second
+                } else if second == (source, original) {
+                    first
+                } else {
+                    return None;
+                };
+                if !matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+                    || !matches!(condition.operand(), Operand::Forward(_))
+                    || condition.location.line < 0
+                    || condition.location.line != original.location.line
+                    || condition.depth_after() != original.depth_after()
+                    || condition.pre_fold_extra_instructions() != 0
+                    // Same-line None specialization removes LOAD_CONST, IS_OP, and
+                    // TO_BOOL. Admit those three slots only on the captured source record.
+                    || (condition.local_policy.hidden_exception_owner_slots() != 0
+                        && (condition.local_policy.hidden_exception_owner_slots() != 3
+                            || !self.exception_owner_provenance.source_none_conditions
+                                .iter().any(|origin| origin.instruction == condition)))
+                    || condition.exception_policy() != super::ExceptionPolicy::default()
+                    || graph[condition_block].last_instruction() != Some(&condition)
+                {
+                    return None;
+                }
+                Some(bridge.operand())
+            })();
+            if let Some(destination) = folded_join {
+                graph
+                    .instructions_mut(source)
+                    .next()
+                    .expect("exact folded arm")
+                    .retarget(destination);
+                graph
+                    .instructions_mut(target)
+                    .next()
+                    .expect("exact original join")
+                    .no_location_policy
+                    .clear_preserved_location();
+                continue;
+            }
             let mut instructions = graph[target].items().iter().filter_map(|item| match item {
                 Item::Instruction(instruction) => Some(instruction),
                 Item::Label(_) => None,

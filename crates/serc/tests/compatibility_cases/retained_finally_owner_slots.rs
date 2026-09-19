@@ -138,3 +138,52 @@ fn matches_cpython_finally_condition_fused_suffix_owner() {
         "finally_condition_fused_suffix.py",
     );
 }
+
+#[test]
+fn matches_cpython_iterator_between_ordinary_try_finalizer_owners() {
+    for (filename, source) in [
+        (
+            "async_generator_iterator_between_ordinary_tries_finalizer_return.py",
+            r"async def stream(items, emit):
+    try:
+        for item in items:
+            try:
+                while True:
+                    try:
+                        yield item
+                        return
+                    except ValueError:
+                        raise
+                    finally:
+                        emit(item)
+            except TypeError:
+                pass
+    except RuntimeError:
+        raise
+    finally:
+        emit(None)
+",
+        ),
+        (
+            "async_generator_finalizer_return_without_intervening_try_control.py",
+            r"async def stream(items, emit):
+    try:
+        for item in items:
+            while True:
+                try:
+                    yield item
+                    return
+                except ValueError:
+                    raise
+                finally:
+                    emit(item)
+    except RuntimeError:
+        raise
+    finally:
+        emit(None)
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

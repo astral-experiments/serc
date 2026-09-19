@@ -172,3 +172,64 @@ fn matches_cpython_inner_try_returns_through_unnamed_handler_chain() {
         }
     }
 }
+
+#[test]
+fn matches_cpython_iterator_between_unnamed_handler_return_owners() {
+    for (filename, source) in [
+        (
+            "unnamed_handler_iterator_inner_handler_none_return.py",
+            r"def probe(items, operation):
+    try:
+        operation()
+    except ValueError:
+        for item in items:
+            try:
+                operation(item)
+            except TypeError:
+                return None
+        return None
+",
+        ),
+        (
+            "unnamed_handler_iterator_inner_handler_value_return.py",
+            r"def probe(items, operation, selected):
+    try:
+        operation()
+    except ValueError:
+        for item in items:
+            try:
+                operation(item)
+            except TypeError:
+                if selected(item):
+                    return operation(item)
+                continue
+        return None
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn matches_cpython_async_iterator_in_handler_try_value_return() {
+    let source = r"async def probe(events, operation, result):
+    try:
+        try:
+            await operation()
+        except ValueError:
+            try:
+                async for item in events:
+                    if item:
+                        return result
+            except TypeError:
+                raise
+    except RuntimeError:
+        pass
+    return result
+";
+    common::assert_matches_cpython_marshal(
+        source,
+        "coroutine_handler_new_try_async_iterator_name_return.py",
+    );
+}

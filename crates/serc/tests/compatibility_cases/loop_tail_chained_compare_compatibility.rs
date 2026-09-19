@@ -285,3 +285,33 @@ fn matches_cpython_nonfinal_elif_chained_compare_exit() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_loop_tail_comparison_pass_original_join() {
+    for (filename, source) in [
+        (
+            "loop_tail_chained_comparison_pass_join_target.py",
+            r"def collect(items, limit, buckets):
+    for index, value in enumerate(items):
+        if 0 <= value < limit:
+            buckets[value].append(index)
+        else:
+            pass
+    finish(buckets)
+",
+        ),
+        (
+            "loop_tail_single_comparison_pass_join_control.py",
+            r"def collect(items, limit, buckets):
+    for index, value in enumerate(items):
+        if value < limit:
+            buckets[value].append(index)
+        else:
+            pass
+    finish(buckets)
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

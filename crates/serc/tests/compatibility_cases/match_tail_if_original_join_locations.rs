@@ -140,3 +140,41 @@ fn matches_cpython_marshal_for_nested_match_terminating_guard_return_joins() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_match_if_iterator_cleanup_boundary() {
+    for (filename, source) in [
+        (
+            "generator_match_if_iterator_cleanup_target.py",
+            r#"def parse(items, groups, kind):
+    match kind:
+        case "other":
+            yield 0
+            return
+        case "wanted":
+            if groups:
+                for item in groups:
+                    if item:
+                        break
+    for item in items:
+        yield item
+"#,
+        ),
+        (
+            "generator_match_if_linear_fallthrough_control.py",
+            r#"def parse(items, groups, kind, visit):
+    match kind:
+        case "other":
+            yield 0
+            return
+        case "wanted":
+            if groups:
+                visit(groups)
+    for item in items:
+        yield item
+"#,
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

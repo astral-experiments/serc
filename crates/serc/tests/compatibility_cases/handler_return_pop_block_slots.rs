@@ -807,3 +807,106 @@ fn matches_cpython_named_return_finalizers_with_enclosing_try_owners() {
         assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_bare_returns_through_two_try_cleanups() {
+    for (filename, source) in [
+        (
+            "bare_handler_return_two_ordinary_tries_while.py",
+            r"def example():
+    try:
+        while True:
+            try:
+                initialize()
+                while True:
+                    try:
+                        message = read()
+                        if not message:
+                            continue
+                        consume(message)
+                    except KeyboardInterrupt:
+                        record()
+                        return
+                    except Exception:
+                        recover()
+            except Exception:
+                reset()
+    except KeyboardInterrupt:
+        finish()
+",
+        ),
+        (
+            "bare_handler_return_two_ordinary_tries_iterator.py",
+            r"async def example(values):
+    try:
+        for value in values:
+            try:
+                if value:
+                    try:
+                        await operation(value)
+                    except TimeoutError:
+                        record(value)
+                        return
+                await consume(value)
+            except Exception:
+                recover(value)
+    except Exception:
+        finish()
+",
+        ),
+        (
+            "annotated_function_uncompacted_try_marker_target.py",
+            r#"def example(reader):
+    try:
+        while True:
+            try:
+                initialize()
+                while True:
+                    try:
+                        def prompt() -> str:
+                            return "message"
+                        message = reader.ask(prompt()).strip()
+                        if not message:
+                            continue
+                        consume(message)
+                    except KeyboardInterrupt:
+                        record()
+                        return
+                    except Exception:
+                        recover()
+            except Exception:
+                reset()
+    except KeyboardInterrupt:
+        finish()
+"#,
+        ),
+        (
+            "annotated_function_default_tuple_marker_control.py",
+            r#"def example(reader):
+    try:
+        while True:
+            try:
+                initialize()
+                while True:
+                    try:
+                        def prompt(value=0) -> str:
+                            return "message"
+                        message = reader.ask(prompt()).strip()
+                        if not message:
+                            continue
+                        consume(message)
+                    except KeyboardInterrupt:
+                        record()
+                        return
+                    except Exception:
+                        recover()
+            except Exception:
+                reset()
+    except KeyboardInterrupt:
+        finish()
+"#,
+        ),
+    ] {
+        assert_matches_cpython_marshal(source, filename);
+    }
+}

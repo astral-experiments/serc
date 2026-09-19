@@ -213,3 +213,50 @@ fn named_handler_return_retires_try_before_async_manager_iterator_cleanup() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_nested_loop_handler_return_swap_owners() {
+    for (filename, source) in [
+        (
+            "nested_unnamed_handler_return_swap_owner.py",
+            r"def example(groups):
+    for group in groups:
+        for value in group:
+            try:
+                return primary(value)
+            except Exception:
+                try:
+                    return secondary(value)
+                except Exception:
+                    try:
+                        return tertiary(value)
+                    except Exception:
+                        continue
+",
+        ),
+        (
+            "nested_named_unnamed_handler_return_swap_owner.py",
+            r"async def example(values):
+    for value in values:
+        try:
+            await prepare(value)
+            try:
+                return primary(value)
+            except Exception as error:
+                try:
+                    return secondary(value)
+                except Exception:
+                    if value:
+                        try:
+                            return tertiary(value, error)
+                        except Exception:
+                            pass
+                    continue
+        except Exception:
+            continue
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

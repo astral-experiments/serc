@@ -206,3 +206,93 @@ fn chained_comparison_pass_arms_keep_original_jump_boundaries() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_assertion_success_authored_pass_join() {
+    let source = r"async def validate(mode, selected, left, right):
+    if mode == 0:
+        result = left
+        assert left
+        pass
+    elif mode == 1:
+        result = right
+        if selected:
+            assert len(left) == len(right)
+        else:
+            assert len(left) == 0
+        pass
+    else:
+        raise ValueError(mode)
+    assert result
+";
+    common::assert_matches_cpython_marshal(
+        source,
+        "assertion_success_authored_pass_join_target.py",
+    );
+}
+
+#[test]
+fn matches_cpython_declaration_only_conditional_suites() {
+    for (filename, source) in [
+        (
+            "declaration_only_global_if_target.py",
+            r"def inspect_data(enabled, debug, values):
+    if enabled:
+        if debug:
+            global PROCESSED_VALUES
+        if set(values) == {1}:
+            return values
+    return None
+",
+        ),
+        (
+            "declaration_only_nonlocal_if_target.py",
+            r"def outer():
+    value = 0
+    def inspect_data(enabled):
+        if enabled:
+            nonlocal value
+        return value
+    return inspect_data
+",
+        ),
+        (
+            "declaration_only_protected_global_target.py",
+            r"def inspect_data(enabled, touch, recover):
+    try:
+        if enabled:
+            global SHARED_VALUE
+        touch()
+    except ValueError:
+        recover()
+",
+        ),
+        (
+            "declaration_only_global_elif_else_target.py",
+            r"def inspect_data(first, second):
+    if first:
+        global FIRST_VALUE
+    elif second:
+        global SECOND_VALUE
+    else:
+        global THIRD_VALUE
+    return 7
+",
+        ),
+        (
+            "declaration_only_nonlocal_else_target.py",
+            r"def outer():
+    value = 0
+    def inspect_data(enabled, touch):
+        if enabled:
+            touch()
+        else:
+            nonlocal value
+        return value
+    return inspect_data
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

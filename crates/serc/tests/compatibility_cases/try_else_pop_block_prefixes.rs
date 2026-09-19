@@ -311,3 +311,38 @@ fn preserves_shared_try_else_backedge_after_linear_statements() {
         assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_protected_final_else_pop_locations() {
+    for (filename, source) in [
+        (
+            "protected_final_else_assignment_pop_target.py",
+            r"def f(flag, work, recover, finish):
+    try:
+        if flag:
+            return recover()
+        else:
+            first = work()
+            second = work()
+    except ValueError:
+        return recover()
+    else:
+        return finish(first, second)
+",
+        ),
+        (
+            "protected_final_else_await_pop_target.py",
+            r"async def f(flag, work, cleanup):
+    try:
+        if flag:
+            raise ValueError(flag)
+        else:
+            await work()
+    finally:
+        cleanup()
+",
+        ),
+    ] {
+        assert_matches_cpython_marshal(source, filename);
+    }
+}

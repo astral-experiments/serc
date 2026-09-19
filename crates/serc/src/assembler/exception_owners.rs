@@ -104,6 +104,8 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) normal_try_class_pattern_donor_labels: FxHashMap<Label, (Label, Label)>,
     // First records of the original manager cleanup arrays, before line resolution.
     pub(super) original_manager_pop_blocks: Vec<Label>,
+    // Exact located POP records at certified original sole-fallthrough joins.
+    pub(super) original_fallthrough_pop_blocks: FxHashMap<Label, Instruction>,
     // Ordinary handler exits copied from an original unlocated POP_EXCEPT/jump array.
     pub(super) original_handler_cleanup_join_exits: FxHashSet<Label>,
     // Original try/except POP_BLOCK exits inside their own finally, for owner transfer
@@ -1029,6 +1031,40 @@ impl ExceptionOwnerProvenance {
             })
             .flatten()
             .collect::<FxHashSet<_>>();
+        // A local function with deferred annotations constructs the annotation and body
+        // functions separately. All six original records survive; the attribute attachment
+        // neither folds constants nor consumes an instruction-array cell.
+        let annotated_function_members = instructions
+            .windows(6)
+            .enumerate()
+            .filter_map(|(start, parts)| {
+                let [
+                    annotations,
+                    annotation_function,
+                    code,
+                    function,
+                    attribute,
+                    store,
+                ] = parts
+                else {
+                    unreachable!()
+                };
+                (annotations.opcode == LOAD_CONST
+                    && annotation_function.opcode == MAKE_FUNCTION
+                    && annotation_function.operand() == Operand::Value(0)
+                    && code.opcode == LOAD_CONST
+                    && function.opcode == MAKE_FUNCTION
+                    && function.operand() == Operand::Value(0)
+                    && attribute.opcode == SET_FUNCTION_ATTRIBUTE
+                    && attribute.operand() == Operand::Value(16)
+                    && store.opcode == STORE_FAST
+                    && parts
+                        .iter()
+                        .all(|part| part.location == annotations.location))
+                .then_some(start..start + 6)
+            })
+            .flatten()
+            .collect::<FxHashSet<_>>();
         let original_folds =
             self.original_uniform_fold_positions(&instructions.iter().collect::<Vec<_>>());
         let mut setup_count = 0;
@@ -1133,6 +1169,8 @@ impl ExceptionOwnerProvenance {
                 }
                 BUILD_TUPLE | MAKE_FUNCTION | SET_FUNCTION_ATTRIBUTE
                     if closure_members.contains(&index) => {}
+                MAKE_FUNCTION | SET_FUNCTION_ATTRIBUTE
+                    if annotated_function_members.contains(&index) => {}
                 BUILD_LIST => {
                     // An empty list stored as a local is neither a constant
                     // sequence fold nor an iterable/containment conversion.
@@ -1444,7 +1482,7 @@ impl LayoutAssembler {
         &self,
         jump_targets: &FxHashSet<Label>,
     ) -> FxHashSet<usize> {
-        use crate::target::opcodes::{LOAD_FAST, LOAD_FAST_BORROW};
+        use crate::target::opcodes::{LOAD_FAST, LOAD_FAST_BORROW, LOAD_FAST_CHECK};
 
         let mut result = FxHashSet::default();
         for origin in &self
@@ -1554,12 +1592,14 @@ impl LayoutAssembler {
                 let same = match (expected, self.items.get(cursor)) {
                     (Item::Label(expected), Some(Item::Label(current))) => expected == current,
                     (Item::Instruction(expected), Some(Item::Instruction(current))) => {
-                        // Borrowing rewrites only the opcode after CP's slot
-                        // selection. Every other captured policy/depth byte must
-                        // still belong to the same original record.
+                        // Borrowing and local initialization checks rewrite only the
+                        // opcode after CP's slot selection. Every other captured policy,
+                        // location, operand, and depth must retain its original identity.
                         let mut expected = *expected;
-                        if expected.opcode == LOAD_FAST && current.opcode == LOAD_FAST_BORROW {
-                            expected.opcode = LOAD_FAST_BORROW;
+                        if expected.opcode == LOAD_FAST
+                            && matches!(current.opcode, LOAD_FAST_BORROW | LOAD_FAST_CHECK)
+                        {
+                            expected.opcode = current.opcode;
                         }
                         if entry.is_none()
                             && original_index == 1

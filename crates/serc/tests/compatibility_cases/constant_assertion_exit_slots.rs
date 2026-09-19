@@ -94,3 +94,33 @@ fn matches_cpython_boolean_condition_explicit_constant_return_control() {
         "boolean_condition_explicit_constant_return_control.py",
     );
 }
+
+#[test]
+fn matches_cpython_folded_assertion_original_jump() {
+    for (filename, source) in [
+        (
+            "folded_true_assertion_original_jump_target.py",
+            r#"def validate(items):
+    for entry in items:
+        if entry.enabled:
+            assert entry.value is None if not entry.selected else True, "invalid value"
+        else:
+            assert entry.value is None
+        consume(entry)
+"#,
+        ),
+        (
+            "folded_false_assertion_original_jump_control.py",
+            r#"def validate(items):
+    for entry in items:
+        if entry.enabled:
+            assert entry.value is None if not entry.selected else False, "invalid value"
+        else:
+            assert entry.value is None
+        consume(entry)
+"#,
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

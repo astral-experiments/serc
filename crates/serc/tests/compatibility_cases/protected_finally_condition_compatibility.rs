@@ -129,3 +129,75 @@ fn matches_cpython_certified_generator_manager_finally_joins() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_coroutine_manager_elif_cleanup_owner() {
+    let source = r"async def managed_value(manager, operation, primary, secondary, restore, remove):
+    with manager():
+        try:
+            await operation()
+        finally:
+            if primary():
+                restore()
+            elif secondary():
+                remove()
+";
+    common::assert_matches_cpython_marshal(
+        source,
+        "manager_coroutine_elif_cleanup_owner_control.py",
+    );
+}
+
+#[test]
+fn matches_cpython_generator_manager_handler_join_owner() {
+    for (filename, source) in [
+        (
+            "manager_generator_elif_cleanup_handler_control.py",
+            r"def managed_value(manager, primary, secondary, restore, remove, recover):
+    with manager():
+        try:
+            yield
+        except ValueError:
+            recover()
+        finally:
+            if primary():
+                restore()
+            elif secondary():
+                remove()
+",
+        ),
+        (
+            "manager_generator_elif_cleanup_named_handler_boundary.py",
+            r"def managed_value(manager, primary, secondary, restore, remove, recover):
+    with manager():
+        try:
+            yield
+        except ValueError as error:
+            recover(error)
+        finally:
+            if primary():
+                restore()
+            elif secondary():
+                remove()
+",
+        ),
+        (
+            "manager_generator_elif_cleanup_branch_handler_boundary.py",
+            r"def managed_value(manager, primary, secondary, restore, remove, recover):
+    with manager():
+        try:
+            yield
+        except ValueError:
+            if primary():
+                recover()
+        finally:
+            if primary():
+                restore()
+            elif secondary():
+                remove()
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

@@ -636,6 +636,10 @@ impl JumpPolicy {
         self.0 |= Self::PRESERVE_EXPLICIT_NOP;
     }
 
+    pub(super) fn allow_explicit_nop_compaction(&mut self) {
+        self.0 &= !Self::PRESERVE_EXPLICIT_NOP;
+    }
+
     pub(super) const fn retained_nop(self) -> RetainedJumpNop {
         match self.0 & Self::RETAINED_NOP_MASK {
             0 | Self::INTERRUPTIBLE => RetainedJumpNop::None,
@@ -652,6 +656,12 @@ impl JumpPolicy {
     pub(super) fn mark_interruptible(&mut self) {
         debug_assert!(matches!(self.retained_nop(), RetainedJumpNop::None));
         self.0 = (self.0 & !Self::RETAINED_NOP_MASK) | Self::INTERRUPTIBLE;
+    }
+
+    /// Replaces a threaded jump's retained-NOP request with the inherited eval check.
+    pub(super) fn mark_interruptible_after_threading(&mut self) {
+        self.0 &= !Self::RETAINED_NOP_MASK;
+        self.mark_interruptible();
     }
 
     pub(super) const fn always_retains_nop(self) -> bool {

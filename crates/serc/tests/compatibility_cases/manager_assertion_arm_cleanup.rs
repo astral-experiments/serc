@@ -52,3 +52,43 @@ fn matches_cpython_manager_match_terminal_try_exit() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_folded_manager_assertion_operands() {
+    for (filename, source) in [
+        (
+            "manager_assert_constant_ifexp_condition_control.py",
+            r"def verify(manager, value, expected):
+    with manager():
+        assert (
+            value == expected
+            if True
+            else False
+        )
+",
+        ),
+        (
+            "manager_assert_folded_ifexp_false_arm_target.py",
+            r#"def verify(manager, value, expected, choose):
+    with manager():
+        assert (
+            value == expected
+            if choose
+            else ""
+        )
+"#,
+        ),
+        (
+            "manager_assert_folded_or_false_arm_target.py",
+            r"def verify(manager, value, expected):
+    with manager():
+        assert (
+            value == expected
+            or False
+        )
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

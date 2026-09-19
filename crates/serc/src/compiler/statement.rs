@@ -5379,6 +5379,129 @@ impl Compiler<'_> {
                                 && pair[0].exception_region_depth.checked_add(1)
                                     == Some(pair[1].exception_region_depth)
                         });
+                // The inner handler leaves its exception state before discarding an
+                // iterator created inside the outer handler. That outer handler still
+                // owns the inner pop, iterator cleanup, and its own value-preserving swap.
+                let iterator_between_unnamed_handlers = !return_is_overridden
+                    && self.context.target_specific_rules_enabled()
+                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                    && self.control.exceptions.active_exception_group_handlers == 0
+                    && self.control.exceptions.active_try_marker_slots.is_empty()
+                    && self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .len()
+                        == 2
+                    && self.control.withs.active_with_exits.is_empty()
+                    && self
+                        .control
+                        .finally
+                        .active_return_finally_contexts
+                        .is_empty()
+                    && self.control.finally.active_loop_finally_contexts.is_empty()
+                    && self
+                        .control
+                        .finally
+                        .active_pass_finally_locations
+                        .is_empty()
+                    && self
+                        .control
+                        .finally
+                        .preserved_return_value_contexts
+                        .is_empty()
+                    && self.control.finally.copied_return_finally_preserved_values == 0
+                    && self.control.finally.active_finally_try_bodies == 0
+                    && self.control.finally.active_normal_finally_bodies == 0
+                    && self.control.finally.active_copied_finally_bodies == 0
+                    && self.control.finally.active_finally_end_blocks == 0
+                    && self.control.finally.active_overriding_finally_returns == 0
+                    && matches!(
+                        (
+                            self.control.exceptions.active_exception_handlers.as_slice(),
+                            self.control.loops.contexts.as_slice(),
+                        ),
+                        ([outer, inner], [iterator])
+                            if outer.name.is_none()
+                                && inner.name.is_none()
+                                && outer.loop_depth == 0
+                                && inner.loop_depth == 1
+                                && outer.with_depth == 0
+                                && inner.with_depth == 0
+                                && outer.try_body_depth == 0
+                                && inner.try_body_depth == 0
+                                && outer.exception_region_depth == 0
+                                && inner.exception_region_depth == 1
+                                && outer.finally_end_depth == 0
+                                && inner.finally_end_depth == 0
+                                && outer.common_cleanup_depth == 1
+                                && inner.common_cleanup_depth == 3
+                                && outer.body_cleanup == outer.common_cleanup
+                                && inner.body_cleanup == inner.common_cleanup
+                                && iterator.iterator_cleanup == IteratorCleanup::Sync
+                                && !iterator.has_orelse
+                                && iterator.with_depth == 0
+                                && iterator.exception_region_depth == 1
+                                && iterator.finally_end_depth == 0
+                    );
+                // A newer ordinary try ends before the inner handler's SWAP. Both
+                // handlers then restore their exception state before the older iterators
+                // unwind, so any enclosing ordinary try must retain their cleanup.
+                let nested_handlers_inside_older_iterator = !return_is_overridden
+                    && preserve_tos
+                    && self.context.target_specific_rules_enabled()
+                    && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+                    && self.control.exceptions.active_exception_group_handlers == 0
+                    && self.control.withs.active_with_exits.is_empty()
+                    && self
+                        .control
+                        .finally
+                        .active_return_finally_contexts
+                        .is_empty()
+                    && self.control.finally.active_loop_finally_contexts.is_empty()
+                    && self
+                        .control
+                        .finally
+                        .active_pass_finally_locations
+                        .is_empty()
+                    && self
+                        .control
+                        .finally
+                        .preserved_return_value_contexts
+                        .is_empty()
+                    && self.control.finally.copied_return_finally_preserved_values == 0
+                    && self.control.finally.active_finally_try_bodies == 0
+                    && self.control.finally.active_normal_finally_bodies == 0
+                    && self.control.finally.active_copied_finally_bodies == 0
+                    && self.control.finally.active_finally_end_blocks == 0
+                    && self.control.finally.active_overriding_finally_returns == 0
+                    && !self.control.loops.contexts.is_empty()
+                    && matches!(
+                        self.control.exceptions.active_exception_handlers.as_slice(),
+                        [outer, inner]
+                            if inner.name.is_none()
+                                && inner.protect_outer_return_pop
+                                && outer.with_depth == 0
+                                && inner.with_depth == 0
+                                && outer.finally_end_depth == 0
+                                && inner.finally_end_depth == 0
+                                && outer.loop_depth == self.control.loops.contexts.len()
+                                && inner.loop_depth == outer.loop_depth
+                                && outer.exception_region_depth == outer.try_body_depth
+                                && inner.exception_region_depth == outer.exception_region_depth + 1
+                                && inner.try_body_depth == outer.try_body_depth
+                                && self.control.exceptions.active_try_marker_slots.len()
+                                    == inner.try_body_depth + 1
+                                && self.control.exceptions.active_exception_region_exclusions.len()
+                                    == inner.exception_region_depth + 2
+                                && self.control.loops.contexts.iter().all(|context| {
+                                    context.iterator_cleanup == IteratorCleanup::Sync
+                                        && context.with_depth == 0
+                                        && context.finally_end_depth == 0
+                                        && context.exception_region_depth
+                                            <= outer.exception_region_depth
+                                })
+                    );
                 // Two contiguous handlers retire their own collectors before the ordinary
                 // try surrounding them. Each name is cleared after its own handler exits,
                 // while the enclosing handler or try still owns the cleanup.
@@ -5790,11 +5913,15 @@ impl Compiler<'_> {
                     handler_count > 0 && self.control.finally.active_finally_end_blocks > 0;
                 // An async iterator created in a new try inside an unnamed handler keeps
                 // that try through POP_TOP. The handler then exits before the enclosing
-                // ordinary try, which still owns POP_EXCEPT but not the return constant.
-                let tracks_async_generator_handler_iterator = statement.value.is_none()
+                // ordinary try, which still owns POP_EXCEPT but not the final return.
+                let tracks_async_handler_iterator = ((statement.value.is_none()
                     && !preserve_tos
                     && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
-                        == CO_ASYNC_GENERATOR
+                        == CO_ASYNC_GENERATOR)
+                    || (preserve_tos
+                        && matches!(statement.value.as_deref(), Some(Expr::Name(_)))
+                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                            == CO_COROUTINE))
                     && self.control.exceptions.active_exception_group_handlers == 0
                     && self.control.exceptions.active_try_marker_slots.len() == 2
                     && self
@@ -5847,7 +5974,7 @@ impl Compiler<'_> {
                         .active_return_finally_contexts
                         .iter()
                         .all(|context| context.handler_depth == 0)
-                    && (tracks_async_generator_handler_iterator
+                    && (tracks_async_handler_iterator
                         || self.control.loops.contexts
                             [self.control.exceptions.active_exception_handlers[0].loop_depth..]
                             .iter()
@@ -5895,14 +6022,39 @@ impl Compiler<'_> {
                                 && manager.exception_region_depth == 0
                                 && manager.normal_finally_depth == 0
                     );
+                // A bare return still restores its handler before retiring the two ordinary
+                // tries that enclose it. Their collectors end independently at iterator
+                // disposal and at the final return, even without a preserved stack value.
+                let bare_handler_return_inside_two_tries = statement.value.is_none()
+                    && self.control.exceptions.active_try_marker_slots.len() == 2
+                    && self
+                        .control
+                        .exceptions
+                        .active_exception_region_exclusions
+                        .len()
+                        == 3
+                    && matches!(
+                        self.control.exceptions.active_exception_handlers.as_slice(),
+                        [handler]
+                            if handler.name.is_none()
+                                && handler.try_body_depth == 2
+                                && handler.exception_region_depth == 2
+                    )
+                    && !self.control.loops.contexts.is_empty()
+                    && self.control.loops.contexts.iter().all(|context| {
+                        matches!(
+                            context.iterator_cleanup,
+                            IteratorCleanup::None | IteratorCleanup::Sync
+                        ) && context.exception_region_depth <= 2
+                    });
                 // A handler restores its exception state before retiring an enclosing try.
                 // Preserve the existing older-iterator path, and also track an ordinary try
                 // when another try entered inside the handler must unwind before POP_EXCEPT.
                 let tracks_handler_enclosing_try_unwinds = !return_is_overridden
-                    && preserve_tos
+                    && (preserve_tos || bare_handler_return_inside_two_tries)
                     && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
                     && self.context.target_specific_rules_enabled()
-                    && handler_count == 1
+                    && (handler_count == 1 || nested_handlers_inside_older_iterator)
                     && self.control.exceptions.active_exception_group_handlers == 0
                     && (self.control.withs.active_with_exits.is_empty()
                         || handler_try_below_async_manager)
@@ -6325,7 +6477,10 @@ impl Compiler<'_> {
                         }
                         if preserve_tos {
                             let common_cleanup_start = (name.is_some()
-                                || ((handler_count == 1 || unwinds_plain_nested_handlers)
+                                || ((handler_count == 1
+                                    || unwinds_plain_nested_handlers
+                                    || (nested_handlers_inside_older_iterator
+                                        && handler_index + 1 == handler_count))
                                     && self
                                         .control
                                         .exceptions
@@ -6388,6 +6543,24 @@ impl Compiler<'_> {
                                 );
                             }
                         }
+                        if !preserve_tos
+                            && iterator_between_unnamed_handlers
+                            && let Some((target, start)) = protected_outer_pop_except_start
+                            && target == handler_index
+                        {
+                            protected_outer_pop_except_start = None;
+                            // Constant returns have no outer SWAP. End this protected span
+                            // after the intervening iterator pop, before the outer POP_EXCEPT.
+                            let end = self.assembler.label();
+                            self.assembler.mark(end);
+                            self.assembler.add_exception_region(
+                                start,
+                                end,
+                                common_cleanup,
+                                common_cleanup_depth,
+                                true,
+                            );
+                        }
                         if (delay_exception_unwind_start || unwinds_handler_and_with)
                             && exception_unwind_start.is_none()
                         {
@@ -6443,7 +6616,8 @@ impl Compiler<'_> {
                                 || self.control.exceptions.active_exception_handlers
                                     [handler_index]
                                     .protect_outer_return_pop
-                                || unwinds_plain_nested_handlers);
+                                || unwinds_plain_nested_handlers
+                                || iterator_between_unnamed_handlers);
                         // An ordinary try between this handler and its finally still owns
                         // POP_EXCEPT and any exception-name clearing. The manager unwind
                         // tracks that collector until the finally starts; a synthetic
@@ -6527,7 +6701,16 @@ impl Compiler<'_> {
                                 .and_then(|index| return_finally_contexts.get(index))
                                 .filter(|context| {
                                     handler_index > 0
-                                        && name.is_some()
+                                        && (name.is_some()
+                                            || (preserve_tos
+                                                && handler_count == 2
+                                                && handler_index == 1
+                                                && self
+                                                    .control
+                                                    .exceptions
+                                                    .active_exception_handlers[0]
+                                                    .name
+                                                    .is_none()))
                                         && context.handler_depth == handler_index
                                         && context.with_depth == with_depth
                                         && context.loop_depth == loop_depth
@@ -6535,7 +6718,7 @@ impl Compiler<'_> {
                                 });
                             if protects_outer_handler
                                 && pending_finally_owner.is_none()
-                                && preserve_tos
+                                && (preserve_tos || iterator_between_unnamed_handlers)
                                 && (unwinds_plain_nested_handlers
                                     || (handler_count == 2
                                         && handler_index == 1
@@ -8443,8 +8626,53 @@ impl Compiler<'_> {
                         // owner until the outer finalizer starts. Do not mask that region
                         // with a synthetic outer-finally owner for this inner copy. Loops
                         // created inside that try remain live throughout the copy too.
-                        let retained_try_owns_copy = (tracks_try_between_finally_unwinds
-                            && context_index == 1)
+                        // Two ordinary tries can surround a live iterator between the
+                        // finalizers. The inner try still owns this copy; the iterator is
+                        // discarded only after the copied body has completed.
+                        let retained_iterator_try_owns_copy = self
+                            .context
+                            .target_specific_rules_enabled()
+                            && statement.value.is_none()
+                            && !preserve_tos
+                            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                                == CO_ASYNC_GENERATOR
+                            && context_index == 1
+                            && return_finally_contexts.len() == 2
+                            && handler_count == 0
+                            && self.control.exceptions.active_exception_group_handlers == 0
+                            && self.control.withs.active_with_exits.is_empty()
+                            && self.control.finally.active_finally_end_blocks == 0
+                            && self.control.finally.active_normal_finally_bodies == 0
+                            && self.control.finally.active_copied_finally_bodies == 0
+                            && outer_context.loop_depth == 0
+                            && outer_context.with_depth == 0
+                            && outer_context.handler_depth == 0
+                            && outer_context.try_body_depth == 0
+                            && outer_context.exception_region_depth == 0
+                            && outer_context.depth == 0
+                            && finally_context.loop_depth == 2
+                            && finally_context.with_depth == 0
+                            && finally_context.handler_depth == 0
+                            && finally_context.try_body_depth == 2
+                            && finally_context.exception_region_depth == 3
+                            && finally_context.depth == 1
+                            && matches!(self.control.loops.contexts.as_slice(),
+                                [iterator, inner_loop]
+                                    if iterator.iterator_cleanup == IteratorCleanup::Sync
+                                        && iterator.with_depth == 0
+                                        && iterator.finally_end_depth == 0
+                                        && iterator.exception_region_depth == 2
+                                        && inner_loop.iterator_cleanup == IteratorCleanup::None
+                                        && inner_loop.with_depth == 0
+                                        && inner_loop.finally_end_depth == 0
+                                        && inner_loop.exception_region_depth == 3)
+                            && handler_region_unwind_starts.as_ref().is_some_and(|starts| {
+                                starts.len() == 5 && starts[1].is_none() && starts[2].is_none()
+                            })
+                            && !suite_contains_abrupt_control_flow(&finally_context.body)
+                            && !suite_contains_yield(&finally_context.body);
+                        let retained_try_owns_copy = retained_iterator_try_owns_copy
+                            || (tracks_try_between_finally_unwinds && context_index == 1)
                             || (self.context.target_specific_rules_enabled()
                                 && handler_count == 0
                                 && finally_context.with_depth == outer_context.with_depth
@@ -9173,6 +9401,12 @@ impl Compiler<'_> {
         );
 
         let branch_count = branches.len();
+        let has_declaration_only_else = branches.last().is_some_and(|(test, body)| {
+            test.is_none()
+                && body
+                    .iter()
+                    .all(|statement| matches!(statement, Stmt::Global(_) | Stmt::Nonlocal(_)))
+        });
         let has_terminating_else = branches
             .last()
             .is_some_and(|(test, body)| test.is_none() && suite_terminates(body));
@@ -9181,6 +9415,9 @@ impl Compiler<'_> {
         let first_branch_is_always_true = jump_constant_truthiness(&statement.test) == Some(true);
         let mut first_branch_max_depth = None;
         for (branch_index, (test, body)) in branches.into_iter().enumerate() {
+            let declaration_only_body = body
+                .iter()
+                .all(|statement| matches!(statement, Stmt::Global(_) | Stmt::Nonlocal(_)));
             if let Some(test) = test {
                 // CPython uses one original array for the false edge and the end
                 // of a final branch without an else suite.
@@ -10352,7 +10589,9 @@ impl Compiler<'_> {
                     },
                 )?;
                 let pass_only_body = matches!(body, [Stmt::Pass(_)]);
+                // Declarations emit no instruction or source-line marker in CPython.
                 if self.assembler.instruction_count() == body_start
+                    && !declaration_only_body
                     && let Some(statement) = body.last()
                 {
                     self.assembler
@@ -10374,6 +10613,8 @@ impl Compiler<'_> {
                     let inherited_shared_if_exit =
                         !self.control.statements.current_statement_has_following
                             && (self.control.statements.inherited_statement_has_following
+                                || self.control.statements.same_region_continuation
+                                    == Some(statement.range)
                                 || self.control.loops.split_loop_tail_prefix_end
                                     == Some(statement.range)
                                 || !self
@@ -10404,7 +10645,19 @@ impl Compiler<'_> {
                             && condition_jump_target_count(&statement.test, false) > 1);
                     let unlocated_assertion_exit = matches!(body.last(), Some(Stmt::Assert(statement))
                         if condition_jump_target_count(&statement.test, true) > 1);
-                    if nested_if_ends_in_break
+                    if declaration_only_body {
+                        // Declarations leave the original success array empty. Only a sole
+                        // condition predecessor can donate a line to its unlocated jump.
+                        let location = if original_condition_has_unique_jump_target(test, true) {
+                            unique_condition_jump_target(test, true)
+                                .map_or(SourceLocation::NONE, |test| {
+                                    self.source_location(test.range())
+                                })
+                        } else {
+                            SourceLocation::NONE
+                        };
+                        self.assembler.set_location(location);
+                    } else if nested_if_ends_in_break
                         && has_terminating_else
                         && !matches!(nested_if_exit, Some(NestedIfExitLocation::Unlocated))
                     {
@@ -10547,6 +10800,11 @@ impl Compiler<'_> {
                     if inherited_shared_if_exit {
                         self.assembler.defer_shared_jump_no_location(branch_exit);
                     }
+                    if has_declaration_only_else {
+                        // The empty else aliases the continuation, but CPython copies
+                        // small exits before removing this original branch jump.
+                        self.assembler.defer_jump_removal(branch_exit);
+                    }
                     // CPython retains the first assertion branch's source jump when it copies a
                     // nonterminal join onto that edge. A directly following return or raise
                     // copies the function-exit block onto later clauses too. A final nested
@@ -10564,7 +10822,14 @@ impl Compiler<'_> {
                                 .inherited_statement_followed_by_small_return
                             && !self.has_active_control_flow_region()))
                         && matches!(body.last(), Some(Stmt::Assert(_)));
-                    if nested_if_ends_in_break
+                    if declaration_only_body {
+                        self.assembler
+                            .preserve_empty_join_inlined_jump_nop(branch_exit);
+                        if !original_condition_has_unique_jump_target(test, true) {
+                            self.assembler
+                                .preserve_no_location(branch_exit.instruction());
+                        }
+                    } else if nested_if_ends_in_break
                         && has_terminating_else
                         && !matches!(nested_if_exit, Some(NestedIfExitLocation::Unlocated))
                     {
@@ -10756,6 +11021,7 @@ impl Compiler<'_> {
                 )?;
                 if branch_index + 1 == branch_count
                     && self.assembler.instruction_count() == body_start
+                    && !declaration_only_body
                     && let Some(statement) = body.last()
                 {
                     self.assembler
@@ -16645,17 +16911,26 @@ impl Compiler<'_> {
         let removed_try_pop_block = (!statement.orelse.is_empty() || match_body_pop_block)
             && !suite_terminates(&statement.body)
             && !self.assembler.last_instruction_is_nop();
-        let deferred_try_pop_block = removed_try_pop_block && self.assembler.at_jump_target();
+        let sole_else_pop_location = (removed_try_pop_block
+            && suite_ends_in_sole_else_fallthrough(&statement.body))
+        .then(|| self.assembler.original_fallthrough_join_location())
+        .flatten();
+        let deferred_try_pop_block = removed_try_pop_block
+            && (self.assembler.at_jump_target() || sole_else_pop_location.is_some());
         let removed_shared_try_pop_block =
             deferred_try_pop_block && self.assembler.has_folded_shared_conditional_entry();
         let deferred_try_pop_instruction = self.assembler.instruction_count();
         if deferred_try_pop_block && !removed_shared_try_pop_block {
-            // An emitted incoming edge starts the original normal-exit array here.
-            // Retain its POP_BLOCK until location propagation and NOP removal decide
-            // whether the physical instruction survives or leaves an owner slot.
-            self.assembler.set_location(SourceLocation::NONE);
+            // An original normal-exit array can have a sole physical else donor
+            // even when every earlier arm terminates. Other incoming edges still
+            // defer their POP_BLOCK location to CFG propagation and NOP removal.
+            self.assembler
+                .set_location(sole_else_pop_location.unwrap_or(SourceLocation::NONE));
             self.emit_with_exception_policy(NOP, 0, 0, ExceptionPolicy::EXCLUDE_ALWAYS)?;
             self.assembler.mark_last_as_converted_pop_block();
+            if sole_else_pop_location.is_some() {
+                self.assembler.record_original_fallthrough_pop_block();
+            }
         }
         if removed_try_pop_block && !deferred_try_pop_block {
             // The normal try-body POP_BLOCK is removed during CPython's first
@@ -17072,7 +17347,10 @@ impl Compiler<'_> {
                 && !self.control.loops.contexts.is_empty()
                 && let Some(Stmt::If(nested)) = statement.orelse.last()
                 && nested.elif_else_clauses.is_empty()
-                && matches!(nested.body.as_slice(), [Stmt::Break(_)])
+                && nested.body.split_last().is_some_and(|(tail, leading)| {
+                    matches!(tail, Stmt::Break(_))
+                        && (leading.is_empty() || suite_has_linear_borrow_fallthrough(leading))
+                })
                 && let Some(test) = terminating_if_fallthrough_test(nested)
                 && condition_has_only_runtime_tests(test)
                 && original_condition_has_unique_jump_target(test, false)
@@ -17961,6 +18239,49 @@ impl Compiler<'_> {
             }
             if statement.orelse.is_empty() && retained_assertion_exit {
                 self.assembler.prevent_jump_threading_target(normal_exit);
+            }
+            if retained_assertion_exit
+                && !statement.is_star
+                && statement.orelse.is_empty()
+                && statement.finalbody.is_empty()
+                && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                    == CO_COROUTINE
+                && self.control.exceptions.active_exception_group_handlers == 0
+                && self.control.exceptions.active_try_marker_slots.is_empty()
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .len()
+                    == 1
+                && self.control.loops.contexts.is_empty()
+                && self.control.withs.active_with_exits.is_empty()
+                && self
+                    .control
+                    .finally
+                    .active_return_finally_contexts
+                    .is_empty()
+                && self.control.finally.active_finally_try_bodies == 0
+                && self.control.finally.active_normal_finally_bodies == 0
+                && self.control.finally.active_copied_finally_bodies == 0
+                && self.control.finally.active_finally_end_blocks == 0
+                && matches!(self.control.exceptions.active_exception_handlers.as_slice(),
+                    [handler] if handler.name.is_some()
+                        && handler.try_body_depth == 0
+                        && handler.exception_region_depth == 0
+                        && handler.loop_depth == 0
+                        && handler.with_depth == 0
+                        && handler.finally_end_depth == 0)
+                && matches!(statement.handlers.as_slice(), [handler]
+                    if handler.as_except_handler().is_some_and(|handler| handler.name.is_some()))
+                && matches!(statement.body.last(), Some(Stmt::Assert(assertion))
+                    if early_condition_truthiness(&assertion.test).is_none()
+                        && original_condition_has_unique_jump_target(&assertion.test, true))
+            {
+                // The successful assertion's converted POP and ordinary exit can share
+                // one original array. Its following jump supplies the same source location.
+                self.assembler
+                    .allow_original_assertion_pop_compaction(normal_exit);
             }
             if loop_exit_location.is_some()
                 && matches!(normal_exit_suite.last(), Some(Stmt::While(loop_statement))
@@ -22885,7 +23206,13 @@ impl Compiler<'_> {
                     self.assembler.mark(start);
                     start
                 });
-        self.assembler.set_location(SourceLocation::NONE);
+        let sole_else_pop_location = (statement.handlers.is_empty()
+            && statement.orelse.is_empty()
+            && suite_ends_in_sole_else_fallthrough(&statement.body))
+        .then(|| self.assembler.original_fallthrough_join_location())
+        .flatten();
+        self.assembler
+            .set_location(sole_else_pop_location.unwrap_or(SourceLocation::NONE));
         // CPython converts POP_BLOCK to a NOP without assigning it an exception owner,
         // including the implicit outer handler of generators and coroutines.
         let normal_finally_pop_block = if let Some(origin) = async_for_end_pop {
@@ -23078,6 +23405,9 @@ impl Compiler<'_> {
                 origin.start,
                 origin.end,
             );
+        }
+        if sole_else_pop_location.is_some() {
+            self.assembler.record_original_fallthrough_pop_block();
         }
         let finalbody_block = self.assembler.current_block_token();
         let finalbody_instruction_start = self.assembler.instruction_count();
@@ -23767,7 +24097,6 @@ impl Compiler<'_> {
                 && capture_manager_pop
                 && !shared_manager_exit
                 && !statement.is_star
-                && statement.handlers.is_empty()
                 && statement.orelse.is_empty()
                 && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
                 && matches!(conditional_exit, Some(NestedIfExitLocation::Unlocated))
@@ -23793,7 +24122,10 @@ impl Compiler<'_> {
                         && tail.elif_else_clauses.iter().all(|clause| clause.test.as_ref()
                             .is_some_and(condition_has_only_runtime_tests)))
             {
-                // The conditional's empty original exit is shared and unlocated.
+                // The conditional's empty original exit is shared and unlocated. Any
+                // ordinary handlers finish before this normal-finally array; their cleanup
+                // does not add a POP_BLOCK to this join. The graph certificate checks the
+                // original jump and every entry alias independently of handler shape.
                 // Its manager POP_BLOCK has no line event to retain. Keep the jump
                 // through exit copying, then let ordinary late removal retire it.
                 self.assembler
@@ -24485,9 +24817,11 @@ impl Compiler<'_> {
                 // final elif's sole false edge then locates the converted manager POP_BLOCK.
                 body_noop = Some(WithBodyExitNoop::Located(exit_test.range()));
             } else if let Some(Stmt::Assert(statement)) = body.last() {
-                if condition_jump_target_count(&statement.test, true) == 1 {
-                    // CPython converts the with block's trailing `POP_BLOCK` to an unlocated
-                    // NOP. Its sole successful assert predecessor supplies the visible line.
+                if condition_jump_target_count(&statement.test, true) == 1
+                    && original_condition_has_unique_jump_target(&statement.test, true)
+                {
+                    // CPython resolves the unlocated POP_BLOCK before folding constant
+                    // assertion arms. Only an originally unique success edge donates a line.
                     body_noop = Some(WithBodyExitNoop::ConvertedPopBlock);
                 }
             }
@@ -24735,9 +25069,26 @@ impl Compiler<'_> {
                 if self.context.target_specific_rules_enabled() =>
             {
                 self.assembler
-                    .original_manager_cleanup_join(protected_end)
+                    .original_manager_cleanup_join(
+                        protected_end,
+                        remaining.is_empty() && with_body_has_cold_normal_donor(body),
+                    )
                     .map(|entry| {
                         WithBodyExitNoop::RetainedManagerPopBlock(SourceLocation::NONE, entry)
+                    })
+                    .or_else(|| {
+                        (remaining.is_empty()
+                            && matches!(body_noop, Some(WithBodyExitNoop::ConvertedPopBlock))
+                            && matches!(body.last(), Some(Stmt::For(statement))
+                                if !statement.is_async))
+                        .then(|| {
+                            self.assembler
+                                .original_manager_copied_finally_break_join(protected_end)
+                        })
+                        .flatten()
+                        .map(|(entry, location)| {
+                            WithBodyExitNoop::RetainedManagerPopBlock(location, entry)
+                        })
                     })
                     .or_else(|| {
                         remaining
@@ -25207,12 +25558,19 @@ impl Compiler<'_> {
             0,
             0,
             if !outer_exception_owns_exit
-                && !self
+                && (!self
                     .control
                     .finally
                     .active_pass_finally_locations
                     .is_empty()
+                    || self
+                        .control
+                        .finally
+                        .copied_return_finally_loop_depth
+                        .is_some())
             {
+                // Return unwinding can discard this copy's scoped exclusions. Keep the
+                // suppression marker ownerless after those regions are reconstructed.
                 ExceptionPolicy::EXCLUDE_ALWAYS
             } else {
                 ExceptionPolicy::default()
@@ -26789,6 +27147,63 @@ fn with_chained_manager_exit_location(
     location
 }
 
+// These source exits reach a distinct manager POP after the cold COPY/POP_EXCEPT/
+// RERAISE footer. The assembler still certifies that exact original footer and its
+// sole source/block join; the existing graph pass resolves live predecessor counts.
+fn with_body_has_cold_normal_donor(body: &[Stmt]) -> bool {
+    let Some(Stmt::Try(statement)) = body.last() else {
+        return false;
+    };
+    if statement.is_star {
+        return false;
+    }
+    if statement.finalbody.is_empty() {
+        if !statement.orelse.is_empty()
+            || !suite_terminates_before_constant_folding(&statement.body)
+            || !statement
+                .body
+                .iter()
+                .any(|statement| matches!(statement, Stmt::Return(_) | Stmt::Raise(_)))
+        {
+            return false;
+        }
+        let mut normal_handlers = statement
+            .handlers
+            .iter()
+            .filter_map(ruff_python_ast::ExceptHandler::as_except_handler)
+            .filter(|handler| !suite_terminates_before_constant_folding(&handler.body));
+        let Some(handler) = normal_handlers.next() else {
+            return false;
+        };
+        let Some(Stmt::For(loop_statement)) = handler.body.last() else {
+            return false;
+        };
+        return normal_handlers.next().is_none()
+            && handler.name.is_none()
+            && !loop_statement.is_async
+            && loop_statement.orelse.is_empty()
+            && !suite_contains_loop_break(&loop_statement.body)
+            && !expression_contains_inline_branch(&loop_statement.iter)
+            && !expression_suspends_current_scope(&loop_statement.iter);
+    }
+    let [Stmt::AugAssign(assignment)] = statement.finalbody.as_slice() else {
+        return false;
+    };
+    !statement.orelse.is_empty()
+        && !statement.handlers.is_empty()
+        && !suite_terminates_before_constant_folding(&statement.body)
+        && suite_has_linear_borrow_fallthrough(&statement.orelse)
+        && statement.handlers.iter().all(|handler| {
+            handler
+                .as_except_handler()
+                .is_some_and(|handler| suite_terminates_before_constant_folding(&handler.body))
+        })
+        && !expression_contains_inline_branch(&assignment.target)
+        && !expression_contains_inline_branch(&assignment.value)
+        && !expression_suspends_current_scope(&assignment.target)
+        && !expression_suspends_current_scope(&assignment.value)
+}
+
 // CPython converts the POP_BLOCK after every synchronous with body into an unowned NOP.
 // When a final structured statement leaves one normal predecessor, location propagation makes
 // that NOP observable before the manager's normal exit.
@@ -27254,6 +27669,28 @@ fn suite_ends_in_retained_try_body_exit_join(body: &[Stmt]) -> bool {
         .elif_else_clauses
         .last()
         .is_some_and(|clause| clause.test.is_none() && !suite_terminates(&clause.body))
+}
+
+// Every runtime arm exits before folding, leaving the final else as the only
+// physical predecessor of the original if-end array and its normal POP_BLOCK.
+fn suite_ends_in_sole_else_fallthrough(body: &[Stmt]) -> bool {
+    let Some(Stmt::If(statement)) = body.last() else {
+        return false;
+    };
+    let Some((last, earlier)) = statement.elif_else_clauses.split_last() else {
+        return false;
+    };
+    condition_has_only_runtime_tests(&statement.test)
+        && suite_terminates_before_constant_folding(&statement.body)
+        && last.test.is_none()
+        && !suite_terminates_before_constant_folding(&last.body)
+        && earlier.iter().all(|clause| {
+            clause
+                .test
+                .as_ref()
+                .is_some_and(condition_has_only_runtime_tests)
+                && suite_terminates_before_constant_folding(&clause.body)
+        })
 }
 
 fn if_normal_exit_count(statement: &ruff_python_ast::StmtIf) -> usize {

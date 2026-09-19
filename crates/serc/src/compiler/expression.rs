@@ -3869,14 +3869,24 @@ impl Compiler<'_> {
             // CPython assigns a hidden fast-local slot to module-scope walrus targets while
             // inlining a comprehension. Function-scope targets remain bindings in the
             // containing function and are not part of the comprehension's save set.
+            let mut walrus_targets = Vec::new();
             if let Some(key) = key {
-                collect_named_expression_target_names(key, &mut temporary_names);
+                collect_named_expression_target_names(key, &mut walrus_targets);
             }
-            collect_named_expression_target_names(value, &mut temporary_names);
+            collect_named_expression_target_names(value, &mut walrus_targets);
             for generator in generators {
                 for condition in &generator.ifs {
-                    collect_named_expression_target_names(condition, &mut temporary_names);
+                    collect_named_expression_target_names(condition, &mut walrus_targets);
                 }
+            }
+            if !walrus_targets.is_empty() {
+                let facts = comprehension_scope_facts(generators, key, value);
+                // Inlining a child copies its binding flags only for names absent
+                // from this scope. An existing outer read does not become a local
+                // merely because a nested comprehension assigns that name.
+                temporary_names.extend(walrus_targets.into_iter().filter(|name| {
+                    !facts.names.contains(name) || facts.walrus_targets.contains(name)
+                }));
             }
         }
         // An inner target read by its own iterable must keep the enclosing value live until the
@@ -4036,8 +4046,32 @@ impl Compiler<'_> {
         // import state here so nested lambdas and generator expressions inherit it, then
         // restore the exact removed names when this comprehension ends.
         let mut removed_imports = Vec::new();
+        let mut removed_module_globals = Vec::new();
+        let mut added_module_globals = Vec::new();
         if matches!(self.unit.scope, Scope::Module) {
             let facts = comprehension_scope_facts(generators, key, value);
+            // A nested `global` declaration also marks the module symbol explicit.
+            // The comprehension's own reads are implicit globals instead, except
+            // for its assignment-expression targets. Save the effective outer flags
+            // before the import overlay, then replace them only for this body.
+            removed_module_globals = facts
+                .names
+                .iter()
+                .filter_map(|name| {
+                    let name_id = self.required_name_id(name);
+                    (!facts.walrus_targets.contains(name)
+                        && self.symbols.module_globals.contains(name_id))
+                    .then_some(name_id)
+                })
+                .collect();
+            // An outer inlined comprehension may have temporarily masked this
+            // flag. A nested assignment expression still owns an explicit global.
+            added_module_globals = facts
+                .walrus_targets
+                .iter()
+                .map(|name| self.required_name_id(name))
+                .filter(|name| !self.symbols.module_globals.contains(*name))
+                .collect();
             for name in facts.names {
                 let name_id = self.required_name_id(&name);
                 if !self.symbols.imported_scope_names.contains(name_id)
@@ -4064,6 +4098,12 @@ impl Compiler<'_> {
                     removed_imports.push(name_id);
                 }
             }
+            for &name in &removed_module_globals {
+                self.symbols.module_globals.remove(name);
+            }
+            self.symbols
+                .module_globals
+                .extend(added_module_globals.iter().copied());
         }
         let result = self.with_control_override(
             |control| &mut control.comprehensions.in_unfiltered_comprehension,
@@ -4122,6 +4162,10 @@ impl Compiler<'_> {
             },
         );
         self.symbols.imported_scope_names.extend(removed_imports);
+        self.symbols.module_globals.extend(removed_module_globals);
+        for name in added_module_globals {
+            self.symbols.module_globals.remove(name);
+        }
         let ((), region_exclusions) = result?;
         self.assembler.mark(protected_end);
 
