@@ -99,3 +99,62 @@ fn matches_cpython_copied_finally_handler_break_locations() {
 "#;
     common::assert_matches_cpython_marshal(source, "copied_finally_pass_handler_break_target.py");
 }
+
+#[test]
+fn matches_cpython_copied_manager_break_nop_fusion_slots() {
+    for (filename, source) in [
+        (
+            "copied_manager_break_three_fusions_null_nop.py",
+            r#"import contextlib
+
+async def validate(items, open_item, work, mapping):
+    value = None
+    for item in items:
+        app = None
+        try:
+            app = await open_item(item)
+            value = await work(app)
+            mapping["before"] = str(value)
+            mapping["first"] = value
+            mapping["second"] = value
+            mapping["third"] = value
+            break
+        except Exception as error:
+            value = str(error)
+        finally:
+            if app is not None:
+                with contextlib.suppress(Exception):
+                    await app.close()
+    result = str(value)
+    return result
+"#,
+        ),
+        (
+            "copied_manager_break_two_fusions_control.py",
+            r#"import contextlib
+
+async def validate(items, open_item, work, mapping):
+    value = None
+    for item in items:
+        app = None
+        try:
+            app = await open_item(item)
+            value = await work(app)
+            mapping["before"] = str(value)
+            mapping["first"] = value
+            mapping["second"] = value
+            break
+        except Exception as error:
+            value = str(error)
+        finally:
+            if app is not None:
+                with contextlib.suppress(Exception):
+                    await app.close()
+    result = str(value)
+    return result
+"#,
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

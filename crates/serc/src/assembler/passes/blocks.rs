@@ -1468,19 +1468,19 @@ impl ThreadedNormalTryJoins {
     }
 }
 
-/// Original triple-store fallthroughs whose unnamed handler cleanup is shared.
-pub(in crate::assembler) struct TripleStoreHandlerExits {
+/// Original reversed-store fallthroughs whose unnamed handler cleanup is shared.
+pub(in crate::assembler) struct ReversedStoreHandlerExits {
     original_labels: FxHashSet<Label>,
-    entries: FxHashMap<Label, TripleStoreHandlerExit>,
+    entries: FxHashMap<Label, ReversedStoreHandlerExit>,
 }
 
-struct TripleStoreHandlerExit {
+struct ReversedStoreHandlerExit {
     swapped_source: Vec<Item>,
     cleanup: Vec<Item>,
     donor: SourceLocation,
 }
 
-impl TripleStoreHandlerExits {
+impl ReversedStoreHandlerExits {
     /// Replays only the captured SWAP-to-NOP conversion and complete store exchange.
     fn location(&self, source: &[Item], target: &[Item]) -> Option<SourceLocation> {
         let origin = target
@@ -2284,9 +2284,16 @@ impl OptimizationPipeline {
             }
         }
 
+        // Erased handlers retain their labels but have lost their handler status.
+        // Those labels must not seed cold paths through otherwise empty arrays.
         let mut stack = self
             .exception_regions
             .iter()
+            .filter(|region| {
+                !self
+                    .retired_exception_handler_targets
+                    .contains(&region.target)
+            })
             .filter_map(|region| graph.label_block(region.target))
             .filter(|block| temperatures[block.index()] != WARM_BLOCK)
             .collect::<Vec<_>>();
@@ -3421,10 +3428,10 @@ impl OptimizationPipeline {
         }
     }
 
-    /// Captures the original donor before static swaps reverse a three-store tail.
-    pub(in crate::assembler) fn capture_triple_store_handler_exits(
+    /// Captures the original donor before static swaps reverse a certified store tail.
+    pub(in crate::assembler) fn capture_reversed_store_handler_exits(
         &self,
-    ) -> TripleStoreHandlerExits {
+    ) -> ReversedStoreHandlerExits {
         let mut entries = FxHashMap::default();
         for pair in self.graph.order().windows(2) {
             let source = self.graph[pair[0]].items();
@@ -3452,6 +3459,27 @@ impl OptimizationPipeline {
                 || jump.location != SourceLocation::NONE
                 || !matches!(jump.operand(), Operand::Forward(_))
             {
+                continue;
+            }
+            if let Some([swap, first, last]) = super::super::constant_pair_store_tail(source) {
+                let mut swapped_source = source.to_vec();
+                let start = swapped_source.len() - 3;
+                let mut removed_swap = swap;
+                removed_swap.opcode = NOP;
+                removed_swap.set_operand(Operand::Value(0));
+                swapped_source[start..].copy_from_slice(&[
+                    Item::Instruction(removed_swap),
+                    Item::Instruction(last),
+                    Item::Instruction(first),
+                ]);
+                entries.insert(
+                    label,
+                    ReversedStoreHandlerExit {
+                        swapped_source,
+                        cleanup: target.to_vec(),
+                        donor: last.location,
+                    },
+                );
                 continue;
             }
             let [
@@ -3487,7 +3515,7 @@ impl OptimizationPipeline {
             ]);
             entries.insert(
                 label,
-                TripleStoreHandlerExit {
+                ReversedStoreHandlerExit {
                     swapped_source,
                     cleanup: target.to_vec(),
                     donor: last.location,
@@ -3505,7 +3533,7 @@ impl OptimizationPipeline {
                 })
                 .collect()
         };
-        TripleStoreHandlerExits {
+        ReversedStoreHandlerExits {
             original_labels,
             entries,
         }
@@ -3517,7 +3545,7 @@ impl OptimizationPipeline {
         original_location_absence: &FxHashSet<Label>,
         owner_retargets: &mut Vec<(Instruction, Instruction)>,
     ) -> Vec<Label> {
-        let origins = self.capture_triple_store_handler_exits();
+        let origins = self.capture_reversed_store_handler_exits();
         let threaded_normal_try_joins = self.capture_threaded_normal_try_joins();
         self.duplicate_exit_blocks_with_store_origins(
             original_location_absence,
@@ -3533,7 +3561,7 @@ impl OptimizationPipeline {
         original_location_absence: &FxHashSet<Label>,
         owner_retargets: &mut Vec<(Instruction, Instruction)>,
         region_retargets: &mut Vec<(ExceptionRegion, ExceptionRegion)>,
-        triple_store_handler_exits: &TripleStoreHandlerExits,
+        reversed_store_handler_exits: &ReversedStoreHandlerExits,
         threaded_normal_try_joins: &ThreadedNormalTryJoins,
     ) -> Vec<Label> {
         let graph = &mut self.graph;
@@ -3662,12 +3690,77 @@ impl OptimizationPipeline {
             exception_handler_blocks,
             requires_copy: _,
         } = analysis;
+        // Bind each captured marker to its complete original prefix before the
+        // copier labels implicit block entries. Transport only that new label;
+        // final owner replay still requires every item to match literally.
+        let conjunction_markers = if self
+            .exception_owner_provenance
+            .copied_conjunction_break_prefixes
+            .is_empty()
+        {
+            Vec::new()
+        } else {
+            let original_items = graph.iter_items().copied().collect::<Vec<_>>();
+            self.exception_owner_provenance
+                .copied_conjunction_break_prefixes
+                .iter()
+                .enumerate()
+                .filter_map(|(index, prefix)| {
+                    if !matches!(prefix.last(), Some(Item::Instruction(marker))
+                        if marker.opcode == NOT_TAKEN)
+                    {
+                        return None;
+                    }
+                    let mut matches = original_items
+                        .windows(prefix.len())
+                        .enumerate()
+                        .filter(|(_, items)| *items == prefix.as_slice());
+                    let (start, _) = matches.next()?;
+                    matches
+                        .next()
+                        .is_none()
+                        .then_some((index, start + prefix.len() - 1))
+                })
+                .collect::<Vec<_>>()
+        };
+        let shared_break_markers = {
+            let original_items = graph.iter_items().copied().collect::<Vec<_>>();
+            self.exception_owner_provenance.copied_shared_break_truth_prefixes.iter().enumerate()
+                .filter_map(|(index, prefix)| {
+                    if !matches!(prefix.last(), Some(Item::Instruction(marker)) if marker.opcode == NOT_TAKEN) {
+                        return None;
+                    }
+                    let mut matches = original_items.windows(prefix.len()).enumerate()
+                        .filter(|(_, items)| *items == prefix.as_slice());
+                    let (start, _) = matches.next()?;
+                    matches.next().is_none().then_some((index, start + prefix.len() - 1))
+                }).collect::<Vec<_>>()
+        };
+        let mut original_position = 0;
         for block in order.iter().copied() {
+            let original_len = graph[block].items().len();
             if graph[block].first_label().is_none() {
                 let label = Label(self.next_label);
                 self.next_label += 1;
                 graph.insert_label(block, 0, label);
+                for &(index, marker_position) in &shared_break_markers {
+                    if marker_position == original_position {
+                        let prefix = &mut self
+                            .exception_owner_provenance
+                            .copied_shared_break_truth_prefixes[index];
+                        prefix.insert(prefix.len() - 1, Item::Label(label));
+                    }
+                }
+                for &(index, marker_position) in &conjunction_markers {
+                    if marker_position == original_position {
+                        let prefix = &mut self
+                            .exception_owner_provenance
+                            .copied_conjunction_break_prefixes[index];
+                        prefix.insert(prefix.len() - 1, Item::Label(label));
+                    }
+                }
             }
+            original_position += original_len;
         }
         self.borrow_authored_finally_break_entries =
             Self::take_pre_copy_authored_finally_break_entries(
@@ -3872,6 +3965,159 @@ impl OptimizationPipeline {
                 })
             })
             .collect::<FxHashMap<_, _>>();
+
+        // A chained comparison reaches its protected value arm through a separate
+        // NOT_TAKEN/jump array. Preserve the complete original arrays before copying
+        // the unowned return; only that one earlier predecessor may revisit the copy.
+        let original_comparison_return_seams = order
+            .iter()
+            .filter_map(|&source| {
+                let source_position = positions[source.index()];
+                let source_items = graph[source].items();
+                let [
+                    Item::Label(entry),
+                    Item::Instruction(load),
+                    Item::Instruction(jump),
+                ] = source_items
+                else {
+                    return None;
+                };
+                let Operand::Forward(return_entry) = jump.operand() else {
+                    return None;
+                };
+                let return_block = graph.label_block(return_entry)?;
+                let return_items = graph[return_block].items();
+                let [
+                    Item::Label(return_label),
+                    Item::Label(end),
+                    Item::Instruction(ret),
+                ] = return_items
+                else {
+                    return None;
+                };
+                let predecessor = *order.get(source_position.checked_sub(2)?)?;
+                let discard = *order.get(source_position.checked_sub(1)?)?;
+                let alternative = *order.get(source_position + 1)?;
+                let condition = *order.get(source_position.checked_sub(3)?)?;
+                let [
+                    Item::Label(_),
+                    Item::Instruction(not_taken),
+                    Item::Instruction(success),
+                ] = graph[predecessor].items()
+                else {
+                    return None;
+                };
+                let [
+                    Item::Label(_),
+                    Item::Instruction(pop),
+                    Item::Instruction(failure),
+                ] = graph[discard].items()
+                else {
+                    return None;
+                };
+                let [Item::Label(alternative_entry), Item::Instruction(value)] =
+                    graph[alternative].items()
+                else {
+                    return None;
+                };
+                let condition_jump = graph[condition].last_instruction()?;
+                let owned_blocks = [condition, predecessor, discard, source, alternative];
+                let mut owners = region_memberships
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, membership)| {
+                        owned_blocks
+                            .iter()
+                            .any(|block| membership.contains(&positions[block.index()]))
+                    });
+                let (region_index, membership) = owners.next()?;
+                let region = self.exception_regions[region_index];
+                (owners.next().is_none()
+                    && owned_blocks
+                        .iter()
+                        .all(|block| membership.contains(&positions[block.index()]))
+                    && region_memberships
+                        .iter()
+                        .all(|membership| !membership.contains(&positions[return_block.index()]))
+                    && !region.is_scope_fallback
+                    && region.depth == 0
+                    && !region.preserve_lasti
+                    && self
+                        .exception_owner_provenance
+                        .ordinary_try_setups
+                        .get(&region.start)
+                        == Some(&region.target)
+                    && region.end == *end
+                    && positions[return_block.index()] == source_position + 2
+                    && *return_label == return_entry
+                    && predecessors[source.index()] == 1
+                    && predecessors[predecessor.index()] == 1
+                    && predecessors[return_block.index()] == 2
+                    && [predecessor, discard, source, alternative]
+                        .iter()
+                        .all(|block| !exception_boundary_blocks[block.index()])
+                    && self
+                        .exception_owner_provenance
+                        .block_boundaries
+                        .contains(entry)
+                    && jump.opcode == JUMP_FORWARD
+                    && jump.location == SourceLocation::NONE
+                    && jump.no_location_policy.copies_split_return_exit()
+                    && !jump.jump_policy.retains_nop_for(jump.operand())
+                    && !has_jump_eval_check(jump)
+                    && load.opcode == LOAD_FAST
+                    && load.depth_after() == Some(1)
+                    && load.location.line >= 0
+                    && matches!(load.operand(), Operand::Value(_))
+                    && ret.opcode == RETURN_VALUE
+                    && ret.depth_after() == Some(0)
+                    && ret.location.line == load.location.line
+                    && ret.operand() == Operand::Value(0)
+                    && not_taken.opcode == NOT_TAKEN
+                    && not_taken.depth_after() == Some(0)
+                    && success.opcode == JUMP_FORWARD
+                    && success.operand() == Operand::Forward(*entry)
+                    && success.jump_policy.retains_nop_for(success.operand())
+                    && !has_jump_eval_check(success)
+                    && pop.opcode == POP_TOP
+                    && failure.opcode == JUMP_FORWARD
+                    && failure.operand() == Operand::Forward(*alternative_entry)
+                    && condition_jump.opcode == POP_JUMP_IF_FALSE
+                    && condition_jump.operand() == Operand::Forward(*alternative_entry)
+                    && condition_jump.location == not_taken.location
+                    && success.location == not_taken.location
+                    && pop.location == not_taken.location
+                    && failure.location == not_taken.location
+                    && not_taken.location.line == load.location.line
+                    && value.depth_after() == Some(1)
+                    && matches!(value.operand(), Operand::Value(_))
+                    && block_has_fallthrough(graph[alternative].items())
+                    && [load, jump, ret, not_taken, success, pop, failure, value]
+                        .iter()
+                        .all(|instruction| {
+                            instruction.pre_fold_extra_instructions() == 0
+                                && instruction.local_policy.hidden_exception_owner_slots() == 0
+                                && instruction.exception_policy() == ExceptionPolicy::default()
+                        }))
+                .then(|| {
+                    (
+                        source,
+                        (
+                            predecessor,
+                            return_block,
+                            region_index,
+                            owned_blocks
+                                .into_iter()
+                                .chain([return_block])
+                                .map(|block| (block, graph[block].items().to_vec()))
+                                .collect::<Vec<_>>(),
+                        ),
+                    )
+                })
+            })
+            .collect::<FxHashMap<_, _>>();
+        let mut comparison_return_revisits =
+            FxHashMap::<_, (BasicBlockId, Vec<Item>, Vec<Item>, usize, (Label, Label))>::default();
 
         // Keep locations already present on original return records distinct from
         // locations inherited by synthetic cleanup copies during this pass.
@@ -4516,6 +4762,29 @@ impl OptimizationPipeline {
                         && graph[source].items() == source_items
                         && graph[target].items() == target_items
                         && graph[*original_return].items() == return_items
+                },
+            );
+            let comparison_return_seam = original_comparison_return_seams.get(&source).filter(
+                |(_, original_return, _, arrays)| {
+                    inline_small_exit
+                        && !planned_copy
+                        && target_pre_fusion_size == 1
+                        && target_blocks == [*original_return]
+                        && target == *original_return
+                        && arrays
+                            .iter()
+                            .all(|(block, items)| graph[*block].items() == items)
+                },
+            );
+            let comparison_return_revisit = comparison_return_revisits.get(&source).filter(
+                |(original_target, source_items, target_items, region_index, hole)| {
+                    inline_small_exit
+                        && !planned_copy
+                        && target_chain_end == target_position
+                        && target == *original_target
+                        && graph[source].items() == source_items
+                        && graph[target].items() == target_items
+                        && copied_region_exclusions[*region_index].contains(hole)
                 },
             );
             let recovery_copy = (!planned_copy
@@ -5353,7 +5622,9 @@ impl OptimizationPipeline {
             }
             original_return_locations.extend(copied_return_locations);
             if inline_small_exit || inline_no_location_block {
-                if planned_copy || (inline_no_location_block && target_chain_end > target_position)
+                if planned_copy
+                    || (inline_no_location_block && target_chain_end > target_position)
+                    || comparison_return_revisit.is_some()
                 {
                     let copied_positions = copied
                         .iter()
@@ -5842,6 +6113,71 @@ impl OptimizationPipeline {
                 copied.remove(0);
                 graph.insert_label(source, 1, copied_label);
             }
+            let inline_comparison_return =
+                comparison_return_seam.is_some_and(|(_, original_return, region_index, arrays)| {
+                    let [
+                        Item::Label(entry),
+                        Item::Label(end),
+                        Item::Instruction(ret),
+                        Item::Label(exclusion_end),
+                    ] = copied.as_slice()
+                    else {
+                        return false;
+                    };
+                    let [
+                        Item::Label(original_entry),
+                        Item::Label(original_end),
+                        Item::Instruction(original_ret),
+                    ] = graph[*original_return].items()
+                    else {
+                        return false;
+                    };
+                    let original_source =
+                        arrays.iter().find(|(block, _)| *block == source).unwrap();
+                    !preserve_inlined_jump_nop
+                        && graph[source].items()
+                            == &original_source.1[..original_source.1.len() - 1]
+                        && *entry == copied_label
+                        && copied_labels.get(original_entry) == Some(entry)
+                        && copied_labels.get(original_end) == Some(end)
+                        && *entry != *end
+                        && *end != *exclusion_end
+                        && *entry != *exclusion_end
+                        && *ret == original_ret.for_exit_copy()
+                        && protected_fragment_origins.is_empty()
+                        && copied_region_exclusions[*region_index]
+                            .contains(&(*entry, *exclusion_end))
+                });
+            if inline_comparison_return {
+                let (predecessor, _, region_index, arrays) = comparison_return_seam.unwrap();
+                let original_predecessor = arrays
+                    .iter()
+                    .find(|(block, _)| block == predecessor)
+                    .unwrap();
+                let Item::Instruction(ret) = &mut copied[2] else {
+                    unreachable!("certified comparison return");
+                };
+                // The removed original jump is still a slot during repeated exit copying.
+                ret.add_pre_fold_extra_instructions(1);
+                let Item::Label(exclusion_end) = copied[3] else {
+                    unreachable!("certified return exclusion end");
+                };
+                let mut expected_target = graph[source].items().to_vec();
+                expected_target.extend_from_slice(&copied);
+                comparison_return_revisits.insert(
+                    *predecessor,
+                    (
+                        source,
+                        original_predecessor.1.clone(),
+                        expected_target,
+                        *region_index,
+                        (copied_label, exclusion_end),
+                    ),
+                );
+                // A later copy can drop the arm but its exclusion endpoints still close
+                // the original owner. Retain those labels just like original region ends.
+                exception_boundary_blocks[source.index()] = true;
+            }
             if inline_borrowed_tuple_exit
                 || inline_unprotected_local_pair
                 || inline_keyword_return_pair
@@ -5854,6 +6190,7 @@ impl OptimizationPipeline {
                 graph.append_to_block(source, copied);
             } else if inline_no_location_block
                 || inline_unprotected_return
+                || inline_comparison_return
                 || (inline_small_exit && target_terminal_opcode == Some(RERAISE))
                 || planned_copy
             {
@@ -6504,11 +6841,11 @@ impl OptimizationPipeline {
                     && !planned_blocks.contains(&target)
                     && positions[source.index()] + 1 == target_position
                     && block_has_fallthrough(graph[source].items())
-                    && let Some(location) = triple_store_handler_exits
+                    && let Some(location) = reversed_store_handler_exits
                         .location(graph[source].items(), graph[target].items())
                         .or_else(|| fused_store_tail_location(graph[source].items()))
                 {
-                    // The captured triple keeps its original last-store donor across
+                    // Captured store tails keep their original last-store donor across
                     // static swaps. Other reversed pairs use their surviving fused line.
                     return Some(location);
                 }

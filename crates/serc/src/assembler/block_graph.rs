@@ -155,7 +155,7 @@ impl PipelineFeatures {
 /// `blocks` is an append-only arena and `order` is the current emission order.
 /// Keeping those concepts separate lets CFG passes reorder or duplicate blocks
 /// without invalidating identities captured by data-flow state.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct BlockGraph {
     blocks: Vec<BasicBlock>,
     order: Vec<BasicBlockId>,

@@ -502,6 +502,8 @@ impl Assembler {
             original_unlocated_cleanup_targets: self.original_unlocated_cleanup_targets,
             original_unlocated_discard_targets: self.original_unlocated_discard_targets,
             copied_finally_iterator_break_origins: self.copied_finally_iterator_break_origins,
+            copied_finally_conjunction_break_origins: self.copied_finally_conjunction_break_origins,
+            shared_finally_iterator_break_origins: self.shared_finally_iterator_break_origins,
             original_shared_unlocated_jump_entries: rustc_hash::FxHashMap::default(),
             original_jump_head_targets: rustc_hash::FxHashSet::default(),
             deferred_shared_jump_blocks: self.deferred_shared_jump_blocks,
@@ -529,7 +531,7 @@ impl OptimizationPipeline {
         parameter_count: usize,
         constants: Option<&mut dyn ConstantTable>,
     ) -> Result<LayoutAssembler, CompileError> {
-        let triple_store_handler_exits = self.capture_triple_store_handler_exits();
+        let reversed_store_handler_exits = self.capture_reversed_store_handler_exits();
         self.preserve_shared_original_manager_pop_locations();
         self.record_shared_unlocated_jump_entries();
         let mut original_owners = FusionOwnerCertificates::capture_original_owners(&self);
@@ -624,7 +626,7 @@ impl OptimizationPipeline {
                 &original_location_absence,
                 &mut copied_exit_owner_retargets,
                 &mut copied_exit_region_retargets,
-                &triple_store_handler_exits,
+                &reversed_store_handler_exits,
                 &threaded_normal_try_joins,
             )
         };
@@ -641,6 +643,41 @@ impl OptimizationPipeline {
         // Exit duplication changes this surviving conditional's target, not its
         // original array or the normal-finally comparison cells recorded within it.
         for (before, after) in &copied_exit_owner_retargets {
+            for prefix in self
+                .exception_owner_provenance
+                .copied_shared_break_truth_prefixes
+                .iter_mut()
+                .chain(
+                    self.exception_owner_provenance
+                        .copied_named_break_truth_prefixes
+                        .iter_mut()
+                        .map(|origin| &mut origin.items),
+                )
+            {
+                for item in prefix {
+                    if let Item::Instruction(condition) = item
+                        && condition == before
+                    {
+                        // Preserve the actual copy pass's complete before/after record;
+                        // the original named-handler condition remains a separate witness.
+                        *condition = *after;
+                    }
+                }
+            }
+            for prefix in &mut self
+                .exception_owner_provenance
+                .copied_conjunction_break_prefixes
+            {
+                for item in prefix {
+                    if let Item::Instruction(condition) = item
+                        && condition == before
+                    {
+                        // Only an actual cleanup copy may transport this full record.
+                        // The owner resolver still requires literal prefix equality.
+                        *condition = *after;
+                    }
+                }
+            }
             for origin in &mut self
                 .exception_owner_provenance
                 .uncompacted_conditional_arrays
@@ -893,6 +930,67 @@ impl OptimizationPipeline {
                 );
                 std::borrow::Cow::Owned(boundaries)
             };
+            let mut break_loads_before = Vec::new();
+            for (prefix_index, prefix) in self
+                .exception_owner_provenance
+                .copied_shared_break_truth_prefixes
+                .iter()
+                .chain(
+                    self.exception_owner_provenance
+                        .copied_named_break_truth_prefixes
+                        .iter()
+                        .map(|origin| &origin.items),
+                )
+                .enumerate()
+            {
+                for (record_index, item) in prefix.iter().enumerate() {
+                    let Item::Instruction(record) = item else {
+                        continue;
+                    };
+                    if record.opcode != crate::target::opcodes::LOAD_FAST {
+                        continue;
+                    }
+                    let Some(anchor) =
+                        prefix[..record_index]
+                            .iter()
+                            .rev()
+                            .find_map(|item| match item {
+                                Item::Label(label) => Some(*label),
+                                Item::Instruction(_) => None,
+                            })
+                    else {
+                        continue;
+                    };
+                    let mut anchors = items
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, item)| **item == Item::Label(anchor));
+                    let Some((anchor_index, _)) = anchors.next() else {
+                        continue;
+                    };
+                    if anchors.next().is_some() {
+                        continue;
+                    }
+                    let Some((offset, before)) = items[anchor_index + 1..]
+                        .iter()
+                        .enumerate()
+                        .find_map(|(offset, item)| match item {
+                            Item::Instruction(before) => Some((offset, *before)),
+                            Item::Label(_) => None,
+                        })
+                    else {
+                        continue;
+                    };
+                    if before == *record {
+                        break_loads_before.push((
+                            prefix_index,
+                            record_index,
+                            anchor_index + 1 + offset,
+                            before,
+                        ));
+                    }
+                }
+            }
             Self::optimize_load_fast_with_retained_entries(
                 &mut items,
                 &self.exception_regions,
@@ -911,6 +1009,30 @@ impl OptimizationPipeline {
                 assertion_side_exits,
                 &retained_finally_entries,
             );
+            for (prefix_index, record_index, index, before) in break_loads_before {
+                let mut expected = before;
+                expected.opcode = crate::target::opcodes::LOAD_FAST_BORROW;
+                if items[index] != Item::Instruction(expected) {
+                    continue;
+                }
+                // The unique captured range alias identified this physical load before
+                // analysis; transport only its actual conversion at that same slot.
+                let prefix = self
+                    .exception_owner_provenance
+                    .copied_shared_break_truth_prefixes
+                    .iter_mut()
+                    .chain(
+                        self.exception_owner_provenance
+                            .copied_named_break_truth_prefixes
+                            .iter_mut()
+                            .map(|origin| &mut origin.items),
+                    )
+                    .nth(prefix_index)
+                    .expect("captured break prefix is retained during borrowing");
+                if prefix[record_index] == Item::Instruction(before) {
+                    prefix[record_index] = Item::Instruction(expected);
+                }
+            }
         }
         if features.has_borrow_empty_block() || !omitted_borrow_markers.is_empty() {
             Self::remove_borrow_empty_block_markers(&mut items);

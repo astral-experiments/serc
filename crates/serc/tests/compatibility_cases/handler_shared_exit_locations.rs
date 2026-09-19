@@ -360,3 +360,47 @@ fn matches_cpython_unnamed_handler_original_cleanup_width() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn preserves_retired_and_reachable_handler_loop_boundaries() {
+    for (filename, source) in [
+        (
+            "retired_handler_after_assert_loop_target.py",
+            r"def run(items, work, recover):
+    result = []
+    for item in items:
+        assert False, 'stop'
+        if item:
+            try:
+                result.append(work(item))
+            except ValueError as error:
+                recover(error)
+        try:
+            work(item)
+        except TypeError:
+            continue
+    return result
+",
+        ),
+        (
+            "reachable_handler_after_assert_loop_control.py",
+            r"def run(items, work, recover):
+    result = []
+    for item in items:
+        assert item is not None, 'stop'
+        if item:
+            try:
+                result.append(work(item))
+            except ValueError as error:
+                recover(error)
+        try:
+            work(item)
+        except TypeError:
+            continue
+    return result
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

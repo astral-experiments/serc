@@ -1701,6 +1701,126 @@ impl HandlerDispatchCertificate {
     }
 }
 
+/// A folded assertion's original empty success array under only the scope fallback.
+struct FoldedAssertSuccessCertificate {
+    entry: Label,
+    next: Label,
+    jump: Instruction,
+    fallback: ExceptionRegion,
+}
+
+impl FoldedAssertSuccessCertificate {
+    fn sole_fallback(view: &View<'_>, index: usize) -> Option<ExceptionRegion> {
+        let position = view.items[..index]
+            .iter()
+            .filter(|item| matches!(item, Item::Instruction(_)))
+            .count();
+        let mut owner = None;
+        for region in view.regions {
+            let start = *view.positions.get(&region.start)?;
+            let end = *view.positions.get(&region.end)?;
+            if start <= position && position < end {
+                if !region.is_scope_fallback
+                    || region.depth != 0
+                    || !region.preserve_lasti
+                    || owner.replace(*region).is_some()
+                {
+                    return None;
+                }
+            }
+        }
+        owner
+    }
+
+    fn capture(view: &View<'_>, index: usize) -> Option<Self> {
+        let [
+            Item::Instruction(nop),
+            Item::Label(entry),
+            Item::Instruction(jump),
+            Item::Label(next),
+        ] = view.items.get(index..index + 4)?
+        else {
+            return None;
+        };
+        // This is the complete constant-true assertion producer: its three old
+        // condition records fold to a NOP before a separate empty success array.
+        let mut expected =
+            Instruction::new(NOP, Operand::Value(0), nop.location, nop.depth_after());
+        expected.add_pre_fold_extra_instructions(2);
+        expected
+            .no_location_policy
+            .set_borrow_fallthrough(super::BorrowFallthrough::Barrier);
+        if *nop != expected
+            || nop.location.line < 0
+            || jump.opcode != crate::target::opcodes::JUMP_FORWARD
+            || !matches!(jump.operand(), Operand::Forward(_))
+            || jump.location != nop.location
+            || jump.depth_after() != nop.depth_after()
+            || jump.exception_policy() != ExceptionPolicy::NoneUnchanged
+            || jump.pre_fold_extra_instructions() != 0
+            || jump.local_policy != super::LocalPolicy::default()
+            || jump.no_location_policy != super::ir::NoLocationPolicy::default()
+            || jump.jump_policy != super::ir::JumpPolicy::default()
+        {
+            return None;
+        }
+        let fallback = Self::sole_fallback(view, index + 2)?;
+        if !same_manager_region(&Self::sole_fallback(view, index)?, &fallback) {
+            return None;
+        }
+        let result = Self {
+            entry: *entry,
+            next: *next,
+            jump: *jump,
+            fallback,
+        };
+        result.valid(view)?;
+        Some(result)
+    }
+
+    fn valid(&self, view: &View<'_>) -> Option<usize> {
+        let start = *view.labels.get(&self.entry)?;
+        if view.items.get(start..start + 3)?
+            != [
+                Item::Label(self.entry),
+                Item::Instruction(self.jump),
+                Item::Label(self.next),
+            ]
+            .as_slice()
+            || !view.provenance.block_boundaries.contains(&self.entry)
+            || !view.provenance.source_boundaries.contains(&self.entry)
+            || view.provenance.normal_try_copy_blocks.contains(&self.entry)
+            || view
+                .provenance
+                .normal_try_copy_inline_labels
+                .contains(&self.entry)
+            || view
+                .provenance
+                .normal_try_copy_internal_labels
+                .contains(&self.entry)
+            || view
+                .provenance
+                .normal_try_copy_jump_nop_successors
+                .contains(&self.entry)
+            || view.items.iter().any(|item| {
+                matches!(item, Item::Instruction(instruction)
+                    if matches!(instruction.operand(), Operand::Forward(label) | Operand::Backward(label)
+                        if label == self.entry))
+            })
+            || view.regions.iter().any(|region| region.target == self.entry)
+        {
+            return None;
+        }
+        let fallback = Self::sole_fallback(view, start + 1)?;
+        // Cold ordering can split the enclosing fallback range. Its target,
+        // stack state, and original priority still identify this same owner.
+        let mut shape = fallback;
+        shape.start = self.fallback.start;
+        shape.end = self.fallback.end;
+        same_manager_region(&shape, &self.fallback).then_some(start + 1)
+    }
+}
+
 #[derive(Default)]
 pub(super) struct FusionOwnerCertificates {
     certificates: Vec<Certificate>,
@@ -1708,13 +1828,17 @@ pub(super) struct FusionOwnerCertificates {
     manager_setup_certificates: Vec<ManagerSetupCertificate>,
     fallback_certificates: Vec<FallbackCertificate>,
     fresh_singleton_certificates: Vec<FreshSingletonCertificate>,
+    folded_assert_success_certificates: Vec<FoldedAssertSuccessCertificate>,
 }
 
 impl FusionOwnerCertificates {
     /// Captures authored arrays before any CFG pass can reuse their owner slots.
     pub(super) fn capture_original_owners(p: &OptimizationPipeline) -> Self {
         if p.exception_regions.is_empty() || (p.exception_owner_provenance.handler_dispatch_arrays.is_empty() && !p.graph.iter_items().any(|item| {
-            matches!(item, Item::Instruction(instruction) if instruction.opcode == NOT_TAKEN && matches!(instruction.exception_policy(), ExceptionPolicy::NoneUnchangedBooleanSingleton | ExceptionPolicy::NonePresent | ExceptionPolicy::NoneAbsent))
+            matches!(item, Item::Instruction(instruction)
+                if (instruction.opcode == NOT_TAKEN && matches!(instruction.exception_policy(), ExceptionPolicy::NoneUnchangedBooleanSingleton | ExceptionPolicy::NonePresent | ExceptionPolicy::NoneAbsent))
+                    || (instruction.opcode == NOP && instruction.pre_fold_extra_instructions() == 2
+                        && instruction.no_location_policy.borrow_fallthrough() == super::BorrowFallthrough::Barrier))
         })) {
             return Self::default();
         }
@@ -1791,6 +1915,12 @@ impl FusionOwnerCertificates {
                 }
             }
         }
+        result.folded_assert_success_certificates = items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| matches!(item, Item::Instruction(instruction) if instruction.opcode == NOP))
+            .filter_map(|(index, _)| FoldedAssertSuccessCertificate::capture(&view, index))
+            .collect();
         result.handler_dispatch_certificates = p
             .exception_owner_provenance
             .handler_dispatch_arrays
@@ -1808,6 +1938,8 @@ impl FusionOwnerCertificates {
             .append(&mut original.fallback_certificates);
         self.fresh_singleton_certificates
             .append(&mut original.fresh_singleton_certificates);
+        self.folded_assert_success_certificates
+            .append(&mut original.folded_assert_success_certificates);
     }
 
     pub(super) fn snapshot(p: &OptimizationPipeline) -> Vec<Item> {
@@ -2161,6 +2293,7 @@ impl FusionOwnerCertificates {
             && self.manager_setup_certificates.is_empty()
             && self.fallback_certificates.is_empty()
             && self.fresh_singleton_certificates.is_empty()
+            && self.folded_assert_success_certificates.is_empty()
         {
             return;
         }
@@ -2176,6 +2309,7 @@ impl FusionOwnerCertificates {
             self.manager_setup_certificates.clear();
             self.fallback_certificates.clear();
             self.fresh_singleton_certificates.clear();
+            self.folded_assert_success_certificates.clear();
             return;
         };
         self.certificates
@@ -2188,6 +2322,8 @@ impl FusionOwnerCertificates {
             .retain(|c| c.valid(&view, false).is_some());
         self.fresh_singleton_certificates
             .retain(|certificate| certificate.valid(&view, false).is_some());
+        self.folded_assert_success_certificates
+            .retain(|certificate| certificate.valid(&view).is_some());
     }
     /// Exports exact surviving manager cells before layout chooses owner regions.
     pub(super) fn manager_owners(
@@ -2229,6 +2365,7 @@ impl FusionOwnerCertificates {
             && self.manager_setup_certificates.is_empty()
             && self.fallback_certificates.is_empty()
             && self.fresh_singleton_certificates.is_empty()
+            && self.folded_assert_success_certificates.is_empty()
         {
             return;
         }
@@ -2248,6 +2385,11 @@ impl FusionOwnerCertificates {
                 self.fresh_singleton_certificates
                     .iter()
                     .filter_map(|certificate| Some((certificate.valid(&view, true)?, None))),
+            )
+            .chain(
+                self.folded_assert_success_certificates
+                    .iter()
+                    .filter_map(|certificate| Some((certificate.valid(&view)?, None))),
             )
             .collect::<Vec<_>>();
         let dispatch_markers = self

@@ -211,3 +211,93 @@ else:
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_discarded_ifexp_direct_try_exit_copy() {
+    for (filename, source) in [
+        (
+            "discarded_ifexp_terminal_try_chain_boundary_control.py",
+            r#"def target(command, choose, left, right):
+    try:
+        if command == "one":
+            left() if choose else right()
+        elif command == "two":
+            second()
+        else:
+            fallback()
+    except ValueError:
+        recover()
+        return 2
+    except RuntimeError:
+        return 3
+    return 0
+"#,
+        ),
+        (
+            "discarded_ifexp_try_chain_following_work_target.py",
+            r#"def target(command, choose, left, right):
+    try:
+        if command == "one":
+            left() if choose else right()
+        elif command == "two":
+            second()
+        else:
+            fallback()
+        following()
+    except ValueError:
+        recover()
+        return 2
+    except RuntimeError:
+        return 3
+    return 0
+"#,
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn matches_cpython_discarded_ifexp_handler_cell_ownership() {
+    for (filename, source) in [
+        (
+            "discarded_ifexp_handler_cell_assignment_target.py",
+            r"def outer():
+    saved = None
+    def target(active, inner, choose, value, left, right):
+        nonlocal saved
+        if active:
+            try:
+                if inner:
+                    left(value) if choose else right(value)
+            except Exception:
+                left(value) if choose else right(value)
+        else:
+            left(value) if choose else right(value)
+        saved = value
+    return target
+",
+        ),
+        (
+            "discarded_ifexp_handler_following_work_cell_control.py",
+            r"def outer():
+    saved = None
+    def target(active, inner, choose, value, left, right):
+        nonlocal saved
+        if active:
+            try:
+                if inner:
+                    left(value) if choose else right(value)
+            except Exception:
+                left(value) if choose else right(value)
+                following()
+        else:
+            left(value) if choose else right(value)
+        saved = value
+    return target
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

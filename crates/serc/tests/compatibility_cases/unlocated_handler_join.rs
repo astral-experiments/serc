@@ -119,3 +119,43 @@ fn matches_cpython_unlocated_conditional_discard_local_return() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_nested_named_handler_normal_exit_fallback() {
+    for (filename, source) in [
+        (
+            "nested_named_handler_keyword_fallback_target.py",
+            r#"async def nested_handler_fallback(make, work, log, warn, finish):
+    try:
+        make()
+        try:
+            await work()
+        except Exception as error:
+            log(error)
+            warn("inner", flush=True)
+    except Exception as error:
+        log(error)
+        warn("outer", flush=True)
+    finish()
+"#,
+        ),
+        (
+            "nested_named_handler_sync_fallback_control.py",
+            r#"def nested_handler_fallback(make, work, log, warn, finish):
+    try:
+        make()
+        try:
+            work()
+        except Exception as error:
+            log(error)
+            warn("inner", flush=True)
+    except Exception as error:
+        log(error)
+        warn("outer", flush=True)
+    finish()
+"#,
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

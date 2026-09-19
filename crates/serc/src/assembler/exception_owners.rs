@@ -54,6 +54,12 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) return_region_reentries: FxHashSet<Label>,
     // Proven CALL/POP or unique conditional-join donor and its exact disposal array.
     pub(super) copied_finally_iterator_returns: Vec<(SourceLocation, Vec<Item>)>,
+    // Fresh authored break array through the first truth marker, with two omitted POPs.
+    pub(super) copied_conjunction_break_prefixes: Vec<Vec<Item>>,
+    // Named break: two handler POPs and the following finalizer POP are omitted.
+    pub(super) copied_named_break_truth_prefixes: Vec<CopiedNamedBreakTruthPrefix>,
+    // Ordinary break, ended try/finally ranges and copied first truth array.
+    pub(super) copied_shared_break_truth_prefixes: Vec<Vec<Item>>,
     pub(super) fusion_boundaries: FxHashSet<Label>,
     pub(super) setup_nop_boundaries: FxHashSet<Label>,
     pub(super) setup_nop_ranges: Vec<(Label, Label)>,
@@ -66,6 +72,7 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) normal_finally_method_none_prefixes: Vec<[Instruction; 5]>,
     pub(super) normal_finally_truth_prefixes: Vec<[Instruction; 4]>,
     pub(super) copied_return_none_prefixes: Vec<CopiedReturnNonePrefix>,
+    pub(super) copied_break_none_nops: Vec<(Vec<Label>, [Instruction; 4])>,
     pub(super) copied_bare_handler_none_prefixes: Vec<(Label, Label, [Instruction; 10])>,
     pub(super) copied_iterator_attribute_none_prefixes: Vec<[Instruction; 4]>,
     pub(super) copied_cleanup_return_none_prefixes: Vec<CopiedCleanupReturnNonePrefix>,
@@ -351,6 +358,14 @@ pub(super) struct SavedNamedHandlerNonePrefix {
     pub(super) entry: Label,
     pub(super) items: Vec<Item>,
     pub(super) unwind_offset: usize,
+}
+
+/// A captured named-handler break, retaining its original condition across exact retargets.
+#[derive(Debug)]
+pub(super) struct CopiedNamedBreakTruthPrefix {
+    pub(super) entry: Label,
+    pub(super) items: Vec<Item>,
+    pub(super) original_condition: Instruction,
 }
 
 /// Original constant-return cleanup, including NULL records omitted under a manager.
@@ -5285,11 +5300,35 @@ impl LayoutAssembler {
                     }
                     let compacted_append = pending_compacted_append.take();
                     let threaded_null_append = pending_threaded_null_append.take();
+                    // A nested retained SETUP keeps the preceding SETUP's protected
+                    // suffix in the same original array. Preserve that exact owned
+                    // prefix before the new live NOP; the existing slot arithmetic
+                    // must still place a later append strictly inside this prefix.
+                    let retained_setup_prefix = retained_owned_suffix.filter(|(start, _)| {
+                        retained_epoch_known
+                            && pop_slot_epoch_known
+                            && retained_setup_nops.contains(&instruction_index)
+                            && !instruction.fusion_policy.is_converted_pop_block()
+                            && tail.insertions == 0
+                            && tail.late_removals == 0
+                            && tail.post_compaction_fusions == 0
+                            && original_array_start <= *start
+                            && *start < instruction_index
+                            && self
+                                .uniform_exception_owner(
+                                    *start,
+                                    instruction_index,
+                                    &label_positions,
+                                )
+                                .is_some_and(|region| {
+                                    !self.exception_regions[region].is_scope_fallback
+                                })
+                    });
                     pending_retained_prefix = (instruction.opcode == NOP
                         && instruction.local_policy.hidden_exception_owner_slots() == 0
                         && instruction.pre_fold_extra_instructions() == 0
                         && owner_history_exact)
-                        .then_some(source_owned_prefix)
+                        .then_some(source_owned_prefix.or(retained_setup_prefix))
                         .flatten()
                         .map(|(start, start_tail)| (start, instruction_index, start_tail, tail));
                     // A NOP can stand for a folded source branch whose original join
@@ -5635,6 +5674,37 @@ impl LayoutAssembler {
                                             });
                                     first_unprotected_setup || unprotected_array_prefix
                                 });
+                            // Fusion leaves its newer stale tail after early compaction.
+                            // If no records changed after this retained SETUP, exactly one
+                            // slot before its protected suffix is the original NULL NOP.
+                            let fused_retained_setup_cell = instruction.opcode == NOT_TAKEN
+                                && instruction.exception_policy().owner()
+                                    == NormalizedExceptionOwner::DynamicCondition
+                                && owner_history_exact
+                                && pop_slot_epoch_known
+                                && tail.insertions == 0
+                                && tail.post_compaction_fusions > 0
+                                && tail.post_compaction_fusions
+                                    == setup_tail.post_compaction_fusions
+                                && tail.early_removals == setup_tail.early_removals
+                                && tail
+                                    .post_compaction_fusions
+                                    .checked_sub(instruction_index - start)
+                                    == Some(1)
+                                && start.checked_sub(1).is_some_and(|index| {
+                                    original_array_start <= index
+                                        && retained_setup_nops.contains(&index)
+                                        && indexed_instructions.get(index).is_some_and(|nop| {
+                                            nop.opcode == NOP
+                                                && nop.exception_policy().exclusion()
+                                                    == super::ExceptionExclusion::Always
+                                                && nop.local_policy.hidden_exception_owner_slots()
+                                                    == 0
+                                                && nop.pre_fold_extra_instructions() == 0
+                                        })
+                                });
+                            has_owner &= !fused_retained_setup_cell;
+                            proven_unprotected_slot |= fused_retained_setup_cell;
                         }
                         // Entry prologue insertion consumes the exact early-compaction
                         // tail before jump normalization appends this marker. With no
@@ -8336,6 +8406,85 @@ impl LayoutAssembler {
                             },
                         );
                     }
+                    // This original excluded NOP supplies its own exact donor cell;
+                    // the capture is limited to the certified copied manager-break array.
+                    if instruction.opcode == NOT_TAKEN
+                        && instruction.exception_policy() == super::ExceptionPolicy::NonePresent
+                        && owner_history_exact
+                        && self.copied_break_none_nop_is_null(
+                            instruction_index,
+                            original_array_start,
+                            tail,
+                            &indexed_instructions,
+                            &label_positions,
+                            &jump_targets,
+                        )
+                    {
+                        owners.insert(
+                            instruction_index,
+                            ExceptionOwnerDecision {
+                                has_owner: false,
+                                source_region: None,
+                                definitive: true,
+                                override_existing: true,
+                            },
+                        );
+                    }
+                    if instruction.opcode == NOT_TAKEN
+                        && instruction.exception_policy()
+                            == super::ExceptionPolicy::NoneDynamicCondition
+                        && owner_history_exact
+                        && tail.early_removals == 1
+                        && tail.insertions == 0
+                        && tail.late_removals == 0
+                        && tail.post_compaction_fusions == 0
+                        && owners
+                            .get(&instruction_index)
+                            .is_none_or(|decision| !decision.definitive)
+                        && self.copied_named_break_truth_is_null(
+                            instruction_index,
+                            original_array_start,
+                            &indexed_instructions,
+                            &label_positions,
+                            &jump_targets,
+                        )
+                    {
+                        owners.insert(
+                            instruction_index,
+                            ExceptionOwnerDecision {
+                                has_owner: false,
+                                source_region: None,
+                                definitive: true,
+                                override_existing: true,
+                            },
+                        );
+                    }
+                    if instruction.opcode == NOT_TAKEN
+                        && owner_history_exact
+                        && instruction.exception_policy()
+                            == super::ExceptionPolicy::NoneDynamicCondition
+                        && owners
+                            .get(&instruction_index)
+                            .is_none_or(|decision| !decision.definitive)
+                        && let Some(region) = self.copied_shared_break_truth_owner(
+                            instruction_index,
+                            original_array_start,
+                            tail,
+                            &indexed_instructions,
+                            &label_positions,
+                            &jump_targets,
+                        )
+                    {
+                        owners.insert(
+                            instruction_index,
+                            ExceptionOwnerDecision {
+                                has_owner: true,
+                                source_region: Some(region),
+                                definitive: true,
+                                override_existing: true,
+                            },
+                        );
+                    }
                     instruction_index += 1;
                     has_instruction = true;
                     if matches!(instruction.opcode, FOR_ITER | SEND) {
@@ -8399,7 +8548,552 @@ impl LayoutAssembler {
             );
         }
         owners.extend(self.normal_try_break_pop_owners(&label_positions, &jump_targets));
+        // The generic fresh-array rule cannot see this pair of omitted POPs.
+        // Replay the exact source certificate after all generic NULL conclusions.
+        owners.extend(self.copied_conjunction_break_owners(&label_positions, &jump_targets));
         owners
+    }
+
+    /// Replays the retained break NOP reused after exactly three local-load fusions.
+    fn copied_break_none_nop_is_null(
+        &self,
+        marker: usize,
+        array: usize,
+        tail: ExceptionOwnerTail,
+        instructions: &[&Instruction],
+        positions: &FxHashMap<Label, usize>,
+        jump_targets: &FxHashSet<Label>,
+    ) -> bool {
+        if tail.insertions != 0
+            || tail.late_removals != 0
+            || tail.post_compaction_fusions != 3
+            || tail.early_removals != 7
+            || marker < array + 3
+        {
+            return false;
+        }
+        let authored = marker - 3;
+        let provenance = &self.exception_owner_provenance;
+        let mut origins = provenance
+            .copied_break_none_nops
+            .iter()
+            .filter(|(_, records)| {
+                let mut expected = *records;
+                if instructions[authored + 1].opcode == crate::target::opcodes::LOAD_FAST_BORROW {
+                    expected[1].opcode = crate::target::opcodes::LOAD_FAST_BORROW;
+                }
+                instructions[authored..=marker]
+                    .iter()
+                    .zip(expected)
+                    .all(|(actual, expected)| **actual == expected)
+            });
+        let Some((aliases, _)) = origins.next() else {
+            return false;
+        };
+        if origins.next().is_some()
+            || aliases.iter().any(|label| {
+                positions.get(label) != Some(&(authored + 1))
+                    || self
+                        .items
+                        .iter()
+                        .filter(|item| **item == Item::Label(*label))
+                        .count()
+                        != 1
+            })
+            || jump_targets
+                .iter()
+                .chain(&provenance.source_boundaries)
+                .chain(&provenance.block_boundaries)
+                .chain(&provenance.fusion_boundaries)
+                .chain(&self.preserved_block_boundaries)
+                .chain(provenance.omitted_nop_counts.keys())
+                .chain(provenance.omitted_nop_locations.keys())
+                .chain(provenance.setups.iter().map(|(label, _)| label))
+                .chain(self.exception_regions.iter().map(|region| &region.target))
+                .any(|label| {
+                    positions
+                        .get(label)
+                        .is_some_and(|position| array < *position && *position <= marker)
+                })
+        {
+            return false;
+        }
+        let prefix = &instructions[array..authored];
+        if prefix.iter().any(|record| {
+            !matches!(record.operand(), Operand::Value(_))
+                || is_scope_exit(record.opcode)
+                || matches!(
+                    record.opcode,
+                    NOP | NOT_TAKEN | STORE_FAST_LOAD_FAST | STORE_FAST_STORE_FAST
+                )
+                || record.exception_policy() != super::ExceptionPolicy::NoneUnchanged
+                || record.local_policy.hidden_exception_owner_slots() != 0
+                || record.pre_fold_extra_instructions() != 0
+                || record.no_location_policy.borrow_fallthrough()
+                    == super::BorrowFallthrough::Barrier
+        }) {
+            return false;
+        }
+        // The one early global NULL fold and the None comparison precede the later
+        // local pass. Its three fusions all occur before this intact four-record
+        // suffix. The appended marker therefore reuses the authored NOP's old cell,
+        // whose unconditional exclusion already proves a NULL owner.
+        prefix
+            .iter()
+            .filter(|record| {
+                matches!(
+                    record.opcode,
+                    LOAD_FAST_LOAD_FAST | LOAD_FAST_BORROW_LOAD_FAST_BORROW
+                )
+            })
+            .count()
+            == 3
+            && prefix
+                .iter()
+                .filter(|record| {
+                    matches!((record.opcode, record.operand()),
+                (LOAD_GLOBAL, Operand::Value(argument)) if argument & 1 != 0)
+                })
+                .count()
+                == 1
+    }
+
+    /// Resolves only the captured named break's original NULL finalizer POP cell.
+    fn copied_named_break_truth_is_null(
+        &self,
+        marker: usize,
+        array: usize,
+        instructions: &[&Instruction],
+        positions: &FxHashMap<Label, usize>,
+        targets: &FxHashSet<Label>,
+    ) -> bool {
+        if marker.checked_sub(array) != Some(7) {
+            return false;
+        }
+        let provenance = &self.exception_owner_provenance;
+        let mut origins = provenance
+            .copied_named_break_truth_prefixes
+            .iter()
+            .filter(|origin| {
+                positions.get(&origin.entry) == Some(&array)
+                    && provenance.source_boundaries.contains(&origin.entry)
+                    && provenance.block_boundaries.contains(&origin.entry)
+            });
+        let Some(origin) = origins.next() else {
+            return false;
+        };
+        if origins.next().is_some() {
+            return false;
+        }
+        let records = origin
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Instruction(record) => Some(*record),
+                Item::Label(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let [
+            authored,
+            pop,
+            none,
+            store,
+            delete,
+            load,
+            truth,
+            condition,
+            expected_marker,
+        ] = records.as_slice()
+        else {
+            return false;
+        };
+        let Some(actual) = instructions.get(array..=marker) else {
+            return false;
+        };
+        let mut expected_pop = *pop;
+        expected_pop
+            .local_policy
+            .add_hidden_exception_owner_slots(1);
+        if actual
+            .iter()
+            .copied()
+            .zip([
+                expected_pop,
+                *none,
+                *store,
+                *delete,
+                *load,
+                *truth,
+                *condition,
+                *expected_marker,
+            ])
+            .any(|(actual, expected)| *actual != expected)
+            || provenance
+                .original_primitive_condition_boundaries
+                .iter()
+                .filter(|record| **record == origin.original_condition)
+                .count()
+                != 1
+        {
+            return false;
+        }
+        let mut ordinal = 0usize;
+        let mut handler_ends = Vec::new();
+        let mut finally_ends = Vec::new();
+        for item in &origin.items {
+            match item {
+                Item::Instruction(_) => ordinal += 1,
+                Item::Label(label) => {
+                    let expected = array + ordinal.saturating_sub(1);
+                    if positions.get(label) != Some(&expected)
+                        || provenance.omitted_nop_counts.contains_key(label)
+                        || provenance.omitted_nop_locations.contains_key(label)
+                        || provenance.fusion_boundaries.contains(label)
+                        || provenance.continuation_boundaries.contains(label)
+                        || provenance.setups.iter().any(|(setup, _)| setup == label)
+                        // A captured leading short-circuit alias can preserve this
+                        // same array entry. An interior preserved boundary still rejects.
+                        || (ordinal > 0 && self.preserved_block_boundaries.contains(label))
+                    {
+                        return false;
+                    }
+                    if ordinal > 0
+                        && (targets.contains(label)
+                            || provenance.source_boundaries.contains(label)
+                            || provenance.block_boundaries.contains(label)
+                            || self
+                                .exception_regions
+                                .iter()
+                                .any(|region| region.start == *label || region.target == *label))
+                    {
+                        return false;
+                    }
+                    if ordinal == 1 {
+                        handler_ends.push(*label);
+                    }
+                    if ordinal == 5 {
+                        finally_ends.push(*label);
+                    }
+                }
+            }
+        }
+        if targets
+            .iter()
+            .chain(&provenance.source_boundaries)
+            .chain(&provenance.block_boundaries)
+            .any(|label| {
+                positions
+                    .get(label)
+                    .is_some_and(|position| array < *position && *position <= marker)
+            })
+        {
+            return false;
+        }
+        let handlers = self
+            .exception_regions
+            .iter()
+            .filter(|region| !region.is_scope_fallback && handler_ends.contains(&region.end))
+            .collect::<Vec<_>>();
+        let finalizers = self
+            .exception_regions
+            .iter()
+            .enumerate()
+            .filter(|(_, region)| !region.is_scope_fallback && finally_ends.contains(&region.end))
+            .collect::<Vec<_>>();
+        if handlers.len() != 2
+            || handlers[0].target == handlers[1].target
+            || handlers.iter().any(|region| {
+                !region.preserve_lasti
+                    || Some(region.depth) != authored.depth_after()
+                    || positions
+                        .get(&region.start)
+                        .is_none_or(|position| *position >= array)
+            })
+            || finalizers.len() != 1
+        {
+            return false;
+        }
+        let (finalizer_index, finalizer) = finalizers[0];
+        if finalizer.preserve_lasti
+            || Some(finalizer.depth) != pop.depth_after()
+            || positions
+                .get(&finalizer.start)
+                .is_none_or(|position| *position >= array)
+            || self.uniform_exception_owner(array, array + 4, positions) != Some(finalizer_index)
+        {
+            return false;
+        }
+        // Original cells: NOP, POP, POP, four name-clear records, finally POP,
+        // LOAD, TO_BOOL, branch. The compacted seven-record prefix appends its
+        // marker into original cell seven, the separately authenticated NULL POP.
+        true
+    }
+
+    /// Resolves a copied break marker whose old cell precedes its whole cleanup.
+    fn copied_shared_break_truth_owner(
+        &self,
+        marker: usize,
+        array: usize,
+        tail: ExceptionOwnerTail,
+        instructions: &[&Instruction],
+        positions: &FxHashMap<Label, usize>,
+        targets: &FxHashSet<Label>,
+    ) -> Option<usize> {
+        let nop = marker.checked_sub(4)?;
+        if array >= nop
+            || tail.insertions != 0
+            || tail.late_removals != 0
+            || tail.post_compaction_fusions != 0
+            || tail.early_removals <= 4
+            || tail.early_removals > marker - array
+        {
+            return None;
+        }
+        let provenance = &self.exception_owner_provenance;
+        let mut matching = provenance
+            .copied_shared_break_truth_prefixes
+            .iter()
+            .filter(|origin| {
+                let Some(
+                    [
+                        Item::Instruction(original_nop),
+                        Item::Label(first),
+                        Item::Label(second),
+                        Item::Instruction(load),
+                        Item::Instruction(truth),
+                        Item::Instruction(condition),
+                        marker_tail @ ..,
+                    ],
+                ) = origin.get(..)
+                else {
+                    return false;
+                };
+                let ([Item::Instruction(original_marker)]
+                | [Item::Label(_), Item::Instruction(original_marker)]) = marker_tail
+                else {
+                    return false;
+                };
+                let ranges = [*first, *second];
+                *instructions[nop] == *original_nop
+                    && *instructions[nop + 1] == *load
+                    && *instructions[nop + 2] == *truth
+                    && *instructions[nop + 3] == *condition
+                    && *instructions[marker] == *original_marker
+                    && self
+                        .items
+                        .windows(origin.len())
+                        .filter(|window| *window == origin.as_slice())
+                        .count()
+                        == 1
+                    && ranges.iter().all(|label| {
+                        positions.get(label) == Some(&(nop + 1))
+                            && !targets.contains(label)
+                            && !provenance.source_boundaries.contains(label)
+                            && !provenance.block_boundaries.contains(label)
+                            && !provenance.fusion_boundaries.contains(label)
+                            && !provenance.continuation_boundaries.contains(label)
+                            && !provenance.omitted_nop_counts.contains_key(label)
+                            && !provenance.omitted_nop_locations.contains_key(label)
+                            && !self.preserved_block_boundaries.contains(label)
+                    })
+                    && !self.exception_regions.iter().any(|region| {
+                        ranges.contains(&region.start) || ranges.contains(&region.target)
+                    })
+            });
+        let origin = matching.next()?;
+        if matching.next().is_some() {
+            return None;
+        }
+        // Every early erased cell in this uninterrupted prefix is the NULL paired
+        // with an odd LOAD_GLOBAL. The omitted POPs add two cells to both the old
+        // cleanup width and its removal count, so they cancel: four live records
+        // (authored NOP, load, truth, condition) separate the donor from this marker.
+        let prefix = &instructions[array..nop];
+        if prefix.iter().any(|record| {
+            record.exception_policy() != super::ExceptionPolicy::NoneUnchanged
+                || record.opcode == NOP
+                || is_conditional_jump(record.opcode)
+                || is_scope_exit(record.opcode)
+                || matches!(record.operand(), Operand::Forward(_) | Operand::Backward(_))
+                || record.local_policy.hidden_exception_owner_slots() != 0
+                || record.pre_fold_extra_instructions() != 0
+                || record.no_location_policy.borrow_fallthrough()
+                    == super::BorrowFallthrough::Barrier
+        }) || prefix
+            .iter()
+            .filter(|record| {
+                record.opcode == LOAD_GLOBAL
+                    && matches!(record.operand(), Operand::Value(argument) if argument & 1 != 0)
+            })
+            .count()
+            != tail.early_removals
+            || targets
+                .iter()
+                .chain(&provenance.block_boundaries)
+                .chain(&provenance.source_boundaries)
+                .chain(&provenance.fusion_boundaries)
+                .chain(&provenance.continuation_boundaries)
+                .chain(&self.preserved_block_boundaries)
+                .chain(provenance.setups.iter().map(|(label, _)| label))
+                .any(|label| {
+                    positions
+                        .get(label)
+                        .is_some_and(|position| array < *position && *position <= marker)
+                })
+        {
+            return None;
+        }
+        let region = self.uniform_exception_owner(array, nop, positions)?;
+        let owner = &self.exception_regions[region];
+        let ranges = origin[1..3]
+            .iter()
+            .filter_map(|item| match item {
+                Item::Label(label) => Some(*label),
+                Item::Instruction(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let ended = self
+            .exception_regions
+            .iter()
+            .filter(|region| !region.is_scope_fallback && ranges.contains(&region.end))
+            .collect::<Vec<_>>();
+        (!owner.is_scope_fallback
+            && !owner.preserve_lasti
+            && Some(owner.depth) == instructions[nop].depth_after()
+            && ranges.contains(&owner.end)
+            && ended.len() == 2
+            && ended[0].target != ended[1].target
+            && ended
+                .iter()
+                .all(|region| !region.preserve_lasti && region.depth == owner.depth))
+        .then_some(region)
+    }
+
+    /// Replays the stale truth slot left by a break's two omitted `POP_BLOCK`s.
+    fn copied_conjunction_break_owners(
+        &self,
+        positions: &FxHashMap<Label, usize>,
+        targets: &FxHashSet<Label>,
+    ) -> FxHashMap<usize, ExceptionOwnerDecision> {
+        let mut result = FxHashMap::default();
+        let provenance = &self.exception_owner_provenance;
+        for origin in &provenance.copied_conjunction_break_prefixes {
+            let Some(nop_offset) = origin
+                .iter()
+                .position(|item| matches!(item, Item::Instruction(_)))
+            else {
+                continue;
+            };
+            let Some(Item::Instruction(nop)) = origin.get(nop_offset) else {
+                continue;
+            };
+            if origin.len() < nop_offset + 5 {
+                continue;
+            }
+            let Some(load_offset) = origin
+                .iter()
+                .enumerate()
+                .skip(nop_offset + 1)
+                .find_map(|(index, item)| matches!(item, Item::Instruction(_)).then_some(index))
+            else {
+                continue;
+            };
+            let mut matches = self
+                .items
+                .windows(origin.len())
+                .enumerate()
+                .filter(|(_, items)| *items == origin.as_slice());
+            let Some((item_start, _)) = matches.next() else {
+                continue;
+            };
+            if matches.next().is_some()
+                || provenance
+                    .copied_conjunction_break_prefixes
+                    .iter()
+                    .filter(|prefix| *prefix == origin)
+                    .count()
+                    != 1
+            {
+                continue;
+            }
+            let start = self.items[..item_start + nop_offset]
+                .iter()
+                .filter(|item| matches!(item, Item::Instruction(_)))
+                .count();
+            let marker = start + 4;
+            let head_labels = origin[..nop_offset]
+                .iter()
+                .filter_map(|item| match item {
+                    Item::Label(label) => Some(*label),
+                    Item::Instruction(_) => None,
+                })
+                .collect::<Vec<_>>();
+            let range_labels = origin[nop_offset + 1..load_offset]
+                .iter()
+                .filter_map(|item| match item {
+                    Item::Label(label) => Some(*label),
+                    Item::Instruction(_) => None,
+                })
+                .collect::<Vec<_>>();
+            if !head_labels.iter().any(|label| {
+                provenance.source_boundaries.contains(label)
+                    && provenance.block_boundaries.contains(label)
+                    && positions.get(label) == Some(&start)
+            }) || range_labels.iter().any(|label| {
+                positions.get(label) != Some(&(start + 1))
+                    || targets.contains(label)
+                    || provenance.source_boundaries.contains(label)
+                    || provenance.block_boundaries.contains(label)
+                    || self.preserved_block_boundaries.contains(label)
+                    || provenance.setups.iter().any(|(entry, _)| entry == label)
+                    || provenance.fusion_boundaries.contains(label)
+                    || provenance.continuation_boundaries.contains(label)
+                    || provenance.omitted_nop_counts.contains_key(label)
+                    || provenance.omitted_nop_locations.contains_key(label)
+            }) || self.exception_regions.iter().any(|region| {
+                range_labels.contains(&region.start) || range_labels.contains(&region.target)
+            }) {
+                continue;
+            }
+            let ended = self
+                .exception_regions
+                .iter()
+                .filter(|region| !region.is_scope_fallback && range_labels.contains(&region.end))
+                .collect::<Vec<_>>();
+            if ended.len() != 2
+                || ended[0].target == ended[1].target
+                || ended.iter().any(|region| {
+                    region.preserve_lasti
+                        || Some(region.depth) != nop.depth_after()
+                        || positions
+                            .get(&region.start)
+                            .is_none_or(|position| *position > start)
+                })
+            {
+                continue;
+            }
+            let Some(region) = self.uniform_exception_owner(start + 1, marker, positions) else {
+                continue;
+            };
+            let owner = &self.exception_regions[region];
+            if !owner.is_scope_fallback || owner.depth != 0 || !owner.preserve_lasti {
+                continue;
+            }
+            // Original cells are NOP, POP, POP, LOAD_FAST, TO_BOOL, condition.
+            // Removing the first two NOPs leaves four live records; appending at
+            // cell four reuses the old TO_BOOL owner. The later truth array has
+            // no captured prefix and still appends into fresh NULL storage.
+            result.insert(
+                marker,
+                ExceptionOwnerDecision {
+                    has_owner: true,
+                    source_region: Some(region),
+                    definitive: true,
+                    override_existing: true,
+                },
+            );
+        }
+        result
     }
 
     /// Replays the complete original bare-return array through two unnamed handlers.

@@ -315,3 +315,27 @@ fn matches_cpython_loop_tail_comparison_pass_original_join() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_terminal_chain_return_copy_budget() {
+    for (filename, source) in [
+        (
+            "terminal_chain_attribute_assignment_return_5.py",
+            r"def f(value, box):
+    if 0 < value < 10:
+        box.value = value
+        return value
+",
+        ),
+        (
+            "terminal_chain_local_assignment_return_4.py",
+            r"def f(value):
+    if 0 < value < 10:
+        result = value
+        return result
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

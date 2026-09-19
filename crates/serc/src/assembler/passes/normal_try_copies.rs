@@ -1690,6 +1690,623 @@ impl OptimizationPipeline {
     /// and exception ranges through the same ascending, once-per-round copy schedule.
     pub(in crate::assembler) fn prepare_normal_try_copy_plan(&mut self) {
         let pass_prefixes = self.restore_normal_try_pass_prefixes();
+        let mut discard_joins = self.original_discard_try_exit_joins();
+        let handler_joins = self.original_discard_handler_exit_joins();
+        let handler_heads = handler_joins.keys().copied().collect::<FxHashSet<_>>();
+        let handler_continuations = handler_joins
+            .values()
+            .map(|(_, target, tail)| (*target, *tail))
+            .collect::<FxHashMap<_, _>>();
+        discard_joins.extend(
+            handler_joins
+                .iter()
+                .map(|(head, (split, target, _))| (*head, (*split, *target))),
+        );
+        if !discard_joins.is_empty() {
+            // Range-only labels do not split CPython's original POP_TOP/JUMP array.
+            // Attempt the existing closed schedule with those arrays intact. An
+            // unrelated predecessor or unsupported tail leaves the graph unchanged.
+            let original = self.graph.clone();
+            let original_next_label = self.next_label;
+            let discard_blocks = self
+                .graph
+                .order()
+                .iter()
+                .copied()
+                .filter(|block| discard_joins.contains_key(block))
+                .collect::<Vec<_>>();
+            let mut internal = discard_blocks
+                .iter()
+                .map(|block| discard_joins[block].0)
+                .collect::<Vec<_>>();
+            let forbidden = self.exception_owner_provenance.source_boundaries.clone();
+            if self
+                .graph
+                .join_continuation_blocks(&internal, &forbidden)
+                .is_ok()
+            {
+                for block in discard_blocks {
+                    self.graph
+                        .instructions_mut(block)
+                        .next_back()
+                        .expect("original discard exit")
+                        .allow_unconditional_block_inlining();
+                }
+                let mut handler_pop_ranges = Vec::new();
+                let mut handler_owner_starts = FxHashMap::default();
+                // The unnamed handler's POP_BLOCK precedes its POP_EXCEPT in this
+                // same original array. Preserve that slot and its unowned interval.
+                let handler_order = self
+                    .graph
+                    .order()
+                    .iter()
+                    .copied()
+                    .filter(|head| handler_joins.contains_key(head))
+                    .collect::<Vec<_>>();
+                for head in handler_order {
+                    let (split, _, _) = handler_joins[&head];
+                    handler_owner_starts.insert(
+                        split,
+                        self.graph[head]
+                            .first_label()
+                            .expect("original handler discard"),
+                    );
+                    let offset = self.graph[head]
+                        .items()
+                        .iter()
+                        .position(|item| *item == Item::Label(split))
+                        .expect("handler end")
+                        + 1;
+                    let end = Label(self.next_label);
+                    self.next_label += 1;
+                    let mut pop = Instruction::synthetic(
+                        NOP,
+                        Operand::Value(0),
+                        SourceLocation::NONE,
+                        Some(1),
+                    );
+                    pop.fusion_policy.mark_converted_pop_block();
+                    self.graph
+                        .insert_item(ItemPosition::new(head, offset), Item::Instruction(pop));
+                    self.graph.insert_label(head, offset + 1, end);
+                    internal.push(end);
+                    handler_pop_ranges.push((split, end));
+                }
+                self.prepare_normal_try_copy_plan_with_discards(
+                    &pass_prefixes,
+                    &discard_joins,
+                    &handler_heads,
+                    &handler_continuations,
+                );
+                if !self
+                    .exception_owner_provenance
+                    .normal_try_copy_steps
+                    .is_empty()
+                {
+                    // Rejoining this exact array puts the handler's original end
+                    // inside its block. Expose the owned POP_TOP as a physical
+                    // region fragment, so copying its labels carries that owner
+                    // while POP_BLOCK and POP_EXCEPT remain outside the handler.
+                    // Keep the original priority and all other owner fields.
+                    if !handler_owner_starts.is_empty() {
+                        let regions = std::mem::take(&mut self.exception_regions);
+                        for region in regions {
+                            if let Some(&start) = handler_owner_starts.get(&region.end)
+                                && region.start != start
+                            {
+                                self.exception_regions.push(ExceptionRegion {
+                                    end: start,
+                                    ..region
+                                });
+                                self.exception_regions
+                                    .push(ExceptionRegion { start, ..region });
+                            } else {
+                                self.exception_regions.push(region);
+                            }
+                        }
+                    }
+                    self.exception_owner_provenance
+                        .normal_try_copy_internal_labels
+                        .extend(internal);
+                    self.exception_owner_provenance
+                        .normal_try_copy_pop_ranges
+                        .extend(handler_pop_ranges);
+                    return;
+                }
+            }
+            self.graph = original;
+            self.next_label = original_next_label;
+        }
+        self.prepare_normal_try_copy_plan_with_discards(
+            &pass_prefixes,
+            &FxHashMap::default(),
+            &FxHashSet::default(),
+            &FxHashMap::default(),
+        );
+    }
+
+    /// Certifies a discarded runtime expression's original direct ordinary-try exit.
+    fn original_discard_try_exit_joins(&self) -> FxHashMap<BasicBlockId, (Label, BasicBlockId)> {
+        use crate::target::opcodes::POP_TOP;
+
+        if self
+            .exception_owner_provenance
+            .normal_try_jump_owners
+            .is_empty()
+        {
+            return FxHashMap::default();
+        }
+        let graph = &self.graph;
+        let order = graph.order();
+        let position = |label| {
+            let block = graph.label_block(label)?;
+            order.iter().position(|candidate| *candidate == block)
+        };
+        let intact = |label| {
+            !self.original_nop_targets.contains(&label)
+                && !self.folded_original_predecessor_targets.contains(&label)
+                && !self.folded_condition_exit_targets.contains(&label)
+                && !self.borrow_block_aliases.contains(&label)
+                && !self
+                    .exception_owner_provenance
+                    .omitted_nop_counts
+                    .contains_key(&label)
+                && !self
+                    .exception_owner_provenance
+                    .omitted_nop_locations
+                    .contains_key(&label)
+                && !self
+                    .exception_owner_provenance
+                    .setups
+                    .iter()
+                    .any(|(entry, _)| *entry == label)
+                && !self
+                    .exception_regions
+                    .iter()
+                    .any(|region| region.target == label)
+        };
+        order
+            .windows(2)
+            .filter_map(|pair| {
+                let [Item::Label(join), Item::Instruction(pop)] = graph[pair[0]].items() else {
+                    return None;
+                };
+                let [Item::Label(split), Item::Instruction(jump)] = graph[pair[1]].items() else {
+                    return None;
+                };
+                let Operand::Forward(target) = jump.operand() else {
+                    return None;
+                };
+                let target_block = graph.label_block(target)?;
+                if *pop
+                    != Instruction::new(POP_TOP, Operand::Value(0), SourceLocation::NONE, Some(0))
+                    || *jump
+                        != Instruction::new(
+                            JUMP_FORWARD,
+                            Operand::Forward(target),
+                            SourceLocation::NONE,
+                            Some(0),
+                        )
+                    || !intact(*join)
+                    || !intact(*split)
+                    || !self.preserved_block_boundaries.contains(join)
+                    || !self
+                        .exception_owner_provenance
+                        .source_boundaries
+                        .contains(join)
+                    || !self
+                        .exception_owner_provenance
+                        .block_boundaries
+                        .contains(join)
+                    || self.preserved_block_boundaries.contains(split)
+                    || self
+                        .exception_owner_provenance
+                        .source_boundaries
+                        .contains(split)
+                    || self
+                        .exception_owner_provenance
+                        .block_boundaries
+                        .contains(split)
+                    || position(*split)? >= position(target)?
+                    || !self.exception_owner_provenance.normal_try_exits.iter().any(
+                        |(entry, exit)| {
+                            graph.label_block(*entry) == Some(target_block)
+                                && super::control_flow::is_original_constant_return(graph, *exit)
+                        },
+                    )
+                {
+                    return None;
+                }
+                // This is the compiler's recorded one-instruction exclusion, not an
+                // independently targeted cleanup or an inferred exception-range end.
+                let mut owners = self
+                    .exception_owner_provenance
+                    .normal_try_jump_owners
+                    .iter()
+                    .filter(|((start, _), _)| start == split);
+                let ((_, end), owner) = owners.next()?;
+                let [owner] = owner.as_slice() else {
+                    return None;
+                };
+                let following = *order.get(position(*split)? + 1)?;
+                if owners.next().is_some()
+                    || graph.label_block(*end) != Some(following)
+                    || owner.start != *split
+                    || owner.end != *end
+                    || owner.is_scope_fallback
+                    || owner.depth != 0
+                    || owner.preserve_lasti
+                {
+                    return None;
+                }
+                let mut incoming = None;
+                for (source, block) in graph.iter() {
+                    for item in block.items() {
+                        let Item::Instruction(instruction) = item else {
+                            continue;
+                        };
+                        let (Operand::Forward(label) | Operand::Backward(label)) =
+                            instruction.operand()
+                        else {
+                            continue;
+                        };
+                        if label == *split {
+                            return None;
+                        }
+                        if label != *join {
+                            continue;
+                        }
+                        let mut expected = Instruction::new(
+                            JUMP_FORWARD,
+                            Operand::Forward(*join),
+                            SourceLocation::NONE,
+                            Some(1),
+                        );
+                        expected.no_location_policy.allow_split_return_exit_copy();
+                        if incoming.is_some() || *instruction != expected {
+                            return None;
+                        }
+                        incoming = Some(order.iter().position(|candidate| *candidate == source)?);
+                    }
+                }
+                let incoming = incoming?;
+                let join_position = position(*join)?;
+                // The true arm and shared discard have the same ordinary-try owner.
+                // The false arm is the sole physical fallthrough; no loop/fallback or
+                // nested cleanup is admitted by a coincident source location.
+                let previous = *order.get(join_position.checked_sub(1)?)?;
+                if incoming >= join_position - 1
+                    || !super::super::block_has_fallthrough(graph[previous].items())
+                    || !self.exception_regions.iter().any(|region| {
+                        region.end == *split
+                            && region.target == owner.target
+                            && region.depth == 0
+                            && !region.preserve_lasti
+                            && !region.is_scope_fallback
+                            && self
+                                .exception_owner_provenance
+                                .ordinary_try_setups
+                                .get(&region.start)
+                                == Some(&region.target)
+                            && position(region.start).is_some_and(|start| start <= incoming)
+                    })
+                    || self.exception_regions.iter().any(|region| {
+                        let (Some(start), Some(end)) =
+                            (position(region.start), position(region.end))
+                        else {
+                            return true;
+                        };
+                        [incoming, join_position]
+                            .iter()
+                            .any(|position| (start..end).contains(position))
+                            && (region.target != owner.target
+                                || region.depth != 0
+                                || region.preserve_lasti
+                                || region.is_scope_fallback)
+                    })
+                {
+                    return None;
+                }
+                Some((pair[0], (*split, target_block)))
+            })
+            .collect()
+    }
+
+    /// Captures the original discard/unnamed-cleanup/outer-join path before threading.
+    fn original_discard_handler_exit_joins(
+        &self,
+    ) -> FxHashMap<BasicBlockId, (Label, BasicBlockId, BasicBlockId)> {
+        use crate::target::opcodes::{LOAD_CONST, LOAD_FAST, POP_TOP, RETURN_VALUE, STORE_DEREF};
+
+        if self.exception_owner_provenance.normal_try_exits.is_empty() {
+            return FxHashMap::default();
+        }
+        let graph = &self.graph;
+        let order = graph.order();
+        let position = |label| {
+            let block = graph.label_block(label)?;
+            order.iter().position(|candidate| *candidate == block)
+        };
+        let intact = |label| {
+            !self.original_nop_targets.contains(&label)
+                && !self.folded_original_predecessor_targets.contains(&label)
+                && !self.folded_condition_exit_targets.contains(&label)
+                && !self.borrow_block_aliases.contains(&label)
+                && !self
+                    .exception_owner_provenance
+                    .omitted_nop_counts
+                    .contains_key(&label)
+                && !self
+                    .exception_owner_provenance
+                    .omitted_nop_locations
+                    .contains_key(&label)
+                && !self
+                    .exception_owner_provenance
+                    .setups
+                    .iter()
+                    .any(|(entry, _)| *entry == label)
+                && !self
+                    .exception_regions
+                    .iter()
+                    .any(|region| region.target == label)
+        };
+        order
+            .windows(2)
+            .filter_map(|pair| {
+                let [Item::Label(join), Item::Instruction(discard)] = graph[pair[0]].items() else {
+                    return None;
+                };
+                let [
+                    Item::Label(split),
+                    Item::Instruction(pop),
+                    Item::Instruction(jump),
+                ] = graph[pair[1]].items()
+                else {
+                    return None;
+                };
+                let Operand::Forward(target) = jump.operand() else {
+                    return None;
+                };
+                let target_block = graph.label_block(target)?;
+                let [Item::Label(continuation), Item::Instruction(exit)] =
+                    graph[target_block].items()
+                else {
+                    return None;
+                };
+                let Operand::Forward(tail) = exit.operand() else {
+                    return None;
+                };
+                let tail_block = graph.label_block(tail)?;
+                let [
+                    Item::Label(tail_head),
+                    Item::Instruction(load),
+                    Item::Instruction(store),
+                    Item::Instruction(none),
+                    Item::Instruction(ret),
+                ] = graph[tail_block].items()
+                else {
+                    return None;
+                };
+                if *continuation != target
+                    || *tail_head != tail
+                    || *discard
+                        != Instruction::new(
+                            POP_TOP,
+                            Operand::Value(0),
+                            SourceLocation::NONE,
+                            Some(1),
+                        )
+                    || *pop
+                        != Instruction::new(
+                            POP_EXCEPT,
+                            Operand::Value(0),
+                            SourceLocation::NONE,
+                            Some(0),
+                        )
+                    || [jump, exit].iter().any(|instruction| {
+                        instruction.opcode != JUMP_FORWARD
+                            || instruction.location != SourceLocation::NONE
+                            || instruction.depth_after() != Some(0)
+                            || instruction.pre_fold_extra_instructions() != 0
+                            || instruction.local_policy.hidden_exception_owner_slots() != 0
+                            || instruction.exception_policy()
+                                != super::super::ExceptionPolicy::default()
+                            || !instruction.jump_policy.inline_small_exit()
+                            || instruction
+                                .jump_policy
+                                .retains_nop_for(instruction.operand())
+                            || instruction.jump_policy.is_interruptible()
+                            || instruction.no_location_policy
+                                != super::super::ir::NoLocationPolicy::default()
+                    })
+                    || load.opcode != LOAD_FAST
+                    || !matches!(load.operand(), Operand::Value(_))
+                    || load.depth_after() != Some(1)
+                    || load.location.line < 0
+                    || load.location.end_line != load.location.line
+                    || store.opcode != STORE_DEREF
+                    || !matches!(store.operand(), Operand::Value(_))
+                    || store.depth_after() != Some(0)
+                    || store.location.line != load.location.line
+                    || store.location.end_line != store.location.line
+                    || none.opcode != LOAD_CONST
+                    || !matches!(none.operand(), Operand::Value(_))
+                    || *none
+                        != Instruction::new(
+                            LOAD_CONST,
+                            none.operand(),
+                            SourceLocation::NONE,
+                            Some(1),
+                        )
+                    || *ret
+                        != Instruction::new(
+                            RETURN_VALUE,
+                            Operand::Value(0),
+                            SourceLocation::NONE,
+                            Some(0),
+                        )
+                    || [load, store].iter().any(|instruction| {
+                        instruction.pre_fold_extra_instructions() != 0
+                            || instruction.local_policy.hidden_exception_owner_slots() != 0
+                            || instruction.exception_policy()
+                                != super::super::ExceptionPolicy::default()
+                            || instruction.no_location_policy
+                                != super::super::ir::NoLocationPolicy::default()
+                            || instruction.fusion_policy.is_converted_pop_block()
+                    })
+                    || [*join, *split, target, tail]
+                        .iter()
+                        .any(|label| !intact(*label))
+                    || !self.preserved_block_boundaries.contains(join)
+                    || ![*join, target, tail].iter().all(|label| {
+                        self.exception_owner_provenance
+                            .source_boundaries
+                            .contains(label)
+                            && self
+                                .exception_owner_provenance
+                                .block_boundaries
+                                .contains(label)
+                    })
+                    || self.preserved_block_boundaries.contains(split)
+                    || self
+                        .exception_owner_provenance
+                        .source_boundaries
+                        .contains(split)
+                    || self
+                        .exception_owner_provenance
+                        .block_boundaries
+                        .contains(split)
+                    || !(position(*split)? < position(target)?
+                        && position(target)? < position(tail)?)
+                {
+                    return None;
+                }
+                let mut owners = self
+                    .exception_regions
+                    .iter()
+                    .filter(|region| region.end == *split);
+                let owner = owners.next()?;
+                if owners.next().is_some()
+                    || owner.is_scope_fallback
+                    || owner.depth != 1
+                    || !owner.preserve_lasti
+                    || !self
+                        .exception_owner_provenance
+                        .setups
+                        .contains(&(owner.start, None))
+                    || !self.exception_owner_provenance.normal_try_exits.iter().any(
+                        |(entry, end)| {
+                            *end == target
+                                && self.exception_regions.iter().any(|region| {
+                                    region.end == *entry
+                                        && region.target == owner.start
+                                        && !region.is_scope_fallback
+                                        && region.depth == 0
+                                        && !region.preserve_lasti
+                                        && self
+                                            .exception_owner_provenance
+                                            .ordinary_try_setups
+                                            .get(&region.start)
+                                            == Some(&owner.start)
+                                })
+                        },
+                    )
+                {
+                    return None;
+                }
+                let mut incoming = None;
+                for (source, block) in graph.iter() {
+                    for item in block.items() {
+                        let Item::Instruction(instruction) = item else {
+                            continue;
+                        };
+                        let (Operand::Forward(label) | Operand::Backward(label)) =
+                            instruction.operand()
+                        else {
+                            continue;
+                        };
+                        if label == *split {
+                            return None;
+                        }
+                        if label != *join {
+                            continue;
+                        }
+                        if incoming.is_some()
+                            || instruction.opcode != JUMP_FORWARD
+                            || instruction.location != SourceLocation::NONE
+                            || instruction.depth_after() != Some(2)
+                            || instruction.pre_fold_extra_instructions() != 0
+                            || instruction.local_policy.hidden_exception_owner_slots() != 0
+                            || instruction.exception_policy()
+                                != super::super::ExceptionPolicy::default()
+                            || instruction.no_location_policy
+                                != super::super::ir::NoLocationPolicy::default()
+                            || !instruction.jump_policy.inline_small_exit()
+                            || instruction
+                                .jump_policy
+                                .retains_nop_for(instruction.operand())
+                            || instruction.jump_policy.is_interruptible()
+                        {
+                            return None;
+                        }
+                        incoming = Some(order.iter().position(|candidate| *candidate == source)?);
+                    }
+                }
+                let incoming = incoming?;
+                let join_position = position(*join)?;
+                let previous = *order.get(join_position.checked_sub(1)?)?;
+                if incoming >= join_position - 1
+                    || position(owner.start)? > incoming
+                    || !super::super::block_has_fallthrough(graph[previous].items())
+                    || self.exception_regions.iter().any(|region| {
+                        let (Some(start), Some(end)) =
+                            (position(region.start), position(region.end))
+                        else {
+                            return true;
+                        };
+                        let same_owner = region.start == owner.start
+                            && region.end == owner.end
+                            && region.target == owner.target
+                            && region.depth == owner.depth
+                            && region.preserve_lasti == owner.preserve_lasti
+                            && region.is_scope_fallback == owner.is_scope_fallback
+                            && match (region.priority, owner.priority) {
+                                (
+                                    ExceptionRegionPriority::OriginalRange(start, end),
+                                    ExceptionRegionPriority::OriginalRange(owner_start, owner_end),
+                                ) => start == owner_start && end == owner_end,
+                                (
+                                    ExceptionRegionPriority::Resolved { start, end },
+                                    ExceptionRegionPriority::Resolved {
+                                        start: owner_start,
+                                        end: owner_end,
+                                    },
+                                ) => start == owner_start && end == owner_end,
+                                _ => false,
+                            };
+                        ([incoming, join_position]
+                            .iter()
+                            .any(|position| (start..end).contains(position))
+                            && !same_owner)
+                            || [position(target).unwrap(), position(tail).unwrap()]
+                                .iter()
+                                .any(|position| (start..end).contains(position))
+                    })
+                {
+                    return None;
+                }
+                Some((pair[0], (*split, target_block, tail_block)))
+            })
+            .collect()
+    }
+
+    fn prepare_normal_try_copy_plan_with_discards(
+        &mut self,
+        pass_prefixes: &[(Label, Label)],
+        discard_joins: &FxHashMap<BasicBlockId, (Label, BasicBlockId)>,
+        handler_discards: &FxHashSet<BasicBlockId>,
+        handler_continuations: &FxHashMap<BasicBlockId, BasicBlockId>,
+    ) {
         let graph = &self.graph;
         let order = graph.order();
         let positions = order
@@ -1705,7 +2322,15 @@ impl OptimizationPipeline {
             let items = graph[block].items();
             let tail = original_local_tuple_return(items)
                 .map(|located| OriginalTail::LocalTupleReturn { located })
-                .or_else(|| original_computed_return(items))?;
+                .or_else(|| original_computed_return(items))
+                .or_else(|| {
+                    handler_continuations
+                        .values()
+                        .any(|tail| *tail == block)
+                        .then_some(OriginalTail::CellStoreReturn {
+                            located: [true, true, false, false],
+                        })
+                })?;
             let mut original_head = false;
             for item in items {
                 let Item::Label(label) = item else {
@@ -1845,6 +2470,21 @@ impl OptimizationPipeline {
         let mut joins = FxHashMap::default();
         for &block in order {
             if exits.contains_key(&block) {
+                continue;
+            }
+            if let Some((_, target)) = discard_joins.get(&block) {
+                joins.insert(block, *target);
+                continue;
+            }
+            if let Some(target) = handler_continuations.get(&block) {
+                let label = graph[*target]
+                    .first_label()
+                    .expect("certified assignment return");
+                let Some(tail) = original_return_tail(label) else {
+                    return;
+                };
+                joins.insert(block, *target);
+                returns.insert(*target, tail);
                 continue;
             }
             let instructions = graph[block]
@@ -2023,7 +2663,8 @@ impl OptimizationPipeline {
                 if !seen.insert(current) {
                     break;
                 }
-                crossed_cleanup |= exits.contains_key(&current);
+                crossed_cleanup |=
+                    exits.contains_key(&current) || handler_discards.contains(&current);
                 current = target;
                 if returns.contains_key(&current) {
                     if crossed_cleanup {
@@ -2131,6 +2772,12 @@ impl OptimizationPipeline {
             .copied()
             .filter(|block| joins.contains_key(block))
             .collect::<FxHashSet<_>>();
+        if discard_joins
+            .keys()
+            .any(|block| !selected_joins.contains(block))
+        {
+            return;
+        }
         // The generic copier copies complete blocks. Reject a jump into a return
         // suffix rather than treating it as an alias of the original return head.
         if graph.iter_items().any(|item| matches!(item, Item::Instruction(instruction)
@@ -2221,6 +2868,24 @@ impl OptimizationPipeline {
                     });
                     false
                 } else if selected_joins.contains(&block) {
+                    if discard_joins.contains_key(&block) {
+                        prefix.push(PrefixSlot {
+                            is_nop: false,
+                            located: false,
+                        });
+                        if handler_discards.contains(&block) {
+                            prefix.extend([
+                                PrefixSlot {
+                                    is_nop: true,
+                                    located: false,
+                                },
+                                PrefixSlot {
+                                    is_nop: false,
+                                    located: false,
+                                },
+                            ]);
+                        }
+                    }
                     if handler_cleanup_joins.contains(&block) {
                         // The producer recorded POP_BLOCK as one hidden slot on
                         // this intact POP_EXCEPT, followed by the original jump.

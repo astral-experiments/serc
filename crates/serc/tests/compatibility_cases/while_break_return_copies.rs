@@ -229,3 +229,54 @@ fn original_loop_exit_bridges_preserve_local_and_cell_return_copies() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_terminal_while_else_shared_return_footer() {
+    for (filename, source) in [
+        (
+            "terminal_while_else_break_shared_footer.py",
+            r"def run(short, items, work):
+    if short:
+        work(items)
+    else:
+        j = 0
+        while j < len(items):
+            a, b = items[j]
+            if a > 0 and b > 0:
+                work(a)
+                work(b)
+                break
+            j += 1
+        else:
+            if a > 0:
+                work(a)
+            if b > 0:
+                work(b)
+",
+        ),
+        (
+            "nonterminal_while_else_break_shared_footer_control.py",
+            r"def run(short, items, work):
+    if short:
+        work(items)
+    else:
+        j = 0
+        while j < len(items):
+            a, b = items[j]
+            if a > 0 and b > 0:
+                work(a)
+                work(b)
+                break
+            j += 1
+        else:
+            if a > 0:
+                work(a)
+            if b > 0:
+                work(b)
+    work(items)
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

@@ -214,3 +214,194 @@ fn matches_cpython_marshal_for_guarded_try_finally_iterator_breaks() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_async_generator_guarded_finally_break_owners() {
+    for (filename, source) in [
+        (
+            "async_generator_named_break_guarded_global_await_target.py",
+            r"async def run(items, make, retry):
+    for item in items:
+        handle = None
+        try:
+            handle = await make(item)
+            yield handle
+            return
+        except Exception as error:
+            if retry(error):
+                continue
+            break
+        finally:
+            if handle is not None:
+                await close_handle(handle)
+    raise RuntimeError
+",
+        ),
+        (
+            "async_generator_named_break_unguarded_global_await_control.py",
+            r"async def run(items, make, retry):
+    for item in items:
+        handle = None
+        try:
+            handle = await make(item)
+            yield handle
+            return
+        except Exception as error:
+            if retry(error):
+                continue
+            break
+        finally:
+            await close_handle(handle)
+    raise RuntimeError
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn matches_cpython_plain_conjunction_finally_iterator_break_boundary() {
+    let source = r"def collect(items, ready, failed, callback):
+    for item in items:
+        try:
+            if item:
+                break
+        finally:
+            if ready and not failed and callback is not None:
+                callback(item, ready)
+    return items
+";
+    common::assert_matches_cpython_marshal(
+        source,
+        "conjunction_finally_iterator_break_plain_target.py",
+    );
+}
+
+#[test]
+fn matches_cpython_shared_iterator_cleanup_join_copies() {
+    for (filename, source) in [
+        (
+            "p280_named_finally_conditional_cleanup.py",
+            r#"def run(items, manager, work, recover, stop, cleanup, keep):
+    with manager:
+        state = None
+        for item in items:
+            try:
+                state = work(item)
+                break
+            except LookupError as error:
+                state = recover(error)
+                if stop(error):
+                    break
+            finally:
+                if state and not keep:
+                    try:
+                        cleanup(state)
+                    except ValueError as cleanup_error:
+                        if state is not None:
+                            if state.error is None:
+                                state.error = f"cleanup: {cleanup_error}"
+                            else:
+                                state.error = f"{state.error}; cleanup: {cleanup_error}"
+    return state
+"#,
+        ),
+        (
+            "p280_shared_finally_iterator_join.py",
+            r"def run(items, work, recover, stop, cleanup, keep):
+    state = None
+    for item in items:
+        try:
+            state = work(item)
+            break
+        except LookupError as error:
+            state = recover(error)
+            if stop(error):
+                break
+        finally:
+            if state and not keep:
+                try:
+                    cleanup(state)
+                except ValueError:
+                    pass
+    return state
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn matches_cpython_copied_finally_global_call_array_boundaries() {
+    for (filename, source) in [
+        (
+            "named_finally_split_six_global_prefix_target.py",
+            r#"def run(items, manager, recover, stop, cleanup, keep, clock,
+        flag, work):
+    with manager:
+        state = None
+        for item in items:
+            try:
+                if flag:
+                    work(item)
+                state = Record(
+                    first=str(fetch(item)),
+                    second=str(classify(item)),
+                    elapsed=round(clock.now(), 3),
+                )
+                break
+            except LookupError as error:
+                state = recover(error)
+                if stop(error):
+                    break
+            finally:
+                if state and not keep:
+                    try:
+                        cleanup(state)
+                    except ValueError as cleanup_error:
+                        if state is not None:
+                            if state.error is None:
+                                state.error = f"cleanup: {cleanup_error}"
+                            else:
+                                state.error = f"{state.error}; cleanup: {cleanup_error}"
+    return state
+"#,
+        ),
+        (
+            "named_finally_linear_six_global_prefix_control.py",
+            r#"def run(items, manager, recover, stop, cleanup, keep, clock,
+        flag, work):
+    with manager:
+        state = None
+        for item in items:
+            try:
+                work(item)
+                state = Record(
+                    first=str(fetch(item)),
+                    second=str(classify(item)),
+                    elapsed=round(clock.now(), 3),
+                )
+                break
+            except LookupError as error:
+                state = recover(error)
+                if stop(error):
+                    break
+            finally:
+                if state and not keep:
+                    try:
+                        cleanup(state)
+                    except ValueError as cleanup_error:
+                        if state is not None:
+                            if state.error is None:
+                                state.error = f"cleanup: {cleanup_error}"
+                            else:
+                                state.error = f"{state.error}; cleanup: {cleanup_error}"
+    return state
+"#,
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

@@ -100,3 +100,33 @@ fn matches_cpython_runtime_while_break_original_empty_try_exit() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_folded_false_original_try_marker() {
+    for (filename, source) in [
+        (
+            "folded_false_try_marker.py",
+            r"async def f(work, after):
+    try:
+        if False:
+            await work()
+    except Exception:
+        pass
+    await after()
+",
+        ),
+        (
+            "runtime_try_marker.py",
+            r"async def f(work, after, flag):
+    try:
+        if flag:
+            await work()
+    except Exception:
+        pass
+    await after()
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

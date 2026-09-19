@@ -100,3 +100,49 @@ fn matches_cpython_bare_return_interleaved_manager_iterators() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn preserves_async_iterator_none_finally_return_boundaries() {
+    for (filename, source) in [
+        (
+            "bare_async_iterator_return_local_none_pop_pair_target.py",
+            r"async def run(stream, stop, enqueue):
+    pending = None
+    try:
+        async for message in stream:
+            if stop(message):
+                return
+            if pending is not None:
+                await enqueue(pending)
+            pending = message
+    except ValueError:
+        pass
+    finally:
+        if pending is not None:
+            await enqueue(pending)
+        await enqueue(None)
+",
+        ),
+        (
+            "value_async_iterator_return_local_none_pop_pair_control.py",
+            r"async def run(stream, stop, enqueue):
+    pending = None
+    try:
+        async for message in stream:
+            if stop(message):
+                return pending
+            if pending is not None:
+                await enqueue(pending)
+            pending = message
+    except ValueError:
+        pass
+    finally:
+        if pending is not None:
+            await enqueue(pending)
+        await enqueue(None)
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

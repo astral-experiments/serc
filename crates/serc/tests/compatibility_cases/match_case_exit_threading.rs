@@ -753,3 +753,96 @@ fn matches_cpython_nested_value_match_final_pass_success_exit() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_last_class_pass_enclosing_branch_joins() {
+    for (filename, source) in [
+        (
+            "last_class_pass_outer_if_join_target.py",
+            r"def sample(enabled, value, sink):
+    if enabled:
+        match value:
+            case Empty():
+                pass
+            case _:
+                sink.append(value)
+    else:
+        sink.append(None)
+    result = sink.copy()
+    sink.append(len(result))
+    return result
+",
+        ),
+        (
+            "last_class_pass_elif_join_target.py",
+            r"def sample(enabled, value, ready, sink):
+    if enabled:
+        match value:
+            case str(text):
+                sink.append(text)
+            case Empty():
+                pass
+            case _:
+                sink.append(value)
+    elif ready:
+        sink.clear()
+    else:
+        sink.append(None)
+    result = sink.copy()
+    sink.append(len(result))
+    return result
+",
+        ),
+        (
+            "last_class_pass_direct_continuation_control.py",
+            r"def sample(value, sink):
+    match value:
+        case Empty():
+            pass
+        case _:
+            sink.append(value)
+    result = sink.copy()
+    sink.append(len(result))
+    return result
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn matches_cpython_match_assertion_success_return_copies() {
+    for (filename, source) in [
+        (
+            "match_assertion_attribute_return.py",
+            r#"def select(subject, value, check):
+    match subject:
+        case 1:
+            assert check(value)
+        case 2:
+            assert check(value)
+        case _:
+            raise AssertionError("unknown")
+    return value.inner.item
+"#,
+        ),
+        (
+            "match_assertion_populated_success_control.py",
+            r#"def select(subject, value, check):
+    match subject:
+        case 1:
+            assert check(value)
+            check(value.inner)
+        case 2:
+            assert check(value)
+            check(value.inner)
+        case _:
+            raise AssertionError("unknown")
+    return value.inner.item
+"#,
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

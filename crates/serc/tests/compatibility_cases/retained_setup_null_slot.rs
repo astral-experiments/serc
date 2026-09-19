@@ -993,3 +993,182 @@ fn matches_cpython_uncompacted_conditional_copy_retargets() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_retained_setup_after_local_fusion() {
+    for (filename, source) in [
+        (
+            "iterator_try_ifexp_post_fusion_owner.py",
+            r"def target(rows, options):
+    for index, row in rows:
+        publish(path(options), index, row)
+        report(stamp())
+        started = clock.time()
+        try:
+            result = prepare(row, options) if options.prepare else run(row, options)
+            consume(result, started)
+        except Exception as error:
+            recover(error)
+",
+        ),
+        (
+            "iterator_try_ifexp_no_local_fusion_control.py",
+            r"def target(rows, options):
+    for row in rows:
+        publish(path(options), row)
+        report(stamp())
+        started = clock.time()
+        try:
+            result = prepare(row, options) if options.prepare else run(row, options)
+            consume(result, started)
+        except Exception as error:
+            recover(error)
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn matches_cpython_nested_retained_setup_array_boundaries() {
+    for (filename, source) in [
+        (
+            "nested_retained_setup_global_calls_target.py",
+            r"def f():
+    try:
+        first()
+        second()
+        third()
+        fourth()
+        fifth()
+        value = SOURCE
+        try:
+            if ENABLED:
+                consume(value)
+        finally:
+            inner_cleanup()
+    finally:
+        outer_cleanup()
+",
+        ),
+        (
+            "nested_retained_setup_new_array_control.py",
+            r"def f(branch):
+    try:
+        first()
+        second()
+        third()
+        fourth()
+        fifth()
+        value = SOURCE
+        if branch:
+            value = OTHER
+        try:
+            if ENABLED:
+                consume(value)
+        finally:
+            inner_cleanup()
+    finally:
+        outer_cleanup()
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn matches_cpython_retained_setup_after_unprotected_record_work() {
+    for (filename, source) in [
+        (
+            "sequential_named_try_attribute_ifexp_target.py",
+            r"def run(groups, allowed):
+    output = {}
+    records = {}
+    for group_index, group in enumerate(groups):
+        for item in group:
+            if item.kind in allowed:
+                if group_index not in output:
+                    output[group_index] = []
+                try:
+                    first = transform(item.value) if item.value else None
+                except AttributeError as error:
+                    report(item.value)
+                    report(error)
+                    first = None
+                output[group_index].append(Entry(value=item.value, filtered=first))
+                if item.key not in records:
+                    records[item.key] = Record(
+                        before=None, after=None, weight=None,
+                        key=item.key, value=None, latest=None,
+                    )
+                    records[item.key].before = Content(
+                        value=load_before(item.value), key=item.key,
+                    )
+                records[item.key].latest = parse(item.value)
+                records[item.key].after = Content(
+                    value=load_after(item.value), key=item.key,
+                )
+                records[item.key].weight = measure(item.value)
+                merged = combine(
+                    records[item.key].before.value,
+                    records[item.key].after.value,
+                    item.key,
+                )
+                try:
+                    second = transform(item.value) if item.value else None
+                except AttributeError as error:
+                    report(item.value)
+                    report(error)
+                    second = None
+                records[item.key].value = parse(merged)
+                records[item.key].filtered = second
+    return records, output
+",
+        ),
+        (
+            "single_named_try_attribute_ifexp_control.py",
+            r"def run(groups, allowed):
+    output = {}
+    records = {}
+    for group_index, group in enumerate(groups):
+        for item in group:
+            if item.kind in allowed:
+                if group_index not in output:
+                    output[group_index] = []
+                first = transform(item.value) if item.value else None
+                output[group_index].append(Entry(value=item.value, filtered=first))
+                if item.key not in records:
+                    records[item.key] = Record(
+                        before=None, after=None, weight=None,
+                        key=item.key, value=None, latest=None,
+                    )
+                    records[item.key].before = Content(
+                        value=load_before(item.value), key=item.key,
+                    )
+                records[item.key].latest = parse(item.value)
+                records[item.key].after = Content(
+                    value=load_after(item.value), key=item.key,
+                )
+                records[item.key].weight = measure(item.value)
+                merged = combine(
+                    records[item.key].before.value,
+                    records[item.key].after.value,
+                    item.key,
+                )
+                try:
+                    second = transform(item.value) if item.value else None
+                except AttributeError as error:
+                    report(item.value)
+                    report(error)
+                    second = None
+                records[item.key].value = parse(merged)
+                records[item.key].filtered = second
+    return records, output
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

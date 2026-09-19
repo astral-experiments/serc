@@ -124,3 +124,64 @@ fn matches_cpython_folded_assertion_original_jump() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_folded_elif_assertion_success() {
+    for (filename, source) in [
+        (
+            "folded_assert_elif_success_target.py",
+            r#"async def process(count, report, finish):
+    if count < 0:
+        report("all")
+    elif count == 0:
+        assert "nothing to do"
+    else:
+        report("some")
+    await finish()
+"#,
+        ),
+        (
+            "runtime_assert_success_control.py",
+            r#"async def process(count, ready, report, finish):
+    if count < 0:
+        report("all")
+    elif count == 0:
+        assert ready
+    else:
+        report("some")
+    await finish()
+"#,
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn matches_cpython_terminal_many_or_assertion_success_returns() {
+    for (filename, source) in [
+        (
+            "terminal_many_or_assert_success_returns.py",
+            r"def check(active, value, user, values):
+    if active:
+        assert (
+            value == 'max'
+            or value == 'auto'
+            or str(value) == '8'
+            or str(value) == '0'
+            or user == 'health'
+            or (str(value) == '4' and any(item for item in values))
+        ), 'unsupported'
+",
+        ),
+        (
+            "terminal_two_or_assert_success_control.py",
+            r"def check(active, value, values):
+    if active:
+        assert value == 'max' or (str(value) == '4' and any(item for item in values)), 'unsupported'
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

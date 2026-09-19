@@ -65,3 +65,53 @@ fn matches_cpython_awaited_named_handler_none_return_cleanup() {
         "saved_named_handler_none_async_await_return_target.py",
     );
 }
+
+#[test]
+fn matches_cpython_named_handler_between_async_managers() {
+    for (filename, source) in [
+        (
+            "named_handler_between_async_managers_none.py",
+            r"async def f(outer, inner, values, work, retry, report):
+    try:
+        async with outer():
+            for item in values:
+                try:
+                    async with inner(item):
+                        try:
+                            await work(item)
+                        except ValueError as error:
+                            if retry(error):
+                                continue
+                            report(error)
+                            return None
+                except RuntimeError:
+                    report(item)
+    except LookupError:
+        report(None)
+",
+        ),
+        (
+            "named_handler_between_async_managers_await_none.py",
+            r"async def f(outer, inner, values, work, retry, report):
+    try:
+        async with outer():
+            for item in values:
+                try:
+                    async with inner(item):
+                        try:
+                            await work(item)
+                        except ValueError as error:
+                            if await retry(error):
+                                continue
+                            report(error)
+                            return None
+                except RuntimeError:
+                    report(item)
+    except LookupError:
+        report(None)
+",
+        ),
+    ] {
+        assert_matches_cpython_marshal(source, filename);
+    }
+}

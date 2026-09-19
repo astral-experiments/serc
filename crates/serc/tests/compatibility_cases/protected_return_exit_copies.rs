@@ -170,3 +170,31 @@ fn matches_cpython_private_nested_try_tuple_return_exits() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_protected_conditional_local_return_copy() {
+    for (filename, source) in [
+        (
+            "protected_chained_local_return.py",
+            r"def select(value, upper):
+    try:
+        parsed = int(value)
+        return parsed if 1 <= parsed <= upper else None
+    except ValueError:
+        return None
+",
+        ),
+        (
+            "protected_primitive_local_return_control.py",
+            r"def select(value, upper):
+    try:
+        parsed = int(value)
+        return parsed if parsed <= upper else None
+    except ValueError:
+        return None
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

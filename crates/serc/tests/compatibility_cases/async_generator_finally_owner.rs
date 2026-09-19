@@ -86,3 +86,62 @@ fn async_generator_finally_borrowing_preserves_original_null_owner() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_folded_false_yield_try_owners() {
+    for (filename, source) in [
+        (
+            "async_generator_false_yield_try_owner_target.py",
+            r"async def f(start, work, recover, cleanup, make):
+    try:
+        start()
+        await work()
+        if False:
+            yield make()
+    except ValueError:
+        recover()
+        await work()
+        raise
+    finally:
+        cleanup()
+",
+        ),
+        (
+            "async_generator_false_yield_closure_owner_target.py",
+            r"def outer(start, work, recover, cleanup, make):
+    async def stream(*args, **kwargs):
+        del args, kwargs
+        try:
+            start()
+            await work()
+            if False:
+                yield make()
+        except ValueError:
+            recover()
+            await work()
+            raise
+        finally:
+            cleanup()
+    return stream
+",
+        ),
+        (
+            "async_generator_runtime_yield_try_owner_control.py",
+            r"async def f(flag, start, work, recover, cleanup, make):
+    try:
+        start()
+        await work()
+        if flag:
+            yield make()
+    except ValueError:
+        recover()
+        await work()
+        raise
+    finally:
+        cleanup()
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

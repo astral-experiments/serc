@@ -778,8 +778,19 @@ impl Compiler<'_> {
                         // A complete if with terminating tested arms still has an original
                         // empty join when only its else suite falls through. It needs no
                         // incoming jump to retain the slot replaced by a small return.
-                        let original_empty_join =
-                            self.assembler.at_original_match_join() || fallthrough_if_join;
+                        // An assertion's sole success edge enters an original empty
+                        // array after its terminal raise. Its case-success jump keeps
+                        // that slot when a small following return is copied into it.
+                        let assertion_success_join = original_unlocated_head
+                            && case.body.last().is_some_and(|statement| {
+                                matches!(statement, Stmt::Assert(assertion)
+                                    if early_condition_truthiness(&assertion.test).is_none()
+                                        && unique_condition_jump_target(&assertion.test, true)
+                                            .is_some())
+                            });
+                        let original_empty_join = self.assembler.at_original_match_join()
+                            || fallthrough_if_join
+                            || assertion_success_join;
                         // The final async-for exhaustion falls directly into the following
                         // match continuation before cold blocks move. Its surviving bridge
                         // represents that fallthrough, not an interruptible case-success jump.
@@ -887,6 +898,21 @@ impl Compiler<'_> {
                                 // This final value-pattern failure has a zero-pop join.
                                 // Keep the Pass line on its success jump while allowing it
                                 // to thread through an enclosing case's original exit.
+                                self.assembler.preserve_authored_pass_jump_nop(success_exit);
+                            } else if authored_pass_exit
+                                && !copied_subject
+                                && case.guard.is_none()
+                                && matches!(case.body.as_slice(), [Stmt::Pass(_)])
+                                && !context.fail_pop.is_empty()
+                                && !self.control.falls_through_to_loop_backedge()
+                                && body_start
+                                    .checked_sub(1)
+                                    .and_then(|index| self.assembler.instruction_opcode_at(index))
+                                    == Some(UNPACK_SEQUENCE)
+                            {
+                                // The final refutable class pattern still has its original
+                                // unpack record before this Pass success. Its jump can thread
+                                // through the enclosing join while keeping the authored line.
                                 self.assembler.preserve_authored_pass_jump_nop(success_exit);
                             } else if copied_subject
                                 && case.guard.is_none()

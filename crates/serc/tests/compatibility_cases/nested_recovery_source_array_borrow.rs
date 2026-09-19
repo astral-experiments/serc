@@ -212,3 +212,85 @@ fn preserves_populated_and_multiline_return_borrow_boundaries() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_split_loop_try_else_return_borrowing() {
+    for (filename, source) in [
+        (
+            "split_loop_try_else_multi_false_return_borrow.py",
+            r"def recover(fetch, pause, attempts, limit, wanted, error):
+    for attempt in attempts:
+        try:
+            observed = fetch()
+        except Exception as failure:
+            if attempt + 1 == limit:
+                raise error from failure
+        else:
+            if observed is not None and observed.key == wanted and observed.ready:
+                return observed
+        if attempt + 1 < limit:
+            pause()
+    raise error
+",
+        ),
+        (
+            "split_loop_try_else_single_false_return_control.py",
+            r"def recover(fetch, pause, attempts, limit, wanted, error):
+    for attempt in attempts:
+        try:
+            observed = fetch()
+        except Exception as failure:
+            if attempt + 1 == limit:
+                raise error from failure
+        else:
+            if observed is not None:
+                return observed
+        if attempt + 1 < limit:
+            pause()
+    raise error
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn matches_cpython_named_iterator_break_guarded_recovery_borrow() {
+    let source = r#"def run(items, options, work, log, cleanup):
+    failures = []
+    for item in items:
+        launched = False
+        started = False
+        finished = False
+        try:
+            work(item)
+            launched = True
+            started = True
+            work(item)
+            finished = True
+        except (ValueError, RuntimeError) as error:
+            if started and not finished:
+                log("incomplete", item)
+            elif not launched:
+                log("unstarted", item)
+            else:
+                log("failed", item)
+            failures.append((item, str(error)))
+            log(error)
+            if not options.keep_going:
+                break
+        finally:
+            if launched and not options.keep_item:
+                try:
+                    cleanup(["delete", item.name])
+                except (ValueError, RuntimeError) as error:
+                    failures.append((item, str(error)))
+                    log(error)
+    return failures
+"#;
+    common::assert_matches_cpython_marshal(
+        source,
+        "named_iterator_terminal_break_guarded_recovery_borrow.py",
+    );
+}

@@ -1481,10 +1481,15 @@ pub(crate) struct Assembler {
     pub(super) original_nop_targets: FxHashSet<Label>,
     /// Normal handler cleanup originally emitted without source locations.
     pub(super) original_unlocated_cleanup_targets: FxHashSet<Label>,
+    /// Exact source-certified named cleanup spans, used only during statement emission.
+    pub(super) guarded_finally_handler_cleanup_origins: Vec<(usize, Vec<Item>)>,
     /// Unlocated Boolean discards with a fallback whose source instruction folded away.
     pub(super) original_unlocated_discard_targets: FxHashSet<Label>,
     /// Complete emitted conditional-finalizer arrays with a shared iterator discard.
     pub(super) copied_finally_iterator_break_origins: Vec<Vec<Item>>,
+    pub(super) copied_finally_conjunction_break_origins: Vec<Vec<Item>>,
+    /// Complete copied cleanup-try arrays certified at their original shared iterator join.
+    pub(super) shared_finally_iterator_break_origins: Vec<Vec<Item>>,
     /// Original shared jump blocks whose source locations are resolved after exit copying.
     pub(super) deferred_shared_jump_blocks: FxHashSet<Label>,
     /// Original label-only prefixes of retained normal-finally `POP_BLOCK` instructions.
@@ -1587,6 +1592,9 @@ pub(super) struct OptimizationPipeline {
     pub(super) original_unlocated_discard_targets: FxHashSet<Label>,
     /// Complete emitted conditional-finalizer arrays with a shared iterator discard.
     pub(super) copied_finally_iterator_break_origins: Vec<Vec<Item>>,
+    pub(super) copied_finally_conjunction_break_origins: Vec<Vec<Item>>,
+    /// Complete copied cleanup-try arrays certified at their original shared iterator join.
+    pub(super) shared_finally_iterator_break_origins: Vec<Vec<Item>>,
     /// Conditional entry labels mapped to their shared original unlocated jump array.
     pub(super) original_shared_unlocated_jump_entries: FxHashMap<Label, Label>,
     /// Original ordinary-jump heads, separate from synthetic source-location joins.
@@ -1699,8 +1707,11 @@ impl Default for Assembler {
             match_join_store_origins: FxHashMap::default(),
             original_nop_targets: FxHashSet::default(),
             original_unlocated_cleanup_targets: FxHashSet::default(),
+            guarded_finally_handler_cleanup_origins: Vec::new(),
             original_unlocated_discard_targets: FxHashSet::default(),
             copied_finally_iterator_break_origins: Vec::new(),
+            copied_finally_conjunction_break_origins: Vec::new(),
+            shared_finally_iterator_break_origins: Vec::new(),
             load_fast_borrowing_enabled: true,
             strict_owned_loads: false,
             forced_borrowed_loads: false,

@@ -26,6 +26,10 @@ pub(super) enum OriginalTail {
         // Intact located global attribute/call slots, including a fused PUSH_NULL.
         width: usize,
     },
+    CellStoreReturn {
+        // A located local-to-cell assignment followed by an implicit return.
+        located: [bool; 4],
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -137,7 +141,8 @@ pub(super) fn plan_normal_try_copies(nodes: &[OriginalNode]) -> Option<CopyResul
                 OriginalTail::Jump { target, .. } => current = index_of(target)?,
                 OriginalTail::ConstantReturn { .. }
                 | OriginalTail::LocalTupleReturn { .. }
-                | OriginalTail::ComputedReturn { .. } => break,
+                | OriginalTail::ComputedReturn { .. }
+                | OriginalTail::CellStoreReturn { .. } => break,
             }
         }
     }
@@ -197,7 +202,8 @@ pub(super) fn plan_normal_try_copies(nodes: &[OriginalNode]) -> Option<CopyResul
                 }
                 None
             }
-            OriginalTail::LocalTupleReturn { located } => {
+            OriginalTail::LocalTupleReturn { located }
+            | OriginalTail::CellStoreReturn { located } => {
                 for (kind, located) in [
                     SlotKind::Other,
                     SlotKind::Other,

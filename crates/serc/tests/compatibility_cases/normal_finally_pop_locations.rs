@@ -430,3 +430,48 @@ fn retains_normal_finally_pop_before_nested_try_after_structured_cleanup() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_nested_normal_finally_cleanup_donor_locations() {
+    for (filename, source) in [
+        (
+            "normal_finally_nested_try_named_handler_donor_target.py",
+            r"def exercise(items, work, recover, stop, cleanup):
+    result = None
+    for item in items:
+        try:
+            result = work(item)
+            break
+        except RuntimeError as error:
+            if stop(item):
+                break
+            result = recover(error)
+        finally:
+            try:
+                cleanup()
+            except ValueError:
+                pass
+    return result
+",
+        ),
+        (
+            "normal_finally_direct_named_handler_donor_control.py",
+            r"def exercise(items, work, recover, stop, cleanup):
+    result = None
+    for item in items:
+        try:
+            result = work(item)
+            break
+        except RuntimeError as error:
+            if stop(item):
+                break
+            result = recover(error)
+        finally:
+            cleanup()
+    return result
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}

@@ -347,3 +347,128 @@ fn matches_cpython_original_ordinary_try_compound_loop_exits() {
         common::assert_matches_cpython_marshal(source, filename);
     }
 }
+
+#[test]
+fn matches_cpython_sync_completed_try_compound_exit() {
+    for (filename, source) in [
+        (
+            "sync_protected_completed_try_three_false_edges.py",
+            r#"def inspect_values(items, depth, emit):
+    try:
+        for value in items:
+            try:
+                try:
+                    text = str(value)
+                except Exception as error:
+                    emit(error)
+                if depth < 4 and hasattr(value, "name") and any(part in value.name for part in ("red", "blue")):
+                    emit(value)
+            except Exception as error:
+                emit(error)
+    except Exception as error:
+        emit(error)
+"#,
+        ),
+        (
+            "sync_protected_completed_try_single_false_edge_control.py",
+            r"def inspect_values(items, depth, emit):
+    try:
+        for value in items:
+            try:
+                try:
+                    text = str(value)
+                except Exception as error:
+                    emit(error)
+                if depth < 4:
+                    emit(value)
+            except Exception as error:
+                emit(error)
+    except Exception as error:
+        emit(error)
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn matches_cpython_async_completed_try_compound_exit() {
+    for (filename, source) in [
+        (
+            "protected_loop_completed_try_and_exit.py",
+            r"async def run(items, choose, consume):
+    for item in items:
+        try:
+            if choose(item):
+                if item.ready:
+                    consume(item)
+                else:
+                    try:
+                        value = obtain(item)
+                    except Exception:
+                        value = None
+                    if isinstance(value, str) and value:
+                        consume(value)
+                        try:
+                            await perform(value)
+                            if item.done:
+                                consume(item)
+                        except Exception as error:
+                            consume(error)
+            elif item.other:
+                consume(item)
+            else:
+                consume(None)
+        except Exception as error:
+            consume(error)
+",
+        ),
+        (
+            "protected_loop_completed_try_following_work_control.py",
+            r"async def run(items, consume):
+    for item in items:
+        try:
+            try:
+                value = obtain(item)
+            except Exception:
+                value = None
+            if isinstance(value, str) and value:
+                await perform(value)
+            consume(item)
+        except Exception as error:
+            consume(error)
+",
+        ),
+    ] {
+        common::assert_matches_cpython_marshal(source, filename);
+    }
+}
+
+#[test]
+fn matches_cpython_nested_cleanup_break_owner_boundary() {
+    let source = r"def run(stop, check, prepare, work, notify, recover, finish):
+    try:
+        while True:
+            try:
+                try:
+                    prepare()
+                except ValueError:
+                    recover()
+                work()
+                if stop and check():
+                    try:
+                        notify()
+                        break
+                    finally:
+                        recover()
+            except Exception:
+                recover()
+    finally:
+        finish()
+";
+    common::assert_matches_cpython_marshal(
+        source,
+        "normal_try_and_cleanup_break_boundary_control.py",
+    );
+}
