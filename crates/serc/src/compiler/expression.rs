@@ -1944,7 +1944,7 @@ impl Compiler<'_> {
                                 true,
                             );
                         }
-                        interpolations.push(interpolation);
+                        interpolations.push((interpolation, part.flags.prefix().is_raw()));
                         strings.push(None);
                     }
                 }
@@ -1964,7 +1964,7 @@ impl Compiler<'_> {
             self.add_constant(string.clone())?;
         }
         self.emit_deferred_constant(Constant::Tuple(strings))?;
-        for interpolation in &interpolations {
+        for (interpolation, is_raw) in &interpolations {
             self.compile_expression(&interpolation.expression)?;
             self.assembler
                 .set_location(self.source_location(interpolation.range));
@@ -1986,7 +1986,11 @@ impl Compiler<'_> {
                 ConversionFlag::Ascii => 12,
             };
             let effect = if let Some(format_spec) = &interpolation.format_spec {
-                self.compile_interpolated_elements(&format_spec.elements, format_spec.range, true)?;
+                self.compile_interpolated_elements(
+                    &format_spec.elements,
+                    format_spec.range,
+                    *is_raw,
+                )?;
                 argument |= 1;
                 -2
             } else {
