@@ -1119,6 +1119,45 @@ def parent():
     }
 
     #[test]
+    fn matches_cpython_marshal_for_class_annotation_comprehensions() {
+        for source in [
+            "class C:\n    def f(x: [i for i in (1,)]): pass\n",
+            "class C:\n global __class__\n def f(a: [i for i in __class__]): pass\n",
+            "class C:\n global __class__\n a: [i for i in __class__]\n",
+            "class C:\n global __class__\n type A = [i for i in __class__]\n",
+            "def outer(x):\n class C:\n  global x\n  def f(a: [x for i in (1,)]): pass\n return C\n",
+            "def outer(x):\n class C:\n  global x\n  a: [x for i in (1,)]\n return C\n",
+            "def outer(x):\n class C:\n  global x\n  def f(a: (x, [x for i in (1,)])): pass\n return C\n",
+            "def outer(x):\n class C:\n  global x\n  a: (x, [x for i in (1,)])\n return C\n",
+            "class C:\n global __class__\n def f(a: [__class__ for i in (1,)]): pass\n",
+            "class C:\n global __class__\n a: [__class__ for i in (1,)]\n",
+            "class C:\n global T\n def f[T](a: [T for i in (1,)]): pass\n",
+            "class C:\n global T\n def f[T](a: (T, [T for i in (1,)])): pass\n",
+            "class C:\n    x: {i for i in (1, 2) if i}\n",
+            "class C:\n    def f(x: {i: i + 1 for i in (1, 2) if i}): pass\n",
+            "class C:\n    type A = [(i, j) for i in (1, 2) for j in (i,) if j]\n",
+            "def outer(value):\n    class C:\n        type A = [value + i for i in (1, 2)]\n    return C\n",
+            "class C:\n    type A = [lambda: i for i in (1, 2)]\n",
+            "class C:\n    type A = [[lambda: j for j in (i,)] for i in (1, 2)]\n",
+            "class C:\n    values = (1, 2)\n    item = int\n    type A = [item for i in values]\n",
+            "class C:\n    def f[T: [i for i in (1, 2)]](): pass\n",
+            "class C:\n    type A[T = {i for i in (1, 2)}] = T\n",
+            "class C:\n    type A = [i for i in [j for j in (1, 2)]]\n",
+            "def outer(value):\n    class C:\n        value = 10\n        type A = [value + i for i in (1,)]\n    return C\n",
+            "def outer(value):\n    class C:\n        value = 10\n        def f(x: [value + i for i in (1,)]): pass\n    return C\n",
+            "def outer(value):\n    class C:\n        value = 10\n        x: [value + i for i in (1,)]\n    return C\n",
+            "class C:\n    type A = [__class__ for i in (1,)]\n",
+            "class C:\n    def f(x: [__class__ for i in (1,)]): pass\n",
+            "class C:\n    x: [__class__ for i in (1,)]\n",
+            "def outer(__class__):\n    class C:\n        type A = [i for i in __class__]\n    return C\n",
+            "def outer(T):\n    class C:\n        def f[T](x: [T for i in (1,)]): pass\n    return C\n",
+            "def outer(a):\n    class C:\n        a = type\n        class D[T](*[a for i in (1,)]): pass\n    return C\n",
+        ] {
+            assert_matches_cpython_marshal(source, "class_annotation_comprehensions.py");
+        }
+    }
+
+    #[test]
     fn matches_cpython_marshal_for_annotation_scope_closures() {
         let source = include_str!("fixtures/benchmark/annotation_scopes.py");
         assert_matches_cpython_marshal(source, "annotation_scopes.py");

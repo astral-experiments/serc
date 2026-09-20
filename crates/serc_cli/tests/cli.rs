@@ -305,6 +305,8 @@ fn compile_matches_cpython_for_version_specific_marshal_identity() {
             "from __future__ import annotations\nsequence: [lambda: item for item in (1,)]\ndef function(argument: [lambda: item for item in (2,)]):\n    pass\n",
             "def f[T](x: [lambda: item for item in (1,)]): pass\n",
             "def outer(values):\n def f[T](x: [lambda: item for item in values]): pass\n return f\n",
+            // Eager annotations keep ordinary comprehensions in the defining scope.
+            "class C:\n def f(a: [i for i in (1,)]): pass\n",
             // Deferred module and class annotations inherit the active future flags.
             "from __future__ import barry_as_FLUFL\nvalue: int\n",
             "from __future__ import barry_as_FLUFL\nclass C:\n value: int\n def method(self, arg: int): pass\n",
@@ -382,8 +384,24 @@ fn compile_matches_cpython_for_version_specific_marshal_identity() {
             "a = ((1e999 - 1e999) * 1j, 1j * (1e999 - 1e999), -(1e999 - 1e999) * 1j, 1j * -(1e999 - 1e999))\n",
             "def first():\n    return (1e999 - 1e999) + 1j\ndef second():\n    return (1e999 - 1e999) + 1j\n",
         ];
+        if version >= serc::PythonVersion::Py313 {
+            // Python 3.12 rejects comprehensions in class-visible annotation scopes.
+            sources.extend([
+                "class C:\n type A[T = {i for i in (1, 2)}] = T\n",
+                "class C:\n type A = [[lambda: j for j in (i,)] for i in (1, 2)]\n",
+                "class C:\n global __class__\n type A = [__class__ for i in (1,)]\n",
+                "class C:\n global __class__\n type A = [i for i in __class__]\n",
+                "def outer(a):\n class C:\n  a = type\n  class D[T](*[a for i in (1,)]): pass\n return C\n",
+            ]);
+        }
         if version >= serc::PythonVersion::Py314 {
             sources.extend([
+                // Deferred signatures keep captures separate from direct class-global lookup.
+                "class C:\n def f[T: [i for i in (1,)]](a: [T for i in (1,)]): pass\n",
+                "def outer(x):\n class C:\n  x = None\n  def f(a: [x for i in (1,)]): pass\n return C\n",
+                "def outer(x):\n class C:\n  x = None\n  def f[T](a: [x for i in (1,)]): pass\n return C\n",
+                "def outer(x):\n class C:\n  global x\n  def f(a: (x, [x for i in (1,)])): pass\n return C\n",
+                "class C:\n global T\n def f[T](a: (T, [T for i in (1,)])): pass\n",
                 // Preserve empty-bytes identity across constant-cache admission orders.
                 "value = b'x' * 0\n",
                 "value = 0 * b'x'\n",
