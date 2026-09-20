@@ -35,13 +35,13 @@ cargo run --release -p serc-cli -- compile --python-version 3.15 path/to/package
 `--python-version` accepts `3.14` (the default, pinned to CPython 3.14.5) and `3.15` (pinned to
 CPython 3.15.0rc2). Cache names use the selected version, such as `module.cpython-314.pyc` and
 `module.cpython-315.pyc`, and their headers carry the corresponding magic number. Python 3.15
-support remains experimental while full corpus compatibility is being established.
+support remains experimental.
 
 Paths default to the current directory. Pass `--check` to compile without writing cache files and
 `--quiet` to suppress the success summary. Compilation is sequential so the command can be
 compared directly with single-worker CPython `compileall`. Source files may use UTF-8 or a
-CPython-compatible encoding cookie for Latin-1, Latin-9, EUC-JP, KOI8-R, or Windows-1251; other source
-encodings are unsupported.
+CPython-compatible encoding cookie for ASCII, Latin-1, Latin-9, EUC-JP, KOI8-R, or Windows-1251;
+other source encodings are unsupported.
 
 ## Library source API
 

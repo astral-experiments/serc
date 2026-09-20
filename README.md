@@ -24,8 +24,8 @@ serc compile --python-version 3.15 path/to/package
 
 The default is `3.14`, pinned to CPython 3.14.5. The experimental `3.15` target is pinned to
 CPython 3.15.0rc2. Each target writes its own cache tag and bytecode magic number, so the two
-versions can coexist under `__pycache__`. Python 3.15 compatibility validation is in progress;
-the corpus results below describe Python 3.14 only.
+versions can coexist under `__pycache__`. The public corpus tables below describe
+Python 3.14 only.
 
 Library callers select `PythonVersion::Py314` or `PythonVersion::Py315` through
 `CompileOptions`, then call `compile_with_options` or `compile_bytes_with_options`. See the
@@ -99,7 +99,7 @@ network, storage, and CPU resources:
 ./scripts/check-mypy-primer-compatibility /path/to/python3.14.5
 ```
 
-The current compatibility measurements are:
+The following public corpus measurements use CPython 3.14.5:
 
 | Corpus | Files | CPython-rejected | Byte-identical accepted | Byte mismatches | Accepted-input match rate |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -146,8 +146,7 @@ compiler internals and target-generation details.
 
 Serc is experimental. Python 3.14 defaults to the exact CPython 3.14.5 target; experimental
 Python 3.15 support targets CPython 3.15.0rc2. Python bytecode and marshal formats are not stable
-across Python releases. Full Python 3.15 corpus compatibility has not yet been established. Changes to
-the compiler are accepted only when every CPython-accepted input in the
+across Python releases. Changes to the compiler are accepted only when every CPython-accepted input in the
 required pinned corpus remains byte-identical and the frozen outcome counts
 remain unchanged unless intentionally advanced. Serc was authored entirely
 by GPT in Codex.
