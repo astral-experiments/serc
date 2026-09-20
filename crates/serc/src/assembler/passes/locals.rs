@@ -1677,7 +1677,7 @@ pub(in crate::assembler) fn optimize_linear_assertion_load_fast(items: &mut [Ite
     }
 }
 
-/// Returns the same local-pair fusion used by the graph pass and copied-entry admission.
+/// Returns the local-pair fusion used by both optimizers and copied-entry admission.
 pub(super) fn fuse_pair(first: &Instruction, second: &Instruction) -> Option<Instruction> {
     let opcode = match (first.opcode, second.opcode) {
         (LOAD_FAST_BORROW, LOAD_FAST_BORROW) => LOAD_FAST_BORROW_LOAD_FAST_BORROW,

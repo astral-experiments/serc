@@ -225,6 +225,53 @@ fn collect_segments<T>(
     segments
 }
 
+/// Fuses non-overlapping adjacent pairs while preserving label barriers and source locations.
+pub(super) fn fuse_adjacent_instructions(
+    items: &mut Vec<Item>,
+    mut fuse: impl FnMut(&Instruction, &Instruction) -> Option<Instruction>,
+) {
+    let original_len = items.len();
+    let mut read = 0;
+    let mut write = 0;
+    while read < original_len {
+        let fused = if read + 1 < original_len {
+            match (&items[read], &items[read + 1]) {
+                (Item::Instruction(first), Item::Instruction(second)) => fuse(first, second),
+                (Item::Label(_), _) | (_, Item::Label(_)) => None,
+            }
+        } else {
+            None
+        };
+        if let Some(instruction) = fused {
+            let second_location = match &items[read + 1] {
+                Item::Instruction(second) => second.location,
+                Item::Label(_) => unreachable!("a fused pair must contain two instructions"),
+            };
+            // CPython resolves missing locations before replacing the second half of a
+            // superinstruction with a removable NOP. For a forward source-order pair,
+            // preserve that location on an immediately following instruction before
+            // compacting the pair. Reversed assignment stores retain the first location.
+            if let Some(Item::Instruction(following)) = items.get_mut(read + 2)
+                && following.location.line < 0
+                && !following.no_location_policy.preserves_location()
+                && second_location.line == instruction.location.line
+                && second_location.column > instruction.location.column
+            {
+                following.location = second_location;
+            }
+            items[write] = Item::Instruction(instruction);
+            read += 2;
+        } else {
+            if write != read {
+                items[write] = items[read];
+            }
+            read += 1;
+        }
+        write += 1;
+    }
+    items.truncate(write);
+}
+
 impl BlockGraph {
     fn partition_items(
         items: Vec<Item>,
@@ -792,49 +839,9 @@ impl BlockGraph {
     pub(super) fn fuse_adjacent_instructions(
         &mut self,
         block: BasicBlockId,
-        mut fuse: impl FnMut(&Instruction, &Instruction) -> Option<Instruction>,
+        fuse: impl FnMut(&Instruction, &Instruction) -> Option<Instruction>,
     ) {
-        let items = &mut self.blocks[block.index()].items;
-        let original_len = items.len();
-        let mut read = 0;
-        let mut write = 0;
-        while read < original_len {
-            let fused = if read + 1 < original_len {
-                match (&items[read], &items[read + 1]) {
-                    (Item::Instruction(first), Item::Instruction(second)) => fuse(first, second),
-                    (Item::Label(_), _) | (_, Item::Label(_)) => None,
-                }
-            } else {
-                None
-            };
-            if let Some(instruction) = fused {
-                let second_location = match &items[read + 1] {
-                    Item::Instruction(second) => second.location,
-                    Item::Label(_) => unreachable!("a fused pair must contain two instructions"),
-                };
-                // CPython resolves missing locations before replacing the second half of a
-                // superinstruction with a removable NOP. For a forward source-order pair,
-                // preserve that location on an immediately following instruction before
-                // compacting the pair. Reversed assignment stores retain the first location.
-                if let Some(Item::Instruction(following)) = items.get_mut(read + 2)
-                    && following.location.line < 0
-                    && !following.no_location_policy.preserves_location()
-                    && second_location.line == instruction.location.line
-                    && second_location.column > instruction.location.column
-                {
-                    following.location = second_location;
-                }
-                items[write] = Item::Instruction(instruction);
-                read += 2;
-            } else {
-                if write != read {
-                    items[write] = items[read];
-                }
-                read += 1;
-            }
-            write += 1;
-        }
-        items.truncate(write);
+        fuse_adjacent_instructions(&mut self.blocks[block.index()].items, fuse);
     }
 
     fn validate_order(&self, order: &[BasicBlockId]) -> Result<(), String> {

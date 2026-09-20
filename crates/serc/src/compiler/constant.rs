@@ -751,7 +751,7 @@ impl Compiler<'_> {
         }
         let mut used = self
             .assembler
-            .used_constant_indices(LOAD_CONST, self.output.constants.len());
+            .used_constant_indices(self.output.constants.len());
         if let Some(index) = deferred_none {
             used[usize::try_from(index).expect("constant index should fit in usize")] = true;
         }
@@ -764,8 +764,7 @@ impl Compiler<'_> {
             .take(self.output.first_flowgraph_constant)
             .flatten()
             .count();
-        self.assembler
-            .remap_constant_indices(LOAD_CONST, &index_map);
+        self.assembler.remap_constant_indices(&index_map);
         self.output.qualified_name_constant_index =
             self.output.qualified_name_constant_index.and_then(|index| {
                 let index = usize::try_from(index).expect("constant index always fits in usize");

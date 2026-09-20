@@ -360,7 +360,6 @@ impl BooleanValueMarkerScan {
 fn reachable_constant_indices(
     graph: &block_graph::BlockGraph,
     reachable: &[bool],
-    load_const: Opcode,
     constant_count: usize,
 ) -> Vec<bool> {
     let mut used = vec![false; constant_count];
@@ -373,7 +372,7 @@ fn reachable_constant_indices(
             let Item::Instruction(instruction) = item else {
                 continue;
             };
-            if instruction.opcode == load_const
+            if instruction.opcode == LOAD_CONST
                 && let Operand::Value(index) = instruction.operand()
                 && let Some(slot) = used.get_mut(index as usize)
             {
@@ -393,11 +392,7 @@ fn reachable_constant_indices(
 /// Marks reachable constants in an assertion-only stream and reports linear-optimizer eligibility.
 ///
 /// `None` rejects the grammar; `Some(false)` preserves valid streams that still require the CFG.
-fn assertion_constant_indices(
-    items: &[Item],
-    load_const: Opcode,
-    used: &mut [bool],
-) -> Option<bool> {
+fn assertion_constant_indices(items: &[Item], used: &mut [bool]) -> Option<bool> {
     let mut items = items.iter();
     let mut assertion_count = 0;
     let mut ended_scope = false;
@@ -454,7 +449,7 @@ fn assertion_constant_indices(
         if instruction.opcode == NOT_TAKEN {
             return None;
         }
-        if instruction.opcode == load_const
+        if instruction.opcode == LOAD_CONST
             && let Some(slot) = used.get_mut(argument as usize)
         {
             *slot = true;
@@ -501,7 +496,7 @@ impl Assembler {
             && self.borrow_omitted_for_backedges.is_empty()
             && self.folded_loop_exit_anchors.is_empty()
             && !self.has_synthesized_percent_target_locations
-            && assertion_constant_indices(items, LOAD_CONST, &mut []).unwrap_or(false)
+            && assertion_constant_indices(items, &mut []).unwrap_or(false)
     }
 
     /// Recognizes a constant return with no CFG or instruction-policy metadata to replay.
@@ -13456,14 +13451,10 @@ impl Assembler {
         Ok(())
     }
 
-    pub(crate) fn used_constant_indices(
-        &mut self,
-        load_const: Opcode,
-        constant_count: usize,
-    ) -> Vec<bool> {
+    pub(crate) fn used_constant_indices(&mut self, constant_count: usize) -> Vec<bool> {
         self.resolve_folded_condition_borrow_entries();
         if let UnoptimizedCode::Prepared { graph, reachable } = &self.code {
-            return reachable_constant_indices(graph, reachable, load_const, constant_count);
+            return reachable_constant_indices(graph, reachable, constant_count);
         }
 
         let mut used = vec![false; constant_count];
@@ -13478,7 +13469,7 @@ impl Assembler {
                 straight_line = false;
                 break;
             }
-            if instruction.opcode == load_const
+            if instruction.opcode == LOAD_CONST
                 && let Operand::Value(index) = instruction.operand()
                 && let Some(slot) = used.get_mut(index as usize)
             {
@@ -13503,7 +13494,7 @@ impl Assembler {
             && self.folded_loop_exit_anchors.is_empty()
             && !self.has_synthesized_percent_target_locations
             && let Some(linear_eligible) =
-                assertion_constant_indices(self.linear_items(), load_const, &mut used)
+                assertion_constant_indices(self.linear_items(), &mut used)
         {
             self.has_proven_linear_assertion_side_exits = linear_eligible;
             return used;
@@ -13516,12 +13507,12 @@ impl Assembler {
         };
         let graph = block_graph::BlockGraph::from_items(items, &self.preserved_block_boundaries);
         let reachable = graph.reachable_blocks(&self.exception_regions);
-        let used = reachable_constant_indices(&graph, &reachable, load_const, constant_count);
+        let used = reachable_constant_indices(&graph, &reachable, constant_count);
         self.code = UnoptimizedCode::Prepared { graph, reachable };
         used
     }
 
-    pub(crate) fn remap_constant_indices(&mut self, load_const: Opcode, index_map: &[Option<u32>]) {
+    pub(crate) fn remap_constant_indices(&mut self, index_map: &[Option<u32>]) {
         let mut discarded_admissions = self
             .discarded_fold_admissions
             .iter_mut()
@@ -13542,7 +13533,7 @@ impl Assembler {
         // survivors stay duplicates when their constant indices change together.
         let original_uniform_folds = &self.exception_owner_provenance.original_uniform_folds;
         let remap = |instruction: &mut Instruction| {
-            if instruction.opcode != load_const {
+            if instruction.opcode != LOAD_CONST {
                 return;
             }
             let Operand::Value(mut index) = instruction.operand() else {
@@ -13556,8 +13547,7 @@ impl Assembler {
                 .expect("constant index should fit in usize");
                 index = index_map[old_index].expect("deferred None constant should be retained");
             } else if let Some(new_index) = index_map[usize::try_from(index).unwrap()] {
-                original_uniform_fold = instruction.opcode == LOAD_CONST
-                    && instruction.jump_policy.has_original_uniform_fold()
+                original_uniform_fold = instruction.jump_policy.has_original_uniform_fold()
                     && original_uniform_folds
                         .iter()
                         .filter(|original| **original == *instruction)
@@ -13590,7 +13580,6 @@ impl Assembler {
         // Apply its mapping to every original witness only after all live records.
         for original in &mut self.exception_owner_provenance.original_uniform_folds {
             if original.opcode == LOAD_CONST
-                && load_const == LOAD_CONST
                 && original.jump_policy.has_original_uniform_fold()
                 && let Operand::Value(index) = original.operand()
                 && index != u32::MAX
@@ -13603,86 +13592,84 @@ impl Assembler {
         // These source arrays were captured before unused constants were pruned.
         // Transport only surviving constant identities; replay still compares every
         // complete instruction and rejects any other change to the original array.
-        if load_const == LOAD_CONST {
-            self.exception_owner_provenance
-                .copied_return_membership_prefixes
-                .retain_mut(|origin| {
-                    let Operand::Value(index) = origin.constant.operand() else {
+        self.exception_owner_provenance
+            .copied_return_membership_prefixes
+            .retain_mut(|origin| {
+                let Operand::Value(index) = origin.constant.operand() else {
+                    return false;
+                };
+                let Some(Some(remapped)) = index_map.get(index as usize) else {
+                    return false;
+                };
+                origin.constant.set_operand(Operand::Value(*remapped));
+                true
+            });
+        self.exception_owner_provenance
+            .copied_return_pop_prefixes
+            .retain_mut(|origin| {
+                let load = &mut origin.records[2];
+                if load.opcode != LOAD_CONST {
+                    return false;
+                }
+                let Operand::Value(index) = load.operand() else {
+                    return false;
+                };
+                let Some(Some(remapped)) = index_map.get(index as usize) else {
+                    return false;
+                };
+                load.set_operand(Operand::Value(*remapped));
+                true
+            });
+        self.exception_owner_provenance
+            .saved_named_handler_none_prefixes
+            .retain_mut(|origin| {
+                for item in &mut origin.items {
+                    let Item::Instruction(instruction) = item else {
+                        continue;
+                    };
+                    if instruction.opcode != LOAD_CONST {
+                        continue;
+                    }
+                    let Operand::Value(index) = instruction.operand() else {
                         return false;
                     };
                     let Some(Some(remapped)) = index_map.get(index as usize) else {
                         return false;
                     };
-                    origin.constant.set_operand(Operand::Value(*remapped));
-                    true
-                });
-            self.exception_owner_provenance
-                .copied_return_pop_prefixes
-                .retain_mut(|origin| {
-                    let load = &mut origin.records[2];
-                    if load.opcode != LOAD_CONST {
-                        return false;
+                    instruction.set_operand(Operand::Value(*remapped));
+                }
+                true
+            });
+        self.exception_owner_provenance
+            .original_normal_finally_arrays
+            .retain_mut(|origin| {
+                origin.borrow_join = origin.borrow_join.and_then(|(join, mut first)| {
+                    if first.opcode == LOAD_CONST {
+                        let Operand::Value(index) = first.operand() else {
+                            return None;
+                        };
+                        let remapped = (*index_map.get(index as usize)?)?;
+                        first.set_operand(Operand::Value(remapped));
                     }
-                    let Operand::Value(index) = load.operand() else {
+                    Some((join, first))
+                });
+                for item in &mut origin.prefix {
+                    let Item::Instruction(instruction) = item else {
+                        continue;
+                    };
+                    if instruction.opcode != LOAD_CONST {
+                        continue;
+                    }
+                    let Operand::Value(index) = instruction.operand() else {
                         return false;
                     };
                     let Some(Some(remapped)) = index_map.get(index as usize) else {
                         return false;
                     };
-                    load.set_operand(Operand::Value(*remapped));
-                    true
-                });
-            self.exception_owner_provenance
-                .saved_named_handler_none_prefixes
-                .retain_mut(|origin| {
-                    for item in &mut origin.items {
-                        let Item::Instruction(instruction) = item else {
-                            continue;
-                        };
-                        if instruction.opcode != LOAD_CONST {
-                            continue;
-                        }
-                        let Operand::Value(index) = instruction.operand() else {
-                            return false;
-                        };
-                        let Some(Some(remapped)) = index_map.get(index as usize) else {
-                            return false;
-                        };
-                        instruction.set_operand(Operand::Value(*remapped));
-                    }
-                    true
-                });
-            self.exception_owner_provenance
-                .original_normal_finally_arrays
-                .retain_mut(|origin| {
-                    origin.borrow_join = origin.borrow_join.and_then(|(join, mut first)| {
-                        if first.opcode == LOAD_CONST {
-                            let Operand::Value(index) = first.operand() else {
-                                return None;
-                            };
-                            let remapped = (*index_map.get(index as usize)?)?;
-                            first.set_operand(Operand::Value(remapped));
-                        }
-                        Some((join, first))
-                    });
-                    for item in &mut origin.prefix {
-                        let Item::Instruction(instruction) = item else {
-                            continue;
-                        };
-                        if instruction.opcode != LOAD_CONST {
-                            continue;
-                        }
-                        let Operand::Value(index) = instruction.operand() else {
-                            return false;
-                        };
-                        let Some(Some(remapped)) = index_map.get(index as usize) else {
-                            return false;
-                        };
-                        instruction.set_operand(Operand::Value(*remapped));
-                    }
-                    true
-                });
-        }
+                    instruction.set_operand(Operand::Value(*remapped));
+                }
+                true
+            });
     }
 
     pub(crate) const fn deferred_none_constant_index(&self) -> Option<u32> {

@@ -1,22 +1,21 @@
 #[cfg(any(test, debug_assertions))]
 use super::super::AssemblerStage;
 use super::super::{
-    Assembler, BorrowFallthrough, COMPARE_OP, CONTAINS_OP, DELETE_FAST, IS_OP, Instruction, Item,
-    LOAD_FAST, LOAD_FAST_AND_CLEAR, LOAD_FAST_BORROW, LOAD_FAST_BORROW_LOAD_FAST_BORROW,
-    LOAD_FAST_CHECK, LOAD_FAST_LOAD_FAST, LayoutAssembler, NOP, Operand, POP_JUMP_IF_FALSE,
-    POP_JUMP_IF_TRUE, POP_TOP, STORE_FAST, STORE_FAST_LOAD_FAST, STORE_FAST_STORE_FAST, TO_BOOL,
-    UNARY_NOT, UNPACK_SEQUENCE, UnoptimizedCode, ends_scope, is_unconditional_jump,
+    Assembler, COMPARE_OP, CONTAINS_OP, DELETE_FAST, IS_OP, Instruction, Item, LOAD_FAST,
+    LOAD_FAST_AND_CLEAR, LOAD_FAST_CHECK, LayoutAssembler, NOP, Operand, POP_JUMP_IF_FALSE,
+    POP_JUMP_IF_TRUE, POP_TOP, STORE_FAST, STORE_FAST_STORE_FAST, TO_BOOL, UNARY_NOT,
+    UNPACK_SEQUENCE, UnoptimizedCode, ends_scope, is_unconditional_jump,
 };
 use crate::CompileError;
 use crate::assembler::ConstantTable;
-use crate::assembler::block_graph::ItemMut;
+use crate::assembler::block_graph::{ItemMut, fuse_adjacent_instructions};
 use crate::target::opcodes::{POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE};
 use crate::target::operands::ComparisonOperation;
 
 use super::control_flow::clear_redundant_boolean_nop_location;
 use super::control_flow::redundant_copy_pop_indices;
 use super::control_flow::remove_none_comparison_boolean_conversions;
-use super::locals::optimize_linear_assertion_load_fast;
+use super::locals::{fuse_pair, optimize_linear_assertion_load_fast};
 
 fn optimize_boolean_conversions_and_redundant_stores(
     items: &mut [Item],
@@ -249,78 +248,6 @@ fn add_checks_for_uninitialized_loads(
     }
 }
 
-fn fuse_superinstructions(items: &mut Vec<Item>) {
-    fn fuse_pair(first: &Instruction, second: &Instruction) -> Option<Instruction> {
-        let opcode = match (first.opcode, second.opcode) {
-            (LOAD_FAST_BORROW, LOAD_FAST_BORROW) => LOAD_FAST_BORROW_LOAD_FAST_BORROW,
-            (LOAD_FAST, LOAD_FAST) => LOAD_FAST_LOAD_FAST,
-            (STORE_FAST, LOAD_FAST | LOAD_FAST_BORROW) => STORE_FAST_LOAD_FAST,
-            (STORE_FAST, STORE_FAST) => STORE_FAST_STORE_FAST,
-            _ => return None,
-        };
-        if first.fusion_policy.prevents_with_next()
-            || first.no_location_policy.borrow_fallthrough() == BorrowFallthrough::Barrier
-            || second.fusion_policy.prevents_with_previous()
-        {
-            return None;
-        }
-        let (Operand::Value(first_argument), Operand::Value(second_argument)) =
-            (first.operand(), second.operand())
-        else {
-            return None;
-        };
-        if first_argument >= 16
-            || second_argument >= 16
-            || first.location.line != second.location.line
-        {
-            return None;
-        }
-        Some(Instruction::fused(
-            opcode,
-            Operand::Value((first_argument << 4) | second_argument),
-            *first,
-            *second,
-        ))
-    }
-
-    let original_len = items.len();
-    let mut read = 0;
-    let mut write = 0;
-    while read < original_len {
-        let fused = if read + 1 < original_len {
-            match (&items[read], &items[read + 1]) {
-                (Item::Instruction(first), Item::Instruction(second)) => fuse_pair(first, second),
-                (Item::Label(_), _) | (_, Item::Label(_)) => None,
-            }
-        } else {
-            None
-        };
-        if let Some(instruction) = fused {
-            let Item::Instruction(second) = items[read + 1] else {
-                unreachable!();
-            };
-            let second_location = second.location;
-            if let Some(Item::Instruction(following)) = items.get_mut(read + 2)
-                && following.location.line < 0
-                && !following.no_location_policy.preserves_location()
-                && second_location.line == instruction.location.line
-                && second_location.column > instruction.location.column
-            {
-                following.location = second_location;
-            }
-            items[write] = Item::Instruction(instruction);
-            read += 2;
-        } else {
-            if write != read {
-                items[write] = items[read];
-            }
-            read += 1;
-        }
-        write += 1;
-    }
-    items.truncate(write);
-}
-
 fn propagate_locations_and_remove_redundant_nops(items: &mut Vec<Item>) {
     let mut previous_location = None;
     let mut previous_retained = None;
@@ -452,7 +379,7 @@ impl Assembler {
             None,
             AssemblerStage::AddChecksForUninitializedLoads,
         )?;
-        fuse_superinstructions(&mut items);
+        fuse_adjacent_instructions(&mut items, fuse_pair);
         #[cfg(any(test, debug_assertions))]
         super::validate_structure(
             &items,
