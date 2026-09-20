@@ -830,7 +830,17 @@ impl OptimizationPipeline {
             original_owners.retain_pipeline(&self);
         }
         if let Some(constants) = constants {
-            if !copied_entry_labels.is_empty() {
+            let sequence_depth = if self.python_version == crate::PythonVersion::Py315 {
+                self.fold_constant_sequences(constants)?
+            } else {
+                None
+            };
+            if let Some(depth) = sequence_depth {
+                removed_max_depth =
+                    Some(removed_max_depth.map_or(depth, |current| current.max(depth)));
+                original_owners.retain_pipeline(&self);
+            }
+            if sequence_depth.is_some() || !copied_entry_labels.is_empty() {
                 self.fold_copied_constants(constants, &copied_entry_labels)?;
                 original_owners.retain_pipeline(&self);
             }
@@ -1126,15 +1136,15 @@ impl LayoutAssembler {
         &self,
         instruction: &Instruction,
     ) -> Result<Operand, CompileError> {
-        let operand = instruction.operand();
-        if self.python_version == crate::PythonVersion::Py314 {
-            return Ok(operand);
-        }
         use crate::target::GENEXPR_RESUME_ARGUMENT;
         use crate::target::opcodes::{GET_YIELD_FROM_ITER, RESUME};
         use crate::target::operands::ResumeLocation;
         use crate::target::operands315::{IteratorMode, ResumeLocation as ResumeLocation315};
 
+        let operand = instruction.operand();
+        if self.python_version == crate::PythonVersion::Py314 {
+            return Ok(operand);
+        }
         let Operand::Value(argument) = operand else {
             return Ok(operand);
         };

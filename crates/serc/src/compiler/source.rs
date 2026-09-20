@@ -522,10 +522,6 @@ impl Compiler<'_> {
         body: &Suite,
         python_version: crate::PythonVersion,
     ) -> Result<(), crate::CompileError> {
-        if python_version != crate::PythonVersion::Py315 {
-            return Ok(());
-        }
-
         #[derive(Default)]
         struct Validator {
             scope: Option<&'static str>,
@@ -607,6 +603,9 @@ impl Compiler<'_> {
             }
         }
 
+        if python_version != crate::PythonVersion::Py315 {
+            return Ok(());
+        }
         let mut validator = Validator::default();
         for statement in body {
             validator.visit_stmt(statement);

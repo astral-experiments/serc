@@ -129,7 +129,7 @@ oracle failure:          0
 ```
 
 The CPython 3.15.0rc2 gate uses the same 2,451 pinned files and requires 2,249 exact matches.
-Its 202 CPython-rejected files are frozen as 131 matched rejections, 57 rejection mismatches,
+Its 202 CPython-rejected files are frozen as 132 matched rejections, 56 rejection mismatches,
 and 14 compiler failures. Every other failure category must remain zero, and `--require-all`
 independently rejects any failure on a CPython-accepted input. Both gates run in CI.
 

@@ -320,6 +320,7 @@ fn capture_cleanup_rotation(items: &[Item]) -> Option<CaptureCleanupRotation<'_>
 pub(crate) trait ConstantTable {
     fn get(&self, index: u32) -> &Constant;
     fn intern(&mut self, constant: Constant) -> Result<u32, CompileError>;
+    fn fold_sequence(&mut self, values: Vec<Constant>, is_set: bool) -> Result<u32, CompileError>;
     fn len(&self) -> usize;
     fn retain_used(&mut self, used: &[bool], order: &[u32]) -> Vec<Option<u32>>;
 }
@@ -13879,7 +13880,7 @@ impl Assembler {
         // These guards model Python 3.14's borrowed-load traversal stopping at
         // eliminated CFG blocks. Python 3.15 visits their normal successors;
         // its final stack analysis decides whether each load can be borrowed.
-        let strict_owned_load = self.python_version == PythonVersion::Py314
+        let strict_owned_load = self.python_version == crate::PythonVersion::Py314
             && self.strict_owned_loads
             && opcode == LOAD_FAST;
         let force_owned_load = explicitly_owned

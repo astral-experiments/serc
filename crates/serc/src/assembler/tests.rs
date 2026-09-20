@@ -1373,11 +1373,51 @@ fn python315_borrow_traversal_crosses_removed_constant_branches() {
             };
             assert!(
                 code.bytecode
-                    .chunks_exact(2)
-                    .any(|word| word == [expected.code_for(version), 0]),
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .any(|word| *word == [expected.code_for(version), 0]),
                 "{version:?}: {source}"
             );
         }
+    }
+}
+
+#[test]
+fn terminal_assignment_fallthrough_keeps_value_owned() {
+    use crate::code_object::Constant;
+    use crate::{CompileOptions, PythonVersion, compile_with_options};
+
+    for version in [PythonVersion::Py314, PythonVersion::Py315] {
+        let module = compile_with_options(
+            "def f(self, value):\n    self.value = {} if value is None else value\n",
+            "tail.py",
+            &CompileOptions {
+                python_version: version,
+                ..CompileOptions::default()
+            },
+        )
+        .unwrap();
+        let code = module
+            .code
+            .constants
+            .iter()
+            .find_map(|constant| match constant {
+                Constant::Code(code) => Some(code),
+                _ => None,
+            })
+            .unwrap();
+        assert!(code.bytecode.windows(6).any(|window| {
+            window
+                == [
+                    LOAD_FAST.code_for(version),
+                    1,
+                    LOAD_FAST_BORROW.code_for(version),
+                    0,
+                    STORE_ATTR.code_for(version),
+                    0,
+                ]
+        }));
     }
 }
 

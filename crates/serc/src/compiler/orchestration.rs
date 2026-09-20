@@ -96,6 +96,13 @@ impl ConstantTable for InterningConstantTable<'_, '_> {
         self.output.intern(constant)
     }
 
+    fn fold_sequence(&mut self, values: Vec<Constant>, is_set: bool) -> Result<u32, CompileError> {
+        let index = self.output.fold_sequence(values, is_set)?;
+        self.context
+            .record_constant_string_origins(self.output.get(index), false);
+        Ok(index)
+    }
+
     fn len(&self) -> usize {
         self.output.len()
     }

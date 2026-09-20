@@ -84,7 +84,7 @@ to `main`.
 The optional second argument selects the target and defaults to `3.14`. The Python 3.15 gate
 uses the same 2,451 files and passes source bytes to both compilers. It requires all 2,249
 CPython-accepted files to match exactly, and freezes the 202 CPython-rejected inputs as
-131 matched rejections, 57 rejection mismatches, and 14 compiler failures. Compiler failures
+132 matched rejections, 56 rejection mismatches, and 14 compiler failures. Compiler failures
 on accepted inputs always fail either gate.
 
 For broader diagnostics, Serc also has a separately pinned corpus derived

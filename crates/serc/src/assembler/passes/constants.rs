@@ -5,12 +5,113 @@ use super::super::{ConstantTable, Item, Label, Operand, OptimizationPipeline, So
 use crate::code_object::Constant;
 use crate::target::Opcode;
 use crate::target::opcodes::{
-    BUILD_TUPLE, LOAD_COMMON_CONSTANT, LOAD_CONST, LOAD_SMALL_INT, NOP, UNARY_NEGATIVE,
+    BUILD_LIST, BUILD_SET, BUILD_TUPLE, CALL_INTRINSIC_1, CONTAINS_OP, GET_ITER, LIST_APPEND,
+    LOAD_COMMON_CONSTANT, LOAD_CONST, LOAD_SMALL_INT, NOP, SET_ADD, UNARY_NEGATIVE,
 };
+use crate::target::operands::UnaryIntrinsic;
 use crate::target::operands315::CommonConstant;
 use crate::{CompileError, PythonVersion};
 
 impl OptimizationPipeline {
+    /// Folds 3.15's append-built constant sequences without crossing basic blocks.
+    pub(super) fn fold_constant_sequences(
+        &mut self,
+        constants: &mut dyn ConstantTable,
+    ) -> Result<Option<u32>, CompileError> {
+        if self.python_version != PythonVersion::Py315 {
+            return Ok(None);
+        }
+        let mut removed_max_depth = None;
+        for block in self.graph.order().to_vec() {
+            for offset in 0..self.graph[block].items().len() {
+                let Item::Instruction(target) = self.graph[block].items()[offset] else {
+                    continue;
+                };
+                let intrinsic = target.opcode == CALL_INTRINSIC_1
+                    && target.operand() == Operand::Value(UnaryIntrinsic::LIST_TO_TUPLE.argument());
+                let append = matches!(target.opcode, LIST_APPEND | SET_ADD)
+                    && target.operand() == Operand::Value(1)
+                    && matches!(
+                        self.graph[block].items().get(offset + 1),
+                        Some(Item::Instruction(next)) if matches!(next.opcode, GET_ITER | CONTAINS_OP)
+                    );
+                if !intrinsic && !append {
+                    continue;
+                }
+                let is_set = target.opcode == SET_ADD;
+                let build_opcode = if is_set { BUILD_SET } else { BUILD_LIST };
+                let append_opcode = if is_set { SET_ADD } else { LIST_APPEND };
+                let mut expect_append = intrinsic;
+                let mut values = Vec::new();
+                let mut start = None;
+                for previous in (0..offset).rev() {
+                    let Item::Instruction(instruction) = self.graph[block].items()[previous] else {
+                        break;
+                    };
+                    if instruction.opcode == NOP {
+                        continue;
+                    }
+                    if instruction.opcode == build_opcode
+                        && instruction.operand() == Operand::Value(0)
+                    {
+                        if expect_append {
+                            start = Some(previous);
+                        }
+                        break;
+                    }
+                    if expect_append {
+                        if instruction.opcode != append_opcode
+                            || instruction.operand() != Operand::Value(1)
+                        {
+                            break;
+                        }
+                    } else {
+                        let Operand::Value(argument) = instruction.operand() else {
+                            break;
+                        };
+                        match instruction.opcode {
+                            LOAD_CONST => values.push(constants.get(argument).clone()),
+                            LOAD_SMALL_INT => values.push(Constant::Int(u64::from(argument))),
+                            _ => break,
+                        }
+                    }
+                    expect_append = !expect_append;
+                }
+                let Some(start) = start else {
+                    continue;
+                };
+                values.reverse();
+                let index = constants.fold_sequence(values, is_set)?;
+                // CPython nops the final append as well, clearing its location before
+                // replacing it. The optional intrinsic instead keeps its original span.
+                let end = if intrinsic { offset } else { offset + 1 };
+                for previous in start..end {
+                    let instruction = self
+                        .graph
+                        .instruction_mut(ItemPosition::new(block, previous))
+                        .unwrap();
+                    if instruction.opcode != NOP {
+                        let depth = instruction.depth_after().unwrap_or(0);
+                        removed_max_depth = Some(
+                            removed_max_depth.map_or(depth, |current: u32| current.max(depth)),
+                        );
+                        instruction.opcode = NOP;
+                        instruction.set_operand(Operand::Value(0));
+                        instruction.location = SourceLocation::NONE;
+                        instruction.no_location_policy.preserve_location();
+                    }
+                }
+                let target = self
+                    .graph
+                    .instruction_mut(ItemPosition::new(block, offset))
+                    .unwrap();
+                target.opcode = LOAD_CONST;
+                target.set_operand(Operand::Value(index));
+            }
+        }
+        Ok(removed_max_depth)
+    }
+
     /// Lowers 3.15's immortal constants after value-based graph optimizations.
     pub(super) fn lower_common_constants(&mut self, constants: &mut dyn ConstantTable) {
         if self.python_version != PythonVersion::Py315 {
@@ -74,9 +175,6 @@ impl OptimizationPipeline {
         constants: &mut dyn ConstantTable,
         copied_entry_labels: &[Label],
     ) -> Result<(), CompileError> {
-        if copied_entry_labels.is_empty() {
-            return Ok(());
-        }
         let copied_entry_labels = copied_entry_labels
             .iter()
             .copied()
@@ -264,7 +362,7 @@ impl OptimizationPipeline {
 #[cfg(test)]
 mod tests {
     use crate::code_object::Constant;
-    use crate::target::opcodes::LOAD_COMMON_CONSTANT;
+    use crate::target::opcodes::{LIST_APPEND, LOAD_COMMON_CONSTANT, SET_ADD};
     use crate::{CompileOptions, PythonVersion, compile_with_options};
 
     #[test]
@@ -283,7 +381,9 @@ mod tests {
             .unwrap();
             let arguments = module
                 .bytecode()
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .filter(|word| word[0] == LOAD_COMMON_CONSTANT.code_for(python_version))
                 .map(|word| word[1])
                 .collect::<Vec<_>>();
@@ -317,5 +417,82 @@ mod tests {
             [Constant::Int(1), Constant::Tuple(empty), Constant::Tuple(pair)]
                 if empty.is_empty() && matches!(pair.as_slice(), [Constant::Int(1), Constant::Int(2)])
         ));
+    }
+
+    #[test]
+    fn python315_large_sequence_folding_preserves_constant_admission_order() {
+        let elements = std::iter::repeat_n("'same value', 10000", 16)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let source =
+            format!("first = 10000\nfor item in [{elements}]:\n    pass\nlast = (20000, 20001)\n");
+        for python_version in [PythonVersion::Py314, PythonVersion::Py315] {
+            let module = compile_with_options(
+                &source,
+                "large_sequence.py",
+                &CompileOptions {
+                    python_version,
+                    ..CompileOptions::default()
+                },
+            )
+            .unwrap();
+            let append_count = module
+                .bytecode()
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .filter(|word| word[0] == LIST_APPEND.code_for(python_version))
+                .count();
+            if python_version == PythonVersion::Py315 {
+                assert_eq!(append_count, 0);
+                assert!(matches!(
+                    module.code.constants.as_slice(),
+                    [Constant::Int(10000), Constant::Tuple(values), Constant::Tuple(last)]
+                        if values.len() == 32
+                            && values.as_chunks::<2>().0.iter().all(|pair|
+                                matches!(pair, [Constant::String(value), Constant::Int(10000)] if value == "same value"))
+                            && matches!(last.as_slice(), [Constant::Int(20000), Constant::Int(20001)])
+                ));
+            } else {
+                assert_eq!(append_count, 32);
+            }
+        }
+    }
+
+    #[test]
+    fn python315_large_frozenset_uses_python_equality_and_records_provenance() {
+        let elements = std::iter::repeat_n("True, 1, 1.0, -0.0, 0, 0.0, 0j", 5)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let module = compile_with_options(
+            &format!("result = item in {{{elements}}}\n"),
+            "large_frozenset.py",
+            &CompileOptions {
+                python_version: PythonVersion::Py315,
+                ..CompileOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            module.code.constants.as_slice(),
+            [Constant::Bool(true), Constant::FrozenSet(values)]
+                if matches!(values.as_slice(), [Constant::Bool(true), Constant::Float(value)] if value.to_bits() == (-0.0_f64).to_bits())
+        ));
+        assert_eq!(module.code.stack_size, 2);
+        assert_eq!(
+            module
+                .code
+                .marshal_provenance
+                .subtree_has_frozenset_constants,
+            Some(true)
+        );
+        assert!(
+            !module
+                .bytecode()
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .any(|word| word[0] == SET_ADD.code_for(PythonVersion::Py315))
+        );
     }
 }

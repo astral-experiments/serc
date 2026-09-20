@@ -268,6 +268,26 @@ impl crate::assembler::ConstantTable for OutputState {
         self.constants.intern(constant)
     }
 
+    fn fold_sequence(&mut self, values: Vec<Constant>, is_set: bool) -> Result<u32, CompileError> {
+        let result = if is_set {
+            self.has_frozenset_constants = true;
+            let mut unique = Vec::with_capacity(values.len());
+            for constant in &values {
+                if !unique
+                    .iter()
+                    .any(|existing| python_constant_values_equal(existing, constant))
+                {
+                    unique.push(constant.clone());
+                }
+            }
+            Constant::FrozenSet(unique)
+        } else {
+            Constant::Tuple(values.clone())
+        };
+        self.record_folded_constant_dependencies(&result, values);
+        self.constants.intern(result)
+    }
+
     fn len(&self) -> usize {
         self.constants.len()
     }
@@ -520,45 +540,46 @@ impl Compiler<'_> {
     pub(super) fn record_folded_constant_dependencies(
         &mut self,
         result: &Constant,
+        operands: Vec<Constant>,
+    ) {
+        self.output
+            .record_folded_constant_dependencies(result, operands);
+    }
+}
+
+impl OutputState {
+    /// Preserves operand admissions for containers created by late graph folding.
+    fn record_folded_constant_dependencies(
+        &mut self,
+        result: &Constant,
         mut operands: Vec<Constant>,
     ) {
         if matches!(result, Constant::FrozenSet(_)) {
             // Cached operands retain their earlier construction order, including folds
             // from discarded branches preceding this set display.
             operands.sort_by_cached_key(|operand| {
-                self.output
-                    .constants
+                self.constants
                     .values
                     .iter()
-                    .chain(
-                        self.output
-                            .deferred_constants
-                            .iter()
-                            .map(|(_, value)| value),
-                    )
+                    .chain(self.deferred_constants.iter().map(|(_, value)| value))
                     .position(|value| ConstantEquality::PoolKey.equal(value, operand))
                     .unwrap_or(usize::MAX)
             });
         }
         let already_reserved = self
-            .output
             .constants
             .values
             .iter()
-            .chain(
-                self.output
-                    .deferred_constants
-                    .iter()
-                    .map(|(_, constant)| constant),
-            )
+            .chain(self.deferred_constants.iter().map(|(_, constant)| constant))
             .any(|constant| ConstantEquality::PoolKey.equal(constant, result));
         if !already_reserved {
-            self.output
-                .folded_constant_dependencies
+            self.folded_constant_dependencies
                 .push((result.clone(), operands));
         }
     }
+}
 
+impl Compiler<'_> {
     /// Emits operand-load residue retained when CPython's flowgraph folds a tuple containing
     /// constant boolean negations.
     pub(super) fn emit_folded_tuple_not_nops(

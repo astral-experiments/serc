@@ -3758,6 +3758,14 @@ impl Compiler<'_> {
         })?;
         if direct_else_name {
             self.assembler.prevent_last_instruction_fusion();
+            if self.context.python_version == crate::PythonVersion::Py315 {
+                // The copied store tail retains its original fallthrough join.
+                // The selected value crosses that block boundary, while the
+                // target receiver is loaded and consumed inside the tail.
+                let join = self.assembler.label();
+                self.assembler.record_borrow_analysis_block_boundary(join);
+                self.assembler.mark(join);
+            }
         }
         if preserve_fallthrough_join_nop {
             self.assembler
