@@ -922,6 +922,7 @@ dependencies = [
 name = "serc"
 version = "0.1.0"
 dependencies = [
+ "clap",
  "cpu-time",
  "encoding_rs",
  "fs-err",
