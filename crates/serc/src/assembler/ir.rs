@@ -552,40 +552,22 @@ impl JumpPolicy {
     const SYNTHETIC: Self = Self(Self::PREVENT_SMALL_EXIT_INLINING);
     const DEFAULT: Self = Self(0);
 
+    /// Combines optimization constraints and block provenance for a fused instruction.
+    ///
+    /// Tags tied to an original jump, including interrupt checks and retained jump NOPs,
+    /// do not survive fusion.
     pub(super) const fn fused(first: Self, second: Self) -> Self {
-        let mut policy = Self::DEFAULT;
-        if !first.inline_small_exit() || !second.inline_small_exit() {
-            policy.0 |= Self::PREVENT_SMALL_EXIT_INLINING;
-        }
-        if !first.allows_threading_target() || !second.allows_threading_target() {
-            policy.0 |= Self::PREVENT_THREADING_TARGET;
-        }
-        if !first.allows_borrow_threading_target() || !second.allows_borrow_threading_target() {
-            policy.0 |= Self::PREVENT_BORROW_THREADING_TARGET;
-        }
-        if first.defers_redundant_removal() || second.defers_redundant_removal() {
-            policy.0 |= Self::DEFER_REDUNDANT_REMOVAL;
-        }
-        if first.preserves_nop_after_threading() || second.preserves_nop_after_threading() {
-            policy.0 |= Self::PRESERVE_NOP_AFTER_THREADING;
-        }
-        if first.borrow_empty_block() || second.borrow_empty_block() {
-            policy.0 |= Self::BORROW_EMPTY_BLOCK;
-        }
-        if first.preserves_explicit_nop() || second.preserves_explicit_nop() {
-            policy.0 |= Self::PRESERVE_EXPLICIT_NOP;
-        }
-        if first.is_normalized_conditional_backedge() || second.is_normalized_conditional_backedge()
-        {
-            policy.0 |= Self::NORMALIZED_CONDITIONAL_BACKEDGE;
-        }
-        if first.is_original_empty_join() || second.is_original_empty_join() {
-            policy.0 |= Self::ORIGINAL_EMPTY_JOIN;
-        }
-        if first.is_original_shared_empty_join() || second.is_original_shared_empty_join() {
-            policy.0 |= Self::ORIGINAL_SHARED_EMPTY_JOIN;
-        }
-        policy
+        const PRESERVED: u16 = JumpPolicy::PREVENT_SMALL_EXIT_INLINING
+            | JumpPolicy::PREVENT_THREADING_TARGET
+            | JumpPolicy::PREVENT_BORROW_THREADING_TARGET
+            | JumpPolicy::DEFER_REDUNDANT_REMOVAL
+            | JumpPolicy::PRESERVE_NOP_AFTER_THREADING
+            | JumpPolicy::BORROW_EMPTY_BLOCK
+            | JumpPolicy::PRESERVE_EXPLICIT_NOP
+            | JumpPolicy::NORMALIZED_CONDITIONAL_BACKEDGE
+            | JumpPolicy::ORIGINAL_EMPTY_JOIN
+            | JumpPolicy::ORIGINAL_SHARED_EMPTY_JOIN;
+        Self((first.0 | second.0) & PRESERVED)
     }
 
     pub(super) const fn inline_small_exit(self) -> bool {
