@@ -323,6 +323,7 @@ pub(crate) trait ConstantTable {
     fn fold_sequence(&mut self, values: Vec<Constant>, is_set: bool) -> Result<u32, CompileError>;
     fn len(&self) -> usize;
     fn retain_used(&mut self, used: &[bool], order: &[u32]) -> Vec<Option<u32>>;
+    fn retain_used_in_order(&mut self, used: &[bool]) -> Vec<Option<u32>>;
 }
 
 /// Identifies the start of an emitted region without depending on inserted labels.
@@ -4495,15 +4496,22 @@ impl Assembler {
         if iterators == 0 || !tail.iter().any(|item| matches!(item, Item::Label(_))) {
             return;
         }
+        // Python 3.15 keeps an index beside the synchronous iterator, so its
+        // value-preserving cleanup is SWAP(3), POP_TOP, POP_TOP.
+        let (cleanup_width, swap_depth) = match self.python_version {
+            crate::PythonVersion::Py314 => (2, 2),
+            crate::PythonVersion::Py315 => (3, 3),
+        };
+        let cleanup_instructions = cleanup_width * iterators;
         let mut offset = 0;
         for item in tail {
             let Item::Instruction(instruction) = item else {
                 continue;
             };
-            let (opcode, operand) = if offset == 2 * iterators {
+            let (opcode, operand) = if offset == cleanup_instructions {
                 (RETURN_VALUE, Operand::Value(0))
-            } else if offset < 2 * iterators && offset.is_multiple_of(2) {
-                (SWAP, Operand::Value(2))
+            } else if offset < cleanup_instructions && offset.is_multiple_of(cleanup_width) {
+                (SWAP, Operand::Value(swap_depth))
             } else {
                 (POP_TOP, Operand::Value(0))
             };
@@ -4517,7 +4525,7 @@ impl Assembler {
             }
             offset += 1;
         }
-        if offset != 2 * iterators + 1
+        if offset != cleanup_instructions + 1
             || !matches!(items.last(), Some(Item::Instruction(instruction))
                 if instruction.opcode == RETURN_VALUE)
         {
@@ -5143,15 +5151,25 @@ impl Assembler {
 
     /// Whether a return's first erased POP shares an original iterator-cleanup join.
     pub(crate) fn iterator_return_pop_is_at_original_entry(&self, boundary: Label) -> bool {
-        let [
-            head @ ..,
-            Item::Instruction(swap),
-            Item::Instruction(pop),
-            Item::Instruction(ret),
-        ] = self.linear_items()
-        else {
+        let items = self.linear_items();
+        // Synchronous iterators retain two stack slots in Python 3.15. Async
+        // iterators still use the one-slot cleanup recognized by Python 3.14.
+        let slots = if self.python_version == crate::PythonVersion::Py315
+            && matches!(items, [.., Item::Instruction(swap), _, _, _]
+                if swap.opcode == SWAP && swap.operand() == Operand::Value(3))
+        {
+            2
+        } else {
+            1
+        };
+        let Some(start) = items.len().checked_sub(slots + 2) else {
             return false;
         };
+        let (head, tail) = items.split_at(start);
+        let [Item::Instruction(swap), pops @ .., Item::Instruction(ret)] = tail else {
+            return false;
+        };
+        let stack_slots = u32::try_from(slots).expect("iterator cleanup has at most two slots");
         let alias_start = head
             .iter()
             .rposition(|item| matches!(item, Item::Instruction(_)))
@@ -5159,19 +5177,23 @@ impl Assembler {
         let aliases = &head[alias_start..];
         if !aliases.contains(&Item::Label(boundary))
             || swap.opcode != SWAP
-            || swap.operand() != Operand::Value(2)
-            || pop.opcode != POP_TOP
-            || pop.operand() != Operand::Value(0)
+            || swap.operand() != Operand::Value(stack_slots + 1)
+            || pops.iter().enumerate().any(|(index, item)| {
+                !matches!(item, Item::Instruction(pop)
+                    if pop.opcode == POP_TOP
+                        && pop.operand() == Operand::Value(0)
+                        && pop.depth_after() == Some(stack_slots - u32::try_from(index).unwrap()))
+            })
             || ret.opcode != RETURN_VALUE
             || ret.operand() != Operand::Value(0)
-            || swap.depth_after() != Some(2)
-            || pop.depth_after() != Some(1)
+            || swap.depth_after() != Some(stack_slots + 1)
             || ret.depth_after() != Some(0)
             || ret.location.line < 0
-            || [swap, pop, ret].iter().any(|instruction| {
-                instruction.location != ret.location
-                    || instruction.pre_fold_extra_instructions() != 0
-                    || instruction.local_policy.hidden_exception_owner_slots() != 0
+            || tail.iter().any(|item| {
+                !matches!(item, Item::Instruction(instruction)
+                    if instruction.location == ret.location
+                        && instruction.pre_fold_extra_instructions() == 0
+                        && instruction.local_policy.hidden_exception_owner_slots() == 0)
             })
         {
             return false;
@@ -5201,7 +5223,10 @@ impl Assembler {
             matches!(item, Item::Instruction(jump)
             if jump.opcode == JUMP_FORWARD
                 && jump.operand() == Operand::Forward(entry)
-                && jump.location == SourceLocation::NONE
+                // Optimized builtin iterable calls carry their expression location
+                // on the normal jump to this same original value join.
+                && (self.python_version == crate::PythonVersion::Py315
+                    || jump.location == SourceLocation::NONE)
                 && jump.depth_after() == swap.depth_after())
         })
     }
@@ -6167,6 +6192,80 @@ impl Assembler {
             .extend(labels.into_iter().map(|label| (label, location)));
     }
 
+    /// Checks every target-specific iterator discard before returning its original join.
+    fn original_iterator_break_tail<'a>(
+        &self,
+        items: &'a [Item],
+    ) -> Option<(&'a [Item], &'a Instruction, &'a Instruction)> {
+        let width = match self.python_version {
+            crate::PythonVersion::Py314 => 1,
+            crate::PythonVersion::Py315 => 2,
+        };
+        let start = items.len().checked_sub(width + 1)?;
+        let (prefix, tail) = items.split_at(start);
+        let Item::Instruction(discard) = tail[width - 1] else {
+            return None;
+        };
+        let after = discard.depth_after()?;
+        for (index, item) in tail[..width].iter().enumerate() {
+            let depth = after.checked_add(u32::try_from(width - index - 1).ok()?)?;
+            if *item
+                != Item::Instruction(Instruction::new(
+                    POP_TOP,
+                    Operand::Value(0),
+                    SourceLocation::NONE,
+                    Some(depth),
+                ))
+            {
+                return None;
+            }
+        }
+        let Item::Instruction(discard) = &tail[width - 1] else {
+            unreachable!();
+        };
+        let Item::Instruction(jump) = &tail[width] else {
+            return None;
+        };
+        Some((prefix, discard, jump))
+    }
+
+    /// Verifies the extra await iterator cell before matching the shared original array.
+    fn iterator_break_await_items<'a>(
+        &self,
+        items: &'a [Item],
+        null_index: usize,
+    ) -> Option<std::borrow::Cow<'a, [Item]>> {
+        if self.python_version == crate::PythonVersion::Py314 {
+            return Some(std::borrow::Cow::Borrowed(items));
+        }
+        let Item::Instruction(awaitable) = *items.get(null_index.checked_sub(1)?)? else {
+            return None;
+        };
+        if awaitable.opcode != crate::target::opcodes::GET_AWAITABLE
+            || items.get(null_index)
+                != Some(&Item::Instruction(Instruction::new(
+                    crate::target::opcodes::PUSH_NULL,
+                    Operand::Value(0),
+                    awaitable.location,
+                    Some(awaitable.depth_after()?.checked_add(1)?),
+                )))
+        {
+            return None;
+        }
+        let mut original = Vec::with_capacity(items.len() - 1);
+        original.extend_from_slice(&items[..null_index]);
+        original.extend_from_slice(&items[null_index + 1..]);
+        Some(std::borrow::Cow::Owned(original))
+    }
+
+    /// Returns the extra stack cell in a synchronous iterator for this target.
+    const fn iterator_break_extra_slot(&self) -> u32 {
+        match self.python_version {
+            crate::PythonVersion::Py314 => 0,
+            crate::PythonVersion::Py315 => 1,
+        }
+    }
+
     /// Proves the three exits of a guarded, pass-only handler share an ownerless iterator discard.
     fn is_guarded_try_iterator_break(
         &self,
@@ -6175,6 +6274,10 @@ impl Assembler {
         target: Label,
         named_handler: bool,
     ) -> bool {
+        let Some((items, discard_iterator, last)) = self.original_iterator_break_tail(items) else {
+            return false;
+        };
+        let extra = self.iterator_break_extra_slot();
         let (prefix, unwind) = if named_handler {
             let (Some(prefix), Some(unwind)) = (items.get(..5), items.get(5..)) else {
                 return false;
@@ -6240,15 +6343,13 @@ impl Assembler {
             Item::Instruction(reraise_cleanup),
             Item::Label(try_join),
             Item::Label(join),
-            Item::Instruction(discard_iterator),
-            Item::Instruction(last),
         ] = cleanup
         else {
             return false;
         };
         // The producer admits this extension only for one ordinary synchronous loop,
-        // with no enclosing owner. Its iterator is the sole remaining stack value.
-        if condition.depth_after() != Some(1)
+        // with no enclosing owner. Only its target-specific iterator cells remain.
+        if condition.depth_after() != Some(1 + extra)
             || *last != jump
             || !matches!(load_guard.operand(), Operand::Value(_))
             || !matches!(method.operand(), Operand::Value(argument) if argument & 1 != 0)
@@ -6289,7 +6390,7 @@ impl Assembler {
             LOAD_FAST,
             load_guard.operand(),
             load_guard.location,
-            Some(2),
+            Some(2 + extra),
         );
         expected_load.local_policy = LocalPolicy::for_load(named_handler, false);
         if *load_guard != expected_load {
@@ -6303,10 +6404,14 @@ impl Assembler {
             },
             Operand::Forward(*join),
             condition.location,
-            Some(1),
+            Some(1 + extra),
         );
-        let mut expected_marker =
-            Instruction::new(NOT_TAKEN, Operand::Value(0), marker.location, Some(1));
+        let mut expected_marker = Instruction::new(
+            NOT_TAKEN,
+            Operand::Value(0),
+            marker.location,
+            Some(1 + extra),
+        );
         if let Some((guard_method, guard_call, boolean)) = guard_call {
             if !matches!(guard_method.operand(), Operand::Value(argument) if argument & 1 != 0)
                 || guard_method.location.line != condition.location.line
@@ -6317,17 +6422,22 @@ impl Assembler {
                         LOAD_ATTR,
                         guard_method.operand(),
                         guard_method.location,
-                        Some(3),
+                        Some(3 + extra),
                     )
                 || *guard_call
                     != Instruction::new(
                         crate::target::opcodes::CALL,
                         Operand::Value(0),
                         guard_call.location,
-                        Some(2),
+                        Some(2 + extra),
                     )
                 || *boolean
-                    != Instruction::new(TO_BOOL, Operand::Value(0), boolean.location, Some(2))
+                    != Instruction::new(
+                        TO_BOOL,
+                        Operand::Value(0),
+                        boolean.location,
+                        Some(2 + extra),
+                    )
             {
                 return false;
             }
@@ -6370,6 +6480,12 @@ impl Assembler {
             (discard_iterator, POP_TOP, Operand::Value(0), 0),
             (last, JUMP_FORWARD, Operand::Forward(target), 0),
         ] {
+            let depth =
+                if std::ptr::eq(instruction, discard_iterator) || std::ptr::eq(instruction, last) {
+                    depth
+                } else {
+                    depth + extra
+                };
             let mut expected = Instruction::new(opcode, operand, instruction.location, Some(depth));
             if std::ptr::eq(instruction, try_nop) {
                 expected.set_exception_policy(ExceptionPolicy::AlwaysUnchanged);
@@ -6410,7 +6526,9 @@ impl Assembler {
                 (store, STORE_FAST, store.operand(), 1),
                 (delete, DELETE_FAST, store.operand(), 1),
             ] {
-                if *instruction != Instruction::new(opcode, operand, pop.location, Some(depth)) {
+                if *instruction
+                    != Instruction::new(opcode, operand, pop.location, Some(depth + extra))
+                {
                     return false;
                 }
             }
@@ -6451,9 +6569,9 @@ impl Assembler {
             return false;
         }
         let expected_regions = [
-            (*try_start, *try_end, *handler, 1, false),
-            (*handler, *handler_end, *handler_cleanup, 2, true),
-            (*reraise, *reraise_end, *handler_cleanup, 2, true),
+            (*try_start, *try_end, *handler, 1 + extra, false),
+            (*handler, *handler_end, *handler_cleanup, 2 + extra, true),
+            (*reraise, *reraise_end, *handler_cleanup, 2 + extra, true),
         ];
         let regions: Vec<_> = self
             .exception_regions
@@ -6501,22 +6619,20 @@ impl Assembler {
         let Some(unwind) = self.linear_items().get(unwind_start..) else {
             return false;
         };
-        let [
-            prefix @ ..,
-            Item::Label(join),
-            Item::Instruction(discard),
-            Item::Instruction(last),
-        ] = unwind
-        else {
+        let Some((unwind, discard, last)) = self.original_iterator_break_tail(unwind) else {
+            return false;
+        };
+        let [prefix @ .., Item::Label(join)] = unwind else {
             return false;
         };
         let Some(after_discard) = discard.depth_after() else {
             return false;
         };
+        let extra = self.iterator_break_extra_slot();
         let (Some(depth), Some(loaded), Some(callable_depth)) = (
-            after_discard.checked_add(1),
-            after_discard.checked_add(2),
-            after_discard.checked_add(3),
+            after_discard.checked_add(1 + extra),
+            after_discard.checked_add(2 + extra),
+            after_discard.checked_add(3 + extra),
         ) else {
             return false;
         };
@@ -6746,6 +6862,13 @@ impl Assembler {
         jump: Instruction,
         target: Label,
     ) -> bool {
+        let Some((items, discard_iterator, last)) = self.original_iterator_break_tail(items) else {
+            return false;
+        };
+        let Some(items) = self.iterator_break_await_items(items, 14) else {
+            return false;
+        };
+        let extra = self.iterator_break_extra_slot();
         let [
             Item::Label(handler_end),
             Item::Instruction(pop),
@@ -6775,9 +6898,7 @@ impl Assembler {
             Item::Instruction(end_send),
             Item::Instruction(discard_call),
             Item::Label(join),
-            Item::Instruction(discard_iterator),
-            Item::Instruction(last),
-        ] = items
+        ] = items.as_ref()
         else {
             return false;
         };
@@ -6860,10 +6981,22 @@ impl Assembler {
                 0,
             ),
         ];
-        expected[4].local_policy = LocalPolicy::for_load(true, true);
+        for (index, instruction) in expected[..19].iter_mut().enumerate() {
+            let depth = instruction.depth_after().unwrap()
+                + extra
+                + extra * u32::from((11..=16).contains(&index));
+            *instruction = Instruction::new(
+                instruction.opcode,
+                instruction.operand(),
+                instruction.location,
+                Some(depth),
+            );
+        }
+        let strict_owned = self.python_version == crate::PythonVersion::Py314;
+        expected[4].local_policy = LocalPolicy::for_load(true, strict_owned);
         expected[5].local_policy.add_hidden_exception_owner_slots(3);
         expected[6].set_exception_policy(ExceptionPolicy::NonePresent);
-        expected[8].local_policy = LocalPolicy::for_load(true, true);
+        expected[8].local_policy = LocalPolicy::for_load(true, strict_owned);
         expected[20].fusion_policy.mark_authored_break();
         expected[20].jump_policy.prevent_threading_target();
         if ![
@@ -6948,7 +7081,7 @@ impl Assembler {
             && region.start == *yield_entry
             && region.end == *resume_entry
             && region.target == *cleanup_entry
-            && region.depth == 3
+            && region.depth == 3 + 2 * extra
             && !region.preserve_lasti
             && regions.next().is_none()
     }
@@ -6962,6 +7095,13 @@ impl Assembler {
     ) -> bool {
         use crate::target::opcodes::{CALL, GET_AWAITABLE, PUSH_NULL, YIELD_VALUE};
 
+        let Some((items, discard_iterator, last)) = self.original_iterator_break_tail(items) else {
+            return false;
+        };
+        let Some(items) = self.iterator_break_await_items(items, 22) else {
+            return false;
+        };
+        let extra = self.iterator_break_extra_slot();
         let [
             Item::Label(start),
             Item::Instruction(load_guard),
@@ -7026,9 +7166,7 @@ impl Assembler {
             Item::Instruction(reraise_cleanup),
             Item::Label(manager_join),
             Item::Label(join),
-            Item::Instruction(discard_iterator),
-            Item::Instruction(last),
-        ] = items
+        ] = items.as_ref()
         else {
             return false;
         };
@@ -7177,6 +7315,22 @@ impl Assembler {
             (discard_iterator, POP_TOP, Operand::Value(0), 0),
             (last, JUMP_FORWARD, Operand::Forward(target), 0),
         ] {
+            let depth =
+                if std::ptr::eq(instruction, discard_iterator) || std::ptr::eq(instruction, last) {
+                    depth
+                } else {
+                    let awaiting = [
+                        await_none,
+                        send_value,
+                        yield_value,
+                        resume_value,
+                        send_backedge,
+                        cleanup_throw,
+                    ]
+                    .into_iter()
+                    .any(|record| std::ptr::eq(instruction, record));
+                    depth + extra + extra * u32::from(awaiting)
+                };
             let mut expected = Instruction::new(opcode, operand, instruction.location, Some(depth));
             if std::ptr::eq(instruction, condition) {
                 expected.local_policy.add_hidden_exception_owner_slots(3);
@@ -7223,9 +7377,9 @@ impl Assembler {
             return false;
         }
         let expected_regions = [
-            (*yield_start, *resume, *throw, 5, false),
-            (*manager_start, *manager_end, *handler, 3, true),
-            (*handler, *handled, *cleanup, 5, true),
+            (*yield_start, *resume, *throw, 5 + 2 * extra, false),
+            (*manager_start, *manager_end, *handler, 3 + extra, true),
+            (*handler, *handled, *cleanup, 5 + extra, true),
         ];
         let regions: Vec<_> = self
             .exception_regions
@@ -7678,7 +7832,7 @@ impl Assembler {
     /// Certifies the iterator tail appended to an already-proven original finalizer join.
     ///
     /// The caller proves the empty shared join before appending the discard and authored
-    /// break. Rechecking the exact two new records prevents a later enclosing-loop join
+    /// break. Rechecking every new discard and jump prevents a later enclosing-loop join
     /// or additional cleanup from receiving this copy certificate.
     pub(crate) fn prepare_shared_finally_iterator_break(
         &mut self,
@@ -7694,8 +7848,9 @@ impl Assembler {
         let Some(relative_entry) = entry.checked_sub(unwind_start) else {
             return;
         };
-        let Some([Item::Instruction(discard), Item::Instruction(last)]) =
-            unwind.get(relative_entry..)
+        let Some(([], discard, last)) = unwind
+            .get(relative_entry..)
+            .and_then(|tail| self.original_iterator_break_tail(tail))
         else {
             return;
         };
@@ -7806,6 +7961,10 @@ impl Assembler {
         } else {
             (None, unwind)
         };
+        let Some((unwind, discard_iterator, last)) = self.original_iterator_break_tail(unwind)
+        else {
+            return;
+        };
         let [
             Item::Label(start),
             Item::Instruction(load_guard),
@@ -7817,8 +7976,6 @@ impl Assembler {
             Item::Instruction(call),
             Item::Instruction(discard_call),
             Item::Label(join),
-            Item::Instruction(discard_iterator),
-            Item::Instruction(last),
         ] = unwind
         else {
             return;
@@ -7827,7 +7984,7 @@ impl Assembler {
             return;
         };
         let (Some(after_discard), Some(loaded), Some(method_depth)) = (
-            depth.checked_sub(1),
+            depth.checked_sub(1 + self.iterator_break_extra_slot()),
             depth.checked_add(1),
             depth.checked_add(2),
         ) else {
@@ -11380,9 +11537,9 @@ impl Assembler {
     /// Locates a manager exit reached only by a break's copied-finally store.
     ///
     /// The source has one break and a terminating loop else. Its original cleanup
-    /// array ends with `STORE_FAST`, unlocated iterator `POP_TOP`, and the authored
-    /// break. Resolve this donor before exit copying, which precedes the ordinary
-    /// within-block location propagation that would locate the last two records.
+    /// array ends with `STORE_FAST`, the target's unlocated iterator pops, and the
+    /// authored break. Resolve this donor before exit copying, which precedes the
+    /// within-block location propagation that would locate the pops and jump.
     pub(crate) fn original_manager_copied_finally_break_join(
         &self,
         protected_end: Label,
@@ -11431,27 +11588,40 @@ impl Assembler {
         if incoming.next().is_some() {
             return None;
         }
-        let [
-            Item::Instruction(store),
-            Item::Instruction(pop),
-            Item::Instruction(jump),
-        ] = items.get(index.checked_sub(2)?..=index)?
-        else {
+        let iterator_slots = match self.python_version {
+            crate::PythonVersion::Py314 => 1,
+            crate::PythonVersion::Py315 => 2,
+        };
+        let tail = items.get(index.checked_sub(iterator_slots + 1)?..=index)?;
+        let [Item::Instruction(store), pops @ .., Item::Instruction(jump)] = tail else {
             return None;
         };
+        let mut depth = store.depth_after()?;
+        for item in pops {
+            let Item::Instruction(pop) = item else {
+                return None;
+            };
+            depth = depth.checked_sub(1)?;
+            if pop.opcode != POP_TOP
+                || pop.operand() != Operand::Value(0)
+                || pop.location != SourceLocation::NONE
+                || pop.depth_after() != Some(depth)
+            {
+                return None;
+            }
+        }
         (store.opcode == STORE_FAST
             && matches!(store.operand(), Operand::Value(_))
             && store.location.line >= 0
-            && pop.opcode == POP_TOP
-            && pop.operand() == Operand::Value(0)
-            && pop.location == SourceLocation::NONE
             && jump.opcode == JUMP_FORWARD
             && jump.operand() == Operand::Forward(entry)
             && jump.location == SourceLocation::NONE
             && jump.fusion_policy.is_authored_break()
-            && store.depth_after().and_then(|depth| depth.checked_sub(1)) == pop.depth_after()
-            && pop.depth_after() == jump.depth_after()
-            && [store, pop, jump].iter().all(|instruction| {
+            && jump.depth_after() == Some(depth)
+            && tail.iter().all(|item| {
+                let Item::Instruction(instruction) = item else {
+                    return false;
+                };
                 instruction.pre_fold_extra_instructions() == 0
                     && instruction.local_policy.hidden_exception_owner_slots() == 0
                     && instruction.exception_policy() == ExceptionPolicy::default()

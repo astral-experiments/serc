@@ -172,12 +172,16 @@ class TargetSelectionTest(unittest.TestCase):
         self.assertEqual(len(strings), 2790)
         self.assertEqual(strings, tuple(sorted(set(strings))))
         self.assertFalse(any(value.startswith("/") for value in strings))
-        with mock.patch.object(generator, "STARTUP_315_SHA256", "0" * 64):
-            with self.assertRaisesRegex(ValueError, "checksum mismatch"):
-                generator.read_startup_strings()
-        with mock.patch.object(generator, "TARGET_COMMIT", "0" * 40):
-            with self.assertRaisesRegex(ValueError, "does not match"):
-                generator.read_startup_strings()
+        with (
+            mock.patch.object(generator, "STARTUP_315_SHA256", "0" * 64),
+            self.assertRaisesRegex(ValueError, "checksum mismatch"),
+        ):
+            generator.read_startup_strings()
+        with (
+            mock.patch.object(generator, "TARGET_COMMIT", "0" * 40),
+            self.assertRaisesRegex(ValueError, "does not match"),
+        ):
+            generator.read_startup_strings()
 
     def test_opcode_boundary_comes_from_pinned_source(self) -> None:
         source = """

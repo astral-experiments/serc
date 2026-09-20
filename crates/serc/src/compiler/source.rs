@@ -20,7 +20,7 @@ use crate::code_object::{
 };
 
 use super::constant::{explicit_surrogate_string, fold_constant};
-use super::scope::{ModulePlan, ScopeArena};
+use super::scope::{ModulePlan, ScopeArena, class_static_attributes};
 use super::symbol::mangle_name;
 use super::{CachedSourceLine, Compiler};
 
@@ -34,6 +34,8 @@ pub(super) struct CompilationContext<'source> {
     pub(super) scopes: ScopeArena,
     lowering_profile: LoweringProfile,
     constant_string_origins: FxHashMap<String, AtomicU8>,
+    static_attribute_names: FxHashSet<String>,
+    cached_static_attribute_tuples: Mutex<FxHashSet<Vec<String>>>,
     pub(super) generated_mangled_strings: FxHashSet<String>,
     // Generated names can first become canonical when an otherwise discarded child assembles.
     // Restricted generic-class identifiers also require real child lowering for key origins.
@@ -97,10 +99,12 @@ impl<'source> CompilationContext<'source> {
         let scopes = ScopeArena::analyze(body);
         let mut generated_mangled_strings = FxHashSet::default();
         let mut requires_interning_trace = false;
+        let mut static_attribute_names = FxHashSet::default();
         let constant_string_origins = parser_interned_strings(
             body,
             &mut generated_mangled_strings,
             &mut requires_interning_trace,
+            &mut static_attribute_names,
         );
         Self {
             python_version,
@@ -111,6 +115,8 @@ impl<'source> CompilationContext<'source> {
             scopes,
             lowering_profile: LoweringProfile::for_suite(body, python_version),
             constant_string_origins,
+            static_attribute_names,
+            cached_static_attribute_tuples: Mutex::new(FxHashSet::default()),
             generated_mangled_strings,
             requires_interning_trace,
             next_interning_order: AtomicUsize::new(0),
@@ -154,6 +160,15 @@ impl<'source> CompilationContext<'source> {
             Constant::String(value) => self.record_constant_string_origin(value, interned),
             Constant::Tuple(values) | Constant::FrozenSet(values) => {
                 if matches!(constant, Constant::Tuple(_)) {
+                    if self.record_static_attribute_tuple_cache(values.iter().map(|value| {
+                        if let Constant::String(value) = value {
+                            Some(value.as_str())
+                        } else {
+                            None
+                        }
+                    })) {
+                        return;
+                    }
                     self.record_cached_string_tuple(values);
                 }
                 for value in values {
@@ -163,6 +178,50 @@ impl<'source> CompilationContext<'source> {
             // A nested code object's constants were recorded while compiling its body.
             _ => {}
         }
+    }
+
+    /// Tracks whole-tuple hits that can suppress a static attribute's scalar admission.
+    fn record_static_attribute_tuple_cache<'a>(
+        &self,
+        values: impl Iterator<Item = Option<&'a str>> + Clone,
+    ) -> bool {
+        if self.static_attribute_names.is_empty()
+            || !values
+                .clone()
+                .any(|value| value.is_some_and(|value| self.static_attribute_names.contains(value)))
+        {
+            return false;
+        }
+        let Some(values) = values
+            .map(|value| value.map(str::to_string))
+            .collect::<Option<Vec<_>>>()
+        else {
+            return false;
+        };
+        !self
+            .cached_static_attribute_tuples
+            .lock()
+            .unwrap()
+            .insert(values)
+    }
+
+    /// Static attributes enter the recursive cache as raw parser-interned identifiers.
+    pub(super) fn record_static_attribute_tuple(&self, values: &[Constant]) {
+        let cached = self.record_static_attribute_tuple_cache(values.iter().map(|value| {
+            if let Constant::String(value) = value {
+                Some(value.as_str())
+            } else {
+                None
+            }
+        }));
+        if !cached {
+            for value in values {
+                if let Constant::String(value) = value {
+                    self.record_constant_string_origin(value, true);
+                }
+            }
+        }
+        self.record_cached_string_tuple(values);
     }
 
     pub(super) fn record_cached_string_tuple(&self, values: &[Constant]) {
@@ -197,6 +256,22 @@ impl<'source> CompilationContext<'source> {
     }
 
     pub(super) fn record_code_assembly(&self, code: &CodeObject) -> Option<usize> {
+        // Assembly merges these tuples without recursively admitting their members.
+        self.record_static_attribute_tuple_cache(
+            code.names.iter().map(|value| Some(value.as_str())),
+        );
+        self.record_static_attribute_tuple_cache(code.constants.iter().map(|value| {
+            if let Constant::String(value) = value {
+                Some(value.as_str())
+            } else {
+                None
+            }
+        }));
+        if code.marshal_provenance.locals_identity == crate::code_object::LocalsIdentity::ByValue {
+            self.record_static_attribute_tuple_cache(
+                code.locals.iter().map(|value| Some(value.as_str())),
+            );
+        }
         if !self.requires_interning_trace {
             return None;
         }
@@ -272,6 +347,7 @@ fn parser_interned_strings(
     body: &Suite,
     generated_mangled_strings: &mut FxHashSet<String>,
     requires_interning_trace: &mut bool,
+    static_attribute_names: &mut FxHashSet<String>,
 ) -> FxHashMap<String, AtomicU8> {
     #[derive(Default)]
     struct ConstantIdentifiers {
@@ -281,6 +357,7 @@ fn parser_interned_strings(
         generated_mangled_strings: FxHashSet<String>,
         raw_private_identifiers: FxHashSet<String>,
         restricted_private_identifier: bool,
+        static_attribute_names: FxHashSet<String>,
     }
 
     impl ConstantIdentifiers {
@@ -336,6 +413,8 @@ fn parser_interned_strings(
                     }
                 }
                 Stmt::ClassDef(definition) => {
+                    self.static_attribute_names
+                        .extend(class_static_attributes(&definition.body));
                     self.record_raw_name(definition.name.as_str());
                     for decorator in &definition.decorator_list {
                         self.visit_decorator(decorator);
@@ -487,6 +566,7 @@ fn parser_interned_strings(
     *requires_interning_trace =
         visitor.restricted_private_identifier || !visitor.generated_mangled_strings.is_empty();
     *generated_mangled_strings = visitor.generated_mangled_strings;
+    *static_attribute_names = visitor.static_attribute_names;
     visitor.origins
 }
 
@@ -1808,7 +1888,12 @@ mod tests {
         .unwrap();
         let mut generated = FxHashSet::default();
         let mut requires_trace = false;
-        let origins = parser_interned_strings(parsed.suite(), &mut generated, &mut requires_trace);
+        let origins = parser_interned_strings(
+            parsed.suite(),
+            &mut generated,
+            &mut requires_trace,
+            &mut FxHashSet::default(),
+        );
         for raw in [
             "Café",
             "__secret",

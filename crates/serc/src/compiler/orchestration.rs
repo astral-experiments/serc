@@ -107,6 +107,10 @@ impl ConstantTable for InterningConstantTable<'_, '_> {
         self.output.len()
     }
 
+    fn retain_used_in_order(&mut self, used: &[bool]) -> Vec<Option<u32>> {
+        self.output.retain_used_in_order(used)
+    }
+
     fn retain_used(&mut self, used: &[bool], order: &[u32]) -> Vec<Option<u32>> {
         self.output.retain_used(used, order)
     }
@@ -715,12 +719,16 @@ impl<'source> Compiler<'source> {
         }
 
         self.assembler.set_location(footer_location);
-        let static_attributes = self.add_constant(Constant::Tuple(
-            class_static_attributes(body)
-                .into_iter()
-                .map(Constant::String)
-                .collect(),
-        ))?;
+        let static_attributes = class_static_attributes(body)
+            .into_iter()
+            .map(Constant::String)
+            .collect::<Vec<_>>();
+        self.context
+            .record_static_attribute_tuple(&static_attributes);
+        let static_attributes = self
+            .output
+            .constants
+            .intern(Constant::Tuple(static_attributes))?;
         self.emit(LOAD_CONST, static_attributes, 1)?;
         self.store_name("__static_attributes__")?;
         if has_classdict_cell {

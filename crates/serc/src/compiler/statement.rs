@@ -5926,7 +5926,8 @@ impl Compiler<'_> {
                                 && outer.finally_end_depth == 0
                                 && inner.finally_end_depth == 0
                                 && outer.common_cleanup_depth == 1
-                                && inner.common_cleanup_depth == 3
+                                && inner.common_cleanup_depth
+                                    == 2 + self.iterator_slots().cast_unsigned()
                                 && outer.body_cleanup == outer.common_cleanup
                                 && inner.body_cleanup == inner.common_cleanup
                                 && iterator.iterator_cleanup == IteratorCleanup::Sync
@@ -7622,7 +7623,10 @@ impl Compiler<'_> {
                             .is_empty()
                         && next_with == 1
                         && self.control.loops.contexts.len() == next_loop
-                        && usize::try_from(self.control.stack.depth).ok() == Some(next_loop + 2)
+                        && usize::try_from(self.control.stack.depth).ok()
+                            == Some(
+                                next_loop * usize::try_from(self.iterator_slots()).unwrap() + 2,
+                            )
                         && self
                             .control
                             .exceptions
@@ -9656,7 +9660,7 @@ impl Compiler<'_> {
                             && finally_context.handler_depth == 0
                             && finally_context.try_body_depth == 2
                             && finally_context.exception_region_depth == 3
-                            && finally_context.depth == 1
+                            && finally_context.depth == self.iterator_slots().cast_unsigned()
                             && matches!(self.control.loops.contexts.as_slice(),
                                 [iterator, inner_loop]
                                     if iterator.iterator_cleanup == IteratorCleanup::Sync

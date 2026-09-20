@@ -1,7 +1,10 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::super::block_graph::ItemPosition;
-use super::super::{ConstantTable, Item, Label, Operand, OptimizationPipeline, SourceLocation};
+use super::super::{
+    ConstantTable, Item, Label, Operand, OptimizationPipeline, SourceLocation,
+    block_has_fallthrough, block_jump_target,
+};
 use crate::code_object::Constant;
 use crate::target::Opcode;
 use crate::target::opcodes::{
@@ -44,10 +47,20 @@ impl OptimizationPipeline {
                 };
                 let intrinsic = target.opcode == CALL_INTRINSIC_1
                     && target.operand() == Operand::Value(UnaryIntrinsic::LIST_TO_TUPLE.argument());
-                let next_opcode = match self.graph[block].items().get(offset + 1) {
-                    Some(Item::Instruction(next)) => Some(next.opcode),
-                    _ => None,
-                };
+                // The Boolean pass can move CONTAINS_OP into a following TO_BOOL
+                // or UNARY_NOT slot. Only its certified retired slots are transparent.
+                let next_opcode = self.graph[block].items()[offset + 1..]
+                    .iter()
+                    .find_map(|item| match item {
+                        Item::Instruction(next)
+                            if next.opcode == NOP && next.is_retired_contains() =>
+                        {
+                            None
+                        }
+                        Item::Instruction(next) => Some(Some(next.opcode)),
+                        Item::Label(_) => Some(None),
+                    })
+                    .flatten();
                 let immediately_iterated =
                     matches!(next_opcode, Some(GET_ITER | GET_YIELD_FROM_ITER));
                 let append = matches!(target.opcode, LIST_APPEND | SET_ADD)
@@ -163,7 +176,8 @@ impl OptimizationPipeline {
                             // its removed prefix must not gain a distinct donor line.
                             instruction.no_location_policy.preserve_location();
                         } else {
-                            instruction.no_location_policy.clear_preserved_location();
+                            instruction.mark_late_fold_location();
+                            instruction.no_location_policy.preserve_location();
                         }
                     }
                 }
@@ -173,9 +187,85 @@ impl OptimizationPipeline {
                     .unwrap();
                 target.opcode = LOAD_CONST;
                 target.set_operand(Operand::Value(index));
+                if !intrinsic {
+                    target.mark_late_fold_location();
+                    target.no_location_policy.clear_preserved_location();
+                }
             }
         }
         Ok(removed_max_depth)
+    }
+
+    /// Resolves newly unlocated sequence loads after local fusion, as CPython does.
+    pub(super) fn resolve_folded_sequence_locations(&mut self) {
+        if self.python_version != PythonVersion::Py315
+            || !self.graph.iter_items().any(|item| {
+                matches!(item, Item::Instruction(instruction) if instruction.has_late_fold_location())
+            })
+        {
+            return;
+        }
+        let order = self.graph.order().to_vec();
+        let mut predecessors = FxHashMap::default();
+        for (index, block) in order.iter().copied().enumerate() {
+            let fallthrough = block_has_fallthrough(self.graph[block].items())
+                .then(|| order.get(index + 1).copied())
+                .flatten();
+            let jump = block_jump_target(self.graph[block].items())
+                .and_then(|label| self.graph.label_block(label));
+            for target in fallthrough.into_iter().chain(jump) {
+                predecessors
+                    .entry(target)
+                    .and_modify(|source| *source = None)
+                    .or_insert(Some(block));
+            }
+        }
+        let handlers = self
+            .exception_regions
+            .iter()
+            .filter_map(|region| self.graph.label_block(region.target))
+            .collect::<FxHashSet<_>>();
+        let mut final_locations = FxHashMap::default();
+        for block in order {
+            let mut previous = None;
+            if !handlers.contains(&block) {
+                let mut visited = FxHashSet::default();
+                let mut predecessor = predecessors.get(&block).copied().flatten();
+                while let Some(source) = predecessor {
+                    if !visited.insert(source) {
+                        break;
+                    }
+                    if let Some(location) = final_locations.get(&source) {
+                        previous = *location;
+                        break;
+                    }
+                    if let Some(instruction) = self.graph[source].last_instruction() {
+                        previous = (instruction.location.line >= 0).then_some(instruction.location);
+                        break;
+                    }
+                    predecessor = predecessors.get(&source).copied().flatten();
+                }
+            }
+            for instruction in self.graph.instructions_mut(block) {
+                if instruction.opcode == NOP && instruction.has_late_fold_location() {
+                    if instruction.location.line >= 0 {
+                        previous = Some(instruction.location);
+                    }
+                    continue;
+                }
+                if instruction.opcode == LOAD_CONST
+                    && instruction.has_late_fold_location()
+                    && instruction.location.line < 0
+                    && let Some(location) = previous
+                {
+                    instruction.location = location;
+                }
+                if instruction.location.line >= 0 {
+                    previous = Some(instruction.location);
+                }
+            }
+            final_locations.insert(block, previous);
+        }
     }
 
     /// Lowers 3.15's immortal constants after value-based graph optimizations.
@@ -218,14 +308,9 @@ impl OptimizationPipeline {
                 used[index as usize] = true;
             }
         }
-        // Earlier folding already established admission order, including values
-        // first constructed by expressions whose loads were subsequently discarded.
-        let order = used
-            .iter()
-            .enumerate()
-            .filter_map(|(index, used)| used.then_some(u32::try_from(index).unwrap()))
-            .collect::<Vec<_>>();
-        let indices = constants.retain_used(&used, &order);
+        // Earlier folding already established admission order. Replaying its
+        // dependencies here could reorder intermediates reused by literal constants.
+        let indices = constants.retain_used_in_order(&used);
         self.graph.for_each_instruction_mut(|instruction| {
             if instruction.opcode == LOAD_CONST
                 && let Operand::Value(index) = instruction.operand()
@@ -483,6 +568,100 @@ mod tests {
             [Constant::Int(1), Constant::Tuple(empty), Constant::Tuple(pair)]
                 if empty.is_empty() && matches!(pair.as_slice(), [Constant::Int(1), Constant::Int(2)])
         ));
+    }
+
+    #[test]
+    fn python315_common_constant_pruning_does_not_replay_fold_dependencies() {
+        let module = compile_with_options(
+            "a = 4 * 64\nb = 8 * 64\nc = 8 * 64 * 5\nd = 2560\n",
+            "folded_literal.py",
+            &CompileOptions {
+                python_version: PythonVersion::Py315,
+                ..CompileOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            module.code.constants.as_slice(),
+            [
+                Constant::Int(4),
+                Constant::Int(2560),
+                Constant::Int(256),
+                Constant::Int(512)
+            ]
+        ));
+    }
+
+    #[test]
+    fn python315_large_set_folds_through_retired_membership_conversions() {
+        let elements = (0..31)
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        for source in [
+            format!("result = [x for x in xs if x in {{{elements}}}]\n"),
+            format!("result = not (x in {{{elements}}})\n"),
+        ] {
+            let module = compile_with_options(
+                &source,
+                "membership_fold.py",
+                &CompileOptions {
+                    python_version: PythonVersion::Py315,
+                    ..CompileOptions::default()
+                },
+            )
+            .unwrap();
+            assert!(
+                module.code.constants.iter().any(
+                    |value| matches!(value, Constant::FrozenSet(values) if values.len() == 31)
+                )
+            );
+            assert!(
+                !module
+                    .bytecode()
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .any(|word| word[0] == SET_ADD.code_for(PythonVersion::Py315))
+            );
+        }
+    }
+
+    #[test]
+    fn python315_late_fold_locations_follow_fusion_and_unique_predecessors() {
+        let elements = std::iter::repeat_n("1", 31).collect::<Vec<_>>().join(", ");
+        for (header, expected) in [
+            (
+                "def f():\n    left, right = pair()\n",
+                &[
+                    0x81, 0x00, 0xdc, 0x12, 0x16, 0x93, 0x26, 0x81, 0x4b, 0x81, 0x44, 0xdb, 0x10,
+                    0x6d, 0x88, 0x04, 0xd9, 0x08, 0x0c, 0xf3, 0x03, 0x00, 0x11, 0x6e, 0x01,
+                ][..],
+            ),
+            (
+                "def f(flag):\n    assert flag\n",
+                &[
+                    0x81, 0x00, 0xdf, 0x0b, 0x0f, 0x80, 0x4b, 0x89, 0x34, 0xdb, 0x10, 0x6d, 0x88,
+                    0x04, 0xd9, 0x08, 0x0c, 0xf3, 0x03, 0x00, 0x11, 0x6e, 0x01,
+                ][..],
+            ),
+        ] {
+            let module = compile_with_options(
+                &format!("{header}    for item in [{elements}]:\n        pass\n"),
+                "late_location.py",
+                &CompileOptions {
+                    python_version: PythonVersion::Py315,
+                    ..CompileOptions::default()
+                },
+            )
+            .unwrap();
+            let Constant::Code(function) = &module.code.constants[0] else {
+                panic!("expected function code");
+            };
+            // Exact line tables from the pinned CPython 3.15 oracle distinguish
+            // fused first-store spans and assertion-success jump donation.
+            assert_eq!(function.line_table, expected);
+        }
     }
 
     #[test]

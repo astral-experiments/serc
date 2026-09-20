@@ -886,6 +886,7 @@ impl OptimizationPipeline {
         }
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::RemoveRedundantCheckedLoads)?;
+        self.resolve_folded_sequence_locations();
         self.propagate_locations_within_blocks();
         fusion_owners.retain_pipeline(&self);
         #[cfg(any(test, debug_assertions))]

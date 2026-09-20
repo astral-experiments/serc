@@ -1051,19 +1051,34 @@ struct InstructionMetadata(NonZeroU16);
 impl InstructionMetadata {
     const POLICY_COUNT: u16 = 23;
     const NORMAL_STATES: u16 = Self::POLICY_COUNT * 5 * 2;
+    const RETIRED_CONTAINS: u16 = 1 << 15;
+    const LATE_FOLD_LOCATION: u16 = 1 << 14;
+    const FLAGS: u16 = Self::RETIRED_CONTAINS | Self::LATE_FOLD_LOCATION;
+
+    const fn flags(self) -> u16 {
+        self.0.get() & Self::FLAGS
+    }
+
+    const fn state(self) -> u16 {
+        self.0.get() & !Self::FLAGS
+    }
+
+    fn with_flags(self, flags: u16) -> Self {
+        Self(NonZeroU16::new(self.state() | flags).expect("instruction metadata reserves zero"))
+    }
 
     // Values 231..=276 retain all 23 exception policies and both copy modes for
     // a direct original jump with no earlier copied slots. Adding slots discards
     // this conservative proof; existing slot counts keep their full range.
     const fn has_initial_borrow_entry(self) -> bool {
-        self.0.get() > Self::NORMAL_STATES
+        self.state() > Self::NORMAL_STATES
     }
 
     const fn normal_bits(self) -> u16 {
         if self.has_initial_borrow_entry() {
-            self.0.get() - Self::NORMAL_STATES - 1
+            self.state() - Self::NORMAL_STATES - 1
         } else {
-            self.0.get() - 1
+            self.state() - 1
         }
     }
 
@@ -1074,7 +1089,7 @@ impl InstructionMetadata {
         } else {
             bits
         };
-        Self(NonZeroU16::new(bits).expect("instruction metadata reserves zero"))
+        Self(NonZeroU16::new(bits | self.flags()).expect("instruction metadata reserves zero"))
     }
 
     fn new(
@@ -1215,6 +1230,29 @@ impl Instruction {
             && self.fusion_policy == other.fusion_policy
             && self.jump_policy == other.jump_policy
             && self.metadata.normal_bits() == other.metadata.normal_bits()
+            && self.metadata.flags() == other.metadata.flags()
+    }
+
+    /// Retains the original membership operation while Boolean lowering moves it.
+    pub(super) fn mark_retired_contains(&mut self) {
+        self.metadata = self
+            .metadata
+            .with_flags(self.metadata.flags() | InstructionMetadata::RETIRED_CONTAINS);
+    }
+
+    pub(super) const fn is_retired_contains(&self) -> bool {
+        self.metadata.flags() & InstructionMetadata::RETIRED_CONTAINS != 0
+    }
+
+    /// Defers the location of a late-folded constant until fused predecessors exist.
+    pub(super) fn mark_late_fold_location(&mut self) {
+        self.metadata = self
+            .metadata
+            .with_flags(self.metadata.flags() | InstructionMetadata::LATE_FOLD_LOCATION);
+    }
+
+    pub(super) const fn has_late_fold_location(&self) -> bool {
+        self.metadata.flags() & InstructionMetadata::LATE_FOLD_LOCATION != 0
     }
 
     pub(super) const fn exception_policy(&self) -> ExceptionPolicy {
@@ -1230,7 +1268,8 @@ impl Instruction {
             self.pre_fold_extra_instructions(),
             self.only_allows_unconditional_inlining(),
         )
-        .with_initial_borrow_entry(self.metadata.has_initial_borrow_entry());
+        .with_initial_borrow_entry(self.metadata.has_initial_borrow_entry())
+        .with_flags(self.metadata.flags());
     }
 
     pub(super) fn set_exception_owner(&mut self, owner: NormalizedExceptionOwner) {
@@ -1260,7 +1299,8 @@ impl Instruction {
             self.pre_fold_extra_instructions().saturating_add(count),
             self.only_allows_unconditional_inlining(),
         )
-        .with_initial_borrow_entry(self.metadata.has_initial_borrow_entry());
+        .with_initial_borrow_entry(self.metadata.has_initial_borrow_entry())
+        .with_flags(self.metadata.flags());
     }
 
     pub(super) fn allow_unconditional_block_inlining(&mut self) {
@@ -1270,7 +1310,8 @@ impl Instruction {
             self.pre_fold_extra_instructions(),
             true,
         )
-        .with_initial_borrow_entry(self.metadata.has_initial_borrow_entry());
+        .with_initial_borrow_entry(self.metadata.has_initial_borrow_entry())
+        .with_flags(self.metadata.flags());
     }
 
     pub(super) const fn only_allows_unconditional_inlining(&self) -> bool {
@@ -1388,7 +1429,8 @@ impl Instruction {
                 first.pre_fold_extra_instructions() + second.pre_fold_extra_instructions(),
                 first.only_allows_unconditional_inlining()
                     || second.only_allows_unconditional_inlining(),
-            ),
+            )
+            .with_flags(first.metadata.flags() | second.metadata.flags()),
         }
     }
 }
@@ -1845,6 +1887,38 @@ mod initial_borrow_metadata_tests {
                 let b = Instruction::new(JUMP_FORWARD, operands[0], source, second);
                 assert_eq!(a.same_fusion_owner_fields(&b), first == second);
             }
+        }
+    }
+
+    #[test]
+    fn constant_fold_provenance_survives_metadata_updates() {
+        for raw in 1..=276 {
+            let original = InstructionMetadata(NonZeroU16::new(raw).unwrap());
+            let mut instruction =
+                Instruction::new(LOAD_FAST, Operand::Value(0), SourceLocation::NONE, None);
+            instruction.metadata = original;
+            instruction.mark_retired_contains();
+            instruction.mark_late_fold_location();
+            assert_eq!(instruction.exception_policy(), original.exception_policy());
+            assert_eq!(
+                instruction.pre_fold_extra_instructions(),
+                original.pre_fold_extra_instructions()
+            );
+            assert_eq!(
+                instruction.metadata.has_initial_borrow_entry(),
+                original.has_initial_borrow_entry()
+            );
+            instruction.set_exception_policy(ExceptionPolicy::NonePresent);
+            instruction.add_pre_fold_extra_instructions(1);
+            instruction.allow_unconditional_block_inlining();
+            instruction.metadata = instruction.metadata.with_initial_borrow_entry(false);
+            assert!(instruction.is_retired_contains());
+            assert!(instruction.has_late_fold_location());
+            assert_eq!(instruction.exception_policy(), ExceptionPolicy::NonePresent);
+            assert_eq!(
+                instruction.pre_fold_extra_instructions(),
+                (original.pre_fold_extra_instructions() + 1).min(4)
+            );
         }
     }
 

@@ -292,6 +292,19 @@ impl crate::assembler::ConstantTable for OutputState {
         self.constants.len()
     }
 
+    fn retain_used_in_order(&mut self, used: &[bool]) -> Vec<Option<u32>> {
+        let indices = self.constants.retain_used(used);
+        self.qualified_name_constant_index = self
+            .qualified_name_constant_index
+            .and_then(|index| indices[index as usize]);
+        self.first_flowgraph_constant = indices
+            .iter()
+            .take(self.first_flowgraph_constant)
+            .flatten()
+            .count();
+        indices
+    }
+
     fn retain_used(&mut self, used: &[bool], order: &[u32]) -> Vec<Option<u32>> {
         fn append_folded_dependencies(
             constant: &Constant,

@@ -1302,6 +1302,182 @@ fn target_caches_and_extended_arguments_share_the_same_layout() {
 }
 
 #[test]
+fn manager_finally_break_donor_requires_every_target_iterator_pop() {
+    use crate::PythonVersion::{Py314, Py315};
+
+    for (version, slots) in [(Py314, 1), (Py315, 2)] {
+        for mutation in ["intact", "missing pop", "wrong depth", "located pop"] {
+            let mut assembler = Assembler::with_python_version(version);
+            let entry = assembler.label();
+            let protected_end = assembler.label();
+            let location = SourceLocation::new(10, 10, 16, 32);
+            let mut items = vec![Item::Instruction(Instruction::new(
+                STORE_FAST,
+                Operand::Value(3),
+                location,
+                Some(2 + slots),
+            ))];
+            for index in 0..slots {
+                items.push(Item::Instruction(Instruction::new(
+                    POP_TOP,
+                    Operand::Value(0),
+                    SourceLocation::NONE,
+                    Some(1 + slots - index),
+                )));
+            }
+            match mutation {
+                "missing pop" => {
+                    items.pop();
+                }
+                "wrong depth" | "located pop" => {
+                    let Item::Instruction(pop) = &mut items[1] else {
+                        unreachable!();
+                    };
+                    if mutation == "wrong depth" {
+                        *pop = Instruction::new(
+                            POP_TOP,
+                            Operand::Value(0),
+                            SourceLocation::NONE,
+                            Some(2 + slots),
+                        );
+                    } else {
+                        pop.location = location;
+                    }
+                }
+                _ => {}
+            }
+            let mut jump = Instruction::new(
+                JUMP_FORWARD,
+                Operand::Forward(entry),
+                SourceLocation::NONE,
+                Some(2),
+            );
+            jump.fusion_policy.mark_authored_break();
+            items.extend([
+                Item::Instruction(jump),
+                Item::Instruction(Instruction::new(
+                    RAISE_VARARGS,
+                    Operand::Value(1),
+                    SourceLocation::new(12, 12, 12, 28),
+                    Some(2),
+                )),
+                Item::Label(entry),
+                Item::Label(protected_end),
+            ]);
+            for item in items {
+                assembler.push_linear_item(item);
+            }
+            assembler.record_exception_owner_block_boundary(entry);
+            assert_eq!(
+                assembler.original_manager_copied_finally_break_join(protected_end),
+                (mutation == "intact").then_some((entry, location)),
+                "{version:?}, {mutation}"
+            );
+        }
+    }
+}
+
+#[test]
+fn iterator_conditional_return_counts_the_original_try_unwind_slot() {
+    use crate::code_object::Constant;
+    use crate::{CompileOptions, PythonVersion, compile_with_options};
+
+    let source = "def choose(items, value, flag):\n    for item in items:\n        try:\n            return value if flag else {}\n        except ValueError:\n            pass\n";
+    for version in [PythonVersion::Py314, PythonVersion::Py315] {
+        let module = compile_with_options(
+            source,
+            "iterator_return.py",
+            &CompileOptions {
+                python_version: version,
+                ..CompileOptions::default()
+            },
+        )
+        .unwrap();
+        let code = module
+            .code
+            .constants
+            .iter()
+            .find_map(|constant| match constant {
+                Constant::Code(code) => Some(code),
+                _ => None,
+            })
+            .unwrap();
+        let returns = code
+            .bytecode
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .filter(|instruction| instruction[0] == RETURN_VALUE.code_for(version))
+            .count();
+        // CPython's four-slot copy limit includes the erased POP_BLOCK. The
+        // second iterator slot makes 3.15's conditional cleanup too large to copy.
+        assert_eq!(
+            returns,
+            if version == PythonVersion::Py315 {
+                2
+            } else {
+                3
+            }
+        );
+        let borrowed_value = [LOAD_FAST_BORROW.code_for(version), 1];
+        assert_eq!(
+            code.bytecode.as_chunks::<2>().0.contains(&borrowed_value),
+            version == PythonVersion::Py314
+        );
+    }
+}
+
+#[test]
+fn builtin_iterable_return_retains_the_original_try_unwind_slot() {
+    use crate::code_object::Constant;
+    use crate::{CompileOptions, PythonVersion, compile_with_options};
+
+    for callable in ["tuple", "list"] {
+        let source = format!(
+            "def choose(items, values):\n    for item in items:\n        try:\n            return {callable}(value for value in values)\n        except ValueError:\n            pass\n"
+        );
+        for version in [PythonVersion::Py314, PythonVersion::Py315] {
+            let module = compile_with_options(
+                &source,
+                "builtin_iterator_return.py",
+                &CompileOptions {
+                    python_version: version,
+                    ..CompileOptions::default()
+                },
+            )
+            .unwrap();
+            let code = module
+                .code
+                .constants
+                .iter()
+                .find_map(|constant| match constant {
+                    Constant::Code(code) => Some(code),
+                    _ => None,
+                })
+                .unwrap();
+            let returns = code
+                .bytecode
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .filter(|instruction| instruction[0] == RETURN_VALUE.code_for(version))
+                .count();
+            // The located optimized-path jump and its normal-call fallback join
+            // before the try POP_BLOCK and the iterator's shared return cleanup.
+            assert_eq!(
+                returns,
+                if version == PythonVersion::Py314 && callable == "tuple" {
+                    3
+                } else {
+                    2
+                },
+                "{version:?}: {callable}"
+            );
+        }
+    }
+}
+
+#[test]
 fn python315_resume_entry_and_depth_have_distinct_encodings() {
     use crate::PythonVersion::Py315;
     use crate::target::GENEXPR_RESUME_ARGUMENT;
@@ -5066,6 +5242,75 @@ fn split_return_condition_transports_only_a_unique_exact_source_witness() {
                     "{change}"
                 );
             }
+        }
+    }
+}
+
+#[test]
+fn iterator_break_finalizers_copy_every_target_iterator_cell() {
+    use crate::code_object::Constant;
+    use crate::{CompileOptions, PythonVersion, compile_with_options};
+
+    let shared_return = "def choose(items, resource):\n    for item in items:\n        try:\n            if item:\n                break\n        finally:\n            try:\n                resource.close()\n            except OSError:\n                pass\n    return items\n";
+    let guarded_handler = "def choose(items, resource, visit):\n    for item in items:\n        try:\n            visit(item)\n            break\n        except Exception as error:\n            if item:\n                break\n        finally:\n            if resource is not None:\n                try:\n                    resource.close()\n                except OSError:\n                    pass\n    visit(resource)\n";
+    for (source, guarded) in [(shared_return, false), (guarded_handler, true)] {
+        for version in [PythonVersion::Py314, PythonVersion::Py315] {
+            let module = compile_with_options(
+                source,
+                "iterator_break_finalizer.py",
+                &CompileOptions {
+                    python_version: version,
+                    ..CompileOptions::default()
+                },
+            )
+            .unwrap();
+            let code = module
+                .code
+                .constants
+                .iter()
+                .find_map(|constant| match constant {
+                    Constant::Code(code) => Some(code),
+                    _ => None,
+                })
+                .unwrap();
+            let instructions = code.bytecode.as_chunks::<2>().0;
+            let iterator_width = if version == PythonVersion::Py315 {
+                2
+            } else {
+                1
+            };
+            let copied_disposals = if guarded {
+                instructions
+                    .windows(iterator_width + 1)
+                    .filter(|window| {
+                        window[..iterator_width]
+                            .iter()
+                            .all(|instruction| *instruction == [POP_TOP.code_for(version), 0])
+                            && window[iterator_width][0] == JUMP_FORWARD.code_for(version)
+                    })
+                    .count()
+            } else {
+                let returns = instructions
+                    .iter()
+                    .filter(|instruction| instruction[0] == RETURN_VALUE.code_for(version))
+                    .count();
+                assert_eq!(returns, 3, "{version:?}");
+                instructions
+                    .windows(iterator_width + 2)
+                    .filter(|window| {
+                        window[..iterator_width]
+                            .iter()
+                            .all(|instruction| *instruction == [POP_TOP.code_for(version), 0])
+                            && matches!(window[iterator_width][0], opcode
+                                if opcode == LOAD_FAST.code_for(version)
+                                    || opcode == LOAD_FAST_BORROW.code_for(version))
+                            && window[iterator_width + 1][0] == RETURN_VALUE.code_for(version)
+                    })
+                    .count()
+            };
+            // Both predecessors receive the complete target-specific iterator cleanup,
+            // whether they then copy a return or jump to an ordinary continuation.
+            assert_eq!(copied_disposals, 2, "{version:?}, guarded={guarded}");
         }
     }
 }

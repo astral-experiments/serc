@@ -875,3 +875,75 @@ fn metadata_tuple_aliases_do_not_intern_equal_frozenset_members() {
         );
     }
 }
+
+#[test]
+fn static_attribute_cache_admission_controls_frozenset_identity() {
+    use crate::{CompileOptions, PythonVersion, compile_with_options};
+
+    // A metadata tuple hit skips recursive scalar admission. A cache miss admits the
+    // parser's existing identifier, so later sets retain the cached frozenset identity.
+    let cases = [
+        (
+            "class C:\n    def __init__(self):\n        self.exec = factory()\n",
+            "exec",
+            true,
+        ),
+        (
+            "class C:\n    def __init__(self):\n        self.exec = 1\n",
+            "exec",
+            false,
+        ),
+        (
+            "ordinary = 'exec'\nclass C:\n    def __init__(self):\n        self.exec = factory()\n",
+            "exec",
+            false,
+        ),
+        (
+            "class C:\n    def __init__(self):\n        self.__exec = factory()\n",
+            "__exec",
+            true,
+        ),
+        (
+            "def prior(x: int):\n    pass\nclass C:\n    def __init__(self):\n        self.format = factory()\n",
+            "format",
+            true,
+        ),
+    ];
+    for python_version in [PythonVersion::Py314, PythonVersion::Py315] {
+        for (prefix, member, shared) in cases {
+            // Distinct tags prevent whole co_consts tuples from masking the set identity.
+            let source = format!(
+                "{prefix}def first(item):\n    return 'tag A', item in {{'{member}', 'x', 'y', 'z'}}\ndef second(item):\n    return 'tag B', item in {{'{member}', 'x', 'y', 'z'}}\n"
+            );
+            let options = CompileOptions {
+                python_version,
+                ..CompileOptions::default()
+            };
+            let module = compile_with_options(&source, "static_attributes.py", &options).unwrap();
+            let first = module
+                .code
+                .constants
+                .iter()
+                .find_map(|constant| match constant {
+                    Constant::Code(code) if code.name == "first" => Some(code),
+                    _ => None,
+                })
+                .unwrap();
+            let set = first
+                .constants
+                .iter()
+                .find(|constant| matches!(constant, Constant::FrozenSet(_)))
+                .unwrap();
+            let graph = ObjectGraph::for_code_with_options(
+                &module.code,
+                python_version,
+                &options.initial_intern_state,
+            );
+            assert_eq!(
+                graph.is_shared(&constant_key(set), false),
+                shared,
+                "{python_version}: {prefix}"
+            );
+        }
+    }
+}

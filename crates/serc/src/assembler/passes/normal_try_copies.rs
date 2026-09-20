@@ -746,7 +746,11 @@ impl OptimizationPipeline {
                 || end_send.operand() != Operand::Value(0)
                 || yield_value.depth_after() != Some(region.depth)
                 || cleanup_throw.depth_after() != Some(region.depth)
-                || end_send.depth_after() != region.depth.checked_sub(1)
+                || end_send.depth_after()
+                    != region.depth.checked_sub(match self.python_version {
+                        crate::PythonVersion::Py314 => 1,
+                        crate::PythonVersion::Py315 => 2,
+                    })
                 || !self
                     .exception_owner_provenance
                     .source_boundaries
