@@ -302,7 +302,7 @@ result. `--require-all` requires every CPython-accepted file to match exactly;
 without an internal failure.
 
 The frozen baseline is 2,230 exact matches and 221 CPython-rejected files. Of the rejected files,
-128 are matched rejections, 75 are currently accepted by Serc, and 18 reach an internal compiler
+151 are matched rejections, 56 are currently accepted by Serc, and 14 reach an internal compiler
 failure. There are zero byte mismatches, unsupported files, parse mismatches, non-UTF-8 files, or
 oracle failures among CPython-accepted inputs.
 
