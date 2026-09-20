@@ -81,7 +81,7 @@ struct ComprehensionLoop {
 #[derive(Debug)]
 struct MatchContext {
     stores: Vec<NameId>,
-    fail_pop: Vec<Label>,
+    fail_pop: Vec<Option<Label>>,
     // Case or OR-alternative source identity; fail-pop indices belong to this context.
     native_fail_owner: ruff_text_size::TextRange,
     direct_loop_failure: Option<Label>,
@@ -577,6 +577,9 @@ impl Compiler<'_> {
                         }
                     }
                     if !truthiness || !context.fail_pop.is_empty() {
+                        // Constant folding removes the guard's jump after CPython
+                        // has already established its failure-block boundary.
+                        self.ensure_match_fail_pop(&mut context, 0);
                         let range = if is_wildcard_pattern(&case.pattern) {
                             case.pattern.range()
                         } else {
@@ -599,19 +602,19 @@ impl Compiler<'_> {
                         }
                     }
                     if !truthiness {
-                        self.ensure_match_fail_pop(&mut context, 0);
                         if context.fail_pop.len() > 1 {
+                            let failure = self.ensure_match_fail_pop(&mut context, 0);
                             // Captures have already been stored, so guard failure skips
                             // the cleanup slots reserved for an unmatched pattern.
-                            let failure = self
-                                .emit_jump_forward_instruction(JUMP_FORWARD, context.fail_pop[0])?;
+                            let failure =
+                                self.emit_jump_forward_instruction(JUMP_FORWARD, failure)?;
                             // CPython's edge is still conditional during small-exit copying.
                             self.assembler.prevent_jump_inlining(failure);
                         }
                         guard_always_false = true;
                     }
                 } else {
-                    self.ensure_match_fail_pop(&mut context, 0);
+                    let failure = self.ensure_match_fail_pop(&mut context, 0);
                     if copied_subject
                         && is_wildcard_pattern(&case.pattern)
                         && self.source_location(case.pattern.range()).line
@@ -637,9 +640,9 @@ impl Compiler<'_> {
                     {
                         // The assembler transports the original bridge donor only onto an
                         // intact private copy of the four-record subject-pop return.
-                        self.compile_match_guard(guard, &case.body, context.fail_pop[0])?;
+                        self.compile_match_guard(guard, &case.body, failure)?;
                     } else {
-                        self.compile_jump_if(guard, false, context.fail_pop[0])?;
+                        self.compile_jump_if(guard, false, failure)?;
                     }
                 }
             }
@@ -775,7 +778,8 @@ impl Compiler<'_> {
                             } else if has_default
                                 && index + 1 == matched_cases
                                 && case.guard.is_none()
-                                && cleanup.is_some_and(|label| context.fail_pop.contains(&label))
+                                && cleanup
+                                    .is_some_and(|label| context.fail_pop.contains(&Some(label)))
                                 && self
                                     .assembler
                                     .is_small_linear_scope_exit_since(success_start)
@@ -1371,18 +1375,27 @@ impl Compiler<'_> {
         }
     }
 
-    fn ensure_match_fail_pop(&mut self, context: &mut MatchContext, pops: usize) {
+    fn ensure_match_fail_pop(&mut self, context: &mut MatchContext, pops: usize) -> Label {
         while context.fail_pop.len() <= pops {
+            let depth = context.fail_pop.len();
+            context.fail_pop.push(None);
+            self.match_fail_pop_label(context, depth);
+        }
+        self.match_fail_pop_label(context, pops)
+    }
+
+    fn match_fail_pop_label(&mut self, context: &mut MatchContext, pops: usize) -> Label {
+        *context.fail_pop[pops].get_or_insert_with(|| {
             let label = self.assembler.label();
             self.bind_native_source_label(
                 super::legacy_native_labels::NativeRole::MatchFailPop(
                     context.native_fail_owner,
-                    context.fail_pop.len(),
+                    pops,
                 ),
                 label,
             );
-            context.fail_pop.push(label);
-        }
+            label
+        })
     }
 
     fn jump_to_match_fail(
@@ -1431,8 +1444,8 @@ impl Compiler<'_> {
             return Ok(());
         }
         let pops = context.on_top + context.stores.len();
-        self.ensure_match_fail_pop(context, pops);
-        self.emit_jump_forward(opcode, context.fail_pop[pops], effect)?;
+        let failure = self.ensure_match_fail_pop(context, pops);
+        self.emit_jump_forward(opcode, failure, effect)?;
         if matches!(
             opcode,
             POP_JUMP_IF_FALSE | POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE | POP_JUMP_IF_TRUE
@@ -1451,18 +1464,21 @@ impl Compiler<'_> {
         failure_depth: i32,
     ) -> Result<(), CompileError> {
         for pops in (1..context.fail_pop.len()).rev() {
-            self.assembler.mark(context.fail_pop[pops]);
+            if let Some(label) = context.fail_pop[pops] {
+                self.assembler.mark(label);
+            }
             self.set_depth(failure_depth + i32::try_from(pops).unwrap());
             self.assembler.set_location(location);
             self.emit(POP_TOP, 0, -1)?;
         }
-        // Native 3.12 cleanup falls through to a separate zero-pop block.
-        // Keep that original boundary even when no pattern jumps to it directly.
-        if self.context.python_version == crate::PythonVersion::Py312 {
-            self.assembler
-                .record_exception_owner_block_boundary(context.fail_pop[0]);
+        if let Some(label) = context.fail_pop[0] {
+            // Native 3.12 cleanup falls through to a separate zero-pop block.
+            // Keep that original boundary even when no pattern jumps to it directly.
+            if self.context.python_version == crate::PythonVersion::Py312 {
+                self.assembler.record_exception_owner_block_boundary(label);
+            }
+            self.assembler.mark(label);
         }
-        self.assembler.mark(context.fail_pop[0]);
         self.set_depth(failure_depth);
         Ok(())
     }
@@ -1723,15 +1739,27 @@ impl Compiler<'_> {
             .set_location(self.source_location(pattern.range));
         self.emit(POP_TOP, 0, -1)?;
         let pops = context.on_top + context.stores.len();
-        self.ensure_match_fail_pop(context, pops);
-        self.emit_jump_forward_instruction(JUMP_FORWARD, context.fail_pop[pops])?;
+        let failure = if self.context.python_version == PythonVersion::Py312 {
+            // Native 3.12 retains each cleanup boundary, including the zero-pop
+            // block that prevents copying cleanup into a protected failure edge.
+            self.ensure_match_fail_pop(context, pops)
+        } else {
+            // An OR failure jumps directly to this depth. Unused intermediate
+            // labels must not split its fallthrough cleanup before exit copying.
+            // Conditional failures keep their existing owner-boundary provenance.
+            if context.fail_pop.len() <= pops {
+                context.fail_pop.resize(pops + 1, None);
+            }
+            self.match_fail_pop_label(context, pops)
+        };
+        self.emit_jump_forward_instruction(JUMP_FORWARD, failure)?;
         // Outer failure pops also allow the success array to copy away, but
         // their failure target must remain too large to copy into this jump.
         let success_start = self.assembler.instruction_count();
         context.empty_failure_jumps.push((
             success_start - 1,
             success_start,
-            (pops != 0).then_some(context.fail_pop[pops]),
+            (pops != 0).then_some(failure),
         ));
         if empty_success {
             context
