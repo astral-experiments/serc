@@ -546,7 +546,7 @@ impl FunctionPlan {
             });
         }
 
-        let mut annotation_collector = ReferenceCollector::default();
+        let mut annotation_references = FxHashSet::default();
         if !future_annotations {
             for parameter in definition
                 .parameters
@@ -555,26 +555,26 @@ impl FunctionPlan {
                 .chain(&definition.parameters.args)
             {
                 if let Some(annotation) = parameter.parameter.annotation.as_deref() {
-                    annotation_collector.visit_expr(annotation);
+                    annotation_references.extend(expression_required_names(annotation));
                 }
             }
             if let Some(parameter) = &definition.parameters.vararg
                 && let Some(annotation) = parameter.annotation.as_deref()
             {
-                annotation_collector.visit_expr(annotation);
+                annotation_references.extend(expression_required_names(annotation));
             }
             for parameter in &definition.parameters.kwonlyargs {
                 if let Some(annotation) = parameter.parameter.annotation.as_deref() {
-                    annotation_collector.visit_expr(annotation);
+                    annotation_references.extend(expression_required_names(annotation));
                 }
             }
             if let Some(parameter) = &definition.parameters.kwarg
                 && let Some(annotation) = parameter.annotation.as_deref()
             {
-                annotation_collector.visit_expr(annotation);
+                annotation_references.extend(expression_required_names(annotation));
             }
             if let Some(annotation) = definition.returns.as_deref() {
-                annotation_collector.visit_expr(annotation);
+                annotation_references.extend(expression_required_names(annotation));
             }
         }
 
@@ -696,7 +696,7 @@ impl FunctionPlan {
                 })
                 .collect(),
             globals: names.intern_set(locals.globals),
-            annotation_references: names.intern_set(annotation_collector.references),
+            annotation_references: names.intern_set(annotation_references),
             cellvars: names.intern_set(cellvars),
             inlined_comprehension_cellvars: names.intern_set(inlined_comprehension_cellvars),
             freevars: Vec::new(),
