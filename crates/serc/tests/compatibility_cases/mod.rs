@@ -162,6 +162,7 @@ mod manager_finally_borrow_blocks;
 mod manager_while_continuations;
 mod mapping_bare_capture_compatibility;
 mod mapping_class_capture_compatibility;
+mod mapping_key_tuple_compatibility;
 mod match_case_loop_tail_conditions;
 mod match_line_event_retention;
 mod match_or_failure_borrows;

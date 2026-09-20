@@ -1734,11 +1734,13 @@ impl Compiler<'_> {
                 ExceptionPolicy::NoneDynamicConditionStrict,
             )?;
         }
-        if let Some(keys) = pattern
-            .keys
-            .iter()
-            .map(fold_constant)
-            .collect::<Option<Vec<_>>>()
+        // CPython's flowgraph only folds tuples with up to 30 stack operands.
+        if pattern.keys.len() <= 30
+            && let Some(keys) = pattern
+                .keys
+                .iter()
+                .map(fold_constant)
+                .collect::<Option<Vec<_>>>()
         {
             // Pattern literals are folded by AST optimization before code generation.
             // Reserve each scalar before the flowgraph builds their keys tuple.
