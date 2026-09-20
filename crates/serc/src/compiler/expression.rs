@@ -2812,14 +2812,12 @@ impl Compiler<'_> {
         if let Some(start) = not_taken_exclusion_start {
             let end = self.assembler.label();
             self.assembler.mark(end);
-            if exclude_not_taken_from_comprehension {
-                for exclusions in &mut self
-                    .control
-                    .comprehensions
-                    .active_comprehension_region_exclusions
-                {
-                    exclusions.push((start, end));
-                }
+            for exclusions in &mut self
+                .control
+                .comprehensions
+                .active_comprehension_region_exclusions
+            {
+                exclusions.push((start, end));
             }
         }
         self.emit(POP_TOP, 0, -1)?;
@@ -7104,8 +7102,6 @@ impl Compiler<'_> {
         self.assembler.mark(exclusion_start);
         // Terminal conditions can also reuse an owned original array slot.
         // Resolve vacancies after cleanup, as for ordinary condition markers.
-        // Fallback modules retain their explicit exclusions instead of recovering
-        // owners from the pinned target's original instruction slots.
         let exception_policy = if !exclude_normal_finally_not_taken_from_with {
             policy.excluded.defer_condition_owner()
         } else {
