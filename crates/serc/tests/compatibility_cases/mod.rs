@@ -42,6 +42,7 @@ mod generator_handler_finally_nop_owner_compatibility;
 mod generator_iterator_negated_name_ifexp_owner_compatibility;
 mod generator_with_finally_condition_compatibility;
 mod handler_cleanup_location_compatibility;
+mod integer_true_division_compatibility;
 mod iterator_boolean_condition_owner_compatibility;
 mod iterator_try_assignment_branch_compatibility;
 mod loop_tail_chained_compare_compatibility;

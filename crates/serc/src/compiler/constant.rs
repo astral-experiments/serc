@@ -1177,10 +1177,15 @@ pub(super) fn fold_constant(expression: &Expr) -> Option<Constant> {
                     fold_integer_arithmetic(&left, operator, &right)
                 }
                 (Constant::Int(left), Operator::Div, Constant::Int(right)) if right != 0 => {
-                    Some(Constant::Float(left as f64 / right as f64))
+                    Some(Constant::Float(divide_integers(left, right)))
                 }
                 (Constant::SignedInt(left), Operator::Div, Constant::Int(right)) if right != 0 => {
-                    Some(Constant::Float(left as f64 / right as f64))
+                    let quotient = divide_integers(left.unsigned_abs(), right);
+                    Some(Constant::Float(if left.is_negative() {
+                        -quotient
+                    } else {
+                        quotient
+                    }))
                 }
                 (Constant::Int(left), Operator::FloorDiv, Constant::Int(right)) if right != 0 => {
                     Some(Constant::Int(left / right))
@@ -1378,6 +1383,45 @@ pub(super) fn fold_constant(expression: &Expr) -> Option<Constant> {
         }
         _ => None,
     }
+}
+
+/// Round the exact quotient to binary64, without first rounding either integer operand.
+fn divide_integers(left: u64, right: u64) -> f64 {
+    if left == 0 {
+        return 0.0;
+    }
+
+    let mut numerator = u128::from(left);
+    let mut denominator = u128::from(right);
+    let mut exponent = i64::from(right.leading_zeros()) - i64::from(left.leading_zeros());
+    let below_power = if exponent >= 0 {
+        numerator < denominator << exponent
+    } else {
+        numerator << -exponent < denominator
+    };
+    exponent -= i64::from(below_power);
+
+    // Scale the exact quotient into [2^52, 2^53). With u64 operands, the scaled
+    // numerator needs at most 117 bits, and every nonzero result is a normal float.
+    if exponent <= 52 {
+        numerator <<= 52 - exponent;
+    } else {
+        denominator <<= exponent - 52;
+    }
+    let mut significand = numerator / denominator;
+    let twice_remainder = 2 * (numerator % denominator);
+    if twice_remainder > denominator || (twice_remainder == denominator && significand & 1 != 0) {
+        significand += 1;
+    }
+    if significand == 1 << 53 {
+        significand >>= 1;
+        exponent += 1;
+    }
+
+    let exponent =
+        u64::try_from(exponent + 1023).expect("u64 quotient has a normal float exponent");
+    let significand = u64::try_from(significand).expect("rounded significand fits in 53 bits");
+    f64::from_bits((exponent << 52) | (significand & ((1 << 52) - 1)))
 }
 
 fn fold_positive_integer_bitwise(
