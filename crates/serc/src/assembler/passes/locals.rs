@@ -2591,10 +2591,10 @@ impl OptimizationPipeline {
     ///
     /// Once a checked load succeeds, CPython's definite-assignment scan treats
     /// that local as initialized for subsequent instructions on the same path.
-    pub(in crate::assembler) fn remove_redundant_checked_loads(&mut self) {
+    pub(in crate::assembler) fn remove_redundant_checked_loads(&mut self) -> bool {
         let graph = &mut self.graph;
         if !graph.features().has_fast_load() {
-            return;
+            return false;
         }
         let checked_blocks = graph
             .order()
@@ -2607,8 +2607,9 @@ impl OptimizationPipeline {
             })
             .collect::<Vec<_>>();
         if checked_blocks.is_empty() {
-            return;
+            return false;
         }
+        let mut changed = false;
         for block in checked_blocks {
             let mut initialized = FxHashSet::default();
             for instruction in graph.instructions_mut(block) {
@@ -2622,6 +2623,7 @@ impl OptimizationPipeline {
                     LOAD_FAST_CHECK => {
                         if initialized.contains(&argument) {
                             instruction.opcode = LOAD_FAST;
+                            changed = true;
                         }
                         initialized.insert(argument);
                     }
@@ -2645,6 +2647,7 @@ impl OptimizationPipeline {
                 }
             }
         }
+        changed
     }
 
     /// Retains original source entries when later threading changes a jump destination.
@@ -5522,7 +5525,8 @@ mod tests {
             );
             // The real pipeline records the intermediate jump-only array as
             // empty after the original authored route has been captured.
-            pipeline.record_borrow_empty_jump_heads();
+            assert!(pipeline.record_borrow_empty_jump_heads());
+            assert!(!pipeline.record_borrow_empty_jump_heads());
             let intermediate = pipeline.graph.label_block(Label(2)).unwrap();
             assert!(
                 pipeline.graph[intermediate]

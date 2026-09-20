@@ -277,11 +277,12 @@ impl OptimizationPipeline {
     ///
     /// CPython applies this peephole before superinstruction fusion when two
     /// adjacent stores target the same local on the same traced line.
-    pub(in crate::assembler) fn optimize_redundant_store_fast(&mut self) {
+    pub(in crate::assembler) fn optimize_redundant_store_fast(&mut self) -> bool {
         let graph = &mut self.graph;
         if !graph.features().has_store_fast() {
-            return;
+            return false;
         }
+        let mut changed = false;
         graph.for_each_adjacent_instruction_pair_mut(|first, second| {
             if first.opcode == STORE_FAST
                 && second.opcode == STORE_FAST
@@ -296,8 +297,10 @@ impl OptimizationPipeline {
             {
                 first.opcode = POP_TOP;
                 first.set_operand(Operand::Value(0));
+                changed = true;
             }
         });
+        changed
     }
 
     /// Removes copy/pop pairs before local analysis and superinstruction fusion.
@@ -2801,10 +2804,10 @@ impl OptimizationPipeline {
     }
 
     /// Preserves original empty jump-head boundaries for the final borrowing traversal.
-    pub(in crate::assembler) fn record_borrow_empty_jump_heads(&mut self) {
+    pub(in crate::assembler) fn record_borrow_empty_jump_heads(&mut self) -> bool {
         // Every admitted original array ends in a forward unconditional jump.
         if !self.graph.features().has_forward_jump() {
-            return;
+            return false;
         }
         let graph = &self.graph;
         let order = graph.order();
@@ -2911,6 +2914,7 @@ impl OptimizationPipeline {
                     .then_some(ItemPosition::new(block, items.len() - 1))
             })
             .collect::<Vec<_>>();
+        let changed = !heads.is_empty();
         for head in heads {
             // Threading transfers this provenance to each predecessor jump. If that
             // jump disappears later, its barrier remains at the original fallthrough
@@ -2919,6 +2923,7 @@ impl OptimizationPipeline {
             // that head's jump must also retain its empty borrowing boundary.
             self.graph.mark_borrow_empty_block(head);
         }
+        changed
     }
 
     /// Finds intact original constant/Pass arrays without crossing a real entry.
@@ -4853,14 +4858,17 @@ impl OptimizationPipeline {
         self.remove_redundant_nops_scoped(false);
     }
 
-    pub(in crate::assembler) fn remove_redundant_with_exit_nops(&mut self) {
-        if !self
+    /// Returns whether manager cleanup ran and may have changed the graph or its provenance.
+    pub(in crate::assembler) fn remove_redundant_with_exit_nops(&mut self) -> bool {
+        if self
             .exception_owner_provenance
             .with_context_locations
             .is_empty()
         {
-            self.remove_redundant_nops_scoped(true);
+            return false;
         }
+        self.remove_redundant_nops_scoped(true);
+        true
     }
 
     fn remove_redundant_nops_scoped(&mut self, with_exits_only: bool) {

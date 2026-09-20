@@ -1843,7 +1843,8 @@ fn backward_conditional_normalization_preserves_successor_labels() {
         ]);
         let mut pipeline = optimization_pipeline(items);
 
-        pipeline.normalize_backward_conditionals().unwrap();
+        assert!(pipeline.normalize_backward_conditionals().unwrap());
+        assert!(!pipeline.normalize_backward_conditionals().unwrap());
 
         pipeline.graph.validate().unwrap();
         for item in pipeline.graph.iter_items() {
@@ -3027,6 +3028,80 @@ fn maybe_null_comprehension_restore_checks_only_the_first_later_load() {
 }
 
 #[test]
+fn local_rewrites_report_only_instruction_changes() {
+    let mut stores = optimization_pipeline(vec![
+        pass_instruction(STORE_FAST, 0, 1),
+        pass_instruction(STORE_FAST, 1, 1),
+        pass_instruction(STORE_FAST, 1, 2),
+        pass_instruction(STORE_FAST, 1, 2),
+    ]);
+    assert!(stores.optimize_redundant_store_fast());
+    let stored = stores.graph.copy_items();
+    assert_eq!(
+        graph_opcodes(&stores),
+        [STORE_FAST, STORE_FAST, POP_TOP, STORE_FAST]
+    );
+    assert!(!stores.optimize_redundant_store_fast());
+    assert_eq!(stores.graph.copy_items(), stored);
+
+    let mut loads = optimization_pipeline(vec![
+        pass_instruction(LOAD_FAST_CHECK, 0, 1),
+        pass_instruction(LOAD_FAST_CHECK, 1, 1),
+        pass_instruction(LOAD_FAST_CHECK, 0, 1),
+        pass_instruction(DELETE_FAST, 0, 1),
+        pass_instruction(LOAD_FAST_CHECK, 0, 1),
+    ]);
+    assert!(loads.remove_redundant_checked_loads());
+    let checked = loads.graph.copy_items();
+    assert_eq!(
+        graph_opcodes(&loads),
+        [
+            LOAD_FAST_CHECK,
+            LOAD_FAST_CHECK,
+            LOAD_FAST,
+            DELETE_FAST,
+            LOAD_FAST_CHECK
+        ]
+    );
+    assert!(!loads.remove_redundant_checked_loads());
+    assert_eq!(loads.graph.copy_items(), checked);
+}
+
+#[test]
+fn swap_runs_report_only_changed_slots() {
+    for (depths, changed, opcodes) in [([2, 3], false, [SWAP, SWAP]), ([2, 2], true, [NOP, NOP])] {
+        let mut assembler = optimization_pipeline(
+            depths
+                .into_iter()
+                .map(|depth| pass_instruction(SWAP, depth, 1))
+                .collect(),
+        );
+        let before = assembler.graph.copy_items();
+        assert_eq!(assembler.optimize_swap_runs().2, changed);
+        assert_eq!(graph_opcodes(&assembler), opcodes);
+        if !changed {
+            assert_eq!(assembler.graph.copy_items(), before);
+        }
+        let after = assembler.graph.copy_items();
+        assert!(!assembler.optimize_swap_runs().2);
+        assert_eq!(assembler.graph.copy_items(), after);
+    }
+
+    let swaps = |depths: [u32; 3]| {
+        depths
+            .into_iter()
+            .map(|depth| pass_instruction(SWAP, depth, 1))
+            .collect::<Vec<_>>()
+    };
+    let mut assembler = optimization_pipeline(swaps([3, 2, 3]));
+    assert!(assembler.optimize_swap_runs().2);
+    let expected = swaps([2, 3, 2]);
+    assert_eq!(assembler.graph.copy_items(), expected);
+    assert!(!assembler.optimize_swap_runs().2);
+    assert_eq!(assembler.graph.copy_items(), expected);
+}
+
+#[test]
 fn redundant_swap_removal_preserves_forward_scan_semantics() {
     let mut assembler = optimization_pipeline(vec![
         pass_instruction(SWAP, 2, 1),
@@ -3038,7 +3113,7 @@ fn redundant_swap_removal_preserves_forward_scan_semantics() {
         pass_instruction(POP_TOP, 0, 1),
     ]);
 
-    assembler.remove_redundant_swaps_before_pops();
+    assert!(assembler.remove_redundant_swaps_before_pops());
 
     assert_eq!(graph_opcodes(&assembler), [SWAP, SWAP, POP_TOP, POP_TOP]);
 }
@@ -3057,7 +3132,11 @@ fn redundant_swap_removal_preserves_distinct_pop_lines() {
         items.extend(pops_and_store.iter().copied());
         let mut assembler = optimization_pipeline(items);
 
-        assembler.remove_redundant_swaps_before_pops();
+        assert_eq!(
+            assembler.remove_redundant_swaps_before_pops(),
+            !retain_rotation
+        );
+        assert!(!assembler.remove_redundant_swaps_before_pops());
 
         let mut expected = vec![pass_instruction(SWAP, 3, 4)];
         if retain_rotation {
