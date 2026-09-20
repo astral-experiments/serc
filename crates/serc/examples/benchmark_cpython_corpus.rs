@@ -1510,7 +1510,7 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        BOOTSTRAP_SEED, BlockSample, Engine, Metric, Options, PYTHON_HELPER, Phase, RawRow,
+        BOOTSTRAP_SEED, BlockSample, Engine, Metric, Options, Phase, PythonRunner, RawRow,
         SourceFile, Timings, block_order, block_order_label, block_samples, bootstrap_median_ci,
         cooldown_metadata, discover, expected_row_count, parse_sample_response,
         process_timer_result, profile_from_executable, ratio_statistics, summarize,
@@ -1518,10 +1518,52 @@ mod tests {
     };
 
     #[test]
-    fn python_helper_classifies_compile_exceptions_as_rejected() {
-        assert!(
-            PYTHON_HELPER.contains("            except Exception:\n                rejected += 1")
+    fn python_helper_benchmarks_only_accepted_sources() {
+        let python =
+            std::env::var("SERC_TEST_PYTHON").unwrap_or_else(|_| "python3.14".to_string());
+        let sources = [
+            ("accepted.py", "answer = 'caf\u{e9}'\n"),
+            ("syntax.py", "if:\n"),
+            ("semantic.py", "return\n"),
+            (
+                "after_rejections.py",
+                "raise RuntimeError('compiled, never executed')\n",
+            ),
+        ]
+        .map(|(filename, source)| SourceFile {
+            path: PathBuf::from(filename),
+            filename: filename.to_string(),
+            source: source.to_string(),
+        });
+        let mut runner = PythonRunner::start(&python).unwrap();
+        let manifest = runner.initialize(&sources).unwrap();
+        let samples = [
+            Phase::CompilerCore,
+            Phase::CompileMarshal,
+            Phase::MarshalOnly,
+        ]
+        .map(|phase| runner.run_phase(phase).unwrap());
+        runner.finish().unwrap();
+
+        assert_eq!(manifest.accepted_indices, [0, 3]);
+        assert_eq!(manifest.rejected, 2);
+        assert_eq!(
+            manifest.source_bytes,
+            sources[0].source.len() + sources[3].source.len()
         );
+        let expected_marshal = [0, 3].map(|index| {
+            serc::compile(&sources[index].source, &sources[index].filename)
+                .unwrap()
+                .marshal()
+        });
+        assert_eq!(manifest.marshaled, expected_marshal);
+        for sample in samples {
+            assert_eq!(sample.count, 2);
+            assert!(sample.observed > 0);
+        }
+        let marshaled_bytes = expected_marshal.iter().map(Vec::len).sum::<usize>();
+        assert_eq!(samples[1].observed, marshaled_bytes);
+        assert_eq!(samples[2].observed, marshaled_bytes);
     }
 
     fn raw_row(

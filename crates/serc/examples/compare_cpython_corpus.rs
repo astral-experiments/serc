@@ -846,12 +846,13 @@ mod tests {
     use super::{
         CompilerInput, CompilerOutcome, ORACLE, Options, OracleOutcome, OutcomeKind,
         capture_compiler, classify, compile_input, compile_module_input, discover,
-        validate_outcome_counts,
+        validate_outcome_counts, verify_python,
     };
     use clap::{Parser, error::ErrorKind};
     use std::collections::BTreeMap;
     use std::fs;
     use std::path::Path;
+    use std::process::Command;
 
     #[test]
     fn default_corpus_and_explicit_roots() {
@@ -1027,17 +1028,39 @@ mod tests {
     }
 
     #[test]
-    fn oracle_classifies_only_compile_exceptions_as_rejected() {
-        let read = ORACLE.find("source = path.read_bytes()").unwrap();
-        let try_compile = ORACLE.find("try:\n    code = compile(source").unwrap();
-        let compile_exception = ORACLE.find("except Exception as error:").unwrap();
-        let marshal = ORACLE
-            .find("sys.stdout.buffer.write(marshal.dumps(code))")
-            .unwrap();
+    fn oracle_distinguishes_compilation_rejections_and_io_failures() {
+        let python =
+            std::env::var("SERC_TEST_PYTHON").unwrap_or_else(|_| "python3.14".to_string());
+        verify_python(&python).unwrap();
+        let directory = tempfile::tempdir().unwrap();
 
-        assert!(read < try_compile);
-        assert!(try_compile < compile_exception);
-        assert!(compile_exception < marshal);
+        for (filename, source, expected_status) in [
+            ("valid.py", Some("pass\n"), 0),
+            ("syntax.py", Some("if:\n"), 2),
+            ("semantic.py", Some("return\n"), 2),
+            ("missing.py", None, 1),
+        ] {
+            let path = directory.path().join(filename);
+            if let Some(source) = source {
+                fs::write(&path, source).unwrap();
+            }
+            let output = Command::new(&python)
+                .args(["-I", "-S", "-c", ORACLE])
+                .arg(&path)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(expected_status), "{output:?}");
+            if expected_status == 0 {
+                let expected = serc::compile(source.unwrap(), path.to_str().unwrap())
+                    .unwrap()
+                    .marshal();
+                assert_eq!(output.stdout, expected);
+                assert!(output.stderr.is_empty(), "{output:?}");
+            } else {
+                assert!(output.stdout.is_empty(), "{output:?}");
+                assert!(!output.stderr.is_empty(), "{output:?}");
+            }
+        }
     }
 
     #[test]
