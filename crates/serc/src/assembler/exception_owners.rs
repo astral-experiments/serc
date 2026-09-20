@@ -2,6 +2,7 @@ use std::cell::OnceCell;
 use std::cmp::Reverse;
 
 use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
 
 use super::{
     Instruction, Item, Label, LayoutAssembler, NormalizedExceptionOwner, Operand, SourceLocation,
@@ -642,6 +643,15 @@ impl ExceptionOwnerProvenance {
 
     /// Captures resolved source records before later passes can copy or change the array.
     fn capture_retained_setup_value_arrays(&mut self, items: &[Item]) {
+        if self.original_value_jump_prefixes.is_empty()
+            || self.synchronous_with_setups.is_empty()
+            || !self.setups.iter().any(|(label, location)| {
+                location.is_none() && self.synchronous_with_setups.contains(label)
+            })
+            || !self.setups.iter().any(|(_, location)| location.is_some())
+        {
+            return;
+        }
         for (value_entry, value_prefix) in &self.original_value_jump_prefixes {
             let mut starts = items
                 .iter()
@@ -4287,6 +4297,7 @@ impl LayoutAssembler {
         let mut pending_threaded_null_append = None;
         let mut has_uninterrupted_fusion = false;
         let mut instruction_index = 0;
+        let copied_handler_cleanups_by_end = OnceCell::new();
         for item in &self.items {
             match item {
                 Item::Label(label) => {
@@ -4301,10 +4312,26 @@ impl LayoutAssembler {
                         captured_null_slots.clear();
                         captured_handler_owner_slots.clear();
                     }
-                    for original in &self.exception_owner_provenance.copied_handler_cleanups {
-                        if original.end != *label || !owner_history_exact {
-                            continue;
-                        }
+                    let copied_handler_cleanups = if owner_history_exact
+                        && !self
+                            .exception_owner_provenance
+                            .copied_handler_cleanups
+                            .is_empty()
+                    {
+                        let by_end = copied_handler_cleanups_by_end.get_or_init(|| {
+                            let mut by_end: FxHashMap<_, SmallVec<[&CopiedHandlerCleanup; 1]>> =
+                                FxHashMap::default();
+                            for original in &self.exception_owner_provenance.copied_handler_cleanups
+                            {
+                                by_end.entry(original.end).or_default().push(original);
+                            }
+                            by_end
+                        });
+                        by_end.get(label)
+                    } else {
+                        None
+                    };
+                    for original in copied_handler_cleanups.into_iter().flatten() {
                         let Some(&start) = label_positions.get(&original.start) else {
                             continue;
                         };

@@ -4963,7 +4963,7 @@ impl OptimizationPipeline {
         let mut preceding_labels = Vec::new();
         let mut setup_nops = FxHashSet::default();
         let mut last_instruction: Option<(ItemPosition, Instruction)> = None;
-        let mut history_blocks = FxHashMap::default();
+        let mut history_blocks = Vec::new();
         let mut history_block = 0_usize;
         for block in graph
             .order()
@@ -5065,7 +5065,7 @@ impl OptimizationPipeline {
                             preceding_labels.clear();
                         }
                         last_instruction = Some((position, *instruction));
-                        history_blocks.insert(position, history_block);
+                        history_blocks.push(history_block);
                         if instruction.opcode == NOT_TAKEN
                             || is_unconditional_jump(instruction.opcode)
                             || ends_scope(instruction.opcode)
@@ -5243,6 +5243,8 @@ impl OptimizationPipeline {
                 })
         });
         let mut instructions = instructions.peekable();
+        // The history above visits every instruction in this same, unchanged graph order.
+        let mut history_blocks = history_blocks.into_iter();
         let mut previous = None;
         let mut previous_graph_block = None;
         let mut previous_position = None;
@@ -5258,7 +5260,7 @@ impl OptimizationPipeline {
         let mut pending_block = None;
         while let Some((graph_block, position, instruction)) = instructions.next() {
             let block = if track_exception_owners {
-                history_blocks[&position]
+                history_blocks.next().expect("NOP instruction history")
             } else {
                 0
             };
@@ -5420,6 +5422,7 @@ impl OptimizationPipeline {
                 removed_unpack_line_block = None;
             }
         }
+        debug_assert!(history_blocks.as_slice().is_empty());
 
         if track_pop_block_boundaries {
             self.exception_owner_provenance

@@ -76,14 +76,13 @@ impl LayoutAssembler {
         let mut block_labels = vec![false; labels.len()];
         let mut setup_labels = vec![false; labels.len()];
         let mut first_region_starts = vec![None; labels.len()];
-        for region in &self.exception_regions {
+        for (region, &(start, _, _, _, _, _)) in self.exception_regions.iter().zip(&regions) {
             if let Some(block_label) =
                 block_labels.get_mut(usize::try_from(region.target.0).unwrap())
             {
                 *block_label = true;
             }
             let target = usize::try_from(region.target.0).unwrap();
-            let start = label_position(labels, region.start).unwrap();
             if first_region_starts[target].is_none_or(|(position, _)| start < position) {
                 first_region_starts[target] = Some((start, region.start));
             }
@@ -159,10 +158,8 @@ impl LayoutAssembler {
                         + u32::from(extended_args[instruction_index])
                         + 1
                         + u32::from(instruction.opcode.caches());
-                    if let Some(region) = dynamic_exception_owners
-                        .get(&instruction_index)
-                        .and_then(|owner| owner.source_region)
-                    {
+                    let dynamic_owner = dynamic_exception_owners.get(&instruction_index);
+                    if let Some(region) = dynamic_owner.and_then(|owner| owner.source_region) {
                         late_source_exception_owners.push((position, end, region));
                     } else {
                         if instruction
@@ -172,7 +169,7 @@ impl LayoutAssembler {
                         {
                             late_exception_exclusions.push((position, end));
                         }
-                        if let Some(has_owner) = dynamic_exception_owners.get(&instruction_index) {
+                        if let Some(has_owner) = dynamic_owner {
                             if has_owner.has_owner {
                                 if has_owner.override_existing {
                                     late_exception_overrides.push((position, end));
@@ -188,9 +185,7 @@ impl LayoutAssembler {
                             == NormalizedExceptionOwner::Absent
                             || (instruction.exception_policy().owner()
                                 == NormalizedExceptionOwner::DynamicCondition
-                                && !dynamic_exception_owners
-                                    .get(&instruction_index)
-                                    .is_some_and(|owner| owner.has_owner))
+                                && !dynamic_owner.is_some_and(|owner| owner.has_owner))
                         {
                             if block_has_applied_comprehension_swap {
                                 late_exception_inclusions.push((position, end));

@@ -2016,7 +2016,7 @@ impl FusionOwnerCertificates {
         })) {
             return Self::default();
         }
-        let items = p.graph.iter_items().copied().collect::<Vec<_>>();
+        let items = p.graph.copy_items();
         let Some(view) = View::new(
             &items,
             &p.exception_regions,
@@ -2128,7 +2128,7 @@ impl FusionOwnerCertificates {
         {
             Vec::new()
         } else {
-            p.graph.iter_items().copied().collect()
+            p.graph.copy_items()
         }
     }
 
@@ -2140,7 +2140,7 @@ impl FusionOwnerCertificates {
             result.extend_original_owners(self);
             return result;
         }
-        let mut after = p.graph.iter_items().copied().collect::<Vec<_>>();
+        let mut after = p.graph.copy_items();
         let (Some(before_view), Some(after_view)) = (
             View::new(
                 before,
@@ -2381,7 +2381,7 @@ impl FusionOwnerCertificates {
     /// Transfers original fallback proofs across the immediately preceding fusion pass.
     fn retain_after_fusion(&mut self, before: &[Item], p: &OptimizationPipeline) {
         if self.has_fusion_transfer_certificates() {
-            let items = p.graph.iter_items().copied().collect::<Vec<_>>();
+            let items = p.graph.copy_items();
             if let (Some(before), Some(after)) = (
                 View::new(
                     before,
@@ -2438,7 +2438,7 @@ impl FusionOwnerCertificates {
         if self.is_empty() {
             return;
         }
-        let items = p.graph.iter_items().copied().collect::<Vec<_>>();
+        let items = p.graph.copy_items();
         let Some(view) = View::new(
             &items,
             &p.exception_regions,
