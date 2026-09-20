@@ -309,29 +309,14 @@ impl Writer<'_, '_, '_> {
                 if let Ok(value) = i32::try_from(*value) {
                     self.byte_and_long(TYPE_INT | flag, value.cast_unsigned());
                 } else {
-                    let digit_count = (64 - value.leading_zeros()).div_ceil(15).max(1);
-                    self.byte_and_long(TYPE_LONG | flag, digit_count);
-                    let mut remaining = *value;
-                    for _ in 0..digit_count {
-                        self.output
-                            .extend_from_slice(&((remaining & 0x7fff) as u16).to_le_bytes());
-                        remaining >>= 15;
-                    }
+                    self.long_integer(flag, *value, false);
                 }
             }
             Constant::SignedInt(value) => {
                 if let Ok(value) = i32::try_from(*value) {
                     self.byte_and_long(TYPE_INT | flag, value.cast_unsigned());
                 } else {
-                    let magnitude = value.unsigned_abs();
-                    let digit_count = (64 - magnitude.leading_zeros()).div_ceil(15).max(1);
-                    self.byte_and_long(TYPE_LONG | flag, 0_u32.wrapping_sub(digit_count));
-                    let mut remaining = magnitude;
-                    for _ in 0..digit_count {
-                        self.output
-                            .extend_from_slice(&((remaining & 0x7fff) as u16).to_le_bytes());
-                        remaining >>= 15;
-                    }
+                    self.long_integer(flag, value.unsigned_abs(), true);
                 }
             }
             Constant::BigInt { negative, digits } => {
@@ -407,14 +392,7 @@ impl Writer<'_, '_, '_> {
             return;
         }
 
-        let digit_count = (64 - value.leading_zeros()).div_ceil(15).max(1);
-        self.byte_and_long(TYPE_LONG | flag, digit_count);
-        let mut remaining = value;
-        for _ in 0..digit_count {
-            self.output
-                .extend_from_slice(&((remaining & 0x7fff) as u16).to_le_bytes());
-            remaining >>= 15;
-        }
+        self.long_integer(flag, value, false);
     }
 
     fn signed_integer(&mut self, object: ObjectId, value: i64, reference_mode: ReferenceMode) {
@@ -426,9 +404,21 @@ impl Writer<'_, '_, '_> {
             return;
         }
 
-        let magnitude = value.unsigned_abs();
+        self.long_integer(flag, value.unsigned_abs(), true);
+    }
+
+    /// Writes base-2^15 digits least significant first, with the sign encoded in the digit count.
+    /// `flag` comes from the caller's completed reference registration.
+    fn long_integer(&mut self, flag: u8, magnitude: u64, negative: bool) {
         let digit_count = (64 - magnitude.leading_zeros()).div_ceil(15).max(1);
-        self.byte_and_long(TYPE_LONG | flag, 0_u32.wrapping_sub(digit_count));
+        self.byte_and_long(
+            TYPE_LONG | flag,
+            if negative {
+                0_u32.wrapping_sub(digit_count)
+            } else {
+                digit_count
+            },
+        );
         let mut remaining = magnitude;
         for _ in 0..digit_count {
             self.output
