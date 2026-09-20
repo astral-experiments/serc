@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::rc::Rc;
 
 use ruff_python_ast::token::TokenKind;
 use ruff_python_ast::visitor::Visitor;
@@ -138,7 +138,7 @@ impl Compiler<'_> {
             0
         } | (self.unit.flags & SUPPORTED_FUTURE_FLAGS);
         let mut wrapper = Self::function(
-            Arc::clone(&self.context),
+            Rc::clone(&self.context),
             &wrapper_name,
             self.child_qualified_name(&wrapper_name),
             self.line_number(u32::from(statement.range.start())),
@@ -291,7 +291,7 @@ impl Compiler<'_> {
             0
         } | (self.unit.flags & SUPPORTED_FUTURE_FLAGS);
         let mut wrapper = Self::function(
-            Arc::clone(&self.context),
+            Rc::clone(&self.context),
             &wrapper_name,
             self.child_qualified_name(&wrapper_name),
             self.line_number(u32::from(
@@ -480,7 +480,7 @@ impl Compiler<'_> {
                 definition.range.start()
             }));
         let mut child = Self::function(
-            Arc::clone(&self.context),
+            Rc::clone(&self.context),
             definition.name.as_str(),
             qualified_name,
             first_line_number,
@@ -725,7 +725,7 @@ impl Compiler<'_> {
             0
         } | (self.unit.flags & SUPPORTED_FUTURE_FLAGS);
         let mut wrapper = Self::function(
-            Arc::clone(&self.context),
+            Rc::clone(&self.context),
             &wrapper_name,
             self.child_qualified_name(&wrapper_name),
             self.line_number(u32::from(
@@ -854,7 +854,7 @@ impl Compiler<'_> {
             }));
         let class_scope_is_nested = self.child_function_is_nested();
         let mut child = Self::class(
-            Arc::clone(&self.context),
+            Rc::clone(&self.context),
             definition.name.as_str(),
             qualified_name,
             first_line_number,
@@ -1250,7 +1250,7 @@ impl Compiler<'_> {
             }
         };
         let mut child = Self::function(
-            Arc::clone(&self.context),
+            Rc::clone(&self.context),
             name,
             if self.unit.generic_target_qualified_name.is_some() {
                 self.unit.qualified_name.rsplit_once('.').map_or_else(
@@ -1443,7 +1443,7 @@ impl Compiler<'_> {
                 )
         };
         let mut child = Self::function(
-            Arc::clone(&self.context),
+            Rc::clone(&self.context),
             "__annotate__",
             annotation_qualified_name,
             self.line_number(u32::from(definition.name.range().start())),
@@ -1583,7 +1583,7 @@ impl Compiler<'_> {
                 0
             };
         let mut child = Self::function(
-            Arc::clone(&self.context),
+            Rc::clone(&self.context),
             "__annotate__",
             self.child_qualified_name("__annotate__"),
             self.unit.first_line_number,
@@ -1695,7 +1695,7 @@ impl Compiler<'_> {
             ..LoweringFunctionPlan::default()
         };
         let mut child = Self::function(
-            Arc::clone(&self.context),
+            Rc::clone(&self.context),
             "__annotate__",
             "__annotate__".to_string(),
             self.line_number(u32::from(

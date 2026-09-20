@@ -2,9 +2,7 @@ use std::collections::hash_map::Entry;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::code_object::{
-    CodeInterningSummary, CodeObject, CompilationInterningEventKind, Constant,
-};
+use crate::code_object::{CodeInterningSummary, CodeObject, CompilationInterningEvent, Constant};
 use crate::target::{is_preinterned_string_for, small_int_bounds_for};
 use crate::{InitialInternState, PythonVersion};
 
@@ -1395,19 +1393,17 @@ fn collect_compilation_interning<'a>(
 
     let mut surviving = FxHashMap::default();
     collect_surviving(code, &mut surviving);
-    let mut events: Vec<_> = code.marshal_provenance.interning_events.iter().collect();
-    events.sort_unstable_by_key(|event| event.order);
     let mut tuple_origins = FxHashMap::default();
-    for event in events {
-        match &event.kind {
-            CompilationInterningEventKind::CachedTuple(values) => {
+    for (order, event) in code.marshal_provenance.interning_events.iter().enumerate() {
+        match event {
+            CompilationInterningEvent::CachedTuple(values) => {
                 tuple_origins
                     .entry(values.iter().map(String::as_str).collect())
                     .or_insert(true);
             }
-            CompilationInterningEventKind::CodeAssembly(summary) => {
+            CompilationInterningEvent::CodeAssembly(summary) => {
                 let origins = CodeTupleOrigins::record(summary, &mut tuple_origins);
-                if let Some(current) = surviving.get(&event.order) {
+                if let Some(current) = surviving.get(&order) {
                     intern_code_object(
                         current,
                         origins,

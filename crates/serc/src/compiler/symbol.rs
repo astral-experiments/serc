@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::sync::Arc;
+use std::rc::Rc;
 
 use ruff_python_ast::visitor::{Visitor, walk_expr, walk_pattern, walk_stmt};
 use ruff_python_ast::{Expr, ExprContext, Pattern, Stmt};
@@ -367,7 +367,7 @@ impl Compiler<'_> {
     }
 
     pub(super) fn store_name_id(&mut self, name_id: NameId) -> Result<(), CompileError> {
-        let context = Arc::clone(&self.context);
+        let context = Rc::clone(&self.context);
         let name = context.scopes.names.resolve(name_id);
         self.store_name_with_id(name, name_id)
     }
@@ -450,7 +450,7 @@ impl Compiler<'_> {
     }
 
     pub(super) fn delete_name_id(&mut self, name_id: NameId) -> Result<(), CompileError> {
-        let context = Arc::clone(&self.context);
+        let context = Rc::clone(&self.context);
         let name = context.scopes.names.resolve(name_id);
         self.delete_name_with_id(name, name_id)
     }

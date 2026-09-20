@@ -1,6 +1,6 @@
 use std::cell::Cell;
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::rc::Rc;
 
 use ruff_python_ast::token::Tokens;
 use ruff_python_ast::{Expr, Stmt, Suite};
@@ -117,11 +117,7 @@ impl ConstantTable for InterningConstantTable<'_, '_> {
 }
 
 impl<'source> Compiler<'source> {
-    fn new(
-        context: Arc<CompilationContext<'source>>,
-        unit: CodeUnit,
-        symbols: SymbolState,
-    ) -> Self {
+    fn new(context: Rc<CompilationContext<'source>>, unit: CodeUnit, symbols: SymbolState) -> Self {
         let assembler = Assembler::with_python_version(context.python_version);
         Self {
             context,
@@ -137,7 +133,7 @@ impl<'source> Compiler<'source> {
     /// Shares lexical context while keeping discarded parent instructions in a fresh emitter.
     pub(super) fn discarded_builder(&self) -> Self {
         Self::new(
-            Arc::clone(&self.context),
+            Rc::clone(&self.context),
             self.unit.clone(),
             self.symbols.clone(),
         )
@@ -166,7 +162,7 @@ impl<'source> Compiler<'source> {
         body: &Suite,
         python_version: crate::PythonVersion,
     ) -> Self {
-        let context = Arc::new(CompilationContext::with_python_version(
+        let context = Rc::new(CompilationContext::with_python_version(
             filename,
             source,
             tokens,
@@ -190,7 +186,7 @@ impl<'source> Compiler<'source> {
     }
 
     pub(super) fn function(
-        context: Arc<CompilationContext<'source>>,
+        context: Rc<CompilationContext<'source>>,
         name: &str,
         qualified_name: String,
         first_line_number: u32,
@@ -282,7 +278,7 @@ impl<'source> Compiler<'source> {
     }
 
     pub(super) fn class(
-        context: Arc<CompilationContext<'source>>,
+        context: Rc<CompilationContext<'source>>,
         name: &str,
         qualified_name: String,
         first_line_number: u32,
@@ -1009,7 +1005,7 @@ impl<'source> Compiler<'source> {
         code.validate()?;
         code.marshal_provenance.assembly_order = self.context.record_code_assembly(&code);
         if matches!(self.unit.scope, Scope::Module) {
-            code.marshal_provenance.interning_events = self.context.interning_events();
+            code.marshal_provenance.interning_events = self.context.take_interning_events();
         }
         Ok(code)
     }
