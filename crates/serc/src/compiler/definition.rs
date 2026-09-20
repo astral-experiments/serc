@@ -1587,7 +1587,7 @@ impl Compiler<'_> {
                 child
                     .assembler
                     .set_location(child.source_location(annotation.range));
-                child.emit_annotation_index(conditional_index)?;
+                child.emit_unsigned_constant(conditional_index)?;
                 conditional_index += 1;
                 let conditional = child.closure_index("__conditional_annotations__")?;
                 child.emit(LOAD_DEREF, conditional, 1)?;
@@ -1706,7 +1706,7 @@ impl Compiler<'_> {
             let location = self.source_location(annotation.range);
             child.assembler.set_location(location);
             let index = to_u32(index, "module annotation index")?;
-            child.emit_annotation_index(index)?;
+            child.emit_unsigned_constant(index)?;
             child.load_name("__conditional_annotations__")?;
             child.emit(CONTAINS_OP, 0, -1)?;
             let skip = child.assembler.label();

@@ -16720,7 +16720,7 @@ impl Compiler<'_> {
                     .set_location(self.source_location(assignment.range));
                 let cell = self.closure_index("__conditional_annotations__")?;
                 self.emit(LOAD_DEREF, cell, 1)?;
-                self.emit_annotation_index(index)?;
+                self.emit_unsigned_constant(index)?;
                 self.emit(SET_ADD, 1, -1)?;
                 self.emit(POP_TOP, 0, -1)?;
             }
@@ -16766,7 +16766,7 @@ impl Compiler<'_> {
                 self.assembler
                     .set_location(self.source_location(assignment.range));
                 self.load_name("__conditional_annotations__")?;
-                self.emit_annotation_index(index)?;
+                self.emit_unsigned_constant(index)?;
                 self.emit(SET_ADD, 1, -1)?;
                 self.emit(POP_TOP, 0, -1)?;
             }
@@ -27728,7 +27728,7 @@ impl Compiler<'_> {
         if self.output.constants.is_empty() {
             self.add_constant(Constant::Int(u64::from(statement.level)))?;
         }
-        self.emit(LOAD_SMALL_INT, statement.level, 1)?;
+        self.emit_unsigned_constant(statement.level)?;
         let imported_names = statement
             .names
             .iter()
