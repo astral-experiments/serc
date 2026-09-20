@@ -1,7 +1,7 @@
 mod common;
 
 use std::process::Command;
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, UNIX_EPOCH};
 
 fn serc() -> Command {
     Command::new(env!("CARGO_BIN_EXE_serc"))
@@ -23,6 +23,16 @@ fn compile_writes_a_timestamp_pyc() {
     let source_path = directory.path().join("module.py");
     let source = "answer = 42\n";
     fs_err::write(&source_path, source).unwrap();
+    let source_mtime = 1_700_000_000;
+    std::fs::File::options()
+        .write(true)
+        .open(&source_path)
+        .unwrap()
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_modified(UNIX_EPOCH + Duration::from_secs(u64::from(source_mtime))),
+        )
+        .unwrap();
 
     let output = serc()
         .args(["compile", "--quiet"])
@@ -35,18 +45,84 @@ fn compile_writes_a_timestamp_pyc() {
     assert!(output.stderr.is_empty());
 
     let pyc_path = directory.path().join("__pycache__/module.cpython-314.pyc");
-    let metadata = fs_err::metadata(&source_path).unwrap();
-    let seconds = metadata
-        .modified()
-        .unwrap()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let source_mtime = u32::try_from(seconds).unwrap();
     let expected =
         serc::compile_to_pyc(source, &source_path.to_string_lossy(), source_mtime).unwrap();
 
     assert_eq!(fs_err::read(pyc_path).unwrap(), expected);
+}
+
+#[cfg(unix)]
+#[test]
+fn compile_matches_cpython_for_rounded_timestamps() {
+    let directory = tempfile::tempdir().unwrap();
+    let source_path = directory.path().join("module.py");
+    let pyc_path = directory.path().join("__pycache__/module.cpython-314.pyc");
+    fs_err::write(&source_path, "answer = 42\n").unwrap();
+
+    for (before_epoch, seconds, nanos) in [
+        (false, 1_700_000_000, 999_999_999),
+        (false, 1_700_000_000, 1),
+        (true, 1_700_000_000, 999_999_999),
+        (true, 1_700_000_000, 1),
+        (true, 1, 500_000_000),
+        (true, 0, 500_000_000),
+        (false, u64::from(u32::MAX), 999_999_999),
+    ] {
+        let duration = Duration::new(seconds, nanos);
+        let modified = if before_epoch {
+            UNIX_EPOCH - duration
+        } else {
+            UNIX_EPOCH + duration
+        };
+        std::fs::File::options()
+            .write(true)
+            .open(&source_path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert_eq!(
+            fs_err::metadata(&source_path).unwrap().modified().unwrap(),
+            modified
+        );
+
+        let output = serc()
+            .args(["compile", "--quiet"])
+            .arg(&source_path)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{modified:?}: {output:?}");
+
+        let native = common::python_3145_command()
+            .args([
+                "-B",
+                "-c",
+                r"
+import importlib._bootstrap_external as external
+import pathlib
+import py_compile
+import sys
+
+source = pathlib.Path(sys.argv[1])
+cache = pathlib.Path(sys.argv[2])
+actual = cache.read_bytes()
+stat = source.stat()
+external._validate_timestamp_pyc(actual, int(stat.st_mtime), stat.st_size, 'module', {})
+oracle = py_compile.compile(str(source), cfile=str(cache) + '.oracle', doraise=True,
+                            optimize=0, invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP)
+sys.stdout.buffer.write(pathlib.Path(oracle).read_bytes())
+",
+            ])
+            .arg(&source_path)
+            .arg(&pyc_path)
+            .output()
+            .unwrap();
+        assert!(native.status.success(), "{modified:?}: {native:?}");
+        assert_eq!(
+            fs_err::read(&pyc_path).unwrap(),
+            native.stdout,
+            "{modified:?}"
+        );
+    }
 }
 
 #[test]

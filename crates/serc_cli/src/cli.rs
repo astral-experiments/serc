@@ -214,12 +214,30 @@ fn compile_path_with_metadata(
 
 /// Encodes signed Unix seconds for a CPython timestamp cache header.
 ///
-/// Fractional seconds are truncated toward zero, then the value wraps modulo 2^32.
+/// CPython first exposes `st_mtime` as a float, then truncates toward zero and wraps
+/// modulo 2^32. Rounding can move a nanosecond timestamp into the next second.
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "match CPython's floating-point stat time; the final remainder fits in u32"
+)]
 fn encode_mtime(modified: SystemTime) -> u32 {
-    match modified.duration_since(UNIX_EPOCH) {
-        Ok(duration) => low_u32(duration.as_secs()),
-        Err(error) => 0_u32.wrapping_sub(low_u32(error.duration().as_secs())),
-    }
+    let (seconds, nanos) = match modified.duration_since(UNIX_EPOCH) {
+        Ok(duration) => (i128::from(duration.as_secs()), duration.subsec_nanos()),
+        Err(error) => {
+            let duration = error.duration();
+            let seconds = -i128::from(duration.as_secs());
+            if duration.subsec_nanos() == 0 {
+                (seconds, 0)
+            } else {
+                (seconds - 1, 1_000_000_000 - duration.subsec_nanos())
+            }
+        }
+    };
+    // Match Modules/posixmodule.c's `sec + 1e-9*nsec`, including before the epoch.
+    let mtime = seconds as f64 + 1e-9 * f64::from(nanos);
+    mtime.trunc().rem_euclid(4_294_967_296.0) as u32
 }
 
 fn low_u32(value: u64) -> u32 {
@@ -347,6 +365,22 @@ mod tests {
         assert_eq!(encode_mtime(UNIX_EPOCH - Duration::from_millis(500)), 0);
         assert_eq!(
             encode_mtime(UNIX_EPOCH + Duration::from_secs(u64::from(u32::MAX) + 1)),
+            0
+        );
+        assert_eq!(
+            encode_mtime(UNIX_EPOCH + Duration::new(1_700_000_000, 999_999_999)),
+            1_700_000_001
+        );
+        assert_eq!(
+            encode_mtime(UNIX_EPOCH - Duration::new(1_700_000_000, 999_999_999)),
+            0_u32.wrapping_sub(1_700_000_001)
+        );
+        assert_eq!(
+            encode_mtime(UNIX_EPOCH + Duration::new(u64::from(u32::MAX), 999_999_999)),
+            0
+        );
+        assert_eq!(
+            encode_mtime(UNIX_EPOCH - Duration::new(u64::from(u32::MAX), 999_999_999)),
             0
         );
     }
