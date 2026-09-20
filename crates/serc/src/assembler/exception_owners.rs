@@ -1005,18 +1005,32 @@ impl ExceptionOwnerProvenance {
         // A raw emitted return or copied backedge is not necessarily a CP
         // record. The compiler's original branch target establishes the left
         // edge independently; the preceding terminator only bounds this scan.
-        let has_original_target = self.original_primitive_condition_boundaries.iter().any(|condition| {
-            matches!(condition.operand(), Operand::Forward(label) if leading_labels.contains(&label))
-                && all.iter().filter(|item| **item == Item::Instruction(*condition)).count() == 1
-        }) || all.iter().any(|item| {
-            matches!(item, Item::Instruction(instruction)
-                if instruction.fusion_policy.is_authored_break()
-                && matches!(instruction.operand(), Operand::Forward(label) | Operand::Backward(label)
-                    if leading_labels.contains(&label)))
-        }) || self.original_match_join_boundaries.iter().any(|entry| {
-            leading_labels.contains(entry)
-                && all.iter().filter(|item| **item == Item::Label(*entry)).count() == 1
-        });
+        let has_original_target = || {
+            self.original_primitive_condition_boundaries
+                .iter()
+                .any(|condition| {
+                    matches!(condition.operand(), Operand::Forward(label) if leading_labels.contains(&label))
+                        && all
+                            .iter()
+                            .filter(|item| **item == Item::Instruction(*condition))
+                            .count()
+                            == 1
+                })
+                || all.iter().any(|item| {
+                    matches!(item, Item::Instruction(instruction)
+                        if instruction.fusion_policy.is_authored_break()
+                        && matches!(instruction.operand(), Operand::Forward(label) | Operand::Backward(label)
+                            if leading_labels.contains(&label)))
+                })
+                || self.original_match_join_boundaries.iter().any(|entry| {
+                    leading_labels.contains(entry)
+                        && all
+                            .iter()
+                            .filter(|item| **item == Item::Label(*entry))
+                            .count()
+                            == 1
+                })
+        };
         if source_head {
             // Graph jump targets alone include copied exits. Require the compiler's
             // original source boundary and exactly one original array at this head.
@@ -1058,7 +1072,10 @@ impl ExceptionOwnerProvenance {
                     return false;
                 }
             }
-        } else if !has_original_target && comprehension_restore_count == 0 && !empty_class_success {
+        } else if comprehension_restore_count == 0
+            && !empty_class_success
+            && (leading_labels.is_empty() || !has_original_target())
+        {
             return false;
         }
         let UncompactedPrefixIndexes { positions, targets } = indexes.get_or_init(|| {
@@ -4301,14 +4318,15 @@ impl LayoutAssembler {
         for item in &self.items {
             match item {
                 Item::Label(label) => {
-                    if boundaries.contains(label)
-                        || jump_targets.contains(label)
-                        || setups.contains_key(label)
-                        || self
-                            .exception_owner_provenance
-                            .source_boundaries
-                            .contains(label)
-                    {
+                    let is_boundary = boundaries.contains(label);
+                    let is_join = is_boundary || jump_targets.contains(label);
+                    let is_region_end = region_ends.contains(label);
+                    let setup = setups.get(label);
+                    let is_source_boundary = self
+                        .exception_owner_provenance
+                        .source_boundaries
+                        .contains(label);
+                    if is_join || setup.is_some() || is_source_boundary {
                         captured_null_slots.clear();
                         captured_handler_owner_slots.clear();
                     }
@@ -4439,13 +4457,9 @@ impl LayoutAssembler {
                             ));
                         }
                     }
-                    if boundaries.contains(label)
-                        || jump_targets.contains(label)
-                        || setups.contains_key(label)
-                        || self
-                            .exception_owner_provenance
-                            .source_boundaries
-                            .contains(label)
+                    if is_join
+                        || setup.is_some()
+                        || is_source_boundary
                         || self
                             .exception_owner_provenance
                             .removed_pop_block_boundaries
@@ -4457,9 +4471,8 @@ impl LayoutAssembler {
                         .exception_owner_provenance
                         .continuation_boundaries
                         .contains(label)
-                        && !boundaries.contains(label)
-                        && !jump_targets.contains(label)
-                        && !setups.contains_key(label)
+                        && !is_join
+                        && setup.is_none()
                         && !self
                             .exception_owner_provenance
                             .removed_pop_block_boundaries
@@ -4467,9 +4480,8 @@ impl LayoutAssembler {
                     if !continues_original_block {
                         has_uninterrupted_fusion = false;
                     }
-                    if boundaries.contains(label)
-                        || jump_targets.contains(label)
-                        || (!setups.contains_key(label)
+                    if is_join
+                        || (setup.is_none()
                             && !self
                                 .exception_owner_provenance
                                 .setup_nop_boundaries
@@ -4478,13 +4490,9 @@ impl LayoutAssembler {
                         pending_retained_prefix = None;
                     }
                     if transferred_pop_setup.is_some_and(|(setup, _)| {
-                        boundaries.contains(label)
-                            || jump_targets.contains(label)
-                            || region_ends.contains(label)
-                            || self
-                                .exception_owner_provenance
-                                .source_boundaries
-                                .contains(label)
+                        is_join
+                            || is_region_end
+                            || is_source_boundary
                             || self
                                 .exception_owner_provenance
                                 .removed_pop_block_boundaries
@@ -4505,9 +4513,8 @@ impl LayoutAssembler {
                     }) {
                         transferred_pop_setup = None;
                     }
-                    if boundaries.contains(label)
-                        || jump_targets.contains(label)
-                        || setups.contains_key(label)
+                    if is_join
+                        || setup.is_some()
                         || self
                             .exception_owner_provenance
                             .removed_pop_block_boundaries
@@ -4518,18 +4525,14 @@ impl LayoutAssembler {
                     // Only range endpoints and recorded bookkeeping continuations may
                     // intervene between this authenticated await condition and its marker.
                     // An authored entry or an unknown label ends the original-array proof.
-                    if boundaries.contains(label)
-                        || jump_targets.contains(label)
-                        || setups.contains_key(label)
-                        || self
-                            .exception_owner_provenance
-                            .source_boundaries
-                            .contains(label)
+                    if is_join
+                        || setup.is_some()
+                        || is_source_boundary
                         || self
                             .exception_owner_provenance
                             .removed_pop_block_boundaries
                             .contains(label)
-                        || !(region_ends.contains(label)
+                        || !(is_region_end
                             || self
                                 .exception_owner_provenance
                                 .continuation_boundaries
@@ -4537,10 +4540,9 @@ impl LayoutAssembler {
                     {
                         pending_await_null_append = None;
                     }
-                    if boundaries.contains(label)
-                        || jump_targets.contains(label)
-                        || setups.contains_key(label)
-                        || region_ends.contains(label)
+                    if is_join
+                        || setup.is_some()
+                        || is_region_end
                         || self
                             .exception_owner_provenance
                             .removed_pop_block_boundaries
@@ -4552,14 +4554,10 @@ impl LayoutAssembler {
                         let original_pop_append = pending_null_append == Some(instruction_index)
                             && owner_history_exact
                             && pop_slot_epoch_known
-                            && region_ends.contains(label)
-                            && !boundaries.contains(label)
-                            && !jump_targets.contains(label)
-                            && !setups.contains_key(label)
-                            && !self
-                                .exception_owner_provenance
-                                .source_boundaries
-                                .contains(label)
+                            && is_region_end
+                            && !is_join
+                            && setup.is_none()
+                            && !is_source_boundary
                             && !self
                                 .exception_owner_provenance
                                 .fusion_boundaries
@@ -4605,18 +4603,17 @@ impl LayoutAssembler {
                         pending_fresh_null_append = None;
                         pending_normal_pop_null_append = None;
                     }
-                    if boundaries.contains(label)
-                        || jump_targets.contains(label)
-                        || setups.contains_key(label)
+                    if is_join
+                        || setup.is_some()
                         || self
                             .exception_owner_provenance
                             .removed_pop_block_boundaries
                             .contains(label)
-                        || (!region_ends.contains(label) && !continues_original_block)
+                        || (!is_region_end && !continues_original_block)
                     {
                         pending_compacted_append = None;
                     }
-                    if has_instruction && boundaries.contains(label) {
+                    if has_instruction && is_boundary {
                         retained_pop_prefix = None;
                         original_array_start = instruction_index;
                         captured_null_slots.clear();
@@ -4638,7 +4635,7 @@ impl LayoutAssembler {
                         uniform_with_suffix = None;
                         ended_owned_suffix = None;
                     }
-                    if region_ends.contains(label)
+                    if is_region_end
                         && !continues_original_block
                         && !self
                             .exception_owner_provenance
@@ -4824,9 +4821,9 @@ impl LayoutAssembler {
                         }
                     }
                     if has_instruction
-                        && !boundaries.contains(label)
-                        && !setups.contains_key(label)
-                        && !region_ends.contains(label)
+                        && !is_boundary
+                        && setup.is_none()
+                        && !is_region_end
                         && !continues_original_block
                         && !self
                             .exception_owner_provenance
@@ -4945,9 +4942,9 @@ impl LayoutAssembler {
                         }
                     }
                     if has_instruction
-                        && !boundaries.contains(label)
+                        && !is_boundary
                         && (jump_targets.contains(label)
-                            || (!setups.contains_key(label)
+                            || (setup.is_none()
                                 && !continues_original_block
                                 && !self
                                     .exception_owner_provenance
@@ -4985,16 +4982,8 @@ impl LayoutAssembler {
                         captured_null_slots.clear();
                         captured_handler_owner_slots.clear();
                     }
-                    source_block |= self
-                        .exception_owner_provenance
-                        .source_boundaries
-                        .contains(label);
-                    if boundaries.contains(label)
-                        && self
-                            .exception_owner_provenance
-                            .source_boundaries
-                            .contains(label)
-                    {
+                    source_block |= is_source_boundary;
+                    if is_boundary && is_source_boundary {
                         source_owned_prefix = Some((instruction_index, tail));
                     }
                     if owner_history_exact
@@ -5005,7 +4994,7 @@ impl LayoutAssembler {
                     {
                         source_owned_prefix = Some((instruction_index, tail));
                     }
-                    if let Some(nop_location) = setups.get(label) {
+                    if let Some(nop_location) = setup {
                         ended_owned_suffix = None;
                         source_owned_prefix = None;
                         let retained = nop_location.is_some_and(|location| {
@@ -12220,6 +12209,7 @@ mod tests {
             "authored break",
             "borrowed",
             "range alias",
+            "missing leading labels",
             "unknown origin",
             "changed origin",
             "duplicate origin",
@@ -12269,6 +12259,17 @@ mod tests {
                     jump.fusion_policy.mark_authored_break();
                     items[0] = Item::Instruction(jump);
                     provenance.original_primitive_condition_boundaries.clear();
+                }
+                "missing leading labels" => {
+                    items.retain(|item| !matches!(item, Item::Label(Label(1) | Label(2))));
+                    // A still-literal incoming condition cannot authenticate an unlabeled array.
+                    assert!(!provenance.uncompacted_prefix(
+                        &items[3..=10],
+                        &items,
+                        &std::cell::OnceCell::new(),
+                        0,
+                        false,
+                    ));
                 }
                 "unknown origin" => provenance.original_primitive_condition_boundaries.clear(),
                 "changed origin" => {
