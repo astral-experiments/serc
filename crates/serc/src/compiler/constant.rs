@@ -1615,15 +1615,30 @@ pub(super) fn fold_constant(expression: &Expr) -> Option<Constant> {
                         return Some(Constant::Tuple(Vec::new()));
                     };
                     let times = usize::try_from(times).ok()?;
-                    (times <= max_times).then(|| {
-                        Constant::Tuple((0..times).flat_map(|_| value.iter().cloned()).collect())
-                    })
+                    if times > max_times {
+                        return None;
+                    }
+                    if let Some(budget) = 1024_usize.checked_div(times) {
+                        check_tuple_complexity(&value, budget)?;
+                    }
+                    Some(Constant::Tuple(
+                        (0..times).flat_map(|_| value.iter().cloned()).collect(),
+                    ))
                 }
                 _ => None,
             }
         }
         _ => None,
     }
+}
+
+// CPython also limits recursively contained tuple items when folding repetition.
+fn check_tuple_complexity(values: &[Constant], budget: usize) -> Option<usize> {
+    let budget = budget.checked_sub(values.len())?;
+    values.iter().try_fold(budget, |budget, value| match value {
+        Constant::Tuple(values) => check_tuple_complexity(values, budget),
+        _ => Some(budget),
+    })
 }
 
 fn fold_integer_bitwise(left: &Constant, operator: Operator, right: &Constant) -> Option<Constant> {

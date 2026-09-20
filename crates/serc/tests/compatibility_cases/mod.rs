@@ -278,6 +278,7 @@ mod try_loop_attribute_ifexp_owner_compatibility;
 mod try_loop_exit_markers;
 mod try_nested_assignment_compatibility;
 mod try_tail_iterator_pass_handler_compatibility;
+mod tuple_repeat_complexity_compatibility;
 mod tuple_unpack_owner_slots;
 mod typed_handler_entry_owner_boundary;
 mod unary_positive_compatibility;
