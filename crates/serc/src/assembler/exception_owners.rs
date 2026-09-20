@@ -12261,7 +12261,7 @@ mod tests {
                     provenance.original_primitive_condition_boundaries.clear();
                 }
                 "missing leading labels" => {
-                    items.retain(|item| !matches!(item, Item::Label(Label(1) | Label(2))));
+                    items.retain(|item| !matches!(item, Item::Label(Label(1 | 2))));
                     // A still-literal incoming condition cannot authenticate an unlabeled array.
                     assert!(!provenance.uncompacted_prefix(
                         &items[3..=10],
