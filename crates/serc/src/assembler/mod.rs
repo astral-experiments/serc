@@ -536,7 +536,11 @@ impl Assembler {
             return false;
         };
         if !matches!(load.opcode, LOAD_CONST | LOAD_SMALL_INT)
-            || !ordinary(resume, RESUME, Operand::Value(0))
+            || !ordinary(
+                resume,
+                RESUME,
+                Operand::Value(ResumeLocation::AT_FUNC_START.argument()),
+            )
             || !ordinary(load, load.opcode, Operand::Value(argument))
             || !ordinary(ret, RETURN_VALUE, Operand::Value(0))
             || nop

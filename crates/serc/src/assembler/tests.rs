@@ -2913,7 +2913,7 @@ fn linear_constant_return_matches_the_block_graph_pipeline() {
     ] {
         let mut items = vec![Item::Instruction(Instruction::new(
             RESUME,
-            Operand::Value(0),
+            Operand::Value(ResumeLocation::AT_FUNC_START.argument()),
             resume,
             Some(0),
         ))];
@@ -2973,7 +2973,7 @@ fn linear_constant_return_matches_the_block_graph_pipeline() {
 fn linear_constant_return_rejects_nontrivial_instructions_and_metadata() {
     let original = || {
         vec![
-            pass_instruction(RESUME, 0, 1),
+            pass_instruction(RESUME, ResumeLocation::AT_FUNC_START.argument(), 1),
             pass_instruction(NOP, 0, 2),
             pass_instruction(LOAD_CONST, 0, 2),
             pass_instruction(RETURN_VALUE, 0, 2),
