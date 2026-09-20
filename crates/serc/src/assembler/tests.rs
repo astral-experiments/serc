@@ -2960,7 +2960,9 @@ fn linear_constant_return_matches_the_block_graph_pipeline() {
         assert_eq!(
             actual
                 .bytecode
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .any(|instruction| instruction[0] == NOP.code()),
             retains_nop
         );
