@@ -1616,11 +1616,7 @@ impl Compiler<'_> {
             if self.output.constants.is_empty() {
                 self.add_constant(Constant::Int(u64::try_from(minimum).unwrap_or(u64::MAX)))?;
             }
-            self.emit(
-                LOAD_SMALL_INT,
-                to_u32(minimum, "sequence pattern length")?,
-                1,
-            )?;
+            self.emit_unsigned_constant(to_u32(minimum, "sequence pattern length")?)?;
             self.emit_comparison(
                 if starred.is_some() {
                     ComparisonOperation::GE
@@ -1652,17 +1648,13 @@ impl Compiler<'_> {
                     .set_location(self.source_location(pattern.range));
                 self.emit(COPY, 1, 1)?;
                 if index < starred {
-                    self.emit(LOAD_SMALL_INT, to_u32(index, "sequence pattern index")?, 1)?;
+                    self.emit_unsigned_constant(to_u32(index, "sequence pattern index")?)?;
                 } else {
                     self.emit(GET_LEN, 0, 1)?;
-                    self.emit(
-                        LOAD_SMALL_INT,
-                        to_u32(
-                            pattern.patterns.len() - index,
-                            "sequence pattern suffix index",
-                        )?,
-                        1,
-                    )?;
+                    self.emit_unsigned_constant(to_u32(
+                        pattern.patterns.len() - index,
+                        "sequence pattern suffix index",
+                    )?)?;
                     self.emit_binary_operation(binary_operator(Operator::Sub, false))?;
                 }
                 self.emit_binary_operation(BinaryOperation::SUBSCR)?;
@@ -1721,11 +1713,7 @@ impl Compiler<'_> {
             self.add_constant(Constant::Int(
                 u64::try_from(pattern.keys.len()).unwrap_or(u64::MAX),
             ))?;
-            self.emit(
-                LOAD_SMALL_INT,
-                to_u32(pattern.keys.len(), "mapping pattern key count")?,
-                1,
-            )?;
+            self.emit_unsigned_constant(to_u32(pattern.keys.len(), "mapping pattern key count")?)?;
             self.emit_comparison(ComparisonOperation::GE, ComparisonMode::Value)?;
             self.jump_to_match_fail_with_marker_policy(
                 context,

@@ -679,13 +679,13 @@ impl Compiler<'_> {
         }
     }
 
-    pub(super) fn emit_annotation_index(&mut self, index: u32) -> Result<(), CompileError> {
-        if u8::try_from(index).is_ok() {
-            self.emit(LOAD_SMALL_INT, index, 1)
+    pub(super) fn emit_unsigned_constant(&mut self, value: u32) -> Result<(), CompileError> {
+        if u8::try_from(value).is_ok() {
+            self.emit(LOAD_SMALL_INT, value, 1)
         } else {
-            // CPython's small-integer load table ends at 255. Larger annotation indices remain
-            // ordinary constants in both the scope body and its deferred annotation thunk.
-            let constant = self.add_constant(Constant::Int(u64::from(index)))?;
+            // CPython's small-integer load table ends at 255. Larger synthesized integers
+            // must be loaded from the constant table.
+            let constant = self.add_constant(Constant::Int(u64::from(value)))?;
             self.emit(LOAD_CONST, constant, 1)
         }
     }
