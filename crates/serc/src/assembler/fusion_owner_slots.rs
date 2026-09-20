@@ -12,6 +12,7 @@ use crate::target::opcodes::{
     STORE_FAST_STORE_FAST,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
 use std::cmp::Reverse;
 
 type Key = (i32, i32, i32, i32, u8, u32);
@@ -66,15 +67,28 @@ fn key(condition: Instruction, marker: Instruction) -> Option<Key> {
     ))
 }
 
+/// Reusable allocations for indexes whose records are rebuilt at every checkpoint.
+#[derive(Default)]
+struct ViewTables {
+    labels: FxHashMap<Label, (usize, usize)>,
+    markers: FxHashMap<Key, SmallVec<[(usize, usize); 1]>>,
+}
+
+impl ViewTables {
+    fn clear(&mut self) {
+        self.labels.clear();
+        self.markers.clear();
+    }
+}
+
 struct View<'a> {
     items: &'a [Item],
     regions: &'a [ExceptionRegion],
     provenance: &'a ExceptionOwnerProvenance,
-    labels: FxHashMap<Label, usize>,
-    positions: FxHashMap<Label, usize>,
+    labels: FxHashMap<Label, (usize, usize)>,
     boundaries: FxHashSet<Label>,
     references: FxHashSet<Label>,
-    markers: FxHashMap<Key, Vec<(usize, usize)>>,
+    markers: FxHashMap<Key, SmallVec<[(usize, usize); 1]>>,
 }
 impl<'a> View<'a> {
     fn new(
@@ -83,25 +97,35 @@ impl<'a> View<'a> {
         provenance: &'a ExceptionOwnerProvenance,
         preserved: &FxHashSet<Label>,
     ) -> Option<Self> {
-        let mut labels = FxHashMap::default();
-        let mut positions = FxHashMap::default();
+        Self::with_tables(items, regions, provenance, preserved, ViewTables::default())
+    }
+
+    fn with_tables(
+        items: &'a [Item],
+        regions: &'a [ExceptionRegion],
+        provenance: &'a ExceptionOwnerProvenance,
+        preserved: &FxHashSet<Label>,
+        tables: ViewTables,
+    ) -> Option<Self> {
+        let ViewTables {
+            mut labels,
+            mut markers,
+        } = tables;
+        labels.clear();
+        markers.clear();
         let mut boundaries = provenance.block_boundaries.clone();
         boundaries.extend(preserved);
-        let mut references = boundaries.clone();
-        let mut markers: FxHashMap<Key, Vec<(usize, usize)>> = FxHashMap::default();
         let mut previous = None;
         let mut n = 0;
         for (i, item) in items.iter().copied().enumerate() {
             match item {
                 Item::Label(l) => {
-                    if labels.insert(l, i).is_some() {
+                    if labels.insert(l, (i, n)).is_some() {
                         return None;
                     }
-                    positions.insert(l, n);
                 }
                 Item::Instruction(ins) => {
                     if let Operand::Forward(l) | Operand::Backward(l) = ins.operand() {
-                        references.insert(l);
                         boundaries.insert(l);
                     }
                     if let Some((p, prior)) = previous {
@@ -114,9 +138,12 @@ impl<'a> View<'a> {
                 }
             }
         }
+        for region in regions {
+            boundaries.insert(region.target);
+        }
+        let mut references = boundaries.clone();
         for r in regions {
-            references.extend([r.start, r.end, r.target]);
-            boundaries.insert(r.target);
+            references.extend([r.start, r.end]);
             if let ExceptionRegionPriority::OriginalRange(s, e) = r.priority {
                 references.extend([s, e]);
             }
@@ -135,14 +162,11 @@ impl<'a> View<'a> {
         for (s, e) in &provenance.setup_nop_ranges {
             references.extend([*s, *e]);
         }
-        let mut retained_origins = provenance
-            .retained_normal_pop_blocks
-            .iter()
-            .collect::<Vec<_>>();
-        retained_origins.sort_unstable_by_key(|(entry, _)| {
-            (labels.get(*entry).copied().unwrap_or(usize::MAX), entry.0)
-        });
-        for (_, origin) in retained_origins {
+        #[expect(
+            clippy::iter_over_hash_type,
+            reason = "The references set is only queried for membership."
+        )]
+        for origin in provenance.retained_normal_pop_blocks.values() {
             references.extend(origin.before.iter().copied());
             references.extend(origin.after.iter().copied());
         }
@@ -151,12 +175,26 @@ impl<'a> View<'a> {
             regions,
             provenance,
             labels,
-            positions,
             boundaries,
             references,
             markers,
         })
     }
+    fn into_tables(self) -> ViewTables {
+        ViewTables {
+            labels: self.labels,
+            markers: self.markers,
+        }
+    }
+
+    fn label_index(&self, label: Label) -> Option<&usize> {
+        self.labels.get(&label).map(|(index, _)| index)
+    }
+
+    fn label_position(&self, label: Label) -> Option<&usize> {
+        self.labels.get(&label).map(|(_, position)| position)
+    }
+
     fn endpoint(&self, condition: Instruction, marker: Instruction) -> Option<(usize, usize)> {
         let candidates = self.markers.get(&key(condition, marker)?)?;
         let mut found = None;
@@ -185,10 +223,10 @@ impl<'a> View<'a> {
             .iter()
             .filter(|x| matches!(x, Item::Instruction(_)))
             .count();
-        let mut owners = Vec::new();
+        let mut owner = None;
         for (index, r) in self.regions.iter().enumerate() {
-            let s = *self.positions.get(&r.start)?;
-            let e = *self.positions.get(&r.end)?;
+            let s = *self.label_position(r.start)?;
+            let e = *self.label_position(r.end)?;
             if s <= pos && pos < e {
                 // A cleanup stack can retain an owner on the original array record
                 // even when the lowered condition is excluded. The local interval
@@ -198,14 +236,20 @@ impl<'a> View<'a> {
                 }
                 let (ps, pe) = match r.priority {
                     ExceptionRegionPriority::OriginalRange(s, e) => {
-                        (*self.positions.get(&s)?, *self.positions.get(&e)?)
+                        (*self.label_position(s)?, *self.label_position(e)?)
                     }
                     ExceptionRegionPriority::Resolved { start, end } => (start, end),
                 };
-                owners.push((
+                let candidate = (
                     (r.is_scope_fallback, Reverse(ps), pe, index),
                     (r.target, r.depth, r.preserve_lasti),
-                ));
+                );
+                if owner
+                    .as_ref()
+                    .is_none_or(|(priority, _)| candidate.0 < *priority)
+                {
+                    owner = Some(candidate);
+                }
             }
         }
         match c.exception_policy().exclusion() {
@@ -213,12 +257,12 @@ impl<'a> View<'a> {
             ExceptionExclusion::None => {}
             ExceptionExclusion::IfExtended => return None,
         }
-        Some(owners.into_iter().min_by_key(|x| x.0).map(|x| x.1))
+        Some(owner.map(|(_, owner)| owner))
     }
     fn no_late_insertions_or_setups(&self, start: usize, end: usize) -> bool {
         if self.items[start..=end].iter().any(|x|matches!(x,Item::Instruction(i) if matches!(i.opcode,COPY_FREE_VARS|MAKE_CELL|RETURN_GENERATOR)||i.pre_fold_extra_instructions()!=0||i.local_policy.hidden_exception_owner_slots()==super::LocalPolicy::MAX_HIDDEN_EXCEPTION_OWNER_SLOTS)){return false;}
         for (l, location) in &self.provenance.setups {
-            let Some(&p) = self.labels.get(l) else {
+            let Some(&p) = self.label_index(*l) else {
                 return false;
             };
             if start <= p && p <= end {
@@ -249,6 +293,7 @@ struct Certificate {
     condition: Instruction,
     marker: Instruction,
     items: Vec<Item>,
+    labels: FxHashSet<Label>,
     owner: Owner,
     boundaries: FxHashSet<Label>,
     setups: Vec<(Label, Option<super::SourceLocation>)>,
@@ -258,7 +303,7 @@ impl Certificate {
         let (c, m) = v.endpoint(self.condition, self.marker)?;
         let start = match self.anchor {
             Anchor::Entry => 0,
-            Anchor::Label(l) => *v.labels.get(&l)?,
+            Anchor::Label(l) => *v.label_index(l)?,
             Anchor::Marker(c, m) => v.endpoint(c, m)?.1 + 1,
             Anchor::OriginalMarker(prior, marker) => {
                 // Repeated sequence predicates may have equal predecessor pairs.
@@ -297,19 +342,24 @@ impl Certificate {
 
     fn valid_array(&self, view: &View<'_>, borrow: bool) -> Option<(usize, usize, usize)> {
         let (start, condition, marker) = self.range(view, borrow)?;
-        if self.setups != view.provenance.setups
-            || self.boundaries
-                != view
-                    .boundaries
-                    .iter()
-                    .copied()
-                    .filter(|l| self.items.iter().any(|x| matches!(x,Item::Label(k)if k==l)))
-                    .collect()
-        {
+        if self.setups != view.provenance.setups || !self.same_boundaries(view) {
             return None;
         }
         self.matches_interval(view, start, marker, borrow)?;
         Some((start, condition, marker))
+    }
+
+    /// Checks the original interval's boundary set without rebuilding its intersection.
+    fn same_boundaries(&self, view: &View<'_>) -> bool {
+        self.boundaries
+            .iter()
+            .all(|label| self.labels.contains(label) && view.boundaries.contains(label))
+            && self
+                .labels
+                .iter()
+                .filter(|label| view.boundaries.contains(*label))
+                .count()
+                == self.boundaries.len()
     }
 
     fn matches_interval(
@@ -319,18 +369,10 @@ impl Certificate {
         marker: usize,
         borrow: bool,
     ) -> Option<()> {
-        let original_labels = self
-            .items
-            .iter()
-            .filter_map(|x| match x {
-                Item::Label(l) => Some(*l),
-                Item::Instruction(_) => None,
-            })
-            .collect::<FxHashSet<_>>();
         let mut old = self.items.iter().copied();
         for item in view.items[start..=marker].iter().copied() {
             if let Item::Label(l) = item {
-                if !original_labels.contains(&l) && !view.references.contains(&l) {
+                if !self.labels.contains(&l) && !view.references.contains(&l) {
                     continue;
                 }
             }
@@ -340,6 +382,16 @@ impl Certificate {
         }
         old.next().is_none().then_some(())
     }
+}
+
+fn labels_in(items: &[Item]) -> FxHashSet<Label> {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Label(label) => Some(*label),
+            Item::Instruction(_) => None,
+        })
+        .collect()
 }
 
 fn one_fusion(before: &[Item], after: &[Item]) -> bool {
@@ -488,6 +540,7 @@ impl FreshSingletonCertificate {
                 anchor,
                 condition: tail[2],
                 marker: tail[3],
+                labels: labels_in(&items),
                 items,
                 owner,
                 boundaries,
@@ -519,8 +572,8 @@ impl FreshSingletonCertificate {
                 .count();
             let mut expected = Vec::new();
             for region in &self.manager_regions {
-                let begin = *view.positions.get(&region.start)?;
-                let end = *view.positions.get(&region.end)?;
+                let begin = *view.label_position(region.start)?;
+                let end = *view.label_position(region.end)?;
                 if begin <= position && position < end {
                     expected.push(region);
                 }
@@ -588,7 +641,7 @@ impl FallbackCertificate {
             return None;
         };
         let (after_condition, after_marker) = after.endpoint(condition, marker)?;
-        let after_start = *after.labels.get(&anchor)?;
+        let after_start = *after.label_index(anchor)?;
         if after_start > after_condition {
             return None;
         }
@@ -630,6 +683,7 @@ impl FallbackCertificate {
                 anchor: Anchor::Label(anchor),
                 condition,
                 marker,
+                labels: labels_in(&items),
                 items,
                 owner,
                 boundaries,
@@ -697,6 +751,7 @@ impl FallbackCertificate {
                 anchor,
                 condition,
                 marker,
+                labels: labels_in(&items),
                 items,
                 owner,
                 boundaries,
@@ -761,15 +816,6 @@ impl FallbackCertificate {
         }
         self.valid(before, false)?;
         let (_, end) = after.endpoint(self.interval.condition, self.interval.marker)?;
-        let original_labels = self
-            .interval
-            .items
-            .iter()
-            .filter_map(|item| match item {
-                Item::Label(label) => Some(*label),
-                Item::Instruction(_) => None,
-            })
-            .collect::<FxHashSet<_>>();
         let mut found = None;
         for &(condition_index, marker_index) in after.markers.get(&key(prior, marker)?)? {
             let (Item::Instruction(condition), Item::Instruction(current_marker)) =
@@ -788,7 +834,7 @@ impl FallbackCertificate {
                 .copied()
                 .filter(|item| match item {
                     Item::Label(label) => {
-                        original_labels.contains(label) || after.references.contains(label)
+                        self.interval.labels.contains(label) || after.references.contains(label)
                     }
                     Item::Instruction(_) => true,
                 })
@@ -798,6 +844,7 @@ impl FallbackCertificate {
             }
         }
         self.interval.items = found?;
+        self.interval.labels = labels_in(&self.interval.items);
         self.removed_slots += 1;
         self.observed_local_fusion = true;
         // The complete interval, exact owner, setup list, and boundaries must still match.
@@ -898,8 +945,7 @@ impl View<'_> {
                 .hidden_exception_owner_slots()
                 != 0
             || self.provenance.setups.iter().any(|(label, _)| {
-                self.labels
-                    .get(label)
+                self.label_index(*label)
                     .is_none_or(|&index| start <= index && index <= marker)
             })
             || !self.items[start..condition].iter().any(|item| {
@@ -999,7 +1045,7 @@ impl View<'_> {
         }
         // Missing labels, hidden SETUP/POP cells, and unknown original entries fail closed.
         for (label, _) in &self.provenance.setups {
-            let position = *self.labels.get(label)?;
+            let position = *self.label_index(*label)?;
             if start <= position && position <= condition {
                 return None;
             }
@@ -1009,8 +1055,7 @@ impl View<'_> {
             .removed_pop_block_boundaries
             .iter()
             .any(|label| {
-                self.labels
-                    .get(label)
+                self.label_index(*label)
                     .is_none_or(|&position| start <= position && position <= condition)
             })
         {
@@ -1050,8 +1095,8 @@ impl View<'_> {
             }
             let mut current = Vec::new();
             for region in self.regions {
-                let begin = *self.positions.get(&region.start)?;
-                let end = *self.positions.get(&region.end)?;
+                let begin = *self.label_position(region.start)?;
+                let end = *self.label_position(region.end)?;
                 if begin <= position && position < end {
                     current.push(*region);
                 }
@@ -1097,7 +1142,7 @@ impl View<'_> {
         // No hidden SETUP/POP_BLOCK records or second true boundary may enter
         // the certificate, including aliases that only become adjacent later.
         for (label, _) in &self.provenance.setups {
-            let p = *self.labels.get(label)?;
+            let p = *self.label_index(*label)?;
             if start <= p && p <= condition {
                 return None;
             }
@@ -1107,8 +1152,7 @@ impl View<'_> {
             .removed_pop_block_boundaries
             .iter()
             .all(|label| {
-                self.labels
-                    .get(label)
+                self.label_index(*label)
                     .is_some_and(|&p| p < start || p > condition)
             })
         {
@@ -1182,8 +1226,8 @@ impl View<'_> {
             previous_instruction = Some(instruction);
             let mut covered = None;
             for region in self.regions {
-                let s = *self.positions.get(&region.start)?;
-                let e = *self.positions.get(&region.end)?;
+                let s = *self.label_position(region.start)?;
+                let e = *self.label_position(region.end)?;
                 if s <= pos && pos < e {
                     let fallback = region.is_scope_fallback && region.depth == 0;
                     // This authored singleton array has no erased or inserted records.
@@ -1331,12 +1375,12 @@ impl ManagerSetupCertificate {
             .count();
         let mut regions = Vec::new();
         for (index, region) in after.regions.iter().enumerate() {
-            let begin = *after.positions.get(&region.start)?;
-            let end = *after.positions.get(&region.end)?;
+            let begin = *after.label_position(region.start)?;
+            let end = *after.label_position(region.end)?;
             if begin <= position && position < end {
                 let (priority_start, priority_end) = match region.priority {
                     ExceptionRegionPriority::OriginalRange(start, end) => {
-                        (*after.positions.get(&start)?, *after.positions.get(&end)?)
+                        (*after.label_position(start)?, *after.label_position(end)?)
                     }
                     ExceptionRegionPriority::Resolved { start, end } => (start, end),
                 };
@@ -1380,8 +1424,8 @@ impl ManagerSetupCertificate {
             .iter()
             .filter(|item| matches!(item, Item::Instruction(_)))
             .count();
-        if !(*before.positions.get(&region.start)? <= original_position
-            && original_position < *before.positions.get(&region.end)?)
+        if !(*before.label_position(region.start)? <= original_position
+            && original_position < *before.label_position(region.end)?)
         {
             return None;
         }
@@ -1391,6 +1435,7 @@ impl ManagerSetupCertificate {
                 condition,
                 marker: marker_instruction,
                 items: after.items[..=after_marker].to_vec(),
+                labels: labels_in(&after.items[..=after_marker]),
                 owner: None,
                 boundaries: after
                     .boundaries
@@ -1424,18 +1469,7 @@ impl ManagerSetupCertificate {
         {
             return None;
         }
-        let boundaries = view
-            .boundaries
-            .iter()
-            .copied()
-            .filter(|label| {
-                self.interval
-                    .items
-                    .iter()
-                    .any(|item| matches!(item, Item::Label(candidate) if candidate == label))
-            })
-            .collect::<FxHashSet<_>>();
-        if boundaries != self.interval.boundaries {
+        if !self.interval.same_boundaries(view) {
             return None;
         }
         self.interval
@@ -1468,8 +1502,8 @@ impl ManagerSetupCertificate {
             .iter()
             .filter(|item| matches!(item, Item::Instruction(_)))
             .count();
-        if !(*view.positions.get(&region.start)? <= position
-            && position < *view.positions.get(&region.end)?)
+        if !(*view.label_position(region.start)? <= position
+            && position < *view.label_position(region.end)?)
         {
             return None;
         }
@@ -1523,6 +1557,7 @@ impl HandlerDispatchCertificate {
             condition: *condition,
             marker: *marker,
             items: origin.items.clone(),
+            labels: labels_in(&origin.items),
             owner: Some((region.target, region.depth, region.preserve_lasti)),
             boundaries: view.boundaries.clone(),
             setups: view.provenance.setups.clone(),
@@ -1554,27 +1589,34 @@ impl HandlerDispatchCertificate {
             .iter()
             .filter(|item| matches!(item, Item::Instruction(_)))
             .count();
-        let mut owners = Vec::new();
+        Self::owner_at(view, position)
+    }
+
+    fn owner_at(view: &View<'_>, position: usize) -> Option<ExceptionRegion> {
+        let mut owner = None;
         for (order, region) in view.regions.iter().enumerate() {
-            let start = *view.positions.get(&region.start)?;
-            let end = *view.positions.get(&region.end)?;
+            let start = *view.label_position(region.start)?;
+            let end = *view.label_position(region.end)?;
             if start <= position && position < end {
                 let (start, end) = match region.priority {
                     ExceptionRegionPriority::OriginalRange(start, end) => {
-                        (*view.positions.get(&start)?, *view.positions.get(&end)?)
+                        (*view.label_position(start)?, *view.label_position(end)?)
                     }
                     ExceptionRegionPriority::Resolved { start, end } => (start, end),
                 };
-                owners.push((
+                let candidate = (
                     (region.is_scope_fallback, Reverse(start), end, order),
                     *region,
-                ));
+                );
+                if owner
+                    .as_ref()
+                    .is_none_or(|(priority, _)| candidate.0 < *priority)
+                {
+                    owner = Some(candidate);
+                }
             }
         }
-        owners
-            .into_iter()
-            .min_by_key(|(priority, _)| *priority)
-            .map(|(_, region)| region)
+        owner.map(|(_, region)| region)
     }
 
     /// Accounts only for a global-call NULL fold or an observed pair of local loads.
@@ -1585,8 +1627,7 @@ impl HandlerDispatchCertificate {
 
         if !view.no_late_insertions_or_setups(start, condition)
             || view.provenance.setups.iter().any(|(label, _)| {
-                view.labels
-                    .get(label)
+                view.label_index(*label)
                     .is_none_or(|position| start <= *position && *position <= condition)
             })
             || view
@@ -1594,8 +1635,7 @@ impl HandlerDispatchCertificate {
                 .removed_pop_block_boundaries
                 .iter()
                 .any(|label| {
-                    view.labels
-                        .get(label)
+                    view.label_index(*label)
                         .is_none_or(|position| start <= *position && *position <= condition)
                 })
         {
@@ -1604,6 +1644,10 @@ impl HandlerDispatchCertificate {
         let mut removed = 0;
         let mut global_call = false;
         let mut call = false;
+        let mut position = view.items[..start]
+            .iter()
+            .filter(|item| matches!(item, Item::Instruction(_)))
+            .count();
         for (offset, item) in view.items[start..=condition].iter().enumerate() {
             let index = start + offset;
             let instruction = match item {
@@ -1621,7 +1665,7 @@ impl HandlerDispatchCertificate {
                 || instruction.only_allows_unconditional_inlining()
                 || instruction.no_location_policy.borrow_fallthrough()
                     == super::BorrowFallthrough::Barrier
-                || !same_manager_region(&Self::owner(view, index)?, &self.region)
+                || !same_manager_region(&Self::owner_at(view, position)?, &self.region)
             {
                 return None;
             }
@@ -1646,6 +1690,7 @@ impl HandlerDispatchCertificate {
                 POP_JUMP_IF_FALSE if index == condition => {}
                 _ => return None,
             }
+            position += 1;
         }
         (removed <= 1 && (!global_call || call)).then_some(removed)
     }
@@ -1666,6 +1711,7 @@ impl HandlerDispatchCertificate {
             return None;
         }
         self.interval.items = items;
+        self.interval.labels = labels_in(&self.interval.items);
         self.observed_fusion = true;
         self.removed = 1;
         self.valid(after, false)?;
@@ -1717,8 +1763,8 @@ impl FoldedAssertSuccessCertificate {
             .count();
         let mut owner = None;
         for region in view.regions {
-            let start = *view.positions.get(&region.start)?;
-            let end = *view.positions.get(&region.end)?;
+            let start = *view.label_position(region.start)?;
+            let end = *view.label_position(region.end)?;
             if start <= position && position < end {
                 if !region.is_scope_fallback
                     || region.depth != 0
@@ -1779,7 +1825,7 @@ impl FoldedAssertSuccessCertificate {
     }
 
     fn valid(&self, view: &View<'_>) -> Option<usize> {
-        let start = *view.labels.get(&self.entry)?;
+        let start = *view.label_index(self.entry)?;
         if view.items.get(start..start + 3)?
             != [
                 Item::Label(self.entry),
@@ -1829,6 +1875,7 @@ pub(super) struct FusionOwnerCertificates {
     fallback_certificates: Vec<FallbackCertificate>,
     fresh_singleton_certificates: Vec<FreshSingletonCertificate>,
     folded_assert_success_certificates: Vec<FoldedAssertSuccessCertificate>,
+    scratch: Option<Box<ViewTables>>,
 }
 
 impl FusionOwnerCertificates {
@@ -1940,6 +1987,9 @@ impl FusionOwnerCertificates {
             .append(&mut original.fresh_singleton_certificates);
         self.folded_assert_success_certificates
             .append(&mut original.folded_assert_success_certificates);
+        if self.scratch.is_none() {
+            self.scratch = original.scratch.take();
+        }
     }
 
     pub(super) fn snapshot(p: &OptimizationPipeline) -> Vec<Item> {
@@ -2032,6 +2082,7 @@ impl FusionOwnerCertificates {
                                         condition,
                                         marker,
                                         items: Vec::new(),
+                                        labels: FxHashSet::default(),
                                         owner,
                                         boundaries: a.boundaries.clone(),
                                         setups: p.exception_owner_provenance.setups.clone(),
@@ -2042,6 +2093,7 @@ impl FusionOwnerCertificates {
                                             && one_fusion(&before[start..=index], &after[s..=m])
                                         {
                                             cert.items = after[s..=m].to_vec();
+                                            cert.labels = labels_in(&cert.items);
                                             cert.boundaries.retain(|l| {
                                                 cert.items
                                                     .iter()
@@ -2163,6 +2215,8 @@ impl FusionOwnerCertificates {
                         certificate.valid(&after, false).is_some()
                             || certificate.rebind_one_fusion(&before, &after).is_some()
                     });
+                self.retain_view(&after);
+                return;
             }
         }
         self.retain_pipeline(p);
@@ -2183,22 +2237,21 @@ impl FusionOwnerCertificates {
         p: &OptimizationPipeline,
         retargets: &[(ExceptionRegion, ExceptionRegion)],
     ) {
-        if !self.handler_dispatch_certificates.is_empty() {
-            let items = p.graph.iter_items().copied().collect::<Vec<_>>();
-            if let Some(view) = View::new(
-                &items,
-                &p.exception_regions,
-                &p.exception_owner_provenance,
-                &p.preserved_block_boundaries,
-            ) {
-                self.handler_dispatch_certificates
-                    .retain_mut(|certificate| {
-                        certificate.rebind_cold_region(&view, retargets).is_some()
-                    });
-            } else {
-                self.handler_dispatch_certificates.clear();
-            }
+        if self.is_empty() {
+            return;
         }
+        let items = p.graph.iter_items().copied().collect::<Vec<_>>();
+        let Some(view) = View::new(
+            &items,
+            &p.exception_regions,
+            &p.exception_owner_provenance,
+            &p.preserved_block_boundaries,
+        ) else {
+            self.clear();
+            return;
+        };
+        self.handler_dispatch_certificates
+            .retain_mut(|certificate| certificate.rebind_cold_region(&view, retargets).is_some());
         for certificate in &mut self.fresh_singleton_certificates {
             let mut transferred = Vec::new();
             for region in &certificate.manager_regions {
@@ -2222,108 +2275,119 @@ impl FusionOwnerCertificates {
             certificate.manager_regions = transferred;
         }
         if !retargets.is_empty() && !self.manager_setup_certificates.is_empty() {
-            let items = p.graph.iter_items().copied().collect::<Vec<_>>();
-            if let Some(view) = View::new(
-                &items,
-                &p.exception_regions,
-                &p.exception_owner_provenance,
-                &p.preserved_block_boundaries,
-            ) {
-                self.manager_setup_certificates.retain_mut(|certificate| {
-                    let Some((start, _, marker)) = certificate.interval.range(&view, false) else {
-                        return false;
-                    };
-                    if certificate
-                        .interval
-                        .matches_interval(&view, start, marker, false)
-                        .is_none()
-                    {
-                        return false;
-                    }
-                    let mut sources = view.items[start..marker].iter().enumerate().filter_map(
-                        |(offset, item)| match item {
+            self.manager_setup_certificates.retain_mut(|certificate| {
+                let Some((start, _, marker)) = certificate.interval.range(&view, false) else {
+                    return false;
+                };
+                if certificate
+                    .interval
+                    .matches_interval(&view, start, marker, false)
+                    .is_none()
+                {
+                    return false;
+                }
+                let mut sources =
+                    view.items[start..marker]
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(offset, item)| match item {
                             Item::Instruction(instruction)
                                 if same_instruction(certificate.source, *instruction, false) =>
                             {
                                 Some(start + offset)
                             }
                             _ => None,
-                        },
-                    );
-                    let Some(source) = sources.next() else {
-                        return false;
-                    };
-                    if sources.next().is_some() {
-                        return false;
+                        });
+                let Some(source) = sources.next() else {
+                    return false;
+                };
+                if sources.next().is_some() {
+                    return false;
+                }
+                let position = view.items[..source]
+                    .iter()
+                    .filter(|item| matches!(item, Item::Instruction(_)))
+                    .count();
+                let mut candidates = retargets.iter().filter_map(|(original, rebuilt)| {
+                    if !same_manager_region(original, &certificate.region) {
+                        return None;
                     }
-                    let position = view.items[..source]
-                        .iter()
-                        .filter(|item| matches!(item, Item::Instruction(_)))
-                        .count();
-                    let mut candidates = retargets.iter().filter_map(|(original, rebuilt)| {
-                        if !same_manager_region(original, &certificate.region) {
-                            return None;
-                        }
-                        let start = *view.positions.get(&rebuilt.start)?;
-                        let end = *view.positions.get(&rebuilt.end)?;
-                        (start <= position && position < end).then_some(*rebuilt)
-                    });
-                    let Some(region) = candidates.next() else {
-                        return false;
-                    };
-                    if candidates.next().is_some() {
-                        return false;
-                    }
-                    // The pass explicitly preserves target, depth, lasti and priority;
-                    // only a recorded replacement containing this exact cell can transfer.
-                    certificate.region = region;
-                    certificate.regions = view.regions.to_vec();
-                    certificate.valid(&view, false).is_some()
+                    let start = *view.label_position(rebuilt.start)?;
+                    let end = *view.label_position(rebuilt.end)?;
+                    (start <= position && position < end).then_some(*rebuilt)
                 });
-            } else {
-                self.manager_setup_certificates.clear();
-            }
+                let Some(region) = candidates.next() else {
+                    return false;
+                };
+                if candidates.next().is_some() {
+                    return false;
+                }
+                // The pass explicitly preserves target, depth, lasti and priority;
+                // only a recorded replacement containing this exact cell can transfer.
+                certificate.region = region;
+                certificate.regions = view.regions.to_vec();
+                certificate.valid(&view, false).is_some()
+            });
         }
-        self.retain_pipeline(p);
+        self.retain_view(&view);
     }
 
-    pub(super) fn retain_pipeline(&mut self, p: &OptimizationPipeline) {
-        if self.certificates.is_empty()
+    fn is_empty(&self) -> bool {
+        self.certificates.is_empty()
             && self.handler_dispatch_certificates.is_empty()
             && self.manager_setup_certificates.is_empty()
             && self.fallback_certificates.is_empty()
             && self.fresh_singleton_certificates.is_empty()
             && self.folded_assert_success_certificates.is_empty()
-        {
+    }
+
+    fn clear(&mut self) {
+        self.certificates.clear();
+        self.handler_dispatch_certificates.clear();
+        self.manager_setup_certificates.clear();
+        self.fallback_certificates.clear();
+        self.fresh_singleton_certificates.clear();
+        self.folded_assert_success_certificates.clear();
+    }
+
+    pub(super) fn retain_pipeline(&mut self, p: &OptimizationPipeline) {
+        if self.is_empty() {
             return;
         }
         let items = p.graph.iter_items().copied().collect::<Vec<_>>();
-        let Some(view) = View::new(
+        let mut tables = self.scratch.take().unwrap_or_default();
+        let Some(view) = View::with_tables(
             &items,
             &p.exception_regions,
             &p.exception_owner_provenance,
             &p.preserved_block_boundaries,
+            std::mem::take(&mut *tables),
         ) else {
-            self.certificates.clear();
-            self.handler_dispatch_certificates.clear();
-            self.manager_setup_certificates.clear();
-            self.fallback_certificates.clear();
-            self.fresh_singleton_certificates.clear();
-            self.folded_assert_success_certificates.clear();
+            self.clear();
             return;
         };
-        self.certificates
-            .retain(|c| c.valid(&view, false).is_some());
+        self.retain_view(&view);
+        if self.is_empty() {
+            return;
+        }
+        *tables = view.into_tables();
+        // Keep only allocation capacity; every record is rebuilt by the next pass.
+        tables.clear();
+        self.scratch = Some(tables);
+    }
+
+    fn retain_view(&mut self, view: &View<'_>) {
+        self.certificates.retain(|c| c.valid(view, false).is_some());
         self.handler_dispatch_certificates
-            .retain(|c| c.valid(&view, false).is_some());
+            .retain(|c| c.valid(view, false).is_some());
         self.manager_setup_certificates
-            .retain(|certificate| certificate.valid(&view, false).is_some());
+            .retain(|certificate| certificate.valid(view, false).is_some());
         self.fallback_certificates
-            .retain(|c| c.valid(&view, false).is_some());
+            .retain(|c| c.valid(view, false).is_some());
         self.fresh_singleton_certificates
-            .retain(|certificate| certificate.valid(&view, false).is_some());
+            .retain(|certificate| certificate.valid(view, false).is_some());
         self.folded_assert_success_certificates
-            .retain(|certificate| certificate.valid(&view).is_some());
+            .retain(|certificate| certificate.valid(view).is_some());
     }
     /// Exports exact surviving manager cells before layout chooses owner regions.
     pub(super) fn manager_owners(
@@ -2360,13 +2424,7 @@ impl FusionOwnerCertificates {
         provenance: &ExceptionOwnerProvenance,
         preserved: &FxHashSet<Label>,
     ) {
-        if self.certificates.is_empty()
-            && self.handler_dispatch_certificates.is_empty()
-            && self.manager_setup_certificates.is_empty()
-            && self.fallback_certificates.is_empty()
-            && self.fresh_singleton_certificates.is_empty()
-            && self.folded_assert_success_certificates.is_empty()
-        {
+        if self.is_empty() {
             return;
         }
         let Some(view) = View::new(items, regions, provenance, preserved) else {
@@ -2458,6 +2516,7 @@ mod tests {
             condition,
             marker,
             items: items.clone(),
+            labels: labels_in(&items),
             owner: None,
             boundaries: FxHashSet::default(),
             setups: Vec::new(),
@@ -3355,6 +3414,7 @@ mod tests {
             condition: interval.condition,
             marker: interval.marker,
             items: interval.items.clone(),
+            labels: interval.labels.clone(),
             owner: interval.owner,
             boundaries: interval.boundaries.clone(),
             setups: interval.setups.clone(),

@@ -235,36 +235,38 @@ fn parser_interned_strings(
     }
 
     impl ConstantIdentifiers {
-        fn mangled_name(&self, name: &str) -> String {
+        fn mangled_name<'a>(&self, name: &'a str) -> std::borrow::Cow<'a, str> {
             if self
                 .mangled_names
                 .as_ref()
                 .is_some_and(|names| !names.contains(name))
             {
-                name.to_string()
+                std::borrow::Cow::Borrowed(name)
             } else {
-                mangle_name(name, self.private_name.as_deref()).into_owned()
+                mangle_name(name, self.private_name.as_deref())
             }
         }
 
         fn record_name(&mut self, name: &str) {
             self.record_raw_name(name);
-            self.origins.entry(name.to_string()).or_default();
             let mangled = self.mangled_name(name);
             if mangled != name {
+                let mangled = mangled.into_owned();
                 self.generated_mangled_strings.insert(mangled.clone());
                 self.origins.entry(mangled).or_default();
             }
         }
 
         fn record_raw_name(&mut self, name: &str) {
-            self.origins.entry(name.to_string()).or_default();
+            if !self.origins.contains_key(name) {
+                self.origins.insert(name.to_string(), AtomicU8::default());
+            }
             if name.contains("__") {
                 self.restricted_private_identifier |= self.mangled_names.is_some();
                 self.raw_private_identifiers.insert(name.to_string());
                 let mangled = self.mangled_name(name);
                 if mangled != name {
-                    self.generated_mangled_strings.insert(mangled);
+                    self.generated_mangled_strings.insert(mangled.into_owned());
                 }
             }
         }
