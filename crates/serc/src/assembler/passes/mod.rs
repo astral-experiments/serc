@@ -462,11 +462,17 @@ impl Assembler {
                     .insert(label);
             }
         }
-        if graph.features().has_forward_conditional()
+        // Later CFG passes can restore protected jump owners but only from this map.
+        if (!self.exception_regions.is_empty()
             || !self
                 .exception_owner_provenance
-                .original_value_jump_prefixes
-                .is_empty()
+                .normal_try_jump_owners
+                .is_empty())
+            && (graph.features().has_forward_conditional()
+                || !self
+                    .exception_owner_provenance
+                    .original_value_jump_prefixes
+                    .is_empty())
         {
             self.exception_owner_provenance
                 .capture_uncompacted_conditional_arrays(&graph.copy_items());
