@@ -1395,7 +1395,15 @@ pub(super) fn fold_constant(expression: &Expr) -> Option<Constant> {
         }
         Expr::Slice(slice) => constant_slice(slice),
         Expr::UnaryOp(unary) => match unary.op {
-            UnaryOp::UAdd => fold_constant(&unary.operand),
+            UnaryOp::UAdd => match fold_constant(&unary.operand)? {
+                Constant::Bool(value) => Some(Constant::Int(u64::from(value))),
+                constant @ (Constant::Int(_)
+                | Constant::SignedInt(_)
+                | Constant::BigInt { .. }
+                | Constant::Float(_)
+                | Constant::Complex { .. }) => Some(constant),
+                _ => None,
+            },
             UnaryOp::Not => literal_truthiness(&unary.operand).map(|value| Constant::Bool(!value)),
             UnaryOp::USub => fold_constant(&unary.operand)?.negated(),
             UnaryOp::Invert => {

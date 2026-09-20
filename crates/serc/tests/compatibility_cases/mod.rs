@@ -278,6 +278,7 @@ mod try_nested_assignment_compatibility;
 mod try_tail_iterator_pass_handler_compatibility;
 mod tuple_unpack_owner_slots;
 mod typed_handler_entry_owner_boundary;
+mod unary_positive_compatibility;
 mod unfiltered_comprehension_none_condition_owner_compatibility;
 mod unlocated_handler_join;
 mod unreachable_literal_order;
