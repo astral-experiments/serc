@@ -590,6 +590,14 @@ impl Compiler<'_> {
                     }
                     if !truthiness {
                         self.ensure_match_fail_pop(&mut context, 0);
+                        if context.fail_pop.len() > 1 {
+                            // Captures have already been stored, so guard failure skips
+                            // the cleanup slots reserved for an unmatched pattern.
+                            let failure = self
+                                .emit_jump_forward_instruction(JUMP_FORWARD, context.fail_pop[0])?;
+                            // CPython's edge is still conditional during small-exit copying.
+                            self.assembler.prevent_jump_inlining(failure);
+                        }
                         guard_always_false = true;
                     }
                 } else {
