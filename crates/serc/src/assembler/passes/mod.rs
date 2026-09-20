@@ -193,7 +193,7 @@ impl Assembler {
     ) -> Result<AssembledCode, CompileError> {
         self.resolve_operand_patches()?;
         self.resolve_folded_condition_borrow_entries();
-        if self.has_only_linear_assertion_side_exits() {
+        if self.has_only_linear_assertion_side_exits() || self.has_only_linear_constant_return() {
             return self
                 .optimize_linear_assertion_side_exits(
                     local_count,
@@ -818,9 +818,7 @@ impl OptimizationPipeline {
         self.validate_structure(AssemblerStage::AddChecksForUninitializedLoads)?;
         let before_fusion = FusionOwnerCertificates::snapshot(&self);
         self.fuse_superinstructions();
-        original_owners.retain_after_fusion(&before_fusion, &self);
-        let mut fusion_owners = FusionOwnerCertificates::capture(&before_fusion, &self);
-        fusion_owners.extend_original_owners(original_owners);
+        let mut fusion_owners = original_owners.after_fusion(&before_fusion, &self);
         drop(before_fusion);
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::FuseSuperinstructions)?;
@@ -1065,13 +1063,7 @@ impl OptimizationPipeline {
                 }
             }
         }
-        self.exception_owner_provenance.fused_manager_owners = fusion_owners.manager_owners(
-            &items,
-            &self.exception_regions,
-            &self.exception_owner_provenance,
-            &self.preserved_block_boundaries,
-        );
-        fusion_owners.apply(
+        self.exception_owner_provenance.fused_manager_owners = fusion_owners.finalize(
             &mut items,
             &self.exception_regions,
             &self.exception_owner_provenance,

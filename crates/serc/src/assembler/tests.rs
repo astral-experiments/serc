@@ -2879,6 +2879,136 @@ fn linear_assertion_optimizer_matches_the_block_graph_pipeline() {
 }
 
 #[test]
+fn linear_constant_return_matches_the_block_graph_pipeline() {
+    let resume = SourceLocation::new(0, 1, 0, 0);
+    let pass = SourceLocation::new(2, 2, 4, 8);
+    let same_line = SourceLocation::new(2, 2, 12, 16);
+    let following_line = SourceLocation::new(3, 3, 4, 12);
+    for (nop, load, ret, opcode, argument, retains_nop) in [
+        (None, following_line, following_line, LOAD_CONST, 0, false),
+        (
+            Some(pass),
+            SourceLocation::NONE,
+            SourceLocation::NONE,
+            LOAD_CONST,
+            0,
+            false,
+        ),
+        (
+            Some(pass),
+            same_line,
+            SourceLocation::NONE,
+            LOAD_SMALL_INT,
+            42,
+            false,
+        ),
+        (
+            Some(pass),
+            following_line,
+            SourceLocation::NONE,
+            LOAD_CONST,
+            513,
+            true,
+        ),
+    ] {
+        let mut items = vec![Item::Instruction(Instruction::new(
+            RESUME,
+            Operand::Value(ResumeLocation::AT_FUNC_START.argument()),
+            resume,
+            Some(0),
+        ))];
+        if let Some(nop) = nop {
+            items.push(Item::Instruction(Instruction::new(
+                NOP,
+                Operand::Value(0),
+                nop,
+                Some(0),
+            )));
+        }
+        items.extend([
+            Item::Instruction(Instruction::new(
+                opcode,
+                Operand::Value(argument),
+                load,
+                Some(1),
+            )),
+            Item::Instruction(Instruction::new(
+                RETURN_VALUE,
+                Operand::Value(0),
+                ret,
+                Some(0),
+            )),
+        ]);
+        let linear = Assembler::from_linear_items(items.clone());
+        assert!(linear.has_only_linear_constant_return());
+        let graph =
+            super::block_graph::BlockGraph::from_items(items, &rustc_hash::FxHashSet::default());
+        let reachable = graph.reachable_blocks(&[]);
+        let generic = Assembler {
+            code: UnoptimizedCode::Prepared { graph, reachable },
+            ..Assembler::default()
+        };
+        assert!(!generic.has_only_linear_constant_return());
+
+        let actual = linear.finish_code(1, 70, 65).unwrap();
+        let expected = generic.finish_code(1, 70, 65).unwrap();
+        assert_eq!(actual.bytecode, expected.bytecode);
+        assert_eq!(actual.line_table, expected.line_table);
+        assert_eq!(actual.exception_table, expected.exception_table);
+        assert_eq!(actual.max_depth, expected.max_depth);
+        assert_eq!(actual.removed_max_depth, expected.removed_max_depth);
+        assert_eq!(
+            actual
+                .bytecode
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .any(|instruction| instruction[0] == NOP.code()),
+            retains_nop
+        );
+    }
+}
+
+#[test]
+fn linear_constant_return_rejects_nontrivial_instructions_and_metadata() {
+    let original = || {
+        vec![
+            pass_instruction(RESUME, ResumeLocation::AT_FUNC_START.argument(), 1),
+            pass_instruction(NOP, 0, 2),
+            pass_instruction(LOAD_CONST, 0, 2),
+            pass_instruction(RETURN_VALUE, 0, 2),
+        ]
+    };
+    for replacement in [
+        pass_instruction(LOAD_FAST, 0, 2),
+        pass_instruction(UNPACK_SEQUENCE, 1, 2),
+        pass_instruction(NOP, 0, -1),
+        Item::Label(super::Label(0)),
+    ] {
+        let mut items = original();
+        items[1] = replacement;
+        assert!(!Assembler::from_linear_items(items).has_only_linear_constant_return());
+    }
+    let mut items = original();
+    let Item::Instruction(nop) = &mut items[1] else {
+        unreachable!();
+    };
+    nop.jump_policy.preserve_explicit_nop();
+    assert!(!Assembler::from_linear_items(items).has_only_linear_constant_return());
+
+    let mut assembler = Assembler::from_linear_items(original());
+    assembler.label();
+    assert!(!assembler.has_only_linear_constant_return());
+    let mut assembler = Assembler::from_linear_items(original());
+    assembler.exception_owner_provenance.omitted_nop_tail =
+        Some((1, SourceLocation::new(2, 2, 0, 0), 1));
+    assert!(!assembler.has_only_linear_constant_return());
+    let mut assembler = Assembler::from_linear_items(original());
+    assembler.has_next_location = true;
+    assert!(!assembler.has_only_linear_constant_return());
+}
+
+#[test]
 fn maybe_null_comprehension_restore_checks_only_the_first_later_load() {
     let mut restore = Instruction::new(STORE_FAST, Operand::Value(0), SourceLocation::NONE, None);
     restore.local_policy.mark_maybe_null_comprehension_restore();

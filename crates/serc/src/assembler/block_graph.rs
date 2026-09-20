@@ -1109,7 +1109,12 @@ impl BlockGraph {
             .collect()
     }
 
-    pub(super) fn into_items(self) -> Vec<Item> {
+    pub(super) fn into_items(mut self) -> Vec<Item> {
+        match self.order.as_slice() {
+            [] => return Vec::new(),
+            [block] => return std::mem::take(&mut self.blocks[block.index()].items),
+            _ => {}
+        }
         let mut blocks = self.blocks.into_iter().map(Some).collect::<Vec<_>>();
         let item_count = self
             .order

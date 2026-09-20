@@ -13,6 +13,7 @@ use crate::target::opcodes::{
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
+use std::cell::OnceCell;
 use std::cmp::Reverse;
 
 type Key = (i32, i32, i32, i32, u8, u32);
@@ -67,28 +68,111 @@ fn key(condition: Instruction, marker: Instruction) -> Option<Key> {
     ))
 }
 
+/// Indexes normally consecutive compiler labels without hashing every owner lookup.
+struct LabelPositions {
+    dense: Vec<LabelPositionSlot>,
+    sparse: FxHashMap<Label, (usize, usize)>,
+    dense_limit: usize,
+    generation: u32,
+}
+
+#[derive(Clone, Copy, Default)]
+struct LabelPositionSlot {
+    position: (usize, usize),
+    generation: u32,
+}
+
+impl Default for LabelPositions {
+    fn default() -> Self {
+        Self {
+            dense: Vec::new(),
+            sparse: FxHashMap::default(),
+            dense_limit: 0,
+            generation: 1,
+        }
+    }
+}
+
+impl LabelPositions {
+    fn prepare(&mut self, item_count: usize) {
+        self.clear();
+        // Large or unusually sparse label IDs must not dictate the allocation size.
+        self.dense_limit = item_count.saturating_mul(2).max(64);
+    }
+
+    fn clear(&mut self) {
+        self.sparse.clear();
+        self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 {
+            self.dense.fill(LabelPositionSlot::default());
+            self.generation = 1;
+        }
+    }
+
+    #[inline]
+    fn insert(&mut self, label: Label, position: (usize, usize)) -> Option<(usize, usize)> {
+        let Ok(index) = usize::try_from(label.0) else {
+            return self.sparse.insert(label, position);
+        };
+        if index >= self.dense_limit {
+            return self.sparse.insert(label, position);
+        }
+        if index >= self.dense.len() {
+            self.dense.resize(index + 1, LabelPositionSlot::default());
+        }
+        let slot = &mut self.dense[index];
+        let previous = (slot.generation == self.generation).then_some(slot.position);
+        *slot = LabelPositionSlot {
+            position,
+            generation: self.generation,
+        };
+        previous
+    }
+
+    #[inline]
+    fn get(&self, label: Label) -> Option<&(usize, usize)> {
+        let Ok(index) = usize::try_from(label.0) else {
+            return self.sparse.get(&label);
+        };
+        if index >= self.dense_limit {
+            return self.sparse.get(&label);
+        }
+        let slot = self.dense.get(index)?;
+        (slot.generation == self.generation).then_some(&slot.position)
+    }
+}
+
 /// Reusable allocations for indexes whose records are rebuilt at every checkpoint.
 #[derive(Default)]
 struct ViewTables {
-    labels: FxHashMap<Label, (usize, usize)>,
+    labels: LabelPositions,
     markers: FxHashMap<Key, SmallVec<[(usize, usize); 1]>>,
+    instruction_positions: Vec<usize>,
 }
 
 impl ViewTables {
     fn clear(&mut self) {
         self.labels.clear();
         self.markers.clear();
+        self.instruction_positions.clear();
     }
+}
+
+#[derive(Default)]
+struct RetentionScratch {
+    items: Vec<Item>,
+    tables: ViewTables,
 }
 
 struct View<'a> {
     items: &'a [Item],
     regions: &'a [ExceptionRegion],
     provenance: &'a ExceptionOwnerProvenance,
-    labels: FxHashMap<Label, (usize, usize)>,
+    labels: LabelPositions,
     boundaries: FxHashSet<Label>,
-    references: FxHashSet<Label>,
+    supplementary_references: OnceCell<FxHashSet<Label>>,
     markers: FxHashMap<Key, SmallVec<[(usize, usize); 1]>>,
+    instruction_positions: Vec<usize>,
 }
 impl<'a> View<'a> {
     fn new(
@@ -110,14 +194,18 @@ impl<'a> View<'a> {
         let ViewTables {
             mut labels,
             mut markers,
+            mut instruction_positions,
         } = tables;
-        labels.clear();
+        labels.prepare(items.len());
         markers.clear();
+        instruction_positions.clear();
+        instruction_positions.reserve(items.len() + 1);
         let mut boundaries = provenance.block_boundaries.clone();
         boundaries.extend(preserved);
         let mut previous = None;
         let mut n = 0;
         for (i, item) in items.iter().copied().enumerate() {
+            instruction_positions.push(n);
             match item {
                 Item::Label(l) => {
                     if labels.insert(l, (i, n)).is_some() {
@@ -138,16 +226,31 @@ impl<'a> View<'a> {
                 }
             }
         }
+        instruction_positions.push(n);
         for region in regions {
             boundaries.insert(region.target);
         }
-        let mut references = boundaries.clone();
-        for r in regions {
+        Some(Self {
+            items,
+            regions,
+            provenance,
+            labels,
+            boundaries,
+            supplementary_references: OnceCell::new(),
+            markers,
+            instruction_positions,
+        })
+    }
+
+    fn collect_supplementary_references(&self) -> FxHashSet<Label> {
+        let mut references = FxHashSet::default();
+        for r in self.regions {
             references.extend([r.start, r.end]);
             if let ExceptionRegionPriority::OriginalRange(s, e) = r.priority {
                 references.extend([s, e]);
             }
         }
+        let provenance = self.provenance;
         references.extend(provenance.source_boundaries.iter().copied());
         references.extend(provenance.continuation_boundaries.iter().copied());
         references.extend(provenance.fusion_boundaries.iter().copied());
@@ -170,29 +273,36 @@ impl<'a> View<'a> {
             references.extend(origin.before.iter().copied());
             references.extend(origin.after.iter().copied());
         }
-        Some(Self {
-            items,
-            regions,
-            provenance,
-            labels,
-            boundaries,
-            references,
-            markers,
-        })
+        references
     }
+
+    fn is_reference(&self, label: Label) -> bool {
+        self.boundaries.contains(&label)
+            || self
+                .supplementary_references
+                .get_or_init(|| self.collect_supplementary_references())
+                .contains(&label)
+    }
+
     fn into_tables(self) -> ViewTables {
         ViewTables {
             labels: self.labels,
             markers: self.markers,
+            instruction_positions: self.instruction_positions,
         }
     }
 
     fn label_index(&self, label: Label) -> Option<&usize> {
-        self.labels.get(&label).map(|(index, _)| index)
+        self.labels.get(label).map(|(index, _)| index)
     }
 
     fn label_position(&self, label: Label) -> Option<&usize> {
-        self.labels.get(&label).map(|(_, position)| position)
+        self.labels.get(label).map(|(_, position)| position)
+    }
+
+    /// Returns the number of instructions before an item or the end of the view.
+    fn instruction_position(&self, item_index: usize) -> usize {
+        self.instruction_positions[item_index]
     }
 
     fn endpoint(&self, condition: Instruction, marker: Instruction) -> Option<(usize, usize)> {
@@ -219,10 +329,7 @@ impl<'a> View<'a> {
         if c.exception_policy().owner() != NormalizedExceptionOwner::Unchanged {
             return None;
         }
-        let pos = self.items[..condition_index]
-            .iter()
-            .filter(|x| matches!(x, Item::Instruction(_)))
-            .count();
+        let pos = self.instruction_position(condition_index);
         let mut owner = None;
         for (index, r) in self.regions.iter().enumerate() {
             let s = *self.label_position(r.start)?;
@@ -372,7 +479,7 @@ impl Certificate {
         let mut old = self.items.iter().copied();
         for item in view.items[start..=marker].iter().copied() {
             if let Item::Label(l) = item {
-                if !self.labels.contains(&l) && !view.references.contains(&l) {
+                if !self.labels.contains(&l) && !view.is_reference(l) {
                     continue;
                 }
             }
@@ -566,10 +673,7 @@ impl FreshSingletonCertificate {
             if current_target != target {
                 return None;
             }
-            let position = view.items[..condition]
-                .iter()
-                .filter(|item| matches!(item, Item::Instruction(_)))
-                .count();
+            let position = view.instruction_position(condition);
             let mut expected = Vec::new();
             for region in &self.manager_regions {
                 let begin = *view.label_position(region.start)?;
@@ -834,7 +938,7 @@ impl FallbackCertificate {
                 .copied()
                 .filter(|item| match item {
                     Item::Label(label) => {
-                        self.interval.labels.contains(label) || after.references.contains(label)
+                        self.interval.labels.contains(label) || after.is_reference(*label)
                     }
                     Item::Instruction(_) => true,
                 })
@@ -1061,10 +1165,7 @@ impl View<'_> {
         {
             return None;
         }
-        let mut position = self.items[..start]
-            .iter()
-            .filter(|item| matches!(item, Item::Instruction(_)))
-            .count();
+        let mut position = self.instruction_position(start);
         let mut original_regions: Option<Vec<ExceptionRegion>> = None;
         for (offset, item) in self.items[start..=condition].iter().enumerate() {
             let instruction = match item {
@@ -1161,10 +1262,7 @@ impl View<'_> {
         let mut owner = None;
         let mut removed = 0;
         let mut previous_instruction = None;
-        let mut pos = self.items[..start]
-            .iter()
-            .filter(|item| matches!(item, Item::Instruction(_)))
-            .count();
+        let mut pos = self.instruction_position(start);
         for (offset, item) in self.items[start..=condition].iter().copied().enumerate() {
             let instruction = match item {
                 Item::Label(label) => {
@@ -1350,7 +1448,7 @@ impl ManagerSetupCertificate {
                             return None;
                         }
                         cells.push(None);
-                    } else if after.references.contains(label) {
+                    } else if after.is_reference(*label) {
                         return None;
                     }
                 }
@@ -1358,10 +1456,7 @@ impl ManagerSetupCertificate {
         }
         // SETUP records survive early compaction and fusion, then disappear before
         // NOT_TAKEN is appended. Its live ordinal selects a concrete old-array cell.
-        let ordinal = after.items[..after_marker]
-            .iter()
-            .filter(|item| matches!(item, Item::Instruction(_)))
-            .count();
+        let ordinal = after.instruction_position(after_marker);
         let source_index = *cells.get(ordinal)?.as_ref()?;
         let Item::Instruction(source) = after.items[source_index] else {
             return None;
@@ -1369,10 +1464,7 @@ impl ManagerSetupCertificate {
         if source.exception_policy() != ExceptionPolicy::NoneUnchanged {
             return None;
         }
-        let position = after.items[..source_index]
-            .iter()
-            .filter(|item| matches!(item, Item::Instruction(_)))
-            .count();
+        let position = after.instruction_position(source_index);
         let mut regions = Vec::new();
         for (index, region) in after.regions.iter().enumerate() {
             let begin = *after.label_position(region.start)?;
@@ -1420,10 +1512,7 @@ impl ManagerSetupCertificate {
         if original_sources.next().is_some() {
             return None;
         }
-        let original_position = before.items[..original_source]
-            .iter()
-            .filter(|item| matches!(item, Item::Instruction(_)))
-            .count();
+        let original_position = before.instruction_position(original_source);
         if !(*before.label_position(region.start)? <= original_position
             && original_position < *before.label_position(region.end)?)
         {
@@ -1498,10 +1587,7 @@ impl ManagerSetupCertificate {
         if regions.next().is_some() {
             return None;
         }
-        let position = view.items[..source]
-            .iter()
-            .filter(|item| matches!(item, Item::Instruction(_)))
-            .count();
+        let position = view.instruction_position(source);
         if !(*view.label_position(region.start)? <= position
             && position < *view.label_position(region.end)?)
         {
@@ -1585,10 +1671,7 @@ impl HandlerDispatchCertificate {
         if instruction.exception_policy() != ExceptionPolicy::NoneUnchanged {
             return None;
         }
-        let position = view.items[..index]
-            .iter()
-            .filter(|item| matches!(item, Item::Instruction(_)))
-            .count();
+        let position = view.instruction_position(index);
         Self::owner_at(view, position)
     }
 
@@ -1619,6 +1702,50 @@ impl HandlerDispatchCertificate {
         owner.map(|(_, region)| region)
     }
 
+    /// Checks that one exact region owns every instruction in a half-open interval.
+    fn owns_interval(
+        view: &View<'_>,
+        first: usize,
+        end: usize,
+        expected: &ExceptionRegion,
+    ) -> Option<()> {
+        if first >= end {
+            return Some(());
+        }
+        let mut owner = None;
+        for (order, region) in view.regions.iter().enumerate() {
+            // Even an unrelated region with missing physical bounds invalidates the old lookup.
+            let physical_start = *view.label_position(region.start)?;
+            let physical_end = *view.label_position(region.end)?;
+            if physical_start.max(first) >= physical_end.min(end) {
+                continue;
+            }
+            let (priority_start, priority_end) = match region.priority {
+                ExceptionRegionPriority::OriginalRange(start, end) => {
+                    (*view.label_position(start)?, *view.label_position(end)?)
+                }
+                ExceptionRegionPriority::Resolved { start, end } => (start, end),
+            };
+            let priority = (
+                region.is_scope_fallback,
+                Reverse(priority_start),
+                priority_end,
+                order,
+            );
+            if owner
+                .as_ref()
+                .is_none_or(|(previous, _, _, _)| priority < *previous)
+            {
+                owner = Some((priority, region, physical_start, physical_end));
+            }
+        }
+        let (_, region, physical_start, physical_end) = owner?;
+        // Exact manager equality includes both physical endpoints. A different winner of the
+        // global priority owns at least one cell; this winner owns all only if it spans the range.
+        (same_manager_region(region, expected) && physical_start <= first && end <= physical_end)
+            .then_some(())
+    }
+
     /// Accounts only for a global-call NULL fold or an observed pair of local loads.
     fn slots(&self, view: &View<'_>, start: usize, condition: usize) -> Option<usize> {
         use crate::target::opcodes::{
@@ -1644,15 +1771,11 @@ impl HandlerDispatchCertificate {
         let mut removed = 0;
         let mut global_call = false;
         let mut call = false;
-        let mut position = view.items[..start]
-            .iter()
-            .filter(|item| matches!(item, Item::Instruction(_)))
-            .count();
         for (offset, item) in view.items[start..=condition].iter().enumerate() {
             let index = start + offset;
             let instruction = match item {
                 Item::Label(label) => {
-                    if offset != 0 && view.references.contains(label) {
+                    if offset != 0 && view.is_reference(*label) {
                         return None;
                     }
                     continue;
@@ -1665,7 +1788,6 @@ impl HandlerDispatchCertificate {
                 || instruction.only_allows_unconditional_inlining()
                 || instruction.no_location_policy.borrow_fallthrough()
                     == super::BorrowFallthrough::Barrier
-                || !same_manager_region(&Self::owner_at(view, position)?, &self.region)
             {
                 return None;
             }
@@ -1690,9 +1812,17 @@ impl HandlerDispatchCertificate {
                 POP_JUMP_IF_FALSE if index == condition => {}
                 _ => return None,
             }
-            position += 1;
         }
-        (removed <= 1 && (!global_call || call)).then_some(removed)
+        if removed > 1 || (global_call && !call) {
+            return None;
+        }
+        Self::owns_interval(
+            view,
+            view.instruction_position(start),
+            view.instruction_position(condition + 1),
+            &self.region,
+        )?;
+        Some(removed)
     }
 
     fn valid(&self, view: &View<'_>, borrow: bool) -> Option<usize> {
@@ -1757,10 +1887,7 @@ struct FoldedAssertSuccessCertificate {
 
 impl FoldedAssertSuccessCertificate {
     fn sole_fallback(view: &View<'_>, index: usize) -> Option<ExceptionRegion> {
-        let position = view.items[..index]
-            .iter()
-            .filter(|item| matches!(item, Item::Instruction(_)))
-            .count();
+        let position = view.instruction_position(index);
         let mut owner = None;
         for region in view.regions {
             let start = *view.label_position(region.start)?;
@@ -1875,7 +2002,7 @@ pub(super) struct FusionOwnerCertificates {
     fallback_certificates: Vec<FallbackCertificate>,
     fresh_singleton_certificates: Vec<FreshSingletonCertificate>,
     folded_assert_success_certificates: Vec<FoldedAssertSuccessCertificate>,
-    scratch: Option<Box<ViewTables>>,
+    scratch: Option<Box<RetentionScratch>>,
 }
 
 impl FusionOwnerCertificates {
@@ -1978,7 +2105,7 @@ impl FusionOwnerCertificates {
     }
 
     /// Moves original-array certificates into the existing later-pass retention path.
-    pub(super) fn extend_original_owners(&mut self, mut original: Self) {
+    fn extend_original_owners(&mut self, mut original: Self) {
         self.handler_dispatch_certificates
             .append(&mut original.handler_dispatch_certificates);
         self.fallback_certificates
@@ -2004,6 +2131,64 @@ impl FusionOwnerCertificates {
             p.graph.iter_items().copied().collect()
         }
     }
+
+    /// Retains authored certificates before capturing new certificates on the same fused graph.
+    pub(super) fn after_fusion(mut self, before: &[Item], p: &OptimizationPipeline) -> Self {
+        if before.is_empty() {
+            self.retain_after_fusion(before, p);
+            let mut result = Self::default();
+            result.extend_original_owners(self);
+            return result;
+        }
+        let mut after = p.graph.iter_items().copied().collect::<Vec<_>>();
+        let (Some(before_view), Some(after_view)) = (
+            View::new(
+                before,
+                &p.exception_regions,
+                &p.exception_owner_provenance,
+                &p.preserved_block_boundaries,
+            ),
+            View::new(
+                &after,
+                &p.exception_regions,
+                &p.exception_owner_provenance,
+                &p.preserved_block_boundaries,
+            ),
+        ) else {
+            self.retain_pipeline(p);
+            let mut result = Self::default();
+            result.extend_original_owners(self);
+            return result;
+        };
+        let retain_tables = if self.has_fusion_transfer_certificates() {
+            self.retain_fusion_views(&before_view, &after_view);
+            false
+        } else if self.is_empty() {
+            false
+        } else {
+            self.retain_view(&after_view);
+            if self.is_empty() {
+                self.scratch = None;
+                false
+            } else {
+                self.scratch.is_none()
+            }
+        };
+        let mut result = Self::capture_views(&before_view, &after_view);
+        if retain_tables {
+            let mut tables = after_view.into_tables();
+            tables.clear();
+            after.clear();
+            self.scratch = Some(Box::new(RetentionScratch {
+                items: after,
+                tables,
+            }));
+        }
+        result.extend_original_owners(self);
+        result
+    }
+
+    #[cfg(test)]
     pub(super) fn capture(before: &[Item], p: &OptimizationPipeline) -> Self {
         if before.is_empty() {
             return Self::default();
@@ -2025,6 +2210,12 @@ impl FusionOwnerCertificates {
         ) else {
             return Self::default();
         };
+        Self::capture_views(&b, &a)
+    }
+
+    fn capture_views(b: &View<'_>, a: &View<'_>) -> Self {
+        let before = b.items;
+        let after = a.items;
         let mut result = Self::default();
         let mut start = 0;
         let mut has_instruction = false;
@@ -2085,9 +2276,9 @@ impl FusionOwnerCertificates {
                                         labels: FxHashSet::default(),
                                         owner,
                                         boundaries: a.boundaries.clone(),
-                                        setups: p.exception_owner_provenance.setups.clone(),
+                                        setups: a.provenance.setups.clone(),
                                     };
-                                    if let Some((s, c, m)) = cert.range(&a, false) {
+                                    if let Some((s, c, m)) = cert.range(a, false) {
                                         if a.owner(c) == Some(owner)
                                             && a.no_late_insertions_or_setups(s, m)
                                             && one_fusion(&before[start..=index], &after[s..=m])
@@ -2106,12 +2297,12 @@ impl FusionOwnerCertificates {
                             }
                         }
                         if let Some(certificate) =
-                            ManagerSetupCertificate::capture(&b, &a, start, index, previous)
+                            ManagerSetupCertificate::capture(b, a, start, index, previous)
                         {
                             result.manager_setup_certificates.push(certificate);
                         }
                         if let Some(cert) =
-                            FallbackCertificate::capture(&b, &a, start, index, previous)
+                            FallbackCertificate::capture(b, a, start, index, previous)
                         {
                             result.fallback_certificates.push(cert);
                         }
@@ -2133,7 +2324,7 @@ impl FusionOwnerCertificates {
                             ))
                     {
                         if let Some(cert) =
-                            FallbackCertificate::capture(&b, &a, start, index, previous)
+                            FallbackCertificate::capture(b, a, start, index, previous)
                         {
                             result.fallback_certificates.push(cert);
                         }
@@ -2188,9 +2379,8 @@ impl FusionOwnerCertificates {
     }
 
     /// Transfers original fallback proofs across the immediately preceding fusion pass.
-    pub(super) fn retain_after_fusion(&mut self, before: &[Item], p: &OptimizationPipeline) {
-        if !self.fallback_certificates.is_empty() || !self.handler_dispatch_certificates.is_empty()
-        {
+    fn retain_after_fusion(&mut self, before: &[Item], p: &OptimizationPipeline) {
+        if self.has_fusion_transfer_certificates() {
             let items = p.graph.iter_items().copied().collect::<Vec<_>>();
             if let (Some(before), Some(after)) = (
                 View::new(
@@ -2206,20 +2396,28 @@ impl FusionOwnerCertificates {
                     &p.preserved_block_boundaries,
                 ),
             ) {
-                self.fallback_certificates.retain_mut(|certificate| {
-                    certificate.valid(&after, false).is_some()
-                        || certificate.rebind_one_fusion(&before, &after).is_some()
-                });
-                self.handler_dispatch_certificates
-                    .retain_mut(|certificate| {
-                        certificate.valid(&after, false).is_some()
-                            || certificate.rebind_one_fusion(&before, &after).is_some()
-                    });
-                self.retain_view(&after);
+                self.retain_fusion_views(&before, &after);
                 return;
             }
         }
         self.retain_pipeline(p);
+    }
+
+    fn has_fusion_transfer_certificates(&self) -> bool {
+        !self.fallback_certificates.is_empty() || !self.handler_dispatch_certificates.is_empty()
+    }
+
+    fn retain_fusion_views(&mut self, before: &View<'_>, after: &View<'_>) {
+        self.fallback_certificates.retain_mut(|certificate| {
+            certificate.valid(after, false).is_some()
+                || certificate.rebind_one_fusion(before, after).is_some()
+        });
+        self.handler_dispatch_certificates
+            .retain_mut(|certificate| {
+                certificate.valid(after, false).is_some()
+                    || certificate.rebind_one_fusion(before, after).is_some()
+            });
+        self.retain_view(after);
     }
 
     pub(super) fn has_manager_setup_certificates(&self) -> bool {
@@ -2304,10 +2502,7 @@ impl FusionOwnerCertificates {
                 if sources.next().is_some() {
                     return false;
                 }
-                let position = view.items[..source]
-                    .iter()
-                    .filter(|item| matches!(item, Item::Instruction(_)))
-                    .count();
+                let position = view.instruction_position(source);
                 let mut candidates = retargets.iter().filter_map(|(original, rebuilt)| {
                     if !same_manager_region(original, &certificate.region) {
                         return None;
@@ -2354,14 +2549,16 @@ impl FusionOwnerCertificates {
         if self.is_empty() {
             return;
         }
-        let items = p.graph.iter_items().copied().collect::<Vec<_>>();
-        let mut tables = self.scratch.take().unwrap_or_default();
+        let mut scratch = self.scratch.take().unwrap_or_default();
+        for (_, block) in p.graph.iter() {
+            scratch.items.extend_from_slice(block.items());
+        }
         let Some(view) = View::with_tables(
-            &items,
+            &scratch.items,
             &p.exception_regions,
             &p.exception_owner_provenance,
             &p.preserved_block_boundaries,
-            std::mem::take(&mut *tables),
+            std::mem::take(&mut scratch.tables),
         ) else {
             self.clear();
             return;
@@ -2370,10 +2567,11 @@ impl FusionOwnerCertificates {
         if self.is_empty() {
             return;
         }
-        *tables = view.into_tables();
+        scratch.tables = view.into_tables();
         // Keep only allocation capacity; every record is rebuilt by the next pass.
-        tables.clear();
-        self.scratch = Some(tables);
+        scratch.tables.clear();
+        scratch.items.clear();
+        self.scratch = Some(scratch);
     }
 
     fn retain_view(&mut self, view: &View<'_>) {
@@ -2390,25 +2588,16 @@ impl FusionOwnerCertificates {
             .retain(|certificate| certificate.valid(view).is_some());
     }
     /// Exports exact surviving manager cells before layout chooses owner regions.
-    pub(super) fn manager_owners(
-        &self,
-        items: &[Item],
-        regions: &[ExceptionRegion],
-        provenance: &ExceptionOwnerProvenance,
-        preserved: &FxHashSet<Label>,
-    ) -> Vec<(Instruction, Instruction, ExceptionRegion)> {
+    fn manager_owners(&self, view: &View<'_>) -> Vec<(Instruction, Instruction, ExceptionRegion)> {
         if self.manager_setup_certificates.is_empty() {
             return Vec::new();
         }
-        let Some(view) = View::new(items, regions, provenance, preserved) else {
-            return Vec::new();
-        };
         self.manager_setup_certificates
             .iter()
             .filter_map(|certificate| {
-                let (condition, marker) = certificate.valid(&view, true)?;
+                let (condition, marker) = certificate.valid(view, true)?;
                 let (Item::Instruction(condition), Item::Instruction(marker)) =
-                    (items[condition], items[marker])
+                    (view.items[condition], view.items[marker])
                 else {
                     return None;
                 };
@@ -2417,19 +2606,21 @@ impl FusionOwnerCertificates {
             .collect()
     }
 
-    pub(super) fn apply(
+    /// Validates manager exports and policy updates against the same unchanged items.
+    pub(super) fn finalize(
         self,
         items: &mut [Item],
         regions: &[ExceptionRegion],
         provenance: &ExceptionOwnerProvenance,
         preserved: &FxHashSet<Label>,
-    ) {
+    ) -> Vec<(Instruction, Instruction, ExceptionRegion)> {
         if self.is_empty() {
-            return;
+            return Vec::new();
         }
         let Some(view) = View::new(items, regions, provenance, preserved) else {
-            return;
+            return Vec::new();
         };
+        let manager_owners = self.manager_owners(&view);
         let changes = self
             .certificates
             .iter()
@@ -2477,6 +2668,18 @@ impl FusionOwnerCertificates {
                 marker.set_exception_policy(ExceptionPolicy::NoneOverridePresent);
             }
         }
+        manager_owners
+    }
+
+    #[cfg(test)]
+    fn apply(
+        self,
+        items: &mut [Item],
+        regions: &[ExceptionRegion],
+        provenance: &ExceptionOwnerProvenance,
+        preserved: &FxHashSet<Label>,
+    ) {
+        let _ = self.finalize(items, regions, provenance, preserved);
     }
 }
 
@@ -2528,6 +2731,203 @@ mod tests {
         let preserved = FxHashSet::default();
         let view = View::new(items, &[], &provenance, &preserved).unwrap();
         cert.valid(&view, borrow).is_some()
+    }
+    #[test]
+    fn instruction_positions_count_only_preceding_instructions() {
+        let provenance = ExceptionOwnerProvenance::default();
+        let preserved = FxHashSet::default();
+        let items = [
+            Item::Label(Label(0)),
+            Item::Label(Label(1)),
+            Item::Instruction(instruction(NOP, Operand::Value(0))),
+            Item::Label(Label(2)),
+            Item::Instruction(instruction(NOP, Operand::Value(0))),
+            Item::Instruction(instruction(NOP, Operand::Value(0))),
+            Item::Label(Label(3)),
+        ];
+        let view = View::new(&items, &[], &provenance, &preserved).unwrap();
+        let positions: Vec<_> = (0..=items.len())
+            .map(|index| view.instruction_position(index))
+            .collect();
+        assert_eq!(positions, [0, 0, 0, 1, 1, 2, 3, 3]);
+        assert_eq!(view.label_position(Label(2)), Some(&1));
+
+        let mut duplicate = items.to_vec();
+        duplicate.push(Item::Label(Label(2)));
+        assert!(View::new(&duplicate, &[], &provenance, &preserved).is_none());
+        assert_eq!(
+            View::new(&[], &[], &provenance, &preserved)
+                .unwrap()
+                .instruction_position(0),
+            0
+        );
+    }
+    #[test]
+    fn label_positions_keep_dense_and_sparse_memberships_exact() {
+        let mut labels = LabelPositions::default();
+        labels.prepare(3);
+        assert_eq!(labels.insert(Label(0), (0, 0)), None);
+        assert_eq!(labels.insert(Label(5), (1, 0)), None);
+        assert_eq!(labels.insert(Label(90), (2, 1)), None);
+        assert_eq!(labels.insert(Label(u32::MAX), (3, 1)), None);
+        assert_eq!(labels.dense.len(), 6);
+        assert_eq!(labels.get(Label(0)), Some(&(0, 0)));
+        assert_eq!(labels.get(Label(5)), Some(&(1, 0)));
+        assert_eq!(labels.get(Label(90)), Some(&(2, 1)));
+        assert_eq!(labels.get(Label(u32::MAX)), Some(&(3, 1)));
+        assert_eq!(labels.get(Label(4)), None);
+        assert_eq!(labels.get(Label(91)), None);
+        assert_eq!(labels.insert(Label(5), (4, 2)), Some((1, 0)));
+        assert_eq!(labels.insert(Label(90), (5, 2)), Some((2, 1)));
+        assert_eq!(labels.insert(Label(u32::MAX), (6, 3)), Some((3, 1)));
+
+        // The same label moves from sparse to dense, then back on a shorter graph.
+        labels.clear();
+        labels.prepare(100);
+        assert_eq!(labels.get(Label(5)), None);
+        assert_eq!(labels.get(Label(90)), None);
+        assert_eq!(labels.get(Label(u32::MAX)), None);
+        assert_eq!(labels.insert(Label(90), (4, 2)), None);
+        assert_eq!(labels.get(Label(90)), Some(&(4, 2)));
+        assert_eq!(labels.dense.len(), 91);
+        labels.clear();
+        labels.prepare(3);
+        assert_eq!(labels.get(Label(90)), None);
+        assert_eq!(labels.insert(Label(90), (1, 1)), None);
+        assert_eq!(labels.get(Label(90)), Some(&(1, 1)));
+        assert_eq!(labels.dense.len(), 91);
+
+        let provenance = ExceptionOwnerProvenance::default();
+        let preserved = FxHashSet::default();
+        let items = [
+            Item::Label(Label(u32::MAX)),
+            Item::Instruction(instruction(NOP, Operand::Value(0))),
+            Item::Label(Label(1)),
+        ];
+        let view = View::new(&items, &[], &provenance, &preserved).unwrap();
+        assert_eq!(view.label_index(Label(u32::MAX)), Some(&0));
+        assert_eq!(view.label_position(Label(1)), Some(&1));
+        for duplicate in [Label(1), Label(u32::MAX)] {
+            let mut duplicate_items = items.to_vec();
+            duplicate_items.push(Item::Label(duplicate));
+            assert!(View::new(&duplicate_items, &[], &provenance, &preserved).is_none());
+        }
+    }
+    #[test]
+    fn label_position_generation_wrap_cannot_revive_stale_records() {
+        let mut labels = LabelPositions::default();
+        labels.prepare(3);
+        assert_eq!(labels.insert(Label(1), (1, 1)), None);
+        assert_eq!(labels.insert(Label(u32::MAX), (9, 9)), None);
+        // Simulate a record left from the generation to which a wrap returns.
+        labels.dense[1].generation = 1;
+        labels.generation = u32::MAX;
+        assert_eq!(labels.insert(Label(2), (2, 2)), None);
+        labels.clear();
+        assert_eq!(labels.generation, 1);
+        assert_eq!(labels.get(Label(1)), None);
+        assert_eq!(labels.get(Label(2)), None);
+        assert_eq!(labels.get(Label(u32::MAX)), None);
+        assert_eq!(labels.insert(Label(1), (3, 3)), None);
+        assert_eq!(labels.get(Label(1)), Some(&(3, 3)));
+        assert_eq!(labels.insert(Label(1), (4, 4)), Some((3, 3)));
+    }
+    #[test]
+    fn references_include_control_flow_and_supplementary_provenance() {
+        let mut provenance = ExceptionOwnerProvenance::default();
+        provenance.source_boundaries.insert(Label(2));
+        let preserved = FxHashSet::from_iter([Label(1)]);
+        let items = [Item::Instruction(instruction(
+            JUMP_FORWARD,
+            Operand::Forward(Label(3)),
+        ))];
+        let view = View::new(&items, &[], &provenance, &preserved).unwrap();
+        assert!(view.is_reference(Label(1)));
+        assert!(view.is_reference(Label(3)));
+        assert!(view.is_reference(Label(2)));
+        assert!(!view.is_reference(Label(4)));
+    }
+    #[test]
+    fn handler_interval_owner_matches_individual_cells_and_preserves_failures() {
+        use ExceptionRegionPriority::{OriginalRange, Resolved};
+
+        let provenance = ExceptionOwnerProvenance::default();
+        let preserved = FxHashSet::default();
+        let items = [
+            Item::Label(Label(10)),
+            Item::Instruction(instruction(NOP, Operand::Value(0))),
+            Item::Label(Label(100)),
+            Item::Instruction(instruction(NOP, Operand::Value(0))),
+            Item::Label(Label(500)),
+            Item::Instruction(instruction(NOP, Operand::Value(0))),
+            Item::Label(Label(1_000)),
+            Item::Instruction(instruction(NOP, Operand::Value(0))),
+            Item::Label(Label(50_000)),
+            Item::Instruction(instruction(NOP, Operand::Value(0))),
+            Item::Label(Label(1_000_000)),
+        ];
+        let make_region = |start, end, target, priority| ExceptionRegion {
+            start: Label(start),
+            end: Label(end),
+            target: Label(target),
+            depth: 1,
+            preserve_lasti: true,
+            is_scope_fallback: false,
+            priority,
+        };
+        let assert_interval =
+            |regions: &[ExceptionRegion], expected: &ExceptionRegion, first, end, wanted| {
+                let view = View::new(&items, regions, &provenance, &preserved).unwrap();
+                let individual_cells = (first..end).all(|position| {
+                    HandlerDispatchCertificate::owner_at(&view, position)
+                        .is_some_and(|owner| same_manager_region(&owner, expected))
+                });
+                assert_eq!(individual_cells, wanted);
+                assert_eq!(
+                    HandlerDispatchCertificate::owns_interval(&view, first, end, expected)
+                        .is_some(),
+                    wanted
+                );
+            };
+        let base = make_region(10, 1_000_000, 10, Resolved { start: 0, end: 5 });
+        let better = make_region(100, 1_000, 100, Resolved { start: 4, end: 5 });
+        let lower = make_region(100, 1_000, 100, Resolved { start: 0, end: 8 });
+        let tied = make_region(100, 1_000, 100, Resolved { start: 0, end: 5 });
+        let mut fallback = better;
+        fallback.is_scope_fallback = true;
+        assert_interval(&[base, better], &base, 0, 5, false);
+        assert_interval(&[base, better], &base, 3, 5, true);
+        assert_interval(&[base, better], &better, 1, 3, true);
+        assert_interval(&[base, better], &better, 0, 4, false);
+        assert_interval(&[base, lower], &base, 0, 5, true);
+        assert_interval(&[fallback, base], &base, 0, 5, true);
+        assert_interval(&[base, tied], &base, 0, 5, true);
+        assert_interval(&[tied, base], &base, 0, 5, false);
+        assert_interval(&[base, base], &base, 0, 5, true);
+        assert_interval(&[], &base, 0, 5, false);
+
+        let missing_priority = make_region(
+            1_000,
+            50_000,
+            100,
+            OriginalRange(Label(u32::MAX), Label(u32::MAX - 1)),
+        );
+        let missing_bounds = make_region(u32::MAX, 1_000_000, 100, Resolved { start: 4, end: 5 });
+        assert_interval(&[base, missing_priority], &base, 0, 3, true);
+        assert_interval(&[base, missing_priority], &base, 0, 4, false);
+        assert_interval(&[base, missing_bounds], &base, 0, 1, false);
+        assert_interval(&[missing_bounds, base], &base, 0, 1, false);
+        assert_interval(&[missing_bounds], &base, 2, 2, true);
+        assert_interval(&[], &base, 2, 2, true);
+        assert_interval(&[], &base, 3, 2, true);
+
+        let mut inverted = missing_priority;
+        inverted.start = Label(1_000);
+        inverted.end = Label(100);
+        let mut empty = missing_priority;
+        empty.start = Label(500);
+        empty.end = Label(500);
+        assert_interval(&[inverted, base, empty], &base, 0, 5, true);
     }
     #[test]
     fn captures_one_actual_fusion() {

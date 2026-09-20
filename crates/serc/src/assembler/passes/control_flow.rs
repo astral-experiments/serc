@@ -665,26 +665,33 @@ impl OptimizationPipeline {
                 let Some((_, copy)) = following.next() else {
                     continue;
                 };
+                if copy.opcode != COPY || !matches!(copy.operand(), Operand::Value(1)) {
+                    continue;
+                }
                 let Some((_, to_bool)) = following.next() else {
                     continue;
                 };
+                if to_bool.opcode != TO_BOOL {
+                    continue;
+                }
                 let Some((_, jump)) = following.next() else {
                     continue;
                 };
+                if !matches!(jump.opcode, POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE)
+                    || !matches!(jump.operand(), Operand::Forward(_))
+                {
+                    continue;
+                }
                 let Some((_, not_taken)) = following.next() else {
                     continue;
                 };
+                if not_taken.opcode != NOT_TAKEN {
+                    continue;
+                }
                 let Some((fallthrough_index, pop)) = following.next() else {
                     continue;
                 };
-                if copy.opcode != COPY
-                    || !matches!(copy.operand(), Operand::Value(1))
-                    || to_bool.opcode != TO_BOOL
-                    || !matches!(jump.opcode, POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE)
-                    || !matches!(jump.operand(), Operand::Forward(_))
-                    || not_taken.opcode != NOT_TAKEN
-                    || pop.opcode != POP_TOP
-                {
+                if pop.opcode != POP_TOP {
                     continue;
                 }
                 let target = &mut conditional_targets
@@ -3878,6 +3885,9 @@ impl OptimizationPipeline {
         &mut self,
         finalize_borrow_empty_blocks: bool,
     ) {
+        if !finalize_borrow_empty_blocks && !self.graph.features().has_forward_jump() {
+            return;
+        }
         let named_match_cleanup_jumps = if finalize_borrow_empty_blocks {
             FxHashSet::default()
         } else {
@@ -3999,16 +4009,21 @@ impl OptimizationPipeline {
         // Count only labels certified to enter the same original instruction array.
         // Two separate arrays must not become shared merely because later passes merge them.
         let mut shared_entries = FxHashMap::<Label, usize>::default();
-        for item in self.graph.iter_items() {
-            if let Item::Instruction(instruction) = item
-                && matches!(
-                    instruction.opcode,
-                    POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE | POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE
-                )
-                && let Operand::Forward(target) = instruction.operand()
-                && let Some(origin) = self.original_shared_unlocated_jump_entries.get(&target)
-            {
-                *shared_entries.entry(*origin).or_default() += 1;
+        if !self.original_shared_unlocated_jump_entries.is_empty() {
+            for item in self.graph.iter_items() {
+                if let Item::Instruction(instruction) = item
+                    && matches!(
+                        instruction.opcode,
+                        POP_JUMP_IF_FALSE
+                            | POP_JUMP_IF_TRUE
+                            | POP_JUMP_IF_NONE
+                            | POP_JUMP_IF_NOT_NONE
+                    )
+                    && let Operand::Forward(target) = instruction.operand()
+                    && let Some(origin) = self.original_shared_unlocated_jump_entries.get(&target)
+                {
+                    *shared_entries.entry(*origin).or_default() += 1;
+                }
             }
         }
         let planned_blocks = if finalize_borrow_empty_blocks {
@@ -4027,9 +4042,6 @@ impl OptimizationPipeline {
                 .collect::<FxHashSet<_>>()
         };
         let graph = &mut self.graph;
-        if !finalize_borrow_empty_blocks && !graph.features().has_forward_jump() {
-            return;
-        }
         // Unlocated borrow markers always disappear after local analysis. Keep the
         // barrier in the graph, but exclude it from physical jump adjacency.
         let is_unlocated_borrow_marker = |instruction: &Instruction| {
@@ -4852,6 +4864,13 @@ impl OptimizationPipeline {
     }
 
     fn remove_redundant_nops_scoped(&mut self, with_exits_only: bool) {
+        if !self
+            .graph
+            .iter_items()
+            .any(|item| matches!(item, Item::Instruction(instruction) if instruction.opcode == NOP))
+        {
+            return;
+        }
         if !with_exits_only
             && !self
                 .exception_owner_provenance
@@ -5167,36 +5186,46 @@ impl OptimizationPipeline {
         // during CPython's NOP compaction. A following equal line also removes it.
         let mut original_manager_pops = FxHashSet::default();
         let mut original_fallthrough_pops = FxHashSet::default();
-        for block in graph.order().iter().copied() {
-            let mut original_manager_pop = false;
-            let mut original_fallthrough_pop = None;
-            for (offset, item) in graph[block].items().iter().enumerate() {
-                match item {
-                    Item::Label(label) => {
-                        original_manager_pop |= self
-                            .exception_owner_provenance
-                            .original_manager_pop_blocks
-                            .contains(label);
-                        if let Some(pop) = self
-                            .exception_owner_provenance
-                            .original_fallthrough_pop_blocks
-                            .get(label)
-                        {
-                            original_fallthrough_pop = Some(pop);
+        if !self
+            .exception_owner_provenance
+            .original_manager_pop_blocks
+            .is_empty()
+            || !self
+                .exception_owner_provenance
+                .original_fallthrough_pop_blocks
+                .is_empty()
+        {
+            for block in graph.order().iter().copied() {
+                let mut original_manager_pop = false;
+                let mut original_fallthrough_pop = None;
+                for (offset, item) in graph[block].items().iter().enumerate() {
+                    match item {
+                        Item::Label(label) => {
+                            original_manager_pop |= self
+                                .exception_owner_provenance
+                                .original_manager_pop_blocks
+                                .contains(label);
+                            if let Some(pop) = self
+                                .exception_owner_provenance
+                                .original_fallthrough_pop_blocks
+                                .get(label)
+                            {
+                                original_fallthrough_pop = Some(pop);
+                            }
                         }
-                    }
-                    Item::Instruction(instruction) => {
-                        if original_manager_pop
-                            && instruction.opcode == NOP
-                            && instruction.fusion_policy.is_converted_pop_block()
-                        {
-                            original_manager_pops.insert(ItemPosition::new(block, offset));
+                        Item::Instruction(instruction) => {
+                            if original_manager_pop
+                                && instruction.opcode == NOP
+                                && instruction.fusion_policy.is_converted_pop_block()
+                            {
+                                original_manager_pops.insert(ItemPosition::new(block, offset));
+                            }
+                            if original_fallthrough_pop == Some(instruction) {
+                                original_fallthrough_pops.insert(ItemPosition::new(block, offset));
+                            }
+                            original_manager_pop = false;
+                            original_fallthrough_pop = None;
                         }
-                        if original_fallthrough_pop == Some(instruction) {
-                            original_fallthrough_pops.insert(ItemPosition::new(block, offset));
-                        }
-                        original_manager_pop = false;
-                        original_fallthrough_pop = None;
                     }
                 }
             }
