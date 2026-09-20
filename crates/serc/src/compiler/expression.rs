@@ -2779,17 +2779,6 @@ impl Compiler<'_> {
             "tuple" => (CommonConstant::BUILTIN_TUPLE, false, true),
             _ => unreachable!("optimized generator call must use all, any, or tuple"),
         };
-        let generator_expression_boolean_dispatch_eligible = (self
-            .context
-            .target_specific_rules_enabled()
-            && !collect_tuple
-            && matches!(call.arguments.args.as_ref(), [Expr::Generator(generator)]
-                if generator
-                    .generators
-                    .iter()
-                    .all(|generator| matches!(generator.target, Expr::Name(_)))
-                    && !matches!(generator.elt.as_ref(), Expr::UnaryOp(unary) if unary.op == UnaryOp::Not)))
-            .then_some(call.arguments.args[0].range());
         let callable_location = self.source_location(call.func.range());
         let base_depth = self.control.stack.depth;
         let fallback = self.assembler.label();
@@ -2819,46 +2808,6 @@ impl Compiler<'_> {
                                 })
                     ))))
         .then_some(ExceptionPolicy::EXCLUDE_ALWAYS);
-        let coroutine_boolean_loop_policy = (!collect_tuple
-            && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR | CO_GENERATOR) != 0
-            && self.context.target_specific_rules_enabled()
-            && self.control.generators.generator_region_start.is_some()
-            && (self
-                .control
-                .exceptions
-                .active_exception_region_exclusions
-                .is_empty()
-                || self.unit.flags & CO_COROUTINE != 0)
-            && ((self.control.withs.active_with_region_exclusions.is_empty()
-                && self
-                    .control
-                    .comprehensions
-                    .active_comprehension_region_exclusions
-                    .is_empty())
-                || (self.unit.flags & CO_COROUTINE != 0 && !self.control.in_synchronous_with()))
-            && !self.control.in_exception_handler()
-            && self.control.exceptions.active_exception_group_handlers == 0
-            && self.control.finally.active_normal_finally_bodies == 0
-            && self.control.finally.active_finally_end_blocks == 0
-            && matches!(
-                call.arguments.args.as_ref(),
-                [Expr::Generator(generator)]
-                    if !expression_suspends_current_scope(&generator.elt)
-                        && (self.control.stack.depth == 0
-                            || generator.generators.first().is_some_and(|generator| {
-                                !expression_suspends_current_scope(&generator.iter)
-                            }))
-                        && generator.generators.iter().enumerate().all(|(index, generator)| {
-                            !generator.is_async
-                                && (index == 0
-                                    || !expression_suspends_current_scope(&generator.iter))
-                                && !generator
-                                    .ifs
-                                    .iter()
-                                    .any(expression_suspends_current_scope)
-                        })
-            ))
-        .then_some(ExceptionPolicy::EXCLUDE_ALWAYS);
         // The iterator's initial body still has its removed target slot. Branch and
         // suspension boundaries consume that slot before the optimized call guard is added.
         let initial_iterator_dispatch = self
@@ -2869,283 +2818,6 @@ impl Compiler<'_> {
                     .assembler
                     .contains_iterator_tail_barrier_since_item(start)
             });
-        // Once this with body has split at a branch, its dispatch guard can only reuse
-        // slots vacated in the current block, including under nested try or iterator bodies.
-        let with_dispatch_after_branch = self.context.target_specific_rules_enabled()
-            && !initial_iterator_dispatch
-            && self
-                .control
-                .current_with_body_start_item()
-                .is_some_and(|start| self.assembler.contains_opcode_since_item(NOT_TAKEN, start))
-            && !self.control.in_exception_handler()
-            && self.control.exceptions.active_exception_group_handlers == 0
-            && self.control.finally.active_normal_finally_bodies == 0
-            && self.control.finally.active_finally_end_blocks == 0;
-        // A preceding normalized branch has already labeled the coroutine's stop-iteration
-        // target, even before its first suspension. The optimized dispatch marker therefore
-        // only keeps an owner when this block has a concrete protected slot to reuse.
-        let coroutine_boolean_dispatch_policy = coroutine_boolean_loop_policy.filter(|_| {
-            self.unit.flags & CO_COROUTINE != 0
-                && (self.control.generators.coroutine_suspension_epoch > 0
-                    || self.assembler.contains_opcode(NOT_TAKEN))
-                && (!self.control.in_loop()
-                    || self.control.stack.depth == 0
-                    || !initial_iterator_dispatch)
-        });
-        let coroutine_tuple_dispatch_policy = (collect_tuple
-            && self.unit.flags & CO_COROUTINE != 0
-            && self.context.target_specific_rules_enabled()
-            && !self.control.in_iterator_loop()
-            && self.control.generators.generator_region_start.is_some()
-            && (self.control.generators.coroutine_suspension_epoch > 0
-                || self.assembler.contains_opcode(NOT_TAKEN))
-            && self.control.withs.active_with_region_exclusions.is_empty()
-            && self
-                .control
-                .comprehensions
-                .active_comprehension_region_exclusions
-                .is_empty()
-            && !self.control.in_exception_handler()
-            && self.control.exceptions.active_exception_group_handlers == 0
-            && self.control.finally.active_normal_finally_bodies == 0
-            && self.control.finally.active_finally_end_blocks == 0)
-            .then_some(ExceptionPolicy::EXCLUDE_ALWAYS);
-        let iterator_boolean_dispatch_policy = coroutine_boolean_loop_policy.filter(|_| {
-            self.control.in_iterator_loop()
-                && self
-                    .control
-                    .generators
-                    .optimized_generator_later_boolean_operand
-        });
-        // Nested optimized calls allocate their dispatch marker in the generator's CFG,
-        // independently of which callable consumes that generator or how its target unpacks.
-        let generator_expression_dispatch = self.context.target_specific_rules_enabled()
-            && self.control.generators.generator_expression
-            && !self.control.generators.generator_filter_expression;
-        let generator_expression_filter_dispatch_policy =
-            (self.context.target_specific_rules_enabled()
-                && self.unit.flags & CO_GENERATOR != 0
-                && self.control.generators.generator_expression
-                && self.control.generators.generator_filter_expression
-                && self
-                    .control
-                    .generators
-                    .generator_expression_has_simple_targets
-                && self.control.stack.depth == 1
-                && self
-                    .control
-                    .exceptions
-                    .active_exception_region_exclusions
-                    .is_empty()
-                && self.control.withs.active_with_region_exclusions.is_empty()
-                && self
-                    .control
-                    .comprehensions
-                    .active_comprehension_region_exclusions
-                    .is_empty()
-                && !self.control.in_exception_handler()
-                && self.control.exceptions.active_exception_group_handlers == 0
-                && self.control.finally.active_normal_finally_bodies == 0
-                && self.control.finally.active_finally_end_blocks == 0
-                && matches!(
-                    call.arguments.args.as_ref(),
-                    [Expr::Generator(generator)]
-                        if !expression_suspends_current_scope(&generator.elt)
-                            && !matches!(generator.elt.as_ref(), Expr::Compare(comparison)
-                                if comparison.ops.len() > 1)
-                            && generator.generators.first().is_none_or(|generator| {
-                                !matches!(generator.iter, Expr::Subscript(_))
-                            })
-                            && generator.generators.iter().enumerate().all(|(index, generator)| {
-                                !generator.is_async
-                                    && (index == 0
-                                        || !expression_suspends_current_scope(&generator.iter))
-                                    && !generator
-                                        .ifs
-                                        .iter()
-                                        .any(expression_suspends_current_scope)
-                            })
-                ))
-            .then_some(ExceptionPolicy::EXCLUDE_ALWAYS);
-        let plain_try_boolean_loop_policy = (!collect_tuple
-            && self.context.target_specific_rules_enabled()
-            && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR | CO_GENERATOR) == 0
-            && !self
-                .control
-                .exceptions
-                .active_exception_region_exclusions
-                .is_empty()
-            && self.control.withs.active_with_region_exclusions.is_empty()
-            && self
-                .control
-                .comprehensions
-                .active_comprehension_region_exclusions
-                .is_empty()
-            && !self.control.in_exception_handler()
-            && self.control.exceptions.active_exception_group_handlers == 0
-            && self.control.finally.active_normal_finally_bodies == 0
-            && self.control.finally.active_finally_end_blocks == 0
-            && matches!(
-                call.arguments.args.as_ref(),
-                [Expr::Generator(generator)]
-                    if !expression_suspends_current_scope(&generator.elt)
-                        && generator.generators.iter().enumerate().all(|(index, generator)| {
-                            !generator.is_async
-                                && (index == 0
-                                    || !expression_suspends_current_scope(&generator.iter))
-                                && !generator
-                                    .ifs
-                                    .iter()
-                                    .any(expression_suspends_current_scope)
-                        })
-            ))
-        .then_some(ExceptionPolicy::EXCLUDE_ALWAYS);
-        // Keep prior manager-owner holes and terminal handler returns out of scope: adding the
-        // correct loop-owner split there worsens the table while earlier gaps remain unmatched.
-        let preserve_synchronous_with_boolean_loop_owner = !collect_tuple
-            && self.context.target_specific_rules_enabled()
-            && self.control.in_synchronous_with()
-            && (!self
-                .control
-                .statements
-                .current_statement_follows_sync_with_return_join
-                || (self
-                    .control
-                    .statements
-                    .current_statement_follows_sync_with_return_join_after_gap
-                    && !self
-                        .control
-                        .exceptions
-                        .active_exception_region_exclusions
-                        .is_empty()))
-            && !self.control.conditions.include_assert_none_condition_owner
-            && ((self.control.statements.current_statement_has_following
-                && !self.control.in_loop()
-                && self
-                    .control
-                    .exceptions
-                    .active_exception_region_exclusions
-                    .is_empty()
-                && self
-                    .control
-                    .generators
-                    .generator_region_exclusions
-                    .is_empty()
-                && self
-                    .control
-                    .withs
-                    .active_with_region_exclusions
-                    .last()
-                    .is_some_and(|exclusions| !exclusions.is_empty()))
-                || (self.control.in_exception_handler()
-                    && !self.control.statements.current_statement_has_following
-                    && self
-                        .control
-                        .generators
-                        .generator_region_exclusions
-                        .is_empty()));
-        let synchronous_with_boolean_loop_policy = (!collect_tuple
-            && self.context.target_specific_rules_enabled()
-            && self.control.in_synchronous_with()
-            && !preserve_synchronous_with_boolean_loop_owner
-            && matches!(
-                call.arguments.args.as_ref(),
-                [Expr::Generator(generator)]
-                    if !expression_suspends_current_scope(&generator.elt)
-                        && generator.generators.iter().enumerate().all(|(index, generator)| {
-                            !generator.is_async
-                                && (index == 0
-                                    || !expression_suspends_current_scope(&generator.iter))
-                                && !generator
-                                    .ifs
-                                    .iter()
-                                    .any(expression_suspends_current_scope)
-                        })
-            ))
-        .then_some(ExceptionPolicy::EXCLUDE_ALWAYS);
-        // A prior assertion or conditional, or a suspension inside this with body, labels the
-        // manager target before CPython appends the optimized dispatch marker. Fresh with bodies
-        // retain their first marker, so keep this range-scoped and separate from the loop policy.
-        let synchronous_with_boolean_dispatch_policy = (synchronous_with_boolean_loop_policy
-            .is_some()
-            && !self.control.in_loop()
-            && self
-                .control
-                .exceptions
-                .active_exception_region_exclusions
-                .is_empty()
-            && self
-                .control
-                .comprehensions
-                .active_comprehension_region_exclusions
-                .is_empty()
-            && !self.control.in_exception_handler()
-            && self.control.exceptions.active_exception_group_handlers == 0
-            && self.control.finally.active_normal_finally_bodies == 0
-            && self.control.finally.active_finally_end_blocks == 0
-            && ((self.control.conditions.include_assert_none_condition_owner
-                && (self
-                    .control
-                    .withs
-                    .shifted_sync_with_boolean_dispatch_calls
-                    .contains(&call.range)
-                    || self
-                        .control
-                        .current_with_suspension_epoch()
-                        .is_some_and(|epoch| {
-                            self.control.generators.coroutine_suspension_epoch > epoch
-                        })))
-                || self
-                    .control
-                    .current_synchronous_with_body_start_item()
-                    .is_some_and(|start| {
-                        self.assembler.contains_opcode_since_item(NOT_TAKEN, start)
-                    })))
-        .then_some(ExceptionPolicy::EXCLUDE_ALWAYS);
-        // CPython appends the Boolean-loop marker and backedge after the coroutine assertion's
-        // stop-iteration target is labeled. The dispatch marker keeps its ordinary owner.
-        let pre_suspension_coroutine_boolean_loop_policy = (matches!(callable, "all" | "any")
-            && self
-                .control
-                .generators
-                .pre_suspension_coroutine_boolean_assertion
-                == Some(call.range)
-            && self.unit.flags & CO_COROUTINE != 0
-            && self.context.target_specific_rules_enabled()
-            && self.control.generators.generator_region_start.is_some()
-            && self.control.stack.depth == 0
-            && self.control.generators.coroutine_suspension_epoch == 0
-            && !self.control.in_loop()
-            && self
-                .control
-                .exceptions
-                .active_exception_region_exclusions
-                .is_empty()
-            && self.control.withs.active_with_region_exclusions.is_empty()
-            && self
-                .control
-                .comprehensions
-                .active_comprehension_region_exclusions
-                .is_empty()
-            && !self.control.in_exception_handler()
-            && self.control.exceptions.active_exception_group_handlers == 0
-            && self.control.finally.active_normal_finally_bodies == 0
-            && self.control.finally.active_finally_end_blocks == 0
-            && matches!(
-                call.arguments.args.as_ref(),
-                [Expr::Generator(generator)]
-                    if !expression_suspends_current_scope(&generator.elt)
-                        && generator.generators.iter().all(|generator| {
-                            !generator.is_async
-                                && !expression_suspends_current_scope(&generator.iter)
-                                && !generator
-                                    .ifs
-                                    .iter()
-                                    .any(expression_suspends_current_scope)
-                        })
-            ))
-        .then_some(ExceptionPolicy::EXCLUDE_ALWAYS);
-
         // The optimized-call guard's NOT_TAKEN is appended after exception targets are labeled.
         // In a plain generator's while body, it inherits the stop-iteration owner after a direct
         // yield resume but uses a fresh ownerless slot on the loop's initial entry.
@@ -3219,61 +2891,7 @@ impl Compiler<'_> {
                 .target_specific_rules_enabled()
                 .then_some(ExceptionPolicy::NoneDynamicConditionStrict)
                 .or(handler_boolean_loop_policy)
-                .or_else(|| {
-                    with_dispatch_after_branch.then(|| {
-                        if self.assembler.current_block_has_dynamic_exception_owner() {
-                            ExceptionPolicy::normalized_owner(true)
-                        } else {
-                            ExceptionPolicy::EXCLUDE_ALWAYS
-                        }
-                    })
-                })
-                .or_else(|| {
-                    synchronous_with_boolean_dispatch_policy
-                        .filter(|_| !self.assembler.current_block_has_dynamic_exception_owner())
-                })
-                .or_else(|| {
-                    pre_suspension_coroutine_boolean_loop_policy
-                        .filter(|_| self.assembler.contains_opcode(NOT_TAKEN))
-                })
                 .or(generator_guard_exception_policy)
-                .or_else(|| {
-                    plain_try_boolean_loop_policy
-                        .filter(|_| !initial_iterator_dispatch)
-                        .map(|_| {
-                            if self
-                                .assembler
-                                .fallthrough_has_concrete_dynamic_exception_owner()
-                            {
-                                ExceptionPolicy::normalized_owner(true)
-                            } else {
-                                ExceptionPolicy::EXCLUDE_ALWAYS
-                            }
-                        })
-                })
-                .or(iterator_boolean_dispatch_policy)
-                .or_else(|| {
-                    generator_expression_dispatch.then(|| {
-                        ExceptionPolicy::normalized_owner(
-                            self.assembler.current_block_has_dynamic_exception_owner(),
-                        )
-                    })
-                })
-                .or(generator_expression_filter_dispatch_policy)
-                .or_else(|| {
-                    coroutine_boolean_dispatch_policy
-                        .or(coroutine_tuple_dispatch_policy)
-                        .map(|_| {
-                            if self
-                                .assembler
-                                .fallthrough_has_concrete_dynamic_exception_owner()
-                            {
-                                ExceptionPolicy::normalized_owner(true)
-                            } else {
-                                ExceptionPolicy::EXCLUDE_ALWAYS
-                            }
-                        })
-                })
                 .unwrap_or_else(|| {
                     if self
                         .control
@@ -3359,25 +2977,7 @@ impl Compiler<'_> {
         if collect_tuple {
             self.emit(BUILD_LIST, 0, 1)?;
         }
-        if generator_expression_boolean_dispatch_eligible.is_some()
-            || self
-                .control
-                .generators
-                .generator_expression_boolean_dispatch_eligible
-                .is_some()
-        {
-            self.with_control_override(
-                |control| {
-                    &mut control
-                        .generators
-                        .generator_expression_boolean_dispatch_eligible
-                },
-                generator_expression_boolean_dispatch_eligible,
-                |compiler| compiler.compile_expression(&call.arguments.args[0]),
-            )?;
-        } else {
-            self.compile_expression(&call.arguments.args[0])?;
-        }
+        self.compile_expression(&call.arguments.args[0])?;
 
         let loop_start = self.assembler.label();
         let exhausted = self.assembler.label();
@@ -3439,25 +3039,7 @@ impl Compiler<'_> {
         self.set_depth(base_depth + 1);
         self.assembler.set_location(callable_location);
         self.emit(PUSH_NULL, 0, 1)?;
-        if generator_expression_boolean_dispatch_eligible.is_some()
-            || self
-                .control
-                .generators
-                .generator_expression_boolean_dispatch_eligible
-                .is_some()
-        {
-            self.with_control_override(
-                |control| {
-                    &mut control
-                        .generators
-                        .generator_expression_boolean_dispatch_eligible
-                },
-                generator_expression_boolean_dispatch_eligible,
-                |compiler| compiler.compile_expression(&call.arguments.args[0]),
-            )?;
-        } else {
-            self.compile_expression(&call.arguments.args[0])?;
-        }
+        self.compile_expression(&call.arguments.args[0])?;
         self.assembler.set_location(self.call_opcode_location(call));
         self.emit(CALL, 1, -2)?;
 
@@ -4210,12 +3792,6 @@ impl Compiler<'_> {
                 );
                 let in_element =
                     std::mem::take(&mut compiler.control.comprehensions.in_comprehension_element);
-                let force_truth_ownerless = std::mem::take(
-                    &mut compiler
-                        .control
-                        .comprehensions
-                        .force_filtered_comprehension_truth_ownerless,
-                );
                 let root_if_filter = std::mem::replace(
                     &mut compiler
                         .control
@@ -4243,10 +3819,6 @@ impl Compiler<'_> {
                     .comprehensions
                     .suppress_filtered_comprehension_none_owner = suppressed;
                 compiler.control.comprehensions.in_comprehension_element = in_element;
-                compiler
-                    .control
-                    .comprehensions
-                    .force_filtered_comprehension_truth_ownerless = force_truth_ownerless;
                 compiler
                     .control
                     .comprehensions
@@ -4522,21 +4094,6 @@ impl Compiler<'_> {
             flags,
         )?;
         child.control.generators.generator_expression = true;
-        child
-            .control
-            .generators
-            .generator_expression_has_simple_targets = generator
-            .generators
-            .iter()
-            .all(|generator| matches!(generator.target, Expr::Name(_)));
-        child
-            .control
-            .generators
-            .generator_expression_boolean_dispatch_eligible = self
-            .control
-            .generators
-            .generator_expression_boolean_dispatch_eligible
-            .filter(|range| *range == generator.range);
         child.unit.private_name.clone_from(&self.unit.private_name);
         child
             .unit
@@ -4571,28 +4128,7 @@ impl Compiler<'_> {
         if !closure_names.is_empty() {
             self.emit_function_attribute(FunctionAttribute::CLOSURE)?;
         }
-        if self
-            .control
-            .generators
-            .generator_expression_boolean_dispatch_eligible
-            .is_some_and(|range| range != generator.range)
-        {
-            self.with_control_override(
-                |control| {
-                    &mut control
-                        .generators
-                        .generator_expression_boolean_dispatch_eligible
-                },
-                None,
-                |compiler| {
-                    if generator.generators[0].is_async {
-                        compiler.compile_expression(&generator.generators[0].iter)
-                    } else {
-                        compiler.compile_iterable_expression(&generator.generators[0].iter)
-                    }
-                },
-            )?;
-        } else if generator.generators[0].is_async {
+        if generator.generators[0].is_async {
             self.compile_expression(&generator.generators[0].iter)?;
         } else {
             self.compile_iterable_expression(&generator.generators[0].iter)?;
@@ -6735,53 +6271,23 @@ impl Compiler<'_> {
         let include_scoped_none_condition_owner =
             preserve_unfiltered_comprehension_leading_none_owner
                 || self.control.conditions.include_scoped_none_condition_owner;
-        if direct_filtered_comprehension
-            && filtered_comprehension_has_ownerless_truth_condition(expression)
-            && !self
-                .control
-                .comprehensions
-                .force_filtered_comprehension_truth_ownerless
-        {
-            self.with_control_override(
-                |control| {
-                    &mut control
-                        .comprehensions
-                        .force_filtered_comprehension_truth_ownerless
-                },
-                true,
-                |compiler| {
-                    compiler.with_control_override(
-                        |control| {
-                            &mut control
-                                .conditions
-                                .exclude_condition_not_taken_from_exception
-                        },
-                        exclude_try_marker,
-                        |compiler| {
-                            compiler.compile_if_expression_condition(&expression.test, else_label)
-                        },
-                    )
-                },
-            )?;
-        } else {
-            self.with_control_override(
-                |control| &mut control.conditions.include_scoped_none_condition_owner,
-                include_scoped_none_condition_owner,
-                |compiler| {
-                    compiler.with_control_override(
-                        |control| {
-                            &mut control
-                                .conditions
-                                .exclude_condition_not_taken_from_exception
-                        },
-                        exclude_try_marker,
-                        |compiler| {
-                            compiler.compile_if_expression_condition(&expression.test, else_label)
-                        },
-                    )
-                },
-            )?;
-        }
+        self.with_control_override(
+            |control| &mut control.conditions.include_scoped_none_condition_owner,
+            include_scoped_none_condition_owner,
+            |compiler| {
+                compiler.with_control_override(
+                    |control| {
+                        &mut control
+                            .conditions
+                            .exclude_condition_not_taken_from_exception
+                    },
+                    exclude_try_marker,
+                    |compiler| {
+                        compiler.compile_if_expression_condition(&expression.test, else_label)
+                    },
+                )
+            },
+        )?;
         if preserve_none_condition_owner
             || preserve_generator_loop_condition_owner
             || preserve_filtered_comprehension_short_circuit_none_owner
@@ -7414,10 +6920,6 @@ impl Compiler<'_> {
                     && suspension_epoch == 0
                     && marker_owner_slots == 1
                     && self.optimized_generator_dispatch_is_in_normal_try()
-                    && !self
-                        .control
-                        .exceptions
-                        .active_call_assignment_preceded_try_body
                     && self.assembler.contains_opcode(NOT_TAKEN)))
                 && self.control.active_with_count() == 0
                 && self.control.finally.active_normal_finally_bodies == 0
@@ -7524,13 +7026,7 @@ impl Compiler<'_> {
         {
             self.compile_bool_expression_at(inner, continuation, false)?;
         } else {
-            self.with_control_override(
-                |control| &mut control.generators.optimized_generator_later_boolean_operand,
-                !leading.is_empty(),
-                |compiler| {
-                    compiler.compile_expression_with_boolean_continuation(last, continuation)
-                },
-            )?;
+            self.compile_expression_with_boolean_continuation(last, continuation)?;
         }
         // Later expressions start in the Boolean value's original join array.
         self.assembler.preserve_block_boundary_if_new(end);
@@ -8150,11 +7646,7 @@ impl Compiler<'_> {
                     }
                     self.assembler.record_short_circuit_owner_continuation();
                 }
-                return self.with_control_override(
-                    |control| &mut control.generators.optimized_generator_later_boolean_operand,
-                    !leading.is_empty(),
-                    |compiler| compiler.compile_jump_if(last, jump_on, label),
-                );
+                return self.compile_jump_if(last, jump_on, label);
             }
             let end = self.assembler.label();
             for (operand_index, value) in leading.iter().enumerate() {
@@ -8175,11 +7667,7 @@ impl Compiler<'_> {
                 }
                 self.assembler.record_short_circuit_owner_continuation();
             }
-            self.with_control_override(
-                |control| &mut control.generators.optimized_generator_later_boolean_operand,
-                !leading.is_empty(),
-                |compiler| compiler.compile_jump_if(last, jump_on, label),
-            )?;
+            self.compile_jump_if(last, jump_on, label)?;
             // The final operand may already end at a pending join label. Keep
             // those labels in one block so small return copies see its body.
             self.assembler.preserve_block_boundary_if_new(end);
@@ -8366,10 +7854,6 @@ impl Compiler<'_> {
                         || preserve_sync_with_short_circuit_none_owner
                         || self.control.in_first_unnamed_exception_handler()
                         || self.control.finally.active_normal_finally_bodies > 0
-                        || self
-                            .control
-                            .comprehensions
-                            .force_filtered_comprehension_truth_ownerless
                         || marker_reuses_exception_owner,
                 ),
             };
@@ -8491,22 +7975,6 @@ impl Compiler<'_> {
             return self.emit_condition_not_taken(ConditionMarkerPolicy {
                 excluded: ExceptionPolicy::EXCLUDE_ALWAYS,
                 ordinary: ExceptionPolicy::EXCLUDE_ALWAYS,
-            });
-        }
-        if self
-            .control
-            .comprehensions
-            .force_filtered_comprehension_truth_ownerless
-            && !comparison_is_boolean
-        {
-            let exception_policy = if self.assembler.current_block_has_dynamic_exception_owner() {
-                ExceptionPolicy::normalized_owner(true)
-            } else {
-                ExceptionPolicy::EXCLUDE_ALWAYS
-            };
-            return self.emit_condition_not_taken(ConditionMarkerPolicy {
-                excluded: exception_policy,
-                ordinary: exception_policy,
             });
         }
         let exclude_plain_try_marker = !comparison_is_boolean
@@ -8756,37 +8224,6 @@ fn is_name_rooted_if_expression_condition(expression: &Expr) -> bool {
         root = attribute.value.as_ref();
     }
     matches!(root, Expr::Name(_))
-}
-
-fn filtered_comprehension_has_ownerless_truth_condition(
-    expression: &ruff_python_ast::ExprIf,
-) -> bool {
-    matches!(
-        (
-            expression.test.as_ref(),
-            expression.body.as_ref(),
-            expression.orelse.as_ref(),
-        ),
-        (
-            Expr::Name(_) | Expr::BoolOp(_),
-            Expr::StringLiteral(_),
-            Expr::StringLiteral(_)
-        ) | (Expr::Name(_), Expr::Call(_), Expr::NoneLiteral(_))
-            | (Expr::Call(_), Expr::StringLiteral(_), Expr::Name(_))
-            | (
-                Expr::Subscript(_),
-                Expr::Subscript(_),
-                Expr::StringLiteral(_)
-            )
-    ) || matches!(
-        (
-            expression.test.as_ref(),
-            expression.body.as_ref(),
-            expression.orelse.as_ref(),
-        ),
-        (Expr::UnaryOp(unary), Expr::StringLiteral(_), Expr::StringLiteral(_))
-            if unary.op == UnaryOp::Not && matches!(unary.operand.as_ref(), Expr::Name(_))
-    )
 }
 
 fn expression_contains_inlined_comprehension(expression: &Expr) -> bool {
