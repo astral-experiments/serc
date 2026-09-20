@@ -82,18 +82,6 @@ impl PartialEq for HashedObjectKey<'_> {
 
 impl Eq for HashedObjectKey<'_> {}
 
-impl PartialOrd for HashedObjectKey<'_> {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for HashedObjectKey<'_> {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.key.cmp(&other.key)
-    }
-}
-
 impl Hash for HashedObjectKey<'_> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         state.write_u64(self.hash);

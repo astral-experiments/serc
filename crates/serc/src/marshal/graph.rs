@@ -1270,9 +1270,11 @@ fn intern_explicit_constants<'a>(
     interned_strings: &mut InternedStrings<'a, '_>,
     interned_constant_strings: &mut FxHashSet<&'a str>,
 ) {
-    let mut explicit_interns: Vec<_> = explicitly_interned.iter().collect();
-    explicit_interns.sort_unstable();
-    for value in explicit_interns {
+    #[expect(
+        clippy::iter_over_hash_type,
+        reason = "These sets are only queried for membership after all explicit constants are interned."
+    )]
+    for value in explicitly_interned {
         interned_strings.insert(value);
         // A later key tuple must preserve an earlier ordinary literal's cache identity.
         if !tracked_string_origins.contains(value) {
