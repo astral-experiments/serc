@@ -8,6 +8,7 @@ mod async_with_terminal_condition_owner_compatibility;
 mod attribute_none_predecessor_lines;
 mod authored_pass_join_locations;
 mod bare_return_manager_iterator;
+mod bigint_float_arithmetic;
 mod boolean_fusion_exception_slots;
 mod boolean_negation_nops;
 mod boolean_original_prefix_owners;
