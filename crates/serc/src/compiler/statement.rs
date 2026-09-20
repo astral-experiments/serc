@@ -406,9 +406,6 @@ pub(super) struct ExceptionState {
     // Whether each active ordinary try has a tuple-typed handler whose CFG can leave stale
     // fallthrough exception-owner slots for a top-level Boolean value marker.
     pub(super) active_tuple_handler_try_bodies: Vec<bool>,
-    // Whether the current try follows two call-valued assignments in its recent prefix.
-    // Their retained exception-owner slot keeps a pre-suspension Boolean marker protected.
-    pub(super) active_call_assignment_preceded_try_body: bool,
     // Linear item offset and suspension epoch of the innermost ordinary try body.
     active_try_body_start: Option<(usize, usize)>,
     active_try_marker_slots: Vec<Option<TryMarkerSlotContext>>,
@@ -621,8 +618,6 @@ pub(super) struct StatementState {
     pub(super) current_statement_preceded_by_try: bool,
     // Whether that try retains a synchronous suffix or cleanup after its suspension.
     current_statement_preceded_by_suffixed_try: bool,
-    // Whether two of this statement's three immediately preceding siblings assign a call.
-    current_statement_preceded_by_call_assignments: bool,
     // Whether this statement directly follows a conditional whose body terminates in a return.
     pub(super) current_statement_preceded_by_terminating_if: bool,
     // Whether a synchronous-with value expression follows a returning conditional, including
@@ -2116,25 +2111,6 @@ impl Compiler<'_> {
                                     || free_indices.contains_key(&name))
                         )
                     });
-                let preceded_by_call_assignments = self.context.target_specific_rules_enabled()
-                    && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR | CO_GENERATOR) != 0
-                    && matches!(statement, Stmt::Try(_))
-                    && body[..index]
-                        .iter()
-                        .rev()
-                        .take(3)
-                        .filter(|statement| match statement {
-                            Stmt::Assign(statement) => {
-                                matches!(statement.value.as_ref(), Expr::Call(_))
-                            }
-                            Stmt::AnnAssign(statement) => statement
-                                .value
-                                .as_deref()
-                                .is_some_and(|value| matches!(value, Expr::Call(_))),
-                            _ => false,
-                        })
-                        .count()
-                        >= 2;
                 let preceded_by_terminating_if = matches!(
                     previous_statement,
                     Some(Stmt::If(previous))
@@ -2158,13 +2134,6 @@ impl Compiler<'_> {
                         .statements
                         .current_statement_preceded_by_suffixed_try,
                     preceded_by_suffixed_try,
-                );
-                let previous_statement_preceded_by_call_assignments = std::mem::replace(
-                    &mut self
-                        .control
-                        .statements
-                        .current_statement_preceded_by_call_assignments,
-                    preceded_by_call_assignments,
                 );
                 let previous_statement_preceded_by_terminating_if = std::mem::replace(
                     &mut self
@@ -2438,10 +2407,6 @@ impl Compiler<'_> {
                     .statements
                     .current_statement_preceded_by_suffixed_try =
                     previous_statement_preceded_by_suffixed_try;
-                self.control
-                    .statements
-                    .current_statement_preceded_by_call_assignments =
-                    previous_statement_preceded_by_call_assignments;
                 self.control
                     .statements
                     .current_statement_preceded_by_terminating_if =
@@ -17756,15 +17721,6 @@ impl Compiler<'_> {
             .exceptions
             .active_tuple_handler_try_bodies
             .push(has_tuple_handler);
-        let previous_call_assignment_preceded_try_body = std::mem::replace(
-            &mut self
-                .control
-                .exceptions
-                .active_call_assignment_preceded_try_body,
-            self.control
-                .statements
-                .current_statement_preceded_by_call_assignments,
-        );
         self.control
             .exceptions
             .active_pass_only_try_bodies
@@ -18293,9 +18249,6 @@ impl Compiler<'_> {
             .active_tuple_handler_try_bodies
             .pop()
             .expect("active try region has tuple-handler context");
-        self.control
-            .exceptions
-            .active_call_assignment_preceded_try_body = previous_call_assignment_preceded_try_body;
         let mut try_exclusions = self
             .control
             .exceptions

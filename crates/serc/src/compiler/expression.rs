@@ -6970,10 +6970,6 @@ impl Compiler<'_> {
                     && suspension_epoch == 0
                     && marker_owner_slots == 1
                     && self.optimized_generator_dispatch_is_in_normal_try()
-                    && !self
-                        .control
-                        .exceptions
-                        .active_call_assignment_preceded_try_body
                     && self.assembler.contains_opcode(NOT_TAKEN)))
                 && self.control.active_with_count() == 0
                 && self.control.finally.active_normal_finally_bodies == 0
