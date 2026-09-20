@@ -3749,7 +3749,13 @@ impl OptimizationPipeline {
                 })
                 .collect::<Vec<_>>()
         };
-        let shared_break_markers = {
+        let shared_break_markers = if self
+            .exception_owner_provenance
+            .copied_shared_break_truth_prefixes
+            .is_empty()
+        {
+            Vec::new()
+        } else {
             let original_items = graph.copy_items();
             self.exception_owner_provenance.copied_shared_break_truth_prefixes.iter().enumerate()
                 .filter_map(|(index, prefix)| {

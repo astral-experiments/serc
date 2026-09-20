@@ -27,16 +27,7 @@ fn same_instruction(a: Instruction, b: Instruction, borrow: bool) -> bool {
                 (LOAD_FAST, LOAD_FAST_BORROW)
                     | (LOAD_FAST_LOAD_FAST, LOAD_FAST_BORROW_LOAD_FAST_BORROW)
             ))
-        && a.operand() == b.operand()
-        && a.location == b.location
-        && a.depth_after() == b.depth_after()
-        && a.local_policy == b.local_policy
-        && a.no_location_policy == b.no_location_policy
-        && a.fusion_policy == b.fusion_policy
-        && a.jump_policy == b.jump_policy
-        && a.exception_policy() == b.exception_policy()
-        && a.pre_fold_extra_instructions() == b.pre_fold_extra_instructions()
-        && a.only_allows_unconditional_inlining() == b.only_allows_unconditional_inlining()
+        && a.same_fusion_owner_fields(&b)
 }
 fn same_item(a: Item, b: Item, borrow: bool) -> bool {
     match (a, b) {
@@ -146,6 +137,7 @@ impl LabelPositions {
 #[derive(Default)]
 struct ViewTables {
     labels: LabelPositions,
+    boundaries: FxHashSet<Label>,
     markers: FxHashMap<Key, SmallVec<[(usize, usize); 1]>>,
     instruction_positions: Vec<usize>,
 }
@@ -153,6 +145,7 @@ struct ViewTables {
 impl ViewTables {
     fn clear(&mut self) {
         self.labels.clear();
+        self.boundaries.clear();
         self.markers.clear();
         self.instruction_positions.clear();
     }
@@ -193,14 +186,16 @@ impl<'a> View<'a> {
     ) -> Option<Self> {
         let ViewTables {
             mut labels,
+            mut boundaries,
             mut markers,
             mut instruction_positions,
         } = tables;
         labels.prepare(items.len());
+        boundaries.clear();
         markers.clear();
         instruction_positions.clear();
         instruction_positions.reserve(items.len() + 1);
-        let mut boundaries = provenance.block_boundaries.clone();
+        boundaries.extend(&provenance.block_boundaries);
         boundaries.extend(preserved);
         let mut previous = None;
         let mut n = 0;
@@ -287,6 +282,7 @@ impl<'a> View<'a> {
     fn into_tables(self) -> ViewTables {
         ViewTables {
             labels: self.labels,
+            boundaries: self.boundaries,
             markers: self.markers,
             instruction_positions: self.instruction_positions,
         }
@@ -501,6 +497,17 @@ fn labels_in(items: &[Item]) -> FxHashSet<Label> {
         .collect()
 }
 
+/// Intersects an interval's labels with the view's boundaries without scanning the whole view.
+fn boundaries_in(items: &[Item], boundaries: &FxHashSet<Label>) -> FxHashSet<Label> {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Label(label) if boundaries.contains(label) => Some(*label),
+            Item::Label(_) | Item::Instruction(_) => None,
+        })
+        .collect()
+}
+
 fn one_fusion(before: &[Item], after: &[Item]) -> bool {
     if before.len() != after.len() + 1 {
         return false;
@@ -632,16 +639,7 @@ impl FreshSingletonCertificate {
             return None;
         }
         let items = view.items[start..=marker].to_vec();
-        let boundaries = view
-            .boundaries
-            .iter()
-            .copied()
-            .filter(|label| {
-                items
-                    .iter()
-                    .any(|item| matches!(item, Item::Label(current) if current == label))
-            })
-            .collect();
+        let boundaries = boundaries_in(&items, &view.boundaries);
         let result = Self {
             interval: Certificate {
                 anchor,
@@ -772,16 +770,7 @@ impl FallbackCertificate {
             return None;
         }
         let items = after.items[after_start..=after_marker].to_vec();
-        let boundaries = after
-            .boundaries
-            .iter()
-            .copied()
-            .filter(|label| {
-                items
-                    .iter()
-                    .any(|item| matches!(item, Item::Label(l) if l == label))
-            })
-            .collect();
+        let boundaries = boundaries_in(&items, &after.boundaries);
         let result = Self {
             interval: Certificate {
                 anchor: Anchor::Label(anchor),
@@ -844,12 +833,7 @@ impl FallbackCertificate {
             before.uniform_fallback_interval(start, condition_index, false)?
         };
         let items = before.items[start..=marker_index].to_vec();
-        let boundaries = before
-            .boundaries
-            .iter()
-            .copied()
-            .filter(|l| items.iter().any(|x| matches!(x, Item::Label(k) if k == l)))
-            .collect();
+        let boundaries = boundaries_in(&items, &before.boundaries);
         let result = Self {
             interval: Certificate {
                 anchor,
@@ -1526,16 +1510,7 @@ impl ManagerSetupCertificate {
                 items: after.items[..=after_marker].to_vec(),
                 labels: labels_in(&after.items[..=after_marker]),
                 owner: None,
-                boundaries: after
-                    .boundaries
-                    .iter()
-                    .copied()
-                    .filter(|label| {
-                        after.items[..=after_marker].iter().any(
-                            |item| matches!(item, Item::Label(candidate) if candidate == label),
-                        )
-                    })
-                    .collect(),
+                boundaries: boundaries_in(&after.items[..=after_marker], &after.boundaries),
                 setups: after.provenance.setups.clone(),
             },
             source,
@@ -1638,19 +1613,16 @@ impl HandlerDispatchCertificate {
         {
             return None;
         }
-        let mut interval = Certificate {
+        let interval = Certificate {
             anchor: Anchor::Label(origin.entry),
             condition: *condition,
             marker: *marker,
             items: origin.items.clone(),
             labels: labels_in(&origin.items),
             owner: Some((region.target, region.depth, region.preserve_lasti)),
-            boundaries: view.boundaries.clone(),
+            boundaries: boundaries_in(&origin.items, &view.boundaries),
             setups: view.provenance.setups.clone(),
         };
-        interval
-            .boundaries
-            .retain(|label| origin.items.contains(&Item::Label(*label)));
         let mut result = Self {
             interval,
             region,
@@ -2275,7 +2247,7 @@ impl FusionOwnerCertificates {
                                         items: Vec::new(),
                                         labels: FxHashSet::default(),
                                         owner,
-                                        boundaries: a.boundaries.clone(),
+                                        boundaries: FxHashSet::default(),
                                         setups: a.provenance.setups.clone(),
                                     };
                                     if let Some((s, c, m)) = cert.range(a, false) {
@@ -2285,11 +2257,8 @@ impl FusionOwnerCertificates {
                                         {
                                             cert.items = after[s..=m].to_vec();
                                             cert.labels = labels_in(&cert.items);
-                                            cert.boundaries.retain(|l| {
-                                                cert.items
-                                                    .iter()
-                                                    .any(|x| matches!(x,Item::Label(k)if k==l))
-                                            });
+                                            cert.boundaries =
+                                                boundaries_in(&cert.items, &a.boundaries);
                                             result.certificates.push(cert);
                                         }
                                     }
@@ -2732,6 +2701,25 @@ mod tests {
         let view = View::new(items, &[], &provenance, &preserved).unwrap();
         cert.valid(&view, borrow).is_some()
     }
+
+    #[test]
+    fn interval_boundaries_match_whole_view_membership() {
+        let boundaries = [Label(1), Label(3), Label(u32::MAX)].into_iter().collect();
+        let items = [
+            Item::Label(Label(4)),
+            Item::Label(Label(3)),
+            Item::Instruction(instruction(JUMP_FORWARD, Operand::Forward(Label(1)))),
+            Item::Label(Label(u32::MAX)),
+            Item::Label(Label(3)),
+        ];
+        assert_eq!(
+            boundaries_in(&items, &boundaries),
+            [Label(3), Label(u32::MAX)].into_iter().collect()
+        );
+        assert!(boundaries_in(&items[..1], &boundaries).is_empty());
+        assert!(boundaries_in(&items, &FxHashSet::default()).is_empty());
+    }
+
     #[test]
     fn instruction_positions_count_only_preceding_instructions() {
         let provenance = ExceptionOwnerProvenance::default();
@@ -2846,6 +2834,98 @@ mod tests {
         assert!(view.is_reference(Label(3)));
         assert!(view.is_reference(Label(2)));
         assert!(!view.is_reference(Label(4)));
+    }
+    #[test]
+    fn reused_view_tables_rebuild_all_boundary_memberships() {
+        let sparse = Label(u32::MAX);
+        let new_sparse = Label(u32::MAX - 1);
+        let make_regions = |target| {
+            [ExceptionRegion {
+                start: Label(10),
+                end: Label(20),
+                target,
+                depth: 0,
+                preserve_lasti: false,
+                is_scope_fallback: false,
+                priority: ExceptionRegionPriority::Resolved { start: 0, end: 1 },
+            }]
+        };
+        let make_items = |target, duplicate| {
+            [
+                Item::Label(Label(1)),
+                Item::Instruction(instruction(JUMP_FORWARD, Operand::Forward(target))),
+                Item::Label(sparse),
+                Item::Instruction(instruction(JUMP_FORWARD, Operand::Forward(duplicate))),
+            ]
+        };
+        let mut first_provenance = ExceptionOwnerProvenance::default();
+        first_provenance.block_boundaries.extend([Label(1), sparse]);
+        first_provenance.source_boundaries.insert(Label(5));
+        let first_preserved = FxHashSet::from_iter([Label(2), sparse]);
+        let first_items = make_items(Label(3), sparse);
+        let first_regions = make_regions(Label(4));
+        let first = View::new(
+            &first_items,
+            &first_regions,
+            &first_provenance,
+            &first_preserved,
+        )
+        .unwrap();
+        assert_eq!(
+            first.boundaries,
+            FxHashSet::from_iter([Label(1), Label(2), Label(3), Label(4), sparse])
+        );
+        assert!(first.is_reference(Label(5)));
+
+        let mut next_provenance = ExceptionOwnerProvenance::default();
+        next_provenance
+            .block_boundaries
+            .extend([Label(11), new_sparse]);
+        next_provenance.source_boundaries.insert(Label(6));
+        let next_preserved = FxHashSet::from_iter([Label(12), new_sparse]);
+        let next_items = make_items(Label(13), new_sparse);
+        let next_regions = make_regions(new_sparse);
+        let next = View::with_tables(
+            &next_items,
+            &next_regions,
+            &next_provenance,
+            &next_preserved,
+            first.into_tables(),
+        )
+        .unwrap();
+        assert_eq!(
+            next.boundaries,
+            FxHashSet::from_iter([Label(11), Label(12), Label(13), new_sparse])
+        );
+        assert_eq!(next.label_index(sparse), Some(&2));
+        assert!(!next.is_reference(sparse));
+        assert!(!next.is_reference(Label(5)));
+        assert!(next.is_reference(Label(6)));
+
+        let mut tables = next.into_tables();
+        tables.clear();
+        let empty_provenance = ExceptionOwnerProvenance::default();
+        let empty_preserved = FxHashSet::default();
+        let empty =
+            View::with_tables(&[], &[], &empty_provenance, &empty_preserved, tables).unwrap();
+        assert!(empty.boundaries.is_empty());
+        assert!(!empty.is_reference(new_sparse));
+
+        for duplicate in [Label(1), sparse] {
+            let clean = View::new(&first_items, &[], &empty_provenance, &empty_preserved).unwrap();
+            let mut duplicate_items = first_items.to_vec();
+            duplicate_items.push(Item::Label(duplicate));
+            assert!(
+                View::with_tables(
+                    &duplicate_items,
+                    &[],
+                    &empty_provenance,
+                    &empty_preserved,
+                    clean.into_tables(),
+                )
+                .is_none()
+            );
+        }
     }
     #[test]
     fn handler_interval_owner_matches_individual_cells_and_preserves_failures() {
@@ -2982,6 +3062,44 @@ mod tests {
         i.retarget(Operand::Forward(Label(3)));
         assert!(!valid(&c, &items, false));
     }
+
+    #[test]
+    fn instruction_borrowing_is_directional_and_ignores_only_initial_jump_borrowing() {
+        for (owned, borrowed) in [
+            (LOAD_FAST, LOAD_FAST_BORROW),
+            (LOAD_FAST_LOAD_FAST, LOAD_FAST_BORROW_LOAD_FAST_BORROW),
+        ] {
+            let original = instruction(owned, Operand::Value(2));
+            let changed = instruction(borrowed, Operand::Value(2));
+            assert!(same_instruction(original, changed, true));
+            assert!(!same_instruction(original, changed, false));
+            assert!(!same_instruction(changed, original, true));
+            assert!(!same_instruction(
+                original,
+                instruction(NOP, Operand::Value(2)),
+                true
+            ));
+            assert!(!same_instruction(
+                original,
+                instruction(borrowed, Operand::Value(3)),
+                true
+            ));
+        }
+        assert!(!same_instruction(
+            instruction(LOAD_FAST, Operand::Value(2)),
+            instruction(LOAD_FAST_BORROW_LOAD_FAST_BORROW, Operand::Value(2)),
+            true,
+        ));
+
+        let original = instruction(JUMP_FORWARD, Operand::Forward(Label(4)));
+        let mut tagged = original;
+        tagged.mark_initial_borrow_jump_target(Label(4));
+        assert!(same_instruction(original, tagged, false));
+        assert!(same_instruction(tagged, original, false));
+        tagged.set_exception_policy(ExceptionPolicy::NonePresent);
+        assert!(!same_instruction(original, tagged, false));
+    }
+
     #[test]
     fn borrowing_requires_exact_remaining_fields() {
         let (c, mut items) = certificate();

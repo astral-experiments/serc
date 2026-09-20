@@ -5118,6 +5118,7 @@ impl OptimizationPipeline {
         }
         let mut copied_array_components = FxHashMap::default();
         if !with_exits_only
+            && !copied_jump_nops.is_empty()
             && !self
                 .exception_owner_provenance
                 .normal_try_copy_inline_labels
@@ -5443,8 +5444,6 @@ impl OptimizationPipeline {
                 .local_policy
                 .add_hidden_exception_owner_slots(slots);
         }
-        for position in redundant.into_iter().rev() {
-            graph.remove_item(position);
-        }
+        graph.remove_ordered_instructions(&redundant);
     }
 }

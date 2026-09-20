@@ -917,7 +917,7 @@ impl<'source> Compiler<'source> {
         };
         let (parser_interned_strings, canonical_constant_strings) =
             if matches!(self.unit.scope, Scope::Module) {
-                self.context.constant_string_provenance()
+                CompilationContext::finish_constant_string_provenance(&mut self.context)
             } else {
                 (FxHashSet::default(), FxHashSet::default())
             };

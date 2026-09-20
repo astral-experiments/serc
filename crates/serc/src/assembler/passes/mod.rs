@@ -548,24 +548,26 @@ impl OptimizationPipeline {
         let mut original_owners = FusionOwnerCertificates::capture_original_owners(&self);
         let retained_finally_origins = self.capture_retained_finally_origins();
         let setup_finally_origins = self.record_borrow_cleanup_calls_with_setups();
+        // Retain immediately after any pass that can edit fusion-view inputs. A skipped pass
+        // can reuse the previous checkpoint; a later edit must never hide an invalidation.
         original_owners.retain_pipeline(&self);
         self.record_borrow_empty_jump_heads();
         original_owners.retain_pipeline(&self);
         if !self.borrow_jump_entry_labels.is_empty() {
+            // Filtering this separate borrowing index changes no fusion-view input.
             self.borrow_jump_entry_labels = Self::nonempty_original_borrow_jump_entries(
                 &self.graph,
                 &self.exception_owner_provenance.block_boundaries,
                 &self.borrow_jump_entry_labels,
             );
         }
-        original_owners.retain_pipeline(&self);
         if !self.borrow_jump_entry_labels.is_empty() {
             self.borrow_threaded_jump_targets = Self::mark_initial_borrow_jump_entries(
                 &mut self.graph,
                 &self.exception_owner_provenance.block_boundaries,
             );
+            original_owners.retain_pipeline(&self);
         }
-        original_owners.retain_pipeline(&self);
         self.record_original_jump_heads();
         self.capture_normal_try_break_pop_owners();
         original_owners.retain_pipeline(&self);
@@ -586,10 +588,15 @@ impl OptimizationPipeline {
         self.prepare_conditional_normal_try_joins();
         original_owners.retain_pipeline(&self);
         let original_location_absence = self.capture_original_location_absence();
-        self.resolve_synthesized_percent_locations();
-        original_owners.retain_pipeline(&self);
-        let synthesized_fallthrough_locations = self.defer_synthesized_fallthrough_locations();
-        original_owners.retain_pipeline(&self);
+        let synthesized_fallthrough_locations = if self.has_synthesized_percent_target_locations {
+            self.resolve_synthesized_percent_locations();
+            original_owners.retain_pipeline(&self);
+            let locations = self.defer_synthesized_fallthrough_locations();
+            original_owners.retain_pipeline(&self);
+            locations
+        } else {
+            Vec::new()
+        };
         self.optimize_boolean_conversions(constants.as_deref());
         original_owners.retain_pipeline(&self);
         #[cfg(any(test, debug_assertions))]
@@ -605,14 +612,14 @@ impl OptimizationPipeline {
                 removed_max_depth =
                     Some(removed_max_depth.map_or(depth, |current| current.max(depth)));
             }
+            original_owners.retain_pipeline(&self);
         }
-        original_owners.retain_pipeline(&self);
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::RemoveUnreachableAfterThreading)?;
         if !assertion_side_exits {
             self.remove_redundant_forward_jumps(false);
+            original_owners.retain_pipeline(&self);
         }
-        original_owners.retain_pipeline(&self);
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::RemoveRedundantForwardJumpsEarly)?;
         self.optimize_redundant_store_fast();
@@ -807,14 +814,17 @@ impl OptimizationPipeline {
         // A terminating match arm can leave its original case jump newly unreachable here.
         let threaded_original = self.thread_original_conditional_jump_targets();
         original_owners.retain_pipeline(&self);
-        if threaded_original && let Some(depth) = self.remove_unreachable_instructions() {
-            removed_max_depth = Some(removed_max_depth.map_or(depth, |current| current.max(depth)));
+        if threaded_original {
+            if let Some(depth) = self.remove_unreachable_instructions() {
+                removed_max_depth =
+                    Some(removed_max_depth.map_or(depth, |current| current.max(depth)));
+            }
+            original_owners.retain_pipeline(&self);
         }
-        original_owners.retain_pipeline(&self);
         if let Some(constants) = constants {
             self.fold_copied_constants(constants, &copied_entry_labels)?;
+            original_owners.retain_pipeline(&self);
         }
-        original_owners.retain_pipeline(&self);
         if let Some(depth) = self.remove_redundant_copy_pop_pairs() {
             removed_max_depth = Some(removed_max_depth.map_or(depth, |current| current.max(depth)));
         }
