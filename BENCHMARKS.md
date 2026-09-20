@@ -1,7 +1,7 @@
 # Benchmarks
 
 These benchmarks were recorded on September 20, 2026, on a Linux x86-64 virtual machine
-exposing 32 AMD EPYC 7763 vCPUs. Both compilers were pinned to the same single logical CPU.
+exposing 32 AMD EPYC 7763 vCPUs. Both compilers were pinned to logical CPU 19.
 The versions were:
 
 - CPython 3.14.5
