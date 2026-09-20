@@ -1,4 +1,5 @@
 use crate::common;
+use crate::common::indent;
 
 #[test]
 fn matches_cpython_nested_with_loop_return_order() {
@@ -52,16 +53,6 @@ print(events)
         source,
         "4\n[('enter', 'outer'), ('enter', 'inner'), ('exit', 'inner'), ('exit', 'outer')]\n",
     );
-}
-
-fn indent(source: &str) -> String {
-    let mut result = String::new();
-    for line in source.lines() {
-        result.push_str("    ");
-        result.push_str(line);
-        result.push('\n');
-    }
-    result
 }
 
 #[test]

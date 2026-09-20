@@ -262,3 +262,13 @@ pub(crate) fn assert_executes(source: &str, expected: &str) {
     );
     assert_eq!(python_text_stdout(output.stdout), expected);
 }
+
+pub(crate) fn indent(source: &str) -> String {
+    let mut result = String::new();
+    for line in source.lines() {
+        result.push_str("    ");
+        result.push_str(line);
+        result.push('\n');
+    }
+    result
+}

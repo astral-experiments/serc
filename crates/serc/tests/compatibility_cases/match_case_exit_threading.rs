@@ -1,4 +1,5 @@
 use crate::common;
+use crate::common::indent;
 
 #[test]
 fn matches_cpython_match_case_condition_before_common_exit() {
@@ -302,16 +303,6 @@ fn matches_cpython_nested_match_case_predicates() {
             common::assert_matches_cpython_marshal(&source, "nested_match_case_predicate.py");
         }
     }
-}
-
-fn indent(source: &str) -> String {
-    let mut indented = String::new();
-    for line in source.lines() {
-        indented.push_str("    ");
-        indented.push_str(line);
-        indented.push('\n');
-    }
-    indented
 }
 
 #[test]

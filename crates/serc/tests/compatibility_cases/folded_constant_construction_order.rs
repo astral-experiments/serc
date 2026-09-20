@@ -1,14 +1,7 @@
 use std::fmt::Write;
 
 use crate::common;
-
-fn indent(source: &str) -> String {
-    let mut result = String::new();
-    for line in source.lines() {
-        writeln!(result, "    {line}").unwrap();
-    }
-    result
-}
+use crate::common::indent;
 
 #[test]
 fn preserves_numeric_dependencies_while_ordering_copied_return_tuples() {
