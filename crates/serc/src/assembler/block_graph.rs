@@ -871,6 +871,16 @@ impl BlockGraph {
         self.iter().flat_map(|(_, block)| block.items())
     }
 
+    /// Copies the ordered item stream into a single allocation.
+    pub(super) fn copy_items(&self) -> Vec<Item> {
+        let item_count = self.iter().map(|(_, block)| block.items().len()).sum();
+        let mut items = Vec::with_capacity(item_count);
+        for (_, block) in self.iter() {
+            items.extend_from_slice(block.items());
+        }
+        items
+    }
+
     pub(super) fn for_each_instruction_mut(&mut self, mut visit: impl FnMut(&mut Instruction)) {
         let blocks = &mut self.blocks;
         for block in self.order.iter().copied() {

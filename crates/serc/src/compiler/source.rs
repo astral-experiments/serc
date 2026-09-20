@@ -288,7 +288,6 @@ fn parser_interned_strings(
                 }
                 Stmt::ClassDef(definition) => {
                     self.record_raw_name(definition.name.as_str());
-                    self.origins.entry(definition.name.to_string()).or_default();
                     for decorator in &definition.decorator_list {
                         self.visit_decorator(decorator);
                     }
@@ -320,7 +319,6 @@ fn parser_interned_strings(
                     if let Some(module) = &import.module {
                         for component in module.as_str().split('.') {
                             self.record_raw_name(component);
-                            self.origins.entry(component.to_string()).or_default();
                         }
                     }
                 }
@@ -404,14 +402,12 @@ fn parser_interned_strings(
                 names.insert(name.to_string());
             }
             self.record_raw_name(name);
-            self.origins.entry(name.to_string()).or_default();
             ruff_python_ast::visitor::walk_type_param(self, parameter);
         }
 
         fn visit_keyword(&mut self, keyword: &'a ruff_python_ast::Keyword) {
             if let Some(name) = &keyword.arg {
                 self.record_raw_name(name.as_str());
-                self.origins.entry(name.to_string()).or_default();
             }
             self.visit_expr(&keyword.value);
         }
@@ -420,17 +416,14 @@ fn parser_interned_strings(
             self.origins.entry(alias.name.to_string()).or_default();
             for component in alias.name.as_str().split('.') {
                 self.record_raw_name(component);
-                self.origins.entry(component.to_string()).or_default();
             }
             if let Some(name) = &alias.asname {
                 self.record_raw_name(name.as_str());
-                self.origins.entry(name.to_string()).or_default();
             }
         }
 
         fn visit_pattern_keyword(&mut self, keyword: &'a ruff_python_ast::PatternKeyword) {
             self.record_raw_name(keyword.attr.as_str());
-            self.origins.entry(keyword.attr.to_string()).or_default();
             self.visit_pattern(&keyword.pattern);
         }
     }

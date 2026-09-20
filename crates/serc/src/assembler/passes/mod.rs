@@ -152,7 +152,7 @@ impl OptimizationPipeline {
         self.graph
             .validate()
             .map_err(|message| invariant_error(stage, &message))?;
-        let items = self.graph.iter_items().copied().collect::<Vec<_>>();
+        let items = self.graph.copy_items();
         let reachable = stage
             .requires_full_reachability()
             .then(|| self.reachable_items());
@@ -462,10 +462,15 @@ impl Assembler {
                     .insert(label);
             }
         }
-        self.exception_owner_provenance
-            .capture_uncompacted_conditional_arrays(
-                &graph.iter_items().copied().collect::<Vec<_>>(),
-            );
+        if graph.features().has_forward_conditional()
+            || !self
+                .exception_owner_provenance
+                .original_value_jump_prefixes
+                .is_empty()
+        {
+            self.exception_owner_provenance
+                .capture_uncompacted_conditional_arrays(&graph.copy_items());
+        }
         OptimizationPipeline {
             graph,
             folded_original_predecessor_targets: self

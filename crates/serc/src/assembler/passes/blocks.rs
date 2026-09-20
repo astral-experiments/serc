@@ -2915,7 +2915,7 @@ impl OptimizationPipeline {
             return;
         }
         let graph = &self.graph;
-        let items = graph.iter_items().copied().collect::<Vec<_>>();
+        let items = graph.copy_items();
         let labels = items
             .iter()
             .enumerate()
@@ -3726,7 +3726,7 @@ impl OptimizationPipeline {
         {
             Vec::new()
         } else {
-            let original_items = graph.iter_items().copied().collect::<Vec<_>>();
+            let original_items = graph.copy_items();
             self.exception_owner_provenance
                 .copied_conjunction_break_prefixes
                 .iter()
@@ -3750,7 +3750,7 @@ impl OptimizationPipeline {
                 .collect::<Vec<_>>()
         };
         let shared_break_markers = {
-            let original_items = graph.iter_items().copied().collect::<Vec<_>>();
+            let original_items = graph.copy_items();
             self.exception_owner_provenance.copied_shared_break_truth_prefixes.iter().enumerate()
                 .filter_map(|(index, prefix)| {
                     if !matches!(prefix.last(), Some(Item::Instruction(marker)) if marker.opcode == NOT_TAKEN) {

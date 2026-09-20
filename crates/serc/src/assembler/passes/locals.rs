@@ -874,7 +874,7 @@ impl OptimizationPipeline {
         if origins.is_empty() {
             return entries;
         }
-        let items = self.graph.iter_items().copied().collect::<Vec<_>>();
+        let items = self.graph.copy_items();
         let positions = items
             .iter()
             .enumerate()
