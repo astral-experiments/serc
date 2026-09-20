@@ -765,3 +765,5 @@ mod normal_try_discard_copies;
 mod non_final_loop_exit_barriers;
 
 mod match_tuple_tail_wrappers;
+
+mod annotation_format_name;

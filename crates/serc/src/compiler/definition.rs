@@ -1579,7 +1579,7 @@ impl Compiler<'_> {
             let classdict = self.required_name_id("__classdict__");
             self.insert_lexical_name(&mut freevars, classdict);
         }
-        let mut local_names = vec!["format".to_string()];
+        let mut local_names = vec![".format".to_string()];
         let mut references = ReferenceCollector::default();
         let mut inlined_cellvars = FxHashSet::default();
         if self.unit.flags & CO_FUTURE_ANNOTATIONS == 0 && !can_see_class_scope {
@@ -1685,7 +1685,7 @@ impl Compiler<'_> {
         );
         child.assembler.set_location(location);
 
-        child.emit_annotation_format_guard("format")?;
+        child.emit_annotation_format_guard(".format")?;
         // The format guard reads its synthetic parameter; annotation expressions use their own globals.
         if let Scope::Function { globals, .. } = &mut child.unit.scope {
             globals.extend(annotation_globals);
@@ -1751,7 +1751,7 @@ impl Compiler<'_> {
             .collect();
         let closure_names = freevars.clone();
         let plan = LoweringFunctionPlan {
-            locals: vec![self.required_name_id("format")],
+            locals: vec![self.required_name_id(".format")],
             globals,
             freevars,
             ..LoweringFunctionPlan::default()
@@ -1781,7 +1781,7 @@ impl Compiler<'_> {
         let line = i32::try_from(self.unit.first_line_number).unwrap_or(i32::MAX);
         let setup_location = SourceLocation::new(line, line, 0, 0);
         child.assembler.set_location(setup_location);
-        child.emit_annotation_format_guard("format")?;
+        child.emit_annotation_format_guard(".format")?;
         child.emit(BUILD_MAP, 0, 1)?;
 
         let mut conditional_index = 0_u32;
@@ -1845,7 +1845,7 @@ impl Compiler<'_> {
         let first = annotations.first().ok_or_else(|| {
             CompileError::Internal("module annotation thunk has no annotations".to_string())
         })?;
-        let mut local_names = vec!["format".to_string()];
+        let mut local_names = vec![".format".to_string()];
         let mut inlined_cellvars = FxHashSet::default();
         for annotation in &annotations {
             local_names.extend(inlined_comprehension_local_names_in_expression(
@@ -1883,7 +1883,7 @@ impl Compiler<'_> {
         child.emit_function_prologue()?;
         let setup_location = self.source_location(body.first().map_or(first.range, Ranged::range));
         child.assembler.set_location(setup_location);
-        child.emit_annotation_format_guard("format")?;
+        child.emit_annotation_format_guard(".format")?;
         child.emit(BUILD_MAP, 0, 1)?;
 
         for (index, annotation) in annotations.iter().enumerate() {
