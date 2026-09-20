@@ -47,6 +47,7 @@ mod continued_cleanup_locations;
 mod copied_exit_borrow_fusion_compatibility;
 mod copied_exit_owner_slots;
 mod copied_finally_break_nop;
+mod copied_finally_break_owners;
 mod copied_finally_break_threading;
 mod copied_finally_call_return_compatibility;
 mod copied_finally_global_fold_owners;

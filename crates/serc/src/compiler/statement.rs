@@ -4115,10 +4115,15 @@ impl Compiler<'_> {
                 let context = self.control.loops.contexts.last().copied().ok_or_else(|| {
                     CompileError::invalid_syntax("'break' outside loop", statement.range)
                 })?;
-                // The direct coroutine break unwinds the same two original try
-                // records as continue. Keep them for stale exception-owner slots.
-                let copied_break_pop_pair = context.iterator_cleanup == IteratorCleanup::None
-                    && self.continued_finally_pop_blocks(context, true, false) == 2;
+                // A direct break unwinds the same original try records as continue.
+                // Keep the single finally POP even when iterator disposal follows it.
+                let break_pop_blocks = self.continued_finally_pop_blocks(context, true, false);
+                let copied_break_pop_blocks =
+                    if break_pop_blocks == 1 || context.iterator_cleanup == IteratorCleanup::None {
+                        break_pop_blocks
+                    } else {
+                        0
+                    };
                 let copied_break_item = self.assembler.item_count();
                 // Keep the two omitted POP_BLOCKs as provenance only. Iterator
                 // cleanup still follows the copied finalizer's shared exit.
@@ -4251,7 +4256,7 @@ impl Compiler<'_> {
                     NOP,
                     0,
                     0,
-                    if copied_break_pop_pair {
+                    if copied_break_pop_blocks > 0 {
                         ExceptionPolicy::default()
                     } else if self
                         .control
@@ -4334,7 +4339,8 @@ impl Compiler<'_> {
                 } = self.emit_loop_control_finally_unwind(
                     context.with_depth,
                     None,
-                    copied_break_pop_pair.then_some(copied_break_item),
+                    (copied_break_pop_blocks > 0)
+                        .then_some((copied_break_item, copied_break_pop_blocks)),
                     None,
                     None,
                 )?;
@@ -12631,13 +12637,18 @@ impl Compiler<'_> {
                 && matches!(guard.body.as_slice(), [Stmt::Try(cleanup)] if !cleanup.is_star))
     }
 
-    /// Counts the original `POP_BLOCK` records before a direct continued finalizer.
+    /// Counts the original `POP_BLOCK` records before a direct loop-control finalizer.
     fn continued_finally_pop_blocks(
         &self,
         context: LoopContext,
         retained_manager_break: bool,
         guarded_none_cleanup: bool,
     ) -> usize {
+        let generator_break = retained_manager_break
+            && matches!(
+                self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR),
+                CO_GENERATOR | CO_ASYNC_GENERATOR
+            );
         // A break can leave one outer async manager active while popping the
         // inner ordinary try and finalizer. No manager cleanup is interleaved.
         let retained_manager = retained_manager_break
@@ -12652,12 +12663,14 @@ impl Compiler<'_> {
         // An exited manager, handler, or pending exit would interleave other cleanup.
         // Continue stops at its loop, leaving outer finalizers and regions active.
         if !(self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
+            || generator_break
             || (!retained_manager_break
                 && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0))
-            || !matches!(
+            || !(matches!(
                 context.iterator_cleanup,
                 IteratorCleanup::None | IteratorCleanup::Sync
-            )
+            ) || (retained_manager_break
+                && context.iterator_cleanup == IteratorCleanup::Async))
             || (retained_manager_break
                 && (context.exception_region_depth != 0
                     || self.control.finally.active_loop_finally_contexts.len() != 1))
@@ -12702,11 +12715,6 @@ impl Compiler<'_> {
             || (retained_manager && finally.with_depth != context.with_depth)
             || finally.exception_region_depth != context.exception_region_depth
             || matches!(finally.body.as_slice(), [Stmt::Pass(_)])
-            // The captured leading None guard can use the original NOP/POP pair
-            // independently of later nested cleanup and copied-tail routing.
-            || (context.iterator_cleanup == IteratorCleanup::Sync
-                && !guarded_none_cleanup
-                && !copied_finally_tail_can_inline_continue(&finally.body))
         {
             return 0;
         }
@@ -12723,6 +12731,12 @@ impl Compiler<'_> {
             return 0;
         };
         if (guarded_none_cleanup && ordinary_tries != 0)
+            || (generator_break && pop_blocks != 1)
+            // A captured single break POP is independent of the copied tail's routing.
+            || (context.iterator_cleanup == IteratorCleanup::Sync
+                && !(guarded_none_cleanup
+                    || (retained_manager_break && pop_blocks == 1)
+                    || copied_finally_tail_can_inline_continue(&finally.body)))
             || !(1..=2).contains(&pop_blocks)
             || self
                 .control
@@ -12743,7 +12757,7 @@ impl Compiler<'_> {
         &mut self,
         with_depth: usize,
         continue_target: Option<Label>,
-        copied_break_item: Option<usize>,
+        copied_break_item: Option<(usize, usize)>,
         copied_continue_item: Option<usize>,
         deferred_finally_end: Option<(usize, usize)>,
     ) -> Result<LoopControlUnwind, CompileError> {
@@ -12946,22 +12960,28 @@ impl Compiler<'_> {
                         self.assembler.mark_last_as_converted_pop_block();
                     }
                 }
-                let copied_break_pop_pair =
-                    if copied_break_item.is_some() && index + 1 == finally_contexts.len() {
-                        let first_pop = self.assembler.item_count();
-                        for _ in 0..2 {
-                            self.emit_with_exception_policy(
-                                NOP,
-                                0,
-                                0,
-                                ExceptionPolicy::EXCLUDE_ALWAYS,
-                            )?;
-                            self.assembler.mark_last_as_converted_pop_block();
-                        }
-                        Some(first_pop)
-                    } else {
-                        None
-                    };
+                let copied_break_first_pop = if let Some((break_item, pop_blocks)) =
+                    copied_break_item
+                    && index + 1 == finally_contexts.len()
+                {
+                    let first_pop = self.assembler.item_count();
+                    for _ in 0..pop_blocks {
+                        self.emit_with_exception_policy(
+                            NOP,
+                            0,
+                            0,
+                            ExceptionPolicy::EXCLUDE_ALWAYS,
+                        )?;
+                        self.assembler.mark_last_as_converted_pop_block();
+                    }
+                    if pop_blocks == 1 {
+                        self.assembler
+                            .record_early_return_nop_pair(break_item, context.handler);
+                    }
+                    Some(first_pop)
+                } else {
+                    None
+                };
                 let unwound_withs = self.control.withs.active_with_exits.split_off(next_with);
                 let active_try_bodies = self.control.finally.active_finally_try_bodies;
                 self.control.finally.active_finally_try_bodies =
@@ -13197,8 +13217,8 @@ impl Compiler<'_> {
                         Some((cleanup_end, exclusion_count));
                 }
                 if result.is_ok()
-                    && let (Some(break_item), Some(first_pop)) =
-                        (copied_break_item, copied_break_pop_pair)
+                    && let (Some((break_item, 2)), Some(first_pop)) =
+                        (copied_break_item, copied_break_first_pop)
                 {
                     self.assembler
                         .record_copied_return_none_prefix(break_item, first_pop, false);
