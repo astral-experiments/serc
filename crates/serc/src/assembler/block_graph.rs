@@ -675,6 +675,43 @@ impl BlockGraph {
         item
     }
 
+    /// Removes original instruction positions in graph order with one compaction per block.
+    /// Adjacent duplicate positions are ignored; labels and conservative features are unchanged.
+    pub(super) fn remove_ordered_instructions(&mut self, positions: &[ItemPosition]) {
+        for positions in positions.chunk_by(|left, right| left.block == right.block) {
+            if let [position] = positions {
+                debug_assert!(matches!(self.item(*position), Item::Instruction(_)));
+                self.remove_item(*position);
+                continue;
+            }
+
+            debug_assert!(
+                positions
+                    .windows(2)
+                    .all(|pair| pair[0].offset <= pair[1].offset)
+            );
+            let mut remaining = positions.iter().peekable();
+            let mut offset = 0;
+            self.retain_items(positions[0].block, |item| {
+                let remove = remaining
+                    .peek()
+                    .is_some_and(|position| position.offset == offset);
+                if remove {
+                    debug_assert!(matches!(item, Item::Instruction(_)));
+                    while remaining
+                        .peek()
+                        .is_some_and(|position| position.offset == offset)
+                    {
+                        remaining.next();
+                    }
+                }
+                offset += 1;
+                !remove
+            });
+            debug_assert_eq!(remaining.len(), 0);
+        }
+    }
+
     /// Retains items that satisfy `keep` while keeping label lookup synchronized.
     pub(super) fn retain_items(
         &mut self,
@@ -1453,6 +1490,73 @@ mod tests {
         assert_eq!(graph.label_block(removed_label), None);
         assert_eq!(graph.label_block(retained_label), Some(block));
         graph.validate().unwrap();
+    }
+
+    #[test]
+    fn ordered_instruction_compaction_matches_reverse_removal() {
+        let labels = [Label(0), Label(1), Label(2)];
+        let mut marked = Instruction::new(NOP, Operand::Value(3), SourceLocation::NONE, None);
+        marked.jump_policy.mark_borrow_empty_block();
+        let graph = BlockGraph::from_items(
+            vec![
+                Item::Label(labels[0]),
+                instruction(NOP, Operand::Value(0)),
+                instruction(NOP, Operand::Value(1)),
+                instruction(TO_BOOL, Operand::Value(0)),
+                instruction(NOP, Operand::Value(2)),
+                Item::Instruction(marked),
+                Item::Label(labels[1]),
+                instruction(NOP, Operand::Value(4)),
+                instruction(NOP, Operand::Value(5)),
+                Item::Label(labels[2]),
+                instruction(NOP, Operand::Value(6)),
+                instruction(NOP, Operand::Value(7)),
+                instruction(RETURN_VALUE, Operand::Value(0)),
+            ],
+            &FxHashSet::from_iter([labels[1], labels[2]]),
+        );
+        for mask in 0..(1_u32 << 8) {
+            let positions = graph
+                .iter()
+                .flat_map(|(block, basic_block)| {
+                    basic_block
+                        .items()
+                        .iter()
+                        .enumerate()
+                        .filter_map(move |(offset, item)| {
+                            let Item::Instruction(instruction) = item else {
+                                return None;
+                            };
+                            let Operand::Value(bit) = instruction.operand() else {
+                                return None;
+                            };
+                            (instruction.opcode == NOP && mask & (1 << bit) != 0)
+                                .then_some(ItemPosition::new(block, offset))
+                        })
+                })
+                .collect::<Vec<_>>();
+            let mut reference = graph.clone();
+            for position in positions.iter().rev() {
+                reference.remove_item(*position);
+            }
+            let mut compacted = graph.clone();
+            compacted.remove_ordered_instructions(&positions);
+            let mut duplicated = graph.clone();
+            let duplicates = positions
+                .iter()
+                .flat_map(|&position| [position; 2])
+                .collect::<Vec<_>>();
+            duplicated.remove_ordered_instructions(&duplicates);
+            for actual in [compacted, duplicated] {
+                assert_eq!(actual.copy_items(), reference.copy_items(), "mask {mask}");
+                assert_eq!(actual.order(), graph.order());
+                assert_eq!(actual.features(), graph.features());
+                for label in labels {
+                    assert_eq!(actual.label_block(label), graph.label_block(label));
+                }
+                actual.validate().unwrap();
+            }
+        }
     }
 
     #[test]

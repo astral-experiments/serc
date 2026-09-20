@@ -1192,6 +1192,20 @@ impl Instruction {
         }
     }
 
+    /// Compares fields retained by a fusion-owner certificate, apart from its opcode policy.
+    /// Initial jump borrowing is independent provenance and does not alter the owner proof.
+    pub(super) fn same_fusion_owner_fields(&self, other: &Self) -> bool {
+        self.operand_payload == other.operand_payload
+            && self.location == other.location
+            && self.depth_after == other.depth_after
+            && self.local_policy == other.local_policy
+            && self.no_location_policy == other.no_location_policy
+            // The fusion policy includes the lossless operand kind as well as its own flags.
+            && self.fusion_policy == other.fusion_policy
+            && self.jump_policy == other.jump_policy
+            && self.metadata.normal_bits() == other.metadata.normal_bits()
+    }
+
     pub(super) const fn exception_policy(&self) -> ExceptionPolicy {
         self.metadata.exception_policy()
     }
@@ -1715,9 +1729,9 @@ impl Default for Assembler {
 mod initial_borrow_metadata_tests {
     use super::{
         ExceptionPolicy, Instruction, InstructionMetadata, Label, NonZeroU16, Operand,
-        SourceLocation,
+        OperandPatchId, SourceLocation,
     };
-    use crate::target::opcodes::JUMP_FORWARD;
+    use crate::target::opcodes::{JUMP_FORWARD, LOAD_FAST};
 
     const POLICIES: [ExceptionPolicy; 23] = [
         ExceptionPolicy::NoneUnchanged,
@@ -1744,6 +1758,80 @@ mod initial_borrow_metadata_tests {
         ExceptionPolicy::NoneUnchangedBooleanSingleton,
         ExceptionPolicy::AlwaysAbsentPostTryCondition,
     ];
+
+    #[test]
+    fn fusion_owner_fields_preserve_every_normal_metadata_combination() {
+        let original = Instruction::new(
+            JUMP_FORWARD,
+            Operand::Forward(Label(1)),
+            SourceLocation::NONE,
+            None,
+        );
+        let mut same_count = 0;
+        for first in 1..=276 {
+            let mut a = original;
+            a.metadata = InstructionMetadata(NonZeroU16::new(first).unwrap());
+            for second in 1..=276 {
+                let mut b = original;
+                b.metadata = InstructionMetadata(NonZeroU16::new(second).unwrap());
+                let expected = a.exception_policy() == b.exception_policy()
+                    && a.pre_fold_extra_instructions() == b.pre_fold_extra_instructions()
+                    && a.only_allows_unconditional_inlining()
+                        == b.only_allows_unconditional_inlining();
+                assert_eq!(
+                    a.same_fusion_owner_fields(&b),
+                    expected,
+                    "{first}, {second}"
+                );
+                same_count += usize::from(expected);
+            }
+        }
+        // 46 owner states have both a tagged and an untagged encoding; 184 have one.
+        assert_eq!(same_count, 46 * 4 + 184);
+    }
+
+    #[test]
+    fn fusion_owner_fields_compare_packed_operands_depth_and_other_policies() {
+        let source = SourceLocation::new(1, 1, 0, 1);
+        let original = Instruction::new(JUMP_FORWARD, Operand::Forward(Label(1)), source, None);
+        let mut changes = [original; 7];
+        changes[0].set_operand(Operand::Forward(Label(2)));
+        changes[1].location = SourceLocation::new(2, 2, 0, 1);
+        changes[2].depth_after = 0;
+        changes[3].local_policy.mark_force_borrowed_load();
+        changes[4].no_location_policy.percent_target_location = 3;
+        changes[5].fusion_policy.prevent_with_previous();
+        changes[6].jump_policy.mark_interruptible();
+        for changed in changes {
+            assert!(!original.same_fusion_owner_fields(&changed));
+            assert!(!changed.same_fusion_owner_fields(&original));
+        }
+        let mut another_opcode = original;
+        another_opcode.opcode = LOAD_FAST;
+        assert!(original.same_fusion_owner_fields(&another_opcode));
+
+        let operands = [
+            Operand::Value(1),
+            Operand::Deferred(OperandPatchId(1)),
+            Operand::Forward(Label(1)),
+            Operand::Backward(Label(1)),
+        ];
+        for first in operands {
+            for second in operands {
+                let a = Instruction::new(JUMP_FORWARD, first, source, None);
+                let b = Instruction::new(JUMP_FORWARD, second, source, None);
+                assert_eq!(a.same_fusion_owner_fields(&b), first == second);
+            }
+        }
+        let depths = [None, Some(0), Some(1), Some(u32::MAX - 1)];
+        for first in depths {
+            for second in depths {
+                let a = Instruction::new(JUMP_FORWARD, operands[0], source, first);
+                let b = Instruction::new(JUMP_FORWARD, operands[0], source, second);
+                assert_eq!(a.same_fusion_owner_fields(&b), first == second);
+            }
+        }
+    }
 
     #[test]
     fn wide_initial_borrow_metadata_preserves_all_276_encodings() {

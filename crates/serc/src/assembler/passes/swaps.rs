@@ -8,10 +8,10 @@ use crate::assembler::OptimizationPipeline;
 use crate::assembler::block_graph::{BlockGraph, ItemPosition};
 
 impl OptimizationPipeline {
-    pub(in crate::assembler) fn remove_redundant_swaps_before_pops(&mut self) {
+    pub(in crate::assembler) fn remove_redundant_swaps_before_pops(&mut self) -> bool {
         let graph = &self.graph;
         if !graph.features().has_swap() {
-            return;
+            return false;
         }
         let instructions = graph
             .item_positions()
@@ -54,24 +54,26 @@ impl OptimizationPipeline {
         }
 
         let graph = &mut self.graph;
+        let changed = !redundant.is_empty();
         for position in redundant.into_iter().rev() {
             graph.remove_item(position);
         }
+        changed
     }
 
     /// Replaces each run of stack swaps with the shortest equivalent sequence.
     ///
     /// This is the first half of CPython's `swaptimize` pass. Reconstructing the
     /// permutation from the end of the run guarantees that the replacement fits
-    /// in the original instruction slots.
+    /// in the original instruction slots. Reports whether any original slot changed.
     pub(in crate::assembler) fn optimize_swap_runs(
         &mut self,
-    ) -> (Vec<Vec<ItemPosition>>, FxHashSet<ItemPosition>) {
+    ) -> (Vec<Vec<ItemPosition>>, FxHashSet<ItemPosition>, bool) {
         const VISITED: usize = usize::MAX;
 
         let graph = &self.graph;
         if !graph.features().has_swap() {
-            return (Vec::new(), FxHashSet::default());
+            return (Vec::new(), FxHashSet::default(), false);
         }
         let mut block_labels = FxHashSet::default();
         for item in graph.iter_items() {
@@ -126,6 +128,7 @@ impl OptimizationPipeline {
             }
         }
         let graph = &mut self.graph;
+        let mut changed = false;
         for block in &blocks {
             let instruction_positions = block
                 .iter()
@@ -196,10 +199,12 @@ impl OptimizationPipeline {
                             else {
                                 unreachable!();
                             };
+                            let argument =
+                                Operand::Value(u32::try_from(stack_index + 1).unwrap_or(u32::MAX));
+                            changed |=
+                                instruction.opcode != SWAP || instruction.operand() != argument;
                             instruction.opcode = SWAP;
-                            instruction.set_operand(Operand::Value(
-                                u32::try_from(stack_index + 1).unwrap_or(u32::MAX),
-                            ));
+                            instruction.set_operand(argument);
                         }
                         if stack[stack_index] == VISITED {
                             debug_assert_eq!(stack_index, index);
@@ -216,13 +221,15 @@ impl OptimizationPipeline {
                     else {
                         unreachable!();
                     };
+                    changed |=
+                        instruction.opcode != NOP || instruction.operand() != Operand::Value(0);
                     instruction.opcode = NOP;
                     instruction.set_operand(Operand::Value(0));
                 }
                 position = run_end;
             }
         }
-        (blocks, capture_cleanup_swaps)
+        (blocks, capture_cleanup_swaps, changed)
     }
 
     /// Applies stack swaps statically by reordering local stores and pops.

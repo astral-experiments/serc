@@ -1,5 +1,5 @@
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use ruff_python_ast::token::{TokenKind, Tokens};
 use ruff_python_ast::visitor::transformer::{Transformer, walk_expr as transform_expr};
@@ -202,7 +202,38 @@ impl<'source> CompilationContext<'source> {
         !self.constant_string_origins.is_empty()
     }
 
-    pub(super) fn constant_string_provenance(&self) -> (FxHashSet<String>, FxHashSet<String>) {
+    /// Takes the completed module's string keys when no child still shares the context.
+    pub(super) fn finish_constant_string_provenance(
+        context: &mut Arc<Self>,
+    ) -> (FxHashSet<String>, FxHashSet<String>) {
+        let Some(context) = Arc::get_mut(context) else {
+            return context.constant_string_provenance();
+        };
+        let origins = std::mem::take(&mut context.constant_string_origins);
+        let mut identifiers = FxHashSet::default();
+        identifiers.reserve(origins.len());
+        let mut canonical = FxHashSet::default();
+        #[expect(
+            clippy::iter_over_hash_type,
+            reason = "Both provenance sets are only queried for membership."
+        )]
+        for (value, origin) in origins {
+            let generated = context.generated_mangled_strings.contains(&value);
+            if origin.into_inner() == 2 {
+                if generated {
+                    canonical.insert(value);
+                } else {
+                    canonical.insert(value.clone());
+                    identifiers.insert(value);
+                }
+            } else if !generated {
+                identifiers.insert(value);
+            }
+        }
+        (identifiers, canonical)
+    }
+
+    fn constant_string_provenance(&self) -> (FxHashSet<String>, FxHashSet<String>) {
         let identifiers = self
             .constant_string_origins
             .keys()
@@ -217,6 +248,11 @@ impl<'source> CompilationContext<'source> {
             .collect();
         (identifiers, canonical)
     }
+}
+
+/// Tests for the ASCII dunder substring without constructing a generic string searcher.
+fn has_double_underscore(name: &str) -> bool {
+    name.as_bytes().windows(2).any(|pair| pair == b"__")
 }
 
 fn parser_interned_strings(
@@ -261,7 +297,7 @@ fn parser_interned_strings(
             if !self.origins.contains_key(name) {
                 self.origins.insert(name.to_string(), AtomicU8::default());
             }
-            if name.contains("__") {
+            if has_double_underscore(name) {
                 self.restricted_private_identifier |= self.mangled_names.is_some();
                 self.raw_private_identifiers.insert(name.to_string());
                 let mangled = self.mangled_name(name);
@@ -1185,6 +1221,13 @@ pub(super) fn unparse_annotation(expression: &Expr, source: &str) -> String {
         return unparse_annotation_tstring(string, source);
     }
 
+    if annotation_needs_no_unparse_corrections(expression) {
+        let indentation = Indentation::default();
+        return Generator::new(&indentation, LineEnding::Lf)
+            .with_mode(CodegenMode::AstUnparse)
+            .expr(expression);
+    }
+
     let mut original_strings = AnnotationStrings::default();
     original_strings.visit_expr(expression);
     let normalized = original_strings.needs_normalization.then(|| {
@@ -1318,6 +1361,19 @@ pub(super) fn unparse_annotation(expression: &Expr, source: &str) -> String {
         annotation.push(')');
     }
     annotation
+}
+
+/// These expressions cannot contain any of the constructs corrected after Ruff generates them.
+fn annotation_needs_no_unparse_corrections(expression: &Expr) -> bool {
+    match expression {
+        Expr::Name(_) | Expr::NoneLiteral(_) => true,
+        Expr::Attribute(attribute) => annotation_needs_no_unparse_corrections(&attribute.value),
+        Expr::BinOp(binary) if binary.op == Operator::BitOr => {
+            annotation_needs_no_unparse_corrections(&binary.left)
+                && annotation_needs_no_unparse_corrections(&binary.right)
+        }
+        _ => false,
+    }
 }
 
 /// CPython builds a complete `JoinedStr` body before applying string repr to it.
@@ -1494,4 +1550,153 @@ fn python_string_repr(value: &str) -> String {
         .str_repr(ruff_python_ast::str::TripleQuotes::No)
         .to_string()
         .expect("Python string representation length fits in usize")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raw_identifier_dunder_matches_adjacent_ascii_underscores() {
+        for (name, expected) in [
+            ("", false),
+            ("_", false),
+            ("plain", false),
+            ("under_score", false),
+            ("_on_both_sides_", false),
+            ("__", true),
+            ("___", true),
+            ("__private", true),
+            ("_Café__already", true),
+            ("trailing__", true),
+            ("_é_", false),
+            ("名__字", true),
+            ("＿_", false),
+            ("_＿", false),
+            ("＿＿", false),
+        ] {
+            assert_eq!(has_double_underscore(name), expected, "{name:?}");
+        }
+
+        let alphabet = ["", "_", "a", "é", "名", "＿"];
+        for first in alphabet {
+            for second in alphabet {
+                for third in alphabet {
+                    for fourth in alphabet {
+                        let name = [first, second, third, fourth].concat();
+                        assert_eq!(
+                            has_double_underscore(&name),
+                            name.contains("__"),
+                            "{name:?}"
+                        );
+                    }
+                }
+            }
+        }
+        let mut name = "letters_and_é".repeat(64);
+        assert!(!has_double_underscore(&name));
+        name.push_str("__end");
+        assert!(has_double_underscore(&name));
+    }
+
+    #[test]
+    fn parser_dunders_preserve_raw_and_generated_mangled_identities() {
+        let parsed = ruff_python_parser::parse_module(
+            "class Café:\n    def f(self):\n        self.__secret\n        self.__already\n        self._Café__already\n        self.élan\n        self.ends_\n",
+        )
+        .unwrap();
+        let mut generated = FxHashSet::default();
+        let mut requires_trace = false;
+        let origins = parser_interned_strings(parsed.suite(), &mut generated, &mut requires_trace);
+        for raw in [
+            "Café",
+            "__secret",
+            "__already",
+            "_Café__already",
+            "élan",
+            "ends_",
+        ] {
+            assert!(origins.contains_key(raw), "{raw:?}");
+        }
+        assert!(generated.contains("_Café__secret"));
+        assert!(!generated.contains("_Café__already"));
+        assert!(requires_trace);
+    }
+
+    #[test]
+    fn finishing_module_string_provenance_moves_exclusive_keys_and_preserves_shared_context() {
+        let tokens = Tokens::new(Vec::new());
+        let mut context = CompilationContext::new("example.py", "", &tokens, &Suite::new());
+        context.constant_string_origins = [
+            ("unused", 0),
+            ("not_interned", 1),
+            ("canonical", 2),
+            ("mangled_unused", 0),
+            ("mangled_not_interned", 1),
+            ("mangled_canonical", 2),
+        ]
+        .into_iter()
+        .map(|(name, state)| (name.to_string(), AtomicU8::new(state)))
+        .collect();
+        context.generated_mangled_strings = [
+            "mangled_unused",
+            "mangled_not_interned",
+            "mangled_canonical",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        context.requires_interning_trace = true;
+        context.record_interning_event(CompilationInterningEventKind::CachedTuple(vec![
+            "earlier".to_string(),
+        ]));
+        let mut context = Arc::new(context);
+        let input_key_address = |name: &str| {
+            context
+                .constant_string_origins
+                .get_key_value(name)
+                .unwrap()
+                .0
+                .as_ptr()
+        };
+        let unused_address = input_key_address("unused");
+        let canonical_address = input_key_address("canonical");
+        let mangled_canonical_address = input_key_address("mangled_canonical");
+        let expected: (FxHashSet<String>, FxHashSet<String>) = (
+            ["unused", "not_interned", "canonical"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            ["canonical", "mangled_canonical"]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        );
+
+        let shared = Arc::clone(&context);
+        let copied = CompilationContext::finish_constant_string_provenance(&mut context);
+        assert_eq!(copied, expected);
+        assert_eq!(shared.constant_string_origins.len(), 6);
+        drop(shared);
+
+        let moved = CompilationContext::finish_constant_string_provenance(&mut context);
+        assert_eq!(moved, expected);
+        assert_eq!(moved.0.get("unused").unwrap().as_ptr(), unused_address);
+        assert_eq!(
+            moved.0.get("canonical").unwrap().as_ptr(),
+            canonical_address
+        );
+        assert_eq!(
+            moved.1.get("mangled_canonical").unwrap().as_ptr(),
+            mangled_canonical_address
+        );
+        assert!(context.constant_string_origins.is_empty());
+        assert_eq!(context.generated_mangled_strings.len(), 3);
+        assert!(context.requires_interning_trace);
+        assert_eq!(context.interning_events().len(), 1);
+        assert_eq!(
+            context.record_interning_event(CompilationInterningEventKind::CachedTuple(Vec::new())),
+            1
+        );
+    }
 }

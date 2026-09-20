@@ -2073,7 +2073,8 @@ impl OptimizationPipeline {
     /// Reverses backward conditionals around a fresh interruptible backedge.
     pub(in crate::assembler) fn normalize_backward_conditionals(
         &mut self,
-    ) -> Result<(), crate::CompileError> {
+    ) -> Result<bool, crate::CompileError> {
+        let mut changed = false;
         let mut position = 0;
         while position < self.graph.order().len() {
             let block = self.graph.block_at(position);
@@ -2114,6 +2115,7 @@ impl OptimizationPipeline {
             };
             // Remove the marker before inserting a successor label can shift its offset.
             self.graph.remove_item(marker);
+            changed = true;
             let successor = self.graph.block_at(position + 1);
             let fallthrough =
                 if let Some(Item::Label(label)) = self.graph[successor].items().first() {
@@ -2153,7 +2155,7 @@ impl OptimizationPipeline {
             );
             position += 2;
         }
-        Ok(())
+        Ok(changed)
     }
 
     pub(in crate::assembler) fn push_cold_blocks_to_end(
@@ -3749,7 +3751,13 @@ impl OptimizationPipeline {
                 })
                 .collect::<Vec<_>>()
         };
-        let shared_break_markers = {
+        let shared_break_markers = if self
+            .exception_owner_provenance
+            .copied_shared_break_truth_prefixes
+            .is_empty()
+        {
+            Vec::new()
+        } else {
             let original_items = graph.copy_items();
             self.exception_owner_provenance.copied_shared_break_truth_prefixes.iter().enumerate()
                 .filter_map(|(index, prefix)| {

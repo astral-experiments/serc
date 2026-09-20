@@ -345,22 +345,20 @@ impl Compiler<'_> {
     }
 
     pub(super) fn mark_definitely_evaluated_locals(&mut self, expression: &Expr) {
-        let Some(references) = definitely_evaluated_references(expression) else {
-            return;
-        };
         let Scope::Function { indices, .. } = &self.unit.scope else {
             return;
         };
-        let references = references
-            .into_iter()
-            .filter_map(|name| {
-                self.name_id(&name)
+        let Some(references) = definitely_evaluated_references(expression) else {
+            return;
+        };
+        let names = &self.context.scopes.names;
+        self.symbols
+            .initialized_locals
+            .extend(references.into_iter().filter_map(|reference| {
+                names
+                    .get(reference)
                     .filter(|name| indices.contains_key(name))
-            })
-            .collect::<Vec<_>>();
-        for name in references {
-            self.symbols.initialized_locals.insert(name);
-        }
+            }));
     }
 
     pub(super) fn store_name(&mut self, name: &str) -> Result<(), CompileError> {

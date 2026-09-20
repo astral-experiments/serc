@@ -1205,6 +1205,22 @@ fn borrow_block_ranges(
         })
         .max()
         .map_or(0, |index| index + 1);
+    borrow_block_ranges_with_label_count(
+        items,
+        boundary_labels,
+        borrow_unreachable_labels,
+        preserved_block_boundaries,
+        label_count,
+    )
+}
+
+fn borrow_block_ranges_with_label_count(
+    items: &[Item],
+    boundary_labels: &FxHashSet<Label>,
+    borrow_unreachable_labels: &FxHashSet<Label>,
+    preserved_block_boundaries: &FxHashSet<Label>,
+    label_count: usize,
+) -> (Vec<Range<usize>>, Vec<usize>, Vec<bool>) {
     let mut label_blocks = vec![usize::MAX; label_count];
     let mut ranges = Vec::new();
     let mut unreachable = Vec::new();
@@ -1214,24 +1230,24 @@ fn borrow_block_ranges(
     let mut is_unreachable = false;
 
     for (index, item) in items.iter().enumerate() {
-        // Empty original blocks stop CPython's borrow traversal. Exception-range
-        // aliases alone do not establish an original block before this boundary.
-        if let Item::Label(label) = item
-            && boundary_labels.contains(label)
-            && (has_instruction || (has_block_label && preserved_block_boundaries.contains(label)))
-        {
-            ranges.push(start..index);
-            unreachable.push(is_unreachable);
-            start = index;
-            has_instruction = false;
-            has_block_label = false;
-            is_unreachable = false;
-        }
-
         if let Item::Label(label) = item {
+            let is_boundary = boundary_labels.contains(label);
+            // Empty original blocks stop CPython's borrow traversal. Exception-range
+            // aliases alone do not establish an original block before this boundary.
+            if is_boundary
+                && (has_instruction
+                    || (has_block_label && preserved_block_boundaries.contains(label)))
+            {
+                ranges.push(start..index);
+                unreachable.push(is_unreachable);
+                start = index;
+                has_instruction = false;
+                has_block_label = false;
+                is_unreachable = false;
+            }
             label_blocks[usize::try_from(label.0).unwrap()] = ranges.len();
             is_unreachable |= borrow_unreachable_labels.contains(label);
-            has_block_label |= boundary_labels.contains(label);
+            has_block_label |= is_boundary;
         }
         has_instruction |= matches!(item, Item::Instruction(_));
 
@@ -2063,6 +2079,9 @@ impl OptimizationPipeline {
         let origins = std::mem::take(origins);
         let verified = Self::verified_threaded_borrow_positions(graph, &origins.snapshots);
         let mut targets = FxHashMap::default();
+        if verified.is_empty() {
+            return targets;
+        }
         let mut instruction_index = 0;
         for position in graph.item_positions() {
             let Item::Instruction(instruction) = graph.item(position) else {
@@ -2091,6 +2110,9 @@ impl OptimizationPipeline {
         let origins = std::mem::take(origins);
         let verified = Self::verified_threaded_borrow_positions(graph, &origins.snapshots);
         let mut entries = AuthoredFinallyBreakEntries::default();
+        if verified.is_empty() {
+            return entries;
+        }
         let mut nearest_label = None;
         let mut original_source = None;
         for position in graph.item_positions() {
@@ -2569,10 +2591,10 @@ impl OptimizationPipeline {
     ///
     /// Once a checked load succeeds, CPython's definite-assignment scan treats
     /// that local as initialized for subsequent instructions on the same path.
-    pub(in crate::assembler) fn remove_redundant_checked_loads(&mut self) {
+    pub(in crate::assembler) fn remove_redundant_checked_loads(&mut self) -> bool {
         let graph = &mut self.graph;
         if !graph.features().has_fast_load() {
-            return;
+            return false;
         }
         let checked_blocks = graph
             .order()
@@ -2585,8 +2607,9 @@ impl OptimizationPipeline {
             })
             .collect::<Vec<_>>();
         if checked_blocks.is_empty() {
-            return;
+            return false;
         }
+        let mut changed = false;
         for block in checked_blocks {
             let mut initialized = FxHashSet::default();
             for instruction in graph.instructions_mut(block) {
@@ -2600,6 +2623,7 @@ impl OptimizationPipeline {
                     LOAD_FAST_CHECK => {
                         if initialized.contains(&argument) {
                             instruction.opcode = LOAD_FAST;
+                            changed = true;
                         }
                         initialized.insert(argument);
                     }
@@ -2623,6 +2647,7 @@ impl OptimizationPipeline {
                 }
             }
         }
+        changed
     }
 
     /// Retains original source entries when later threading changes a jump destination.
@@ -3263,12 +3288,29 @@ impl OptimizationPipeline {
             (assertion_borrow_block_ranges(items), None)
         } else {
             let mut block_labels = FxHashSet::default();
+            // Cold-handler relocation keeps its shared warm break block nonempty. The
+            // surviving authored break still reaches its exit, even when an adjacent
+            // removed loop anchor records a disconnected fallthrough at that target.
+            let mut cold_join_targets = FxHashSet::default();
+            let mut highest_bound_label = None;
             for item in items.iter() {
-                if let Item::Instruction(instruction) = item
-                    && let Operand::Forward(label) | Operand::Backward(label) =
-                        instruction.operand()
-                {
-                    block_labels.insert(label);
+                match item {
+                    Item::Label(label) => {
+                        highest_bound_label =
+                            highest_bound_label.max(usize::try_from(label.0).ok());
+                    }
+                    Item::Instruction(instruction) => match instruction.operand() {
+                        Operand::Forward(label) => {
+                            block_labels.insert(label);
+                        }
+                        Operand::Backward(label) => {
+                            block_labels.insert(label);
+                            if instruction.opcode == JUMP_BACKWARD_NO_INTERRUPT {
+                                cold_join_targets.insert(label);
+                            }
+                        }
+                        Operand::Value(_) | Operand::Deferred(_) => {}
+                    },
                 }
             }
             // CPython's borrow analysis operates on CFG blocks. Protected-range
@@ -3289,12 +3331,14 @@ impl OptimizationPipeline {
                         .collect(),
                 )
             };
-            let (blocks, label_blocks, borrow_unreachable_blocks) = borrow_block_ranges(
-                items,
-                &block_labels,
-                borrow_unreachable_labels,
-                &borrow_boundaries,
-            );
+            let (blocks, label_blocks, borrow_unreachable_blocks) =
+                borrow_block_ranges_with_label_count(
+                    items,
+                    &block_labels,
+                    borrow_unreachable_labels,
+                    &borrow_boundaries,
+                    highest_bound_label.map_or(0, |index| index + 1),
+                );
             let jump_entry_blocks = if borrow_jump_entry_labels.is_empty() {
                 Vec::new()
             } else {
@@ -3316,23 +3360,6 @@ impl OptimizationPipeline {
                     })
                     .collect::<Vec<_>>()
             };
-            // Cold-handler relocation keeps its shared warm break block nonempty. The
-            // surviving authored break still reaches its exit, even when an adjacent
-            // removed loop anchor records a disconnected fallthrough at that target.
-            let cold_join_targets = items
-                .iter()
-                .filter_map(|item| {
-                    let Item::Instruction(instruction) = item else {
-                        return None;
-                    };
-                    if instruction.opcode == JUMP_BACKWARD_NO_INTERRUPT
-                        && let Operand::Backward(label) = instruction.operand()
-                    {
-                        return Some(label);
-                    }
-                    None
-                })
-                .collect::<FxHashSet<_>>();
             // A removed break reaches an empty original block, but a branch around the
             // loop can still enter its nonempty continuation. Keep that entry available
             // only when every unreachable marker here belongs to the disconnected loop.
@@ -4143,11 +4170,13 @@ impl OptimizationPipeline {
 mod tests {
     use rustc_hash::{FxHashMap, FxHashSet};
 
-    use super::{assertion_borrow_block_ranges, borrow_block_ranges};
+    use super::{
+        assertion_borrow_block_ranges, borrow_block_ranges, borrow_block_ranges_with_label_count,
+    };
     use crate::assembler::{
-        BorrowFallthrough, BorrowLoopExitPolicy, Instruction, Item, JUMP_FORWARD,
-        LOAD_COMMON_CONSTANT, LOAD_CONST, LOAD_FAST, LOAD_FAST_BORROW, Label, NOP, NOT_TAKEN,
-        Operand, POP_JUMP_IF_TRUE, POP_TOP, RETURN_VALUE, SourceLocation,
+        BorrowFallthrough, BorrowLoopExitPolicy, Instruction, Item, JUMP_BACKWARD_NO_INTERRUPT,
+        JUMP_FORWARD, LOAD_COMMON_CONSTANT, LOAD_CONST, LOAD_FAST, LOAD_FAST_BORROW, Label, NOP,
+        NOT_TAKEN, Operand, POP_JUMP_IF_TRUE, POP_TOP, RETURN_VALUE, SourceLocation,
     };
     use crate::target::opcodes::RAISE_VARARGS;
 
@@ -4646,6 +4675,66 @@ mod tests {
         assert_eq!(ranges, [0..4, 4..7, 7..9, 9..11, 11..14]);
         assert_eq!(label_blocks, [0, 0, 1, 2, 3, 4]);
         assert_eq!(unreachable_blocks, [false, false, false, false, true]);
+    }
+
+    #[test]
+    fn borrowed_ranges_use_bound_labels_only_and_preserve_sparse_indices() {
+        let first = Label(2);
+        let target = Label(7);
+        let unbound_forward = Label(90);
+        let unbound_backward = Label(91);
+        let items = vec![
+            Item::Label(first),
+            instruction(LOAD_FAST, Operand::Value(0)),
+            instruction(POP_JUMP_IF_TRUE, Operand::Forward(target)),
+            Item::Label(target),
+            instruction(LOAD_FAST, Operand::Value(1)),
+            instruction(RETURN_VALUE, Operand::Value(0)),
+            instruction(JUMP_FORWARD, Operand::Forward(unbound_forward)),
+            instruction(
+                JUMP_BACKWARD_NO_INTERRUPT,
+                Operand::Backward(unbound_backward),
+            ),
+        ];
+        let boundaries = FxHashSet::from_iter([target, unbound_forward, unbound_backward]);
+        let unreachable = FxHashSet::from_iter([target, unbound_forward]);
+        let preserved = FxHashSet::default();
+        let automatic = borrow_block_ranges(&items, &boundaries, &unreachable, &preserved);
+        let precalculated =
+            borrow_block_ranges_with_label_count(&items, &boundaries, &unreachable, &preserved, 8);
+
+        assert_eq!(automatic, precalculated);
+        assert_eq!(automatic.0, [0..3, 3..6, 6..7, 7..8]);
+        let mut expected_labels = [usize::MAX; 8];
+        expected_labels[2] = 0;
+        expected_labels[7] = 1;
+        assert_eq!(automatic.1, expected_labels);
+        assert_eq!(automatic.2, [false, true, false, false]);
+
+        let mut optimized = items;
+        super::OptimizationPipeline::optimize_load_fast(
+            &mut optimized,
+            &[],
+            super::BorrowEntryLabels {
+                unreachable: &FxHashSet::default(),
+                loop_exits: &FxHashMap::default(),
+                finally_entries: &FxHashMap::default(),
+                finally_jump_sources: &FxHashMap::default(),
+                jump_entries: &FxHashSet::default(),
+                original_boundaries: &FxHashSet::default(),
+                pre_copy_jump_entries: &FxHashMap::default(),
+                authored_finally_break_entries: &FxHashMap::default(),
+            },
+            &FxHashSet::default(),
+            &FxHashSet::default(),
+            false,
+        );
+        for index in [1, 4] {
+            assert!(matches!(
+                optimized[index],
+                Item::Instruction(instruction) if instruction.opcode == LOAD_FAST_BORROW
+            ));
+        }
     }
 
     #[test]
@@ -5436,7 +5525,8 @@ mod tests {
             );
             // The real pipeline records the intermediate jump-only array as
             // empty after the original authored route has been captured.
-            pipeline.record_borrow_empty_jump_heads();
+            assert!(pipeline.record_borrow_empty_jump_heads());
+            assert!(!pipeline.record_borrow_empty_jump_heads());
             let intermediate = pipeline.graph.label_block(Label(2)).unwrap();
             assert!(
                 pipeline.graph[intermediate]

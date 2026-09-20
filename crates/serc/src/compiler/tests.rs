@@ -1582,6 +1582,36 @@ fn expression_comment_stripping_uses_ruff_comment_tokens() {
 }
 
 #[test]
+fn annotation_unparsing_preserves_name_union_grouping_and_complex_members() {
+    for (annotation, expected) in [
+        ("((alpha.Type))", "alpha.Type"),
+        ("None", "None"),
+        ("((A | B) | C)", "A | B | C"),
+        ("A | (B | (C | None))", "A | (B | (C | None))"),
+        ("((A | B)).Nested | None", "(A | B).Nested | None"),
+        ("(A | B).Nested.More", "(A | B).Nested.More"),
+        ("\u{212A}.\u{FB03} | \u{1D4AF}", "K.ffi | T"),
+        ("α.β | None", "α.β | None"),
+        ("A | tuple[(B, C)]", "A | tuple[B, C]"),
+        ("((A, B)) | None", "(A, B) | None"),
+        (r#"A | "Forward""#, "A | 'Forward'"),
+        ("A | (lambda *args: B)", "A | (lambda*args: B)"),
+        ("A | factory(**(B | C))", "A | factory(**B | C)"),
+    ] {
+        let source = format!("value: {annotation}");
+        let module = parse_module(&source).unwrap();
+        let [Stmt::AnnAssign(assignment)] = module.suite().as_slice() else {
+            panic!("expected an annotated assignment");
+        };
+        assert_eq!(
+            unparse_annotation(&assignment.annotation, &source),
+            expected,
+            "{annotation}",
+        );
+    }
+}
+
+#[test]
 fn annotation_unparsing_uses_tokens_for_nested_delimiters() {
     for (source, expected) in [
         ("value: tuple[(int, str)]", "tuple[int, str]"),

@@ -1005,18 +1005,32 @@ impl ExceptionOwnerProvenance {
         // A raw emitted return or copied backedge is not necessarily a CP
         // record. The compiler's original branch target establishes the left
         // edge independently; the preceding terminator only bounds this scan.
-        let has_original_target = self.original_primitive_condition_boundaries.iter().any(|condition| {
-            matches!(condition.operand(), Operand::Forward(label) if leading_labels.contains(&label))
-                && all.iter().filter(|item| **item == Item::Instruction(*condition)).count() == 1
-        }) || all.iter().any(|item| {
-            matches!(item, Item::Instruction(instruction)
-                if instruction.fusion_policy.is_authored_break()
-                && matches!(instruction.operand(), Operand::Forward(label) | Operand::Backward(label)
-                    if leading_labels.contains(&label)))
-        }) || self.original_match_join_boundaries.iter().any(|entry| {
-            leading_labels.contains(entry)
-                && all.iter().filter(|item| **item == Item::Label(*entry)).count() == 1
-        });
+        let has_original_target = || {
+            self.original_primitive_condition_boundaries
+                .iter()
+                .any(|condition| {
+                    matches!(condition.operand(), Operand::Forward(label) if leading_labels.contains(&label))
+                        && all
+                            .iter()
+                            .filter(|item| **item == Item::Instruction(*condition))
+                            .count()
+                            == 1
+                })
+                || all.iter().any(|item| {
+                    matches!(item, Item::Instruction(instruction)
+                        if instruction.fusion_policy.is_authored_break()
+                        && matches!(instruction.operand(), Operand::Forward(label) | Operand::Backward(label)
+                            if leading_labels.contains(&label)))
+                })
+                || self.original_match_join_boundaries.iter().any(|entry| {
+                    leading_labels.contains(entry)
+                        && all
+                            .iter()
+                            .filter(|item| **item == Item::Label(*entry))
+                            .count()
+                            == 1
+                })
+        };
         if source_head {
             // Graph jump targets alone include copied exits. Require the compiler's
             // original source boundary and exactly one original array at this head.
@@ -1058,7 +1072,10 @@ impl ExceptionOwnerProvenance {
                     return false;
                 }
             }
-        } else if !has_original_target && comprehension_restore_count == 0 && !empty_class_success {
+        } else if comprehension_restore_count == 0
+            && !empty_class_success
+            && (leading_labels.is_empty() || !has_original_target())
+        {
             return false;
         }
         let UncompactedPrefixIndexes { positions, targets } = indexes.get_or_init(|| {
@@ -4301,14 +4318,15 @@ impl LayoutAssembler {
         for item in &self.items {
             match item {
                 Item::Label(label) => {
-                    if boundaries.contains(label)
-                        || jump_targets.contains(label)
-                        || setups.contains_key(label)
-                        || self
-                            .exception_owner_provenance
-                            .source_boundaries
-                            .contains(label)
-                    {
+                    let is_boundary = boundaries.contains(label);
+                    let is_join = is_boundary || jump_targets.contains(label);
+                    let is_region_end = region_ends.contains(label);
+                    let setup = setups.get(label);
+                    let is_source_boundary = self
+                        .exception_owner_provenance
+                        .source_boundaries
+                        .contains(label);
+                    if is_join || setup.is_some() || is_source_boundary {
                         captured_null_slots.clear();
                         captured_handler_owner_slots.clear();
                     }
@@ -4439,13 +4457,9 @@ impl LayoutAssembler {
                             ));
                         }
                     }
-                    if boundaries.contains(label)
-                        || jump_targets.contains(label)
-                        || setups.contains_key(label)
-                        || self
-                            .exception_owner_provenance
-                            .source_boundaries
-                            .contains(label)
+                    if is_join
+                        || setup.is_some()
+                        || is_source_boundary
                         || self
                             .exception_owner_provenance
                             .removed_pop_block_boundaries
@@ -4457,9 +4471,8 @@ impl LayoutAssembler {
                         .exception_owner_provenance
                         .continuation_boundaries
                         .contains(label)
-                        && !boundaries.contains(label)
-                        && !jump_targets.contains(label)
-                        && !setups.contains_key(label)
+                        && !is_join
+                        && setup.is_none()
                         && !self
                             .exception_owner_provenance
                             .removed_pop_block_boundaries
@@ -4467,9 +4480,8 @@ impl LayoutAssembler {
                     if !continues_original_block {
                         has_uninterrupted_fusion = false;
                     }
-                    if boundaries.contains(label)
-                        || jump_targets.contains(label)
-                        || (!setups.contains_key(label)
+                    if is_join
+                        || (setup.is_none()
                             && !self
                                 .exception_owner_provenance
                                 .setup_nop_boundaries
@@ -4478,13 +4490,9 @@ impl LayoutAssembler {
                         pending_retained_prefix = None;
                     }
                     if transferred_pop_setup.is_some_and(|(setup, _)| {
-                        boundaries.contains(label)
-                            || jump_targets.contains(label)
-                            || region_ends.contains(label)
-                            || self
-                                .exception_owner_provenance
-                                .source_boundaries
-                                .contains(label)
+                        is_join
+                            || is_region_end
+                            || is_source_boundary
                             || self
                                 .exception_owner_provenance
                                 .removed_pop_block_boundaries
@@ -4505,9 +4513,8 @@ impl LayoutAssembler {
                     }) {
                         transferred_pop_setup = None;
                     }
-                    if boundaries.contains(label)
-                        || jump_targets.contains(label)
-                        || setups.contains_key(label)
+                    if is_join
+                        || setup.is_some()
                         || self
                             .exception_owner_provenance
                             .removed_pop_block_boundaries
@@ -4518,18 +4525,14 @@ impl LayoutAssembler {
                     // Only range endpoints and recorded bookkeeping continuations may
                     // intervene between this authenticated await condition and its marker.
                     // An authored entry or an unknown label ends the original-array proof.
-                    if boundaries.contains(label)
-                        || jump_targets.contains(label)
-                        || setups.contains_key(label)
-                        || self
-                            .exception_owner_provenance
-                            .source_boundaries
-                            .contains(label)
+                    if is_join
+                        || setup.is_some()
+                        || is_source_boundary
                         || self
                             .exception_owner_provenance
                             .removed_pop_block_boundaries
                             .contains(label)
-                        || !(region_ends.contains(label)
+                        || !(is_region_end
                             || self
                                 .exception_owner_provenance
                                 .continuation_boundaries
@@ -4537,10 +4540,9 @@ impl LayoutAssembler {
                     {
                         pending_await_null_append = None;
                     }
-                    if boundaries.contains(label)
-                        || jump_targets.contains(label)
-                        || setups.contains_key(label)
-                        || region_ends.contains(label)
+                    if is_join
+                        || setup.is_some()
+                        || is_region_end
                         || self
                             .exception_owner_provenance
                             .removed_pop_block_boundaries
@@ -4552,14 +4554,10 @@ impl LayoutAssembler {
                         let original_pop_append = pending_null_append == Some(instruction_index)
                             && owner_history_exact
                             && pop_slot_epoch_known
-                            && region_ends.contains(label)
-                            && !boundaries.contains(label)
-                            && !jump_targets.contains(label)
-                            && !setups.contains_key(label)
-                            && !self
-                                .exception_owner_provenance
-                                .source_boundaries
-                                .contains(label)
+                            && is_region_end
+                            && !is_join
+                            && setup.is_none()
+                            && !is_source_boundary
                             && !self
                                 .exception_owner_provenance
                                 .fusion_boundaries
@@ -4605,18 +4603,17 @@ impl LayoutAssembler {
                         pending_fresh_null_append = None;
                         pending_normal_pop_null_append = None;
                     }
-                    if boundaries.contains(label)
-                        || jump_targets.contains(label)
-                        || setups.contains_key(label)
+                    if is_join
+                        || setup.is_some()
                         || self
                             .exception_owner_provenance
                             .removed_pop_block_boundaries
                             .contains(label)
-                        || (!region_ends.contains(label) && !continues_original_block)
+                        || (!is_region_end && !continues_original_block)
                     {
                         pending_compacted_append = None;
                     }
-                    if has_instruction && boundaries.contains(label) {
+                    if has_instruction && is_boundary {
                         retained_pop_prefix = None;
                         original_array_start = instruction_index;
                         captured_null_slots.clear();
@@ -4638,7 +4635,7 @@ impl LayoutAssembler {
                         uniform_with_suffix = None;
                         ended_owned_suffix = None;
                     }
-                    if region_ends.contains(label)
+                    if is_region_end
                         && !continues_original_block
                         && !self
                             .exception_owner_provenance
@@ -4824,9 +4821,9 @@ impl LayoutAssembler {
                         }
                     }
                     if has_instruction
-                        && !boundaries.contains(label)
-                        && !setups.contains_key(label)
-                        && !region_ends.contains(label)
+                        && !is_boundary
+                        && setup.is_none()
+                        && !is_region_end
                         && !continues_original_block
                         && !self
                             .exception_owner_provenance
@@ -4945,9 +4942,9 @@ impl LayoutAssembler {
                         }
                     }
                     if has_instruction
-                        && !boundaries.contains(label)
+                        && !is_boundary
                         && (jump_targets.contains(label)
-                            || (!setups.contains_key(label)
+                            || (setup.is_none()
                                 && !continues_original_block
                                 && !self
                                     .exception_owner_provenance
@@ -4985,16 +4982,8 @@ impl LayoutAssembler {
                         captured_null_slots.clear();
                         captured_handler_owner_slots.clear();
                     }
-                    source_block |= self
-                        .exception_owner_provenance
-                        .source_boundaries
-                        .contains(label);
-                    if boundaries.contains(label)
-                        && self
-                            .exception_owner_provenance
-                            .source_boundaries
-                            .contains(label)
-                    {
+                    source_block |= is_source_boundary;
+                    if is_boundary && is_source_boundary {
                         source_owned_prefix = Some((instruction_index, tail));
                     }
                     if owner_history_exact
@@ -5005,7 +4994,7 @@ impl LayoutAssembler {
                     {
                         source_owned_prefix = Some((instruction_index, tail));
                     }
-                    if let Some(nop_location) = setups.get(label) {
+                    if let Some(nop_location) = setup {
                         ended_owned_suffix = None;
                         source_owned_prefix = None;
                         let retained = nop_location.is_some_and(|location| {
@@ -5836,112 +5825,24 @@ impl LayoutAssembler {
                             },
                         );
                     }
-                    // Primitive match tests keep their unchanged marker policy. They
-                    // still append a fresh NULL record once entry-prologue insertion
-                    // consumes every exact early-compaction slot in the original array.
-                    if instruction.opcode == NOT_TAKEN
-                        && instruction.exception_policy() == super::ExceptionPolicy::NoneUnchanged
-                        && has_entry_prologue
-                        && instruction.local_policy.hidden_exception_owner_slots() == 0
-                        && instruction.pre_fold_extra_instructions() == 0
-                        && original_array_start == 0
-                        && owner_history_exact
-                        && tail.insertions > 0
-                        && tail.early_removals <= tail.insertions
-                        && tail.late_removals == 0
-                        && tail.post_compaction_fusions == 0
-                        && owners
-                            .get(&instruction_index)
-                            .is_none_or(|decision| !decision.definitive)
-                    {
-                        owners.insert(
-                            instruction_index,
-                            ExceptionOwnerDecision {
-                                has_owner: false,
-                                source_region: None,
-                                definitive: true,
-                                override_existing: false,
-                            },
-                        );
-                    }
-                    // Local fusion leaves a newer stale suffix inside the original array.
-                    // Entry prologue insertion consumes that suffix first; once all fusion
-                    // slots are used, the marker reuses the older peephole-compaction tail.
-                    if instruction.opcode == NOT_TAKEN
-                        && instruction.exception_policy().owner()
-                            == NormalizedExceptionOwner::Present
-                        && tail.late_removals == 0
-                        && let Some((start, setup_tail, setup_label)) = protected_suffix
-                    {
-                        let (removed, protected_before_compaction) =
-                            if tail.post_compaction_fusions > tail.insertions {
-                                (
-                                    tail.post_compaction_fusions,
-                                    instruction_index - start + tail.post_compaction_fusions
-                                        - setup_tail.post_compaction_fusions,
-                                )
-                            } else {
-                                (
-                                    tail.early_removals,
-                                    instruction_index - start + tail.early_removals
-                                        - setup_tail.early_removals,
-                                )
-                            };
-                        // Prologue insertion consumes vacancies from every earlier compaction.
-                        // Once none remain, the appended marker gets a fresh NULL owner.
-                        let prologue_consumed_all_slots =
-                            tail.insertions > 0 && tail.early_removals <= tail.insertions;
-                        // Entry prologue insertion can move the append onto the retained
-                        // NULL SETUP immediately before this protected suffix. Certify
-                        // that specific original cell before considering the wider prefix.
-                        let prologue_reuses_original_tail = owner_history_exact
+                    // These replay rules only resolve inserted markers.
+                    if instruction.opcode == NOT_TAKEN {
+                        // Primitive match tests keep their unchanged marker policy. They
+                        // still append a fresh NULL record once entry-prologue insertion
+                        // consumes every exact early-compaction slot in the original array.
+                        if instruction.exception_policy() == super::ExceptionPolicy::NoneUnchanged
+                            && has_entry_prologue
+                            && instruction.local_policy.hidden_exception_owner_slots() == 0
+                            && instruction.pre_fold_extra_instructions() == 0
                             && original_array_start == 0
+                            && owner_history_exact
                             && tail.insertions > 0
-                            && tail.insertions == setup_tail.insertions
-                            && tail.post_compaction_fusions <= tail.insertions;
-                        let prologue_reuses_null_setup = prologue_reuses_original_tail
-                            && tail.early_removals.checked_sub(tail.insertions)
-                                == protected_before_compaction.checked_add(1)
-                            && start.checked_sub(1).is_some_and(|index| {
-                                retained_setup_nops.contains(&index)
-                                    && indexed_instructions.get(index).is_some_and(|nop| {
-                                        nop.opcode == NOP
-                                            && (nop.exception_policy().exclusion()
-                                                == super::ExceptionExclusion::Always
-                                                || (nop.exception_policy()
-                                                    == super::ExceptionPolicy::NoneUnchanged
-                                                    && !owners.contains_key(&index)
-                                                    && self.exception_regions.iter().all(
-                                                        |region| match (
-                                                            label_positions.get(&region.start),
-                                                            label_positions.get(&region.end),
-                                                        ) {
-                                                            (Some(begin), Some(end)) => {
-                                                                index < *begin || *end <= index
-                                                            }
-                                                            _ => false,
-                                                        },
-                                                    )))
-                                            && nop.local_policy.hidden_exception_owner_slots() == 0
-                                            && nop.pre_fold_extra_instructions() == 0
-                                            && nop.no_location_policy.borrow_fallthrough()
-                                                != super::BorrowFallthrough::Barrier
-                                    })
-                            });
-                        // An earlier donor is also NULL when the entire original entry
-                        // prefix was unprotected. Reject erased SETUP origins as well as
-                        // surviving owners before relying on the compacted prefix.
-                        let prologue_reuses_null_prefix = prologue_reuses_original_tail
-                            && tail.insertions <= start
-                            && tail
-                                .early_removals
-                                .checked_sub(tail.insertions)
-                                .is_some_and(|remaining| remaining > protected_before_compaction)
-                            && null_original_entry_prefix(start, setup_label, &owners);
-                        if prologue_consumed_all_slots
-                            || prologue_reuses_null_setup
-                            || prologue_reuses_null_prefix
-                            || (tail.insertions == 0 && removed > protected_before_compaction)
+                            && tail.early_removals <= tail.insertions
+                            && tail.late_removals == 0
+                            && tail.post_compaction_fusions == 0
+                            && owners
+                                .get(&instruction_index)
+                                .is_none_or(|decision| !decision.definitive)
                         {
                             owners.insert(
                                 instruction_index,
@@ -5953,134 +5854,122 @@ impl LayoutAssembler {
                                 },
                             );
                         }
-                    }
-                    // A retained SETUP may follow an owned source record and one erased
-                    // outer POP. An exact append slot can still belong to that earlier
-                    // handler, even though it falls before the new protected suffix.
-                    if instruction.opcode == NOT_TAKEN
-                        && instruction.exception_policy() == super::ExceptionPolicy::NonePresent
-                        && owner_history_exact
-                        && tail.insertions == 0
-                        && tail.late_removals == 0
-                        && tail.post_compaction_fusions == 0
-                        && let Some((start, setup_tail, setup)) = protected_suffix
-                        && setup_tail.insertions == 0
-                        && setup_tail.late_removals == 0
-                        && setup_tail.post_compaction_fusions == 0
-                        && tail.early_removals.checked_sub(setup_tail.early_removals) == Some(3)
-                        && let Some(region) = self.retained_setup_predecessor_owner(
-                            instruction_index,
-                            original_array_start,
-                            start,
-                            setup,
-                            setup_tail.early_removals,
-                            &indexed_instructions,
-                            &label_positions,
-                            &jump_targets,
-                            &owners,
-                        )
-                    {
-                        owners.insert(
-                            instruction_index,
-                            ExceptionOwnerDecision {
-                                has_owner: true,
-                                source_region: Some(region),
-                                definitive: true,
-                                override_existing: true,
-                            },
-                        );
-                    }
-                    // A retained SETUP can follow removals owned by an outer handler. Only
-                    // certify a reused inner owner when the last compaction lands entirely
-                    // within a known, uniformly owned suffix; other outcomes remain unknown.
-                    if instruction.opcode == NOT_TAKEN
-                        && matches!(
-                            instruction.exception_policy().owner(),
-                            NormalizedExceptionOwner::Absent
-                                | NormalizedExceptionOwner::DynamicCondition
-                        )
-                        && tail.insertions == 0
-                        && tail.late_removals == 0
-                        && let Some((start, setup_tail)) = retained_owned_suffix
-                    {
-                        let (removed, suffix_before_compaction) =
-                            if tail.post_compaction_fusions > 0 {
-                                (
-                                    tail.post_compaction_fusions,
-                                    instruction_index - start + tail.post_compaction_fusions
-                                        - setup_tail.post_compaction_fusions,
-                                )
-                            } else {
-                                (
-                                    tail.early_removals,
-                                    instruction_index - start + tail.early_removals
-                                        - setup_tail.early_removals,
-                                )
-                            };
-                        if removed > 0
-                            && removed <= suffix_before_compaction
-                            && self.has_uniform_exception_owner(
-                                start,
-                                instruction_index,
-                                &label_positions,
-                            )
+                        // Local fusion leaves a newer stale suffix inside the original array.
+                        // Entry prologue insertion consumes that suffix first; once all fusion
+                        // slots are used, the marker reuses the older peephole-compaction tail.
+                        if instruction.exception_policy().owner()
+                            == NormalizedExceptionOwner::Present
+                            && tail.late_removals == 0
+                            && let Some((start, setup_tail, setup_label)) = protected_suffix
                         {
-                            owners.insert(
-                                instruction_index,
-                                ExceptionOwnerDecision {
-                                    has_owner: true,
-                                    source_region: None,
-                                    definitive: true,
-                                    override_existing: true,
-                                },
-                            );
+                            let (removed, protected_before_compaction) =
+                                if tail.post_compaction_fusions > tail.insertions {
+                                    (
+                                        tail.post_compaction_fusions,
+                                        instruction_index - start + tail.post_compaction_fusions
+                                            - setup_tail.post_compaction_fusions,
+                                    )
+                                } else {
+                                    (
+                                        tail.early_removals,
+                                        instruction_index - start + tail.early_removals
+                                            - setup_tail.early_removals,
+                                    )
+                                };
+                            // Prologue insertion consumes vacancies from every earlier compaction.
+                            // Once none remain, the appended marker gets a fresh NULL owner.
+                            let prologue_consumed_all_slots =
+                                tail.insertions > 0 && tail.early_removals <= tail.insertions;
+                            // Entry prologue insertion can move the append onto the retained
+                            // NULL SETUP immediately before this protected suffix. Certify
+                            // that specific original cell before considering the wider prefix.
+                            let prologue_reuses_original_tail = owner_history_exact
+                                && original_array_start == 0
+                                && tail.insertions > 0
+                                && tail.insertions == setup_tail.insertions
+                                && tail.post_compaction_fusions <= tail.insertions;
+                            let prologue_reuses_null_setup = prologue_reuses_original_tail
+                                && tail.early_removals.checked_sub(tail.insertions)
+                                    == protected_before_compaction.checked_add(1)
+                                && start.checked_sub(1).is_some_and(|index| {
+                                    retained_setup_nops.contains(&index)
+                                        && indexed_instructions.get(index).is_some_and(|nop| {
+                                            nop.opcode == NOP
+                                                && (nop.exception_policy().exclusion()
+                                                    == super::ExceptionExclusion::Always
+                                                    || (nop.exception_policy()
+                                                        == super::ExceptionPolicy::NoneUnchanged
+                                                        && !owners.contains_key(&index)
+                                                        && self.exception_regions.iter().all(
+                                                            |region| match (
+                                                                label_positions.get(&region.start),
+                                                                label_positions.get(&region.end),
+                                                            ) {
+                                                                (Some(begin), Some(end)) => {
+                                                                    index < *begin || *end <= index
+                                                                }
+                                                                _ => false,
+                                                            },
+                                                        )))
+                                                && nop.local_policy.hidden_exception_owner_slots()
+                                                    == 0
+                                                && nop.pre_fold_extra_instructions() == 0
+                                                && nop.no_location_policy.borrow_fallthrough()
+                                                    != super::BorrowFallthrough::Barrier
+                                        })
+                                });
+                            // An earlier donor is also NULL when the entire original entry
+                            // prefix was unprotected. Reject erased SETUP origins as well as
+                            // surviving owners before relying on the compacted prefix.
+                            let prologue_reuses_null_prefix = prologue_reuses_original_tail
+                                && tail.insertions <= start
+                                && tail
+                                    .early_removals
+                                    .checked_sub(tail.insertions)
+                                    .is_some_and(|remaining| {
+                                        remaining > protected_before_compaction
+                                    })
+                                && null_original_entry_prefix(start, setup_label, &owners);
+                            if prologue_consumed_all_slots
+                                || prologue_reuses_null_setup
+                                || prologue_reuses_null_prefix
+                                || (tail.insertions == 0 && removed > protected_before_compaction)
+                            {
+                                owners.insert(
+                                    instruction_index,
+                                    ExceptionOwnerDecision {
+                                        has_owner: false,
+                                        source_region: None,
+                                        definitive: true,
+                                        override_existing: false,
+                                    },
+                                );
+                            }
                         }
-                    }
-                    // A retained SETUP fixes this original array's left edge. Local
-                    // fusion leaves its old suffix in place even when an intervening
-                    // POP_BLOCK changes the owner. The last F surviving records span at
-                    // least F old records, so a uniform clean suffix of that width proves
-                    // the owner of a marker appended after F fusion removals.
-                    if instruction.opcode == NOT_TAKEN
-                        && instruction.exception_policy().owner()
-                            == NormalizedExceptionOwner::Absent
-                        && instruction.exception_policy().exclusion()
-                            == super::ExceptionExclusion::None
-                        && owner_history_exact
-                        && !owners.contains_key(&instruction_index)
-                        && tail.insertions == 0
-                        && tail.late_removals == 0
-                        && tail.post_compaction_fusions > 0
-                        && let Some((start, _, _)) = protected_suffix
-                        && original_array_start < start
-                        && start <= instruction_index
-                        && tail.post_compaction_fusions <= instruction_index - start
-                    {
-                        let suffix_start = instruction_index - tail.post_compaction_fusions;
-                        if let Some(region) = self.uniform_exception_owner(
-                            suffix_start,
-                            instruction_index,
-                            &label_positions,
-                        ) && !self.exception_regions[region].is_scope_fallback
-                            && indexed_instructions[suffix_start..instruction_index]
-                                .iter()
-                                .enumerate()
-                                .all(|(offset, previous)| {
-                                    previous.exception_policy().exclusion()
-                                        == super::ExceptionExclusion::None
-                                        && previous.exception_policy().owner()
-                                            == NormalizedExceptionOwner::Unchanged
-                                        && previous.local_policy.hidden_exception_owner_slots() == 0
-                                        && previous.pre_fold_extra_instructions() == 0
-                                        && !matches!(
-                                            previous.opcode,
-                                            LOAD_FAST_BORROW_LOAD_FAST_BORROW
-                                                | LOAD_FAST_LOAD_FAST
-                                                | STORE_FAST_LOAD_FAST
-                                                | STORE_FAST_STORE_FAST
-                                        )
-                                        && !owners.contains_key(&(suffix_start + offset))
-                                })
+                        // A retained SETUP may follow an owned source record and one erased
+                        // outer POP. An exact append slot can still belong to that earlier
+                        // handler, even though it falls before the new protected suffix.
+                        if instruction.exception_policy() == super::ExceptionPolicy::NonePresent
+                            && owner_history_exact
+                            && tail.insertions == 0
+                            && tail.late_removals == 0
+                            && tail.post_compaction_fusions == 0
+                            && let Some((start, setup_tail, setup)) = protected_suffix
+                            && setup_tail.insertions == 0
+                            && setup_tail.late_removals == 0
+                            && setup_tail.post_compaction_fusions == 0
+                            && tail.early_removals.checked_sub(setup_tail.early_removals) == Some(3)
+                            && let Some(region) = self.retained_setup_predecessor_owner(
+                                instruction_index,
+                                original_array_start,
+                                start,
+                                setup,
+                                setup_tail.early_removals,
+                                &indexed_instructions,
+                                &label_positions,
+                                &jump_targets,
+                                &owners,
+                            )
                         {
                             owners.insert(
                                 instruction_index,
@@ -6092,331 +5981,421 @@ impl LayoutAssembler {
                                 },
                             );
                         }
-                    }
-                    // A late SETUP removal compacts the live array after prologue insertion.
-                    // With L removed SETUPs and W surviving records in the final uniform
-                    // manager-owned suffix, L <= W places the appended slot inside that
-                    // suffix. Its owner is the preceding condition's manager even when an
-                    // outer generator handler already structurally covers the marker.
-                    if instruction.opcode == NOT_TAKEN
-                        && matches!(
+                        // A retained SETUP can follow removals owned by an outer handler. Only
+                        // certify a reused inner owner when the last compaction lands entirely
+                        // within a known, uniformly owned suffix; other outcomes remain unknown.
+                        if matches!(
+                            instruction.exception_policy().owner(),
+                            NormalizedExceptionOwner::Absent
+                                | NormalizedExceptionOwner::DynamicCondition
+                        ) && tail.insertions == 0
+                            && tail.late_removals == 0
+                            && let Some((start, setup_tail)) = retained_owned_suffix
+                        {
+                            let (removed, suffix_before_compaction) =
+                                if tail.post_compaction_fusions > 0 {
+                                    (
+                                        tail.post_compaction_fusions,
+                                        instruction_index - start + tail.post_compaction_fusions
+                                            - setup_tail.post_compaction_fusions,
+                                    )
+                                } else {
+                                    (
+                                        tail.early_removals,
+                                        instruction_index - start + tail.early_removals
+                                            - setup_tail.early_removals,
+                                    )
+                                };
+                            if removed > 0
+                                && removed <= suffix_before_compaction
+                                && self.has_uniform_exception_owner(
+                                    start,
+                                    instruction_index,
+                                    &label_positions,
+                                )
+                            {
+                                owners.insert(
+                                    instruction_index,
+                                    ExceptionOwnerDecision {
+                                        has_owner: true,
+                                        source_region: None,
+                                        definitive: true,
+                                        override_existing: true,
+                                    },
+                                );
+                            }
+                        }
+                        // A retained SETUP fixes this original array's left edge. Local
+                        // fusion leaves its old suffix in place even when an intervening
+                        // POP_BLOCK changes the owner. The last F surviving records span at
+                        // least F old records, so a uniform clean suffix of that width proves
+                        // the owner of a marker appended after F fusion removals.
+                        if instruction.exception_policy().owner()
+                            == NormalizedExceptionOwner::Absent
+                            && instruction.exception_policy().exclusion()
+                                == super::ExceptionExclusion::None
+                            && owner_history_exact
+                            && !owners.contains_key(&instruction_index)
+                            && tail.insertions == 0
+                            && tail.late_removals == 0
+                            && tail.post_compaction_fusions > 0
+                            && let Some((start, _, _)) = protected_suffix
+                            && original_array_start < start
+                            && start <= instruction_index
+                            && tail.post_compaction_fusions <= instruction_index - start
+                        {
+                            let suffix_start = instruction_index - tail.post_compaction_fusions;
+                            if let Some(region) = self.uniform_exception_owner(
+                                suffix_start,
+                                instruction_index,
+                                &label_positions,
+                            ) && !self.exception_regions[region].is_scope_fallback
+                                && indexed_instructions[suffix_start..instruction_index]
+                                    .iter()
+                                    .enumerate()
+                                    .all(|(offset, previous)| {
+                                        previous.exception_policy().exclusion()
+                                            == super::ExceptionExclusion::None
+                                            && previous.exception_policy().owner()
+                                                == NormalizedExceptionOwner::Unchanged
+                                            && previous.local_policy.hidden_exception_owner_slots()
+                                                == 0
+                                            && previous.pre_fold_extra_instructions() == 0
+                                            && !matches!(
+                                                previous.opcode,
+                                                LOAD_FAST_BORROW_LOAD_FAST_BORROW
+                                                    | LOAD_FAST_LOAD_FAST
+                                                    | STORE_FAST_LOAD_FAST
+                                                    | STORE_FAST_STORE_FAST
+                                            )
+                                            && !owners.contains_key(&(suffix_start + offset))
+                                    })
+                            {
+                                owners.insert(
+                                    instruction_index,
+                                    ExceptionOwnerDecision {
+                                        has_owner: true,
+                                        source_region: Some(region),
+                                        definitive: true,
+                                        override_existing: true,
+                                    },
+                                );
+                            }
+                        }
+                        // A late SETUP removal compacts the live array after prologue insertion.
+                        // With L removed SETUPs and W surviving records in the final uniform
+                        // manager-owned suffix, L <= W places the appended slot inside that
+                        // suffix. Its owner is the preceding condition's manager even when an
+                        // outer generator handler already structurally covers the marker.
+                        if matches!(
                             instruction.exception_policy().owner(),
                             NormalizedExceptionOwner::Absent
                                 | NormalizedExceptionOwner::Present
                                 | NormalizedExceptionOwner::DynamicCondition
                                 | NormalizedExceptionOwner::DynamicConditionStrict
-                        )
-                        && uniform_with_suffix.is_some_and(|start| {
+                        ) && uniform_with_suffix.is_some_and(|start| {
                             tail.late_removals > 0
                                 && tail.late_removals <= instruction_index - start
-                        })
-                    {
-                        owners.insert(
-                            instruction_index,
-                            ExceptionOwnerDecision {
-                                has_owner: true,
-                                source_region: None,
-                                definitive: true,
-                                override_existing: true,
-                            },
-                        );
-                    }
-                    let reusable_suffix_slots = if tail.late_removals > 0 {
-                        tail.late_removals
-                    } else if tail.insertions == 0 && owner_history_exact {
-                        if tail.post_compaction_fusions > 0 {
-                            tail.post_compaction_fusions
-                        } else {
-                            tail.early_removals
-                        }
-                    } else {
-                        0
-                    };
-                    let folded_none_suffix_slots = if tail.late_removals == 0
-                        && tail.insertions == 0
-                        && tail.post_compaction_fusions == 0
-                        && previous.is_some_and(|previous: Instruction| {
-                            matches!(previous.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
-                                && previous.local_policy.hidden_exception_owner_slots() >= 3
                         }) {
-                        // LOAD_CONST(None), IS_OP, and TO_BOOL share the condition's owner.
-                        // They still occupy its original suffix after early compaction.
-                        3
-                    } else {
-                        0
-                    };
-                    // Compaction leaves the old array suffix untouched. A certified erased
-                    // POP_BLOCK starts a uniform suffix in that same array. Its surviving
-                    // width is a lower bound before compaction; a reused slot within that
-                    // bound has this exact owner even if earlier records have other owners.
-                    if instruction.opcode == NOT_TAKEN
-                        && instruction.exception_policy().exclusion()
+                            owners.insert(
+                                instruction_index,
+                                ExceptionOwnerDecision {
+                                    has_owner: true,
+                                    source_region: None,
+                                    definitive: true,
+                                    override_existing: true,
+                                },
+                            );
+                        }
+                        let reusable_suffix_slots = if tail.late_removals > 0 {
+                            tail.late_removals
+                        } else if tail.insertions == 0 && owner_history_exact {
+                            if tail.post_compaction_fusions > 0 {
+                                tail.post_compaction_fusions
+                            } else {
+                                tail.early_removals
+                            }
+                        } else {
+                            0
+                        };
+                        let folded_none_suffix_slots = if tail.late_removals == 0
+                            && tail.insertions == 0
+                            && tail.post_compaction_fusions == 0
+                            && previous.is_some_and(|previous: Instruction| {
+                                matches!(previous.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+                                    && previous.local_policy.hidden_exception_owner_slots() >= 3
+                            }) {
+                            // LOAD_CONST(None), IS_OP, and TO_BOOL share the condition's owner.
+                            // They still occupy its original suffix after early compaction.
+                            3
+                        } else {
+                            0
+                        };
+                        // Compaction leaves the old array suffix untouched. A certified erased
+                        // POP_BLOCK starts a uniform suffix in that same array. Its surviving
+                        // width is a lower bound before compaction; a reused slot within that
+                        // bound has this exact owner even if earlier records have other owners.
+                        if instruction.exception_policy().exclusion()
                             == super::ExceptionExclusion::None
-                        && matches!(
-                            instruction.exception_policy().owner(),
-                            NormalizedExceptionOwner::Unchanged
-                                | NormalizedExceptionOwner::Absent
-                                | NormalizedExceptionOwner::Present
-                                | NormalizedExceptionOwner::DynamicCondition
-                                | NormalizedExceptionOwner::DynamicConditionStrict
-                        )
-                        && let Some(start) = ended_owned_suffix
-                        && reusable_suffix_slots > 0
-                        && reusable_suffix_slots
-                            <= instruction_index - start + folded_none_suffix_slots
-                        && let Some(region) =
-                            self.uniform_exception_owner(start, instruction_index, &label_positions)
-                    {
-                        owners.insert(
-                            instruction_index,
-                            ExceptionOwnerDecision {
-                                has_owner: true,
-                                source_region: Some(region),
-                                definitive: true,
-                                override_existing: true,
-                            },
-                        );
-                    }
-                    if instruction.opcode == NOT_TAKEN
-                        && source_block
-                        && tail.early_removals == 0
-                        && tail.late_removals == 0
-                    {
-                        // This conditional's original array begins at a source join and has
-                        // no removed records. Appending its marker allocates a NULL owner.
-                        owners.insert(
-                            instruction_index,
-                            ExceptionOwnerDecision {
-                                has_owner: false,
-                                source_region: None,
-                                definitive: true,
-                                override_existing: false,
-                            },
-                        );
-                    }
-                    // Fusion leaves stale records in a uniformly owned original source
-                    // array. A marker appended into that suffix inherits the same owner.
-                    if instruction.opcode == NOT_TAKEN
-                        && source_block
-                        && owner_history_exact
-                        && tail.insertions == 0
-                        && tail.late_removals == 0
-                        && tail.post_compaction_fusions > 0
-                        && instruction.exception_policy().exclusion()
-                            == super::ExceptionExclusion::None
-                        && let Some((start, _)) = source_owned_prefix
-                        && let Some(region) =
-                            self.uniform_exception_owner(start, instruction_index, &label_positions)
-                    {
-                        owners.insert(
-                            instruction_index,
-                            ExceptionOwnerDecision {
-                                has_owner: true,
-                                source_region: Some(region),
-                                definitive: true,
-                                override_existing: true,
-                            },
-                        );
-                    }
-                    // Late SETUP compaction can leave an ordinary-try record behind
-                    // a manager return. Its owner survives in the appended marker slot.
-                    if instruction.opcode == NOT_TAKEN
-                        && instruction.exception_policy() == super::ExceptionPolicy::NonePresent
-                        && original_array_start == 0
-                        && owner_history_exact
-                        && matches!(tail.insertions, 0 | 2)
-                        && tail.late_removals == 3
-                        && tail.post_compaction_fusions == 0
-                        && owners
-                            .get(&instruction_index)
-                            .is_none_or(|owner| !owner.definitive)
-                        && let Some(region) = self.entry_manager_return_setup_owner(
-                            instruction_index,
-                            tail.insertions,
-                            &indexed_instructions,
-                            &label_positions,
-                            &jump_targets,
-                            &late_setup_positions,
-                        )
-                    {
-                        owners.insert(
-                            instruction_index,
-                            ExceptionOwnerDecision {
-                                has_owner: true,
-                                source_region: Some(region),
-                                definitive: true,
-                                override_existing: true,
-                            },
-                        );
-                    }
-                    // This source certificate identifies the retained authored return
-                    // NOP and every live prefix record. It proves only this NULL POP cell;
-                    // the generic POP epoch remains unknown after unrelated NOPs.
-                    if instruction.opcode == NOT_TAKEN
-                        && owner_history_exact
-                        && tail.insertions == 0
-                        && tail.late_removals == 0
-                        && tail.post_compaction_fusions == 0
-                        && owners
-                            .get(&instruction_index)
-                            .is_none_or(|owner| !owner.definitive)
-                        && self.retained_manager_return_none_owner(
-                            instruction_index,
-                            original_array_start,
-                            tail,
-                            &indexed_instructions,
-                            &label_positions,
-                            &jump_targets,
-                        )
-                    {
-                        owners.insert(
-                            instruction_index,
-                            ExceptionOwnerDecision {
-                                has_owner: false,
-                                source_region: None,
-                                definitive: true,
-                                override_existing: true,
-                            },
-                        );
-                    }
-                    // The original manager POP precedes its cleanup. A later local-load
-                    // fusion compacts the live array again, superseding those early slots.
-                    if instruction.opcode == NOT_TAKEN
-                        && matches!(
+                            && matches!(
+                                instruction.exception_policy().owner(),
+                                NormalizedExceptionOwner::Unchanged
+                                    | NormalizedExceptionOwner::Absent
+                                    | NormalizedExceptionOwner::Present
+                                    | NormalizedExceptionOwner::DynamicCondition
+                                    | NormalizedExceptionOwner::DynamicConditionStrict
+                            )
+                            && let Some(start) = ended_owned_suffix
+                            && reusable_suffix_slots > 0
+                            && reusable_suffix_slots
+                                <= instruction_index - start + folded_none_suffix_slots
+                            && let Some(region) = self.uniform_exception_owner(
+                                start,
+                                instruction_index,
+                                &label_positions,
+                            )
+                        {
+                            owners.insert(
+                                instruction_index,
+                                ExceptionOwnerDecision {
+                                    has_owner: true,
+                                    source_region: Some(region),
+                                    definitive: true,
+                                    override_existing: true,
+                                },
+                            );
+                        }
+                        if source_block && tail.early_removals == 0 && tail.late_removals == 0 {
+                            // This conditional's original array begins at a source join and has
+                            // no removed records. Appending its marker allocates a NULL owner.
+                            owners.insert(
+                                instruction_index,
+                                ExceptionOwnerDecision {
+                                    has_owner: false,
+                                    source_region: None,
+                                    definitive: true,
+                                    override_existing: false,
+                                },
+                            );
+                        }
+                        // Fusion leaves stale records in a uniformly owned original source
+                        // array. A marker appended into that suffix inherits the same owner.
+                        if source_block
+                            && owner_history_exact
+                            && tail.insertions == 0
+                            && tail.late_removals == 0
+                            && tail.post_compaction_fusions > 0
+                            && instruction.exception_policy().exclusion()
+                                == super::ExceptionExclusion::None
+                            && let Some((start, _)) = source_owned_prefix
+                            && let Some(region) = self.uniform_exception_owner(
+                                start,
+                                instruction_index,
+                                &label_positions,
+                            )
+                        {
+                            owners.insert(
+                                instruction_index,
+                                ExceptionOwnerDecision {
+                                    has_owner: true,
+                                    source_region: Some(region),
+                                    definitive: true,
+                                    override_existing: true,
+                                },
+                            );
+                        }
+                        // Late SETUP compaction can leave an ordinary-try record behind
+                        // a manager return. Its owner survives in the appended marker slot.
+                        if instruction.exception_policy() == super::ExceptionPolicy::NonePresent
+                            && original_array_start == 0
+                            && owner_history_exact
+                            && matches!(tail.insertions, 0 | 2)
+                            && tail.late_removals == 3
+                            && tail.post_compaction_fusions == 0
+                            && owners
+                                .get(&instruction_index)
+                                .is_none_or(|owner| !owner.definitive)
+                            && let Some(region) = self.entry_manager_return_setup_owner(
+                                instruction_index,
+                                tail.insertions,
+                                &indexed_instructions,
+                                &label_positions,
+                                &jump_targets,
+                                &late_setup_positions,
+                            )
+                        {
+                            owners.insert(
+                                instruction_index,
+                                ExceptionOwnerDecision {
+                                    has_owner: true,
+                                    source_region: Some(region),
+                                    definitive: true,
+                                    override_existing: true,
+                                },
+                            );
+                        }
+                        // This source certificate identifies the retained authored return
+                        // NOP and every live prefix record. It proves only this NULL POP cell;
+                        // the generic POP epoch remains unknown after unrelated NOPs.
+                        if owner_history_exact
+                            && tail.insertions == 0
+                            && tail.late_removals == 0
+                            && tail.post_compaction_fusions == 0
+                            && owners
+                                .get(&instruction_index)
+                                .is_none_or(|owner| !owner.definitive)
+                            && self.retained_manager_return_none_owner(
+                                instruction_index,
+                                original_array_start,
+                                tail,
+                                &indexed_instructions,
+                                &label_positions,
+                                &jump_targets,
+                            )
+                        {
+                            owners.insert(
+                                instruction_index,
+                                ExceptionOwnerDecision {
+                                    has_owner: false,
+                                    source_region: None,
+                                    definitive: true,
+                                    override_existing: true,
+                                },
+                            );
+                        }
+                        // The original manager POP precedes its cleanup. A later local-load
+                        // fusion compacts the live array again, superseding those early slots.
+                        if matches!(
                             instruction.exception_policy(),
                             super::ExceptionPolicy::NonePresent
                                 | super::ExceptionPolicy::NoneAbsent
-                        )
-                        && owner_history_exact
-                        && pop_slot_epoch_known
-                        && tail.insertions == 0
-                        && tail.late_removals == 0
-                        && owners
-                            .get(&instruction_index)
-                            .is_none_or(|owner| !owner.definitive)
-                        && let Some(decision) = self.copied_manager_return_compaction_owner(
-                            instruction_index,
-                            original_array_start,
-                            tail,
-                            &indexed_instructions,
-                            &label_positions,
-                            &jump_targets,
-                            false,
-                        )
-                    {
-                        owners.insert(instruction_index, decision);
-                    }
-                    // A captured truth-manager cleanup also authenticates a retained
-                    // authored return NOP. Its exact records provide their own proof;
-                    // the generic POP epoch stays unknown for every other retained NOP.
-                    if instruction.opcode == NOT_TAKEN
-                        && instruction.exception_policy()
-                            == super::ExceptionPolicy::NoneDynamicCondition
-                        && previous.is_some_and(|condition: Instruction| {
-                            matches!(
-                                condition.opcode,
-                                crate::target::opcodes::POP_JUMP_IF_FALSE
-                                    | crate::target::opcodes::POP_JUMP_IF_TRUE
+                        ) && owner_history_exact
+                            && pop_slot_epoch_known
+                            && tail.insertions == 0
+                            && tail.late_removals == 0
+                            && owners
+                                .get(&instruction_index)
+                                .is_none_or(|owner| !owner.definitive)
+                            && let Some(decision) = self.copied_manager_return_compaction_owner(
+                                instruction_index,
+                                original_array_start,
+                                tail,
+                                &indexed_instructions,
+                                &label_positions,
+                                &jump_targets,
+                                false,
                             )
-                        })
-                        && owner_history_exact
-                        && tail.insertions == 0
-                        && tail.late_removals == 0
-                        && tail.post_compaction_fusions == 0
-                        && owners
-                            .get(&instruction_index)
-                            .is_none_or(|owner| !owner.definitive)
-                        && let Some(decision) = self.copied_manager_return_compaction_owner(
-                            instruction_index,
-                            original_array_start,
-                            tail,
-                            &indexed_instructions,
-                            &label_positions,
-                            &jump_targets,
-                            false,
-                        )
-                    {
-                        owners.insert(instruction_index, decision);
-                    }
-                    // This exact adjacent authored-NOP/inner-try-POP pair certifies the
-                    // retained NULL cell independently of the generic POP epoch.
-                    if instruction.opcode == NOT_TAKEN
-                        && instruction.exception_policy() == super::ExceptionPolicy::NonePresent
-                        && owner_history_exact
-                        && tail.insertions == 0
-                        && tail.late_removals == 0
-                        && tail.post_compaction_fusions == 0
-                        && owners
-                            .get(&instruction_index)
-                            .is_none_or(|owner| !owner.definitive)
-                        && let Some(decision) = self.copied_manager_return_compaction_owner(
-                            instruction_index,
-                            original_array_start,
-                            tail,
-                            &indexed_instructions,
-                            &label_positions,
-                            &jump_targets,
-                            true,
-                        )
-                    {
-                        owners.insert(instruction_index, decision);
-                    }
-                    // A retained return POP can hide two earlier NULL POP records.
-                    // Its captured call prefix proves that sufficiently early compaction
-                    // reuses the preceding try's array, without restoring the POP epoch.
-                    if instruction.opcode == NOT_TAKEN
-                        && instruction.exception_policy()
+                        {
+                            owners.insert(instruction_index, decision);
+                        }
+                        // A captured truth-manager cleanup also authenticates a retained
+                        // authored return NOP. Its exact records provide their own proof;
+                        // the generic POP epoch stays unknown for every other retained NOP.
+                        if instruction.exception_policy()
                             == super::ExceptionPolicy::NoneDynamicCondition
-                        && owner_history_exact
-                        && tail.insertions == 0
-                        && tail.late_removals == 0
-                        && tail.post_compaction_fusions == 0
-                        && owners
-                            .get(&instruction_index)
-                            .is_none_or(|owner| !owner.definitive)
-                        && let Some(region) = self.copied_return_call_parent_owner(
-                            instruction_index,
-                            original_array_start,
-                            tail,
-                            &indexed_instructions,
-                            &label_positions,
-                            &jump_targets,
-                        )
-                    {
-                        owners.insert(
-                            instruction_index,
-                            ExceptionOwnerDecision {
-                                has_owner: true,
-                                source_region: Some(region),
-                                definitive: true,
-                                override_existing: true,
-                            },
-                        );
-                    }
-                    // A retained return POP can hide two earlier NULL POP records.
-                    // Its captured attribute prefix locates the original return and POPs;
-                    // sufficiently early compaction
-                    // reuses the preceding try's array, without restoring the POP epoch.
-                    if instruction.opcode == NOT_TAKEN
-                        && instruction.exception_policy()
+                            && previous.is_some_and(|condition: Instruction| {
+                                matches!(
+                                    condition.opcode,
+                                    crate::target::opcodes::POP_JUMP_IF_FALSE
+                                        | crate::target::opcodes::POP_JUMP_IF_TRUE
+                                )
+                            })
+                            && owner_history_exact
+                            && tail.insertions == 0
+                            && tail.late_removals == 0
+                            && tail.post_compaction_fusions == 0
+                            && owners
+                                .get(&instruction_index)
+                                .is_none_or(|owner| !owner.definitive)
+                            && let Some(decision) = self.copied_manager_return_compaction_owner(
+                                instruction_index,
+                                original_array_start,
+                                tail,
+                                &indexed_instructions,
+                                &label_positions,
+                                &jump_targets,
+                                false,
+                            )
+                        {
+                            owners.insert(instruction_index, decision);
+                        }
+                        // This exact adjacent authored-NOP/inner-try-POP pair certifies the
+                        // retained NULL cell independently of the generic POP epoch.
+                        if instruction.exception_policy() == super::ExceptionPolicy::NonePresent
+                            && owner_history_exact
+                            && tail.insertions == 0
+                            && tail.late_removals == 0
+                            && tail.post_compaction_fusions == 0
+                            && owners
+                                .get(&instruction_index)
+                                .is_none_or(|owner| !owner.definitive)
+                            && let Some(decision) = self.copied_manager_return_compaction_owner(
+                                instruction_index,
+                                original_array_start,
+                                tail,
+                                &indexed_instructions,
+                                &label_positions,
+                                &jump_targets,
+                                true,
+                            )
+                        {
+                            owners.insert(instruction_index, decision);
+                        }
+                        // A retained return POP can hide two earlier NULL POP records.
+                        // Its captured call prefix proves that sufficiently early compaction
+                        // reuses the preceding try's array, without restoring the POP epoch.
+                        if instruction.exception_policy()
                             == super::ExceptionPolicy::NoneDynamicCondition
-                        && owner_history_exact
-                        && tail.insertions == 0
-                        && tail.late_removals == 0
-                        && tail.post_compaction_fusions == 0
-                        && owners
-                            .get(&instruction_index)
-                            .is_none_or(|owner| !owner.definitive)
-                        && let Some(decision) = self.copied_return_attribute_truth_owner(
-                            instruction_index,
-                            original_array_start,
-                            tail,
-                            &indexed_instructions,
-                            &label_positions,
-                            &jump_targets,
-                        )
-                    {
-                        owners.insert(instruction_index, decision);
+                            && owner_history_exact
+                            && tail.insertions == 0
+                            && tail.late_removals == 0
+                            && tail.post_compaction_fusions == 0
+                            && owners
+                                .get(&instruction_index)
+                                .is_none_or(|owner| !owner.definitive)
+                            && let Some(region) = self.copied_return_call_parent_owner(
+                                instruction_index,
+                                original_array_start,
+                                tail,
+                                &indexed_instructions,
+                                &label_positions,
+                                &jump_targets,
+                            )
+                        {
+                            owners.insert(
+                                instruction_index,
+                                ExceptionOwnerDecision {
+                                    has_owner: true,
+                                    source_region: Some(region),
+                                    definitive: true,
+                                    override_existing: true,
+                                },
+                            );
+                        }
+                        // A retained return POP can hide two earlier NULL POP records.
+                        // Its captured attribute prefix locates the original return and POPs;
+                        // sufficiently early compaction
+                        // reuses the preceding try's array, without restoring the POP epoch.
+                        if instruction.exception_policy()
+                            == super::ExceptionPolicy::NoneDynamicCondition
+                            && owner_history_exact
+                            && tail.insertions == 0
+                            && tail.late_removals == 0
+                            && tail.post_compaction_fusions == 0
+                            && owners
+                                .get(&instruction_index)
+                                .is_none_or(|owner| !owner.definitive)
+                            && let Some(decision) = self.copied_return_attribute_truth_owner(
+                                instruction_index,
+                                original_array_start,
+                                tail,
+                                &indexed_instructions,
+                                &label_positions,
+                                &jump_targets,
+                            )
+                        {
+                            owners.insert(instruction_index, decision);
+                        }
                     }
                     let method_none_prefix =
                         if matches!(instruction.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
@@ -7573,126 +7552,70 @@ impl LayoutAssembler {
                             },
                         );
                     }
-                    if instruction.opcode == NOT_TAKEN
-                        && instruction.exception_policy().exclusion()
+                    if instruction.opcode == NOT_TAKEN {
+                        if instruction.exception_policy().exclusion()
                             == super::ExceptionExclusion::None
-                        && let Some((index, region)) = pending_normal_none_owner.take()
-                        && index == instruction_index
-                        && owners
-                            .get(&instruction_index)
-                            .is_none_or(|owner| !owner.definitive)
-                    {
-                        owners.insert(
-                            instruction_index,
-                            ExceptionOwnerDecision {
-                                has_owner: region.is_some(),
-                                source_region: region,
-                                definitive: true,
-                                override_existing: true,
-                            },
-                        );
-                    }
-                    if instruction.opcode == NOT_TAKEN
-                        && instruction_index > 0
-                        && owners
-                            .get(&instruction_index)
-                            .is_none_or(|owner| !owner.definitive)
-                    {
-                        for (condition, marker, region) in
-                            &self.exception_owner_provenance.fused_manager_owners
+                            && let Some((index, region)) = pending_normal_none_owner.take()
+                            && index == instruction_index
+                            && owners
+                                .get(&instruction_index)
+                                .is_none_or(|owner| !owner.definitive)
                         {
-                            if instruction == marker
-                                && indexed_instructions[instruction_index - 1] == condition
-                                && let Some(source_region) =
-                                    self.exception_regions.iter().position(|candidate| {
-                                        super::fusion_owner_slots::same_manager_region(
-                                            candidate, region,
-                                        )
-                                    })
+                            owners.insert(
+                                instruction_index,
+                                ExceptionOwnerDecision {
+                                    has_owner: region.is_some(),
+                                    source_region: region,
+                                    definitive: true,
+                                    override_existing: true,
+                                },
+                            );
+                        }
+                        if instruction_index > 0
+                            && owners
+                                .get(&instruction_index)
+                                .is_none_or(|owner| !owner.definitive)
+                        {
+                            for (condition, marker, region) in
+                                &self.exception_owner_provenance.fused_manager_owners
                             {
-                                owners.insert(
-                                    instruction_index,
-                                    ExceptionOwnerDecision {
-                                        has_owner: true,
-                                        source_region: Some(source_region),
-                                        definitive: true,
-                                        override_existing: true,
-                                    },
-                                );
+                                if instruction == marker
+                                    && indexed_instructions[instruction_index - 1] == condition
+                                    && let Some(source_region) =
+                                        self.exception_regions.iter().position(|candidate| {
+                                            super::fusion_owner_slots::same_manager_region(
+                                                candidate, region,
+                                            )
+                                        })
+                                {
+                                    owners.insert(
+                                        instruction_index,
+                                        ExceptionOwnerDecision {
+                                            has_owner: true,
+                                            source_region: Some(source_region),
+                                            definitive: true,
+                                            override_existing: true,
+                                        },
+                                    );
+                                }
                             }
                         }
-                    }
-                    // A complete value-Boolean expansion consumes up to two newer
-                    // fusion slots. Its marker can then reuse an older named-handler
-                    // cleanup cell, whose owner differs from the copied finalizer.
-                    if instruction.opcode == NOT_TAKEN
-                        && instruction.exception_policy() == super::ExceptionPolicy::NoneDynamic
-                        && owner_history_exact
-                        && pop_slot_epoch_known
-                        && original_value_jump_positions
-                            .values()
-                            .any(|position| *position == instruction_index)
-                        && owners.get(&instruction_index).is_none_or(|decision| {
-                            !decision.definitive
-                                || (decision.has_owner
-                                    && decision.source_region.is_none()
-                                    && !decision.override_existing)
-                        })
-                        && let Some(region) = self.copied_handler_value_owner(
-                            instruction_index,
-                            original_array_start,
-                            tail,
-                            &indexed_instructions,
-                            &label_positions,
-                            &jump_targets,
-                        )
-                    {
-                        owners.insert(
-                            instruction_index,
-                            ExceptionOwnerDecision {
-                                has_owner: true,
-                                source_region: Some(region),
-                                definitive: true,
-                                override_existing: true,
-                            },
-                        );
-                    }
-                    // A captured named-handler prefix crosses only its own retained
-                    // SETUP; it does not restore the generic POP epoch that NOP ends.
-                    if instruction.opcode == NOT_TAKEN
-                        && instruction.exception_policy()
-                            == super::ExceptionPolicy::NoneDynamicCondition
-                        && owner_history_exact
-                        && owners
-                            .get(&instruction_index)
-                            .is_none_or(|decision| !decision.definitive)
-                        && let Some(region) = self.named_handler_try_owner(
-                            instruction_index,
-                            original_array_start,
-                            tail,
-                            &indexed_instructions,
-                            &label_positions,
-                            &jump_targets,
-                        )
-                    {
-                        owners.insert(
-                            instruction_index,
-                            ExceptionOwnerDecision {
-                                has_owner: true,
-                                source_region: Some(region),
-                                definitive: true,
-                                override_existing: true,
-                            },
-                        );
-                    }
-                    if instruction.opcode == NOT_TAKEN
-                        && instruction.exception_policy() == super::ExceptionPolicy::NonePresent
-                        && owner_history_exact
-                        && owners
-                            .get(&instruction_index)
-                            .is_none_or(|decision| !decision.definitive)
-                        && self
-                            .continued_handler_try_is_null(
+                        // A complete value-Boolean expansion consumes up to two newer
+                        // fusion slots. Its marker can then reuse an older named-handler
+                        // cleanup cell, whose owner differs from the copied finalizer.
+                        if instruction.exception_policy() == super::ExceptionPolicy::NoneDynamic
+                            && owner_history_exact
+                            && pop_slot_epoch_known
+                            && original_value_jump_positions
+                                .values()
+                                .any(|position| *position == instruction_index)
+                            && owners.get(&instruction_index).is_none_or(|decision| {
+                                !decision.definitive
+                                    || (decision.has_owner
+                                        && decision.source_region.is_none()
+                                        && !decision.override_existing)
+                            })
+                            && let Some(region) = self.copied_handler_value_owner(
                                 instruction_index,
                                 original_array_start,
                                 tail,
@@ -7700,282 +7623,59 @@ impl LayoutAssembler {
                                 &label_positions,
                                 &jump_targets,
                             )
-                            .is_some()
-                    {
-                        owners.insert(
-                            instruction_index,
-                            ExceptionOwnerDecision {
-                                has_owner: false,
-                                source_region: None,
-                                definitive: true,
-                                override_existing: true,
-                            },
-                        );
-                    }
-                    // This saved-value cleanup certifies two omitted handler POPs and
-                    // the exact later finalizer NULL cell without changing generic history.
-                    if instruction.opcode == NOT_TAKEN
-                        && instruction.exception_policy() == super::ExceptionPolicy::NonePresent
-                        && owner_history_exact
-                        && pop_slot_epoch_known
-                        && owners
-                            .get(&instruction_index)
-                            .is_none_or(|decision| !decision.definitive)
-                        && self.saved_named_handler_none_is_null(
-                            instruction_index,
-                            original_array_start,
-                            tail,
-                            &indexed_instructions,
-                            &label_positions,
-                            &jump_targets,
-                        )
-                    {
-                        owners.insert(
-                            instruction_index,
-                            ExceptionOwnerDecision {
-                                has_owner: false,
-                                source_region: None,
-                                definitive: true,
-                                override_existing: true,
-                            },
-                        );
-                    }
-                    // A complete captured unwind supplies its own original array proof;
-                    // it does not revive the generic POP epoch after manager range aliases.
-                    if instruction.opcode == NOT_TAKEN
-                        && instruction.exception_policy() == super::ExceptionPolicy::NonePresent
-                        && owner_history_exact
-                        && owners
-                            .get(&instruction_index)
-                            .is_none_or(|decision| !decision.definitive)
-                        && let Some(decision) = self.copied_cleanup_return_none_owner(
-                            instruction_index,
-                            original_array_start,
-                            tail,
-                            &indexed_instructions,
-                            &label_positions,
-                            &jump_targets,
-                        )
-                    {
-                        owners.insert(instruction_index, decision);
-                    }
-                    // Resolve only a concrete live cleanup record in the original array.
-                    // Missing named-handler POPs precede this span; all existing hidden
-                    // records remain counted exactly once by the ordinary tail scanner.
-                    if instruction.opcode == NOT_TAKEN
-                        && owner_history_exact
-                        && tail.insertions == 0
-                        && tail.late_removals == 0
-                        && tail.post_compaction_fusions == 0
-                        && instruction.exception_policy().exclusion()
-                            == super::ExceptionExclusion::None
-                        && matches!(
-                            instruction.exception_policy().owner(),
-                            NormalizedExceptionOwner::Present
-                                | NormalizedExceptionOwner::DynamicCondition
-                                | NormalizedExceptionOwner::DynamicConditionStrict
-                        )
-                        && owners
-                            .get(&instruction_index)
-                            .is_none_or(|decision| !decision.definitive)
-                        && let Some((
-                            array,
-                            start,
-                            end,
-                            end_removed,
-                            missing,
-                            continued_call,
-                            continued_attribute_none,
-                        )) = copied_handler_prefix
-                        && array == original_array_start
-                        && end <= instruction_index
-                        && tail.early_removals >= end_removed
-                        && (if let Some((prefix, marker)) = continued_attribute_none {
-                            instruction_index - end == prefix.len()
-                                && *instruction == marker
-                                && indexed_instructions[end..instruction_index]
-                                    .iter()
-                                    .zip(prefix)
-                                    .all(|(actual, mut expected)| {
-                                        if expected.opcode == crate::target::opcodes::LOAD_FAST
-                                            && actual.opcode
-                                                == crate::target::opcodes::LOAD_FAST_BORROW
-                                        {
-                                            expected.opcode = actual.opcode;
-                                        }
-                                        **actual == expected
-                                    })
-                        } else if let Some((prefix, marker)) = continued_call {
-                            instruction_index - end == prefix.len()
-                                && *instruction == marker
-                                && indexed_instructions[end..instruction_index]
-                                    .iter()
-                                    .zip(prefix)
-                                    .all(|(actual, mut expected)| {
-                                        if expected.opcode == crate::target::opcodes::LOAD_FAST
-                                            && actual.opcode
-                                                == crate::target::opcodes::LOAD_FAST_BORROW
-                                        {
-                                            expected.opcode = actual.opcode;
-                                        }
-                                        **actual == expected
-                                    })
-                        } else {
-                            previous.is_some_and(|previous: Instruction| {
-                                let none_test =
-                                    matches!(
-                                        previous.opcode,
-                                        POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE
-                                    ) && previous.local_policy.hidden_exception_owner_slots() == 3;
-                                // Both handler forms retain an authenticated cleanup prefix.
-                                // A named handler also contributes two omitted NULL POPs;
-                                // its name cleanup remains four distinct live records.
-                                // An inner iterator consumes the authored return NOP,
-                                // while its ordinary try and the named handler contribute
-                                // three omitted NULL POPs before the unchanged name cleanup.
-                                // The original capture already revalidated that iterator and
-                                // every cleanup record at this exact start/end pair.
-                                let iterator_handler_truth_prefix = missing == 3
-                                    && end - start == 4
-                                    && end_removed == 1
-                                    && self.exception_owner_provenance
-                                        .copied_handler_cleanups.iter()
-                                        .filter(|origin| {
-                                            origin.missing_null_pops == 3
-                                                && origin.removed_prefix_slots == 0
-                                                && origin.return_iterator.is_some()
-                                                && origin.instructions.len() == 4
-                                                && origin.assignment_pop.is_none()
-                                                && origin.continued_call.is_none()
-                                                && origin.continued_attribute_none.is_none()
-                                                && label_positions.get(&origin.start) == Some(&start)
-                                                && label_positions.get(&origin.end) == Some(&end)
-                                                && self.exception_owner_provenance
-                                                    .removed_pop_block_boundaries.contains(&origin.end)
-                                                && self.exception_owner_provenance
-                                                    .removed_pop_block_widths.get(&origin.end)
-                                                    .copied().unwrap_or(1) == 1
-                                        }).count() == 1;
-                                let handler_truth_prefix = (missing == 0
-                                    && end - start == 1
-                                    && indexed_instructions[start].opcode
-                                        == crate::target::opcodes::POP_EXCEPT
-                                    && indexed_instructions[start]
-                                        .local_policy
-                                        .hidden_exception_owner_slots()
-                                        == 2)
-                                    || (missing == 2
-                                        && end - start == 4
-                                        && end_removed == 1
-                                        && indexed_instructions[start].opcode
-                                            == crate::target::opcodes::POP_EXCEPT
-                                        && indexed_instructions[start]
-                                            .local_policy
-                                            .hidden_exception_owner_slots()
-                                            == 1
-                                        && indexed_instructions[start + 1].opcode == crate::target::opcodes::LOAD_CONST
-                                        && indexed_instructions[start + 2].opcode
-                                            == crate::target::opcodes::STORE_FAST
-                                        && indexed_instructions[start + 3].opcode
-                                            == crate::target::opcodes::DELETE_FAST
-                                        && indexed_instructions[start + 2].operand()
-                                            == indexed_instructions[start + 3].operand())
-                                    || iterator_handler_truth_prefix;
-                                // Authenticate the single finalizer POP and every live
-                                // suffix record after the captured handler cleanup.
-                                let truth_test = handler_truth_prefix
-                                    && instruction_index - end == 3
-                                    && matches!(
-                                        indexed_instructions[end].opcode,
-                                        crate::target::opcodes::LOAD_FAST
-                                            | crate::target::opcodes::LOAD_FAST_BORROW
-                                            | crate::target::opcodes::LOAD_DEREF
-                                    )
-                                    && indexed_instructions[end]
-                                        .local_policy
-                                        .hidden_exception_owner_slots()
-                                        == 1
-                                    && indexed_instructions[end + 1].opcode
-                                        == crate::target::opcodes::TO_BOOL
-                                    && indexed_instructions[end + 1]
-                                        .local_policy
-                                        .hidden_exception_owner_slots()
-                                        == 0
-                                    && matches!(
-                                        previous.opcode,
-                                        crate::target::opcodes::POP_JUMP_IF_FALSE
-                                            | crate::target::opcodes::POP_JUMP_IF_TRUE
-                                    )
-                                    && previous.local_policy.hidden_exception_owner_slots() == 0
-                                    && previous.location.line >= 0
-                                    && instruction.location == previous.location
-                                    && indexed_instructions[end..instruction_index].iter().all(
-                                        |record| {
-                                            record.location == previous.location
-                                                && record.pre_fold_extra_instructions() == 0
-                                                && record.exception_policy()
-                                                    == super::ExceptionPolicy::NoneUnchanged
-                                        },
-                                    )
-                                    && (ended_pop_slot
-                                        .is_some_and(|(pop, _, width)| pop == end && width == 1)
-                                        // The named cleanup's exact end label also records
-                                        // this POP when the generic owned-prefix epoch ends
-                                        // at POP_EXCEPT. Do not revive that broader epoch.
-                                        || (missing == 2
-                                            && end - start == 4
-                                            && end_removed == 1
-                                            && self.exception_owner_provenance
-                                                .copied_handler_cleanups.iter()
-                                                .filter(|origin| {
-                                                    origin.missing_null_pops == 2
-                                                        && origin.removed_prefix_slots == 1
-                                                        && origin.instructions.len() == 4
-                                                        && origin.assignment_pop.is_none()
-                                                        && origin.continued_call.is_none()
-                                                        && origin.continued_attribute_none.is_none()
-                                                        && label_positions.get(&origin.start) == Some(&start)
-                                                        && label_positions.get(&origin.end) == Some(&end)
-                                                        && self.exception_owner_provenance
-                                                            .removed_pop_block_boundaries.contains(&origin.end)
-                                                        && self.exception_owner_provenance
-                                                            .removed_pop_block_widths.get(&origin.end)
-                                                            .copied().unwrap_or(1) == 1
-                                                }).count() == 1)
-                                        || iterator_handler_truth_prefix)
-                                    && self
-                                        .exception_owner_provenance
-                                        .original_primitive_condition_boundaries
-                                        .iter()
-                                        .filter(|condition| **condition == previous)
-                                        .count()
-                                        == 1
-                                    && !jump_targets
-                                        .iter()
-                                        .chain(&self.exception_owner_provenance.source_boundaries)
-                                        .chain(&self.exception_owner_provenance.block_boundaries)
-                                        .any(|label| {
-                                            label_positions.get(label).is_some_and(|position| {
-                                                end < *position && *position <= instruction_index
-                                            })
-                                        });
-                                none_test || truth_test
-                            })
-                        })
-                        && let Some(removed) = tail.early_removals.checked_add(missing)
-                    {
-                        let suffix = instruction_index - end + tail.early_removals - end_removed;
-                        // The authenticated direct continue originally emitted its NOP,
-                        // two handler POPs, the four name-cleanup records, then the
-                        // finalizer POP. The exact attribute None prefix appends into
-                        // that last NULL cell; it adds no earlier live or hidden record.
-                        if continued_attribute_none.is_some()
-                            && array == start
-                            && end - start == 4
-                            && end_removed == 1
-                            && missing == 2
-                            && tail.early_removals == end_removed + 3
-                            && instruction_index - array == 1 + missing + end - start
+                        {
+                            owners.insert(
+                                instruction_index,
+                                ExceptionOwnerDecision {
+                                    has_owner: true,
+                                    source_region: Some(region),
+                                    definitive: true,
+                                    override_existing: true,
+                                },
+                            );
+                        }
+                        // A captured named-handler prefix crosses only its own retained
+                        // SETUP; it does not restore the generic POP epoch that NOP ends.
+                        if instruction.exception_policy()
+                            == super::ExceptionPolicy::NoneDynamicCondition
+                            && owner_history_exact
+                            && owners
+                                .get(&instruction_index)
+                                .is_none_or(|decision| !decision.definitive)
+                            && let Some(region) = self.named_handler_try_owner(
+                                instruction_index,
+                                original_array_start,
+                                tail,
+                                &indexed_instructions,
+                                &label_positions,
+                                &jump_targets,
+                            )
+                        {
+                            owners.insert(
+                                instruction_index,
+                                ExceptionOwnerDecision {
+                                    has_owner: true,
+                                    source_region: Some(region),
+                                    definitive: true,
+                                    override_existing: true,
+                                },
+                            );
+                        }
+                        if instruction.exception_policy() == super::ExceptionPolicy::NonePresent
+                            && owner_history_exact
+                            && owners
+                                .get(&instruction_index)
+                                .is_none_or(|decision| !decision.definitive)
+                            && self
+                                .continued_handler_try_is_null(
+                                    instruction_index,
+                                    original_array_start,
+                                    tail,
+                                    &indexed_instructions,
+                                    &label_positions,
+                                    &jump_targets,
+                                )
+                                .is_some()
                         {
                             owners.insert(
                                 instruction_index,
@@ -7987,54 +7687,456 @@ impl LayoutAssembler {
                                 },
                             );
                         }
-                        // Equality selects the original NULL finally POP immediately after
-                        // cleanup, not its preceding POP_EXCEPT. Its one transferred record
-                        // must be the only hidden slot on the immediately following load.
-                        if removed == suffix
-                            && (instruction_index - end == 2
-                                || (missing == 2
-                                    && end - start == 4
-                                    && instruction_index - end == 3
-                                    && continued_call.is_none()
-                                    && continued_attribute_none.is_none()
-                                    && previous.is_some_and(|condition| {
+                        // This saved-value cleanup certifies two omitted handler POPs and
+                        // the exact later finalizer NULL cell without changing generic history.
+                        if instruction.exception_policy() == super::ExceptionPolicy::NonePresent
+                            && owner_history_exact
+                            && pop_slot_epoch_known
+                            && owners
+                                .get(&instruction_index)
+                                .is_none_or(|decision| !decision.definitive)
+                            && self.saved_named_handler_none_is_null(
+                                instruction_index,
+                                original_array_start,
+                                tail,
+                                &indexed_instructions,
+                                &label_positions,
+                                &jump_targets,
+                            )
+                        {
+                            owners.insert(
+                                instruction_index,
+                                ExceptionOwnerDecision {
+                                    has_owner: false,
+                                    source_region: None,
+                                    definitive: true,
+                                    override_existing: true,
+                                },
+                            );
+                        }
+                        // A complete captured unwind supplies its own original array proof;
+                        // it does not revive the generic POP epoch after manager range aliases.
+                        if instruction.exception_policy() == super::ExceptionPolicy::NonePresent
+                            && owner_history_exact
+                            && owners
+                                .get(&instruction_index)
+                                .is_none_or(|decision| !decision.definitive)
+                            && let Some(decision) = self.copied_cleanup_return_none_owner(
+                                instruction_index,
+                                original_array_start,
+                                tail,
+                                &indexed_instructions,
+                                &label_positions,
+                                &jump_targets,
+                            )
+                        {
+                            owners.insert(instruction_index, decision);
+                        }
+                        // Resolve only a concrete live cleanup record in the original array.
+                        // Missing named-handler POPs precede this span; all existing hidden
+                        // records remain counted exactly once by the ordinary tail scanner.
+                        if owner_history_exact
+                            && tail.insertions == 0
+                            && tail.late_removals == 0
+                            && tail.post_compaction_fusions == 0
+                            && instruction.exception_policy().exclusion()
+                                == super::ExceptionExclusion::None
+                            && matches!(
+                                instruction.exception_policy().owner(),
+                                NormalizedExceptionOwner::Present
+                                    | NormalizedExceptionOwner::DynamicCondition
+                                    | NormalizedExceptionOwner::DynamicConditionStrict
+                            )
+                            && owners
+                                .get(&instruction_index)
+                                .is_none_or(|decision| !decision.definitive)
+                            && let Some((
+                                array,
+                                start,
+                                end,
+                                end_removed,
+                                missing,
+                                continued_call,
+                                continued_attribute_none,
+                            )) = copied_handler_prefix
+                            && array == original_array_start
+                            && end <= instruction_index
+                            && tail.early_removals >= end_removed
+                            && (if let Some((prefix, marker)) = continued_attribute_none {
+                                instruction_index - end == prefix.len()
+                                    && *instruction == marker
+                                    && indexed_instructions[end..instruction_index]
+                                        .iter()
+                                        .zip(prefix)
+                                        .all(|(actual, mut expected)| {
+                                            if expected.opcode == crate::target::opcodes::LOAD_FAST
+                                                && actual.opcode
+                                                    == crate::target::opcodes::LOAD_FAST_BORROW
+                                            {
+                                                expected.opcode = actual.opcode;
+                                            }
+                                            **actual == expected
+                                        })
+                            } else if let Some((prefix, marker)) = continued_call {
+                                instruction_index - end == prefix.len()
+                                    && *instruction == marker
+                                    && indexed_instructions[end..instruction_index]
+                                        .iter()
+                                        .zip(prefix)
+                                        .all(|(actual, mut expected)| {
+                                            if expected.opcode == crate::target::opcodes::LOAD_FAST
+                                                && actual.opcode
+                                                    == crate::target::opcodes::LOAD_FAST_BORROW
+                                            {
+                                                expected.opcode = actual.opcode;
+                                            }
+                                            **actual == expected
+                                        })
+                            } else {
+                                previous.is_some_and(|previous: Instruction| {
+                                    let none_test =
                                         matches!(
-                                            condition.opcode,
+                                            previous.opcode,
+                                            POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE
+                                        ) && previous.local_policy.hidden_exception_owner_slots() == 3;
+                                    // Both handler forms retain an authenticated cleanup prefix.
+                                    // A named handler also contributes two omitted NULL POPs;
+                                    // its name cleanup remains four distinct live records.
+                                    // An inner iterator consumes the authored return NOP,
+                                    // while its ordinary try and the named handler contribute
+                                    // three omitted NULL POPs before the unchanged name cleanup.
+                                    // The original capture already revalidated that iterator and
+                                    // every cleanup record at this exact start/end pair.
+                                    let iterator_handler_truth_prefix = missing == 3
+                                        && end - start == 4
+                                        && end_removed == 1
+                                        && self.exception_owner_provenance
+                                            .copied_handler_cleanups.iter()
+                                            .filter(|origin| {
+                                                origin.missing_null_pops == 3
+                                                    && origin.removed_prefix_slots == 0
+                                                    && origin.return_iterator.is_some()
+                                                    && origin.instructions.len() == 4
+                                                    && origin.assignment_pop.is_none()
+                                                    && origin.continued_call.is_none()
+                                                    && origin.continued_attribute_none.is_none()
+                                                    && label_positions.get(&origin.start) == Some(&start)
+                                                    && label_positions.get(&origin.end) == Some(&end)
+                                                    && self.exception_owner_provenance
+                                                        .removed_pop_block_boundaries.contains(&origin.end)
+                                                    && self.exception_owner_provenance
+                                                        .removed_pop_block_widths.get(&origin.end)
+                                                        .copied().unwrap_or(1) == 1
+                                            }).count() == 1;
+                                    let handler_truth_prefix = (missing == 0
+                                        && end - start == 1
+                                        && indexed_instructions[start].opcode
+                                            == crate::target::opcodes::POP_EXCEPT
+                                        && indexed_instructions[start]
+                                            .local_policy
+                                            .hidden_exception_owner_slots()
+                                            == 2)
+                                        || (missing == 2
+                                            && end - start == 4
+                                            && end_removed == 1
+                                            && indexed_instructions[start].opcode
+                                                == crate::target::opcodes::POP_EXCEPT
+                                            && indexed_instructions[start]
+                                                .local_policy
+                                                .hidden_exception_owner_slots()
+                                                == 1
+                                            && indexed_instructions[start + 1].opcode == crate::target::opcodes::LOAD_CONST
+                                            && indexed_instructions[start + 2].opcode
+                                                == crate::target::opcodes::STORE_FAST
+                                            && indexed_instructions[start + 3].opcode
+                                                == crate::target::opcodes::DELETE_FAST
+                                            && indexed_instructions[start + 2].operand()
+                                                == indexed_instructions[start + 3].operand())
+                                        || iterator_handler_truth_prefix;
+                                    // Authenticate the single finalizer POP and every live
+                                    // suffix record after the captured handler cleanup.
+                                    let truth_test = handler_truth_prefix
+                                        && instruction_index - end == 3
+                                        && matches!(
+                                            indexed_instructions[end].opcode,
+                                            crate::target::opcodes::LOAD_FAST
+                                                | crate::target::opcodes::LOAD_FAST_BORROW
+                                                | crate::target::opcodes::LOAD_DEREF
+                                        )
+                                        && indexed_instructions[end]
+                                            .local_policy
+                                            .hidden_exception_owner_slots()
+                                            == 1
+                                        && indexed_instructions[end + 1].opcode
+                                            == crate::target::opcodes::TO_BOOL
+                                        && indexed_instructions[end + 1]
+                                            .local_policy
+                                            .hidden_exception_owner_slots()
+                                            == 0
+                                        && matches!(
+                                            previous.opcode,
                                             crate::target::opcodes::POP_JUMP_IF_FALSE
                                                 | crate::target::opcodes::POP_JUMP_IF_TRUE
                                         )
-                                    })))
-                            && matches!(
-                                indexed_instructions[end].opcode,
-                                crate::target::opcodes::LOAD_FAST
-                                    | crate::target::opcodes::LOAD_FAST_BORROW
-                                    | crate::target::opcodes::LOAD_DEREF
-                            )
-                            && indexed_instructions[end]
-                                .local_policy
-                                .hidden_exception_owner_slots()
-                                == 1
-                            && (if instruction_index - end == 2 {
-                                self.exception_owner_provenance
-                                    .source_none_conditions
-                                    .iter()
-                                    .filter(|origin| Some(origin.instruction) == previous)
-                                    .count()
-                                    == 1
-                            } else {
-                                self.exception_owner_provenance
-                                    .original_primitive_condition_boundaries
-                                    .iter()
-                                    .filter(|condition| Some(**condition) == previous)
-                                    .count()
-                                    == 1
+                                        && previous.local_policy.hidden_exception_owner_slots() == 0
+                                        && previous.location.line >= 0
+                                        && instruction.location == previous.location
+                                        && indexed_instructions[end..instruction_index].iter().all(
+                                            |record| {
+                                                record.location == previous.location
+                                                    && record.pre_fold_extra_instructions() == 0
+                                                    && record.exception_policy()
+                                                        == super::ExceptionPolicy::NoneUnchanged
+                                            },
+                                        )
+                                        && (ended_pop_slot
+                                            .is_some_and(|(pop, _, width)| pop == end && width == 1)
+                                            // The named cleanup's exact end label also records
+                                            // this POP when the generic owned-prefix epoch ends
+                                            // at POP_EXCEPT. Do not revive that broader epoch.
+                                            || (missing == 2
+                                                && end - start == 4
+                                                && end_removed == 1
+                                                && self.exception_owner_provenance
+                                                    .copied_handler_cleanups.iter()
+                                                    .filter(|origin| {
+                                                        origin.missing_null_pops == 2
+                                                            && origin.removed_prefix_slots == 1
+                                                            && origin.instructions.len() == 4
+                                                            && origin.assignment_pop.is_none()
+                                                            && origin.continued_call.is_none()
+                                                            && origin.continued_attribute_none.is_none()
+                                                            && label_positions.get(&origin.start) == Some(&start)
+                                                            && label_positions.get(&origin.end) == Some(&end)
+                                                            && self.exception_owner_provenance
+                                                                .removed_pop_block_boundaries.contains(&origin.end)
+                                                            && self.exception_owner_provenance
+                                                                .removed_pop_block_widths.get(&origin.end)
+                                                                .copied().unwrap_or(1) == 1
+                                                    }).count() == 1)
+                                            || iterator_handler_truth_prefix)
+                                        && self
+                                            .exception_owner_provenance
+                                            .original_primitive_condition_boundaries
+                                            .iter()
+                                            .filter(|condition| **condition == previous)
+                                            .count()
+                                            == 1
+                                        && !jump_targets
+                                            .iter()
+                                            .chain(&self.exception_owner_provenance.source_boundaries)
+                                            .chain(&self.exception_owner_provenance.block_boundaries)
+                                            .any(|label| {
+                                                label_positions.get(label).is_some_and(|position| {
+                                                    end < *position && *position <= instruction_index
+                                                })
+                                            });
+                                    none_test || truth_test
+                                })
                             })
+                            && let Some(removed) = tail.early_removals.checked_add(missing)
+                        {
+                            let suffix =
+                                instruction_index - end + tail.early_removals - end_removed;
+                            // The authenticated direct continue originally emitted its NOP,
+                            // two handler POPs, the four name-cleanup records, then the
+                            // finalizer POP. The exact attribute None prefix appends into
+                            // that last NULL cell; it adds no earlier live or hidden record.
+                            if continued_attribute_none.is_some()
+                                && array == start
+                                && end - start == 4
+                                && end_removed == 1
+                                && missing == 2
+                                && tail.early_removals == end_removed + 3
+                                && instruction_index - array == 1 + missing + end - start
+                            {
+                                owners.insert(
+                                    instruction_index,
+                                    ExceptionOwnerDecision {
+                                        has_owner: false,
+                                        source_region: None,
+                                        definitive: true,
+                                        override_existing: true,
+                                    },
+                                );
+                            }
+                            // Equality selects the original NULL finally POP immediately after
+                            // cleanup, not its preceding POP_EXCEPT. Its one transferred record
+                            // must be the only hidden slot on the immediately following load.
+                            if removed == suffix
+                                && (instruction_index - end == 2
+                                    || (missing == 2
+                                        && end - start == 4
+                                        && instruction_index - end == 3
+                                        && continued_call.is_none()
+                                        && continued_attribute_none.is_none()
+                                        && previous.is_some_and(|condition| {
+                                            matches!(
+                                                condition.opcode,
+                                                crate::target::opcodes::POP_JUMP_IF_FALSE
+                                                    | crate::target::opcodes::POP_JUMP_IF_TRUE
+                                            )
+                                        })))
+                                && matches!(
+                                    indexed_instructions[end].opcode,
+                                    crate::target::opcodes::LOAD_FAST
+                                        | crate::target::opcodes::LOAD_FAST_BORROW
+                                        | crate::target::opcodes::LOAD_DEREF
+                                )
+                                && indexed_instructions[end]
+                                    .local_policy
+                                    .hidden_exception_owner_slots()
+                                    == 1
+                                && (if instruction_index - end == 2 {
+                                    self.exception_owner_provenance
+                                        .source_none_conditions
+                                        .iter()
+                                        .filter(|origin| Some(origin.instruction) == previous)
+                                        .count()
+                                        == 1
+                                } else {
+                                    self.exception_owner_provenance
+                                        .original_primitive_condition_boundaries
+                                        .iter()
+                                        .filter(|condition| Some(**condition) == previous)
+                                        .count()
+                                        == 1
+                                })
+                                && self
+                                    .exception_owner_provenance
+                                    .removed_pop_block_boundaries
+                                    .iter()
+                                    .any(|label| {
+                                        label_positions.get(label) == Some(&end)
+                                            && self
+                                                .exception_owner_provenance
+                                                .removed_pop_block_widths
+                                                .get(label)
+                                                .copied()
+                                                .unwrap_or(1)
+                                                == 1
+                                    })
+                            {
+                                owners.insert(
+                                    instruction_index,
+                                    ExceptionOwnerDecision {
+                                        has_owner: false,
+                                        source_region: None,
+                                        definitive: true,
+                                        override_existing: true,
+                                    },
+                                );
+                            }
+                            if removed > suffix && removed - suffix <= end - start {
+                                let source = end - (removed - suffix);
+                                if let Some(region) = self.uniform_exception_owner(
+                                    source,
+                                    source + 1,
+                                    &label_positions,
+                                ) && !self.exception_regions[region].is_scope_fallback
+                                {
+                                    owners.insert(
+                                        instruction_index,
+                                        ExceptionOwnerDecision {
+                                            has_owner: true,
+                                            source_region: Some(region),
+                                            definitive: true,
+                                            override_existing: true,
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                        // Before the captured authored-return slot, an appended marker can
+                        // reuse the uniformly protected prefix. The retained POP remains NULL.
+                        if owner_history_exact
+                            && tail.insertions == 0
+                            && tail.late_removals == 0
+                            && tail.post_compaction_fusions == 0
+                            && instruction.exception_policy().exclusion()
+                                == super::ExceptionExclusion::None
+                            && matches!(
+                                instruction.exception_policy().owner(),
+                                NormalizedExceptionOwner::Present
+                                    | NormalizedExceptionOwner::DynamicCondition
+                            )
+                            && owners
+                                .get(&instruction_index)
+                                .is_none_or(|decision| !decision.definitive)
+                            && let Some((array, pop, slot, region)) = early_return_nop_slot
+                            && original_array_start == array
+                            && pop < instruction_index
+                            && instruction_index < slot
+                            && self.uniform_exception_owner(array, pop, &label_positions)
+                                == Some(region)
+                            && indexed_instructions[array..pop].iter().all(|instruction| {
+                                instruction.exception_policy().exclusion()
+                                    == super::ExceptionExclusion::None
+                                    && instruction.exception_policy().owner()
+                                        == NormalizedExceptionOwner::Unchanged
+                                    && instruction.local_policy.hidden_exception_owner_slots() == 0
+                                    && instruction.pre_fold_extra_instructions() == 0
+                                    && instruction.no_location_policy.borrow_fallthrough()
+                                        != super::BorrowFallthrough::Barrier
+                            })
+                        {
+                            owners.insert(
+                                instruction_index,
+                                ExceptionOwnerDecision {
+                                    has_owner: true,
+                                    source_region: Some(region),
+                                    definitive: true,
+                                    override_existing: true,
+                                },
+                            );
+                        }
+                        // A returned async iterator leaves its owned POP_TOP cell in
+                        // the old array. The adjacent finalizer POP transfers one hidden
+                        // slot to the local load; neither changes the disposal cell's owner.
+                        if owner_history_exact
+                            && tail.insertions == 0
+                            && tail.late_removals == 0
+                            && tail.post_compaction_fusions == 0
+                            && instruction.exception_policy().exclusion()
+                                == super::ExceptionExclusion::None
+                            && matches!(
+                                instruction.exception_policy().owner(),
+                                NormalizedExceptionOwner::Present
+                                    | NormalizedExceptionOwner::DynamicCondition
+                            )
+                            && instruction.local_policy.hidden_exception_owner_slots() == 0
+                            && instruction.pre_fold_extra_instructions() == 0
+                            && owners
+                                .get(&instruction_index)
+                                .is_none_or(|decision| !decision.definitive)
+                            && let Some((array, iterator, slot, region)) =
+                                early_return_iterator_slot
+                            && original_array_start == array
+                            && instruction_index == slot
+                            && matches!(indexed_instructions.get(iterator + 1..instruction_index),
+                            Some([load, to_bool, condition])
+                                if matches!(load.opcode, crate::target::opcodes::LOAD_FAST | crate::target::opcodes::LOAD_FAST_BORROW)
+                                    && matches!(load.operand(), Operand::Value(_))
+                                    && load.local_policy.hidden_exception_owner_slots() == 1
+                                    && to_bool.opcode == crate::target::opcodes::TO_BOOL
+                                    && to_bool.operand() == Operand::Value(0)
+                                    && to_bool.local_policy.hidden_exception_owner_slots() == 0
+                                    && matches!(condition.opcode, crate::target::opcodes::POP_JUMP_IF_FALSE | crate::target::opcodes::POP_JUMP_IF_TRUE)
+                                    && matches!(condition.operand(), Operand::Forward(_))
+                                    && condition.local_policy.hidden_exception_owner_slots() == 0
+                                    && [load, to_bool, condition].iter().all(|record| {
+                                        record.pre_fold_extra_instructions() == 0
+                                            && record.exception_policy() == super::ExceptionPolicy::NoneUnchanged
+                                            && record.location == instruction.location
+                                            && record.no_location_policy.borrow_fallthrough() == super::BorrowFallthrough::Reachable
+                                            && !record.jump_policy.borrow_empty_block()
+                                    }))
                             && self
                                 .exception_owner_provenance
                                 .removed_pop_block_boundaries
                                 .iter()
                                 .any(|label| {
-                                    label_positions.get(label) == Some(&end)
+                                    label_positions.get(label) == Some(&(iterator + 1))
                                         && self
                                             .exception_owner_provenance
                                             .removed_pop_block_widths
@@ -8047,6 +8149,305 @@ impl LayoutAssembler {
                             owners.insert(
                                 instruction_index,
                                 ExceptionOwnerDecision {
+                                    has_owner: true,
+                                    source_region: Some(region),
+                                    definitive: true,
+                                    override_existing: true,
+                                },
+                            );
+                        }
+                        // An attribute None test follows the same captured iterator disposal.
+                        // Its append cell is either that owned POP_TOP or the following NULL POP.
+                        if owner_history_exact
+                            && tail.insertions == 0
+                            && tail.late_removals == 0
+                            && tail.post_compaction_fusions == 0
+                            && instruction.exception_policy() == super::ExceptionPolicy::NonePresent
+                            && owners
+                                .get(&instruction_index)
+                                .is_none_or(|owner| !owner.definitive)
+                            && let Some((array, iterator, slot, region)) =
+                                early_return_iterator_slot
+                            && original_array_start == array
+                            && instruction_index.checked_sub(iterator) == Some(4)
+                            && (instruction_index == slot
+                                || slot.checked_add(1) == Some(instruction_index))
+                            && self
+                                .exception_owner_provenance
+                                .copied_iterator_attribute_none_prefixes
+                                .iter()
+                                .filter(|[original_pop, original_load, attribute, condition]| {
+                                    let mut load = *original_load;
+                                    load.local_policy.add_hidden_exception_owner_slots(1);
+                                    let actual = indexed_instructions[iterator + 1];
+                                    if actual.opcode == crate::target::opcodes::LOAD_FAST_BORROW {
+                                        load.opcode = actual.opcode;
+                                    }
+                                    self.exception_owner_provenance
+                                        .early_return_iterator_pops
+                                        .iter()
+                                        .any(|(_, original_iterator, pop, target)| {
+                                            let mut expected_iterator = *original_iterator;
+                                            expected_iterator
+                                                .local_policy
+                                                .add_hidden_exception_owner_slots(1);
+                                            pop == original_pop
+                                                && expected_iterator
+                                                    == *indexed_instructions[iterator]
+                                                && self.exception_regions[region].target == *target
+                                        })
+                                        && *actual == load
+                                        && *indexed_instructions[iterator + 2] == *attribute
+                                        && *indexed_instructions[iterator + 3] == *condition
+                                        && instruction.location == condition.location
+                                })
+                                .count()
+                                == 1
+                            && self
+                                .exception_owner_provenance
+                                .removed_pop_block_boundaries
+                                .iter()
+                                .any(|label| {
+                                    label_positions.get(label) == Some(&(iterator + 1))
+                                        && self
+                                            .exception_owner_provenance
+                                            .removed_pop_block_widths
+                                            .get(label)
+                                            .copied()
+                                            .unwrap_or(1)
+                                            == 1
+                                })
+                            && !jump_targets.iter().any(|label| {
+                                label_positions
+                                    .get(label)
+                                    .is_some_and(|&p| iterator < p && p <= instruction_index)
+                            })
+                        {
+                            let source_region = (instruction_index == slot).then_some(region);
+                            owners.insert(
+                                instruction_index,
+                                ExceptionOwnerDecision {
+                                    has_owner: source_region.is_some(),
+                                    source_region,
+                                    definitive: true,
+                                    override_existing: true,
+                                },
+                            );
+                        }
+                        // The explicit TO_BOOL places a truthiness marker one cell later
+                        // than a None test. Either original POP cell is still NULL; the
+                        // preceding authored return NOP and unchanged earlier array cells
+                        // retain the ordinary try's owner rather than the scope fallback.
+                        if owner_history_exact
+                            && tail.insertions == 0
+                            && tail.late_removals == 0
+                            && tail.post_compaction_fusions == 0
+                            && instruction.exception_policy().exclusion()
+                                == super::ExceptionExclusion::None
+                            && matches!(
+                                instruction.exception_policy().owner(),
+                                NormalizedExceptionOwner::Present
+                                    | NormalizedExceptionOwner::DynamicCondition
+                            )
+                            && instruction.local_policy.hidden_exception_owner_slots() == 0
+                            && instruction.pre_fold_extra_instructions() == 0
+                            && owners
+                                .get(&instruction_index)
+                                .is_none_or(|decision| !decision.definitive)
+                            && let Some((array, pop, slot)) = early_return_truth_slot
+                            && original_array_start == array
+                            && instruction_index - pop == 4
+                            && (instruction_index <= slot
+                                || slot.checked_add(1) == Some(instruction_index)
+                                || slot.checked_add(2) == Some(instruction_index))
+                            && instruction.location == indexed_instructions[pop + 3].location
+                        {
+                            let protected = instruction_index <= slot;
+                            let source_region = protected
+                                .then(|| {
+                                    (slot - instruction_index <= pop - array
+                                        && indexed_instructions[array..pop].iter().all(|record| {
+                                            record.exception_policy()
+                                                == super::ExceptionPolicy::NoneUnchanged
+                                                && record.opcode != NOP
+                                                && record
+                                                    .local_policy
+                                                    .hidden_exception_owner_slots()
+                                                    == 0
+                                                && record.pre_fold_extra_instructions() == 0
+                                                && record.no_location_policy.borrow_fallthrough()
+                                                    != super::BorrowFallthrough::Barrier
+                                        }))
+                                    .then(|| {
+                                        self.uniform_exception_owner(array, pop, &label_positions)
+                                    })
+                                    .flatten()
+                                    .filter(|region| {
+                                        !self.exception_regions[*region].is_scope_fallback
+                                            && !self.exception_regions[*region].preserve_lasti
+                                    })
+                                })
+                                .flatten();
+                            if !protected || source_region.is_some() {
+                                owners.insert(
+                                    instruction_index,
+                                    ExceptionOwnerDecision {
+                                        has_owner: protected,
+                                        source_region,
+                                        definitive: true,
+                                        override_existing: true,
+                                    },
+                                );
+                            }
+                        }
+                        // A captured POP pair remains the same original array when
+                        // the actual threading pass retargets its terminal condition.
+                        // Only that exact rewritten condition/marker pair can supersede
+                        // the generic Strict presence estimate below.
+                        let threaded_paired_pop_marker = instruction.exception_policy().owner()
+                            == NormalizedExceptionOwner::DynamicConditionStrict
+                            && early_return_nop_slot.is_some_and(|(_, pop, _, _)| {
+                                indexed_instructions[pop]
+                                    .local_policy
+                                    .hidden_exception_owner_slots()
+                                    == 2
+                            })
+                            && previous.is_some_and(|condition| {
+                                self.exception_owner_provenance
+                                    .threaded_condition_origins
+                                    .contains(&(condition, *instruction))
+                                    // Another copied condition can leave an identical
+                                    // historical origin after later normalization.
+                                    // The captured POP prefix must identify the sole
+                                    // surviving condition/marker pair.
+                                    && indexed_instructions
+                                        .windows(2)
+                                        .filter(|pair| {
+                                            *pair[0] == condition && *pair[1] == *instruction
+                                        })
+                                        .count()
+                                        == 1
+                            });
+                        // One captured finally POP has the same NULL cell for a truth
+                        // test. Its explicit TO_BOOL moves the appended marker one cell
+                        // past the None-test shape without adding an original POP.
+                        let single_pop_truth_marker = instruction.local_policy.hidden_exception_owner_slots() == 0
+                            && instruction.pre_fold_extra_instructions() == 0
+                            && early_return_nop_slot.is_some_and(|(_, pop, _, _)| {
+                                indexed_instructions[pop]
+                                    .local_policy
+                                    .hidden_exception_owner_slots() == 1
+                                    && matches!(
+                                        indexed_instructions.get(pop + 1..instruction_index),
+                                        Some([load, to_bool, condition])
+                                            if matches!(load.opcode,
+                                                crate::target::opcodes::LOAD_FAST
+                                                    | crate::target::opcodes::LOAD_FAST_BORROW)
+                                                && matches!(load.operand(), Operand::Value(_))
+                                                && to_bool.opcode == crate::target::opcodes::TO_BOOL
+                                                && to_bool.operand() == Operand::Value(0)
+                                                && matches!(condition.opcode,
+                                                    crate::target::opcodes::POP_JUMP_IF_FALSE | crate::target::opcodes::POP_JUMP_IF_TRUE)
+                                                && matches!(condition.operand(), Operand::Forward(_))
+                                                && [load, to_bool, condition].iter().all(|record| {
+                                                    record.local_policy.hidden_exception_owner_slots() == 0
+                                                        && record.pre_fold_extra_instructions() == 0
+                                                        && record.exception_policy()
+                                                            == super::ExceptionPolicy::NoneUnchanged
+                                                        && record.location == instruction.location
+                                                        && record.no_location_policy.borrow_fallthrough()
+                                                            == super::BorrowFallthrough::Reachable
+                                                        && !record.jump_policy.borrow_empty_block()
+                                                })
+                                    )
+                            });
+                        // Early compaction leaves the authored exit NOP and its adjacent
+                        // POP_BLOCK records in their old array cells. The first retains its
+                        // try owner; either captured POP is NULL despite a scope fallback.
+                        if owner_history_exact
+                            && tail.insertions == 0
+                            && tail.late_removals == 0
+                            && tail.post_compaction_fusions == 0
+                            && instruction.exception_policy().exclusion()
+                                == super::ExceptionExclusion::None
+                            && (matches!(
+                                instruction.exception_policy().owner(),
+                                NormalizedExceptionOwner::Present
+                                    | NormalizedExceptionOwner::DynamicCondition
+                            ) || threaded_paired_pop_marker)
+                            && owners.get(&instruction_index).is_none_or(|decision| {
+                                !decision.definitive
+                                    || (threaded_paired_pop_marker
+                                        && decision.has_owner
+                                        && decision.source_region.is_none()
+                                        && !decision.override_existing)
+                            })
+                            && let Some((array, pop, slot, region)) = early_return_nop_slot
+                            && original_array_start == array
+                            && instruction_index.checked_sub(slot).is_some_and(|distance| {
+                                distance
+                                    <= usize::from(
+                                        indexed_instructions[pop]
+                                            .local_policy
+                                            .hidden_exception_owner_slots(),
+                                    )
+                            })
+                            && ((instruction_index - pop == 3
+                                && matches!(
+                                    indexed_instructions[pop + 1].opcode,
+                                    crate::target::opcodes::LOAD_FAST
+                                        | crate::target::opcodes::LOAD_FAST_BORROW
+                                        | crate::target::opcodes::LOAD_DEREF
+                                )
+                                && indexed_instructions[pop + 1]
+                                    .local_policy
+                                    .hidden_exception_owner_slots()
+                                    == 0
+                                && previous.is_some_and(|previous: Instruction| {
+                                    matches!(
+                                        previous.opcode,
+                                        POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE
+                                    ) && previous.local_policy.hidden_exception_owner_slots() == 3
+                                }))
+                                || single_pop_truth_marker)
+                        {
+                            let source_region = (instruction_index == slot).then_some(region);
+                            owners.insert(
+                                instruction_index,
+                                ExceptionOwnerDecision {
+                                    has_owner: source_region.is_some(),
+                                    source_region,
+                                    definitive: true,
+                                    override_existing: true,
+                                },
+                            );
+                        }
+                        // The last SETUP compaction copies live records left and leaves
+                        // their old tail cells intact. Revalidate this original entry array
+                        // separately: retained SETUP NOPs can carry earlier POP annotations
+                        // that intentionally invalidate the generic early-history proofs.
+                        if original_array_start == 0
+                            && owner_history_exact
+                            && tail.late_removals == late_setup_positions.len()
+                            && tail.post_compaction_fusions == 0
+                            && instruction.exception_policy().exclusion()
+                                == super::ExceptionExclusion::None
+                            && instruction.exception_policy().owner()
+                                == NormalizedExceptionOwner::Present
+                            && owners
+                                .get(&instruction_index)
+                                .is_none_or(|decision| !decision.definitive)
+                            && self.entry_retained_setup_null_marker(
+                                instruction_index,
+                                &indexed_instructions,
+                                &label_positions,
+                                &jump_targets,
+                                &late_setup_positions,
+                            )
+                        {
+                            owners.insert(
+                                instruction_index,
+                                ExceptionOwnerDecision {
                                     has_owner: false,
                                     source_region: None,
                                     definitive: true,
@@ -8054,509 +8455,82 @@ impl LayoutAssembler {
                                 },
                             );
                         }
-                        if removed > suffix && removed - suffix <= end - start {
-                            let source = end - (removed - suffix);
-                            if let Some(region) =
-                                self.uniform_exception_owner(source, source + 1, &label_positions)
-                                && !self.exception_regions[region].is_scope_fallback
-                            {
-                                owners.insert(
-                                    instruction_index,
-                                    ExceptionOwnerDecision {
-                                        has_owner: true,
-                                        source_region: Some(region),
-                                        definitive: true,
-                                        override_existing: true,
-                                    },
-                                );
-                            }
-                        }
-                    }
-                    // Before the captured authored-return slot, an appended marker can
-                    // reuse the uniformly protected prefix. The retained POP remains NULL.
-                    if instruction.opcode == NOT_TAKEN
-                        && owner_history_exact
-                        && tail.insertions == 0
-                        && tail.late_removals == 0
-                        && tail.post_compaction_fusions == 0
-                        && instruction.exception_policy().exclusion()
-                            == super::ExceptionExclusion::None
-                        && matches!(
-                            instruction.exception_policy().owner(),
-                            NormalizedExceptionOwner::Present
-                                | NormalizedExceptionOwner::DynamicCondition
-                        )
-                        && owners
-                            .get(&instruction_index)
-                            .is_none_or(|decision| !decision.definitive)
-                        && let Some((array, pop, slot, region)) = early_return_nop_slot
-                        && original_array_start == array
-                        && pop < instruction_index
-                        && instruction_index < slot
-                        && self.uniform_exception_owner(array, pop, &label_positions)
-                            == Some(region)
-                        && indexed_instructions[array..pop].iter().all(|instruction| {
-                            instruction.exception_policy().exclusion()
-                                == super::ExceptionExclusion::None
-                                && instruction.exception_policy().owner()
-                                    == NormalizedExceptionOwner::Unchanged
-                                && instruction.local_policy.hidden_exception_owner_slots() == 0
-                                && instruction.pre_fold_extra_instructions() == 0
-                                && instruction.no_location_policy.borrow_fallthrough()
-                                    != super::BorrowFallthrough::Barrier
-                        })
-                    {
-                        owners.insert(
-                            instruction_index,
-                            ExceptionOwnerDecision {
-                                has_owner: true,
-                                source_region: Some(region),
-                                definitive: true,
-                                override_existing: true,
-                            },
-                        );
-                    }
-                    // A returned async iterator leaves its owned POP_TOP cell in
-                    // the old array. The adjacent finalizer POP transfers one hidden
-                    // slot to the local load; neither changes the disposal cell's owner.
-                    if instruction.opcode == NOT_TAKEN
-                        && owner_history_exact
-                        && tail.insertions == 0
-                        && tail.late_removals == 0
-                        && tail.post_compaction_fusions == 0
-                        && instruction.exception_policy().exclusion()
-                            == super::ExceptionExclusion::None
-                        && matches!(
-                            instruction.exception_policy().owner(),
-                            NormalizedExceptionOwner::Present
-                                | NormalizedExceptionOwner::DynamicCondition
-                        )
-                        && instruction.local_policy.hidden_exception_owner_slots() == 0
-                        && instruction.pre_fold_extra_instructions() == 0
-                        && owners
-                            .get(&instruction_index)
-                            .is_none_or(|decision| !decision.definitive)
-                        && let Some((array, iterator, slot, region)) = early_return_iterator_slot
-                        && original_array_start == array
-                        && instruction_index == slot
-                        && matches!(indexed_instructions.get(iterator + 1..instruction_index),
-                        Some([load, to_bool, condition])
-                            if matches!(load.opcode, crate::target::opcodes::LOAD_FAST | crate::target::opcodes::LOAD_FAST_BORROW)
-                                && matches!(load.operand(), Operand::Value(_))
-                                && load.local_policy.hidden_exception_owner_slots() == 1
-                                && to_bool.opcode == crate::target::opcodes::TO_BOOL
-                                && to_bool.operand() == Operand::Value(0)
-                                && to_bool.local_policy.hidden_exception_owner_slots() == 0
-                                && matches!(condition.opcode, crate::target::opcodes::POP_JUMP_IF_FALSE | crate::target::opcodes::POP_JUMP_IF_TRUE)
-                                && matches!(condition.operand(), Operand::Forward(_))
-                                && condition.local_policy.hidden_exception_owner_slots() == 0
-                                && [load, to_bool, condition].iter().all(|record| {
-                                    record.pre_fold_extra_instructions() == 0
-                                        && record.exception_policy() == super::ExceptionPolicy::NoneUnchanged
-                                        && record.location == instruction.location
-                                        && record.no_location_policy.borrow_fallthrough() == super::BorrowFallthrough::Reachable
-                                        && !record.jump_policy.borrow_empty_block()
-                                }))
-                        && self
-                            .exception_owner_provenance
-                            .removed_pop_block_boundaries
-                            .iter()
-                            .any(|label| {
-                                label_positions.get(label) == Some(&(iterator + 1))
-                                    && self
-                                        .exception_owner_provenance
-                                        .removed_pop_block_widths
-                                        .get(label)
-                                        .copied()
-                                        .unwrap_or(1)
-                                        == 1
-                            })
-                    {
-                        owners.insert(
-                            instruction_index,
-                            ExceptionOwnerDecision {
-                                has_owner: true,
-                                source_region: Some(region),
-                                definitive: true,
-                                override_existing: true,
-                            },
-                        );
-                    }
-                    // An attribute None test follows the same captured iterator disposal.
-                    // Its append cell is either that owned POP_TOP or the following NULL POP.
-                    if instruction.opcode == NOT_TAKEN
-                        && owner_history_exact
-                        && tail.insertions == 0
-                        && tail.late_removals == 0
-                        && tail.post_compaction_fusions == 0
-                        && instruction.exception_policy() == super::ExceptionPolicy::NonePresent
-                        && owners
-                            .get(&instruction_index)
-                            .is_none_or(|owner| !owner.definitive)
-                        && let Some((array, iterator, slot, region)) = early_return_iterator_slot
-                        && original_array_start == array
-                        && instruction_index.checked_sub(iterator) == Some(4)
-                        && (instruction_index == slot
-                            || slot.checked_add(1) == Some(instruction_index))
-                        && self
-                            .exception_owner_provenance
-                            .copied_iterator_attribute_none_prefixes
-                            .iter()
-                            .filter(|[original_pop, original_load, attribute, condition]| {
-                                let mut load = *original_load;
-                                load.local_policy.add_hidden_exception_owner_slots(1);
-                                let actual = indexed_instructions[iterator + 1];
-                                if actual.opcode == crate::target::opcodes::LOAD_FAST_BORROW {
-                                    load.opcode = actual.opcode;
-                                }
-                                self.exception_owner_provenance
-                                    .early_return_iterator_pops
-                                    .iter()
-                                    .any(|(_, original_iterator, pop, target)| {
-                                        let mut expected_iterator = *original_iterator;
-                                        expected_iterator
-                                            .local_policy
-                                            .add_hidden_exception_owner_slots(1);
-                                        pop == original_pop
-                                            && expected_iterator == *indexed_instructions[iterator]
-                                            && self.exception_regions[region].target == *target
-                                    })
-                                    && *actual == load
-                                    && *indexed_instructions[iterator + 2] == *attribute
-                                    && *indexed_instructions[iterator + 3] == *condition
-                                    && instruction.location == condition.location
-                            })
-                            .count()
-                            == 1
-                        && self
-                            .exception_owner_provenance
-                            .removed_pop_block_boundaries
-                            .iter()
-                            .any(|label| {
-                                label_positions.get(label) == Some(&(iterator + 1))
-                                    && self
-                                        .exception_owner_provenance
-                                        .removed_pop_block_widths
-                                        .get(label)
-                                        .copied()
-                                        .unwrap_or(1)
-                                        == 1
-                            })
-                        && !jump_targets.iter().any(|label| {
-                            label_positions
-                                .get(label)
-                                .is_some_and(|&p| iterator < p && p <= instruction_index)
-                        })
-                    {
-                        let source_region = (instruction_index == slot).then_some(region);
-                        owners.insert(
-                            instruction_index,
-                            ExceptionOwnerDecision {
-                                has_owner: source_region.is_some(),
-                                source_region,
-                                definitive: true,
-                                override_existing: true,
-                            },
-                        );
-                    }
-                    // The explicit TO_BOOL places a truthiness marker one cell later
-                    // than a None test. Either original POP cell is still NULL; the
-                    // preceding authored return NOP and unchanged earlier array cells
-                    // retain the ordinary try's owner rather than the scope fallback.
-                    if instruction.opcode == NOT_TAKEN
-                        && owner_history_exact
-                        && tail.insertions == 0
-                        && tail.late_removals == 0
-                        && tail.post_compaction_fusions == 0
-                        && instruction.exception_policy().exclusion()
-                            == super::ExceptionExclusion::None
-                        && matches!(
-                            instruction.exception_policy().owner(),
-                            NormalizedExceptionOwner::Present
-                                | NormalizedExceptionOwner::DynamicCondition
-                        )
-                        && instruction.local_policy.hidden_exception_owner_slots() == 0
-                        && instruction.pre_fold_extra_instructions() == 0
-                        && owners
-                            .get(&instruction_index)
-                            .is_none_or(|decision| !decision.definitive)
-                        && let Some((array, pop, slot)) = early_return_truth_slot
-                        && original_array_start == array
-                        && instruction_index - pop == 4
-                        && (instruction_index <= slot
-                            || slot.checked_add(1) == Some(instruction_index)
-                            || slot.checked_add(2) == Some(instruction_index))
-                        && instruction.location == indexed_instructions[pop + 3].location
-                    {
-                        let protected = instruction_index <= slot;
-                        let source_region = protected
-                            .then(|| {
-                                (slot - instruction_index <= pop - array
-                                    && indexed_instructions[array..pop].iter().all(|record| {
-                                        record.exception_policy()
-                                            == super::ExceptionPolicy::NoneUnchanged
-                                            && record.opcode != NOP
-                                            && record.local_policy.hidden_exception_owner_slots()
-                                                == 0
-                                            && record.pre_fold_extra_instructions() == 0
-                                            && record.no_location_policy.borrow_fallthrough()
-                                                != super::BorrowFallthrough::Barrier
-                                    }))
-                                .then(|| self.uniform_exception_owner(array, pop, &label_positions))
-                                .flatten()
-                                .filter(|region| {
-                                    !self.exception_regions[*region].is_scope_fallback
-                                        && !self.exception_regions[*region].preserve_lasti
-                                })
-                            })
-                            .flatten();
-                        if !protected || source_region.is_some() {
+                        // This original excluded NOP supplies its own exact donor cell;
+                        // the capture is limited to the certified copied manager-break array.
+                        if instruction.exception_policy() == super::ExceptionPolicy::NonePresent
+                            && owner_history_exact
+                            && self.copied_break_none_nop_is_null(
+                                instruction_index,
+                                original_array_start,
+                                tail,
+                                &indexed_instructions,
+                                &label_positions,
+                                &jump_targets,
+                            )
+                        {
                             owners.insert(
                                 instruction_index,
                                 ExceptionOwnerDecision {
-                                    has_owner: protected,
-                                    source_region,
+                                    has_owner: false,
+                                    source_region: None,
                                     definitive: true,
                                     override_existing: true,
                                 },
                             );
                         }
-                    }
-                    // A captured POP pair remains the same original array when
-                    // the actual threading pass retargets its terminal condition.
-                    // Only that exact rewritten condition/marker pair can supersede
-                    // the generic Strict presence estimate below.
-                    let threaded_paired_pop_marker = instruction.opcode == NOT_TAKEN
-                        && instruction.exception_policy().owner()
-                            == NormalizedExceptionOwner::DynamicConditionStrict
-                        && early_return_nop_slot.is_some_and(|(_, pop, _, _)| {
-                            indexed_instructions[pop]
-                                .local_policy
-                                .hidden_exception_owner_slots()
-                                == 2
-                        })
-                        && previous.is_some_and(|condition| {
-                            self.exception_owner_provenance
-                                .threaded_condition_origins
-                                .contains(&(condition, *instruction))
-                                // Another copied condition can leave an identical
-                                // historical origin after later normalization.
-                                // The captured POP prefix must identify the sole
-                                // surviving condition/marker pair.
-                                && indexed_instructions
-                                    .windows(2)
-                                    .filter(|pair| {
-                                        *pair[0] == condition && *pair[1] == *instruction
-                                    })
-                                    .count()
-                                    == 1
-                        });
-                    // One captured finally POP has the same NULL cell for a truth
-                    // test. Its explicit TO_BOOL moves the appended marker one cell
-                    // past the None-test shape without adding an original POP.
-                    let single_pop_truth_marker = instruction.opcode == NOT_TAKEN
-                        && instruction.local_policy.hidden_exception_owner_slots() == 0
-                        && instruction.pre_fold_extra_instructions() == 0
-                        && early_return_nop_slot.is_some_and(|(_, pop, _, _)| {
-                            indexed_instructions[pop]
-                                .local_policy
-                                .hidden_exception_owner_slots() == 1
-                                && matches!(
-                                    indexed_instructions.get(pop + 1..instruction_index),
-                                    Some([load, to_bool, condition])
-                                        if matches!(load.opcode,
-                                            crate::target::opcodes::LOAD_FAST
-                                                | crate::target::opcodes::LOAD_FAST_BORROW)
-                                            && matches!(load.operand(), Operand::Value(_))
-                                            && to_bool.opcode == crate::target::opcodes::TO_BOOL
-                                            && to_bool.operand() == Operand::Value(0)
-                                            && matches!(condition.opcode,
-                                                crate::target::opcodes::POP_JUMP_IF_FALSE | crate::target::opcodes::POP_JUMP_IF_TRUE)
-                                            && matches!(condition.operand(), Operand::Forward(_))
-                                            && [load, to_bool, condition].iter().all(|record| {
-                                                record.local_policy.hidden_exception_owner_slots() == 0
-                                                    && record.pre_fold_extra_instructions() == 0
-                                                    && record.exception_policy()
-                                                        == super::ExceptionPolicy::NoneUnchanged
-                                                    && record.location == instruction.location
-                                                    && record.no_location_policy.borrow_fallthrough()
-                                                        == super::BorrowFallthrough::Reachable
-                                                    && !record.jump_policy.borrow_empty_block()
-                                            })
-                                )
-                        });
-                    // Early compaction leaves the authored exit NOP and its adjacent
-                    // POP_BLOCK records in their old array cells. The first retains its
-                    // try owner; either captured POP is NULL despite a scope fallback.
-                    if instruction.opcode == NOT_TAKEN
-                        && owner_history_exact
-                        && tail.insertions == 0
-                        && tail.late_removals == 0
-                        && tail.post_compaction_fusions == 0
-                        && instruction.exception_policy().exclusion()
-                            == super::ExceptionExclusion::None
-                        && (matches!(
-                            instruction.exception_policy().owner(),
-                            NormalizedExceptionOwner::Present
-                                | NormalizedExceptionOwner::DynamicCondition
-                        ) || threaded_paired_pop_marker)
-                        && owners.get(&instruction_index).is_none_or(|decision| {
-                            !decision.definitive
-                                || (threaded_paired_pop_marker
-                                    && decision.has_owner
-                                    && decision.source_region.is_none()
-                                    && !decision.override_existing)
-                        })
-                        && let Some((array, pop, slot, region)) = early_return_nop_slot
-                        && original_array_start == array
-                        && instruction_index.checked_sub(slot).is_some_and(|distance| {
-                            distance
-                                <= usize::from(
-                                    indexed_instructions[pop]
-                                        .local_policy
-                                        .hidden_exception_owner_slots(),
-                                )
-                        })
-                        && ((instruction_index - pop == 3
-                            && matches!(
-                                indexed_instructions[pop + 1].opcode,
-                                crate::target::opcodes::LOAD_FAST
-                                    | crate::target::opcodes::LOAD_FAST_BORROW
-                                    | crate::target::opcodes::LOAD_DEREF
+                        if instruction.exception_policy()
+                            == super::ExceptionPolicy::NoneDynamicCondition
+                            && owner_history_exact
+                            && tail.early_removals == 1
+                            && tail.insertions == 0
+                            && tail.late_removals == 0
+                            && tail.post_compaction_fusions == 0
+                            && owners
+                                .get(&instruction_index)
+                                .is_none_or(|decision| !decision.definitive)
+                            && self.copied_named_break_truth_is_null(
+                                instruction_index,
+                                original_array_start,
+                                &indexed_instructions,
+                                &label_positions,
+                                &jump_targets,
                             )
-                            && indexed_instructions[pop + 1]
-                                .local_policy
-                                .hidden_exception_owner_slots()
-                                == 0
-                            && previous.is_some_and(|previous: Instruction| {
-                                matches!(previous.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
-                                    && previous.local_policy.hidden_exception_owner_slots() == 3
-                            }))
-                            || single_pop_truth_marker)
-                    {
-                        let source_region = (instruction_index == slot).then_some(region);
-                        owners.insert(
-                            instruction_index,
-                            ExceptionOwnerDecision {
-                                has_owner: source_region.is_some(),
-                                source_region,
-                                definitive: true,
-                                override_existing: true,
-                            },
-                        );
-                    }
-                    // The last SETUP compaction copies live records left and leaves
-                    // their old tail cells intact. Revalidate this original entry array
-                    // separately: retained SETUP NOPs can carry earlier POP annotations
-                    // that intentionally invalidate the generic early-history proofs.
-                    if instruction.opcode == NOT_TAKEN
-                        && original_array_start == 0
-                        && owner_history_exact
-                        && tail.late_removals == late_setup_positions.len()
-                        && tail.post_compaction_fusions == 0
-                        && instruction.exception_policy().exclusion()
-                            == super::ExceptionExclusion::None
-                        && instruction.exception_policy().owner()
-                            == NormalizedExceptionOwner::Present
-                        && owners
-                            .get(&instruction_index)
-                            .is_none_or(|decision| !decision.definitive)
-                        && self.entry_retained_setup_null_marker(
-                            instruction_index,
-                            &indexed_instructions,
-                            &label_positions,
-                            &jump_targets,
-                            &late_setup_positions,
-                        )
-                    {
-                        owners.insert(
-                            instruction_index,
-                            ExceptionOwnerDecision {
-                                has_owner: false,
-                                source_region: None,
-                                definitive: true,
-                                override_existing: true,
-                            },
-                        );
-                    }
-                    // This original excluded NOP supplies its own exact donor cell;
-                    // the capture is limited to the certified copied manager-break array.
-                    if instruction.opcode == NOT_TAKEN
-                        && instruction.exception_policy() == super::ExceptionPolicy::NonePresent
-                        && owner_history_exact
-                        && self.copied_break_none_nop_is_null(
-                            instruction_index,
-                            original_array_start,
-                            tail,
-                            &indexed_instructions,
-                            &label_positions,
-                            &jump_targets,
-                        )
-                    {
-                        owners.insert(
-                            instruction_index,
-                            ExceptionOwnerDecision {
-                                has_owner: false,
-                                source_region: None,
-                                definitive: true,
-                                override_existing: true,
-                            },
-                        );
-                    }
-                    if instruction.opcode == NOT_TAKEN
-                        && instruction.exception_policy()
-                            == super::ExceptionPolicy::NoneDynamicCondition
-                        && owner_history_exact
-                        && tail.early_removals == 1
-                        && tail.insertions == 0
-                        && tail.late_removals == 0
-                        && tail.post_compaction_fusions == 0
-                        && owners
-                            .get(&instruction_index)
-                            .is_none_or(|decision| !decision.definitive)
-                        && self.copied_named_break_truth_is_null(
-                            instruction_index,
-                            original_array_start,
-                            &indexed_instructions,
-                            &label_positions,
-                            &jump_targets,
-                        )
-                    {
-                        owners.insert(
-                            instruction_index,
-                            ExceptionOwnerDecision {
-                                has_owner: false,
-                                source_region: None,
-                                definitive: true,
-                                override_existing: true,
-                            },
-                        );
-                    }
-                    if instruction.opcode == NOT_TAKEN
-                        && owner_history_exact
-                        && instruction.exception_policy()
-                            == super::ExceptionPolicy::NoneDynamicCondition
-                        && owners
-                            .get(&instruction_index)
-                            .is_none_or(|decision| !decision.definitive)
-                        && let Some(region) = self.copied_shared_break_truth_owner(
-                            instruction_index,
-                            original_array_start,
-                            tail,
-                            &indexed_instructions,
-                            &label_positions,
-                            &jump_targets,
-                        )
-                    {
-                        owners.insert(
-                            instruction_index,
-                            ExceptionOwnerDecision {
-                                has_owner: true,
-                                source_region: Some(region),
-                                definitive: true,
-                                override_existing: true,
-                            },
-                        );
+                        {
+                            owners.insert(
+                                instruction_index,
+                                ExceptionOwnerDecision {
+                                    has_owner: false,
+                                    source_region: None,
+                                    definitive: true,
+                                    override_existing: true,
+                                },
+                            );
+                        }
+                        if owner_history_exact
+                            && instruction.exception_policy()
+                                == super::ExceptionPolicy::NoneDynamicCondition
+                            && owners
+                                .get(&instruction_index)
+                                .is_none_or(|decision| !decision.definitive)
+                            && let Some(region) = self.copied_shared_break_truth_owner(
+                                instruction_index,
+                                original_array_start,
+                                tail,
+                                &indexed_instructions,
+                                &label_positions,
+                                &jump_targets,
+                            )
+                        {
+                            owners.insert(
+                                instruction_index,
+                                ExceptionOwnerDecision {
+                                    has_owner: true,
+                                    source_region: Some(region),
+                                    definitive: true,
+                                    override_existing: true,
+                                },
+                            );
+                        }
                     }
                     instruction_index += 1;
                     has_instruction = true;
@@ -10915,6 +10889,16 @@ mod tests {
             assert!(!decision.has_owner);
             assert_eq!(decision.definitive, !barrier && !outer_region);
             assert_eq!(decision.override_existing, !barrier && !outer_region);
+
+            if !barrier && !outer_region {
+                let Item::Instruction(instruction) = &mut assembler.items[5] else {
+                    unreachable!();
+                };
+                instruction.opcode = LOAD_FAST;
+                let decisions = assembler.dynamic_exception_owners();
+                let decision = decisions.get(&3).expect("ordinary dynamic owner decision");
+                assert!(!decision.override_existing);
+            }
         }
     }
 
@@ -12220,6 +12204,7 @@ mod tests {
             "authored break",
             "borrowed",
             "range alias",
+            "missing leading labels",
             "unknown origin",
             "changed origin",
             "duplicate origin",
@@ -12269,6 +12254,17 @@ mod tests {
                     jump.fusion_policy.mark_authored_break();
                     items[0] = Item::Instruction(jump);
                     provenance.original_primitive_condition_boundaries.clear();
+                }
+                "missing leading labels" => {
+                    items.retain(|item| !matches!(item, Item::Label(Label(1 | 2))));
+                    // A still-literal incoming condition cannot authenticate an unlabeled array.
+                    assert!(!provenance.uncompacted_prefix(
+                        &items[3..=10],
+                        &items,
+                        &std::cell::OnceCell::new(),
+                        0,
+                        false,
+                    ));
                 }
                 "unknown origin" => provenance.original_primitive_condition_boundaries.clear(),
                 "changed origin" => {
