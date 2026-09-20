@@ -6444,9 +6444,13 @@ impl Compiler<'_> {
             Expr::Tuple(tuple)
                 if tuple.elts.iter().any(Expr::is_starred_expr) || tuple.elts.len() > 30 =>
             {
-                // CPython lowers these tuples through a temporary list, then removes the
-                // list-to-tuple intrinsic when the tuple is immediately iterated.
-                self.compile_collection(&tuple.elts, CollectionKind::List)
+                // The 3.15 flowgraph folds constant append chains before removing this
+                // intrinsic, preserving the tuple's location on the folded load.
+                self.compile_collection(&tuple.elts, CollectionKind::List)?;
+                if self.context.python_version == PythonVersion::Py315 {
+                    self.emit_unary_intrinsic(UnaryIntrinsic::LIST_TO_TUPLE)?;
+                }
+                Ok(())
             }
             Expr::List(list) if !list.elts.iter().any(Expr::is_starred_expr) => {
                 if list.elts.len() <= 30

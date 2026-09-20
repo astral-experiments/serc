@@ -816,7 +816,11 @@ impl Compiler<'_> {
         Ok(())
     }
 
-    fn record_discarded_fold_admissions(&mut self, first_fold: usize, admission: Option<Label>) {
+    pub(super) fn record_discarded_fold_admissions(
+        &mut self,
+        first_fold: usize,
+        admission: Option<Label>,
+    ) {
         if self.output.deferred_constants.len() > first_fold {
             let admission = admission.unwrap_or_else(|| {
                 let label = self.assembler.label();

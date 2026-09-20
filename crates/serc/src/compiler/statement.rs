@@ -1913,7 +1913,13 @@ impl Compiler<'_> {
                 && fold_constant(&expression.value).is_some()
             {
                 if literal_constant(&expression.value).is_none() {
+                    let first_fold = self.output.deferred_constants.len();
                     self.record_folded_value(&expression.value)?;
+                    if self.context.python_version == crate::PythonVersion::Py315 {
+                        // This statement emits no load, but later sequence folding
+                        // must retain its constant's original construction order.
+                        self.record_discarded_fold_admissions(first_fold, None);
+                    }
                 }
                 let range = if let Expr::FString(fstring) = expression.value.as_ref() {
                     Self::fstring_result_range(fstring)

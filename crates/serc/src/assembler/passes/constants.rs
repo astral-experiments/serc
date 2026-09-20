@@ -5,8 +5,9 @@ use super::super::{ConstantTable, Item, Label, Operand, OptimizationPipeline, So
 use crate::code_object::Constant;
 use crate::target::Opcode;
 use crate::target::opcodes::{
-    BUILD_LIST, BUILD_SET, BUILD_TUPLE, CALL_INTRINSIC_1, CONTAINS_OP, GET_ITER, LIST_APPEND,
-    LOAD_COMMON_CONSTANT, LOAD_CONST, LOAD_SMALL_INT, NOP, SET_ADD, UNARY_NEGATIVE,
+    BUILD_LIST, BUILD_SET, BUILD_TUPLE, CALL_INTRINSIC_1, CONTAINS_OP, GET_ITER,
+    GET_YIELD_FROM_ITER, LIST_APPEND, LOAD_COMMON_CONSTANT, LOAD_CONST, LOAD_SMALL_INT, NOP,
+    SET_ADD, UNARY_NEGATIVE,
 };
 use crate::target::operands::UnaryIntrinsic;
 use crate::target::operands315::CommonConstant;
@@ -21,20 +22,37 @@ impl OptimizationPipeline {
         if self.python_version != PythonVersion::Py315 {
             return Ok(None);
         }
+        let mut boundaries = self.preserved_block_boundaries.clone();
+        boundaries.extend(&self.exception_owner_provenance.block_boundaries);
+        boundaries.extend(&self.exception_owner_provenance.source_boundaries);
+        boundaries.extend(&self.original_nop_targets);
+        boundaries.extend(&self.original_jump_head_targets);
+        boundaries.extend(self.exception_regions.iter().map(|region| region.target));
+        boundaries.extend(self.graph.iter_items().filter_map(|item| match item {
+            Item::Instruction(instruction) => match instruction.operand() {
+                Operand::Forward(label) | Operand::Backward(label) => Some(label),
+                Operand::Value(_) | Operand::Deferred(_) => None,
+            },
+            Item::Label(_) => None,
+        }));
         let mut removed_max_depth = None;
-        for block in self.graph.order().to_vec() {
+        let order = self.graph.order().to_vec();
+        for (block_index, block) in order.iter().copied().enumerate() {
             for offset in 0..self.graph[block].items().len() {
                 let Item::Instruction(target) = self.graph[block].items()[offset] else {
                     continue;
                 };
                 let intrinsic = target.opcode == CALL_INTRINSIC_1
                     && target.operand() == Operand::Value(UnaryIntrinsic::LIST_TO_TUPLE.argument());
+                let next_opcode = match self.graph[block].items().get(offset + 1) {
+                    Some(Item::Instruction(next)) => Some(next.opcode),
+                    _ => None,
+                };
+                let immediately_iterated =
+                    matches!(next_opcode, Some(GET_ITER | GET_YIELD_FROM_ITER));
                 let append = matches!(target.opcode, LIST_APPEND | SET_ADD)
                     && target.operand() == Operand::Value(1)
-                    && matches!(
-                        self.graph[block].items().get(offset + 1),
-                        Some(Item::Instruction(next)) if matches!(next.opcode, GET_ITER | CONTAINS_OP)
-                    );
+                    && (immediately_iterated || next_opcode == Some(CONTAINS_OP));
                 if !intrinsic && !append {
                     continue;
                 }
@@ -78,10 +96,48 @@ impl OptimizationPipeline {
                     expect_append = !expect_append;
                 }
                 let Some(start) = start else {
+                    if intrinsic && immediately_iterated {
+                        let instruction = self
+                            .graph
+                            .instruction_mut(ItemPosition::new(block, offset))
+                            .unwrap();
+                        let depth = instruction.depth_after().unwrap_or(0);
+                        removed_max_depth = Some(
+                            removed_max_depth.map_or(depth, |current: u32| current.max(depth)),
+                        );
+                        instruction.opcode = NOP;
+                        instruction.set_operand(Operand::Value(0));
+                    }
                     continue;
                 };
                 values.reverse();
                 let index = constants.fold_sequence(values, is_set)?;
+                // Authored statement NOPs can be separated by bookkeeping labels
+                // from the original array they locate. CPython transfers their span
+                // through the newly cleared records before removing the donor NOP.
+                let mut nop_location = None;
+                'find_donor: for previous_block in order[..=block_index].iter().rev() {
+                    let items = self.graph[*previous_block].items();
+                    let items = if *previous_block == block {
+                        &items[..start]
+                    } else {
+                        items
+                    };
+                    for item in items.iter().rev() {
+                        match item {
+                            Item::Label(label) if boundaries.contains(label) => break 'find_donor,
+                            Item::Label(_) => {}
+                            Item::Instruction(instruction)
+                                if instruction.opcode == NOP && instruction.location.line < 0 => {}
+                            Item::Instruction(instruction) => {
+                                if instruction.opcode == NOP {
+                                    nop_location = Some(instruction.location);
+                                }
+                                break 'find_donor;
+                            }
+                        }
+                    }
+                }
                 // CPython nops the final append as well, clearing its location before
                 // replacing it. The optional intrinsic instead keeps its original span.
                 let end = if intrinsic { offset } else { offset + 1 };
@@ -90,15 +146,25 @@ impl OptimizationPipeline {
                         .graph
                         .instruction_mut(ItemPosition::new(block, previous))
                         .unwrap();
-                    if instruction.opcode != NOP {
+                    if instruction.opcode == NOP {
+                        if instruction.location.line >= 0 {
+                            nop_location = Some(instruction.location);
+                        }
+                    } else {
                         let depth = instruction.depth_after().unwrap_or(0);
                         removed_max_depth = Some(
                             removed_max_depth.map_or(depth, |current: u32| current.max(depth)),
                         );
                         instruction.opcode = NOP;
                         instruction.set_operand(Operand::Value(0));
-                        instruction.location = SourceLocation::NONE;
-                        instruction.no_location_policy.clear_preserved_location();
+                        instruction.location = nop_location.unwrap_or(SourceLocation::NONE);
+                        if intrinsic {
+                            // The retained intrinsic supplies the tuple's own span;
+                            // its removed prefix must not gain a distinct donor line.
+                            instruction.no_location_policy.preserve_location();
+                        } else {
+                            instruction.no_location_policy.clear_preserved_location();
+                        }
                     }
                 }
                 let target = self
@@ -362,7 +428,7 @@ impl OptimizationPipeline {
 #[cfg(test)]
 mod tests {
     use crate::code_object::Constant;
-    use crate::target::opcodes::{LIST_APPEND, LOAD_COMMON_CONSTANT, SET_ADD};
+    use crate::target::opcodes::{LIST_APPEND, LOAD_COMMON_CONSTANT, LOAD_CONST, SET_ADD};
     use crate::{CompileOptions, PythonVersion, compile_with_options};
 
     #[test]
@@ -493,6 +559,66 @@ mod tests {
                 .0
                 .iter()
                 .any(|word| word[0] == SET_ADD.code_for(PythonVersion::Py315))
+        );
+    }
+
+    #[test]
+    fn python315_sequence_fold_keeps_discarded_constant_admission_and_location() {
+        let elements = std::iter::repeat_n("'value'", 31)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let module = compile_with_options(
+            &format!("()\nfor item in [{elements}]:\n    pass\nother = (1, 2)\nf(**kw)\n"),
+            "discarded_sequence.py",
+            &CompileOptions {
+                python_version: PythonVersion::Py315,
+                ..CompileOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            module.code.constants.as_slice(),
+            [Constant::String(first), Constant::Tuple(empty), Constant::Tuple(values), Constant::Tuple(pair)]
+                if first == "value" && empty.is_empty() && values.len() == 31
+                    && matches!(pair.as_slice(), [Constant::Int(1), Constant::Int(2)])
+        ));
+        // The discarded expression's authored NOP donates its span to the folded
+        // load and disappears; the first word after RESUME and its cache is the load.
+        assert_eq!(
+            module.bytecode()[4],
+            LOAD_CONST.code_for(PythonVersion::Py315)
+        );
+        assert_eq!(module.bytecode()[5], 2);
+    }
+
+    #[test]
+    fn python315_tuple_iteration_removes_the_unlocated_fold_prefix() {
+        let elements = std::iter::repeat_n("'value'", 31)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let module = compile_with_options(
+            &format!("def f():\n    for item in ({elements}):\n        pass\n"),
+            "tuple_iteration.py",
+            &CompileOptions {
+                python_version: PythonVersion::Py315,
+                ..CompileOptions::default()
+            },
+        )
+        .unwrap();
+        let function = module
+            .code
+            .constants
+            .iter()
+            .find_map(|constant| match constant {
+                Constant::Code(code) => Some(code),
+                _ => None,
+            })
+            .unwrap();
+        // The removed sequence must not retain a NOP on the function definition's
+        // line before the replacement load carrying the tuple expression's span.
+        assert_eq!(
+            function.bytecode[4],
+            LOAD_CONST.code_for(PythonVersion::Py315)
         );
     }
 }

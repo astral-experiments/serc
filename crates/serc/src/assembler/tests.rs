@@ -1671,6 +1671,35 @@ fn constant_pop_candidates_are_recorded_during_emission() {
 }
 
 #[test]
+fn discarded_constant_precedes_late_sequence_admission() {
+    use crate::code_object::Constant;
+    use crate::{CompileOptions, PythonVersion, compile_with_options};
+
+    let values = (0..31)
+        .map(|index| format!("'item_{index}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let source = format!("()\nfor item in [{values}]:\n    use(item)\nother = (1, 2)\nf(**kw)\n");
+    let module = compile_with_options(
+        &source,
+        "discarded_before_sequence.py",
+        &CompileOptions {
+            python_version: PythonVersion::Py315,
+            ..CompileOptions::default()
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        module.code.constants.as_slice(),
+        [Constant::String(first), Constant::Tuple(empty), Constant::Tuple(sequence), Constant::Tuple(pair)]
+            if first == "item_0"
+                && empty.is_empty()
+                && sequence.len() == 31
+                && matches!(pair.as_slice(), [Constant::Int(1), Constant::Int(2)])
+    ));
+}
+
+#[test]
 fn discarded_value_emission_matches_handle_emission() {
     fn assert_same_stream(expected: &Assembler, actual: &Assembler) {
         assert_eq!(expected.instruction_count(), actual.instruction_count());
